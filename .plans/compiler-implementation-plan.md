@@ -50,14 +50,14 @@
 │                    └──────────────┬───────────────────┘                   │
 │                                  │                                       │
 │                                  ▼                                       │
-│                    ┌──────────────────────────────────┐                   │
-│                    │             gen                   │                   │
-│                    │  ┌──────────────┬──────────────┐ │                   │
-│                    │  │ intermediate │    link       │ │                   │
-│                    │  │ (IR gen +    │ (target emit  │ │                   │
-│                    │  │  optimize)   │  + linking)   │ │                   │
-│                    │  └──────────────┴──────────────┘ │                   │
-│                    └──────────────────────────────────┘                   │
+│                    ┌─────────────────────────────────────────────────┐   │
+│                    │                    gen                           │   │
+│                    │  ┌──────────────┬────────────┬───────────────┐  │   │
+│                    │  │ intermediate │ optimizer  │     link      │  │   │
+│                    │  │ (AST → IR)   │ (IR passes │ (target emit  │  │   │
+│                    │  │              │  & xforms) │  + linking)   │  │   │
+│                    │  └──────────────┴────────────┴───────────────┘  │   │
+│                    └─────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,10 +90,13 @@ User Input (via program API)
 [analysis/semantic] ── type checking, scope resolution, semantic validation
     │
     ▼
-[gen/intermediate] ── AST → Intermediate Representation (IR), IR optimization
+[gen/intermediate] ── AST → Intermediate Representation (IR)
     │
     ▼
-[gen/link] ── IR → target-specific machine code, linking, output binary
+[gen/optimizer] ── IR optimization passes (constant folding, DCE, CSE, etc.)
+    │
+    ▼
+[gen/link] ── optimized IR → target-specific machine code, linking, output binary
     │
     ▼
 Executable / Library / WASM module (per target)
@@ -232,12 +235,37 @@ dss-code-prime/
 │   └── gen/                                 # ── Code Generation ──
 │       ├── CMakeLists.txt
 │       │
-│       ├── intermediate/                    # IR Generation & Optimization
+│       ├── intermediate/                    # IR Generation
 │       │   ├── ir_generator.hpp             # Public API: generate(AST) → IR
 │       │   ├── ir_generator.cpp             # Walks annotated AST, emits IR nodes
-│       │   ├── ir_node.hpp                  # IR instruction set (three-address code style)
-│       │   ├── ir_optimizer.hpp             # Optimization passes (constant folding, DCE, etc.)
-│       │   └── ir_optimizer.cpp
+│       │   └── ir_node.hpp                  # IR instruction set (three-address code style)
+│       │
+│       ├── optimizer/                       # IR Optimization (target-independent)
+│       │   ├── optimizer.hpp                # Public API: optimize(IR) → optimized IR
+│       │   ├── optimizer.cpp                # Runs the optimization pass pipeline
+│       │   ├── pass.hpp                     # Abstract base class for optimization passes
+│       │   ├── passes/                      # Individual optimization pass implementations
+│       │   │   ├── constant_folding.hpp     # Evaluate compile-time constant expressions
+│       │   │   ├── constant_folding.cpp
+│       │   │   ├── constant_propagation.hpp # Replace variables with known constant values
+│       │   │   ├── constant_propagation.cpp
+│       │   │   ├── dead_code_elimination.hpp # Remove unreachable / unused instructions
+│       │   │   ├── dead_code_elimination.cpp
+│       │   │   ├── common_subexpr_elim.hpp  # Reuse already-computed expressions
+│       │   │   ├── common_subexpr_elim.cpp
+│       │   │   ├── copy_propagation.hpp     # Replace copies with original values
+│       │   │   ├── copy_propagation.cpp
+│       │   │   ├── strength_reduction.hpp   # Replace expensive ops with cheaper equivalents
+│       │   │   ├── strength_reduction.cpp
+│       │   │   ├── loop_invariant_motion.hpp # Hoist invariant computations out of loops
+│       │   │   └── loop_invariant_motion.cpp
+│       │   └── analysis/                    # IR analysis utilities used by passes
+│       │       ├── cfg_builder.hpp          # Build control-flow graph from IR
+│       │       ├── cfg_builder.cpp
+│       │       ├── liveness.hpp             # Variable liveness analysis
+│       │       ├── liveness.cpp
+│       │       ├── reaching_defs.hpp        # Reaching definitions analysis
+│       │       └── reaching_defs.cpp
 │       │
 │       └── link/                            # Target Code Emission & Linking
 │           ├── linker.hpp                   # Public API: link(IR, target) → output binary
@@ -291,8 +319,12 @@ dss-code-prime/
     │       └── test_type_checker.cpp
     └── gen/
         ├── intermediate/
-        │   ├── test_ir_generator.cpp
-        │   └── test_ir_optimizer.cpp
+        │   └── test_ir_generator.cpp
+        ├── optimizer/
+        │   ├── test_optimizer.cpp
+        │   ├── test_constant_folding.cpp
+        │   ├── test_dead_code_elimination.cpp
+        │   └── test_cfg_builder.cpp
         └── link/
             └── test_linker.cpp
 ```
@@ -883,7 +915,7 @@ private:
 
 ---
 
-#### 4.7.1 `gen/intermediate/` — IR Generation & Optimization
+#### 4.7.1 `gen/intermediate/` — IR Generation
 
 Transforms the semantically-validated AST into a **target-independent Intermediate Representation**.
 
@@ -922,29 +954,90 @@ private:
 - `FUNC_BEGIN name` / `FUNC_END` — Function boundaries
 - `ALLOC dest, type` — Allocate stack space
 
-**`IROptimizer`** — Applies target-independent optimizations:
-- Constant folding (evaluate compile-time expressions)
-- Constant propagation
-- Dead code elimination (remove unreachable instructions)
-- Common subexpression elimination
-- Copy propagation
+---
+
+#### 4.7.2 `gen/optimizer/` — IR Optimizer
+
+The optimizer is a **dedicated module** that sits between IR generation and target emission. It operates **on the IR** (not the AST, not the machine code) because:
+
+1. **IR is simpler than AST** — uniform three-address instructions are easier to analyze than a tree of heterogeneous nodes
+2. **Target-independent** — every optimization here benefits all 8 target backends simultaneously
+3. **IR is designed for it** — three-address code / SSA representations were specifically created to enable efficient dataflow analysis and transformation
+4. **Separated concern** — keeping optimization as its own module makes passes independently testable, orderable, and toggleable
+
+##### Pipeline Architecture
+
+The optimizer runs a configurable **pipeline of passes** over the IR. Each pass implements a common interface and can be enabled/disabled or reordered:
 
 ```cpp
-class IROptimizer {
+/// Abstract base for all optimization passes.
+class OptimizationPass {
 public:
-    /// Apply all optimization passes to the IR program.
+    virtual ~OptimizationPass() = default;
+    virtual std::string name() const = 0;
+    virtual bool run(IRProgram& program) = 0;  // Returns true if IR was modified
+};
+
+/// Runs the full optimization pipeline.
+class Optimizer {
+public:
+    explicit Optimizer(ErrorReporter& reporter);
+
+    /// Register a pass to the pipeline.
+    void addPass(std::unique_ptr<OptimizationPass> pass);
+
+    /// Run all registered passes. Repeats until no pass modifies the IR (fixed-point).
     void optimize(IRProgram& program);
 
-    /// Apply a specific optimization pass.
-    void constantFolding(IRProgram& program);
-    void deadCodeElimination(IRProgram& program);
-    void copyPropagation(IRProgram& program);
+    /// Convenience: build the default optimization pipeline.
+    static Optimizer createDefault(ErrorReporter& reporter);
+
+private:
+    std::vector<std::unique_ptr<OptimizationPass>> passes_;
+    ErrorReporter& reporter_;
+    size_t maxIterations_ = 10;  // Safety bound for fixed-point iteration
 };
+```
+
+##### Optimization Passes
+
+| Pass | What it does | Example |
+|---|---|---|
+| **Constant Folding** | Evaluates expressions with known constant operands at compile time. | `t1 = 3 + 4` → `t1 = 7` |
+| **Constant Propagation** | When a variable is assigned a constant, replaces subsequent uses with that constant. | `x = 5; y = x + 1` → `x = 5; y = 5 + 1` |
+| **Dead Code Elimination** | Removes instructions whose results are never used, and unreachable code after unconditional jumps/returns. | Unused `t2 = a * b` removed if `t2` is never read |
+| **Common Subexpression Elimination** | When the same expression is computed multiple times (with unchanged operands), reuses the first result. | `t1 = a + b; ... t3 = a + b` → `t1 = a + b; ... t3 = t1` |
+| **Copy Propagation** | When `x = y` and `y` doesn't change, replaces uses of `x` with `y`, enabling further dead code elimination. | `t1 = t0; use(t1)` → `use(t0)` |
+| **Strength Reduction** | Replaces expensive operations with cheaper equivalents. | `x * 2` → `x + x`; `x * 8` → `x << 3` |
+| **Loop-Invariant Code Motion** | Moves computations that produce the same result on every iteration to before the loop. | `for(...) { t = a + b; ... }` → `t = a + b; for(...) { ... }` |
+
+##### IR Analysis Utilities
+
+The passes rely on shared analysis infrastructure:
+
+| Analysis | Purpose |
+|---|---|
+| **CFG Builder** | Constructs a Control-Flow Graph from the linear IR instruction list. Basic blocks and edges between them. Required by most passes. |
+| **Liveness Analysis** | Determines which variables are "live" (will be read later) at each point. Powers dead code elimination and future register allocation. |
+| **Reaching Definitions** | For each point in the program, determines which definitions (assignments) could have produced each variable's current value. Powers constant propagation and CSE. |
+
+##### Default Pass Ordering
+
+The optimizer runs passes in this order (repeating until stable):
+
+```
+1. Constant Folding          ─┐
+2. Constant Propagation       │  These feed each other:
+3. Copy Propagation           │  folding creates constants,
+4. Common Subexpr Elimination │  propagation enables more folding
+5. Dead Code Elimination     ─┘
+6. Strength Reduction
+7. Loop-Invariant Code Motion
 ```
 
 ---
 
-#### 4.7.2 `gen/link/` — Target-Specific Emission & Linking
+#### 4.7.3 `gen/link/` — Target-Specific Emission & Linking
 
 Transforms the optimized IR into **target-specific machine code** and produces the final output (executable, library, or WASM module).
 
@@ -1025,7 +1118,7 @@ CMake toolchain files for each cross-compilation target. Each file sets:
 
 - Root `CMakeLists.txt` sets C++20 standard, detects platform, includes subdirectories
 - Each `src/` subdirectory has its own `CMakeLists.txt` producing a static library
-- Libraries link: `core` ← `source-factory` ← `tokenizer` ← `analysis` ← `gen` ← `program`
+- Libraries link: `core` ← `source-factory` ← `tokenizer` ← `analysis` ← `gen` (intermediate + optimizer + link) ← `program`
 - `main.cpp` links `program` (which transitively pulls everything) into the `dss-code-prime` executable
 - `tests/CMakeLists.txt` uses **Google Test** (fetched via CMake `FetchContent`)
 
@@ -1054,12 +1147,13 @@ CMake toolchain files for each cross-compilation target. Each file sets:
 | 6 | `analysis-lexical` | Implement lexical analysis | tokenizer | Implement Lexer and LexicalRules. Validate and classify the raw token stream. |
 | 7 | `analysis-syntactic` | Implement syntactic analysis | analysis-lexical | Implement Parser, Grammar, ASTBuilder. Parse tokens into AST using grammar from config. |
 | 8 | `analysis-semantic` | Implement semantic analysis | analysis-syntactic | Implement SemanticAnalyzer, SymbolTable, TypeChecker, ScopeResolver. Validate AST semantics. |
-| 9 | `gen-intermediate` | Implement IR generation | analysis-semantic | Implement IRGenerator and IROptimizer. Transform AST to IR and apply optimizations. |
-| 10 | `gen-link` | Implement code emission & linking | gen-intermediate | Implement Linker, TargetBase, and initial targets (Linux x86_64 as first). Emit machine code and produce binaries. |
-| 11 | `program-api` | Implement program API & driver | core-types, gen-link | Implement Program (public API), InputResolver (directory scan, file list, glob), ProjectFile (.dsp parser), CompilationRequest/Result models. Multi-target dispatch. |
-| 12 | `targets-expand` | Expand target support | gen-link | Implement remaining targets: Windows, macOS, iOS, Android, Web/WASM. |
-| 13 | `testing` | Comprehensive test suite | all above | Write unit tests for every module. Integration tests compiling example programs end-to-end. |
-| 14 | `docker-setup` | Docker & CI setup | scaffold-project | Finalize Dockerfile, compose, toolchain files. Set up CI/CD pipeline for automated builds and tests. |
+| 9 | `gen-intermediate` | Implement IR generation | analysis-semantic | Implement IRGenerator and IR node types. Transform annotated AST into three-address code IR. |
+| 10 | `gen-optimizer` | Implement IR optimizer | gen-intermediate | Implement Optimizer pipeline, OptimizationPass base, all passes (constant folding, propagation, DCE, CSE, copy propagation, strength reduction, loop-invariant motion), and IR analysis utilities (CFG builder, liveness, reaching definitions). |
+| 11 | `gen-link` | Implement code emission & linking | gen-optimizer | Implement Linker, TargetBase, and initial targets (Linux x86_64 as first). Emit machine code and produce binaries. |
+| 12 | `program-api` | Implement program API & driver | core-types, gen-link | Implement Program (public API), InputResolver (directory scan, file list, glob), ProjectFile (.dsp parser), CompilationRequest/Result models. Multi-target dispatch. |
+| 13 | `targets-expand` | Expand target support | gen-link | Implement remaining targets: Windows, macOS, iOS, Android, Web/WASM. |
+| 14 | `testing` | Comprehensive test suite | all above | Write unit tests for every module. Integration tests compiling example programs end-to-end. |
+| 15 | `docker-setup` | Docker & CI setup | scaffold-project | Finalize Dockerfile, compose, toolchain files. Set up CI/CD pipeline for automated builds and tests. |
 
 ---
 
