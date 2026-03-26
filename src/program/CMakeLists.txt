@@ -3,4 +3,4 @@ add_library(program OBJECT
 )
 
 target_include_directories(program PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-target_link_libraries(program PUBLIC core)
+target_link_libraries(program PUBLIC core gen)

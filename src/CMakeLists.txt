@@ -1,9 +1,10 @@
 add_subdirectory(core)
+add_subdirectory(gen)
 add_subdirectory(program)
 
 # ── Shared library (DLL / .so / .dylib) ──
 # All compiler functionality in a single shared library for embedding in other projects.
-add_library(dss-code-prime-lib SHARED $<TARGET_OBJECTS:core> $<TARGET_OBJECTS:program>)
+add_library(dss-code-prime-lib SHARED $<TARGET_OBJECTS:core> $<TARGET_OBJECTS:gen> $<TARGET_OBJECTS:program>)
 target_include_directories(dss-code-prime-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(dss-code-prime-lib
     PUBLIC  DSS_SHARED_BUILD

@@ -1,9 +1,32 @@
 #include "program/program.hpp"
+#include "gen/link/targets/windows/target_windows_x86_64.hpp"
+#include <filesystem>
 #include <iostream>
+#include <string>
+
+namespace fs = std::filesystem;
 
 namespace dss {
 
 int Program::run(int argc, char* argv[]) {
+    // Temporary: if called with "--demo-gui [output-dir]", generate a demo Windows exe
+    // Output goes to: <output-dir>/target/windows-x86_64/hello.exe
+    if (argc >= 2 && std::string(argv[1]) == "--demo-gui") {
+        std::string baseDir = (argc >= 3) ? argv[2] : ".";
+
+        TargetWindowsX86_64 target;
+        fs::path targetDir = fs::path(baseDir) / "target" / target.name();
+        fs::create_directories(targetDir);
+
+        fs::path outputPath = targetDir / ("hello" + target.outputExtension());
+        if (TargetWindowsX86_64::generateSimpleGui(outputPath.string())) {
+            std::cout << "Generated: " << outputPath.string() << std::endl;
+            return 0;
+        }
+        std::cerr << "Failed to generate: " << outputPath.string() << std::endl;
+        return 1;
+    }
+
     std::cout << "Hello, World! DSS Code Prime compiler ready." << std::endl;
     return 0;
 }
