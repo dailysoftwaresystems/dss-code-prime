@@ -40,4 +40,7 @@
 # debug information files
 *.dwo
 
+# Build directory
+build/
+
 #.plans/ -- Not for now, but will be used when first minimal implementation is done and we start working on the next steps.
