@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:/Strawberry/c/bin/c++.exe --version)",
+      "Bash(rm -rf build)",
+      "Bash(cmake -S . -B build -G Ninja)",
+      "Bash(cmake --build C:/Source/DailySoftware/dss-code-prime/build -j 4)",
+      "Bash(ctest --output-on-failure)",
+      "Bash(./dss_core_test_strong_ids.exe)",
+      "Bash(./build/bin/dss/dss_core_test_source_span.exe)",
+      "Bash(echo \"exit: $?\")",
+      "PowerShell(cd C:/Source/DailySoftware/dss-code-prime; & .\\\\build\\\\bin\\\\dss\\\\dss_core_test_source_span.exe 2>&1 | Select-Object -Last 3; \"exit=$LASTEXITCODE\")",
+      "Bash(gh release *)",
+      "Bash(cmake --version)",
+      "WebFetch(domain:cmake.org)",
+      "PowerShell(cmake *)",
+      "PowerShell(winget install *)",
+      "PowerShell(Get-Process *)",
+      "Bash(taskkill.exe //F //PID 52056 //PID 45656)",
+      "Bash(cd /c)",
+      "Bash(powershell.exe -NoProfile -Command \"winget install Kitware.CMake --scope user --accept-source-agreements --accept-package-agreements --silent --disable-interactivity\")",
+      "Bash(grep -E 'windows-x86_64\\\\.zip$')",
+      "Bash(/c/Users/rafae/AppData/Local/Programs/cmake-4.3.2-windows-x86_64/bin/cmake.exe --version)",
+      "Bash(/c/Users/rafae/AppData/Local/Programs/cmake-4.3.2-windows-x86_64/bin/cmake.exe --build /c/Source/DailySoftware/dss-code-prime/build -j 4)",
+      "Read(//c/Source/DailySoftware/DBAS.Base.App/.github/workflows//**)",
+      "Read(//c/Source/DailySoftware/DSS.DevOps//**)",
+      "Bash(awk '{print $NF}')"
+    ]
+  }
+}
