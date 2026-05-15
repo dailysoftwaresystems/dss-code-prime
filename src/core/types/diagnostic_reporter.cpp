@@ -92,6 +92,10 @@ std::uint64_t hashKey(ParseDiagnostic const& d) noexcept {
     h = fnv1a64(h, static_cast<std::uint64_t>(d.buffer.v));
     h = fnv1a64(h, static_cast<std::uint64_t>(d.span.start()));
     h = fnv1a64(h, static_cast<std::uint64_t>(d.span.end()));
+    // Include the rule context so per-frame EOF diagnostics (which share
+    // a span but have distinct ruleContexts) don't dedup-collapse against
+    // each other.
+    h = fnv1a64(h, d.ruleContext ? static_cast<std::uint64_t>(d.ruleContext->v) : 0u);
     return h;
 }
 } // namespace

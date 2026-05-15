@@ -11,6 +11,7 @@ add_library(core OBJECT
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/tree.cpp
+    types/tree_builder.cpp
 )
 
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

@@ -86,6 +86,24 @@ TEST(Reporter, DistinctSpansAreNotDeduped) {
     EXPECT_EQ(r.all().size(), 2u);
 }
 
+TEST(Reporter, RuleContextIsPartOfDedupKey) {
+    // Regression for the dedup fix that enabled per-frame EOF
+    // diagnostics in the builder: identical (code, buffer, span) with
+    // DIFFERENT ruleContexts must NOT collapse.
+    DiagnosticReporter r;
+    BufferId b{1};
+    auto d1 = makeDiag(DiagnosticCode::P_PrematureEndOfInput, DiagnosticSeverity::Error, b, 10, 10);
+    d1.ruleContext = RuleId{1};
+    auto d2 = makeDiag(DiagnosticCode::P_PrematureEndOfInput, DiagnosticSeverity::Error, b, 10, 10);
+    d2.ruleContext = RuleId{2};
+    auto d3 = makeDiag(DiagnosticCode::P_PrematureEndOfInput, DiagnosticSeverity::Error, b, 10, 10);
+    d3.ruleContext = RuleId{1};   // same code+span+rule as d1 → must dedup
+    r.report(d1);
+    r.report(d2);
+    r.report(d3);
+    EXPECT_EQ(r.all().size(), 2u);
+}
+
 TEST(Reporter, PerCodeCapCoalescesSilently) {
     DiagnosticReporter::Config cfg;
     cfg.maxPerCode = 3;

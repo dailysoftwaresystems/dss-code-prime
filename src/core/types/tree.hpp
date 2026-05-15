@@ -26,15 +26,17 @@ namespace detail {
 // detail/ means consumers can't fabricate one casually — only the builder
 // (and unit tests deliberately importing the detail header) produces one.
 //
-// CP1 leaves `schema` and `diagnostics` null; CP2 wires them up. Tree's
-// accessors stay null-safe so trees built without those work in tests.
+// Hand-fabricated test trees may leave `schema` and `diagnostics` null;
+// the builder path always sets both. Tree's accessors abort with a clear
+// message when a null-set member is dereferenced (`tree.schema()` /
+// `tree.diagnostics()`), so misuse is loud rather than silent.
 struct DSS_EXPORT TreeData {
     std::shared_ptr<SourceBuffer>        source;
     std::shared_ptr<RuleInterner const>  rules;
-    std::shared_ptr<GrammarSchema const> schema;          // optional in CP1
+    std::shared_ptr<GrammarSchema const> schema;          // null only in hand-built test trees
     std::vector<Node>                    nodes;           // arena; index = NodeId.v
     std::vector<NodeId>                  childIndex;      // flat child table
-    std::unique_ptr<DiagnosticReporter>  diagnostics;     // optional in CP1
+    std::unique_ptr<DiagnosticReporter>  diagnostics;     // null only in hand-built test trees
     NodeId                               root = InvalidNode;
     TreeId                               id   = InvalidTree;
 };

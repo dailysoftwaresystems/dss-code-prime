@@ -16,8 +16,8 @@ Updated as work progresses. Detailed phase status lives in §7.
 | **T2**  | Tree arena + Node + NodeFlags (read-only API)               | ✅ done |
 | **T3**  | ParseDiagnostic + DiagnosticReporter + DiagnosticPolicy     | ✅ done |
 | **T4**  | GrammarSchema + SchemaCursor + ScopeKind + JSON loader + `toy.lang.json` | ✅ done |
-| **T5**  | schema-aware `TreeBuilder` (RAII `OpenScope`, recovery)     | ⏳ next |
-| **T6**  | `TreeCursor` (CST + AST modes)                              | ⏳ pending |
+| **T5**  | schema-aware `TreeBuilder` (RAII `OpenScope`, recovery)     | ✅ done (review-fix sweep applied) |
+| **T6**  | `TreeCursor` (CST + AST modes)                              | ⏳ next |
 | **T7**  | `tree_visitor.hpp` walk helpers                             | ⏳ pending |
 | **T8**  | `NodeAttribute<T>` side-tables                              | ⏳ pending |
 | **T9**  | initial typed views                                         | ⏳ pending |
@@ -33,7 +33,7 @@ Updated as work progresses. Detailed phase status lives in §7.
 | C++ standard | **23** |
 | Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows |
 | Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
-| Test suite | **112 cases across 11 ctest suites — 100% pass** |
+| Test suite | **136 cases across 12 ctest suites — 100% pass** |
 
 **Files now in `src/core/types/` (all on `core` static lib):**
 
@@ -42,17 +42,18 @@ strong_ids.hpp
 source_span.hpp/.cpp
 source_buffer.hpp/.cpp
 token.hpp
-interner.hpp                 ← header-only template, shared by Rule/SchemaToken interners
+interner.hpp                 ← header-only template with transparent heterogeneous lookup
 rule_id.hpp                  ← using RuleInterner = Interner<RuleId>
 schema_token_interner.hpp    ← using SchemaTokenInterner = Interner<SchemaTokenId>
 scope_kind.hpp/.cpp
 schema_cursor.hpp
 parse_diagnostic.hpp/.cpp
-diagnostic_reporter.hpp/.cpp
+diagnostic_reporter.hpp/.cpp ← FNV-1a64 dedup hash includes ruleContext
 grammar_schema.hpp/.cpp
 grammar_schema_json.hpp/.cpp ← only TU that includes <nlohmann/json.hpp>
 tree_node.hpp                ← NodeKind, NodeFlags, detail::Node (40 bytes)
 tree.hpp/.cpp                ← detail::TreeData, Tree (immutable, schema- & diagnostics-aware accessors)
+tree_builder.hpp/.cpp        ← schema-aware assembler, RAII OpenScope, cascade-cookie tracking
 ```
 
 **Shipped configs:**
@@ -60,11 +61,19 @@ tree.hpp/.cpp                ← detail::TreeData, Tree (immutable, schema- & di
 
 **Deviations from spec, captured intentionally:**
 1. `detail::Node` is **40 bytes** (not 32) — `DiagnosticIndex` added during the rigor-review pass pushed past the original cacheline-doubled budget. Still 1.6 nodes per 64 B line; performance impact negligible.
-2. `RuleInterner` is now `using RuleInterner = Interner<RuleId>;` — header-only template `Interner<Id>` is the shared source. Identifier interner (plan §9 item 2) becomes a one-line addition.
+2. `RuleInterner` is now `using RuleInterner = Interner<RuleId>;` — header-only template `Interner<Id>` is the shared source. Uses C++20 transparent heterogeneous lookup (`std::hash<string_view>` + `equal_to<>`) so `find()`/`contains()`/`intern()` accept `string_view` without allocating temporaries. Identifier interner (plan §9 item 2) becomes a one-line addition.
 3. `GrammarSchemaData` POD mirrors the Tree/TreeData split — instead of friending the JSON loader, the loader builds a movable POD that the schema's public ctor consumes.
 4. `GrammarSchema::loadShipped` walks parent dirs to find `src/source-config/languages/<name>.lang.json`, so the lookup is independent of cwd (ctest, repo root, build dir all work).
 5. CP1 declared but did not implement `Tree::cursor()` / `Tree::astCursor()` / `Tree::childrenOfRule()` — those declarations were removed and will return when T6 lands. `Tree::firstChildOfRule()` is documented for T5/T6 but the declaration also waits.
 6. `T11` (CMake wireup) is folded into each checkpoint as files land — there's no separate "wire all files" phase at the end. The standalone T11 row in §7 is retained for the docs/discoverability angle.
+7. **T5 scope limit:** the builder validates *within* an open frame (lexeme resolution, scope filter, priority tiebreak, scope-stack mutation, recovery, EOF synthesis, HasError propagation, internal invariants). It does **not** drive the schema's compiled shape graph for sequence/alt validation — that requires extending `GrammarSchema` with a navigable shape instruction stream. The parser (parent-plan phase #7) is the source of truth for "this `open(rule)` is valid here" until the shape walker lands.
+8. **T5 reliability features added during review-fix sweep:**
+   - `open() &` qualifier — disqualifies rvalue builders so `OpenScope` can't outlive a temporary.
+   - `closedCookies_` set in builder — cascade-closed frames register their cookies; subsequent OpenScope `close()`s no-op cleanly instead of emitting spurious `P_BuilderInvariant`.
+   - Release-mode `P_BuilderInvariant` guards on every public mutator (no debug-only `assert` corruption paths post-finish).
+   - Leftover-scope detection at `finish()` emits a `P_BuilderInvariant` noting the imbalance.
+   - `currentRule()` introspector for the parser layer.
+   - Empty-tree `finish()` (no `open()` ever called) returns a well-formed Tree with `InvalidNode` root instead of dereferencing past the arena.
 
 ---
 
@@ -448,7 +457,11 @@ namespace detail {  // implementation detail — accessed only via Tree
         uint32_t         childCount;   // consecutive children (0 for leaves)
         DiagnosticIndex  diagnostic;   // valid() iff Error or HasError set
     };
-    static_assert(sizeof(Node) == 32, "Node must stay cacheline-friendly");
+    static_assert(sizeof(Node) <= 40, "Node grew unexpectedly — review layout");
+    // Plan originally targeted 32 bytes, but the DiagnosticIndex added during
+    // the rigor-review pass pushed the layout to 40 bytes. Still 1.6 nodes per
+    // 64 B cacheline; shrinking further would force packing firstChild/
+    // childCount into 16 bits each (capping children/node at 65 535).
 }
 ```
 
@@ -1233,10 +1246,10 @@ Each phase produces a self-contained, testable deliverable. Land them in order; 
 | T0  | ✅ done | `tree-deps-cmake`     | nlohmann/json + GoogleTest FetchContent | root `CMakeLists.txt`, `tests/CMakeLists.txt`, `tests/core/CMakeLists.txt`, `templates/.gitignore.cpp` | CMake floor 4.0, C++23, nlohmann_json 3.12.0, GoogleTest 1.17.0 wired via FetchContent. `enable_testing()` + `option(DSS_BUILD_TESTS ON)`. |
 | T1  | ✅ done | `tree-source-types`   | Source primitives + strong IDs | `strong_ids.hpp`, `source_buffer.*`, `source_span.*`, `token.hpp`, `interner.hpp`, `rule_id.hpp` (+ stub `rule_id.cpp`), `schema_token_interner.hpp` | `DSS_STRONG_ID` macro; `SourceSpan::of()` factory; `Interner<Id>` template (RuleInterner and SchemaTokenInterner are using-aliases); `freeze()` enforced. **8 + 9 + 10 + 4 + 8 = 39 test cases.** |
 | T2  | ✅ done | `tree-storage`        | `Tree` arena + `Node` struct + `NodeFlags` | `tree_node.hpp`, `tree.hpp/.cpp`, stub `grammar_schema.hpp`, stub `diagnostic_reporter.hpp` | `detail::Node` is 40 bytes (relaxed from 32 once `DiagnosticIndex` was added); `NodeFlags` ops `inline constexpr`; discriminant-asserting `rule()`/`tokenKind()`/`diagnostic()`; release-fatal `node_(id)` bounds check. **9 + 10 = 19 test cases including a death test.** |
-| T3  | ✅ done | `tree-diagnostics`    | Diagnostic types + reporter + policy | `scope_kind.hpp/.cpp`, `parse_diagnostic.hpp/.cpp`, `diagnostic_reporter.hpp/.cpp` | `DiagnosticCode` as `enum class : uint16_t` (P/C/S/I prefix ranges); `RelatedLocation`, scopeStack on every diag; `DiagnosticPolicy` (suppress/overrides/warningsAsErrors); `Config{maxDiagnostics,maxPerCode,dedupWindow}`; FNV-1a64 hash dedup; `BufferRegistry`. `format()` produces caret-pointed line + scope + related; `formatAll()` sorts by (buffer, span). **5 + 16 = 21 test cases.** |
+| T3  | ✅ done | `tree-diagnostics`    | Diagnostic types + reporter + policy | `scope_kind.hpp/.cpp`, `parse_diagnostic.hpp/.cpp`, `diagnostic_reporter.hpp/.cpp` | `DiagnosticCode` as `enum class : uint16_t` (P/C/S/I prefix ranges); `RelatedLocation`, scopeStack on every diag; `DiagnosticPolicy` (suppress/overrides/warningsAsErrors); `Config{maxDiagnostics,maxPerCode,dedupWindow}`; FNV-1a64 hash dedup including `ruleContext`; `BufferRegistry`. `format()` produces caret-pointed line + scope + related; `formatAll()` sorts by (buffer, span). **5 + 18 = 23 test cases** (includes ruleContext-in-hash regression). |
 | T4  | ✅ done | `tree-schema-loader`  | `GrammarSchema` + `SchemaCursor` + `ScopeKind` + JSON loader + toy config | `grammar_schema.hpp/.cpp`, `grammar_schema_json.hpp/.cpp`, `schema_cursor.hpp`, `src/source-config/languages/toy.lang.json` | `GrammarSchemaData` POD mirrors Tree/TreeData split (no friend gymnastics). `LoadResult<T>` = `std::expected<T, vector<ConfigDiagnostic>>`. Pre-interns `Identifier`/`IntLiteral`/etc. as built-in token kinds. Walks parent dirs in `loadShipped` to be cwd-agnostic. nlohmann/json linked PRIVATE — no leak. **19 test cases** covering happy path + every C_* code. |
-| T5  | ⏳ next | `tree-builder`        | Schema-aware `TreeBuilder` with RAII `OpenScope` | `tree_builder.hpp/.cpp` | (a) Happy path: tokens for `var x = 1 + 2;` → clean tree. (b) Unexpected-token → `Error` node + `P_UnexpectedToken` with scopeStack; `HasError` set on every ancestor. (c) Missing-required at EOF → synthetic `Missing` + one `P_PrematureEndOfInput` per unclosed shape, related-linked. (d) EmptySpace tokens attached with flag; schema cursor not advanced. (e) Ambiguous-token tiebreak via `priority` + `P_AmbiguousToken`. (f) Recovery forward-progress watchdog → `P_RecoveryStalled`. (g) `OpenScope` RAII auto-close on destructor; explicit `close()` idempotent. (h) `P_BuilderInvariant` for internal violations (pushToken with no open node, popScope underflow). |
-| T6  | ⏳ pending | `tree-cursor`      | CST + AST cursors | `tree_cursor.hpp/.cpp` | AST mode skips by `isEmptySpace()` bit ONLY — `Missing`/`Synthetic` ARE visible. `Bookmark { tree*, id }` cross-tree restore debug-asserts. |
+| T5  | ✅ done | `tree-builder`        | Schema-aware `TreeBuilder` with RAII `OpenScope` | `tree_builder.hpp/.cpp` | (a) Happy path verified. (b) `P_UnknownToken`/`P_UnexpectedToken` both produce Error nodes with scope-stack snapshot and HasError ancestor walk. (c) `P_PrematureEndOfInput` per unclosed shape, ruleContext-distinct via dedup-hash fix in reporter. (d) EmptySpace flag landed from `meaning.flagsApplied`. (e) `P_AmbiguousToken` warning + first-declared wins. (f) Forward progress guaranteed structurally (one token per `pushToken` call). (g) `OpenScope` RAII + move-only + idempotent close + cascade-cookie tracking. (h) Builder invariants (no-open-frame, popScope underflow, LIFO violation, double-finish) all emit `P_BuilderInvariant` in release. **+9 review-fix improvements** (rvalue-disqualified `open()`, leftover-scope diagnostic, `currentRule()` peek, empty-tree finish, etc.). **22 test cases** including OpenScope move semantics, LIFO cascade, death-test for double `finish()`. |
+| T6  | ⏳ next | `tree-cursor`      | CST + AST cursors | `tree_cursor.hpp/.cpp` | AST mode skips by `isEmptySpace()` bit ONLY — `Missing`/`Synthetic` ARE visible. `Bookmark { tree*, id }` cross-tree restore debug-asserts. |
 | T7  | ⏳ pending | `tree-visitor`     | Walk helpers | `tree_visitor.hpp` | Pre-order/post-order/skip-control over `TreeCursor`. Zero-alloc 10K-node walk. |
 | T8  | ⏳ pending | `tree-attrs`       | `NodeAttribute<T>` side-tables | `tree_attrs.hpp` | Required `TreeId` association; cross-tree access debug-asserts. Sparse+dense storage; `set`/`get`/`tryGet`/`has`/`clear`/`size`/iteration. |
 | T9  | ⏳ pending | `tree-views`       | Initial typed views | `tree_views.hpp` | `IdentifierView`, `LiteralView`, `BinaryExprView`, `BlockView`, `FunctionDeclView`. Each has `::from(tree, id)` returning `std::optional` based on rule check. |

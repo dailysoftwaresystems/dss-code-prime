@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,6 +22,27 @@
 
 namespace dss {
 
+namespace detail {
+
+// Transparent hasher/equality so `unordered_map<string, ...>` can be
+// queried with a `string_view` without allocating an intermediate
+// `string`. Enabled by providing a nested `is_transparent` tag — C++20+
+// container behavior.
+struct StringHash {
+    using is_transparent = void;
+    [[nodiscard]] std::size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+    [[nodiscard]] std::size_t operator()(std::string const& s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+    [[nodiscard]] std::size_t operator()(char const* s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
+} // namespace detail
+
 template <typename Id>
 class Interner {
 public:
@@ -33,7 +55,7 @@ public:
     // After freeze() the interner refuses new entries (debug-asserts;
     // release returns the invalid sentinel — Id{}).
     [[nodiscard]] Id intern(std::string_view name) {
-        if (auto it = lookup_.find(std::string{name}); it != lookup_.end()) {
+        if (auto it = lookup_.find(name); it != lookup_.end()) {
             return it->second;
         }
         if (frozen_) {
@@ -53,7 +75,15 @@ public:
     }
 
     [[nodiscard]] bool contains(std::string_view name) const {
-        return lookup_.find(std::string{name}) != lookup_.end();
+        return lookup_.find(name) != lookup_.end();
+    }
+
+    // Const lookup — returns Id{} (invalid) when the name isn't interned.
+    // Use this in read-only paths (e.g. after the interner is frozen)
+    // instead of intern(), which requires non-const access.
+    [[nodiscard]] Id find(std::string_view name) const {
+        auto it = lookup_.find(name);
+        return (it == lookup_.end()) ? Id{} : it->second;
     }
 
     [[nodiscard]] std::size_t size() const noexcept { return names_.size(); }
@@ -67,7 +97,11 @@ public:
 
 private:
     std::vector<std::string>             names_;     // index = Id::v; names_[0] == ""
-    std::unordered_map<std::string, Id>  lookup_;    // does NOT include the empty sentinel
+    // Transparent hasher + heterogeneous equality (`std::equal_to<>`) so
+    // string_view queries don't allocate a temporary std::string. Hot
+    // path: every Word-kind pushToken does a find() for "Identifier".
+    std::unordered_map<std::string, Id,
+                       detail::StringHash, std::equal_to<>>  lookup_;
     bool                                 frozen_ = false;
 };
 

@@ -25,7 +25,9 @@
       "Read(//c/Source/DailySoftware/DBAS.Base.App/.github/workflows//**)",
       "Read(//c/Source/DailySoftware/DSS.DevOps//**)",
       "Bash(awk '{print $NF}')",
-      "Bash(/c/Users/rafae/AppData/Local/Programs/cmake-4.3.2-windows-x86_64/bin/cmake.exe -S /c/Source/DailySoftware/dss-code-prime -B /c/Source/DailySoftware/dss-code-prime/build -G Ninja)"
+      "Bash(/c/Users/rafae/AppData/Local/Programs/cmake-4.3.2-windows-x86_64/bin/cmake.exe -S /c/Source/DailySoftware/dss-code-prime -B /c/Source/DailySoftware/dss-code-prime/build -G Ninja)",
+      "Bash(/c/Users/rafae/AppData/Local/Programs/cmake-4.3.2-windows-x86_64/bin/cmake.exe --build /c/Source/DailySoftware/dss-code-prime/build -j 1)",
+      "Bash(./dss_core_test_tree_builder.exe)"
     ]
   }
 }

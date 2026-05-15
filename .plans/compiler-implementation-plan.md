@@ -7,6 +7,23 @@
 >
 > See §8 (Implementation Phases) for the current cross-plan dependency view.
 
+## 0. Current Status (snapshot)
+
+| Area | State |
+|---|---|
+| Build system (CMake 4.0 floor, C++23, FetchContent of nlohmann/json 3.12.0 + GoogleTest 1.17.0) | ✅ working |
+| Core types — tree/node/diagnostics/schema + schema-aware `TreeBuilder` (sub-plan T0–T5, 6 of 12 phases) | ✅ landed — **136 ctest cases, 100% pass** |
+| Core types — cursor + visitor + attrs + views + end-to-end (sub-plan T6–T10, T12) | ⏳ next |
+| `source-factory/` thin facade | ⏳ waiting on remaining core-types work |
+| `tokenizer/` + `analysis/{lexical,syntactic,semantic}/` | ⏳ pending |
+| `gen/intermediate/` + `gen/optimizer/` | ⏳ pending |
+| `gen/link/` Windows PE demo | 🟦 standalone (not yet IR-driven) |
+| `program/` driver | 🟦 skeleton with `--demo-gui` (compile* methods are TODO) |
+| CI/CD pipelines (`cpp-app-pr.yml` / `pkg.yml` / `deploy.yml` in [DSS.DevOps](../../DSS.DevOps/.github/workflows/) + consumer wiring) | ✅ landed (v1 tagged) |
+| Docker / cross-compile toolchains | ⏳ pending |
+
+Drill into the [sub-plan §0 status table](./tree-node-model-plan.md#0-current-status-snapshot) for tree/node phase detail.
+
 ## 1. Vision & Overview
 
 **DSS Code Prime** is a universal, configurable compiler written in C++. Its core design principle is that **both the source language and the target platform are configurable**, making it a single compiler engine capable of compiling _any_ defined language to _any_ supported target.
@@ -1166,23 +1183,23 @@ Cross-platform compiler matrix: **MSVC 17.5+, GCC 13+, Clang 16+** (the LTS-grad
 
 ## 8. Implementation Phases (Todos)
 
-| # | ID | Title | Dependencies | Description |
-|---|---|---|---|---|
-| 1 | `scaffold-project` | Scaffold project & build system | — | Create CMakeLists.txt files, directory structure, Docker setup, and verify the project builds as an empty shell on all platforms. **Status: mostly done** (per current repo state — Docker pieces still pending). |
-| 2 | `core-types` | Implement core types | scaffold-project | **See [tree-node-model-plan.md](./tree-node-model-plan.md) T0–T12.** Implements `SourceBuffer`, `SourceSpan`, `Token` (with `CoreTokenKind` + `SchemaTokenId`), strong IDs (`NodeId`/`RuleId`/`SchemaTokenId`/`BufferId`/`TreeId`/`DiagnosticIndex`), `Tree` + `Node` + `NodeFlags` (arena + immutability), `TreeBuilder` (schema-aware, RAII `OpenScope`), `TreeCursor` (CST + AST mode), `NodeAttribute<T>`, `GrammarSchema` + `SchemaCursor` + `ScopeKind`, `ParseDiagnostic` + `DiagnosticCode` + `DiagnosticReporter` + `DiagnosticPolicy`, typed views. Drops the obsolete `core/error/` directory (subsumed). |
-| 3 | `source-config-schema` | Design language config schema | scaffold-project | **Subsumed into core-types T4.** Authoring of the JSON schema spec + `toy.lang.json` happens inside the tree/node sub-plan. Shipped languages (`csharp.lang.json` etc.) are authored later in `languages-onboarding-plan.md`. |
-| 4 | `source-factory` | Implement source factory | core-types | **Now a thin facade** that resolves a language name → config-file path and calls `GrammarSchema::loadFromFile`. `models/` and `validators/` directories are dropped (replaced by `GrammarSchema` in core-types). |
-| 5 | `tokenizer` | Implement tokenizer | core-types, source-factory | Implement `Tokenizer` against `SourceBuffer` + `GrammarSchema`. Emits *all* tokens including whitespace/comments (`CoreTokenKind::Whitespace`/`LineComment`/`BlockComment`); the builder applies `NodeFlags::EmptySpace`. |
-| 6 | `analysis-lexical` | Implement lexical analysis | tokenizer | Implement `Lexer` for literal validation, escape sequences, numeric ranges. Emits diagnostics into the same `DiagnosticReporter` the builder uses. |
-| 7 | `analysis-syntactic` | Implement syntactic analysis | analysis-lexical | Implement a recursive-descent parser that drives `TreeBuilder` (from core-types). Output is the `Tree` (CST). |
-| 8 | `analysis-semantic` | Implement semantic analysis | analysis-syntactic | Implement `SemanticAnalyzer`, `SymbolTable`, `TypeChecker`, `ScopeResolver`. Populates `NodeAttribute<TypeInfo>`, `NodeAttribute<SymbolId>`, etc. on the tree. |
-| 9 | `gen-intermediate` | Implement IR generation | analysis-semantic | Implement `IRGenerator` reading from `Tree` + attribute tables. No tree mutation. |
-| 10 | `gen-optimizer` | Implement IR optimizer | gen-intermediate | Implement Optimizer pipeline, OptimizationPass base, all passes (constant folding, propagation, DCE, CSE, copy propagation, strength reduction, loop-invariant motion), and IR analysis utilities (CFG builder, liveness, reaching definitions). |
-| 11 | `gen-link` | Implement code emission & linking | gen-optimizer | Implement Linker, TargetBase, and initial targets (Linux x86_64 as first). Emit machine code and produce binaries. **Status: standalone Windows PE demo exists in current scaffold; not yet IR-driven.** |
-| 12 | `program-api` | Implement program API & driver | core-types, gen-link | Implement Program (public API), InputResolver, ProjectFile (.dsp parser), CompilationRequest/Result. Multi-target dispatch. **Status: skeleton with `--demo-gui` flag in current scaffold; remaining methods are stubs.** |
-| 13 | `targets-expand` | Expand target support | gen-link | Implement remaining targets: Linux, macOS, iOS, Android, Web/WASM. |
-| 14 | `testing` | Comprehensive test suite | all above | Write unit tests for every module. Integration tests compiling example programs end-to-end. |
-| 15 | `docker-setup` | Docker & CI setup | scaffold-project | Finalize Dockerfile, compose, toolchain files. Set up CI/CD pipeline for automated builds and tests. |
+| # | Status | ID | Title | Dependencies | Description |
+|---|---|---|---|---|---|
+| 1  | ✅ mostly done (Docker still pending) | `scaffold-project` | Scaffold project & build system | — | Create CMakeLists.txt files, directory structure, Docker setup. Current: CMake 4.0 floor, C++23, hidden visibility, shared lib + exe wired, integrated test target alive. **Pending:** Dockerfile + toolchains. |
+| 2  | 🟦 in progress (6/12 of sub-plan complete) | `core-types` | Implement core types | scaffold-project | **See [tree-node-model-plan.md](./tree-node-model-plan.md) — checkpoint snapshot at top.** **Done:** T0 build deps, T1 source primitives + strong IDs + interners (transparent heterogeneous lookup), T2 Tree storage + Node + NodeFlags, T3 ParseDiagnostic + DiagnosticReporter + DiagnosticPolicy (FNV-1a64 dedup with ruleContext), T4 GrammarSchema + SchemaCursor + ScopeKind + JSON loader + `toy.lang.json`, T5 schema-aware `TreeBuilder` with RAII `OpenScope`, cascade-cookie tracking, release-mode invariant guards, recovery + EOF synthesis (**136 test cases, 100% pass**). **Next:** T6 cursor / T7 visitor / T8 attrs / T9 views / T10 end-to-end / T12 docs. The obsolete `core/error/` directory is dropped (subsumed by `DiagnosticReporter`). |
+| 3  | ✅ subsumed into #2 (T4) | `source-config-schema` | Design language config schema | scaffold-project | The JSON schema is defined inside `grammar_schema_json.cpp`; `toy.lang.json` is the reference. Shipped languages (`csharp.lang.json` etc.) are authored later in `languages-onboarding-plan.md`. |
+| 4  | ⏳ pending — depends on #2 | `source-factory` | Implement source factory | core-types | **Now a thin facade** that resolves a language name → config-file path and calls `GrammarSchema::loadFromFile`. Note: `GrammarSchema::loadShipped` already does both for the engine; this phase is the public API thin wrapper. `models/` and `validators/` directories are dropped. |
+| 5  | ⏳ pending | `tokenizer` | Implement tokenizer | core-types, source-factory | Implement `Tokenizer` against `SourceBuffer` + `GrammarSchema`. Emits *all* tokens including whitespace/comments (`CoreTokenKind::Whitespace`/`LineComment`/`BlockComment`); the builder applies `NodeFlags::EmptySpace`. |
+| 6  | ⏳ pending | `analysis-lexical` | Implement lexical analysis | tokenizer | Implement `Lexer` for literal validation, escape sequences, numeric ranges. Emits diagnostics into the same `DiagnosticReporter` the builder uses. |
+| 7  | ⏳ pending | `analysis-syntactic` | Implement syntactic analysis | analysis-lexical | Implement a recursive-descent parser that drives `TreeBuilder` (from core-types T5). Output is the `Tree` (CST). |
+| 8  | ⏳ pending | `analysis-semantic` | Implement semantic analysis | analysis-syntactic | Implement `SemanticAnalyzer`, `SymbolTable`, `TypeChecker`, `ScopeResolver`. Populates `NodeAttribute<TypeInfo>`, `NodeAttribute<SymbolId>`, etc. on the tree. |
+| 9  | ⏳ pending | `gen-intermediate` | Implement IR generation | analysis-semantic | Implement `IRGenerator` reading from `Tree` + attribute tables. No tree mutation. |
+| 10 | ⏳ pending | `gen-optimizer` | Implement IR optimizer | gen-intermediate | Implement Optimizer pipeline, OptimizationPass base, all passes (constant folding, propagation, DCE, CSE, copy propagation, strength reduction, loop-invariant motion), and IR analysis utilities (CFG builder, liveness, reaching definitions). |
+| 11 | 🟦 partial (Windows PE demo only) | `gen-link` | Implement code emission & linking | gen-optimizer | Implement Linker, TargetBase, and initial targets (Linux x86_64 as first). Emit machine code and produce binaries. **Current:** standalone Windows PE generator (`TargetWindowsX86_64::generateSimpleGui`) exists but is *not* IR-driven. |
+| 12 | 🟦 skeleton only | `program-api` | Implement program API & driver | core-types, gen-link | Implement Program (public API), InputResolver, ProjectFile (.dsp parser), CompilationRequest/Result. Multi-target dispatch. **Current:** skeleton with `--demo-gui` flag wired to the PE generator; `compileProject` / `compileFiles` / `compileDirectory` are TODO stubs. |
+| 13 | ⏳ pending | `targets-expand` | Expand target support | gen-link | Implement remaining targets: Linux, macOS, iOS, Android, Web/WASM. |
+| 14 | 🟦 in progress (core test suite live) | `testing` | Comprehensive test suite | all above | **Current:** 11 ctest suites / 112 individual cases over `core/types/` — all green on Win+GCC13. Per-module suites will land as each phase completes. Integration tests compiling example programs end-to-end are pending phase 12. |
+| 15 | 🟦 partial (CI/CD pipelines done — Docker not) | `docker-setup` | Docker & CI setup | scaffold-project | **Done:** `cpp-app-pr.yml` / `cpp-app-pkg.yml` / `cpp-app-deploy.yml` reusable workflows in [DSS.DevOps](../../DSS.DevOps/.github/workflows/) + consumer workflows in `dss-code-prime/.github/workflows/`. **Pending:** Dockerfile, docker-compose, cross-compile toolchain files. |
 
 ---
 
