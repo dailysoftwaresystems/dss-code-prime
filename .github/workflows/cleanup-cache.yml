@@ -1,0 +1,32 @@
+name: Cleanup Branch Cache
+
+# Removes the FetchContent / build caches associated with a PR once
+# that PR closes. Without this, every long-lived PR keeps its cache
+# entries indefinitely and we eventually hit GitHub's 10 GB per-repo
+# cache cap, at which point ALL caches start LRU-evicting and CI
+# slows down.
+
+on:
+  pull_request:
+    types: [closed]
+
+concurrency:
+  group: cleanup-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+          BRANCH:   refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          echo "Deleting all caches for $BRANCH"
+          gh cache delete --all -R "$REPO" --ref "$BRANCH" --succeed-on-no-caches
+          echo "Cleanup complete"

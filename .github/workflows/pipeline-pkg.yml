@@ -1,0 +1,19 @@
+name: Package
+
+# Calls the reusable C++ app pkg workflow in DSS.DevOps.
+# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v1/workflows/cpp-app-pkg.yml
+#
+# Fires on every push to release/{beta,stable}. The deploy workflow
+# performs the branch merge that triggers this — so a successful
+# `workflow_dispatch` Deploy run results in a tag + GH release here.
+
+on:
+  push:
+    branches: ["release/beta", "release/stable"]
+
+permissions:
+  contents: write
+
+jobs:
+  pkg:
+    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pkg.yml@v1

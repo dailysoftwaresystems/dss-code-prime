@@ -1,0 +1,49 @@
+#include "core/types/parse_diagnostic.hpp"
+
+#include <gtest/gtest.h>
+
+using namespace dss;
+
+TEST(DiagnosticCode, SymbolicNameRoundtrip) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::P_UnexpectedToken),     "P_UnexpectedToken");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::P_PrematureEndOfInput), "P_PrematureEndOfInput");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_MissingField),        "C_MissingField");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::P_TooManyDiagnostics),  "P_TooManyDiagnostics");
+}
+
+TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::P_UnexpectedToken),  "P0001");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::P_AmbiguousToken),   "P0008");
+    // 9xxx range stays as 9xxx (not collapsed via the high-nibble strip).
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::P_BuilderInvariant), "P9000");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::P_RecoveryStalled),  "P9003");
+    // C_* prefix and the high nibble is stripped for the numeric portion.
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_MissingField),     "C0001");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_AmbiguousAlternatives), "C0010");
+}
+
+TEST(DiagnosticSeverity, NameMapping) {
+    EXPECT_EQ(severityName(DiagnosticSeverity::Hint),    "hint");
+    EXPECT_EQ(severityName(DiagnosticSeverity::Info),    "info");
+    EXPECT_EQ(severityName(DiagnosticSeverity::Warning), "warning");
+    EXPECT_EQ(severityName(DiagnosticSeverity::Error),   "error");
+}
+
+TEST(ParseDiagnostic, DefaultsAreSensible) {
+    ParseDiagnostic d;
+    EXPECT_EQ(d.code, DiagnosticCode::None);
+    EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+    EXPECT_FALSE(d.ruleContext.has_value());
+    EXPECT_TRUE(d.expected.empty());
+    EXPECT_TRUE(d.scopeStack.empty());
+    EXPECT_TRUE(d.related.empty());
+    EXPECT_TRUE(d.actual.empty());
+}
+
+TEST(ScopeKind, NameMapping) {
+    EXPECT_EQ(scopeName(ScopeKind::None),    "None");
+    EXPECT_EQ(scopeName(ScopeKind::Root),    "Root");
+    EXPECT_EQ(scopeName(ScopeKind::Block),   "Block");
+    EXPECT_EQ(scopeName(ScopeKind::Generic), "Generic");
+    EXPECT_EQ(scopeName(static_cast<ScopeKind>(2048)), "Custom");
+}

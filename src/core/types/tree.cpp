@@ -50,6 +50,23 @@ RuleInterner const& Tree::rules() const noexcept {
     return *data_.rules;
 }
 
+GrammarSchema const& Tree::schema() const noexcept {
+    // Tests may fabricate a Tree without a schema (schema is null until T4
+    // wires it through TreeBuilder). Calling schema() on such a tree is a
+    // misuse; we abort rather than dereference null silently.
+    if (!data_.schema) {
+        treeFatal("Tree::schema: no GrammarSchema attached (tree built without one)");
+    }
+    return *data_.schema;
+}
+
+DiagnosticReporter const& Tree::diagnostics() const noexcept {
+    if (!data_.diagnostics) {
+        treeFatal("Tree::diagnostics: no DiagnosticReporter attached (tree built without one)");
+    }
+    return *data_.diagnostics;
+}
+
 NodeId Tree::root() const noexcept { return data_.root; }
 
 std::size_t Tree::nodeCount() const noexcept { return data_.nodes.size(); }

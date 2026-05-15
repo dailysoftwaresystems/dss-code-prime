@@ -5,7 +5,16 @@
 #   - Cleanest target-export and presets story
 # Latest at time of writing is 4.3.2. Anything in the 4.x line is fine.
 cmake_minimum_required(VERSION 4.0)
-project(dss-code-prime VERSION 0.1.0 LANGUAGES CXX)
+
+# Single source of truth for the project version is the `VERSION` file at
+# repo root (a one-line file containing `Major.Minor.Patch`). The deploy
+# pipeline (DSS.DevOps cpp-app-deploy) bumps it; CMake reads it here.
+# Keeping the version in one place avoids the classic CMakeLists-vs-VERSION
+# drift on every release.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" DSS_VERSION_RAW)
+string(STRIP "${DSS_VERSION_RAW}" DSS_VERSION)
+
+project(dss-code-prime VERSION ${DSS_VERSION} LANGUAGES CXX)
 
 # ── Language standard ──
 # C++23 is required for std::expected, std::format ranges support, etc.

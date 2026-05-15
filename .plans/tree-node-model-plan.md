@@ -5,6 +5,69 @@
 
 ---
 
+## 0. Current Status (snapshot)
+
+Updated as work progresses. Detailed phase status lives in §7.
+
+| Phase | Title | Status |
+|---|---|---|
+| **T0**  | nlohmann/json + GoogleTest + tests/ tree (CMake)            | ✅ done |
+| **T1**  | source primitives + strong IDs + RuleInterner               | ✅ done |
+| **T2**  | Tree arena + Node + NodeFlags (read-only API)               | ✅ done |
+| **T3**  | ParseDiagnostic + DiagnosticReporter + DiagnosticPolicy     | ✅ done |
+| **T4**  | GrammarSchema + SchemaCursor + ScopeKind + JSON loader + `toy.lang.json` | ✅ done |
+| **T5**  | schema-aware `TreeBuilder` (RAII `OpenScope`, recovery)     | ⏳ next |
+| **T6**  | `TreeCursor` (CST + AST modes)                              | ⏳ pending |
+| **T7**  | `tree_visitor.hpp` walk helpers                             | ⏳ pending |
+| **T8**  | `NodeAttribute<T>` side-tables                              | ⏳ pending |
+| **T9**  | initial typed views                                         | ⏳ pending |
+| **T10** | toy-parser end-to-end (happy + broken)                      | ⏳ pending |
+| **T11** | CMake wireup for any remaining core sources                 | (rolling — done per chunk) |
+| **T12** | `docs/tree-model.md` + `docs/language-config-spec.md`       | ⏳ pending |
+
+**Build state today**
+
+| | |
+|---|---|
+| CMake floor | **4.0** (latest stable on inception; tested with 4.3.2) |
+| C++ standard | **23** |
+| Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows |
+| Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
+| Test suite | **112 cases across 11 ctest suites — 100% pass** |
+
+**Files now in `src/core/types/` (all on `core` static lib):**
+
+```
+strong_ids.hpp
+source_span.hpp/.cpp
+source_buffer.hpp/.cpp
+token.hpp
+interner.hpp                 ← header-only template, shared by Rule/SchemaToken interners
+rule_id.hpp                  ← using RuleInterner = Interner<RuleId>
+schema_token_interner.hpp    ← using SchemaTokenInterner = Interner<SchemaTokenId>
+scope_kind.hpp/.cpp
+schema_cursor.hpp
+parse_diagnostic.hpp/.cpp
+diagnostic_reporter.hpp/.cpp
+grammar_schema.hpp/.cpp
+grammar_schema_json.hpp/.cpp ← only TU that includes <nlohmann/json.hpp>
+tree_node.hpp                ← NodeKind, NodeFlags, detail::Node (40 bytes)
+tree.hpp/.cpp                ← detail::TreeData, Tree (immutable, schema- & diagnostics-aware accessors)
+```
+
+**Shipped configs:**
+- `src/source-config/languages/toy.lang.json` — minimal Toy language (multi-typed `+`/`<`, scope forbid, sequence/alt/repeat shapes). Loads via `GrammarSchema::loadShipped("toy")`.
+
+**Deviations from spec, captured intentionally:**
+1. `detail::Node` is **40 bytes** (not 32) — `DiagnosticIndex` added during the rigor-review pass pushed past the original cacheline-doubled budget. Still 1.6 nodes per 64 B line; performance impact negligible.
+2. `RuleInterner` is now `using RuleInterner = Interner<RuleId>;` — header-only template `Interner<Id>` is the shared source. Identifier interner (plan §9 item 2) becomes a one-line addition.
+3. `GrammarSchemaData` POD mirrors the Tree/TreeData split — instead of friending the JSON loader, the loader builds a movable POD that the schema's public ctor consumes.
+4. `GrammarSchema::loadShipped` walks parent dirs to find `src/source-config/languages/<name>.lang.json`, so the lookup is independent of cwd (ctest, repo root, build dir all work).
+5. CP1 declared but did not implement `Tree::cursor()` / `Tree::astCursor()` / `Tree::childrenOfRule()` — those declarations were removed and will return when T6 lands. `Tree::firstChildOfRule()` is documented for T5/T6 but the declaration also waits.
+6. `T11` (CMake wireup) is folded into each checkpoint as files land — there's no separate "wire all files" phase at the end. The standalone T11 row in §7 is retained for the docs/discoverability angle.
+
+---
+
 ## 1. Goal
 
 Design and implement a **single, language-agnostic tree data structure** that:
@@ -1165,21 +1228,21 @@ The tree is the **hub**: schema validates it as it's built, parser writes it onc
 
 Each phase produces a self-contained, testable deliverable. Land them in order; each phase's tests gate the next.
 
-| # | ID | Title | Files | Acceptance |
-|---|---|---|---|---|
-| T0 | `tree-deps-cmake` | nlohmann/json + GoogleTest FetchContent | root `CMakeLists.txt`, `tests/CMakeLists.txt` (created) | `cmake --build` succeeds; a trivial `#include <nlohmann/json.hpp>` test compiles; `tests/` directory created as sibling to `src/`. **Prerequisite for T4** since the schema loader needs JSON. |
-| T1 | `tree-source-types` | Source primitives + strong IDs | `strong_ids.hpp`, `source_buffer.*`, `source_span.*`, `token.hpp`, `rule_id.*` (`RuleInterner`) | Unit tests: line/col from byte offset; `SourceSpan::of()` enforces ordering; `intersect`/`overlaps`/`containsSpan` correct; empty-operand join semantics; `RuleInterner::freeze()` rejects post-freeze `intern()`; strong-id distinctness verified (compile-fail tests where `NodeId` is passed in place of `RuleId`). |
-| T2 | `tree-storage` | `Tree` arena + `Node` struct + `NodeFlags` | `tree_node.hpp`, `tree.hpp/.cpp` (read API only, no builder yet) | Manually fabricated `TreeData` → `Tree` round-trips: `text(id)`, `children(id)`, `parent(id)`, discriminant-asserting `rule()`/`tokenKind()` correct; `NodeFlags` bitwise + `isEmptySpace()` helpers; `static_assert(sizeof(Node) == 32)` passes; release-mode bounds check on `children()` fires when corrupted. |
-| T3 | `tree-diagnostics` | Diagnostic types + reporter + policy | `parse_diagnostic.*`, `diagnostic_reporter.*` | (a) Constructed diagnostics format correctly (caret pointer, scope-stack line, related locations). (b) Reporter aggregates; `hasErrors()` accurate. (c) `maxDiagnostics` cap emits `P_TooManyDiagnostics` and stops. (d) `maxPerCode` coalesces. (e) `DiagnosticPolicy.suppress` drops silently; `overrides` re-routes severity; `warningsAsErrors` promotes. (f) `BufferRegistry`-based format works for multi-buffer diagnostics. No dep on schema or builder. |
-| T4 | `tree-schema-loader` | `GrammarSchema` + `SchemaCursor` + `ScopeKind` | `grammar_schema.*`, `grammar_schema_json.*`, `schema_cursor.hpp`, `scope_kind.hpp`, `src/source-config/languages/toy.lang.json` | (a) Loads `toy.lang.json` cleanly via `loadFromFile`. (b) Malformed configs (missing field, unknown shape, circular shape, version mismatch, ambiguous alts) produce the right `C####` codes in `Result::diagnostics` and a null value — never throw. (c) `lookupLexeme` returns multi-typed meanings with correct `priority`/scope filtering. (d) `expectedAt` returns a stable span (no allocation). (e) Interners frozen after load (post-load `intern()` is rejected). (f) JSON library does not leak through `grammar_schema.hpp` (a `.cpp` that only includes the public header compiles without nlohmann on its include path). |
-| T5 | `tree-builder` | Schema-aware `TreeBuilder` with RAII `OpenScope` | `tree_builder.hpp/.cpp` | (a) Happy path: tokens for `var x = 1 + 2;` against the toy schema → clean tree, `HasError` unset on root, zero diagnostics. (b) Unexpected-token: `var x = 1 + }` → `Error` node + `P_UnexpectedToken` with right `expected`/`actual`/`scopeStack`; `HasError` set on every ancestor including root (assert via parent-chain walk). (c) Missing-required at EOF: `if (x) {` (no closing `}` before EOF) → synthetic `Missing` node(s) + one `P_PrematureEndOfInput` per unclosed shape, related-linked to each opener. (d) EmptySpace: whitespace + `// comment` attached with the flag, schema cursor not advanced. (e) Ambiguous-token: when two meanings tie, first-declared wins + `P_AmbiguousToken`. (f) Recovery forward-progress: a pathological input cannot stall the builder (watchdog test fires `P_RecoveryStalled` and advances). (g) `OpenScope` RAII: forgetting `close()` works (auto-closes on destructor); explicit `close()` is idempotent. (h) Builder internal-invariant violations (pushToken with no open node, popScope underflow) emit `P_BuilderInvariant` in release-mode tests. |
-| T6 | `tree-cursor` | CST + AST cursors | `tree_cursor.hpp/.cpp` | Walk T5's tree in both modes; AST mode skips by `isEmptySpace()` bit only (verified) — `Missing`/`Synthetic` nodes ARE visible in AST mode; `Bookmark` round-trips; cross-tree `restore()` debug-asserts. |
-| T7 | `tree-visitor` | Walk helpers | `tree_visitor.hpp` | Pre-order/post-order/skip-control walks visit the expected nodes; benchmarks confirm zero allocations during a 10K-node walk. |
-| T8 | `tree-attrs` | Side-table attributes | `tree_attrs.hpp` | Sparse + dense storage variants; `set`/`get`/`tryGet`/`has` correctness; survives the tree's lifetime; cross-tree access debug-asserts via `TreeId`; iteration yields every set node. |
-| T9 | `tree-views` | Initial typed views | `tree_views.hpp` | At minimum: `IdentifierView`, `LiteralView`, `BinaryExprView`, `BlockView`, `FunctionDeclView`. Each has a `::from(tree, id)` factory that returns `std::optional` based on rule check. Used in T10. |
-| T10 | `tree-end-to-end` | Toy parser + walker demo + broken-input demo | `tests/core/test_tree_end_to_end.cpp`, `toy.lang.json` | Loads `toy.lang.json` → produces tokens (mocked tokenizer) → drives schema-aware `TreeBuilder` → walks the resulting tree with a visitor → prints it. Then a deliberately broken sample produces a tree + a non-empty `DiagnosticReporter` with the expected codes (`P_UnexpectedToken`, `P_MissingRequiredChild`, …). |
-| T11 | `tree-cmake-wireup` | Wire new core .cpp files | `src/core/CMakeLists.txt` | All new files compile under `core` static lib on Windows; `core` exports `Tree`, `TreeBuilder`, `GrammarSchema`, `DiagnosticReporter`, etc. with `DSS_EXPORT`. (T0 already handled root deps.) |
-| T12 | `tree-docs` | Header docs + design docs | inline doxygen + `docs/tree-model.md` + `docs/language-config-spec.md` | A new contributor can (a) read `docs/tree-model.md` and add a typed view in <30 minutes, and (b) read `docs/language-config-spec.md` and write a `.lang.json` that loads cleanly. |
+| # | Status | ID | Title | Files | Notes |
+|---|---|---|---|---|---|
+| T0  | ✅ done | `tree-deps-cmake`     | nlohmann/json + GoogleTest FetchContent | root `CMakeLists.txt`, `tests/CMakeLists.txt`, `tests/core/CMakeLists.txt`, `templates/.gitignore.cpp` | CMake floor 4.0, C++23, nlohmann_json 3.12.0, GoogleTest 1.17.0 wired via FetchContent. `enable_testing()` + `option(DSS_BUILD_TESTS ON)`. |
+| T1  | ✅ done | `tree-source-types`   | Source primitives + strong IDs | `strong_ids.hpp`, `source_buffer.*`, `source_span.*`, `token.hpp`, `interner.hpp`, `rule_id.hpp` (+ stub `rule_id.cpp`), `schema_token_interner.hpp` | `DSS_STRONG_ID` macro; `SourceSpan::of()` factory; `Interner<Id>` template (RuleInterner and SchemaTokenInterner are using-aliases); `freeze()` enforced. **8 + 9 + 10 + 4 + 8 = 39 test cases.** |
+| T2  | ✅ done | `tree-storage`        | `Tree` arena + `Node` struct + `NodeFlags` | `tree_node.hpp`, `tree.hpp/.cpp`, stub `grammar_schema.hpp`, stub `diagnostic_reporter.hpp` | `detail::Node` is 40 bytes (relaxed from 32 once `DiagnosticIndex` was added); `NodeFlags` ops `inline constexpr`; discriminant-asserting `rule()`/`tokenKind()`/`diagnostic()`; release-fatal `node_(id)` bounds check. **9 + 10 = 19 test cases including a death test.** |
+| T3  | ✅ done | `tree-diagnostics`    | Diagnostic types + reporter + policy | `scope_kind.hpp/.cpp`, `parse_diagnostic.hpp/.cpp`, `diagnostic_reporter.hpp/.cpp` | `DiagnosticCode` as `enum class : uint16_t` (P/C/S/I prefix ranges); `RelatedLocation`, scopeStack on every diag; `DiagnosticPolicy` (suppress/overrides/warningsAsErrors); `Config{maxDiagnostics,maxPerCode,dedupWindow}`; FNV-1a64 hash dedup; `BufferRegistry`. `format()` produces caret-pointed line + scope + related; `formatAll()` sorts by (buffer, span). **5 + 16 = 21 test cases.** |
+| T4  | ✅ done | `tree-schema-loader`  | `GrammarSchema` + `SchemaCursor` + `ScopeKind` + JSON loader + toy config | `grammar_schema.hpp/.cpp`, `grammar_schema_json.hpp/.cpp`, `schema_cursor.hpp`, `src/source-config/languages/toy.lang.json` | `GrammarSchemaData` POD mirrors Tree/TreeData split (no friend gymnastics). `LoadResult<T>` = `std::expected<T, vector<ConfigDiagnostic>>`. Pre-interns `Identifier`/`IntLiteral`/etc. as built-in token kinds. Walks parent dirs in `loadShipped` to be cwd-agnostic. nlohmann/json linked PRIVATE — no leak. **19 test cases** covering happy path + every C_* code. |
+| T5  | ⏳ next | `tree-builder`        | Schema-aware `TreeBuilder` with RAII `OpenScope` | `tree_builder.hpp/.cpp` | (a) Happy path: tokens for `var x = 1 + 2;` → clean tree. (b) Unexpected-token → `Error` node + `P_UnexpectedToken` with scopeStack; `HasError` set on every ancestor. (c) Missing-required at EOF → synthetic `Missing` + one `P_PrematureEndOfInput` per unclosed shape, related-linked. (d) EmptySpace tokens attached with flag; schema cursor not advanced. (e) Ambiguous-token tiebreak via `priority` + `P_AmbiguousToken`. (f) Recovery forward-progress watchdog → `P_RecoveryStalled`. (g) `OpenScope` RAII auto-close on destructor; explicit `close()` idempotent. (h) `P_BuilderInvariant` for internal violations (pushToken with no open node, popScope underflow). |
+| T6  | ⏳ pending | `tree-cursor`      | CST + AST cursors | `tree_cursor.hpp/.cpp` | AST mode skips by `isEmptySpace()` bit ONLY — `Missing`/`Synthetic` ARE visible. `Bookmark { tree*, id }` cross-tree restore debug-asserts. |
+| T7  | ⏳ pending | `tree-visitor`     | Walk helpers | `tree_visitor.hpp` | Pre-order/post-order/skip-control over `TreeCursor`. Zero-alloc 10K-node walk. |
+| T8  | ⏳ pending | `tree-attrs`       | `NodeAttribute<T>` side-tables | `tree_attrs.hpp` | Required `TreeId` association; cross-tree access debug-asserts. Sparse+dense storage; `set`/`get`/`tryGet`/`has`/`clear`/`size`/iteration. |
+| T9  | ⏳ pending | `tree-views`       | Initial typed views | `tree_views.hpp` | `IdentifierView`, `LiteralView`, `BinaryExprView`, `BlockView`, `FunctionDeclView`. Each has `::from(tree, id)` returning `std::optional` based on rule check. |
+| T10 | ⏳ pending | `tree-end-to-end`  | Toy parser + walker demo + broken-input demo | `tests/core/test_tree_end_to_end.cpp` | Drive `TreeBuilder` from a mocked tokenizer against `toy.lang.json`; walk the tree with a visitor; print it. Broken sample produces non-empty `DiagnosticReporter` with expected codes. |
+| T11 | (rolling) | `tree-cmake-wireup` | Per-checkpoint `src/core/CMakeLists.txt` updates | `src/core/CMakeLists.txt` | Folded into each chunk as files land. No separate "wire all files" pass. |
+| T12 | ⏳ pending | `tree-docs`        | Header docs + design docs | inline doxygen + `docs/tree-model.md` + `docs/language-config-spec.md` | New-contributor onboarding: read both docs and (a) add a typed view in <30 min, (b) author a `.lang.json` that loads cleanly. |
 
 **Critical path:** T0 → T1 → T2 → T3 → T4 → T5 → T10.
 **Parallelizable once deps met:** T3 + T4 after T1/T2. T6, T7, T8, T9 after T5. T11, T12 anytime.

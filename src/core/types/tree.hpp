@@ -17,7 +17,8 @@
 
 namespace dss {
 
-class RuleInterner;
+// (RuleInterner is now a `using` alias defined in rule_id.hpp; included
+//  transitively via grammar_schema.hpp above.)
 
 namespace detail {
 
@@ -58,11 +59,17 @@ public:
     Tree& operator=(Tree&&) noexcept;
 
     // ── identity ──
-    [[nodiscard]] TreeId               id()        const noexcept;
-    [[nodiscard]] SourceBuffer const&  source()    const noexcept;
-    [[nodiscard]] RuleInterner const&  rules()     const noexcept;
-    [[nodiscard]] NodeId               root()      const noexcept;
-    [[nodiscard]] std::size_t          nodeCount() const noexcept;
+    [[nodiscard]] TreeId                     id()        const noexcept;
+    [[nodiscard]] SourceBuffer const&        source()    const noexcept;
+    [[nodiscard]] RuleInterner const&        rules()     const noexcept;
+    [[nodiscard]] NodeId                     root()      const noexcept;
+    [[nodiscard]] std::size_t                nodeCount() const noexcept;
+
+    // Aborts (release-fatal) if no schema / no reporter attached.
+    // Hand-fabricated trees in tests may build without either; the builder
+    // path always attaches both.
+    [[nodiscard]] GrammarSchema const&       schema()       const noexcept;
+    [[nodiscard]] DiagnosticReporter const&  diagnostics()  const noexcept;
 
     // ── universal per-node accessors ──
     [[nodiscard]] NodeKind    kind(NodeId id)  const;
