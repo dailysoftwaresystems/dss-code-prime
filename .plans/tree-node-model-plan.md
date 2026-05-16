@@ -69,7 +69,7 @@ tree_cursor.hpp/.cpp         ← CST/AST cursor, opaque Bookmark with TreeId gua
 2. `RuleInterner` is now `using RuleInterner = Interner<RuleId>;` — header-only template `Interner<Id>` is the shared source. Uses C++20 transparent heterogeneous lookup (`std::hash<string_view>` + `equal_to<>`) so `find()`/`contains()`/`intern()` accept `string_view` without allocating temporaries. Identifier interner (plan §9 item 2) becomes a one-line addition.
 3. `GrammarSchemaData` POD mirrors the Tree/TreeData split — instead of friending the JSON loader, the loader builds a movable POD that the schema's public ctor consumes.
 4. `GrammarSchema::loadShipped` walks parent dirs to find `src/source-config/languages/<name>.lang.json`, so the lookup is independent of cwd (ctest, repo root, build dir all work).
-5. CP1 declared but did not implement `Tree::cursor()` / `Tree::astCursor()` / `Tree::childrenOfRule()` — those declarations were removed and will return when T6 lands. `Tree::firstChildOfRule()` is documented for T5/T6 but the declaration also waits.
+5. `Tree::cursor()` / `Tree::astCursor()` ✅ restored in T6. `Tree::childrenOfRule()` and `Tree::firstChildOfRule()` remain deferred — neither was needed by T6's consumers and the right design (zero-alloc range view vs. eager vector) is best decided when a real semantic-analysis pass demands them.
 6. `T11` (CMake wireup) is folded into each checkpoint as files land — there's no separate "wire all files" phase at the end. The standalone T11 row in §7 is retained for the docs/discoverability angle.
 7. **T5 scope limit:** the builder validates *within* an open frame (lexeme resolution, scope filter, priority tiebreak, scope-stack mutation, recovery, EOF synthesis, HasError propagation, internal invariants). It does **not** drive the schema's compiled shape graph for sequence/alt validation — that requires extending `GrammarSchema` with a navigable shape instruction stream. The parser (parent-plan phase #7) is the source of truth for "this `open(rule)` is valid here" until the shape walker lands.
 8. **T5 reliability features added during review-fix sweep:**
@@ -79,6 +79,15 @@ tree_cursor.hpp/.cpp         ← CST/AST cursor, opaque Bookmark with TreeId gua
    - Leftover-scope detection at `finish()` emits a `P_BuilderInvariant` noting the imbalance.
    - `currentRule()` introspector for the parser layer.
    - Empty-tree `finish()` (no `open()` ever called) returns a well-formed Tree with `InvalidNode` root instead of dereferencing past the arena.
+9. **T6 reliability features added during review-fix sweep:**
+   - `Bookmark` opacity: private fields + `friend TreeCursor` + read-only accessors. Catches hand-construction at compile time.
+   - `Bookmark` embeds `TreeId` for ABA protection — `restore()` validates the captured TreeId matches the cursor's tree.
+   - Cycle caps in `depth()` (returns `-1` on corruption since it's `noexcept`) and AST `gotoParent` (aborts with a clear message — symmetric with `Tree::children()`'s release-mode bounds check).
+   - Convenience forwarders on the cursor: `text()`, `span()`, `rule()`, `tokenKind()` — save consumers the `c.tree().X(c.current())` boilerplate.
+10. **`LexemeMeaning::validScopes` wired into `TreeBuilder::pushToken`.** v1 originally documented the field as "empty == valid everywhere; non-empty == restrict to listed" but `pushToken` ignored it (pure dead exposure). Now `resolveMeaning` AND's the per-meaning `validScopes` check with the schema-level `forbid` check from `isTokenValidInScope`. v2 §5.3 will replace this flat field with the richer `scopeRequire` object; until then, the field earns its keep.
+11. **Test infrastructure extracted from duplication:**
+    - `tests/core/toy_harness.hpp` — `dss::tests::ToyHarness` (shared schema-load + Token-synthesis helper).
+    - `tests/core/raw_tree_builder.hpp` — `dss::tests::RawTreeBuilder` for hand-fabricating trees with shapes `TreeBuilder` can't produce. Adopted by `test_tree`, `test_tree_cursor`; `test_tree_builder` uses the harness only (its trees come from the real builder).
 
 ---
 
