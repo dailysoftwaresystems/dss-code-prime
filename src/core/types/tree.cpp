@@ -68,6 +68,9 @@ DiagnosticReporter const& Tree::diagnostics() const noexcept {
     return *data_.diagnostics;
 }
 
+bool Tree::hasSchema()      const noexcept { return static_cast<bool>(data_.schema); }
+bool Tree::hasDiagnostics() const noexcept { return static_cast<bool>(data_.diagnostics); }
+
 NodeId Tree::root() const noexcept { return data_.root; }
 
 std::size_t Tree::nodeCount() const noexcept { return data_.nodes.size(); }

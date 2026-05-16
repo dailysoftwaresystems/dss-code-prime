@@ -69,9 +69,12 @@ public:
 
     // Aborts (release-fatal) if no schema / no reporter attached.
     // Hand-fabricated trees in tests may build without either; the builder
-    // path always attaches both.
-    [[nodiscard]] GrammarSchema const&       schema()       const noexcept;
-    [[nodiscard]] DiagnosticReporter const&  diagnostics()  const noexcept;
+    // path always attaches both. Callers that want to probe rather than
+    // dereference use `hasSchema()` / `hasDiagnostics()`.
+    [[nodiscard]] GrammarSchema const&       schema()         const noexcept;
+    [[nodiscard]] DiagnosticReporter const&  diagnostics()    const noexcept;
+    [[nodiscard]] bool                       hasSchema()      const noexcept;
+    [[nodiscard]] bool                       hasDiagnostics() const noexcept;
 
     // ── universal per-node accessors ──
     [[nodiscard]] NodeKind    kind(NodeId id)  const;
