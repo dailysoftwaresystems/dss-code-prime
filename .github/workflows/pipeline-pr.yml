@@ -1,7 +1,7 @@
 name: Pipeline
 
 # Calls the reusable C++ app PR workflow in DSS.DevOps.
-# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v1/workflows/cpp-app-pr.yml
+# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v2/.github/workflows/cpp-app-pr.yml
 
 on:
   pull_request:
@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   pipeline-pr:
-    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pr.yml@v1
+    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pr.yml@v2
     with:
       cmake-version: "latest"
     secrets:

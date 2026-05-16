@@ -1,7 +1,7 @@
 name: Package
 
 # Calls the reusable C++ app pkg workflow in DSS.DevOps.
-# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v1/workflows/cpp-app-pkg.yml
+# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v2/.github/workflows/cpp-app-pkg.yml
 #
 # Fires on every push to release/{beta,stable}. The deploy workflow
 # performs the branch merge that triggers this — so a successful
@@ -16,4 +16,4 @@ permissions:
 
 jobs:
   pkg:
-    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pkg.yml@v1
+    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pkg.yml@v2

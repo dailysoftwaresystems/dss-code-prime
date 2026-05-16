@@ -1,7 +1,7 @@
 name: Deploy
 
 # Calls the reusable C++ app deploy workflow in DSS.DevOps.
-# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v1/workflows/cpp-app-deploy.yml
+# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v2/.github/workflows/cpp-app-deploy.yml
 #
 # Two channels:
 #   - beta:   main → release/beta. Bumps VERSION (minor++ by default,
@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   deploy:
-    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-deploy.yml@v1
+    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-deploy.yml@v2
     with:
       channel: ${{ inputs.channel }}
       version: ${{ inputs.version }}
