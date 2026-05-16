@@ -265,6 +265,25 @@ struct ResolvedMeaning {
     std::size_t   matchCount = 0;
 };
 
+// Per-meaning scope filter — the LexemeMeaning::validScopes field on a
+// token entry. Documented as: empty == valid everywhere; non-empty ==
+// require at least one of the listed scopes to be on the active stack.
+//
+// Distinct from `schema.isTokenValidInScope` which enforces the schema's
+// top-level `scopes.validity[].forbid` rules (per-scope, not per-token).
+// Both checks are AND'd in `resolveMeaning`.
+[[nodiscard]] bool meaningAllowedByValidScopes(
+    LexemeMeaning const& m,
+    std::span<ScopeKind const> scopes) noexcept {
+    if (m.validScopes.empty()) return true;
+    for (ScopeKind required : m.validScopes) {
+        for (ScopeKind active : scopes) {
+            if (required == active) return true;
+        }
+    }
+    return false;
+}
+
 ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
                                std::string_view lexeme,
                                std::span<ScopeKind const> scopes) {
@@ -272,11 +291,18 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     const auto candidates = schema.lookupLexeme(lexeme);
     if (candidates.empty()) return out;
 
+    // A candidate survives iff BOTH the schema's per-scope forbid rules
+    // AND the candidate's per-meaning validScopes allow it.
+    auto candidateAllowed = [&](LexemeMeaning const& m) {
+        return schema.isTokenValidInScope(m.id, scopes)
+            && meaningAllowedByValidScopes(m, scopes);
+    };
+
     // Candidates arrive pre-sorted by priority (lowest first, stable on
-    // ties). Find the first that survives the scope-validity filter.
+    // ties). Find the first that survives.
     std::optional<std::size_t> winnerIdx;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
-        if (schema.isTokenValidInScope(candidates[i].id, scopes)) {
+        if (candidateAllowed(candidates[i])) {
             if (!winnerIdx) winnerIdx = i;
             ++out.matchCount;
         }
@@ -290,7 +316,7 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     // surface this as P_AmbiguousToken.
     for (std::size_t i = *winnerIdx + 1; i < candidates.size(); ++i) {
         if (candidates[i].priority != out.meaning.priority) break;
-        if (schema.isTokenValidInScope(candidates[i].id, scopes)) {
+        if (candidateAllowed(candidates[i])) {
             out.ambiguous = true;
             break;
         }

@@ -4,6 +4,7 @@
 > Detailed designs for individual modules now live in dedicated sub-plans:
 >
 > - **[`tree-node-model-plan.md`](./tree-node-model-plan.md)** — the tree/node data structure, `GrammarSchema` config loader, `TreeBuilder`, diagnostics. **Supersedes** the relevant pieces of §4.2.2 (`ast.hpp`), §4.3 (config JSON shape), §4.4 (`source-factory/` internals), §4.5 (tokenizer trivia handling), and §4.6.2 (parser/AST construction) of this document. Where this document and the sub-plan disagree, **the sub-plan wins**; in-line `> AMENDED:` notes in the sections below redirect readers.
+> - **[`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md)** — additive extensions to the v1 schema for operator precedence, contextual keywords, scope-stack patterns, speculative `alt`, string interpolation, and custom string-literal variants. Pending — lands after the v1 E2E milestone, driven by an empirical C-subset stress test. Will unlock the eventual `languages-onboarding-plan.md`.
 >
 > See §8 (Implementation Phases) for the current cross-plan dependency view.
 

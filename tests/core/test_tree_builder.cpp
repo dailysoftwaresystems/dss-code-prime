@@ -4,6 +4,7 @@
 #include "core/types/tree.hpp"
 #include "core/types/tree_builder.hpp"
 #include "core/types/tree_node.hpp"
+#include "toy_harness.hpp"
 
 #include <gtest/gtest.h>
 
@@ -16,6 +17,7 @@
 #include <vector>
 
 using namespace dss;
+using dss::tests::ToyHarness;
 
 namespace {
 
@@ -61,50 +63,13 @@ constexpr std::string_view kToyConfig = R"JSON({
   }
 })JSON";
 
-struct Harness {
-    std::shared_ptr<SourceBuffer>        src;
-    std::shared_ptr<GrammarSchema const> schema;
-
-    // Construct from source text. Loads the toy config; FAIL the test on
-    // load failure so individual tests stay focused on builder behaviour.
+// Thin shim so existing tests keep using `Harness::make(text)` — delegates
+// to the shared `ToyHarness` with this file's `kToyConfig`.
+struct Harness : public ToyHarness {
     static Harness make(std::string sourceText) {
         Harness h;
-        h.src = SourceBuffer::fromString(std::move(sourceText), "<test>");
-        auto loaded = GrammarSchema::loadFromText(kToyConfig);
-        EXPECT_TRUE(loaded.has_value())
-            << (loaded.has_value() ? "" : loaded.error()[0].message);
-        h.schema = *loaded;
+        static_cast<ToyHarness&>(h) = ToyHarness::make(std::move(sourceText), kToyConfig);
         return h;
-    }
-
-    // Build a Token from a substring of the source. The substring MUST
-    // appear exactly once — otherwise we'd silently use the first hit and
-    // confuse later tests that expect different positions. Use the
-    // `startHint` overload for sources with repeated lexemes.
-    Token tok(std::string_view text, CoreTokenKind kind = CoreTokenKind::Operator) {
-        const auto sv = src->text();
-        const auto first = sv.find(text);
-        EXPECT_NE(first, std::string_view::npos) << "test source missing '" << text << "'";
-        const auto second = (first == std::string_view::npos)
-            ? std::string_view::npos
-            : sv.find(text, first + 1);
-        EXPECT_EQ(second, std::string_view::npos)
-            << "Harness::tok: '" << text
-            << "' appears multiple times in the source; use the startHint overload";
-        return Token{
-            .coreKind   = kind,
-            .schemaKind = InvalidSchemaToken,
-            .span       = SourceSpan::of(static_cast<ByteOffset>(first),
-                                          static_cast<ByteOffset>(first + text.size())),
-        };
-    }
-    Token tok(std::string_view text, std::size_t startHint, CoreTokenKind kind) {
-        return Token{
-            .coreKind   = kind,
-            .schemaKind = InvalidSchemaToken,
-            .span       = SourceSpan::of(static_cast<ByteOffset>(startHint),
-                                          static_cast<ByteOffset>(startHint + text.size())),
-        };
     }
 };
 
@@ -612,4 +577,53 @@ TEST(TreeBuilder, FinishWithoutAnyOpenProducesEmptyTree) {
     EXPECT_EQ(t.root(), InvalidNode);
     EXPECT_EQ(t.nodeCount(), 0u);
     EXPECT_EQ(t.diagnostics().errorCount(), 0u);
+}
+
+// ── LexemeMeaning::validScopes per-meaning filter ──────────────────────
+
+TEST(TreeBuilder, PerMeaningValidScopesFiltersResolution) {
+    // A `%` with one meaning declared as `validScopes: ["Block"]` — it
+    // should resolve only when Block is on the active scope stack.
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "VS", "version": "0.1.0" },
+      "tokens": {
+        "%": [{ "kind": "BlockOnlyOperator", "validScopes": ["Block"] }]
+      },
+      "shapes": { "root": { "sequence": [] } }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("%", "<vs>");
+
+    Token pct{
+        .coreKind   = CoreTokenKind::Operator,
+        .schemaKind = InvalidSchemaToken,
+        .span       = SourceSpan::of(0, 1),
+    };
+
+    // Without Block on the stack: no meaning matches → P_UnknownToken.
+    {
+        TreeBuilder b{src, schema};
+        auto root = b.open(schema->rules().find("root"));
+        b.pushToken(pct);
+        root.close();
+        Tree t = std::move(b).finish();
+        EXPECT_EQ(countCode(t.diagnostics().all(),
+                            DiagnosticCode::P_UnknownToken), 1u);
+    }
+    // With Block on the stack: meaning matches → no diagnostic.
+    {
+        TreeBuilder b{src, schema};
+        auto root = b.open(schema->rules().find("root"));
+        b.pushScope(ScopeKind::Block);
+        b.pushToken(pct);
+        b.popScope();
+        root.close();
+        Tree t = std::move(b).finish();
+        EXPECT_EQ(t.diagnostics().errorCount(), 0u);
+        // Single leaf attached.
+        auto kids = t.children(t.root());
+        ASSERT_EQ(kids.size(), 1u);
+        EXPECT_EQ(t.kind(kids[0]), NodeKind::Token);
+    }
 }

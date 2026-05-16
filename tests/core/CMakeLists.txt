@@ -10,5 +10,6 @@ dss_add_test(NAME core/test_parse_diagnostic    SOURCES test_parse_diagnostic.cp
 dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter.cpp)
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
 dss_add_test(NAME core/test_tree_builder        SOURCES test_tree_builder.cpp)
+dss_add_test(NAME core/test_tree_cursor         SOURCES test_tree_cursor.cpp)
 dss_add_test(NAME core/test_tree_node           SOURCES test_tree_node.cpp)
 dss_add_test(NAME core/test_tree                SOURCES test_tree.cpp)

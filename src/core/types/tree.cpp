@@ -3,6 +3,7 @@
 #include "core/types/diagnostic_reporter.hpp"   // complete-type for unique_ptr dtor
 #include "core/types/grammar_schema.hpp"        // complete-type for shared_ptr (defensive)
 #include "core/types/rule_id.hpp"
+#include "core/types/tree_cursor.hpp"           // for Tree::cursor() / astCursor()
 
 #include <cassert>
 #include <cstdio>
@@ -121,6 +122,16 @@ std::optional<DiagnosticIndex> Tree::diagnostic(NodeId id) const {
     auto const& n = node_(id);
     if (!n.diagnostic.valid()) return std::nullopt;
     return n.diagnostic;
+}
+
+// ── cursors ──────────────────────────────────────────────────────────────
+
+TreeCursor Tree::cursor() const {
+    return TreeCursor{*this, data_.root, CursorMode::Cst};
+}
+
+TreeCursor Tree::astCursor() const {
+    return TreeCursor{*this, data_.root, CursorMode::Ast};
 }
 
 } // namespace dss

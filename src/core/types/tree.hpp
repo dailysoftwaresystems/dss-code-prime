@@ -92,6 +92,16 @@ public:
     [[nodiscard]] SchemaTokenId tokenKind(NodeId id) const;   // requires Token
     [[nodiscard]] std::optional<DiagnosticIndex> diagnostic(NodeId id) const;
 
+    // ── cursors ──
+    //
+    // CST cursor visits every node (incl. EmptySpace leaves); AST cursor
+    // skips by NodeFlags::EmptySpace. Both start positioned at the root.
+    // On an empty tree (root == InvalidNode), both methods return a
+    // cursor whose current() is InvalidNode; movement methods will fail
+    // cleanly without dereferencing past the arena.
+    [[nodiscard]] class TreeCursor cursor()    const;
+    [[nodiscard]] class TreeCursor astCursor() const;
+
 private:
     // Bounds-check `id` against the arena. Aborts on invalid id (release-mode).
     [[nodiscard]] detail::Node const& node_(NodeId id) const;

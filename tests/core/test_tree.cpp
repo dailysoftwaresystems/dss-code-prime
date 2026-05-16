@@ -2,89 +2,56 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"
+#include "raw_tree_builder.hpp"
 
 #include <gtest/gtest.h>
 
-#include <memory>
 #include <utility>
-#include <vector>
 
 using namespace dss;
+using dss::tests::RawTreeBuilder;
 
 namespace {
 
-// Fabricates a small tree by hand without going through TreeBuilder (which
-// arrives in CP3). Encodes a deliberately simple shape:
+// Build a small tree by hand without going through TreeBuilder. Encodes
+// a deliberately simple shape:
 //
 //   root (Internal, rule="program")
-//   ├── (1) Token, span=[0,3)   "var"
-//   ├── (2) Token, span=[3,4)   " "     (EmptySpace)
-//   ├── (3) Token, span=[4,5)   "x"
-//   └── (4) Token, span=[5,6)   ";"
+//   ├── (2) Token, span=[0,3)   "var"
+//   ├── (3) Token, span=[3,4)   " "     (EmptySpace)
+//   ├── (4) Token, span=[4,5)   "x"
+//   └── (5) Token, span=[5,6)   ";"
 //
-// Returns a fully-formed Tree.
+// The two out-parameters (rules and src) let tests assert pointer
+// identity against the Tree's accessors.
 Tree makeSampleTree(std::shared_ptr<RuleInterner>& outRules,
                     std::shared_ptr<SourceBuffer>& outSrc) {
-    outRules = std::make_shared<RuleInterner>();
-    const RuleId programRule = outRules->intern("program");
-    outRules->freeze();
+    RawTreeBuilder rb{"var x;", "<test>"};
+    const RuleId programRule = rb.internRule("program");
 
-    outSrc = SourceBuffer::fromString("var x;", "<test>");
+    rb.addNode(NodeKind::Internal, programRule, SourceSpan::of(0, 6),
+               NodeFlags::None, /*parent=*/ InvalidNode,
+               /*children=*/ { NodeId{2}, NodeId{3}, NodeId{4}, NodeId{5} });
 
-    detail::TreeData td;
-    td.source = outSrc;
-    td.rules  = outRules;
-    td.id     = TreeId{1};
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(0, 3),
+               NodeFlags::None, /*parent=*/ NodeId{1},
+               /*children=*/ {}, /*tokenKind=*/ SchemaTokenId{1});
 
-    // Node 0 reserved (InvalidNode sentinel). Real nodes start at index 1.
-    td.nodes.resize(5);
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(3, 4),
+               NodeFlags::EmptySpace, /*parent=*/ NodeId{1},
+               /*children=*/ {}, /*tokenKind=*/ SchemaTokenId{2});
 
-    // Node 1 = root
-    td.nodes[1] = detail::Node{
-        .kind       = NodeKind::Internal,
-        .flags      = NodeFlags::None,
-        .rule       = programRule,
-        .span       = SourceSpan::of(0, 6),
-        .parent     = InvalidNode,
-        .firstChild = 0,                       // offset into childIndex_
-        .childCount = 4,
-    };
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(4, 5),
+               NodeFlags::None, /*parent=*/ NodeId{1},
+               /*children=*/ {}, /*tokenKind=*/ SchemaTokenId{3});
 
-    // Children (nodes 2..5 by NodeId; using indices 2..5 in arena).
-    td.nodes[2] = detail::Node{
-        .kind      = NodeKind::Token,
-        .tokenKind = SchemaTokenId{1},         // pretend: "VarKeyword"
-        .span      = SourceSpan::of(0, 3),
-        .parent    = NodeId{1},
-    };
-    td.nodes[3] = detail::Node{
-        .kind      = NodeKind::Token,
-        .flags     = NodeFlags::EmptySpace,
-        .tokenKind = SchemaTokenId{2},         // pretend: "Whitespace"
-        .span      = SourceSpan::of(3, 4),
-        .parent    = NodeId{1},
-    };
-    // Reuse last slots — actually we declared 5 nodes (1 sentinel + 4 real). Let me fix:
-    td.nodes[4] = detail::Node{
-        .kind      = NodeKind::Token,
-        .tokenKind = SchemaTokenId{3},         // pretend: "Identifier"
-        .span      = SourceSpan::of(4, 5),
-        .parent    = NodeId{1},
-    };
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(5, 6),
+               NodeFlags::None, /*parent=*/ NodeId{1},
+               /*children=*/ {}, /*tokenKind=*/ SchemaTokenId{4});
 
-    // Need 4 children: var, ws, ident, semicolon. Resize for one more.
-    td.nodes.resize(6);
-    td.nodes[5] = detail::Node{
-        .kind      = NodeKind::Token,
-        .tokenKind = SchemaTokenId{4},         // pretend: "EndCommand"
-        .span      = SourceSpan::of(5, 6),
-        .parent    = NodeId{1},
-    };
-
-    td.childIndex = { NodeId{2}, NodeId{3}, NodeId{4}, NodeId{5} };
-    td.root = NodeId{1};
-
-    return Tree{std::move(td)};
+    outRules = rb.rules();
+    outSrc   = rb.source();
+    return std::move(rb).finish(/*root=*/ NodeId{1});
 }
 
 } // namespace
