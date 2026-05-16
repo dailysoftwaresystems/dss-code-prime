@@ -1,0 +1,473 @@
+#include "core/types/diagnostic_reporter.hpp"
+#include "core/types/grammar_schema.hpp"
+#include "core/types/parse_diagnostic.hpp"
+#include "core/types/rule_id.hpp"
+#include "core/types/source_buffer.hpp"
+#include "core/types/source_span.hpp"
+#include "core/types/strong_ids.hpp"
+#include "core/types/token.hpp"
+#include "core/types/tree.hpp"
+#include "core/types/tree_builder.hpp"
+#include "core/types/tree_cursor.hpp"
+#include "core/types/tree_node.hpp"
+#include "core/types/tree_views.hpp"
+#include "core/types/tree_visitor.hpp"
+#include "core/types/well_known_names.hpp"
+#include "toy_harness.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+// End-to-end integration test for the core tree stack: shipped JSON config
+// → SourceBuffer → GrammarSchema → TreeBuilder driven by synthetic tokens
+// → Tree → walk via visitor → pretty-printed AST → DiagnosticReporter →
+// typed views. Happy-path tests assert the full pretty-printed AST against
+// a string literal; broken-path tests assert specific diagnostic codes and
+// that the recovered tree still walks.
+
+using namespace dss;
+using dss::tests::ToyHarness;
+
+namespace {
+
+// Sequential token emitter — finds the next occurrence of `text` at or
+// after the cursor, advancing the cursor past the match. Lets tests
+// pass through sources with repeated lexemes (";", "=") without per-call
+// startHints.
+class TokenSeq {
+public:
+    explicit TokenSeq(SourceBuffer const& src) : src_(&src) {}
+
+    Token next(std::string_view text, CoreTokenKind kind = CoreTokenKind::Operator) {
+        const auto sv = src_->text();
+        const auto found = sv.find(text, pos_);
+        EXPECT_NE(found, std::string_view::npos)
+            << "TokenSeq: lexeme '" << text << "' not found after offset " << pos_;
+        if (found == std::string_view::npos) {
+            return Token{.coreKind = kind, .schemaKind = InvalidSchemaToken,
+                         .span = SourceSpan::of(static_cast<ByteOffset>(pos_),
+                                                 static_cast<ByteOffset>(pos_))};
+        }
+        pos_ = found + text.size();
+        return Token{
+            .coreKind   = kind,
+            .schemaKind = InvalidSchemaToken,
+            .span       = SourceSpan::of(static_cast<ByteOffset>(found),
+                                          static_cast<ByteOffset>(pos_)),
+        };
+    }
+
+    Token word(std::string_view text) { return next(text, CoreTokenKind::Word); }
+    Token ws(std::string_view text)   { return next(text, CoreTokenKind::Whitespace); }
+    Token op(std::string_view text)   { return next(text, CoreTokenKind::Operator); }
+
+private:
+    SourceBuffer const* src_;
+    std::size_t         pos_ = 0;
+};
+
+ToyHarness loadShippedHarness(std::string sourceText) {
+    auto loaded = GrammarSchema::loadShipped("toy");
+    if (!loaded) {
+        ADD_FAILURE() << "loadShipped(\"toy\") failed — config missing or malformed";
+        return ToyHarness{
+            .src    = SourceBuffer::fromString(std::move(sourceText), "<e2e>"),
+            .schema = nullptr,
+        };
+    }
+    return ToyHarness{
+        .src    = SourceBuffer::fromString(std::move(sourceText), "<e2e>"),
+        .schema = *loaded,
+    };
+}
+
+// Walk the tree in AST mode, emitting "rule:<name>" for Internal nodes and
+// tok:"<text>" for visible Token leaves. Indent is two spaces per depth
+// level. The output is the structural fingerprint that string-equality
+// assertions in happy-path tests compare against. Error/Missing/Synthetic
+// flags are intentionally NOT surfaced; broken-path tests verify them via
+// a separate walk over `tree.flags(id)`.
+std::string prettyPrint(Tree const& t) {
+    std::string out;
+    if (!t.root().valid()) return out;
+    walkPreOrder(TreeCursor{t, t.root(), CursorMode::Ast},
+                 [&](TreeCursor const& c) {
+        const int d = c.depth();
+        for (int i = 0; i < d; ++i) out += "  ";
+        const auto id = c.current();
+        if (t.kind(id) == NodeKind::Internal) {
+            out += "rule:";
+            out += t.rules().name(t.rule(id));
+        } else {
+            out += "tok:\"";
+            out += t.text(id);
+            out += '"';
+        }
+        out += '\n';
+    });
+    return out;
+}
+
+std::size_t countCode(std::span<ParseDiagnostic const> diags, DiagnosticCode code) {
+    std::size_t n = 0;
+    for (auto const& d : diags) if (d.code == code) ++n;
+    return n;
+}
+
+// Count descendants of `start` (excluding `start` itself) whose flags have
+// HasError set. Used by broken-path tests to verify the parser actually
+// inserted an Error leaf rather than just recording a diagnostic.
+std::size_t countErrorDescendants(Tree const& t, NodeId start) {
+    std::size_t n = 0;
+    bool firstSeen = false;
+    walkPreOrder(TreeCursor{t, start, CursorMode::Cst}, [&](TreeCursor const& c) {
+        if (!firstSeen) { firstSeen = true; return; }   // skip start itself
+        if (hasError(t.flags(c.current()))) ++n;
+    });
+    return n;
+}
+
+// Drive a "var <name> = <value>;" statement.
+void driveVarDecl(TreeBuilder& b, TokenSeq& ts, ToyHarness const& h,
+                  std::string_view name, std::string_view value) {
+    auto stmt = b.open(h.schema->rules().find("statement"));
+    auto vd   = b.open(h.schema->rules().find("varDecl"));
+    b.pushToken(ts.word("var"));
+    b.pushToken(ts.ws(" "));
+    b.pushToken(ts.word(name));
+    b.pushToken(ts.ws(" "));
+    b.pushToken(ts.op("="));
+    b.pushToken(ts.ws(" "));
+    {
+        auto expr = b.open(h.schema->rules().find("expression"));
+        b.pushToken(ts.word(value));
+    }
+    b.pushToken(ts.op(";"));
+}
+
+void driveExprStmt(TreeBuilder& b, TokenSeq& ts, ToyHarness const& h,
+                   std::string_view name) {
+    auto stmt = b.open(h.schema->rules().find("statement"));
+    auto es   = b.open(h.schema->rules().find("exprStmt"));
+    {
+        auto expr = b.open(h.schema->rules().find("expression"));
+        b.pushToken(ts.word(name));
+    }
+    b.pushToken(ts.op(";"));
+}
+
+} // namespace
+
+TEST(TreeEndToEnd, HappyPath_SingleVarDecl_PrintsExpectedTree) {
+    auto h = loadShippedHarness("var x = y;");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        driveVarDecl(b, ts, h, "x", "y");
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_TRUE(t.diagnostics().all().empty());
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_FALSE(hasError(t.flags(t.root())));
+
+    const std::string_view expected =
+        "rule:root\n"
+        "  rule:statement\n"
+        "    rule:varDecl\n"
+        "      tok:\"var\"\n"
+        "      tok:\"x\"\n"
+        "      tok:\"=\"\n"
+        "      rule:expression\n"
+        "        tok:\"y\"\n"
+        "      tok:\";\"\n";
+    EXPECT_EQ(prettyPrint(t), expected);
+}
+
+TEST(TreeEndToEnd, HappyPath_SingleExprStmt_PrintsExpectedTree) {
+    auto h = loadShippedHarness("y;");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        driveExprStmt(b, ts, h, "y");
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_TRUE(t.diagnostics().all().empty());
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const std::string_view expected =
+        "rule:root\n"
+        "  rule:statement\n"
+        "    rule:exprStmt\n"
+        "      rule:expression\n"
+        "        tok:\"y\"\n"
+        "      tok:\";\"\n";
+    EXPECT_EQ(prettyPrint(t), expected);
+}
+
+TEST(TreeEndToEnd, HappyPath_MultipleStatements_PrintsExpectedTree) {
+    auto h = loadShippedHarness("var x = a; y; var w = b;");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        driveVarDecl(b, ts, h, "x", "a");
+        b.pushToken(ts.ws(" "));
+        driveExprStmt(b, ts, h, "y");
+        b.pushToken(ts.ws(" "));
+        driveVarDecl(b, ts, h, "w", "b");
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_TRUE(t.diagnostics().all().empty());
+
+    // Whitespace between statements attaches as a child of root, not of the
+    // preceding statement. Verify directly — pretty-print skips EmptySpace
+    // so the string assertion alone wouldn't catch a re-attachment regression.
+    std::size_t rootWsCount = 0;
+    for (NodeId c : t.children(t.root())) {
+        if (isEmptySpace(t.flags(c))) ++rootWsCount;
+    }
+    EXPECT_EQ(rootWsCount, 2u);
+
+    const std::string_view expected =
+        "rule:root\n"
+        "  rule:statement\n"
+        "    rule:varDecl\n"
+        "      tok:\"var\"\n"
+        "      tok:\"x\"\n"
+        "      tok:\"=\"\n"
+        "      rule:expression\n"
+        "        tok:\"a\"\n"
+        "      tok:\";\"\n"
+        "  rule:statement\n"
+        "    rule:exprStmt\n"
+        "      rule:expression\n"
+        "        tok:\"y\"\n"
+        "      tok:\";\"\n"
+        "  rule:statement\n"
+        "    rule:varDecl\n"
+        "      tok:\"var\"\n"
+        "      tok:\"w\"\n"
+        "      tok:\"=\"\n"
+        "      rule:expression\n"
+        "        tok:\"b\"\n"
+        "      tok:\";\"\n";
+    EXPECT_EQ(prettyPrint(t), expected);
+}
+
+TEST(TreeEndToEnd, HappyPath_ViewsResolveOnRealParse) {
+    auto h = loadShippedHarness("var x = a; y; var w = b;");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        driveVarDecl(b, ts, h, "x", "a");
+        b.pushToken(ts.ws(" "));
+        driveExprStmt(b, ts, h, "y");
+        b.pushToken(ts.ws(" "));
+        driveVarDecl(b, ts, h, "w", "b");
+    }
+    Tree t = std::move(b).finish();
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+
+    std::vector<std::string> seen;
+    walkPreOrder(t.astCursor(), [&](TreeCursor const& c) {
+        const auto id = c.current();
+        if (t.kind(id) != NodeKind::Internal) return WalkAction::Continue;
+        if (t.rules().name(t.rule(id)) != "statement") return WalkAction::Continue;
+
+        // Statement's first VISIBLE child is the actual decl / expr-stmt
+        // node. nthVisibleChild is robust to any future leading-EmptySpace
+        // refactor; raw children().front() would silently break.
+        const auto inner = detail::views::nthVisibleChild(t, id, 0);
+        if (!inner.valid()) {
+            ADD_FAILURE() << "statement has no visible child";
+            return WalkAction::Stop;
+        }
+
+        if (auto vd = VarDeclView::from(t, inner)) {
+            seen.push_back("varDecl:" + std::string{vd->name().name()});
+        } else if (auto es = ExprStmtView::from(t, inner)) {
+            const auto expr = es->expression();
+            const auto first = detail::views::nthVisibleChild(t, expr, 0);
+            if (!first.valid()) {
+                ADD_FAILURE() << "exprStmt's expression has no visible child";
+                return WalkAction::Stop;
+            }
+            seen.push_back("exprStmt:" + std::string{t.text(first)});
+        } else {
+            ADD_FAILURE() << "statement's first child was neither varDecl nor exprStmt";
+        }
+        return WalkAction::SkipChildren;
+    });
+
+    EXPECT_EQ(seen, (std::vector<std::string>{
+        "varDecl:x", "exprStmt:y", "varDecl:w",
+    }));
+}
+
+TEST(TreeEndToEnd, BrokenPath_UnknownTokenRecovered) {
+    auto h = loadShippedHarness("var x = @;");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        auto stmt = b.open(h.schema->rules().find("statement"));
+        auto vd   = b.open(h.schema->rules().find("varDecl"));
+        b.pushToken(ts.word("var"));
+        b.pushToken(ts.ws(" "));
+        b.pushToken(ts.word("x"));
+        b.pushToken(ts.ws(" "));
+        b.pushToken(ts.op("="));
+        b.pushToken(ts.ws(" "));
+        b.pushToken(ts.op("@"));
+        b.pushToken(ts.op(";"));
+    }
+    Tree t = std::move(b).finish();
+
+    const auto diags = t.diagnostics().all();
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasError(t.flags(t.root())));
+    EXPECT_GE(countCode(diags, DiagnosticCode::P_UnknownToken), 1u);
+
+    // The bad token must materialize as a flagged descendant — not just a
+    // diagnostic entry. Catches a regression where the unknown token gets
+    // silently dropped without an Error leaf.
+    EXPECT_GE(countErrorDescendants(t, t.root()), 1u);
+
+    // Error-leaf print format is implementation-defined; assert shape via
+    // substring presence rather than full string equality.
+    const auto printed = prettyPrint(t);
+    EXPECT_NE(printed.find("rule:root"),    std::string::npos);
+    EXPECT_NE(printed.find("rule:varDecl"), std::string::npos);
+    EXPECT_NE(printed.find("tok:\"var\""),  std::string::npos);
+    EXPECT_NE(printed.find("tok:\";\""),    std::string::npos);
+}
+
+TEST(TreeEndToEnd, BrokenPath_UnclosedScopesAtEof) {
+    auto h = loadShippedHarness("var x");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+
+    // Guards held in a heap vector and dropped after finish() — otherwise
+    // their destructors would close the frames before finish() sees them.
+    auto guards = std::make_unique<std::vector<TreeBuilder::OpenScope>>();
+    guards->push_back(b.open(h.schema->rules().find("root")));
+    guards->push_back(b.open(h.schema->rules().find("statement")));
+    guards->push_back(b.open(h.schema->rules().find("varDecl")));
+    b.pushToken(ts.word("var"));
+    b.pushToken(ts.ws(" "));
+    b.pushToken(ts.word("x"));
+
+    Tree t = std::move(b).finish();
+    guards.reset();   // safe: closeFrame_ no-ops on a finished builder
+
+    const auto diags = t.diagnostics().all();
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_PrematureEndOfInput), 3u);
+    EXPECT_TRUE(hasError(t.flags(t.root())));
+}
+
+TEST(TreeEndToEnd, BrokenPath_TruncatedAfterKeyword) {
+    auto h = loadShippedHarness("var");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+    auto guards = std::make_unique<std::vector<TreeBuilder::OpenScope>>();
+    guards->push_back(b.open(h.schema->rules().find("root")));
+    guards->push_back(b.open(h.schema->rules().find("statement")));
+    guards->push_back(b.open(h.schema->rules().find("varDecl")));
+    b.pushToken(ts.word("var"));
+
+    Tree t = std::move(b).finish();
+    guards.reset();
+
+    const auto diags = t.diagnostics().all();
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_PrematureEndOfInput), 3u);
+
+    const auto printed = prettyPrint(t);
+    EXPECT_NE(printed.find("rule:varDecl"), std::string::npos);
+    EXPECT_NE(printed.find("tok:\"var\""),  std::string::npos);
+}
+
+TEST(TreeEndToEnd, BrokenPath_PushErrorRecovered) {
+    // pushError is the parser's explicit "wrong token" signal: inserts an
+    // Error leaf, emits P_UnexpectedToken, propagates HasError to root.
+    // Distinct from BrokenPath_UnknownTokenRecovered which exercises
+    // schema-rejects-lexeme; this covers parser-rejects-token.
+    auto h = loadShippedHarness("var x = ?;");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        auto stmt = b.open(h.schema->rules().find("statement"));
+        auto vd   = b.open(h.schema->rules().find("varDecl"));
+        b.pushToken(ts.word("var"));
+        b.pushToken(ts.ws(" "));
+        b.pushToken(ts.word("x"));
+        b.pushToken(ts.ws(" "));
+        b.pushToken(ts.op("="));
+        b.pushToken(ts.ws(" "));
+        b.pushError(SourceSpan::of(8, 9), std::nullopt,
+                    h.schema->schemaTokens().find(tokens::kIdentifier),
+                    "expected expression");
+        b.pushToken(ts.op(";"));
+    }
+    Tree t = std::move(b).finish();
+
+    const auto diags = t.diagnostics().all();
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasError(t.flags(t.root())));
+    EXPECT_GE(countCode(diags, DiagnosticCode::P_UnexpectedToken), 1u);
+    EXPECT_GE(countErrorDescendants(t, t.root()), 1u);
+}
+
+TEST(TreeEndToEnd, BrokenPath_PopScopeUnderflow) {
+    // Pushing a closesScope token (`}`) with no opener exercises the
+    // scope-stack-underflow path inside pushToken → popScope, which
+    // emits P_BuilderInvariant. Proves the schema's scope-effect
+    // resolution is wired up at the E2E level (T5 doesn't yet emit
+    // the dedicated P_UnmatchedClose code — that's reserved for a
+    // future parser-level enhancement).
+    auto h = loadShippedHarness("}");
+    ASSERT_NE(h.schema, nullptr);
+
+    TreeBuilder b{h.src, h.schema};
+    TokenSeq    ts{*h.src};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        b.pushToken(ts.op("}"));
+    }
+    Tree t = std::move(b).finish();
+
+    const auto diags = t.diagnostics().all();
+    EXPECT_GE(countCode(diags, DiagnosticCode::P_BuilderInvariant), 1u);
+}
