@@ -14,13 +14,141 @@
 
 | | |
 |---|---|
-| Status        | ⏳ **Pending** — does not start until the v1 E2E milestone is complete. |
-| Trigger       | First attempt to author a real-language `.lang.json` (starting with a C subset). |
-| Predecessors  | v1 T1–T12 (`tree-node-model-plan.md`); a minimal end-to-end pipeline (tokenize → parse → IR → emit → run on a toy program). |
+| Status        | 🟢 **Ready to start.** v1 sub-plan T0–T12 has shipped — 278 ctest cases across 17 suites, 100% pass. The empirical trigger is met: a real-language `.lang.json` can now be drafted against a complete, schema-aware, diagnostics-aware foundation. |
+| Trigger       | ✅ v1 complete. PR0 (`c-subset.lang.json`) is the next action. |
+| Predecessors  | ✅ v1 T1–T12 (`tree-node-model-plan.md`). ⚠️ "minimal end-to-end pipeline (tokenize → parse → IR → emit)" — **NOT done**. T10 ships an E2E test that drives `TreeBuilder` via hand-constructed token streams; no real lexer/parser/IR exists yet. PR0 inherits this constraint (see §0.2). |
 | Successors    | `languages-onboarding-plan.md` (authoring `csharp` / `dart` / `tsql` / `sqlite` configs). |
 | Scope         | Schema-level expressiveness only. No new tree-node types. No IR/codegen changes. Tokenizer gains "lexer modes" for string interpolation; lexer-mode *stack* is the checkpoint primitive's responsibility. |
 
 This plan is **deliberately empirical**: PR0 authors a C subset against the v1 schema *as-is* and catalogs the gaps that surface. §4.1 defines the workflow for what happens when a PR0 gap doesn't fit the §5 design as written.
+
+---
+
+### 0.1 v1 snapshot at v2 start
+
+What's in `src/core/types/` today, what v2 PRs will extend, and what v2 design assumptions have drifted from reality since this plan was authored.
+
+**Shipped and stable (v2 builds on these):**
+
+| Asset | Header / source | Notes |
+|---|---|---|
+| Strong IDs | `strong_ids.hpp` | `NodeId`, `RuleId`, `SchemaTokenId`, `BufferId`, `TreeId`, `DiagnosticIndex`. Untouched by v2. |
+| Interner template | `interner.hpp` | C++20 transparent heterogeneous lookup. Untouched by v2. |
+| `SourceBuffer`, `SourceSpan` | `source_buffer.hpp/.cpp`, `source_span.hpp/.cpp` | Untouched by v2. |
+| `Token` | `token.hpp` | Untouched by v2. |
+| `GrammarSchema` + `GrammarSchemaData` POD | `grammar_schema.hpp/.cpp` | **Extended by v2 PR1, PR2, PR3, PR5, PR6.** New `LexemeMeaning` fields, new top-level methods. |
+| JSON loader | `grammar_schema_json.hpp/.cpp` | **Extended by every v2 PR that introduces a JSON key.** |
+| `ScopeKind` | `scope_kind.hpp/.cpp` | Untouched by v2 unless onboarding adds a built-in (e.g., `Interpolation`). |
+| `SchemaCursor` | `schema_cursor.hpp` | Header exists; `advance()`/`enterRule()`/`leaveRule()` are stubs. **PR2a closes this** — first real implementation. |
+| `ParseDiagnostic` + codes | `parse_diagnostic.hpp/.cpp` | **Extended by v2** with new `P_*` and `C_*` codes per PR. `diagnosticCodeName()` switch must be updated for every new code (the easy-miss step §3 flags). |
+| `DiagnosticReporter` | `diagnostic_reporter.hpp/.cpp` | FNV-1a64 dedup hash includes `ruleContext`. **PR4 adds `truncateTo(...)` + `RollbackToken`** for `Checkpoint`. |
+| `Tree`, `detail::Node`, `NodeKind`, `NodeFlags` | `tree.hpp/.cpp`, `tree_node.hpp` | Stable. v2 doesn't touch the node arena. `Node` is ~40 bytes (v1 §0 deviation #1; relaxed from the original 32-byte budget). |
+| `Tree::hasSchema()` / `hasDiagnostics()` | `tree.hpp/.cpp` | **New in T9 — not in this plan's original Files-to-extend table.** Token-level `View::from(...)` already uses `hasSchema()` to gracefully fall back to `nullopt` on schema-less hand-built trees. v2 PRs that touch view-adjacent code should match this pattern. |
+| `TreeBuilder` + RAII `OpenScope` | `tree_builder.hpp/.cpp` | **PR4 adds `Checkpoint` + `checkpoint()` / `commit()` / `rollback()`.** PR4 also refactors `Frame::children` to `{childIndexStart, childIndexCount}` for O(1) rollback (currently `std::vector<NodeId> children`). PR2b adds contextual-keyword resolution to `pushToken`. |
+| `TreeCursor` (CST + AST) | `tree_cursor.hpp/.cpp` | Opaque `Bookmark` with `TreeId` ABA guard. v1 §0 deviation #7 (which previously said "CP1 did not implement `Tree::cursor()`") is **closed**. Untouched by v2. |
+| `tree_visitor.hpp` (walk helpers) | header-only | T7 — `walkPreOrder` / `walkPostOrder` / `WalkAction`. Untouched by v2. |
+| `tree_attrs.hpp` (`NodeAttribute<T>`) | header-only | T8 — sparse↔dense auto-promotion, custom move ops. Untouched by v2. |
+| `tree_views.hpp` (7 views) | header-only | T9 — `IdentifierView`, `LiteralView`, `BinaryExprView`, `BlockView`, `FunctionDeclView`, `VarDeclView`, `ExprStmtView`. **PR1 introduces operator precedence; the parser-side Pratt walker may eventually want a typed `OperatorExprView` to wrap `BinaryExprView` + operand resolution — flag for v2 retrospective.** |
+| `well_known_names.hpp` | header-only | T9 — `dss::rules::*` + `dss::tokens::*` constants. **Every new v2 well-known rule/token should be added here for single-source-of-truth.** |
+| `detail::views::nthVisibleChild` / `visibleChildCount` / `ruleIdFor` / `tokenKindFor` | `tree_views.hpp` | Helpers; reusable by v2 parser scaffolding. |
+| Shipped grammar | `src/source-config/languages/toy.lang.json` | **Must continue to load unchanged through every v2 PR** — smoke test pin. |
+| Onboarding docs | `docs/tree-model.md`, `docs/language-config-spec.md` | T12 — pinned by `GrammarSchema.DocsCookbookCalcExampleLoadsCleanly`. Each v2 PR appends a "v2 additions" section to `language-config-spec.md` (per PR8). |
+
+**Test infrastructure available to v2 PRs:**
+
+| Helper | File | When v2 PRs will use it |
+|---|---|---|
+| `RawTreeBuilder` | `tests/core/raw_tree_builder.hpp` | Hand-build trees with shapes `TreeBuilder` won't produce yet (e.g., a `binaryExpr` with operator precedence applied). No schema attached. |
+| `SchemaTreeBuilder` (inline) | `tests/core/test_tree_views.cpp` | Schema-bound variant — token-level lookups resolve. PR1 / PR5 / PR6 tests likely want this. |
+| `ToyHarness` | `tests/core/toy_harness.hpp` | Inline-JSON-config + source-buffer + `tok(text, kind)` substring matcher. PR0 may want a `CSubsetHarness` clone. |
+| `TokenSeq` (inline) | `tests/core/test_tree_end_to_end.cpp` | Sequential lexeme emitter — handles sources with repeated `;`/`=`. |
+| `prettyPrint` (inline) | `tests/core/test_tree_end_to_end.cpp` | AST-mode walk → `rule:<name>` / `tok:"<text>"`. Strict string-equality assertions on the result are how T10 catches structural drift. |
+| `countCode` / `countErrorDescendants` (inline) | `tests/core/test_tree_end_to_end.cpp` | For broken-path tests; PR4 (`Checkpoint` rollback) will lean on `countCode` heavily. |
+| Allocation counter (inline) | `tests/core/test_tree_visitor.cpp` | Global `operator new` override — PR4 acceptance bullet (f) (1000-token speculative under 50 ms) may want it. |
+
+**v1 deviations that v2 inherits or closes:**
+
+- **D1 (Node ~40 bytes, not 32).** Still in effect; v2 doesn't shrink it. PR4's `Frame::children` refactor doesn't change `Node`.
+- **D5 (`Tree::childrenOfRule`/`firstChildOfRule` deferred).** Still deferred. PR2a's schema cursor may relitigate this — flag for the design diff.
+- **D7 (T5 doesn't drive the schema's compiled shape graph).** **PR2a closes this** (real `SchemaCursor::advance`).
+- **D10 (`LexemeMeaning::validScopes` was wired in T5 as a flat array).** **PR3 replaces it with `scopeRequire` object.** PR3's migration test must verify the v1 flat form still loads as the `anyOf` arm.
+- **D11 (test infrastructure extracted from duplication).** Stable. v2 PR tests should extend `SchemaTreeBuilder` rather than spawning new helpers when possible.
+
+**Plan→reality drift since v2 was authored:**
+
+| Item | v2 plan says | Reality | Action |
+|---|---|---|---|
+| `Tree::cursor()` / `astCursor()` | v1 §0 deviation #5 — deferred | ✅ Shipped in T6 | Strike from PR2a's scope notes |
+| `Tree::hasSchema()` / `hasDiagnostics()` | Not mentioned | ✅ Shipped in T9 — token-level `View::from` uses graceful no-schema fallback | PR1 / PR3 / PR5 patterns that touch token-resolution should adopt the same graceful pattern |
+| `detail::views::nthVisibleChild` | Not mentioned | ✅ Shipped in T9 | Reusable by PR2a / PR4 parser-scaffolding test code |
+| `well_known_names.hpp` | Not mentioned | ✅ Shipped in T9 | Every new v2 rule/token name lands here, not as a bare string literal |
+| `tree_attrs.hpp` + `NodeAttribute<T>` | Not mentioned | ✅ Shipped in T8 — semantic passes will use this | PR2b's contextual-keyword resolution might be a candidate consumer (per-frame contextual-state side-table) — flag for design |
+| `T10 BrokenPath_PushErrorRecovered` + `BrokenPath_PopScopeUnderflow` patterns | Not mentioned | ✅ Shipped in T10 | PR4's Checkpoint-rollback tests should follow the same shape (exact diag counts, `hasError(root)`, `countErrorDescendants` ≥ 1) |
+| `parse_diagnostic_reporter.cpp` `diagnosticCodeName()` switch | Flagged as easy-miss step | Still relevant — must be updated for every new code in every v2 PR | Keep as-is |
+| `compiler.cpp` / `Compiler` class | Not referenced | Placeholder, untouched | Out of v2 scope |
+| Real lexer / parser / IR | "predecessor" but stretch | Not done. PR0/PR4/PR7 sample-input testing remains hand-token-driven, like T10. | See §0.2 |
+
+---
+
+### 0.2 Next implementation steps — review
+
+This subsection captures the honest "where to start" read for someone picking up v2 cold, plus the design risks the plan as-written should weather.
+
+**The immediate next step is PR0 (`v2-empirical-c-subset`).** It is the critical-path entry — every other PR depends on PR0's gap catalog driving its design refinements.
+
+#### PR0 sub-tasks (concrete)
+
+1. **Draft `src/source-config/languages/c-subset.lang.json`** against the v1 schema as-is. Target the scope listed in §4 (typedef, operator precedence, simple string literals, block structure, function decls, if/while/return).
+2. **Attempt to load it.** Capture every `C_*` diagnostic with its exact code, JSON pointer, and message. Note silent-acceptances (loader accepts but the schema is semantically wrong).
+3. **Attempt to parse representative C samples.** **Constraint inherited from v1:** no real lexer/parser exists. Sample-parse attempts will use the same hand-tokenization pattern as `tests/core/test_tree_end_to_end.cpp` — `SchemaTreeBuilder` + `TokenSeq` driving `TreeBuilder::open` / `pushToken` / `pushError`. This is good enough to surface "the schema cannot express precedence" / "contextual keywords resolve wrong" / etc.; it is **not** sufficient to surface lexer-mode gaps (PR5) or interpolation gaps (PR6) — those wait for the tokenizer phase.
+4. **Author `.plans/v2-gap-catalog.md`** following the §4.1 row format. Each gap row points to a §5 subsection.
+5. **Bump `dssSchemaVersion: 2`** in `c-subset.lang.json` once the loader accepts it (PR0 itself ships the loader change accepting `2`).
+6. **Smoke-pin `toy.lang.json`** — re-run `GrammarSchema.LoadShipped` and assert it still loads under the same loader changes.
+
+PR0 ends with a gap catalog OR with a v3 candidate row in §9 — branches (a)/(b)/(c) per §4.1.
+
+#### Sequence after PR0
+
+Per the critical path declared in §7 (PR0 → PR1 → PR2a → PR2b → PR4 → PR7 → PR8), with PR3/PR5/PR6 as independent landings:
+
+| Order | PR | Why this slot |
+|---|---|---|
+| 1 | PR0 | Empirical entry; gates every subsequent design refinement. |
+| 2 | PR1 (precedence) | Smallest concrete schema extension. Closes the most universal language requirement. |
+| 3 | PR2a (schema-cursor) | Closes v1's biggest deferral (sequence/alt enforcement). Unblocks PR2b. |
+| 4 | PR2b (contextual keywords) | Stacks naturally on the schema cursor. |
+| 5 | PR3 (scopeRequire) — independent | Can ship any time after PR0. Small. |
+| 6 | PR4 (Checkpoint) | The most complex piece. Needed for speculative `alt` AND for PR5's lexer-mode-stack snapshot. |
+| 7 | PR5 (lexer modes) — independent | Schema-side only; tokenizer integration deferred to its phase. |
+| 8 | PR6 (string styles) — independent | Schema-side only; tokenizer integration deferred. |
+| 9 | PR7 (T-SQL stress test) | Validates v2 is sufficient for a non-trivial real grammar. |
+| 10 | PR8 (plan-doc maintenance) | One-day janitorial close-out. |
+
+#### Honest risk register for v2 implementation
+
+1. **PR4 (Checkpoint) is under-estimated at 6–9 days.** Speculative parse with rollback across `TreeBuilder` arena pushes + frame stack + scope stack + lexer-mode stack + diagnostic reporter (incl. `perCode_`, `recent_`, `hitCap_` deltas) is the most invasive change in v2. The `Frame::children` `{indexStart, indexCount}` refactor alone touches every current builder code path that appends children. **Recommend budgeting 9–12 days and triple-checking PR4's acceptance bullets (a)–(f) all land green simultaneously.**
+
+2. **PR2a (schema cursor) is well-scoped but the cycle case is subtle.** "rule A references rule B references rule A indirectly through `repeat`" — implementations of this typically need an explicit "depth budget" or "visited-rules set" to terminate. Worth specifying in PR2a's design (perhaps as part of v2 §5 if it's not already covered) before writing code.
+
+3. **PR0's gap catalog may produce more amendments than §4.1 anticipates.** §4.1 branch (a) is "small extension fits naturally → amend §5." If PR0 produces 4+ amendments to §5, that's a signal the §5 design as-written is wrong in aggregate. §9 item 11 already flags this as a v2.5-plan-spawn trigger.
+
+4. **PR5/PR6 ship as un-runnable surface.** Schema-side only; the tokenizer phase will discover gaps the stub-driver missed. Acceptance bullets explicitly note this. **Recommendation:** when the tokenizer phase begins, do not consider PR5/PR6 "closed" — re-validate against the real tokenizer's needs and amend the schema if necessary (this is branch (a) territory, not breakage).
+
+5. **No real parser means no real end-to-end signal for v2.** The v2 plan acknowledges this (parser is parent-plan phase #7). But operationally: every v2 PR's acceptance tests run against hand-tokenized sources. The first time v2 features get exercised under a real parse will be in the tokenizer/parser phase. **Plan accordingly:** expect a v2-fixup pass when the parser lands.
+
+6. **v1 deviations carry forward.** D1 (Node ~40B), D5 (deferred `childrenOfRule`), the `Compiler` class stub. None block v2 work, but they remain on the books.
+
+7. **Plan-to-code ratio.** v1 already ships a heavy plan-to-code ratio. v2 will deepen this — `.plans/v2-gap-catalog.md` is new, plus per-PR design-diff appendices. **Recommendation:** the gap catalog stays terse (table only, no prose); design-diff appendices stay under 10 lines per row. Save the prose for the v2.5/v3 plans if they materialize.
+
+#### What v2 does NOT deliver (set expectations)
+
+End-state of v2 = "the schema can express a C-subset, T-SQL-subset, and the v2-listed feature set; configs load cleanly; the builder can be driven (by a future real parser) to produce correctly-shaped trees for those configs."
+
+End-state of v2 ≠ "you can compile a C program." Lexer, parser, IR, optimizer, linker, codegen all remain unimplemented after v2. Those are parent-plan phases #5/#6/#7/#8+.
+
+#### Adjacent recommendation (not in scope, but worth flagging)
+
+Consider whether a **minimal regex-based tokenizer** for `c-subset` is worth spinning up in parallel with PR0. It would let PR0 actually parse sample C sources rather than hand-tokenize them; tighter feedback loop, better gap detection. Counter-argument: not in v2's budget; adds ~1 week to PR0; may force lexer-design decisions ahead of the schema-driven design they should follow. Net: I'd note it as an option in the v2-gap-catalog if PR0's hand-tokenization productively surfaces less than ~60% of expected C gaps.
 
 ---
 
