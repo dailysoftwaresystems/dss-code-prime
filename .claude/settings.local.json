@@ -31,7 +31,9 @@
       "Bash(ninja -t targets all)",
       "PowerShell(& C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tree_visitor.exe 2>&1 | Select-Object -Last 80)",
       "PowerShell(& C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tree_visitor.exe 2>&1 | Select-Object -Last 60)",
-      "PowerShell(ctest *)"
+      "PowerShell(ctest *)",
+      "PowerShell(& C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tree_attrs.exe 2>&1 | Select-Object -Last 80)",
+      "PowerShell(& C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tree_attrs.exe 2>&1 | Select-Object -Last 90)"
     ]
   }
 }

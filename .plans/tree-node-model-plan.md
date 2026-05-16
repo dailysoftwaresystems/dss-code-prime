@@ -19,8 +19,8 @@ Updated as work progresses. Detailed phase status lives in §7.
 | **T5**  | schema-aware `TreeBuilder` (RAII `OpenScope`, recovery)     | ✅ done (review-fix sweep applied) |
 | **T6**  | `TreeCursor` (CST + AST modes)                              | ✅ done (review-fix sweep applied + loose-ends closed) |
 | **T7**  | `tree_visitor.hpp` walk helpers                             | ✅ done |
-| **T8**  | `NodeAttribute<T>` side-tables                              | ⏳ next |
-| **T9**  | initial typed views                                         | ⏳ pending |
+| **T8**  | `NodeAttribute<T>` side-tables                              | ✅ done |
+| **T9**  | initial typed views                                         | ⏳ next |
 | **T10** | toy-parser end-to-end (happy + broken)                      | ⏳ pending |
 | **T11** | CMake wireup for any remaining core sources                 | (rolling — done per chunk) |
 | **T12** | `docs/tree-model.md` + `docs/language-config-spec.md`       | ⏳ pending |
@@ -33,7 +33,7 @@ Updated as work progresses. Detailed phase status lives in §7.
 | C++ standard | **23** |
 | Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows |
 | Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
-| Test suite | **179 cases across 14 ctest suites — 100% pass** |
+| Test suite | **232 cases across 15 ctest suites — 100% pass** |
 
 **Files now in `src/core/types/` (all on `core` static lib):**
 
@@ -56,6 +56,7 @@ tree.hpp/.cpp                ← detail::TreeData, Tree (immutable, schema- & di
 tree_builder.hpp/.cpp        ← schema-aware assembler, RAII OpenScope, cascade-cookie tracking
 tree_cursor.hpp/.cpp         ← CST/AST cursor, opaque Bookmark with TreeId guard, convenience forwarders
 tree_visitor.hpp             ← header-only pre/post-order walks over TreeCursor; subtree-bounded; void- or WalkAction-returning visitors
+tree_attrs.hpp               ← header-only NodeAttribute<T> side-table; sparse→dense auto-promotion; Tree-bound with nodeCount bounds check
 ```
 
 **Test-only helpers (`tests/core/`):**
@@ -733,15 +734,17 @@ All implemented over `TreeCursor`. No dynamic dispatch.
 
 ### 5.10 `tree_attrs.hpp` — Attribute side-tables
 
-Bound to a specific `Tree` via `TreeId` at construction; cross-tree lookups debug-assert. Two storage strategies pick themselves at runtime (sparse vs dense) based on actual coverage.
+Bound to a specific `Tree` via `Tree const&` at construction (stashes `&tree` + `tree.id()`). Every API entry bounds-checks `id.valid() && id.v < tree.nodeCount()` and aborts via local `attrFatal` (same posture as `treeFatal`/`cursorFatal`) on violation. **Caveat — cross-tree guard is bounds-based, not membership-based:** a NodeId from a different tree whose `.v` falls within the bound tree's range slips through. Full membership detection would require tagging every NodeId with its source TreeId, which the project chose against (NodeId is plain `uint32_t` for size). Two storage strategies pick themselves at runtime (sparse vs dense) based on actual coverage.
 
 ```cpp
 template <typename T>
 class NodeAttribute {
 public:
-    // Required: the tree this attribute table belongs to.
-    // Cross-tree lookups (set/get with a NodeId from a different tree) DSS_ASSERT.
-    explicit NodeAttribute(TreeId tree) noexcept;
+    // Required: the tree this attribute table belongs to. Stashes the
+    // Tree& for nodeCount-based bounds checks; an out-of-range NodeId
+    // aborts via attrFatal. (Cross-tree NodeIds in range slip through —
+    // see caveat above.)
+    explicit NodeAttribute(Tree const& tree) noexcept;
 
     void     set(NodeId id, T value);
     bool     has(NodeId id) const;
@@ -1266,7 +1269,7 @@ Each phase produces a self-contained, testable deliverable. Land them in order; 
 | T5  | ✅ done | `tree-builder`        | Schema-aware `TreeBuilder` with RAII `OpenScope` | `tree_builder.hpp/.cpp` | (a) Happy path verified. (b) `P_UnknownToken`/`P_UnexpectedToken` both produce Error nodes with scope-stack snapshot and HasError ancestor walk. (c) `P_PrematureEndOfInput` per unclosed shape, ruleContext-distinct via dedup-hash fix in reporter. (d) EmptySpace flag landed from `meaning.flagsApplied`. (e) `P_AmbiguousToken` warning + first-declared wins. (f) Forward progress guaranteed structurally (one token per `pushToken` call). (g) `OpenScope` RAII + move-only + idempotent close + cascade-cookie tracking. (h) Builder invariants (no-open-frame, popScope underflow, LIFO violation, double-finish) all emit `P_BuilderInvariant` in release. **+9 review-fix improvements** (rvalue-disqualified `open()`, leftover-scope diagnostic, `currentRule()` peek, empty-tree finish, etc.). **22 test cases** including OpenScope move semantics, LIFO cascade, death-test for double `finish()`. |
 | T6  | ✅ done | `tree-cursor`      | CST + AST cursors | `tree_cursor.hpp/.cpp`, `Tree::cursor()`/`astCursor()` entry points restored (v1 §0 deviation #5 closed), `tests/core/raw_tree_builder.hpp`, `tests/core/toy_harness.hpp` | AST skips by `isEmptySpace()` ONLY — `Missing`/`Synthetic` ARE visible (load-bearing). `Bookmark` is opaque (private fields + `friend TreeCursor`) and carries `TreeId` to catch ABA. `restore()` distinguishes three failure modes with distinct fatal messages (invalid / cross-tree / stale TreeId). Movement methods are `[[nodiscard]]`; empty-tree cursor fails cleanly without aborting (every method short-circuits on invalid position). Cycle caps in `depth()` and AST `gotoParent` prevent infinite loops on corrupt parent chains. Convenience forwarders: `text()`, `span()`, `rule()`, `tokenKind()`. **19 test cases** including empty-tree, hand-fabricated Missing/Synthetic preservation, mode-mixing bookmark, cycle paths. |
 | T7  | ✅ done | `tree-visitor`     | Walk helpers | `tree_visitor.hpp`, `tests/core/test_tree_visitor.cpp` | Header-only `walkPreOrder` / `walkPostOrder` over `TreeCursor`. Auto-detects `void`- or `WalkAction`-returning visitors via `if constexpr`. `WalkAction::{Continue, SkipChildren, Stop}`. Subtree-bounded — walks never ascend past the start node (depth-0 guard before sibling/parent moves). Zero allocations on the hot path (state is cursor + one int) — verified by a global `operator new` counter wrapped around 10K-node pre- and post-order walks. Three overloads each (cursor / `Tree`+start / whole `Tree`). **23 test cases** covering void/WalkAction/move-only visitor signatures, pre-/post-order ordering, Skip and Stop control at both mid-walk and start-node positions, symmetric subtree bounding from both left and right internal starts, single-leaf start, AST-mode propagation across BOTH pre- and post-order walks, empty-tree + invalid-start no-ops, and the zero-allocation 10K-node acceptance check. |
-| T8  | ⏳ next | `tree-attrs`       | `NodeAttribute<T>` side-tables | `tree_attrs.hpp` | Required `TreeId` association; cross-tree access debug-asserts. Sparse+dense storage; `set`/`get`/`tryGet`/`has`/`clear`/`size`/iteration. |
+| T8  | ✅ done | `tree-attrs`       | `NodeAttribute<T>` side-tables | `tree_attrs.hpp`, `tests/core/test_tree_attrs.cpp` | Header-only `NodeAttribute<T>` bound to a `Tree const&` (stashes `&tree` + `tree.id()`). Storage is `std::variant<unordered_map<NodeId,T>, vector<optional<T>>>` — starts sparse, auto-promotes to dense when coverage ≥ 50% AND `nodeCount() ≥ 16`. No demotion; `clear()` resets to sparse. Public API: `set`/`erase`/`clear`/`reserve`, `has`/`get`/`tryGet` with both const and mutable overloads (in-place mutation supported), `size`/`empty`/`isDense`/`tree`. Forward iterator template `Iterator_<bool IsConst>` over both backings via internal `std::variant<MapIter, (vec*, idx)>`; yields `std::pair<NodeId, T&>` by value (the reference inside the by-value pair aliases live storage, so `for (auto kv : attr) kv.second.mutate();` works); order unspecified. Bounds check (`id.valid() && id.v < nodeCount()`) on every entry → `attrFatal` aborts on violation. NB: cross-tree guard is **bounds-based, not membership-based** — a NodeId from a different tree whose `.v` falls within the bound tree's range is not detected (full membership would require tagging NodeId with its TreeId, ruled out elsewhere as too heavy). Move-only with custom move ops that reset the source's `denseCount_` + variant so the moved-from observable state is internally consistent (rather than relying on the std-lib's "valid but unspecified" contract). **53 test cases** (40 functional + 13 `EXPECT_DEATH`) covering: two-tree-id disambiguation, const-overload return-type `static_assert`, sparse + dense modes, promotion floor boundary at exactly nc=16 (and nc=15 stays sparse), 50% threshold at even (nc=22) and odd (nc=17) node counts, promotion preserves values + survives mid-life mutation, dense-mode new-entry tracking, erase-below-threshold does NOT demote, promotion is set-only (never triggered by has/get/erase), mutation through get/tryGet/iteration in both modes, dense iteration with internal `nullopt` gaps, sparse iteration after erase, move-only `T = unique_ptr<int>` across promotion, move-construct + move-assign of the attribute leave source with `size()==0`, reserve is a safe no-op in dense mode, every bounds-violation path on every API, absent-NodeId fatals in both backings, and empty-tree fatals on every entry point. |
 | T9  | ⏳ pending | `tree-views`       | Initial typed views | `tree_views.hpp` | `IdentifierView`, `LiteralView`, `BinaryExprView`, `BlockView`, `FunctionDeclView`. Each has `::from(tree, id)` returning `std::optional` based on rule check. |
 | T10 | ⏳ pending | `tree-end-to-end`  | Toy parser + walker demo + broken-input demo | `tests/core/test_tree_end_to_end.cpp` | Drive `TreeBuilder` from a mocked tokenizer against `toy.lang.json`; walk the tree with a visitor; print it. Broken sample produces non-empty `DiagnosticReporter` with expected codes. |
 | T11 | (rolling) | `tree-cmake-wireup` | Per-checkpoint `src/core/CMakeLists.txt` updates | `src/core/CMakeLists.txt` | Folded into each chunk as files land. No separate "wire all files" pass. |
