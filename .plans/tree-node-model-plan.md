@@ -17,8 +17,8 @@ Updated as work progresses. Detailed phase status lives in §7.
 | **T3**  | ParseDiagnostic + DiagnosticReporter + DiagnosticPolicy     | ✅ done |
 | **T4**  | GrammarSchema + SchemaCursor + ScopeKind + JSON loader + `toy.lang.json` | ✅ done |
 | **T5**  | schema-aware `TreeBuilder` (RAII `OpenScope`, recovery)     | ✅ done (review-fix sweep applied) |
-| **T6**  | `TreeCursor` (CST + AST modes)                              | ⏳ next |
-| **T7**  | `tree_visitor.hpp` walk helpers                             | ⏳ pending |
+| **T6**  | `TreeCursor` (CST + AST modes)                              | ✅ done (review-fix sweep applied + loose-ends closed) |
+| **T7**  | `tree_visitor.hpp` walk helpers                             | ⏳ next |
 | **T8**  | `NodeAttribute<T>` side-tables                              | ⏳ pending |
 | **T9**  | initial typed views                                         | ⏳ pending |
 | **T10** | toy-parser end-to-end (happy + broken)                      | ⏳ pending |
@@ -33,7 +33,7 @@ Updated as work progresses. Detailed phase status lives in §7.
 | C++ standard | **23** |
 | Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows |
 | Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
-| Test suite | **136 cases across 12 ctest suites — 100% pass** |
+| Test suite | **156 cases across 13 ctest suites — 100% pass** |
 
 **Files now in `src/core/types/` (all on `core` static lib):**
 
@@ -52,9 +52,14 @@ diagnostic_reporter.hpp/.cpp ← FNV-1a64 dedup hash includes ruleContext
 grammar_schema.hpp/.cpp
 grammar_schema_json.hpp/.cpp ← only TU that includes <nlohmann/json.hpp>
 tree_node.hpp                ← NodeKind, NodeFlags, detail::Node (40 bytes)
-tree.hpp/.cpp                ← detail::TreeData, Tree (immutable, schema- & diagnostics-aware accessors)
+tree.hpp/.cpp                ← detail::TreeData, Tree (immutable, schema- & diagnostics-aware accessors, cursor()/astCursor() entry points)
 tree_builder.hpp/.cpp        ← schema-aware assembler, RAII OpenScope, cascade-cookie tracking
+tree_cursor.hpp/.cpp         ← CST/AST cursor, opaque Bookmark with TreeId guard, convenience forwarders
 ```
+
+**Test-only helpers (`tests/core/`):**
+- `toy_harness.hpp` — shared `ToyHarness` for builder/cursor tests (loads a JSON config, synthesizes tokens; replaces ~60 lines of duplication across two test files).
+- `raw_tree_builder.hpp` — `RawTreeBuilder` for hand-fabricating trees with shapes `TreeBuilder` can't produce (pre-flagged Missing nodes, Synthetic leaves, EmptySpace Internal wrappers).
 
 **Shipped configs:**
 - `src/source-config/languages/toy.lang.json` — minimal Toy language (multi-typed `+`/`<`, scope forbid, sequence/alt/repeat shapes). Loads via `GrammarSchema::loadShipped("toy")`.
@@ -1249,8 +1254,8 @@ Each phase produces a self-contained, testable deliverable. Land them in order; 
 | T3  | ✅ done | `tree-diagnostics`    | Diagnostic types + reporter + policy | `scope_kind.hpp/.cpp`, `parse_diagnostic.hpp/.cpp`, `diagnostic_reporter.hpp/.cpp` | `DiagnosticCode` as `enum class : uint16_t` (P/C/S/I prefix ranges); `RelatedLocation`, scopeStack on every diag; `DiagnosticPolicy` (suppress/overrides/warningsAsErrors); `Config{maxDiagnostics,maxPerCode,dedupWindow}`; FNV-1a64 hash dedup including `ruleContext`; `BufferRegistry`. `format()` produces caret-pointed line + scope + related; `formatAll()` sorts by (buffer, span). **5 + 18 = 23 test cases** (includes ruleContext-in-hash regression). |
 | T4  | ✅ done | `tree-schema-loader`  | `GrammarSchema` + `SchemaCursor` + `ScopeKind` + JSON loader + toy config | `grammar_schema.hpp/.cpp`, `grammar_schema_json.hpp/.cpp`, `schema_cursor.hpp`, `src/source-config/languages/toy.lang.json` | `GrammarSchemaData` POD mirrors Tree/TreeData split (no friend gymnastics). `LoadResult<T>` = `std::expected<T, vector<ConfigDiagnostic>>`. Pre-interns `Identifier`/`IntLiteral`/etc. as built-in token kinds. Walks parent dirs in `loadShipped` to be cwd-agnostic. nlohmann/json linked PRIVATE — no leak. **19 test cases** covering happy path + every C_* code. |
 | T5  | ✅ done | `tree-builder`        | Schema-aware `TreeBuilder` with RAII `OpenScope` | `tree_builder.hpp/.cpp` | (a) Happy path verified. (b) `P_UnknownToken`/`P_UnexpectedToken` both produce Error nodes with scope-stack snapshot and HasError ancestor walk. (c) `P_PrematureEndOfInput` per unclosed shape, ruleContext-distinct via dedup-hash fix in reporter. (d) EmptySpace flag landed from `meaning.flagsApplied`. (e) `P_AmbiguousToken` warning + first-declared wins. (f) Forward progress guaranteed structurally (one token per `pushToken` call). (g) `OpenScope` RAII + move-only + idempotent close + cascade-cookie tracking. (h) Builder invariants (no-open-frame, popScope underflow, LIFO violation, double-finish) all emit `P_BuilderInvariant` in release. **+9 review-fix improvements** (rvalue-disqualified `open()`, leftover-scope diagnostic, `currentRule()` peek, empty-tree finish, etc.). **22 test cases** including OpenScope move semantics, LIFO cascade, death-test for double `finish()`. |
-| T6  | ⏳ next | `tree-cursor`      | CST + AST cursors | `tree_cursor.hpp/.cpp` | AST mode skips by `isEmptySpace()` bit ONLY — `Missing`/`Synthetic` ARE visible. `Bookmark { tree*, id }` cross-tree restore debug-asserts. |
-| T7  | ⏳ pending | `tree-visitor`     | Walk helpers | `tree_visitor.hpp` | Pre-order/post-order/skip-control over `TreeCursor`. Zero-alloc 10K-node walk. |
+| T6  | ✅ done | `tree-cursor`      | CST + AST cursors | `tree_cursor.hpp/.cpp`, `Tree::cursor()`/`astCursor()` entry points restored (v1 §0 deviation #5 closed), `tests/core/raw_tree_builder.hpp`, `tests/core/toy_harness.hpp` | AST skips by `isEmptySpace()` ONLY — `Missing`/`Synthetic` ARE visible (load-bearing). `Bookmark` is opaque (private fields + `friend TreeCursor`) and carries `TreeId` to catch ABA. `restore()` distinguishes three failure modes with distinct fatal messages (invalid / cross-tree / stale TreeId). Movement methods are `[[nodiscard]]`; empty-tree cursor fails cleanly without aborting (every method short-circuits on invalid position). Cycle caps in `depth()` and AST `gotoParent` prevent infinite loops on corrupt parent chains. Convenience forwarders: `text()`, `span()`, `rule()`, `tokenKind()`. **19 test cases** including empty-tree, hand-fabricated Missing/Synthetic preservation, mode-mixing bookmark, cycle paths. |
+| T7  | ⏳ next | `tree-visitor`     | Walk helpers | `tree_visitor.hpp` | Pre-order/post-order/skip-control over `TreeCursor`. Zero-alloc 10K-node walk. |
 | T8  | ⏳ pending | `tree-attrs`       | `NodeAttribute<T>` side-tables | `tree_attrs.hpp` | Required `TreeId` association; cross-tree access debug-asserts. Sparse+dense storage; `set`/`get`/`tryGet`/`has`/`clear`/`size`/iteration. |
 | T9  | ⏳ pending | `tree-views`       | Initial typed views | `tree_views.hpp` | `IdentifierView`, `LiteralView`, `BinaryExprView`, `BlockView`, `FunctionDeclView`. Each has `::from(tree, id)` returning `std::optional` based on rule check. |
 | T10 | ⏳ pending | `tree-end-to-end`  | Toy parser + walker demo + broken-input demo | `tests/core/test_tree_end_to_end.cpp` | Drive `TreeBuilder` from a mocked tokenizer against `toy.lang.json`; walk the tree with a visitor; print it. Broken sample produces non-empty `DiagnosticReporter` with expected codes. |
