@@ -261,6 +261,51 @@ TEST(GrammarSchema, LoadShippedToy) {
     }
 }
 
+// Pins the cookbook example in docs/language-config-spec.md §7 against the
+// loader. If this fails, the doc's "Loads cleanly because:" claims are wrong.
+TEST(GrammarSchema, DocsCookbookCalcExampleLoadsCleanly) {
+    constexpr std::string_view kCalcCookbook = R"JSON({
+  "dssSchemaVersion": 1,
+
+  "language": {
+    "name":           "Calc",
+    "version":        "0.1.0",
+    "fileExtensions": [".calc"]
+  },
+
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+
+    "+":  [{ "kind": "PlusOp" }],
+    "-":  [{ "kind": "MinusOp" }],
+    "=":  [{ "kind": "EqOp" }],
+    ";":  [{ "kind": "End" }],
+
+    "(":  [{ "kind": "ParenOpen",  "opensScope": "Paren" }],
+    ")":  [{ "kind": "ParenClose", "closesScope": true   }]
+  },
+
+  "keywords": [
+    { "word": "let", "kind": "LetKeyword" }
+  ],
+
+  "shapes": {
+    "root":     { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":     { "alt":      ["letDecl", "exprStmt"] },
+    "letDecl":  { "sequence": ["LetKeyword", "Identifier", "EqOp", "IntLiteral", "End"] },
+    "exprStmt": { "sequence": ["IntLiteral", "End"] }
+  }
+})JSON";
+
+    auto result = GrammarSchema::loadFromText(kCalcCookbook);
+    ASSERT_TRUE(result.has_value())
+        << "docs cookbook failed to load: "
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    EXPECT_EQ((*result)->name(), "Calc");
+}
+
 TEST(GrammarSchema, LoadShippedRejectsPathLikeNames) {
     auto a = GrammarSchema::loadShipped("../etc/passwd");
     auto b = GrammarSchema::loadShipped("/abs/path");
