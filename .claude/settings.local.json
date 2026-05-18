@@ -38,7 +38,9 @@
       "PowerShell(& C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tree_end_to_end.exe 2>&1 | Select-Object -Last 80)",
       "PowerShell(& C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tree_end_to_end.exe 2>&1 | Select-Object -Last 40)",
       "Bash(gh pr *)",
-      "Bash(git fetch *)"
+      "Bash(git fetch *)",
+      "Bash(gh run *)",
+      "Bash(git *)"
     ]
   }
 }
