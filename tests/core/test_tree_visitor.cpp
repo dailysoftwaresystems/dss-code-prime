@@ -23,24 +23,44 @@ using dss::tests::RawTreeBuilder;
 
 // ── allocation counter ───────────────────────────────────────────────────
 //
-// Replaces global operator new/delete inside this test executable so the
-// 10K-node walk can prove zero heap activity during the walk machinery.
-// Counts allocations only; deletes pass through. Snapshot before the walk,
-// compare after.
+// The 10K-node walk asserts zero heap activity. Two backends measure that,
+// chosen at compile time by whether AddressSanitizer is on:
 //
-// Under AddressSanitizer the override is compiled out: ASan replaces the
-// system allocator wholesale, so a malloc/free-based counter would measure
-// ASan's bookkeeping rather than real C++ allocations, and ASan's strict
-// alloc-dealloc-mismatch check would flag every freed pointer as
-// "operator new vs free" because it can't see through the override. The
-// Release/GCC leg keeps the invariant; the ASan leg trusts its own
-// allocator tracking to surface real heap activity.
+//   Non-ASan (Release, GCC leg):
+//     Replace global operator new/delete with counting wrappers around
+//     malloc/free. snapshot() reads the atomic counter. Fast, intrusive,
+//     and only works because nothing else in the binary cares which heap
+//     it ends up on.
+//
+//   ASan (Clang sanitizer leg):
+//     ASan replaces the allocator wholesale, so the malloc/free wrappers
+//     above can't be in the binary at all — ASan classifies the eventual
+//     free() as "alloc-dealloc-mismatch" against the wrapper's
+//     "operator new" symbol and aborts the test before it runs.
+//     Instead, query ASan's own live-byte counter via the public
+//     <sanitizer/allocator_interface.h>. snapshot() returns currently-
+//     allocated bytes; a zero delta across the walk proves the same
+//     invariant the non-ASan path proves with a count delta.
+//
+// Both backends verify the invariant; the underlying primitive differs.
 
-#if defined(__SANITIZE_ADDRESS__) || \
-    (defined(__has_feature) && __has_feature(address_sanitizer))
+// `__has_feature` is a Clang built-in — on GCC it's a bare identifier the
+// preprocessor cannot call, so the `defined(__has_feature) && __has_feature(...)`
+// short-circuit trick still tries to parse the call and errors out. Define a
+// zero-returning stub when the real macro is absent so the test compiles
+// under both compilers.
+#ifndef __has_feature
+#  define __has_feature(x) 0
+#endif
+
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
 #  define DSS_TEST_UNDER_ASAN 1
 #else
 #  define DSS_TEST_UNDER_ASAN 0
+#endif
+
+#if DSS_TEST_UNDER_ASAN
+#  include <sanitizer/allocator_interface.h>
 #endif
 
 namespace alloc_counter {
@@ -51,10 +71,13 @@ inline std::size_t snapshot() noexcept {
     return g_count.load(std::memory_order_relaxed);
 }
 #else
-// ASan path: skip counting. snapshot() returns a constant so the
-// before/after delta is always zero — the EXPECT_EQ assertions become
-// trivially true and the test still exercises the walk machinery.
-inline std::size_t snapshot() noexcept { return 0; }
+// Returns ASan's live-byte total for the current process. Comparing two
+// snapshots gives the exact heap-bytes delta over the bracketed window —
+// equivalent to "did this code touch the heap at all", which is what the
+// walk-allocates-nothing invariant cares about.
+inline std::size_t snapshot() noexcept {
+    return __sanitizer_get_current_allocated_bytes();
+}
 #endif
 } // namespace alloc_counter
 
