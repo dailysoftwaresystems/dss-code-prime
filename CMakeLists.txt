@@ -28,6 +28,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
+# OBJECT libraries under src/ (core, gen, program) feed dss-code-prime-lib,
+# which is SHARED. CMake doesn't auto-enable -fPIC on OBJECT libs, so without
+# this the Linux link step rejects their .o files with "relocation … cannot
+# be used when making a shared object; recompile with -fPIC". Setting it
+# globally also future-proofs any STATIC-into-SHARED linking we add later.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Place DSS compiler binaries in bin/dss/
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/dss)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/dss)

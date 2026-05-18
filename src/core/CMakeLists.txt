@@ -17,6 +17,13 @@ add_library(core OBJECT
 
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+# These OBJECT-lib sources are the actual compilation units that get folded
+# into dss-code-prime-lib (SHARED) via $<TARGET_OBJECTS:core>. Setting the
+# defines on the SHARED target would not reach them — $<TARGET_OBJECTS> only
+# copies finished .o files, not usage requirements — so DSS_BUILDING_DLL has
+# to live here for __declspec(dllexport) in core/export.hpp to fire on MSVC.
+target_compile_definitions(core PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
+
 # nlohmann/json is included by exactly one translation unit
 # (grammar_schema_json.cpp). PRIVATE keeps the include path off the
 # transitive consumers — every other file in `core` (and every consumer
