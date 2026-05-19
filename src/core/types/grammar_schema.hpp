@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/compiled_shape.hpp"
+#include "core/types/lexer_mode.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/rule_id.hpp"
@@ -79,6 +80,13 @@ struct DSS_EXPORT LexemeMeaning {
     // (`reservedWordPolicy: "contextual"`).
     bool             contextual    = false;
     ScopeMatch       scopeRequire{};
+    // Lexer-mode-stack effect applied by the tokenizer (when it lands)
+    // immediately after this meaning is produced. v1 configs have no
+    // mode info — defaults to `None` (no effect). `modeArg` references
+    // the target mode for Push/Replace; ignored for Pop. Resolved at
+    // load time so the tokenizer doesn't re-walk strings per token.
+    ModeOp           modeOp        = ModeOp::None;
+    LexerModeId      modeArg{};
 };
 
 static_assert(std::is_trivially_copyable_v<LexemeMeaning>,
@@ -151,6 +159,28 @@ struct DSS_EXPORT GrammarSchemaData {
     // "contextual"` in JSON flips this to Contextual, and the loader
     // also forces `contextual = true` on every keyword's LexemeMeaning.
     ReservedWordPolicy reservedWordPolicy = ReservedWordPolicy::Strict;
+
+    // ── Lexer-mode tables ──
+    // `lexerModes` holds the metadata (name, id, defaultToken) for each
+    // declared mode; indexed by LexerModeId.v. Always contains at least
+    // one mode ("main") — the loader synthesizes it when `lexerModes`
+    // is absent from JSON, so consumers can pull from `lexerModes` even
+    // for v1 configs without special-casing.
+    //
+    // `lexerModeIds` is the reverse map for loader-time name resolution.
+    //
+    // `lexerModeTokens` is per-mode lexeme → meanings. Keyed by
+    // LexerModeId.v. The "main" mode's table is a superset of the
+    // top-level `tokens` map plus any inline tokens declared on
+    // `lexerModes.main`; on per-lexeme conflict, inline wins. Other
+    // modes hold whatever the config declared inline (plus the
+    // top-level map when they say `tokens: "default"`).
+    std::vector<LexerMode>                            lexerModes;
+    std::unordered_map<std::string, LexerModeId>      lexerModeIds;
+    std::unordered_map<std::uint32_t,
+                       std::unordered_map<std::string,
+                                          std::vector<LexemeMeaning>>>
+                                                      lexerModeTokens;
 };
 
 } // namespace detail
@@ -191,6 +221,26 @@ public:
     [[nodiscard]] ReservedWordPolicy reservedWordPolicy() const noexcept {
         return d_.reservedWordPolicy;
     }
+
+    // ── Lexer modes ──
+    // The compiled mode table. Always non-empty: contains at least
+    // "main" (synthesized when `lexerModes` is absent from JSON).
+    [[nodiscard]] std::span<LexerMode const> lexerModes() const noexcept {
+        return d_.lexerModes;
+    }
+
+    // Lookup a mode by name. Returns InvalidLexerMode if not found.
+    [[nodiscard]] LexerModeId findLexerMode(std::string_view name) const noexcept;
+
+    // Lookup a mode by id. Aborts via the strong-id contract if `id`
+    // doesn't refer to a real mode in this schema.
+    [[nodiscard]] LexerMode const& lexerMode(LexerModeId id) const noexcept;
+
+    // Per-mode lexeme lookup. Empty span if the mode has no entries
+    // for `lexeme`. Mode-aware analogue of `lookupLexeme(lexeme)`,
+    // which queries the "main" mode by convention.
+    [[nodiscard]] std::span<LexemeMeaning const>
+        lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept;
 
     // ── Shape navigation ──
     //

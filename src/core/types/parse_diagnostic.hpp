@@ -75,6 +75,7 @@ enum class DiagnosticCode : std::uint16_t {
     C_ConflictingField            = 0xC024,
     C_UnknownScopeName            = 0xC025,
     C_RedundantField              = 0xC026,
+    C_UnknownLexerMode            = 0xC027,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

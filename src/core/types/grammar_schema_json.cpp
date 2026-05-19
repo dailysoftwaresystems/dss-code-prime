@@ -79,6 +79,81 @@ struct Collector {
 // builder still works, but every pushToken pays an O(N×stack) scan.
 constexpr std::size_t kScopeListSoftCap = 32;
 
+void parseModeFields(json const& m,
+                     std::string const& entryPath,
+                     std::unordered_map<std::string, LexerModeId> const& modeIds,
+                     LexemeMeaning& lm,
+                     Collector& c) {
+    const bool hasOp  = m.contains("modeOp");
+    const bool hasArg = m.contains("modeArg");
+    if (!hasOp && !hasArg) return;
+
+    if (!hasOp) {
+        c.emit(DiagnosticCode::C_ConflictingField,
+               std::format("{}/modeArg", entryPath),
+               "'modeArg' is meaningless without 'modeOp'");
+        return;
+    }
+    if (!m.at("modeOp").is_string()) {
+        c.emit(DiagnosticCode::C_ConflictingField,
+               std::format("{}/modeOp", entryPath),
+               "'modeOp' must be a string ('pushMode' | 'popMode' | 'replaceMode')");
+        return;
+    }
+    const auto opStr = m.at("modeOp").get<std::string>();
+    ModeOp op = ModeOp::None;
+    if      (opStr == "pushMode")    op = ModeOp::PushMode;
+    else if (opStr == "popMode")     op = ModeOp::PopMode;
+    else if (opStr == "replaceMode") op = ModeOp::ReplaceMode;
+    else {
+        c.emit(DiagnosticCode::C_ConflictingField,
+               std::format("{}/modeOp", entryPath),
+               std::format("unknown modeOp '{}' (expected 'pushMode' | 'popMode' | 'replaceMode')",
+                           opStr));
+        return;
+    }
+
+    LexerModeId arg{};
+    if (hasArg) {
+        if (!m.at("modeArg").is_string()) {
+            c.emit(DiagnosticCode::C_ConflictingField,
+                   std::format("{}/modeArg", entryPath),
+                   "'modeArg' must be a string mode name");
+            return;
+        }
+        const auto target = m.at("modeArg").get<std::string>();
+        auto it = modeIds.find(target);
+        if (it == modeIds.end()) {
+            c.emit(DiagnosticCode::C_UnknownLexerMode,
+                   std::format("{}/modeArg", entryPath),
+                   std::format("unknown lexer mode '{}'", target));
+            return;
+        }
+        arg = it->second;
+    }
+
+    if (op == ModeOp::PushMode || op == ModeOp::ReplaceMode) {
+        if (!hasArg) {
+            c.emit(DiagnosticCode::C_ConflictingField,
+                   std::format("{}/modeOp", entryPath),
+                   std::format("'modeOp: {}' requires 'modeArg' naming the target mode",
+                               opStr));
+            return;
+        }
+    } else if (op == ModeOp::PopMode) {
+        if (hasArg) {
+            c.emit(DiagnosticCode::C_RedundantField,
+                   std::format("{}/modeArg", entryPath),
+                   "'modeArg' has no effect with 'modeOp: popMode'",
+                   DiagnosticSeverity::Warning);
+            arg = LexerModeId{};                     // ignore the value
+        }
+    }
+
+    lm.modeOp  = op;
+    lm.modeArg = arg;
+}
+
 // Parse a JSON array of scope names into vector<ScopeKind>. Unknown
 // names emit C_UnknownScopeName and are dropped; non-string elements
 // emit C_ConflictingField with the index path. The walk continues on
@@ -114,6 +189,18 @@ std::vector<ScopeKind> parseScopeArray(json const& arr,
     }
     return out;
 }
+
+// Parse `modeOp` + `modeArg` on a token meaning entry. Mutates `lm`
+// in-place. `modeIds` is the table built during lexer-modes Pass 1
+// (top-level name registration). Emits diagnostics for unknown ops,
+// missing modeArg on push/replace, redundant modeArg on pop, and
+// unresolved mode references. Silently no-ops when neither field is
+// present.
+inline void parseModeFields(nlohmann::json const& m,
+                            std::string const& entryPath,
+                            std::unordered_map<std::string, LexerModeId> const& modeIds,
+                            LexemeMeaning& lm,
+                            struct Collector& c);
 
 // Parse a single scope-name string field into ScopeKind. Returns
 // nullopt if the field is missing, wrong type, or names a scope the
@@ -733,6 +820,55 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     data.rules        = std::make_shared<RuleInterner>();
     data.schemaTokens = std::make_shared<SchemaTokenInterner>();
 
+    // ── Lexer modes — name registration (Pass 1) ─────────────────────
+    //
+    // Walk `lexerModes` first to register every mode name → LexerModeId
+    // BEFORE any token meaning is parsed. Token meanings carrying
+    // `modeOp: pushMode/replaceMode` need their `modeArg` resolved
+    // against an existing mode-name table; without this Pass 1,
+    // forward references inside the same `lexerModes` object would
+    // silently fail to resolve.
+    //
+    // Always synthesize a "main" mode at id 1 — even when the config
+    // doesn't declare `lexerModes` — so the tokenizer phase (when it
+    // lands) can pull from `lexerModes()` uniformly without special-
+    // casing v1 configs. The id assignment is dense [1..N]; id 0 is
+    // reserved as the InvalidLexerMode sentinel.
+    auto registerMode = [&](std::string const& name) -> LexerModeId {
+        auto it = data.lexerModeIds.find(name);
+        if (it != data.lexerModeIds.end()) return it->second;
+        const LexerModeId id{static_cast<std::uint32_t>(data.lexerModes.size())};
+        // We reserved slot 0 for InvalidLexerMode; bump every real mode
+        // to start at id 1. Push a dummy sentinel into the vector once,
+        // on first call, so indices match LexerModeId.v.
+        if (data.lexerModes.empty()) {
+            data.lexerModes.push_back(LexerMode{});  // index 0 = invalid
+        }
+        const LexerModeId realId{
+            static_cast<std::uint32_t>(data.lexerModes.size())};
+        LexerMode m;
+        m.name = name;
+        m.id   = realId;
+        data.lexerModes.push_back(std::move(m));
+        data.lexerModeIds.emplace(name, realId);
+        (void)id;
+        return realId;
+    };
+
+    // Synthesize "main" first so it always has id 1.
+    const LexerModeId mainModeId = registerMode("main");
+
+    if (doc.contains("lexerModes")) {
+        if (!doc.at("lexerModes").is_object()) {
+            coll.emit(DiagnosticCode::C_ConflictingField, "/lexerModes",
+                      "'lexerModes' must be an object");
+        } else {
+            for (auto const& [modeName, _] : doc.at("lexerModes").items()) {
+                (void)registerMode(modeName);
+            }
+        }
+    }
+
     // Pre-intern built-in token kinds.
     for (auto name : kBuiltinTokenKindNames) {
         (void)data.schemaTokens->intern(name);
@@ -957,6 +1093,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // weakened by the loader's silent fallback.
                         continue;
                     }
+                    parseModeFields(m, entryPath, data.lexerModeIds, lm, coll);
                     meanings.push_back(lm);
                 }
 
@@ -1017,6 +1154,67 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             }
 
             data.lexemeTable[kw.at("word").get<std::string>()].push_back(lm);
+        }
+    }
+
+    // ── Lexer modes — per-mode population (Pass 2) ───────────────────
+    //
+    // After top-level tokens + keywords are parsed into `lexemeTable`,
+    // populate `lexerModeTokens` for every registered mode. The "main"
+    // mode always inherits the top-level table (it IS the v1 token map);
+    // other modes parse their inline `tokens`/`defaultToken` from the
+    // `lexerModes` object. Per-mode inline tokens parsing of the full
+    // meaning shape is a follow-up; today only `defaultToken` is wired
+    // (the lookup-by-mode API works; tokenizer-specific tokens lists
+    // come when the tokenizer ships and the use case is real).
+    if (mainModeId.valid()) {
+        data.lexerModeTokens[mainModeId.v] = data.lexemeTable;
+    }
+    if (doc.contains("lexerModes") && doc.at("lexerModes").is_object()) {
+        for (auto const& [modeName, modeObj] : doc.at("lexerModes").items()) {
+            const auto modePath = std::format("/lexerModes/{}", modeName);
+            if (!modeObj.is_object()) {
+                coll.emit(DiagnosticCode::C_ConflictingField, modePath,
+                          "mode definition must be an object");
+                continue;
+            }
+            auto modeIt = data.lexerModeIds.find(modeName);
+            if (modeIt == data.lexerModeIds.end()) continue;   // unreachable
+            const LexerModeId modeId = modeIt->second;
+
+            // `defaultToken: { "kind": "X" }` — emitted by the tokenizer
+            // when nothing else matches the input.
+            if (modeObj.contains("defaultToken")) {
+                json const& dt = modeObj.at("defaultToken");
+                if (!dt.is_object() || !dt.contains("kind") ||
+                    !dt.at("kind").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/defaultToken", modePath),
+                              "'defaultToken' must be an object with a string 'kind'");
+                } else {
+                    data.lexerModes[modeId.v].defaultToken =
+                        data.schemaTokens->intern(dt.at("kind").get<std::string>());
+                }
+            }
+
+            // `tokens: "default"` — inherit the top-level table.
+            // Any other shape is documented but not parsed in this PR;
+            // a follow-up will land per-mode inline tokens parsing.
+            if (modeObj.contains("tokens")) {
+                json const& tk = modeObj.at("tokens");
+                if (tk.is_string() && tk.get<std::string>() == "default") {
+                    data.lexerModeTokens[modeId.v] = data.lexemeTable;
+                } else if (tk.is_object()) {
+                    // Per-mode inline tokens: parsing landed in a
+                    // follow-up. Today the mode's lookup table stays
+                    // empty unless the author also uses top-level
+                    // `tokens` (which "main" inherits).
+                } else {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/tokens", modePath),
+                              "'tokens' must be 'default' or an inline tokens object");
+                }
+            }
         }
     }
 

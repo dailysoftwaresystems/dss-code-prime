@@ -34,6 +34,7 @@ DSS_STRONG_ID(SchemaTokenId);
 DSS_STRONG_ID(BufferId);
 DSS_STRONG_ID(TreeId);
 DSS_STRONG_ID(DiagnosticIndex);
+DSS_STRONG_ID(LexerModeId);
 
 #undef DSS_STRONG_ID
 
@@ -43,6 +44,7 @@ inline constexpr SchemaTokenId   InvalidSchemaToken{};
 inline constexpr BufferId        InvalidBuffer{};
 inline constexpr TreeId          InvalidTree{};
 inline constexpr DiagnosticIndex InvalidDiagnostic{};
+inline constexpr LexerModeId     InvalidLexerMode{};
 
 } // namespace dss
 
@@ -60,5 +62,6 @@ DSS_HASH_ID(SchemaTokenId);
 DSS_HASH_ID(BufferId);
 DSS_HASH_ID(TreeId);
 DSS_HASH_ID(DiagnosticIndex);
+DSS_HASH_ID(LexerModeId);
 
 #undef DSS_HASH_ID

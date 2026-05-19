@@ -10,6 +10,7 @@ add_library(core OBJECT
     types/diagnostic_reporter.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
+    types/lexer_mode.cpp
     types/tree.cpp
     types/tree_builder.cpp
     types/tree_cursor.cpp

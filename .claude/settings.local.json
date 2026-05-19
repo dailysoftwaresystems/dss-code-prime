@@ -76,7 +76,8 @@
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_grammar_schema.exe\" 2>&1 | Select-String -Pattern \"\\(FAILED|Expected|Actual\\)\" | Select-Object -First 30)",
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_scope_require.exe\" 2>&1 | Select-String \"PASSED\" | Select-Object -Last 1)",
       "Bash(cmake --build C:/Source/DailySoftware/dss-code-prime/build --clean-first)",
-      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_checkpoint.exe\" 2>&1 | Select-Object -Last 50)"
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_checkpoint.exe\" 2>&1 | Select-Object -Last 50)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_checkpoint.exe\" 2>&1 | Select-String \"PASSED|FAILED\" | Select-Object -Last 5)"
     ]
   }
 }
