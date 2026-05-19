@@ -65,6 +65,7 @@ enum class DiagnosticCode : std::uint16_t {
     C_UnclosableScope             = 0xC011,
     C_MalformedJson               = 0xC020,
     C_InvalidLanguageName         = 0xC021,
+    C_InvalidPrecedenceTable      = 0xC022,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

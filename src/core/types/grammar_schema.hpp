@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/schema_cursor.hpp"
@@ -91,6 +92,11 @@ struct DSS_EXPORT GrammarSchemaData {
     // Per-rule "expected names" — populated at load time so expectedAt()
     // returns a stable span (no allocation per call).
     std::unordered_map<std::uint32_t, std::vector<std::string>> expectedAt;
+
+    // Operator precedence + associativity by (SchemaTokenId, arity).
+    // Empty when the config has no `operators` section. Read-only after
+    // construction; the loader is the only writer.
+    OperatorTable operators;
 };
 
 } // namespace detail
@@ -123,6 +129,9 @@ public:
     // ── Token recognition ──
     [[nodiscard]] std::span<LexemeMeaning const> lookupLexeme(std::string_view lexeme) const noexcept;
     [[nodiscard]] bool isEmptySpace(SchemaTokenId id) const noexcept;
+
+    // ── Operators (v2) ──
+    [[nodiscard]] OperatorTable const& operatorTable() const noexcept { return d_.operators; }
 
     // ── Shape navigation ──
     [[nodiscard]] SchemaCursor rootCursor() const noexcept;

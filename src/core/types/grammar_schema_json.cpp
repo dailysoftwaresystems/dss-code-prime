@@ -1,6 +1,7 @@
 #include "core/types/grammar_schema_json.hpp"
 
 #include "core/types/grammar_schema.hpp"
+#include "core/types/operator_table.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
@@ -135,7 +136,23 @@ void collectReferences(json const& body,
         collectReferences(body.at("repeat"),
                           std::format("{}/repeat", path), outRefs, c);
     }
-    // `binary` etc. — future expansion. Silently skip.
+    // `expr` — Pratt-style expression shape. The body is an object with an
+    // `atom` rule reference (required) and an optional `minPrecedence`. The
+    // parser (when it exists) reads `operatorTable()` to climb; the loader
+    // only validates the atom reference resolves to a known rule.
+    if (body.contains("expr")) {
+        json const& exprBody = body.at("expr");
+        const auto exprPath = std::format("{}/expr", path);
+        if (!exprBody.is_object()) {
+            c.emit(DiagnosticCode::C_MissingField, exprPath,
+                   "'expr' body must be an object with an 'atom' field");
+        } else if (!exprBody.contains("atom") || !exprBody.at("atom").is_string()) {
+            c.emit(DiagnosticCode::C_MissingField, exprPath,
+                   "'expr' requires a string 'atom' field naming the operand rule");
+        } else {
+            outRefs.push_back(exprBody.at("atom").get<std::string>());
+        }
+    }
 }
 
 } // anonymous namespace
@@ -328,6 +345,151 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             LexemeMeaning lm{};
             lm.id = data.schemaTokens->intern(kw.at("kind").get<std::string>());
             data.lexemeTable[kw.at("word").get<std::string>()].push_back(lm);
+        }
+    }
+
+    // operators ──
+    // Lifts the JSON's `operators.groups[]` into the dense OperatorTable.
+    // Runs AFTER tokens + keywords so every referenced lexeme is already
+    // in lexemeTable and every referenced kind is already interned in
+    // schemaTokens. Multi-meaning lexemes require an explicit `kind` field
+    // on the group; single-meaning lexemes resolve automatically. The
+    // single source of truth for operator metadata is data.operators —
+    // LexemeMeaning is deliberately NOT extended with precedence fields,
+    // so lexeme resolution and operator metadata stay decoupled.
+    if (doc.contains("operators")) {
+        json const& opsObj = doc.at("operators");
+        if (!opsObj.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, "/operators",
+                      "'operators' must be an object");
+        } else if (!opsObj.contains("groups") || !opsObj.at("groups").is_array()) {
+            coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, "/operators/groups",
+                      "'operators.groups' must be an array");
+        } else {
+            json const& groups = opsObj.at("groups");
+            for (std::size_t i = 0; i < groups.size(); ++i) {
+                json const& g = groups[i];
+                const auto gPath = std::format("/operators/groups/{}", i);
+
+                if (!g.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "group must be an object");
+                    continue;
+                }
+                if (!g.contains("precedence") || !g.at("precedence").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "group requires integer 'precedence'");
+                    continue;
+                }
+                const auto precedence = g.at("precedence").get<std::int32_t>();
+
+                OperatorAssoc assoc = OperatorAssoc::None;
+                if (g.contains("associativity")) {
+                    if (!g.at("associativity").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'associativity' must be a string");
+                        continue;
+                    }
+                    const auto a = g.at("associativity").get<std::string>();
+                    if      (a == "left")  assoc = OperatorAssoc::Left;
+                    else if (a == "right") assoc = OperatorAssoc::Right;
+                    else if (a == "none")  assoc = OperatorAssoc::None;
+                    else {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("unknown associativity '{}' (expected left|right|none)", a));
+                        continue;
+                    }
+                }
+
+                OperatorArity arity = OperatorArity::Infix;
+                if (g.contains("arity")) {
+                    if (!g.at("arity").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'arity' must be a string");
+                        continue;
+                    }
+                    const auto a = g.at("arity").get<std::string>();
+                    if      (a == "infix")   arity = OperatorArity::Infix;
+                    else if (a == "prefix")  arity = OperatorArity::Prefix;
+                    else if (a == "postfix") arity = OperatorArity::Postfix;
+                    else {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("unknown arity '{}' (expected infix|prefix|postfix)", a));
+                        continue;
+                    }
+                }
+
+                if (!g.contains("operators") || !g.at("operators").is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "group requires an 'operators' array");
+                    continue;
+                }
+
+                // Optional `kind` disambiguates groups whose lexemes have
+                // multiple meanings. When omitted, every lexeme in this
+                // group must have a single meaning.
+                std::optional<std::string> explicitKind;
+                if (g.contains("kind")) {
+                    if (!g.at("kind").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'kind' must be a string");
+                        continue;
+                    }
+                    explicitKind = g.at("kind").get<std::string>();
+                    if (!data.schemaTokens->contains(*explicitKind)) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("group 'kind' '{}' is not a declared token kind",
+                                              *explicitKind));
+                        continue;
+                    }
+                }
+
+                const OperatorTable::Entry entry{precedence, assoc};
+
+                for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
+                    json const& op = g.at("operators")[j];
+                    const auto opPath = std::format("{}/operators/{}", gPath, j);
+                    if (!op.is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                  "operator entry must be a string lexeme");
+                        continue;
+                    }
+                    const auto lex = op.get<std::string>();
+
+                    auto it = data.lexemeTable.find(lex);
+                    if (it == data.lexemeTable.end() || it->second.empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                  std::format("operator lexeme '{}' is not declared in 'tokens' or 'keywords'", lex));
+                        continue;
+                    }
+                    auto const& meanings = it->second;
+
+                    SchemaTokenId targetId;
+                    if (explicitKind) {
+                        const auto explicitId = data.schemaTokens->intern(*explicitKind);
+                        bool found = false;
+                        for (auto const& m : meanings) {
+                            if (m.id.v == explicitId.v) { found = true; break; }
+                        }
+                        if (!found) {
+                            coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                      std::format("group 'kind' '{}' is not a meaning of lexeme '{}'",
+                                                  *explicitKind, lex));
+                            continue;
+                        }
+                        targetId = explicitId;
+                    } else if (meanings.size() == 1) {
+                        targetId = meanings[0].id;
+                    } else {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                  std::format("lexeme '{}' has {} meanings; group must specify 'kind' to disambiguate",
+                                              lex, meanings.size()));
+                        continue;
+                    }
+
+                    data.operators.insert(targetId, arity, entry);
+                }
+            }
         }
     }
 

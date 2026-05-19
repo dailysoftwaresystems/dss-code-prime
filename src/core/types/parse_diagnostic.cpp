@@ -41,6 +41,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_UnclosableScope:          return "C_UnclosableScope";
         case DiagnosticCode::C_MalformedJson:            return "C_MalformedJson";
         case DiagnosticCode::C_InvalidLanguageName:      return "C_InvalidLanguageName";
+        case DiagnosticCode::C_InvalidPrecedenceTable:   return "C_InvalidPrecedenceTable";
     }
     return "Unknown";
 }

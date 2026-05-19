@@ -14,13 +14,33 @@
 
 | | |
 |---|---|
-| Status        | 🟢 **Ready to start.** v1 sub-plan T0–T12 has shipped — 278 ctest cases across 17 suites, 100% pass. The empirical trigger is met: a real-language `.lang.json` can now be drafted against a complete, schema-aware, diagnostics-aware foundation. |
-| Trigger       | ✅ v1 complete. PR0 (`c-subset.lang.json`) is the next action. |
-| Predecessors  | ✅ v1 T1–T12 (`tree-node-model-plan.md`). ⚠️ "minimal end-to-end pipeline (tokenize → parse → IR → emit)" — **NOT done**. T10 ships an E2E test that drives `TreeBuilder` via hand-constructed token streams; no real lexer/parser/IR exists yet. PR0 inherits this constraint (see §0.2). |
+| Status        | 🟡 **In flight.** PR0 ✅ shipped (c-subset config, loader version-window bump, gap catalog, 6 new tests). PR1 ✅ shipped (OperatorTable + loader `operators` section + `expr` shape kind + c-subset operator table). 289 ctest cases across 18 suites, 100% pass. PR2a (schema cursor) is the next critical-path item. |
+| Trigger       | ✅ v1 complete; PR0 and PR1 shipped. |
+| Predecessors  | ✅ v1 T1–T12 (`tree-node-model-plan.md`). ⚠️ "minimal end-to-end pipeline (tokenize → parse → IR → emit)" — **NOT done**. T10 ships an E2E test that drives `TreeBuilder` via hand-constructed token streams; no real lexer/parser/IR exists yet. PR0/PR1 inherit this constraint (see §0.2). |
 | Successors    | `languages-onboarding-plan.md` (authoring `csharp` / `dart` / `tsql` / `sqlite` configs). |
 | Scope         | Schema-level expressiveness only. No new tree-node types. No IR/codegen changes. Tokenizer gains "lexer modes" for string interpolation; lexer-mode *stack* is the checkpoint primitive's responsibility. |
 
-This plan is **deliberately empirical**: PR0 authors a C subset against the v1 schema *as-is* and catalogs the gaps that surface. §4.1 defines the workflow for what happens when a PR0 gap doesn't fit the §5 design as written.
+This plan is **deliberately empirical**: PR0 authored a C subset against the v1 schema and catalogued the gaps that surfaced. §4.1 defines the workflow for what happens when a PRn gap doesn't fit the §5 design as written.
+
+### PR landing log
+
+| PR | Status | Commit / notes |
+|---|---|---|
+| PR0 | ✅ shipped | `4aef654` (initial) + `3aca464` (review followup). c-subset.lang.json, loader [1..2], v2-gap-catalog.md, 6 tests. |
+| PR1 | ✅ shipped | OperatorTable + loader `operators` section + `expr` shape kind + c-subset operators (`dssSchemaVersion: 2`) + 18 tests. |
+| PR2a | ⏳ pending | Real `SchemaCursor::advance` / `expectedSet`. |
+| PR2b | ⏳ pending | Contextual keywords + reservedWordPolicy. |
+| PR3  | ⏳ pending | `scopeRequire` (anyOf/forbid/topMustBe/outermost). |
+| PR4  | ⏳ pending | `TreeBuilder::Checkpoint` + speculative alt. |
+| PR5  | ⏳ pending | Lexer-mode stack + `modeOp`. |
+| PR6  | ⏳ pending | `stringStyle` descriptor. |
+| PR7  | ⏳ pending | tsql-subset.lang.json stress test. |
+| PR8  | ⏳ pending | Plan-doc maintenance close-out. |
+
+### PR1 deviations from this plan
+
+- **LexemeMeaning is NOT extended with `precedence` / `associativity` / `arity` fields.** The plan's §5.1 design literally adds these to `LexemeMeaning`; PR1 instead concentrates operator metadata in `OperatorTable` only. Rationale: lexeme resolution and operator metadata are different concerns; dual storage smelled of duplication. The plan's reading-side API (`OperatorTable::lookup`) is unchanged — only the storage shape moved. If a future API really needs precedence attached to LexemeMeaning, it can join the table at that point.
+- **Multi-meaning lexeme disambiguation lives on the group, not the operator entry.** The JSON shape for the group is `{ "kind": "LtOp", "operators": ["<"] }` — one explicit kind per group. Per-operator-entry `kind` was considered but rejected as more verbose for the realistic case (a group represents one operator, with maybe a few synonyms).
 
 ---
 
@@ -826,8 +846,8 @@ Each PR is sized in **person-days** assuming someone with v1-codebase context. A
 
 | # | Status | ID | Title | Days | Files | Acceptance |
 |---|---|---|---|---|---|---|
-| **PR0** | ⏳ pending | `v2-empirical-c-subset` | Author `c-subset.lang.json` against v1 schema; build gap catalog | **5–8** | `src/source-config/languages/c-subset.lang.json` + `.plans/v2-gap-catalog.md` | (a) Config loads or fails-with-named-`C_*`-codes (every error in v2-gap-catalog has the `C_*` code + JSON pointer + sample input). (b) For each gap row, the table cell "Resolves via" points to a §5 subsection. (c) `dssSchemaVersion: 2` accepted by v2 loader; same config with `dssSchemaVersion: 1` emits `C_UnknownField` on every v2-only field. (d) `toy.lang.json` still loads. (e) PR0 also touches v1 §9 to strike items now in flight. |
-| **PR1** | ⏳ pending | `v2-precedence` | Operator precedence + associativity + arity | **3–5** | `grammar_schema.{hpp,cpp}`, `grammar_schema_json.cpp`, `parse_diagnostic.{hpp,cpp}` (new code `C_InvalidPrecedenceTable`), new `operator_table.{hpp,cpp}`, `tests/core/test_operator_table.cpp` | `EXPECT_EQ(schema->operatorTable().lookup(plus, Infix)->precedence, 50);` and similar for assoc, arity, prefix-vs-infix distinct entries. `toy.lang.json` reloads. Pratt parse-tree assertions deferred until parser exists. |
+| **PR0** | ✅ shipped | `v2-empirical-c-subset` | Author `c-subset.lang.json` against v1 schema; build gap catalog | **5–8** | `src/source-config/languages/c-subset.lang.json` + `.plans/v2-gap-catalog.md` | Config loads cleanly under the [1..2] window; gap catalog enumerates 18 gaps with branch-(a)/(b)/(c) tagging; `toy.lang.json` still loads; 6 new tests (3 grammar_schema + 3 c_subset) including a flip-target pin for PR1's precedence work. |
+| **PR1** | ✅ shipped | `v2-precedence` | Operator precedence + associativity + arity | **3–5** | `grammar_schema.{hpp,cpp}`, `grammar_schema_json.cpp`, `parse_diagnostic.{hpp,cpp}` (new code `C_InvalidPrecedenceTable`), new `operator_table.hpp` (header-only), `tests/core/test_operator_table.cpp` | `schema->operatorTable().lookup(plus, Infix)` returns precedence 50 / assoc Left; `lookup(minus, Prefix)` returns precedence 90 (distinct from infix 65); `lookup(identifier, Infix)` is empty; c-subset.lang.json bumped to v2 with a full C precedence table; multi-meaning lexemes require explicit group `kind`; `expr` shape kind recognized by loader (atom rule reference validated). 17 new tests in `test_operator_table.cpp` + 1 in `test_c_subset.cpp`. Pratt parse-tree assertions deferred until parser exists (the `ExpressionWithMixedOpsIsLeftFolded` flip-target test stays pinned). |
 | **PR2a** | ⏳ pending | `v2-schema-walker` | Real `SchemaCursor::advance()` / `enterRule()` / `leaveRule()` / `expectedSet()` | **4–6** | `grammar_schema.{hpp,cpp}`, `grammar_schema_json.cpp`, `schema_cursor.hpp`, `tests/core/test_schema_cursor.cpp` | Cursor advances through `sequence` / `alt` / `optional` / `repeat`. `expectedSet()` returns the FIRST set at any cursor position. Cursor descends into nested rules and pops correctly. Walker handles cycles (rule A references rule B references rule A indirectly through `repeat`). Closes v1 §0 deviation #7. |
 | **PR2b** | ⏳ pending | `v2-contextual-keywords` | Soft keywords + reserved-word policy on top of the walker | **2–3** | `grammar_schema.{hpp,cpp}`, `grammar_schema_json.cpp`, `tree_builder.{hpp,cpp}`, `parse_diagnostic.{hpp,cpp}` (new code `P_ContextualKeywordResolution`), `tests/core/test_contextual_keywords.cpp` | `int await = 0;` with `await` contextual: `t.kind(leaf2) == NodeKind::Token && t.tokenKind(leaf2) == identifierId`. `CREATE TABLE Select(x int)` under `reservedWordPolicy: contextual`: same expectation for `Select`. `toy.lang.json` reloads. |
 | **PR3** | ⏳ pending | `v2-scope-patterns` | `scopeRequire` object (anyOf/forbid/topMustBe/outermost) | **2** | `grammar_schema.{hpp,cpp}`, `grammar_schema_json.cpp`, `tree_builder.cpp`, `tests/core/test_scope_require.cpp` | v1 flat `validScopes: [...]` migrates to `scopeRequire.anyOf` (verified by test). New constraints reject tokens correctly: assertions on `pushToken` rejecting `LtOperator` inside `Generic` via `forbid`, etc. `toy.lang.json` reloads (uses `scopes.validity`, untouched). |

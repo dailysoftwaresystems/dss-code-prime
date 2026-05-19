@@ -1,5 +1,6 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/token.hpp"
@@ -265,6 +266,47 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         "                tok:\"}\"\n"
         "        tok:\"}\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
+}
+
+// Schema-side precedence is in place even though the builder doesn't yet
+// consume it. `*` binds tighter than `+`, `=` is right-assoc at the
+// bottom, and `-` carries distinct prefix and infix entries. The future
+// parser will translate this table into nested tree shapes; today it's
+// data sitting on the schema, queryable by the eventual Pratt walker.
+TEST(CSubsetEndToEnd, OperatorTableMatchesCPrecedence) {
+    auto h = loadShippedCSubset("");
+    ASSERT_NE(h.schema, nullptr);
+    auto const& table  = h.schema->operatorTable();
+    auto const& tokens = h.schema->schemaTokens();
+
+    auto plus  = table.lookup(tokens.find("PlusOp"),    OperatorArity::Infix);
+    auto star  = table.lookup(tokens.find("StarOp"),    OperatorArity::Infix);
+    auto assign= table.lookup(tokens.find("AssignOp"),  OperatorArity::Infix);
+    auto bangP = table.lookup(tokens.find("BangOp"),    OperatorArity::Prefix);
+    auto minusI= table.lookup(tokens.find("MinusOp"),   OperatorArity::Infix);
+    auto minusP= table.lookup(tokens.find("MinusOp"),   OperatorArity::Prefix);
+
+    ASSERT_TRUE(plus.has_value());
+    ASSERT_TRUE(star.has_value());
+    ASSERT_TRUE(assign.has_value());
+    ASSERT_TRUE(bangP.has_value());
+    ASSERT_TRUE(minusI.has_value());
+    ASSERT_TRUE(minusP.has_value());
+
+    EXPECT_LT(plus->precedence,   star->precedence)
+        << "`+` must bind less tightly than `*`";
+    EXPECT_LT(assign->precedence, plus->precedence)
+        << "`=` must bind less tightly than `+`";
+    EXPECT_EQ(assign->associativity, OperatorAssoc::Right);
+    EXPECT_EQ(plus->associativity,   OperatorAssoc::Left);
+    EXPECT_EQ(star->associativity,   OperatorAssoc::Left);
+
+    // Same lexeme; arity-distinguished entries.
+    EXPECT_NE(minusI->precedence, minusP->precedence);
+    EXPECT_GT(minusP->precedence, minusI->precedence)
+        << "unary `-` must bind tighter than binary `-`";
+    EXPECT_EQ(minusP->associativity, OperatorAssoc::Right);
+    EXPECT_GT(bangP->precedence, plus->precedence);
 }
 
 // Pins the current shape of `a + b * c;` — a flat left-fold under one

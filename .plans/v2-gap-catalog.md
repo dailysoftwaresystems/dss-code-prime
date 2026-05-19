@@ -26,7 +26,7 @@
 
 | # | Symptom                                                      | Source / JSON site                          | Diagnostic                                                            | Resolves via                          | Sample                                  |
 |---|--------------------------------------------------------------|---------------------------------------------|-----------------------------------------------------------------------|---------------------------------------|-----------------------------------------|
-| 1 | `a + b * c` parses left-fold as `((a+b)*c)` instead of `(a+(b*c))`. Same for `a = b = c` (left-assoc, should be right). | `shapes/expression`, `shapes/binaryOp`     | none — loader accepts, the shape simply doesn't model precedence      | §5.1 (PR1) — operator precedence       | `1 + 2 * 3;`, `a = b = c;`              |
+| 1 | ~~`a + b * c` parses left-fold.~~ **Schema-side data landed in PR1**: `c-subset.lang.json` now declares the full C precedence table via `operators.groups`, queryable through `GrammarSchema::operatorTable().lookup(kind, arity)`. **Tree shape is still wrong** because no parser yet consumes the table — the flip happens when a Pratt walker lands in the parser phase. Test `CSubsetEndToEnd.ExpressionWithMixedOpsIsLeftFolded` stays pinned until then; `CSubsetEndToEnd.OperatorTableMatchesCPrecedence` proves the data is in place. | `shapes/expression`, `shapes/binaryOp`, `operators.groups` | none — loader accepts | **§5.1 (PR1) — data ✅**; tree-shape flip awaits parser phase | `1 + 2 * 3;`, `a = b = c;` |
 | 2 | `typedef int MyInt; MyInt x;` can't distinguish `MyInt` as a type later — `Identifier` is unconditional in v1. | `keywords` / `Identifier` resolution        | none — loader accepts, parser produces wrong-typed leaves              | §5.2 (PR2b) — contextual keywords + symbol-table side-table | `typedef int MyInt;`<br>`MyInt v;` |
 | 3 | `//` line comments and `/* */` block comments cannot be marked `EmptySpace` declaratively. | (omitted from `tokens`)                     | n/a — feature absent from c-subset                                    | §5.5 (PR5) — lexer modes, comment mode | `// hello`<br>`/* multi */`             |
 | 4 | String escape sequences (`"\"hi\\n\""`) treated as opaque chars; v1's `StringLiteral` is a built-in primitive with no per-language escape rules. | (relies on built-in `StringLiteral`)        | none — built-in token kind accepts, escapes round-trip as raw         | §5.6 (PR6) — `stringStyle` descriptor  | `"hello\nworld"`                        |
@@ -90,5 +90,6 @@ Per user decision (Q1 below), rows 9, 10, 13, 15 were landed in the same PR0 com
 
 ## 6. Status
 
-- **PR0:** ✅ ready to commit. Config drafted; loader version-bump landed; gap catalog drafted; 4 new tests pass locally (`LoadShippedCSubset`, `SchemaVersionTwoAccepted`, `SchemaVersionThreeRejectedWithRangeMessage`, plus 3 `CSubsetEndToEnd.*`).
-- **PR1..PR8:** ⏳ pending.
+- **PR0:** ✅ shipped (commits `4aef654` + `3aca464`).
+- **PR1:** ✅ shipped. OperatorTable + loader `operators` section + `expr` shape kind + c-subset operators (bumped to `dssSchemaVersion: 2`). Row 1 marked data-resolved; tree-shape flip awaits parser phase.
+- **PR2a..PR8:** ⏳ pending.

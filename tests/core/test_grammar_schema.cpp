@@ -275,7 +275,7 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     auto const& schema = **result;
 
     EXPECT_EQ(schema.name(), "CSubset");
-    EXPECT_EQ(schema.schemaVersion(), 1u);
+    EXPECT_EQ(schema.schemaVersion(), 2u);
 
     // Every shape name declared in the JSON must resolve. A typo would
     // currently load cleanly and only fail when a caller asks for the

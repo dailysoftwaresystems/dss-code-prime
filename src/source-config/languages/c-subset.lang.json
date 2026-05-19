@@ -1,5 +1,5 @@
 {
-  "dssSchemaVersion": 1,
+  "dssSchemaVersion": 2,
 
   "language": {
     "name":           "CSubset",
@@ -44,6 +44,23 @@
     "~":  [{ "kind": "TildeOp"  }],
     "<<": [{ "kind": "ShlOp"    }],
     ">>": [{ "kind": "ShrOp"    }]
+  },
+
+  "operators": {
+    "groups": [
+      { "precedence": 15, "associativity": "right",                      "operators": ["="]                                    },
+      { "precedence": 20, "associativity": "left",                       "operators": ["||"]                                   },
+      { "precedence": 25, "associativity": "left",                       "operators": ["&&"]                                   },
+      { "precedence": 30, "associativity": "left",                       "operators": ["|"]                                    },
+      { "precedence": 35, "associativity": "left",                       "operators": ["^"]                                    },
+      { "precedence": 40, "associativity": "left",                       "operators": ["&"]                                    },
+      { "precedence": 50, "associativity": "left",                       "operators": ["==", "!="]                             },
+      { "precedence": 55, "associativity": "left",                       "operators": ["<", ">", "<=", ">="]                   },
+      { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
+      { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
+      { "precedence": 70, "associativity": "left",                       "operators": ["*", "/"]                               },
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-"]                          }
+    ]
   },
 
   "keywords": [
