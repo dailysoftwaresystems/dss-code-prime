@@ -9,6 +9,7 @@
 #include "core/types/schema_cursor.hpp"
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
+#include "core/types/string_style.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree_node.hpp"
 
@@ -86,6 +87,11 @@ struct DSS_EXPORT LexemeMeaning {
     // tokenizer doesn't re-walk mode-name strings per token.
     ModeOp           modeOp        = ModeOp::None;
     LexerModeId      modeArg{};
+    // Index into `GrammarSchemaData::stringStyles` when this meaning
+    // is a delimited-string opener (e.g. `"`, `@"`, `R"`). Empty for
+    // every other meaning. Pool-indexed (not embedded) so LexemeMeaning
+    // stays trivially copyable.
+    std::optional<std::uint32_t> stringStyleIdx;
 };
 
 static_assert(std::is_trivially_copyable_v<LexemeMeaning>,
@@ -173,6 +179,12 @@ struct DSS_EXPORT GrammarSchemaData {
                        std::unordered_map<std::string,
                                           std::vector<LexemeMeaning>>>
                                                       lexerModeTokens;
+
+    // Indexed by `LexemeMeaning::stringStyleIdx`. Stored by value so
+    // each StringStyle owns its `endsAt`/`tagPattern` strings; the
+    // vector is allowed to reallocate (LexemeMeaning carries the
+    // index, not a pointer).
+    std::vector<StringStyle>                          stringStyles;
 };
 
 } // namespace detail
@@ -233,6 +245,12 @@ public:
     // always means "no meanings for this lexeme," never "wrong id."
     [[nodiscard]] std::span<LexemeMeaning const>
         lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept;
+
+    // String-literal metadata for a meaning that opens a delimited
+    // string body. Returns nullptr when the meaning has no `stringStyle`
+    // declared (the common case). Aborts on an out-of-range index —
+    // strong-id-style contract.
+    [[nodiscard]] StringStyle const* stringStyle(LexemeMeaning const& m) const noexcept;
 
     // ── Shape navigation ──
     //

@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -153,6 +154,149 @@ void parseModeFields(json const& m,
 
     lm.modeOp  = op;
     lm.modeArg = arg;
+}
+
+// Parse a `stringStyle` object on a token meaning. Returns the parsed
+// StringStyle when the field is present and well-formed. Returns
+// nullopt when the field is absent OR when parsing failed (in which
+// case at least one diagnostic was emitted). Caller decides whether
+// to attach the resulting style to a LexemeMeaning.
+//
+// Validation:
+//   - `escapeKind`: required string, one of "char"/"doubled-delimiter"/"none".
+//   - `escapeChar`: required when escapeKind == "char"; single character.
+//   - `endsAt`: required non-empty string.
+//   - `endsAtLongestMatch`/`multiline`: optional bools.
+//   - `delimiterTag`: optional string; only "matched" is recognized.
+//   - `tagPattern`: optional regex string (default `[A-Za-z0-9_]{0,16}`);
+//     compiled at load time via std::regex to surface malformed patterns.
+inline std::optional<StringStyle> parseStringStyle(json const& obj,
+                                                   std::string const& path,
+                                                   struct Collector& c);
+
+std::optional<StringStyle> parseStringStyle(json const& obj,
+                                            std::string const& path,
+                                            Collector& c) {
+    if (!obj.is_object()) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle, path,
+               "'stringStyle' must be an object");
+        return std::nullopt;
+    }
+
+    StringStyle s;
+
+    // escapeKind — required.
+    if (!obj.contains("escapeKind") || !obj.at("escapeKind").is_string()) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/escapeKind", path),
+               "'escapeKind' is required and must be a string "
+               "('char' | 'doubled-delimiter' | 'none')");
+        return std::nullopt;
+    }
+    const auto ek = obj.at("escapeKind").get<std::string>();
+    if      (ek == "none")              s.escapeKind = EscapeKind::None;
+    else if (ek == "char")              s.escapeKind = EscapeKind::Char;
+    else if (ek == "doubled-delimiter") s.escapeKind = EscapeKind::DoubledDelimiter;
+    else {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/escapeKind", path),
+               std::format("unknown escapeKind '{}'", ek));
+        return std::nullopt;
+    }
+
+    // escapeChar — required if escapeKind == Char; rejected otherwise.
+    const bool hasEsc = obj.contains("escapeChar");
+    if (s.escapeKind == EscapeKind::Char) {
+        if (!hasEsc || !obj.at("escapeChar").is_string() ||
+            obj.at("escapeChar").get<std::string>().size() != 1) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/escapeChar", path),
+                   "'escapeChar' is required when escapeKind is 'char' and "
+                   "must be a single-character string");
+            return std::nullopt;
+        }
+        s.escapeChar = obj.at("escapeChar").get<std::string>().front();
+    } else if (hasEsc) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/escapeChar", path),
+               "'escapeChar' is only meaningful when escapeKind is 'char'");
+        // Continue — the field is just ignored; not a fatal error.
+    }
+
+    // endsAt — required, non-empty.
+    if (!obj.contains("endsAt") || !obj.at("endsAt").is_string() ||
+        obj.at("endsAt").get<std::string>().empty()) {
+        c.emit(DiagnosticCode::C_MissingField,
+               std::format("{}/endsAt", path),
+               "'endsAt' is required and must be a non-empty string");
+        return std::nullopt;
+    }
+    s.endsAt = obj.at("endsAt").get<std::string>();
+
+    // endsAtLongestMatch — optional bool.
+    if (obj.contains("endsAtLongestMatch")) {
+        if (!obj.at("endsAtLongestMatch").is_boolean()) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/endsAtLongestMatch", path),
+                   "'endsAtLongestMatch' must be a boolean");
+            return std::nullopt;
+        }
+        s.endsAtLongestMatch = obj.at("endsAtLongestMatch").get<bool>();
+    }
+
+    // multiline — optional bool.
+    if (obj.contains("multiline")) {
+        if (!obj.at("multiline").is_boolean()) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/multiline", path),
+                   "'multiline' must be a boolean");
+            return std::nullopt;
+        }
+        s.multiline = obj.at("multiline").get<bool>();
+    }
+
+    // delimiterTag — optional; only "matched" is recognized.
+    if (obj.contains("delimiterTag")) {
+        if (!obj.at("delimiterTag").is_string() ||
+            obj.at("delimiterTag").get<std::string>() != "matched") {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/delimiterTag", path),
+                   "'delimiterTag' is optional; the only recognized value is 'matched'");
+            return std::nullopt;
+        }
+        s.hasMatchedDelimiterTag = true;
+    }
+
+    // tagPattern — optional regex (default applied when delimiterTag
+    // is "matched" and tagPattern is omitted).
+    constexpr std::string_view kDefaultTagPattern = "[A-Za-z0-9_]{0,16}";
+    if (obj.contains("tagPattern")) {
+        if (!obj.at("tagPattern").is_string()) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/tagPattern", path),
+                   "'tagPattern' must be a regex string");
+            return std::nullopt;
+        }
+        s.tagPattern = obj.at("tagPattern").get<std::string>();
+    } else if (s.hasMatchedDelimiterTag) {
+        s.tagPattern = kDefaultTagPattern;
+    }
+
+    // Validate regex at load time. std::regex throws regex_error on
+    // malformed patterns; convert to C_InvalidStringStyle.
+    if (!s.tagPattern.empty()) {
+        try {
+            std::regex compiled(s.tagPattern);
+            (void)compiled;
+        } catch (std::regex_error const& e) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/tagPattern", path),
+                   std::format("'tagPattern' is not a valid regex: {}", e.what()));
+            return std::nullopt;
+        }
+    }
+
+    return s;
 }
 
 // Parse a JSON array of scope names into vector<ScopeKind>. Unknown
@@ -1081,6 +1225,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         continue;
                     }
                     parseModeFields(m, entryPath, data.lexerModeIds, lm, coll);
+
+                    if (m.contains("stringStyle")) {
+                        auto ss = parseStringStyle(m.at("stringStyle"),
+                                                   std::format("{}/stringStyle", entryPath),
+                                                   coll);
+                        if (ss.has_value()) {
+                            lm.stringStyleIdx = static_cast<std::uint32_t>(
+                                data.stringStyles.size());
+                            data.stringStyles.push_back(std::move(*ss));
+                        }
+                    }
+
                     meanings.push_back(lm);
                 }
 
@@ -1110,16 +1266,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                           "keyword entry needs string 'word' and string 'kind'");
                 continue;
             }
-            // Mode operations belong on `tokens` entries — keywords
-            // resolve contextually (soft-keyword demotion) which is a
-            // distinct mechanism from tokenizer-mode switching. Mixing
-            // the two on one entry conflates resolution responsibilities;
-            // reject loudly rather than silently drop the modeOp.
+            // Mode operations and string-style descriptors belong on
+            // `tokens` entries — keywords resolve contextually (soft-
+            // keyword demotion), a distinct mechanism from mode
+            // switching or delimited-string opening. Reject loudly.
             if (kw.contains("modeOp") || kw.contains("modeArg")) {
                 coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
                           "mode operations belong on 'tokens' entries; keywords "
                           "cannot switch lexer modes — move the entry to "
                           "'tokens' or drop the mode fields");
+                continue;
+            }
+            if (kw.contains("stringStyle")) {
+                coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
+                          "'stringStyle' belongs on 'tokens' entries; keywords "
+                          "are word-shaped and cannot open delimited strings");
                 continue;
             }
             LexemeMeaning lm{};

@@ -113,6 +113,18 @@ LexerMode const& GrammarSchema::lexerMode(LexerModeId id) const noexcept {
     return d_.lexerModes[id.v];
 }
 
+StringStyle const* GrammarSchema::stringStyle(LexemeMeaning const& m) const noexcept {
+    if (!m.stringStyleIdx.has_value()) return nullptr;
+    if (*m.stringStyleIdx >= d_.stringStyles.size()) {
+        std::fprintf(stderr,
+            "dss::GrammarSchema::stringStyle: out-of-range stringStyleIdx "
+            "(idx=%u, pool_size=%zu)\n",
+            *m.stringStyleIdx, d_.stringStyles.size());
+        std::abort();
+    }
+    return &d_.stringStyles[*m.stringStyleIdx];
+}
+
 std::span<LexemeMeaning const>
 GrammarSchema::lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept {
     if (!mode.valid() || mode.v >= d_.lexerModes.size()) {

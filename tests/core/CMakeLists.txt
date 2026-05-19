@@ -24,3 +24,4 @@ dss_add_test(NAME core/test_contextual_keywords SOURCES test_contextual_keywords
 dss_add_test(NAME core/test_scope_require       SOURCES test_scope_require.cpp)
 dss_add_test(NAME core/test_checkpoint          SOURCES test_checkpoint.cpp)
 dss_add_test(NAME core/test_lexer_modes         SOURCES test_lexer_modes.cpp)
+dss_add_test(NAME core/test_string_style        SOURCES test_string_style.cpp)
