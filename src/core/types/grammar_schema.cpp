@@ -89,9 +89,10 @@ bool GrammarSchema::isEmptySpace(SchemaTokenId id) const noexcept {
 
 namespace {
 
-// Helper: locate the position record for a cursor, or nullptr if the
-// cursor is invalid / out of range. Const access; the cursor methods are
-// read-only.
+// Locate the position record for a cursor, or nullptr if the cursor is
+// invalid / out of range. The cursor's `posId == 0` sentinel matches the
+// loader's `positions[0]` placeholder, so this also blocks default-
+// constructed cursors before they touch real data.
 [[nodiscard]] detail::Position const* lookupPos(
     detail::GrammarSchemaData const& d, SchemaCursor cur) noexcept {
     if (!cur.valid()) return nullptr;
@@ -120,8 +121,8 @@ SchemaCursor GrammarSchema::enterRule(RuleId rule) const noexcept {
 SchemaCursor GrammarSchema::leaveRule(SchemaCursor parentCur) const noexcept {
     auto const* p = lookupPos(d_, parentCur);
     if (p == nullptr) return SchemaCursor{};
-    if (p->slotKind != detail::SlotKind::RuleLeaf) return SchemaCursor{};
-    return SchemaCursor{parentCur.rule(), p->nextPos};
+    if (p->slotKind() != SlotKind::RuleLeaf) return SchemaCursor{};
+    return SchemaCursor{parentCur.rule(), p->nextPos()};
 }
 
 SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const noexcept {
@@ -131,29 +132,25 @@ SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const n
     if (cur.posId() >= positions.size()) return SchemaCursor{};
 
     // Walk through AltChoice positions until we hit a TokenLeaf or fail.
-    // Each AltChoice routes via the branch whose precomputed expectedSet
-    // contains `tok`. Loop is bounded by the number of nested alts; in
-    // practice depth 2–3.
+    // Each AltChoice routes into the first branch whose precomputed
+    // expectedSet contains `tok`. The loader rejects ambiguous alts at
+    // load time (C_AmbiguousAlternatives), so the "first match wins"
+    // behaviour is unambiguous in any schema that loaded successfully.
     std::uint32_t curPosId = cur.posId();
     while (true) {
         auto const& p = positions[curPosId];
-        if (p.slotKind == detail::SlotKind::TokenLeaf) {
-            if (p.tokenId.v == tok.v) {
-                return SchemaCursor{cur.rule(), p.nextPos};
+        if (p.slotKind() == SlotKind::TokenLeaf) {
+            if (p.tokenId().v == tok.v) {
+                return SchemaCursor{cur.rule(), p.nextPos()};
             }
             return SchemaCursor{};
         }
-        if (p.slotKind == detail::SlotKind::AltChoice) {
+        if (p.slotKind() == SlotKind::AltChoice) {
             std::uint32_t matched = 0;
             bool found = false;
-            for (auto bid : p.branches) {
-                auto const& branch = positions[bid];
-                for (auto const& t : branch.expectedSet) {
-                    if (t.v == tok.v) {
-                        matched = bid;
-                        found = true;
-                        break;
-                    }
+            for (auto bid : p.branches()) {
+                for (auto const& t : positions[bid].expectedSet()) {
+                    if (t.v == tok.v) { matched = bid; found = true; break; }
                 }
                 if (found) break;
             }
@@ -161,8 +158,9 @@ SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const n
             curPosId = matched;
             continue;
         }
-        // RuleLeaf or End — can't be advanced by a token. The caller
-        // must descend via enterRule or return to the parent first.
+        // RuleLeaf or End — not advanceable by a token. Caller must
+        // descend via enterRule (RuleLeaf) or pop back to the parent
+        // (End).
         return SchemaCursor{};
     }
 }
@@ -170,24 +168,23 @@ SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const n
 std::span<SchemaTokenId const> GrammarSchema::expectedSet(SchemaCursor cur) const noexcept {
     auto const* p = lookupPos(d_, cur);
     if (p == nullptr) return {};
-    return p->expectedSet;
+    return p->expectedSet();
 }
 
-detail::SlotKind GrammarSchema::slotKind(SchemaCursor cur) const noexcept {
+SlotKind GrammarSchema::slotKind(SchemaCursor cur) const noexcept {
     auto const* p = lookupPos(d_, cur);
-    if (p == nullptr) return detail::SlotKind::End;
-    return p->slotKind;
+    return p == nullptr ? SlotKind::End : p->slotKind();
 }
 
 RuleId GrammarSchema::slotRuleRef(SchemaCursor cur) const noexcept {
     auto const* p = lookupPos(d_, cur);
-    if (p == nullptr || p->slotKind != detail::SlotKind::RuleLeaf) return InvalidRule;
-    return p->ruleId;
+    if (p == nullptr || p->slotKind() != SlotKind::RuleLeaf) return InvalidRule;
+    return p->ruleId();
 }
 
 bool GrammarSchema::isAtEndOfRule(SchemaCursor cur) const noexcept {
     auto const* p = lookupPos(d_, cur);
-    return p != nullptr && p->slotKind == detail::SlotKind::End;
+    return p != nullptr && p->slotKind() == SlotKind::End;
 }
 
 std::span<SchemaTokenId const> GrammarSchema::firstSetOf(RuleId rule) const noexcept {
@@ -219,7 +216,7 @@ bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
 bool GrammarSchema::canEndSource(SchemaCursor cur) const noexcept {
     if (cur.rule().v != d_.rootRule.v) return false;
     auto const* p = lookupPos(d_, cur);
-    return p != nullptr && p->nullableTail;
+    return p != nullptr && p->nullableTail();
 }
 
 } // namespace dss

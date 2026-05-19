@@ -95,7 +95,8 @@ struct DSS_EXPORT ParseDiagnostic {
     std::optional<RuleId> ruleContext;   // which expected shape was active
 
     // What the schema would have accepted at this position. Pre-rendered
-    // strings sourced from GrammarSchema::expectedAt() — e.g. {"';'", "expression"}.
+    // strings — the builder populates these from `schemaTokens().name()` /
+    // `rules().name()` at emit time, e.g. {"';'", "expression"}.
     std::vector<std::string> expected;
 
     // What was actually seen — lexeme text or token-kind name.

@@ -80,7 +80,27 @@
   "shapes": {
     "root": { "sequence": [ { "repeat": "topLevel" } ] },
 
-    "topLevel": { "alt": [ "funcDecl", "varDecl" ] },
+    "topLevel": {
+      "sequence": [ "typeRef", "Identifier", "topLevelTail" ]
+    },
+
+    "topLevelTail": { "alt": [ "funcTail", "varDeclTail" ] },
+
+    "funcTail": {
+      "sequence": [
+        "ParenOpen",
+        { "optional": "paramList" },
+        "ParenClose",
+        "block"
+      ]
+    },
+
+    "varDeclTail": {
+      "sequence": [
+        { "optional": { "sequence": [ "AssignOp", "expression" ] } },
+        "EndStatement"
+      ]
+    },
 
     "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword" ] },
 
@@ -101,17 +121,6 @@
     },
 
     "varDecl": { "sequence": [ "varDeclHead", "EndStatement" ] },
-
-    "funcDecl": {
-      "sequence": [
-        "typeRef",
-        "Identifier",
-        "ParenOpen",
-        { "optional": "paramList" },
-        "ParenClose",
-        "block"
-      ]
-    },
 
     "paramList": {
       "sequence": [

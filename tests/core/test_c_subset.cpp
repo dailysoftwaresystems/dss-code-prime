@@ -87,9 +87,11 @@ Token at(SourceBuffer const& src, std::string_view text, std::size_t startHint,
 
 } // namespace
 
-// Drives `int x = 5;` through the topLevel → varDecl chain. Pins the
-// varDeclHead refactor (typeRef + Identifier + optional initializer) plus
-// the typeBase nesting under typeRef that carries the future const slot.
+// Drives `int x = 5;` through the disambiguated topLevel shape:
+// typeRef → Identifier → topLevelTail → varDeclTail. The shape graph
+// resolves funcDecl-vs-varDecl on the post-Identifier token (ParenOpen vs
+// AssignOp/EndStatement); both branches share a single typeRef + Identifier
+// prefix so the loader's alt-FIRST ambiguity check stays happy.
 TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     auto h = loadShippedCSubset("int x = 5;");
     ASSERT_NE(h.schema, nullptr);
@@ -98,27 +100,23 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto top  = b.open(h.schema->rules().find("topLevel"));
-        auto vd   = b.open(h.schema->rules().find("varDecl"));
         {
-            auto head = b.open(h.schema->rules().find("varDeclHead"));
-            {
-                auto ty = b.open(h.schema->rules().find("typeRef"));
-                {
-                    auto tb = b.open(h.schema->rules().find("typeBase"));
-                    b.pushToken(at(*h.src, "int", CoreTokenKind::Word));
-                }
-            }
-            b.pushToken(at(*h.src, "x", CoreTokenKind::Word));
+            auto ty = b.open(h.schema->rules().find("typeRef"));
+            auto tb = b.open(h.schema->rules().find("typeBase"));
+            b.pushToken(at(*h.src, "int", CoreTokenKind::Word));
+        }
+        b.pushToken(at(*h.src, "x", CoreTokenKind::Word));
+        {
+            auto tail   = b.open(h.schema->rules().find("topLevelTail"));
+            auto vdTail = b.open(h.schema->rules().find("varDeclTail"));
             b.pushToken(at(*h.src, "="));
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
-                {
-                    auto opr = b.open(h.schema->rules().find("operand"));
-                    b.pushToken(at(*h.src, "5", CoreTokenKind::Word));
-                }
+                auto opr  = b.open(h.schema->rules().find("operand"));
+                b.pushToken(at(*h.src, "5", CoreTokenKind::Word));
             }
+            b.pushToken(at(*h.src, ";"));
         }
-        b.pushToken(at(*h.src, ";"));
     }
     Tree t = std::move(b).finish();
 
@@ -129,26 +127,25 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     const std::string_view expected =
         "rule:root\n"
         "  rule:topLevel\n"
-        "    rule:varDecl\n"
-        "      rule:varDeclHead\n"
-        "        rule:typeRef\n"
-        "          rule:typeBase\n"
-        "            tok:\"int\"\n"
-        "        tok:\"x\"\n"
+        "    rule:typeRef\n"
+        "      rule:typeBase\n"
+        "        tok:\"int\"\n"
+        "    tok:\"x\"\n"
+        "    rule:topLevelTail\n"
+        "      rule:varDeclTail\n"
         "        tok:\"=\"\n"
         "        rule:expression\n"
         "          rule:operand\n"
         "            tok:\"5\"\n"
-        "      tok:\";\"\n";
+        "        tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
 // Drives `int main(void) { if (x) { return x; } }` through topLevel →
-// funcDecl → block → statement → ifStmt → block → returnStmt. Exercises
-// the actual config path real C source would take, not a synthetic
-// `statement`-under-`root` shortcut: a typo in any of `funcDecl` /
-// `paramList` / `param` / `block` / `ifStmt` / `returnStmt` in the JSON
-// would fail this test.
+// topLevelTail → funcTail → block → statement → ifStmt → block →
+// returnStmt. Exercises the actual config path real C source takes.
+// A typo in any of `topLevelTail` / `funcTail` / `paramList` / `param` /
+// `block` / `ifStmt` / `returnStmt` would fail this test.
 TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
     auto h = loadShippedCSubset("int main(void) { if (x) { return x; } }");
     ASSERT_NE(h.schema, nullptr);
@@ -168,55 +165,58 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto top  = b.open(h.schema->rules().find("topLevel"));
-        auto fn   = b.open(h.schema->rules().find("funcDecl"));
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
             b.pushToken(at(*h.src, "int", CoreTokenKind::Word));
         }
         b.pushToken(at(*h.src, "main", CoreTokenKind::Word));
-        b.pushToken(at(*h.src, "(", firstParen));
         {
-            auto pl = b.open(h.schema->rules().find("paramList"));
-            auto p  = b.open(h.schema->rules().find("param"));
-            auto ty = b.open(h.schema->rules().find("typeRef"));
-            auto tb = b.open(h.schema->rules().find("typeBase"));
-            b.pushToken(at(*h.src, "void", CoreTokenKind::Word));
-        }
-        b.pushToken(at(*h.src, ")", firstParenC));
-        {
-            auto blk = b.open(h.schema->rules().find("block"));
-            b.pushToken(at(*h.src, "{", outerBlockO));
+            auto tail = b.open(h.schema->rules().find("topLevelTail"));
+            auto fn   = b.open(h.schema->rules().find("funcTail"));
+            b.pushToken(at(*h.src, "(", firstParen));
             {
-                auto stmt = b.open(h.schema->rules().find("statement"));
-                auto ifs  = b.open(h.schema->rules().find("ifStmt"));
-                b.pushToken(at(*h.src, "if", CoreTokenKind::Word));
-                b.pushToken(at(*h.src, "(", secondParen));
-                {
-                    auto expr = b.open(h.schema->rules().find("expression"));
-                    auto opr  = b.open(h.schema->rules().find("operand"));
-                    b.pushToken(at(*h.src, "x", x1, CoreTokenKind::Word));
-                }
-                b.pushToken(at(*h.src, ")", secondParenC));
-                {
-                    auto innerStmt = b.open(h.schema->rules().find("statement"));
-                    auto innerBlk  = b.open(h.schema->rules().find("block"));
-                    b.pushToken(at(*h.src, "{", innerBlockO));
-                    {
-                        auto retStmt = b.open(h.schema->rules().find("statement"));
-                        auto rs      = b.open(h.schema->rules().find("returnStmt"));
-                        b.pushToken(at(*h.src, "return", CoreTokenKind::Word));
-                        {
-                            auto retExpr = b.open(h.schema->rules().find("expression"));
-                            auto retOpr  = b.open(h.schema->rules().find("operand"));
-                            b.pushToken(at(*h.src, "x", x2, CoreTokenKind::Word));
-                        }
-                        b.pushToken(at(*h.src, ";"));
-                    }
-                    b.pushToken(at(*h.src, "}", innerBlockC));
-                }
+                auto pl = b.open(h.schema->rules().find("paramList"));
+                auto p  = b.open(h.schema->rules().find("param"));
+                auto ty = b.open(h.schema->rules().find("typeRef"));
+                auto tb = b.open(h.schema->rules().find("typeBase"));
+                b.pushToken(at(*h.src, "void", CoreTokenKind::Word));
             }
-            b.pushToken(at(*h.src, "}", outerBlockC));
+            b.pushToken(at(*h.src, ")", firstParenC));
+            {
+                auto blk = b.open(h.schema->rules().find("block"));
+                b.pushToken(at(*h.src, "{", outerBlockO));
+                {
+                    auto stmt = b.open(h.schema->rules().find("statement"));
+                    auto ifs  = b.open(h.schema->rules().find("ifStmt"));
+                    b.pushToken(at(*h.src, "if", CoreTokenKind::Word));
+                    b.pushToken(at(*h.src, "(", secondParen));
+                    {
+                        auto expr = b.open(h.schema->rules().find("expression"));
+                        auto opr  = b.open(h.schema->rules().find("operand"));
+                        b.pushToken(at(*h.src, "x", x1, CoreTokenKind::Word));
+                    }
+                    b.pushToken(at(*h.src, ")", secondParenC));
+                    {
+                        auto innerStmt = b.open(h.schema->rules().find("statement"));
+                        auto innerBlk  = b.open(h.schema->rules().find("block"));
+                        b.pushToken(at(*h.src, "{", innerBlockO));
+                        {
+                            auto retStmt = b.open(h.schema->rules().find("statement"));
+                            auto rs      = b.open(h.schema->rules().find("returnStmt"));
+                            b.pushToken(at(*h.src, "return", CoreTokenKind::Word));
+                            {
+                                auto retExpr = b.open(h.schema->rules().find("expression"));
+                                auto retOpr  = b.open(h.schema->rules().find("operand"));
+                                b.pushToken(at(*h.src, "x", x2, CoreTokenKind::Word));
+                            }
+                            b.pushToken(at(*h.src, ";"));
+                        }
+                        b.pushToken(at(*h.src, "}", innerBlockC));
+                    }
+                }
+                b.pushToken(at(*h.src, "}", outerBlockC));
+            }
         }
     }
     Tree t = std::move(b).finish();
@@ -231,40 +231,41 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
     const std::string_view expected =
         "rule:root\n"
         "  rule:topLevel\n"
-        "    rule:funcDecl\n"
-        "      rule:typeRef\n"
-        "        rule:typeBase\n"
-        "          tok:\"int\"\n"
-        "      tok:\"main\"\n"
-        "      tok:\"(\"\n"
-        "      rule:paramList\n"
-        "        rule:param\n"
-        "          rule:typeRef\n"
-        "            rule:typeBase\n"
-        "              tok:\"void\"\n"
-        "      tok:\")\"\n"
-        "      rule:block\n"
-        "        tok:\"{\"\n"
-        "        rule:statement\n"
-        "          rule:ifStmt\n"
-        "            tok:\"if\"\n"
-        "            tok:\"(\"\n"
-        "            rule:expression\n"
-        "              rule:operand\n"
-        "                tok:\"x\"\n"
-        "            tok:\")\"\n"
-        "            rule:statement\n"
-        "              rule:block\n"
-        "                tok:\"{\"\n"
-        "                rule:statement\n"
-        "                  rule:returnStmt\n"
-        "                    tok:\"return\"\n"
-        "                    rule:expression\n"
-        "                      rule:operand\n"
-        "                        tok:\"x\"\n"
-        "                    tok:\";\"\n"
-        "                tok:\"}\"\n"
-        "        tok:\"}\"\n";
+        "    rule:typeRef\n"
+        "      rule:typeBase\n"
+        "        tok:\"int\"\n"
+        "    tok:\"main\"\n"
+        "    rule:topLevelTail\n"
+        "      rule:funcTail\n"
+        "        tok:\"(\"\n"
+        "        rule:paramList\n"
+        "          rule:param\n"
+        "            rule:typeRef\n"
+        "              rule:typeBase\n"
+        "                tok:\"void\"\n"
+        "        tok:\")\"\n"
+        "        rule:block\n"
+        "          tok:\"{\"\n"
+        "          rule:statement\n"
+        "            rule:ifStmt\n"
+        "              tok:\"if\"\n"
+        "              tok:\"(\"\n"
+        "              rule:expression\n"
+        "                rule:operand\n"
+        "                  tok:\"x\"\n"
+        "              tok:\")\"\n"
+        "              rule:statement\n"
+        "                rule:block\n"
+        "                  tok:\"{\"\n"
+        "                  rule:statement\n"
+        "                    rule:returnStmt\n"
+        "                      tok:\"return\"\n"
+        "                      rule:expression\n"
+        "                        rule:operand\n"
+        "                          tok:\"x\"\n"
+        "                      tok:\";\"\n"
+        "                  tok:\"}\"\n"
+        "          tok:\"}\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 

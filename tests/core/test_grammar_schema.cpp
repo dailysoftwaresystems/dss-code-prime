@@ -138,9 +138,9 @@ TEST(GrammarSchema, ExpectedSetReturnsStableSpan) {
     auto a = schema->expectedSet(root);
     auto b = schema->expectedSet(root);
     // Pointer identity proves the span comes from schema-owned storage
-    // (no allocation per call). Stable span is the contract every
-    // downstream caller (PR2b contextual keywords, future parser, the
-    // diagnostic renderer) depends on.
+    // (no allocation per call). Every downstream consumer that holds an
+    // expectedSet across schema-cursor operations depends on this
+    // stability invariant.
     EXPECT_EQ(a.data(), b.data());
     EXPECT_EQ(a.size(), b.size());
 }
@@ -203,7 +203,7 @@ TEST(GrammarSchema, ForbidReferencingUnknownTokenReportsCode) {
       "dssSchemaVersion": 1,
       "language": { "name": "X", "version": "0.1.0" },
       "scopes": { "validity": [ { "scope": "Generic", "forbid": ["NotDeclared"] } ] },
-      "shapes": { "root": { "sequence": [] } }
+      "shapes": { "root": { "sequence": ["Identifier"] } }
     })";
     auto result = GrammarSchema::loadFromText(bad);
     ASSERT_FALSE(result.has_value());
@@ -218,7 +218,7 @@ TEST(GrammarSchema, UnknownScopeNameReportsCode) {
       "dssSchemaVersion": 1,
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { "<": [{ "kind": "K", "opensScope": "Fictional" }] },
-      "shapes": { "root": { "sequence": [] } }
+      "shapes": { "root": { "sequence": ["Identifier"] } }
     })";
     auto result = GrammarSchema::loadFromText(bad);
     ASSERT_FALSE(result.has_value());
@@ -232,7 +232,7 @@ TEST(GrammarSchema, MissingRootShapeReportsCode) {
     constexpr std::string_view bad = R"({
       "dssSchemaVersion": 1,
       "language": { "name": "X", "version": "0.1.0" },
-      "shapes": { "alpha": { "sequence": [] } }
+      "shapes": { "alpha": { "sequence": ["Identifier"] } }
     })";
     auto result = GrammarSchema::loadFromText(bad);
     ASSERT_FALSE(result.has_value());
@@ -282,8 +282,10 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     // Every shape name declared in the JSON must resolve. A typo would
     // currently load cleanly and only fail when a caller asks for the
     // missing name; pinning here makes the regression visible at load.
-    for (std::string_view rule : {"root", "topLevel", "typeBase", "typeRef",
-                                  "varDeclHead", "varDecl", "funcDecl",
+    for (std::string_view rule : {"root", "topLevel", "topLevelTail",
+                                  "funcTail", "varDeclTail",
+                                  "typeBase", "typeRef",
+                                  "varDeclHead", "varDecl",
                                   "paramList", "param", "block", "statement",
                                   "ifStmt", "whileStmt", "doStmt", "forStmt",
                                   "returnStmt", "exprStmt", "expression",
@@ -312,7 +314,7 @@ TEST(GrammarSchema, LoadShippedCSubset) {
 // `typeRef` admits `const int const x` (double-const). Real C allows
 // double-const only with intervening type modifiers; the c-subset is
 // deliberately more permissive while precedence/arity are deferred.
-// Pinned so PR1+ doesn't tighten this without intent.
+// Pinned so a future PR doesn't tighten this without intent.
 TEST(GrammarSchema, CSubsetTypeRefAllowsDoubleConst) {
     auto result = GrammarSchema::loadShipped("c-subset");
     if (!result.has_value()) {

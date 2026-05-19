@@ -133,10 +133,10 @@ public:
     [[nodiscard]] std::span<LexemeMeaning const> lookupLexeme(std::string_view lexeme) const noexcept;
     [[nodiscard]] bool isEmptySpace(SchemaTokenId id) const noexcept;
 
-    // ── Operators (v2) ──
+    // ── Operators ──
     [[nodiscard]] OperatorTable const& operatorTable() const noexcept { return d_.operators; }
 
-    // ── Shape navigation (v2 PR2a) ──
+    // ── Shape navigation ──
     //
     // SchemaCursor is a per-rule position. Descent into nested rules is
     // caller-managed via a stack of cursors. `advance` consumes a token
@@ -144,6 +144,11 @@ public:
     // returns a fresh cursor at the start of the named rule — the caller
     // saves the parent cursor so it can resume the parent via `leaveRule`
     // once the child reaches end-of-body.
+    //
+    // `advance` returns an invalid cursor (`valid() == false`) on either
+    // a token mismatch OR when the current slot is `RuleLeaf` / `End`
+    // (the caller must `enterRule` / `leaveRule` for those). Inspect via
+    // `slotKind` before calling `advance` if the distinction matters.
 
     [[nodiscard]] SchemaCursor rootCursor() const noexcept;
     [[nodiscard]] SchemaCursor enterRule(RuleId rule) const noexcept;
@@ -152,12 +157,11 @@ public:
 
     [[nodiscard]] std::span<SchemaTokenId const> expectedSet(SchemaCursor cur) const noexcept;
 
-    [[nodiscard]] detail::SlotKind slotKind(SchemaCursor cur) const noexcept;
-    [[nodiscard]] RuleId           slotRuleRef(SchemaCursor cur) const noexcept;
-    [[nodiscard]] bool             isAtEndOfRule(SchemaCursor cur) const noexcept;
+    [[nodiscard]] SlotKind slotKind(SchemaCursor cur) const noexcept;
+    [[nodiscard]] RuleId   slotRuleRef(SchemaCursor cur) const noexcept;
+    [[nodiscard]] bool     isAtEndOfRule(SchemaCursor cur) const noexcept;
 
-    // Direct per-rule queries — useful for the eventual parser without
-    // needing a cursor instance.
+    // Direct per-rule queries that don't require a cursor instance.
     [[nodiscard]] std::span<SchemaTokenId const> firstSetOf(RuleId rule) const noexcept;
     [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;
 

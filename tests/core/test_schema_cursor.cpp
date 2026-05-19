@@ -46,9 +46,8 @@ TEST(SchemaCursor, RootCursorPointsAtFirstRuleStep) {
 
     auto root = schema->rootCursor();
     ASSERT_TRUE(root.valid());
-    EXPECT_EQ(schema->slotKind(root), detail::SlotKind::TokenLeaf);
+    EXPECT_EQ(schema->slotKind(root), SlotKind::TokenLeaf);
 
-    // Position 0 of `root` expects PlusOp; not Identifier yet.
     auto expected = schema->expectedSet(root);
     EXPECT_TRUE(firstSetContains(expected, kindId(*schema, "PlusOp")));
     EXPECT_FALSE(firstSetContains(expected, kindId(*schema, "Identifier")));
@@ -71,7 +70,6 @@ TEST(SchemaCursor, AdvanceThroughSequenceStepByStep) {
     auto c1 = schema->advance(c0, kindId(*schema, "PlusOp"));
     ASSERT_TRUE(c1.valid());
 
-    // Now at step 1; expects Identifier next.
     auto exp1 = schema->expectedSet(c1);
     EXPECT_TRUE(firstSetContains(exp1, kindId(*schema, "Identifier")));
     EXPECT_FALSE(firstSetContains(exp1, kindId(*schema, "End")));
@@ -121,7 +119,7 @@ TEST(SchemaCursor, AltExpectedSetIsUnionOfBranchFirsts) {
     ASSERT_NE(schema, nullptr);
 
     auto root = schema->rootCursor();
-    EXPECT_EQ(schema->slotKind(root), detail::SlotKind::AltChoice);
+    EXPECT_EQ(schema->slotKind(root), SlotKind::AltChoice);
     auto exp = schema->expectedSet(root);
     EXPECT_TRUE(firstSetContains(exp, kindId(*schema, "PlusOp")));
     EXPECT_TRUE(firstSetContains(exp, kindId(*schema, "MinusOp")));
@@ -165,18 +163,15 @@ TEST(SchemaCursor, OptionalExpectedSetIncludesInnerAndContinuation) {
 
     auto c0 = schema->rootCursor();
     auto exp = schema->expectedSet(c0);
-    // Both the optional's inner FIRST and the continuation's FIRST must be valid.
     EXPECT_TRUE(firstSetContains(exp, kindId(*schema, "PlusOp")));
     EXPECT_TRUE(firstSetContains(exp, kindId(*schema, "End")));
 
-    // Take the optional.
     auto withPlus = schema->advance(c0, kindId(*schema, "PlusOp"));
     ASSERT_TRUE(withPlus.valid());
     auto cEnd1 = schema->advance(withPlus, kindId(*schema, "End"));
     ASSERT_TRUE(cEnd1.valid());
     EXPECT_TRUE(schema->canEndSource(cEnd1));
 
-    // Skip the optional.
     auto cEnd2 = schema->advance(c0, kindId(*schema, "End"));
     ASSERT_TRUE(cEnd2.valid());
     EXPECT_TRUE(schema->canEndSource(cEnd2));
@@ -218,22 +213,22 @@ TEST(SchemaCursor, RepeatLoopsBackToEntryAfterEachIteration) {
     EXPECT_TRUE(firstSetContains(exp0, kindId(*schema, "PlusOp")));
     EXPECT_TRUE(firstSetContains(exp0, kindId(*schema, "End")));
 
-    // Match PlusOp twice; cursor must return to the same loop entry.
     auto after1 = schema->advance(loopEntry, kindId(*schema, "PlusOp"));
     ASSERT_TRUE(after1.valid());
     auto after2 = schema->advance(after1, kindId(*schema, "PlusOp"));
     ASSERT_TRUE(after2.valid());
-    // Both intermediate cursors share the loop-entry's expectedSet — they
-    // ARE the loop entry, returned to after each iteration of `repeat`.
+    // After each iteration the cursor must land back at the loop entry —
+    // pointer-identity on expectedSet's underlying storage proves the
+    // back-edge points at the same position, not at a structural twin.
     EXPECT_EQ(schema->expectedSet(after1).data(), exp0.data());
+    EXPECT_EQ(after1.posId(), loopEntry.posId());
     EXPECT_EQ(schema->expectedSet(after2).data(), exp0.data());
+    EXPECT_EQ(after2.posId(), loopEntry.posId());
 
-    // Exit the loop.
     auto cEnd = schema->advance(after2, kindId(*schema, "End"));
     ASSERT_TRUE(cEnd.valid());
     EXPECT_TRUE(schema->canEndSource(cEnd));
 
-    // Empty-loop exit is also legal.
     auto cEmptyExit = schema->advance(loopEntry, kindId(*schema, "End"));
     ASSERT_TRUE(cEmptyExit.valid());
     EXPECT_TRUE(schema->canEndSource(cEmptyExit));
@@ -258,15 +253,13 @@ TEST(SchemaCursor, EnterRuleReturnsCursorAtChildStart) {
     ASSERT_NE(schema, nullptr);
 
     auto root = schema->rootCursor();
-    // root's first slot is a RuleLeaf for `inner`.
-    EXPECT_EQ(schema->slotKind(root), detail::SlotKind::RuleLeaf);
+    EXPECT_EQ(schema->slotKind(root), SlotKind::RuleLeaf);
     EXPECT_EQ(schema->slotRuleRef(root).v, ruleId(*schema, "inner").v);
 
     auto innerStart = schema->enterRule(ruleId(*schema, "inner"));
     ASSERT_TRUE(innerStart.valid());
     EXPECT_EQ(innerStart.rule().v, ruleId(*schema, "inner").v);
 
-    // Token-level expectedSet inside `inner` is {PlusOp}.
     auto exp = schema->expectedSet(innerStart);
     EXPECT_TRUE(firstSetContains(exp, kindId(*schema, "PlusOp")));
     EXPECT_FALSE(firstSetContains(exp, kindId(*schema, "End")));
@@ -289,10 +282,8 @@ TEST(SchemaCursor, LeaveRuleAdvancesParentPastTheSlot) {
     ASSERT_NE(schema, nullptr);
 
     auto parent = schema->rootCursor();
-    // (caller would save `parent`, descend, ...)
     auto resumed = schema->leaveRule(parent);
     ASSERT_TRUE(resumed.valid());
-    // Now at parent's step-after-inner, expecting End.
     auto exp = schema->expectedSet(resumed);
     EXPECT_TRUE(firstSetContains(exp, kindId(*schema, "End")));
     EXPECT_FALSE(firstSetContains(exp, kindId(*schema, "PlusOp")));
@@ -377,7 +368,8 @@ TEST(SchemaCursor, CanEndSourceOnlyAtRootEnd) {
     auto rootEnd = schema->leaveRule(schema->rootCursor());
     EXPECT_TRUE(schema->canEndSource(rootEnd));
 
-    // The same end-of-body cursor inside a NON-root rule is not source-end.
+    // canEndSource only fires in the root rule. End-of-body inside a
+    // non-root rule must not be a "source can end here" signal.
     auto innerEnd = schema->advance(
         schema->enterRule(ruleId(*schema, "inner")),
         kindId(*schema, "PlusOp"));
@@ -431,8 +423,8 @@ TEST(SchemaCursor, ExprShapeBehavesAsAtomReferenceForCursor) {
     auto schema = load(kCfg);
     ASSERT_NE(schema, nullptr);
 
-    // FIRST(expression) = FIRST(primary) = {Identifier}.
     auto fs = schema->firstSetOf(ruleId(*schema, "expression"));
+    ASSERT_EQ(fs.size(), 1u);
     EXPECT_TRUE(firstSetContains(fs, kindId(*schema, "Identifier")));
 }
 
@@ -441,6 +433,237 @@ TEST(SchemaCursor, ExprShapeBehavesAsAtomReferenceForCursor) {
 TEST(SchemaCursor, DefaultConstructedCursorIsInvalid) {
     SchemaCursor c;
     EXPECT_FALSE(c.valid());
+}
+
+// ── All-nullable cycle: FIRST stays empty, fixed-point still converges ──
+
+TEST(SchemaCursor, AllNullableCycleTerminates) {
+    // a → repeat[optional[b]] is nullable from every step (both `repeat`
+    // and `optional` are nullable). b → optional[a] is nullable too. The
+    // grammar has no token references at all, so FIRST stays empty
+    // throughout. Fixed-point termination relies on `(firstSet, nullable)`
+    // reaching a stable pair, NOT on FIRST growing. If a future refactor
+    // ever made convergence depend on FIRST monotonicity alone, this test
+    // would hang during load.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": {
+        "root": { "sequence": [ "a", "PlusOp" ] },
+        "a":    { "repeat":   "b" },
+        "b":    { "optional": "a" }
+      }
+    })JSON";
+    auto schema = load(kCfg);
+    ASSERT_NE(schema, nullptr);
+    EXPECT_TRUE(schema->isNullable(ruleId(*schema, "a")));
+    EXPECT_TRUE(schema->isNullable(ruleId(*schema, "b")));
+    EXPECT_EQ(schema->firstSetOf(ruleId(*schema, "a")).size(), 0u);
+    EXPECT_EQ(schema->firstSetOf(ruleId(*schema, "b")).size(), 0u);
+}
+
+// ── AltChoice ambiguity is a load error ──────────────────────────────────
+
+TEST(SchemaCursor, AltBranchesShareFirstTokenIsLoadError) {
+    // Two branches whose FIRST sets overlap on `PlusOp` — the cursor would
+    // silently first-branch-win on advance. The loader rejects this so
+    // the config author either restructures the grammar or factors the
+    // shared prefix into a parent rule.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "+": [{ "kind": "PlusOp" }],
+        "*": [{ "kind": "StarOp" }]
+      },
+      "shapes": {
+        "root": {
+          "alt": [
+            { "sequence": [ "PlusOp", "Identifier" ] },
+            { "sequence": [ "PlusOp", "StarOp" ] }
+          ]
+        }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    auto const& diags = loaded.error();
+    auto it = std::ranges::find_if(diags, [](auto const& d) {
+        return d.code == DiagnosticCode::C_AmbiguousAlternatives;
+    });
+    ASSERT_NE(it, diags.end());
+    EXPECT_NE(it->message.find("PlusOp"), std::string::npos)
+        << "diagnostic should name the offending token; got: " << it->message;
+}
+
+TEST(SchemaCursor, NonAmbiguousAltLoadsCleanly) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "+": [{ "kind": "PlusOp" }],
+        "*": [{ "kind": "StarOp" }]
+      },
+      "shapes": { "root": { "alt": [ "PlusOp", "StarOp" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value());
+}
+
+// ── Multi-level descent: enterRule × leaveRule × leaveRule ───────────────
+
+TEST(SchemaCursor, MultiLevelDescentAndReturn) {
+    // root → outer → inner → tok. Caller manages a 3-deep cursor stack.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": {
+        "root":  { "sequence": [ "outer", "PlusOp" ] },
+        "outer": { "sequence": [ "inner" ] },
+        "inner": { "sequence": [ "Identifier" ] }
+      }
+    })JSON";
+    auto schema = load(kCfg);
+    ASSERT_NE(schema, nullptr);
+
+    // Save root, descend into outer.
+    auto rootCur  = schema->rootCursor();
+    EXPECT_EQ(schema->slotRuleRef(rootCur).v, ruleId(*schema, "outer").v);
+    auto outerCur = schema->enterRule(ruleId(*schema, "outer"));
+    ASSERT_TRUE(outerCur.valid());
+
+    // Save outer, descend into inner.
+    EXPECT_EQ(schema->slotRuleRef(outerCur).v, ruleId(*schema, "inner").v);
+    auto innerCur = schema->enterRule(ruleId(*schema, "inner"));
+    ASSERT_TRUE(innerCur.valid());
+
+    // Match Identifier inside inner.
+    auto innerEnd = schema->advance(innerCur, kindId(*schema, "Identifier"));
+    ASSERT_TRUE(innerEnd.valid());
+    EXPECT_TRUE(schema->isAtEndOfRule(innerEnd));
+
+    // Pop back to outer (advance past the inner ruleref), then to root.
+    auto outerAfter = schema->leaveRule(outerCur);
+    ASSERT_TRUE(outerAfter.valid());
+    EXPECT_TRUE(schema->isAtEndOfRule(outerAfter));
+
+    auto rootAfter = schema->leaveRule(rootCur);
+    ASSERT_TRUE(rootAfter.valid());
+    // Now expecting PlusOp.
+    EXPECT_TRUE(firstSetContains(schema->expectedSet(rootAfter),
+                                  kindId(*schema, "PlusOp")));
+    auto rootEnd = schema->advance(rootAfter, kindId(*schema, "PlusOp"));
+    ASSERT_TRUE(rootEnd.valid());
+    EXPECT_TRUE(schema->canEndSource(rootEnd));
+}
+
+// ── advance on RuleLeaf is an invalid no-op ──────────────────────────────
+
+TEST(SchemaCursor, AdvanceOnRuleLeafReturnsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": {
+        "root":  { "sequence": [ "inner" ] },
+        "inner": { "sequence": [ "PlusOp" ] }
+      }
+    })JSON";
+    auto schema = load(kCfg);
+    ASSERT_NE(schema, nullptr);
+
+    auto cur = schema->rootCursor();
+    EXPECT_EQ(schema->slotKind(cur), SlotKind::RuleLeaf);
+    // The token IS in FIRST(inner), but caller must enterRule first.
+    // advance refuses rather than silently descending.
+    auto bogus = schema->advance(cur, kindId(*schema, "PlusOp"));
+    EXPECT_FALSE(bogus.valid());
+}
+
+// ── expectedSet ordering and span stability ──────────────────────────────
+
+TEST(SchemaCursor, ExpectedSetOrderedBySchemaTokenIdValue) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "a": [{ "kind": "Alpha" }],
+        "b": [{ "kind": "Beta"  }],
+        "c": [{ "kind": "Gamma" }]
+      },
+      "shapes": { "root": { "alt": [ "Gamma", "Alpha", "Beta" ] } }
+    })JSON";
+    auto schema = load(kCfg);
+    ASSERT_NE(schema, nullptr);
+
+    auto exp = schema->expectedSet(schema->rootCursor());
+    ASSERT_EQ(exp.size(), 3u);
+    // mergeSorted produces ids in ascending .v order regardless of the
+    // alt declaration order. Pinning ascending order locks the contract
+    // future consumers may use for binary search.
+    for (std::size_t i = 1; i < exp.size(); ++i) {
+        EXPECT_LT(exp[i - 1].v, exp[i].v);
+    }
+}
+
+TEST(SchemaCursor, ExpectedSetSpanIsStableAcrossCursorOperations) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ { "repeat": "PlusOp" }, "Identifier" ] } }
+    })JSON";
+    auto schema = load(kCfg);
+    ASSERT_NE(schema, nullptr);
+
+    // Loop-entry position; expectedSet built via tie-the-knot. Capture
+    // pointer+size, run a sequence of cursor operations, re-check that
+    // the original span still points at the same storage.
+    auto loopEntry = schema->rootCursor();
+    auto exp0      = schema->expectedSet(loopEntry);
+    auto* data0    = exp0.data();
+    auto  size0    = exp0.size();
+
+    auto after  = schema->advance(loopEntry, kindId(*schema, "PlusOp"));
+    auto after2 = schema->advance(after,     kindId(*schema, "PlusOp"));
+    auto cEnd   = schema->advance(after2,    kindId(*schema, "Identifier"));
+    (void)cEnd;
+
+    auto expAgain = schema->expectedSet(loopEntry);
+    EXPECT_EQ(expAgain.data(), data0);
+    EXPECT_EQ(expAgain.size(), size0);
+}
+
+TEST(SchemaCursor, FirstSetOfReturnsStableSpan) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } }
+    })JSON";
+    auto schema = load(kCfg);
+    ASSERT_NE(schema, nullptr);
+    auto a = schema->firstSetOf(ruleId(*schema, "root"));
+    auto b = schema->firstSetOf(ruleId(*schema, "root"));
+    EXPECT_EQ(a.data(), b.data());
+    EXPECT_EQ(a.size(), b.size());
+}
+
+// ── enterRule on invalid / non-existent rules ────────────────────────────
+
+TEST(SchemaCursor, EnterRuleOnInvalidRuleReturnsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } }
+    })JSON";
+    auto schema = load(kCfg);
+    ASSERT_NE(schema, nullptr);
+    EXPECT_FALSE(schema->enterRule(InvalidRule).valid());
+    EXPECT_FALSE(schema->enterRule(RuleId{9999}).valid());
 }
 
 TEST(SchemaCursor, OperationsOnInvalidCursorReturnInvalid) {
@@ -457,6 +680,6 @@ TEST(SchemaCursor, OperationsOnInvalidCursorReturnInvalid) {
     EXPECT_FALSE(schema->advance(invalid, kindId(*schema, "PlusOp")).valid());
     EXPECT_FALSE(schema->leaveRule(invalid).valid());
     EXPECT_TRUE(schema->expectedSet(invalid).empty());
-    EXPECT_EQ(schema->slotKind(invalid), detail::SlotKind::End);
+    EXPECT_EQ(schema->slotKind(invalid), SlotKind::End);
     EXPECT_FALSE(schema->canEndSource(invalid));
 }

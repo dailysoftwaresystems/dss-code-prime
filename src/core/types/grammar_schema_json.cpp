@@ -120,6 +120,12 @@ void collectReferences(json const& body,
                    std::format("'{}' must be an array", kind));
             return;
         }
+        if (arr.empty()) {
+            c.emit(DiagnosticCode::C_MissingField,
+                   std::format("{}/{}", path, kind),
+                   std::format("'{}' must contain at least one element", kind));
+            return;
+        }
         for (std::size_t i = 0; i < arr.size(); ++i) {
             collectReferences(arr[i], std::format("{}/{}/{}", path, kind, i),
                               outRefs, c);
@@ -127,8 +133,11 @@ void collectReferences(json const& body,
     };
 
     // The five shape kinds are mutually exclusive — a body declares one of
-    // sequence|alt|optional|repeat|expr, never two. A body declaring two
-    // would silently run both branches; surface that as a load error.
+    // sequence|alt|optional|repeat|expr, never two — and a body must declare
+    // at least one. A body with zero kinds silently produces a no-op rule
+    // (the position builder falls through to `return cont`); a body with
+    // multiple kinds silently runs every matching branch. Both are surface
+    // misfires that this guard turns into load errors.
     {
         constexpr std::string_view kShapeKinds[] = {
             "sequence", "alt", "optional", "repeat", "expr",
@@ -137,7 +146,10 @@ void collectReferences(json const& body,
         for (auto k : kShapeKinds) {
             if (body.contains(k)) present.push_back(k);
         }
-        if (present.size() > 1) {
+        if (present.empty()) {
+            c.emit(DiagnosticCode::C_UnknownShape, path,
+                   "shape body declares no kind — expected exactly one of sequence|alt|optional|repeat|expr");
+        } else if (present.size() > 1) {
             std::string joined;
             for (std::size_t i = 0; i < present.size(); ++i) {
                 if (i) joined += ", ";
@@ -208,7 +220,7 @@ void insertSorted(std::vector<SchemaTokenId>& v, SchemaTokenId t) {
 }
 
 void mergeSorted(std::vector<SchemaTokenId>& into,
-                 std::vector<SchemaTokenId> const& from) {
+                 std::span<SchemaTokenId const> from) {
     for (auto t : from) insertSorted(into, t);
 }
 
@@ -287,19 +299,25 @@ std::vector<SchemaTokenId> firstOfBody(json const& body,
 
 void computeFirstAndNullable(GrammarSchemaData& data, json const& shapesJson) {
     // Initialise every rule's FIRST = {} and nullable = false. Iterate
-    // until a full pass leaves every rule's values unchanged.
+    // until a full pass leaves every rule's values unchanged. FIRST sets
+    // only grow (via insertSorted's dedup) and nullable only flips
+    // false→true, so the loop is monotone over a finite lattice. The
+    // iteration cap is a safety net — if a future refactor breaks
+    // monotonicity, we abort rather than hanging silently.
     for (auto const& [shapeName, _] : shapesJson.items()) {
         const auto rid = data.rules->find(shapeName);
         data.compiledRules[rid.v] = detail::CompiledRule{};
     }
 
+    constexpr int kMaxIters = 10000;
     bool changed = true;
-    while (changed) {
+    int iters = 0;
+    while (changed && iters++ < kMaxIters) {
         changed = false;
         for (auto const& [shapeName, body] : shapesJson.items()) {
             const auto rid = data.rules->find(shapeName);
             auto& rule = data.compiledRules[rid.v];
-            auto newFirst    = firstOfBody(body, data);
+            auto newFirst     = firstOfBody(body, data);
             const bool newNul = nullableOfBody(body, data);
             if (newFirst != rule.firstSet || newNul != rule.nullable) {
                 rule.firstSet = std::move(newFirst);
@@ -314,60 +332,33 @@ struct PositionBuilder {
     std::vector<detail::Position>& positions;
     GrammarSchemaData const&       data;
 
-    [[nodiscard]] std::uint32_t alloc() {
-        positions.emplace_back();
+    [[nodiscard]] std::uint32_t emplace(detail::Position p) {
+        positions.push_back(std::move(p));
         return static_cast<std::uint32_t>(positions.size() - 1);
     }
 
-    [[nodiscard]] std::uint32_t allocEnd() {
-        const auto id = alloc();
-        positions[id].slotKind = detail::SlotKind::End;
-        return id;
-    }
-
-    [[nodiscard]] std::uint32_t allocAltChoice(std::vector<std::uint32_t> branches) {
-        const auto id = alloc();
-        auto& p = positions[id];
-        p.slotKind = detail::SlotKind::AltChoice;
-        std::vector<SchemaTokenId> ex;
-        for (auto bid : branches) mergeSorted(ex, positions[bid].expectedSet);
-        p.expectedSet = std::move(ex);
-        p.branches    = std::move(branches);
-        return id;
-    }
-
+    // `cont` is the position-id the built body falls through to when it
+    // completes. Threaded right-to-left through sequence children so each
+    // child's `nextPos` points at its actual successor.
     [[nodiscard]] std::uint32_t build(json const& body, std::uint32_t cont) {
         if (body.is_string()) {
             const auto& name = body.get<std::string>();
             if (data.rules->contains(name)) {
                 const auto rid = data.rules->find(name);
-                const auto id  = alloc();
-                auto& p = positions[id];
-                p.slotKind = detail::SlotKind::RuleLeaf;
-                p.ruleId   = rid;
-                p.nextPos  = cont;
+                std::vector<SchemaTokenId> firstSet;
                 auto it = data.compiledRules.find(rid.v);
-                if (it != data.compiledRules.end()) {
-                    p.expectedSet = it->second.firstSet;
-                }
-                return id;
+                if (it != data.compiledRules.end()) firstSet = it->second.firstSet;
+                return emplace(detail::Position::makeRuleLeaf(rid, cont, std::move(firstSet)));
             }
             if (data.schemaTokens->contains(name)) {
-                const auto tid = data.schemaTokens->find(name);
-                const auto id  = alloc();
-                auto& p = positions[id];
-                p.slotKind   = detail::SlotKind::TokenLeaf;
-                p.tokenId    = tid;
-                p.nextPos    = cont;
-                p.expectedSet = {tid};
-                return id;
+                return emplace(detail::Position::makeTokenLeaf(
+                    data.schemaTokens->find(name), cont));
             }
-            return cont;  // unreachable; reference validated earlier
+            return cont;  // unreachable; references validated earlier
         }
         if (body.contains("sequence")) {
             const auto& seq = body.at("sequence");
             std::uint32_t curCont = cont;
-            // Build right-to-left so each child's nextPos is its actual successor.
             for (auto it = seq.rbegin(); it != seq.rend(); ++it) {
                 curCont = build(*it, curCont);
             }
@@ -378,30 +369,38 @@ struct PositionBuilder {
             std::vector<std::uint32_t> branches;
             branches.reserve(alt.size());
             for (auto const& branch : alt) branches.push_back(build(branch, cont));
-            return allocAltChoice(std::move(branches));
+            std::vector<SchemaTokenId> ex;
+            for (auto bid : branches) mergeSorted(ex, positions[bid].expectedSet());
+            return emplace(detail::Position::makeAltChoice(std::move(branches), std::move(ex)));
         }
         if (body.contains("optional")) {
             const auto innerStart = build(body.at("optional"), cont);
-            return allocAltChoice({innerStart, cont});
+            std::vector<SchemaTokenId> ex;
+            mergeSorted(ex, positions[innerStart].expectedSet());
+            mergeSorted(ex, positions[cont].expectedSet());
+            return emplace(detail::Position::makeAltChoice({innerStart, cont}, std::move(ex)));
         }
         if (body.contains("repeat")) {
-            // Tie-the-knot: allocate the loop entry first, build the body
-            // with cont=loopEntry so the body's tail loops back, then fill
-            // in branches + expectedSet now that innerStart is known.
-            const auto loopEntry = alloc();
-            positions[loopEntry].slotKind = detail::SlotKind::AltChoice;
+            // Tie-the-knot: reserve a slot for the loop entry first, build
+            // the body with cont=loopEntry so the body's tail loops back,
+            // then overwrite the reserved slot with a real AltChoice once
+            // `innerStart` is known. Nothing reads `positions[loopEntry]`
+            // mid-recursion — child positions only read sibling rules'
+            // `firstSet` from `data.compiledRules`, which is pre-populated
+            // by `computeFirstAndNullable`.
+            const auto loopEntry  = emplace(detail::Position::makeEnd());
             const auto innerStart = build(body.at("repeat"), loopEntry);
-            positions[loopEntry].branches = {innerStart, cont};
             std::vector<SchemaTokenId> ex;
-            mergeSorted(ex, positions[innerStart].expectedSet);
-            mergeSorted(ex, positions[cont].expectedSet);
-            positions[loopEntry].expectedSet = std::move(ex);
+            mergeSorted(ex, positions[innerStart].expectedSet());
+            mergeSorted(ex, positions[cont].expectedSet());
+            positions[loopEntry] = detail::Position::makeAltChoice(
+                {innerStart, cont}, std::move(ex));
             return loopEntry;
         }
         if (body.contains("expr")) {
-            // PR2a treats `expr` as if it were its `atom` rule — the
-            // operator-climbing step is a parser concern that consumes the
-            // operator table at parse time, not at cursor-walk time.
+            // Treat the `expr` shape as its `atom` rule reference — the
+            // Pratt operator-climbing step is the parser's job, not the
+            // cursor's.
             return build(body.at("expr").at("atom"), cont);
         }
         return cont;
@@ -413,48 +412,104 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson) {
         const auto rid = data.rules->find(shapeName);
         auto& rule = data.compiledRules[rid.v];
         rule.positions.clear();
-        rule.positions.emplace_back();   // sentinel at index 0; posId 0 = invalid
+        // positions[0] is the sentinel for cursor posId==0 (invalid).
+        // positions[1] is the End that body completions fall through to.
+        rule.positions.emplace_back();
         PositionBuilder builder{rule.positions, data};
-        const auto endId   = builder.allocEnd();
+        const auto endId   = builder.emplace(detail::Position::makeEnd());
         const auto entryId = builder.build(body, endId);
         rule.entryPos = entryId;
     }
 }
 
+// Scan every compiled AltChoice for branches whose precomputed FIRST sets
+// overlap. The cursor's `advance` does silent first-branch-wins on overlap,
+// which is the wrong default for a grammar that wants disjoint alts; this
+// pass surfaces the conflict at load time so the config author resolves
+// it by either restructuring the grammar OR (in PR4) marking the alt as
+// `speculative: true` to opt in to backtracking semantics. Today the
+// `speculative` field doesn't exist yet, so every ambiguous alt is a
+// load error.
+void detectAmbiguousAlternatives(GrammarSchemaData& data, Collector& coll,
+                                  json const& shapesJson) {
+    for (auto const& [shapeName, _] : shapesJson.items()) {
+        const auto rid = data.rules->find(shapeName);
+        auto it = data.compiledRules.find(rid.v);
+        if (it == data.compiledRules.end()) continue;
+        auto const& positions = it->second.positions;
+        for (std::size_t posIdx = 0; posIdx < positions.size(); ++posIdx) {
+            auto const& p = positions[posIdx];
+            if (p.slotKind() != SlotKind::AltChoice) continue;
+            auto branches = p.branches();
+            for (std::size_t i = 0; i + 1 < branches.size(); ++i) {
+                auto a = positions[branches[i]].expectedSet();
+                for (std::size_t j = i + 1; j < branches.size(); ++j) {
+                    auto b = positions[branches[j]].expectedSet();
+                    // Both sets are sorted by SchemaTokenId.v; linear merge
+                    // detects overlap in O(|a|+|b|).
+                    std::size_t ai = 0, bi = 0;
+                    SchemaTokenId overlap{};
+                    bool found = false;
+                    while (ai < a.size() && bi < b.size()) {
+                        if (a[ai].v == b[bi].v) {
+                            overlap = a[ai]; found = true; break;
+                        }
+                        if (a[ai].v < b[bi].v) ++ai; else ++bi;
+                    }
+                    if (found) {
+                        coll.emit(DiagnosticCode::C_AmbiguousAlternatives,
+                                  std::format("/shapes/{}", shapeName),
+                                  std::format("alt branches share FIRST token '{}' — the cursor would silently take the first branch; restructure the alt or factor the shared prefix",
+                                              data.schemaTokens->name(overlap)));
+                    }
+                }
+            }
+        }
+    }
+}
+
 void computeNullableTails(GrammarSchemaData& data) {
+    // Fixed point over a finite lattice (false ⇒ true is monotone). Cap
+    // iterations as a safety net — if a future refactor accidentally
+    // flips a flag back, we'd otherwise hang silently.
+    constexpr int kMaxIters = 10000;
     for (auto& [_, rule] : data.compiledRules) {
         auto& positions = rule.positions;
         for (auto& p : positions) {
-            p.nullableTail = (p.slotKind == detail::SlotKind::End);
+            p.setNullableTail(p.slotKind() == SlotKind::End);
         }
         bool changed = true;
-        while (changed) {
+        int iters = 0;
+        while (changed && iters++ < kMaxIters) {
             changed = false;
             for (auto& p : positions) {
-                bool newVal = p.nullableTail;
-                switch (p.slotKind) {
-                case detail::SlotKind::End:
+                bool newVal = p.nullableTail();
+                switch (p.slotKind()) {
+                case SlotKind::End:
                     newVal = true;
                     break;
-                case detail::SlotKind::TokenLeaf:
+                case SlotKind::TokenLeaf:
                     newVal = false;
                     break;
-                case detail::SlotKind::RuleLeaf: {
-                    auto it = data.compiledRules.find(p.ruleId.v);
+                case SlotKind::RuleLeaf: {
+                    // Crossing a rule boundary requires both legs to be
+                    // nullable — the callee rule itself AND the parent's
+                    // continuation. Dropping either invalidates the path.
+                    auto it = data.compiledRules.find(p.ruleId().v);
                     const bool ruleNullable =
                         (it != data.compiledRules.end()) && it->second.nullable;
-                    newVal = ruleNullable && positions[p.nextPos].nullableTail;
+                    newVal = ruleNullable && positions[p.nextPos()].nullableTail();
                     break;
                 }
-                case detail::SlotKind::AltChoice:
+                case SlotKind::AltChoice:
                     newVal = false;
-                    for (auto bid : p.branches) {
-                        if (positions[bid].nullableTail) { newVal = true; break; }
+                    for (auto bid : p.branches()) {
+                        if (positions[bid].nullableTail()) { newVal = true; break; }
                     }
                     break;
                 }
-                if (newVal != p.nullableTail) {
-                    p.nullableTail = newVal;
+                if (newVal != p.nullableTail()) {
+                    p.setNullableTail(newVal);
                     changed = true;
                 }
             }
@@ -889,10 +944,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // nullable-tail flags. Only worth doing when references
             // validated cleanly — otherwise the compile pass would crash
             // on broken references it expects the prior pass to reject.
+            // Ambiguity detection runs last: it reads the position tables
+            // to surface alt branches whose FIRST sets overlap.
             if (!coll.hasErrors()) {
-                computeFirstAndNullable(data, doc.at("shapes"));
-                buildPositionTables    (data, doc.at("shapes"));
-                computeNullableTails   (data);
+                computeFirstAndNullable    (data, doc.at("shapes"));
+                buildPositionTables        (data, doc.at("shapes"));
+                detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
+                computeNullableTails       (data);
             }
         }
     }

@@ -14,7 +14,7 @@
 
 | | |
 |---|---|
-| Status        | 🟡 **In flight.** PR0 ✅ shipped. PR1 ✅ shipped + review-fixed. PR2a ✅ shipped (real SchemaCursor walker: compiled position tables, fixed-point FIRST/NULLABLE, per-position nullableTail, caller-managed descent stack, `expectedAt` dropped). 320 ctest cases across 19 suites, 100% pass. PR2b (contextual keywords) is the next critical-path item. |
+| Status        | 🟡 **In flight.** PR0 ✅ shipped. PR1 ✅ shipped + review-fixed. PR2a ✅ shipped + review-fixed (Position class with factories, ambiguity detection via `C_AmbiguousAlternatives`, empty-array / no-shape-kind body errors, c-subset's `topLevel` refactored to disambiguate). 329 ctest cases across 19 suites, 100% pass. PR2b (contextual keywords) is the next critical-path item. |
 | Trigger       | ✅ v1 complete; PR0 and PR1 shipped. |
 | Predecessors  | ✅ v1 T1–T12 (`tree-node-model-plan.md`). ⚠️ "minimal end-to-end pipeline (tokenize → parse → IR → emit)" — **NOT done**. T10 ships an E2E test that drives `TreeBuilder` via hand-constructed token streams; no real lexer/parser/IR exists yet. PR0/PR1 inherit this constraint (see §0.2). |
 | Successors    | `languages-onboarding-plan.md` (authoring `csharp` / `dart` / `tsql` / `sqlite` configs). |
@@ -28,7 +28,7 @@ This plan is **deliberately empirical**: PR0 authored a C subset against the v1 
 |---|---|---|
 | PR0 | ✅ shipped | `4aef654` (initial) + `3aca464` (review followup). c-subset.lang.json, loader [1..2], v2-gap-catalog.md, 6 tests. |
 | PR1 | ✅ shipped | `068b633` (initial) + `048953f` (review followup). OperatorTable + loader `operators` section + `expr` shape kind + c-subset operators (`dssSchemaVersion: 2`) + 31 tests (17 initial + 13 from review followup, +1 c-subset precedence pin). |
-| PR2a | ✅ shipped | New `compiled_shape.hpp` (Position/CompiledRule/SlotKind). Loader computes per-rule FIRST/NULLABLE via fixed-point, then builds per-rule flat Position table (tie-the-knot for repeats), then computes nullableTail via fixed-point. SchemaCursor rebuilt as `(RuleId, posId)`. Real `advance`/`enterRule`/`leaveRule`/`expectedSet`/`slotKind`/`slotRuleRef`/`isAtEndOfRule`/`canEndSource`/`firstSetOf`/`isNullable` on `GrammarSchema`. `expectedAt` dropped entirely. 18 new tests in `test_schema_cursor.cpp`. |
+| PR2a | ✅ shipped | `b571cf3` (initial) + review followup. New `compiled_shape.hpp` (Position class with factories, CompiledRule). `SlotKind` lives in `dss::`. Loader computes per-rule FIRST/NULLABLE via fixed-point with iteration cap, builds per-rule flat Position table (tie-the-knot for repeats), runs ambiguity detection (`C_AmbiguousAlternatives` on overlapping alt FIRSTs), then computes nullableTail. SchemaCursor is `(RuleId, posId)` at 8 bytes, trivially-copyable. Full cursor API + drop of `expectedAt`. Loader hardening: empty array bodies + zero-shape-kind objects load-error; iteration caps on fixed points. c-subset's `topLevel` refactored to disambiguate. 27 cursor tests + ambiguity + multi-level descent + span-stability + ordering pins. |
 | PR2b | ⏳ pending | Contextual keywords + reservedWordPolicy. |
 | PR3  | ⏳ pending | `scopeRequire` (anyOf/forbid/topMustBe/outermost). |
 | PR4  | ⏳ pending | `TreeBuilder::Checkpoint` + speculative alt. |
@@ -51,10 +51,14 @@ This plan is **deliberately empirical**: PR0 authored a C subset against the v1 
 
 ### PR2a contracts established for downstream PRs
 
-- **`SchemaCursor` is value-typed and unlimited-depth via caller stack.** Future PRs that need descent (PR2b contextual keywords, the eventual parser) manage their own `vector<SchemaCursor>` stack.
+- **`SchemaCursor` is value-typed and 8 bytes.** Trivially copyable (`static_assert`ed). Future PRs that need descent (PR2b contextual keywords, the future parser) manage their own `vector<SchemaCursor>` stack — depth is unbounded.
 - **`expectedSet` at a `RuleLeaf` returns `FIRST(rule)` only, NOT the parent's continuation.** When the rule is nullable the caller checks `isNullable(slotRuleRef(cur))` and uses `leaveRule(cur)` to skip past the slot without descending. Auto-skipping is *not* folded into `expectedSet`.
-- **The position table is the authoritative compiled form.** Every position carries a precomputed `expectedSet` (`span<SchemaTokenId const>`) and a `nullableTail` boolean — both stable spans/values, no per-call computation. PR2b will consult `expectedSet` at every contextual-keyword resolution point.
+- **The position table is the authoritative compiled form.** Every position carries a precomputed `expectedSet` (`span<SchemaTokenId const>`) and a `nullableTail` boolean — both stable spans/values, no per-call computation. The span pointer survives any sequence of cursor operations on the schema (pinned by `ExpectedSetSpanIsStableAcrossCursorOperations`).
+- **`expectedSet` ordering is ascending by `SchemaTokenId.v`.** `mergeSorted` is the loader-side normalizer; pinned by `ExpectedSetOrderedBySchemaTokenIdValue`. Consumers may binary-search.
 - **`canEndSource(cur)` is true iff `cur.rule() == root` AND `positions[cur.posId()].nullableTail`.** A future parser uses this to decide "the input ended; is that legal?" without re-walking the schema.
+- **Alt branches must have disjoint FIRST sets.** Loader emits `C_AmbiguousAlternatives` (with the offending shared token name) at load time when two alt branches share a FIRST token. The cursor's `advance` does silent first-branch-wins on overlap — the ambiguity check is the only thing keeping that determinism honest. PR4's speculative `alt` will opt out of this check via the `speculative: true` flag.
+- **Shape bodies must declare exactly one of `sequence|alt|optional|repeat|expr`** AND **`sequence`/`alt` arrays must be non-empty.** Both check at load time (`C_UnknownShape` / `C_MissingField`).
+- **`advance(cur, tok)` on a `RuleLeaf` slot returns invalid** — the caller must `enterRule` to descend. Pinned by `AdvanceOnRuleLeafReturnsInvalid`.
 
 ### PR1 contracts established for downstream PRs
 
