@@ -48,11 +48,9 @@ struct DSS_EXPORT LexemeMeaning {
     NodeFlags        flagsApplied  = NodeFlags::None;
     ScopeKind        opensScope    = ScopeKind::None;
     bool             closesScope   = false;
-    // Soft / "contextual" keyword. When true, `pushToken` consults the
-    // schema cursor's expectedSet at resolution time: if this meaning's
-    // `id` isn't in the expected set the lexeme degrades to Identifier.
-    // Set per-keyword in JSON (`contextual: true`) or implicitly on every
-    // keyword when the config declares `reservedWordPolicy: "contextual"`.
+    // Soft keyword: outside the cursor's expectedSet, degrades to
+    // Identifier. Set per-keyword (`contextual: true`) or by policy
+    // (`reservedWordPolicy: "contextual"`).
     bool             contextual    = false;
     // Empty == "valid in every scope"; non-empty == restrict to listed.
     std::span<ScopeKind const> validScopes;
@@ -183,6 +181,19 @@ public:
     [[nodiscard]] SchemaCursor enterRule(RuleId rule) const noexcept;
     [[nodiscard]] SchemaCursor leaveRule(SchemaCursor parentCur) const noexcept;
     [[nodiscard]] SchemaCursor advance(SchemaCursor cur, SchemaTokenId tok) const noexcept;
+
+    // Walk `parentCur` through any AltChoice positions to find a RuleLeaf
+    // slot for `rule`, returning that RuleLeaf cursor. Used by builders
+    // that want to save a saved-parent cursor for `leaveRule` symmetry
+    // when the parent slot is an AltChoice (e.g. the body of a `repeat`
+    // or an `optional`/`alt` whose chosen branch is RuleLeaf(rule)).
+    //
+    // Returns `parentCur` unchanged when it's already at RuleLeaf(rule).
+    // Returns an invalid cursor when no path through AltChoice positions
+    // leads to a RuleLeaf for `rule` — caller falls back to saving the
+    // original cursor (and leaveRule will then report off-track).
+    [[nodiscard]] SchemaCursor routeToRuleLeaf(SchemaCursor parentCur,
+                                               RuleId rule) const noexcept;
 
     [[nodiscard]] std::span<SchemaTokenId const> expectedSet(SchemaCursor cur) const noexcept;
 

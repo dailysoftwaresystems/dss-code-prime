@@ -353,7 +353,17 @@ TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
     }
     Tree t = std::move(b).finish();
 
-    EXPECT_TRUE(t.diagnostics().all().empty());
+    // This test opens `statement` directly under `root`, bypassing the
+    // c-subset schema's typical `topLevel → topLevelTail → funcTail → block
+    // → statement` path. The schema cursor goes off-track on the first
+    // statement open and emits a single P_SchemaCursorDesync (info) per
+    // the one-shot policy. The tree shape itself is the structural pin.
+    auto const& diags = t.diagnostics().all();
+    EXPECT_EQ(diags.size(), 1u);
+    if (!diags.empty()) {
+        EXPECT_EQ(diags.front().code, DiagnosticCode::P_SchemaCursorDesync);
+        EXPECT_EQ(diags.front().severity, DiagnosticSeverity::Info);
+    }
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
 

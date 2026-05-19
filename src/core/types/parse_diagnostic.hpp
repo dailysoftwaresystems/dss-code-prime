@@ -49,6 +49,7 @@ enum class DiagnosticCode : std::uint16_t {
     P_UnclosedScope               = 0x000A,
     P_UnmatchedClose              = 0x000B,
     P_ContextualKeywordResolution = 0x000C,
+    P_SchemaCursorDesync          = 0x000D,
 
     // ── P9xxx — builder internal-invariant violations (release-mode rescues) ──
     P_BuilderInvariant            = 0x9000,

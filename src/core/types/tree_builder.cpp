@@ -106,6 +106,25 @@ void TreeBuilder::emitDiagnostic_(ParseDiagnostic d) {
     reporter_->report(std::move(d));
 }
 
+void TreeBuilder::noteCursorDesync_(bool wasValid,
+                                    bool nowValid,
+                                    SourceSpan span,
+                                    std::optional<RuleId> rule) {
+    if (cursorDesynced_) return;
+    if (!(wasValid && !nowValid)) return;
+    cursorDesynced_ = true;
+
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::P_SchemaCursorDesync;
+    d.severity = DiagnosticSeverity::Info;
+    d.buffer   = source_ ? source_->id() : InvalidBuffer;
+    d.span     = span;
+    d.ruleContext = rule;
+    d.actual   = "schema cursor went off-track; contextual keyword "
+                 "resolution will stay strict for the remainder of the build";
+    emitDiagnostic_(std::move(d));
+}
+
 void TreeBuilder::addBuilderInvariant_(std::string actual, SourceSpan span) {
     ParseDiagnostic d;
     d.code     = DiagnosticCode::P_BuilderInvariant;
@@ -180,8 +199,16 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
 
     // Walk the schema cursor in parallel with the open frame. Saving the
     // parent's cursor lets closeFrame_ resume the parent via leaveRule
-    // when this rule completes.
-    cursorStack_.push_back(cursor_);
+    // when this rule completes. `leaveRule` requires the saved cursor be
+    // at a RuleLeaf slot — if the parent cursor is at an AltChoice (the
+    // body of a `repeat`/`optional`/`alt`), route it to the RuleLeaf
+    // branch for `rule` first so close() can resume cleanly.
+    SchemaCursor savedParent = cursor_;
+    if (savedParent.valid()) {
+        auto routed = schema_->routeToRuleLeaf(savedParent, rule);
+        if (routed.valid()) savedParent = routed;
+    }
+    cursorStack_.push_back(savedParent);
     cursor_ = schema_->enterRule(rule);
 
     return OpenScope{this, cookie};
@@ -256,15 +283,17 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             closedCookies_.insert(fr.cookie);
         }
         open_.pop_back();
-        // Pop the matching schema cursor and advance the now-current
-        // parent cursor past the rule-leaf slot we descended through.
-        // leaveRule on a non-RuleLeaf cursor returns invalid, which is
-        // what we want — the schema walk is "off track" for everything
-        // downstream and contextual resolution will stay strict.
+        // Invariant: cursorStack_.size() == open_.size() at every
+        // open/close boundary. leaveRule on a non-RuleLeaf saved cursor
+        // returns invalid and trips noteCursorDesync_ — strict-only
+        // contextual resolution for the remainder of the build.
         if (!cursorStack_.empty()) {
             SchemaCursor savedParent = cursorStack_.back();
             cursorStack_.pop_back();
+            const bool wasValid = savedParent.valid();
             cursor_ = schema_->leaveRule(savedParent);
+            noteCursorDesync_(wasValid, cursor_.valid(), fr.openerSpan,
+                              std::optional<RuleId>{fr.rule});
         } else {
             cursor_ = SchemaCursor{};
         }
@@ -435,6 +464,20 @@ void TreeBuilder::pushToken(Token const& tok) {
     // strict policy. This avoids silently turning every soft keyword
     // into an identifier when the parser temporarily diverges from the
     // schema during error recovery.
+    if (resolved.meaning.contextual) {
+        // Defense-in-depth: loader rejects `contextual: true` on the
+        // Identifier kind (see grammar_schema_json.cpp), but anyone
+        // fabricating a LexemeMeaning by hand would skip that check.
+        // The demotion target equals the source → infinite no-op
+        // identity; abort early with a clear message.
+        const auto identId = schema_->schemaTokens().find("Identifier");
+        if (resolved.meaning.id.v == identId.v) {
+            std::fputs("dss::TreeBuilder fatal: contextual meaning resolved to "
+                       "Identifier (the demotion target); config bypassed the "
+                       "loader's C_MissingField check\n", stderr);
+            std::abort();
+        }
+    }
     if (resolved.meaning.contextual && cursor_.valid()) {
         const auto expected = schema_->expectedSet(cursor_);
         bool inExpected = false;
@@ -482,11 +525,24 @@ void TreeBuilder::pushToken(Token const& tok) {
     const NodeId id = emit_(leaf);
     attachToCurrentFrame_(id);
 
-    // Walk the schema cursor by the resolved token kind. If `advance`
-    // returns invalid (token not expected at this position) the cursor
-    // becomes invalid for the remainder of the build, and future
-    // contextual resolutions stay strict per the fallback above.
-    cursor_ = schema_->advance(cursor_, resolved.meaning.id);
+    // Walk the schema cursor by the resolved token kind. EmptySpace
+    // tokens never appear in the schema's expected sets — whitespace is
+    // off-grammar by design — so don't advance through them; doing so
+    // would invalidate the cursor on every space and trip the desync
+    // diagnostic on every otherwise-clean parse. For non-EmptySpace
+    // tokens, if `advance` returns invalid (token not expected at this
+    // position) the cursor becomes invalid for the remainder of the
+    // build, future contextual resolutions stay strict per the fallback
+    // above, and the first valid → invalid transition surfaces one
+    // P_SchemaCursorDesync.
+    if (!isEmptySpace(resolved.meaning.flagsApplied)) {
+        const bool wasValid = cursor_.valid();
+        cursor_ = schema_->advance(cursor_, resolved.meaning.id);
+        noteCursorDesync_(wasValid, cursor_.valid(), tok.span,
+                          open_.empty()
+                              ? std::optional<RuleId>{}
+                              : std::optional<RuleId>{open_.back().rule});
+    }
 }
 
 // ── pushError ────────────────────────────────────────────────────────────

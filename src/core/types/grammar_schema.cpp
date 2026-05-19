@@ -125,6 +125,27 @@ SchemaCursor GrammarSchema::leaveRule(SchemaCursor parentCur) const noexcept {
     return SchemaCursor{parentCur.rule(), p->nextPos()};
 }
 
+SchemaCursor GrammarSchema::routeToRuleLeaf(SchemaCursor parentCur,
+                                            RuleId rule) const noexcept {
+    auto const* p = lookupPos(d_, parentCur);
+    if (p == nullptr) return SchemaCursor{};
+    if (p->slotKind() == SlotKind::RuleLeaf && p->ruleId().v == rule.v) {
+        return parentCur;
+    }
+    if (p->slotKind() == SlotKind::AltChoice) {
+        // Try each branch; first match wins (the loader already rejects
+        // ambiguous alts at load time via C_AmbiguousAlternatives, so
+        // any two RuleLeaf branches in the same AltChoice would have
+        // been flagged before reaching here).
+        for (auto bid : p->branches()) {
+            SchemaCursor probe{parentCur.rule(), bid};
+            auto found = routeToRuleLeaf(probe, rule);
+            if (found.valid()) return found;
+        }
+    }
+    return SchemaCursor{};
+}
+
 SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const noexcept {
     auto it = d_.compiledRules.find(cur.rule().v);
     if (it == d_.compiledRules.end()) return SchemaCursor{};

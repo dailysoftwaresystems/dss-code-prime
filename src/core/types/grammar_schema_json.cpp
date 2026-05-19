@@ -750,6 +750,24 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
             if (forceContextual) lm.contextual = true;
+
+            // Identifier IS the demotion target for contextual keywords.
+            // A keyword whose own kind is Identifier cannot meaningfully
+            // be contextual — the would-be demotion is a no-op, and the
+            // marking is almost always a config mistake (Identifier
+            // declared as a keyword by accident). Reject loudly rather
+            // than silently treat the entry as plain Identifier.
+            if (lm.contextual &&
+                kw.at("kind").get<std::string>() == "Identifier") {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          std::format("{}/contextual", kwPath),
+                          std::format("keyword '{}' cannot be contextual: "
+                                      "kind 'Identifier' is itself the "
+                                      "contextual-demotion target",
+                                      kw.at("word").get<std::string>()));
+                continue;
+            }
+
             data.lexemeTable[kw.at("word").get<std::string>()].push_back(lm);
         }
     }

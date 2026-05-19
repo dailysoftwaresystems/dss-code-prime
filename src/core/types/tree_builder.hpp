@@ -158,6 +158,15 @@ private:
     void                    emitDiagnostic_(ParseDiagnostic d);
     void                    addBuilderInvariant_(std::string actual, SourceSpan span);
 
+    // Emit P_SchemaCursorDesync exactly once per build the first time the
+    // schema cursor goes from valid to invalid. `wasValid` is the state
+    // before the most recent walk step (advance or leaveRule); `nowValid`
+    // is the result. `span` and `rule` populate the diagnostic location.
+    void                    noteCursorDesync_(bool wasValid,
+                                              bool nowValid,
+                                              SourceSpan span,
+                                              std::optional<RuleId> rule);
+
     // Attach a node id to the current frame's children list. Returns false
     // when there's no open frame (caller must have already emitted a
     // P_BuilderInvariant for that case).
@@ -175,13 +184,18 @@ private:
     std::vector<ScopeKind>                 scopes_;      // current scope stack
 
     // Schema cursor mirroring `open_`. Walked through enterRule on open(),
-    // leaveRule on close, and advance on pushToken. Lets `pushToken`
-    // consult `expectedSet(cursor_)` for contextual-keyword resolution.
-    // Goes invalid silently if the caller drives the builder against the
-    // schema's shape — the contextual demotion path treats an invalid
+    // leaveRule on close, and advance on pushToken. Invariant:
+    // `cursorStack_.size() == open_.size()` before/after every open/close
+    // operation. Goes invalid when the caller drives the builder against
+    // the schema's shape; the contextual demotion path treats an invalid
     // cursor as "no expectations known; keep the keyword."
     SchemaCursor                           cursor_;
     std::vector<SchemaCursor>              cursorStack_;
+    // One-shot — true after the first valid → invalid cursor transition.
+    // Bounds the P_SchemaCursorDesync diagnostic to one emission per
+    // build so a long parse that goes off-track doesn't flood the
+    // diagnostic stream.
+    bool                                   cursorDesynced_ = false;
 
     // Cookies that have been "closed" by cascade or by finish() but whose
     // OpenScope guards are still alive (and will eventually call close()

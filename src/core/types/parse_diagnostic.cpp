@@ -30,6 +30,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_UnmatchedClose:           return "P_UnmatchedClose";
         case DiagnosticCode::P_ContextualKeywordResolution:
             return "P_ContextualKeywordResolution";
+        case DiagnosticCode::P_SchemaCursorDesync:
+            return "P_SchemaCursorDesync";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
         case DiagnosticCode::P_UnfinishedTree:           return "P_UnfinishedTree";
