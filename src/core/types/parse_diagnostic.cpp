@@ -47,6 +47,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_InvalidLanguageName:      return "C_InvalidLanguageName";
         case DiagnosticCode::C_InvalidPrecedenceTable:   return "C_InvalidPrecedenceTable";
         case DiagnosticCode::C_RedundantScopeRequire:    return "C_RedundantScopeRequire";
+        case DiagnosticCode::C_ConflictingField:         return "C_ConflictingField";
+        case DiagnosticCode::C_UnknownScopeName:         return "C_UnknownScopeName";
     }
     return "Unknown";
 }

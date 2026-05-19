@@ -69,6 +69,8 @@ enum class DiagnosticCode : std::uint16_t {
     C_InvalidLanguageName         = 0xC021,
     C_InvalidPrecedenceTable      = 0xC022,
     C_RedundantScopeRequire       = 0xC023,
+    C_ConflictingField            = 0xC024,
+    C_UnknownScopeName            = 0xC025,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

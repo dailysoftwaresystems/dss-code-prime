@@ -224,7 +224,7 @@ TEST(GrammarSchema, UnknownScopeNameReportsCode) {
     ASSERT_FALSE(result.has_value());
     auto const& diags = result.error();
     EXPECT_TRUE(std::ranges::any_of(diags, [](auto const& d) {
-        return d.code == DiagnosticCode::C_UnclosableScope;
+        return d.code == DiagnosticCode::C_UnknownScopeName;
     }));
 }
 

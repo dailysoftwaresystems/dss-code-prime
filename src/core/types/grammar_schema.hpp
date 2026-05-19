@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -39,24 +40,29 @@ struct DSS_EXPORT ConfigDiagnostic {
     std::string         message;
 };
 
-// Per-meaning scope-stack constraints. Replaces v1's flat
-// `validScopes: [...]`. Every field defaults to "no constraint":
-//   anyOf empty       — no anyOf requirement
-//   forbid empty      — no forbid requirement
-//   topMustBe unset   — no innermost-scope requirement
-//   outermost unset   — no outermost-scope requirement
+// Per-meaning scope-stack constraints. Every field defaults to "no
+// constraint": empty `anyOf`/`forbid` and unset `topMustBe`/`outermost`
+// all mean "no requirement from this axis." Legacy `validScopes: [...]`
+// loads as `scopeRequire.anyOf` (backward compat).
 //
-// Builder checks in `pushToken` in this order — first failure rejects
-// the meaning: forbid → topMustBe → outermost → anyOf.
+// Enforcement: `meaningAllowedByScopeRequire` in `tree_builder.cpp` is
+// the canonical site that documents and applies the check order.
 //
-// Backwards compat: v1 flat `validScopes: [...]` loads as
-// `scopeRequire.anyOf = [...]` with everything else default.
+// Lifetime: `anyOf` and `forbid` are `std::span`s into
+// `GrammarSchemaData::scopeListPool`. The loader reserves the pool up
+// front based on a Pass-A count so subsequent `push_back`s never
+// reallocate; the spans remain valid for the lifetime of the owning
+// `GrammarSchema`. Mutating the pool after construction is unsupported.
 struct DSS_EXPORT ScopeMatch {
     std::span<ScopeKind const>  anyOf;
     std::span<ScopeKind const>  forbid;
     std::optional<ScopeKind>    topMustBe;
     std::optional<ScopeKind>    outermost;
 };
+
+static_assert(std::is_trivially_copyable_v<ScopeMatch>,
+              "ScopeMatch must stay trivially copyable — copied through "
+              "the candidate-filtering hot path in resolveMeaning.");
 
 // One resolved meaning of a lexeme, sourced from a single entry under
 // the config's `tokens` map. A lexeme may have several meanings — the
@@ -74,6 +80,10 @@ struct DSS_EXPORT LexemeMeaning {
     bool             contextual    = false;
     ScopeMatch       scopeRequire{};
 };
+
+static_assert(std::is_trivially_copyable_v<LexemeMeaning>,
+              "LexemeMeaning must stay trivially copyable — copied through "
+              "the candidate-filtering hot path in resolveMeaning.");
 
 // How aggressively the builder treats keywords as reserved.
 //
