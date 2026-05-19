@@ -104,7 +104,10 @@ LexerModeId GrammarSchema::findLexerMode(std::string_view name) const noexcept {
 
 LexerMode const& GrammarSchema::lexerMode(LexerModeId id) const noexcept {
     if (!id.valid() || id.v >= d_.lexerModes.size()) {
-        std::fputs("dss::GrammarSchema::lexerMode: invalid LexerModeId\n", stderr);
+        std::fprintf(stderr,
+            "dss::GrammarSchema::lexerMode: invalid LexerModeId (v=%u, "
+            "table_size=%zu)\n",
+            id.v, d_.lexerModes.size());
         std::abort();
     }
     return d_.lexerModes[id.v];
@@ -113,7 +116,10 @@ LexerMode const& GrammarSchema::lexerMode(LexerModeId id) const noexcept {
 std::span<LexemeMeaning const>
 GrammarSchema::lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept {
     if (!mode.valid() || mode.v >= d_.lexerModes.size()) {
-        std::fputs("dss::GrammarSchema::lookupLexemeInMode: invalid LexerModeId\n", stderr);
+        std::fprintf(stderr,
+            "dss::GrammarSchema::lookupLexemeInMode: invalid LexerModeId "
+            "(v=%u, table_size=%zu)\n",
+            mode.v, d_.lexerModes.size());
         std::abort();
     }
     auto modeIt = d_.lexerModeTokens.find(mode.v);

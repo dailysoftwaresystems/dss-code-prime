@@ -629,6 +629,94 @@ TEST(LookupLexemeInModeDeath, InvalidLexerModeIdAborts) {
                  "invalid LexerModeId");
 }
 
+// ── H1: mode with only defaultToken (no tokens) warns ──────────────────
+
+TEST(LexerModesLoader, DefaultTokenWithoutTokensFieldWarns) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": {
+        "root":      { "alt": ["A", "B"] },
+        "A":         { "sequence": [ "PlusOp" ] },
+        "B":         { "sequence": [ "PlusOp" ] }
+      },
+      "lexerModes": {
+        "string-body": { "defaultToken": { "kind": "StringChar" } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_RedundantField &&
+               d.message.find("only 'defaultToken' will ever match") != std::string::npos;
+    }));
+}
+
+// ── T1-T4: stack API gaps from round-2 review ───────────────────────────
+
+TEST(LexerModeStack, TopOrInvalidReturnsActualTopWhenNonEmpty) {
+    LexerModeStack s;
+    s.push(LexerModeId{7});
+    s.push(LexerModeId{9});
+    EXPECT_EQ(s.topOrInvalid().v, 9u);
+    s.pop();
+    EXPECT_EQ(s.topOrInvalid().v, 7u);
+}
+
+TEST(LexerModeStack, ClearLeavesStackReusable) {
+    LexerModeStack s;
+    s.push(LexerModeId{1});
+    s.push(LexerModeId{2});
+    s.clear();
+    EXPECT_TRUE(s.empty());
+    // Reuse after clear: push, snapshot, mutate, restore.
+    s.push(LexerModeId{5});
+    auto snap = s.snapshot();
+    s.push(LexerModeId{6});
+    s.push(LexerModeId{7});
+    s.restore(snap);
+    ASSERT_EQ(s.depth(), 1u);
+    EXPECT_EQ(s.top().v, 5u);
+}
+
+TEST(LexerModeStackDeath, ApplyReplaceModeOnEmptyAborts) {
+    LexerModeStack s;
+    EXPECT_DEATH({ s.apply(ModeOp::ReplaceMode, LexerModeId{1}); },
+                 "replaceTop\\(\\) on empty stack");
+}
+
+TEST(LexerModeStack, FramesAccessorReturnsBottomToTop) {
+    LexerModeStack s;
+    s.push(LexerModeId{1});
+    s.push(LexerModeId{2});
+    s.push(LexerModeId{3});
+    auto fr = s.frames();
+    ASSERT_EQ(fr.size(), 3u);
+    EXPECT_EQ(fr[0].v, 1u);
+    EXPECT_EQ(fr[1].v, 2u);
+    EXPECT_EQ(fr[2].v, 3u);
+}
+
+// ── Generation-counter behavior: two distinct stacks get distinct ids ──
+
+TEST(LexerModeStackDeath, SecondInstanceAtSameAddressCannotImpersonate) {
+    // Hard to test address recycling directly without UB. Instead test
+    // the equivalent: snapshot from one stack does not restore into a
+    // separately-constructed second stack, even after the first is
+    // destroyed and the second starts empty. This pins the per-instance
+    // id stamp regardless of address reuse.
+    LexerModeStack::Snapshot snap;
+    {
+        LexerModeStack a;
+        a.push(LexerModeId{1});
+        snap = a.snapshot();
+    }
+    LexerModeStack b;
+    EXPECT_DEATH({ b.restore(snap); },
+                 "restore\\(\\) with a snapshot from a different stack");
+}
+
 // ── No mode metadata on a meaning means ModeOp::None ────────────────────
 
 TEST(LexerModesLoader, TokenWithoutModeOpDefaultsToNone) {

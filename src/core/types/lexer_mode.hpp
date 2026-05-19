@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/strong_ids.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -26,38 +27,25 @@ enum class ModeOp : std::uint8_t {
 
 [[nodiscard]] DSS_EXPORT std::string_view modeOpName(ModeOp op) noexcept;
 
-// Stack of active lexer modes the tokenizer is currently inside. The
-// top of the stack is the mode that decides which tokens the tokenizer
-// will produce next.
-//
-// Strict-ops policy: `pop`/`replaceTop`/`top` abort via the project's
-// `*Fatal` pattern when called on an empty stack. Reaching this state
-// means the schema and tokenizer disagree on Push/Pop pairing — a real
-// bug, not a recoverable condition. Lenient callers explicitly opt in
-// via `tryPop()` / `topOrInvalid()`.
-//
-// Tokenizer integration deferred — TreeBuilder::Checkpoint will route
-// snapshot/restore through this type when the tokenizer phase lands.
+// Stack of active lexer modes. Top frame chooses which tokens the
+// tokenizer produces next. `pop`/`replaceTop`/`top` abort on empty —
+// disagreement between schema and tokenizer is a bug, not a runtime
+// condition. Lenient callers opt in via `tryPop()` / `topOrInvalid()`.
 class DSS_EXPORT LexerModeStack {
 public:
-    // Snapshot for speculative rollback. Captures the full frames
-    // vector (not just depth) — PushMode under speculation may
-    // arbitrarily reshape the stack, and there's no constant-time
-    // inverse for "what was here before." Stamped with the originating
-    // stack's identity so `restore` can refuse cross-stack mixups.
+    // Speculative-rollback token. Captures the full frames vector
+    // (PushMode under speculation may reshape arbitrarily) plus a
+    // per-instance id stamp (`owner_`); `restore` aborts when the
+    // stamp doesn't match, defending against address-recycling
+    // false-passes that a raw `this` pointer would slip past.
     class DSS_EXPORT Snapshot {
     private:
         friend class LexerModeStack;
         std::vector<LexerModeId> frames_;
-        // Identity stamp captured at snapshot() time. Asserted equal
-        // to `&stack` in restore() to catch the speculative-Checkpoint
-        // class of bug where a Snapshot from one stack is restored
-        // into a different one. Stored as raw uintptr_t (not a back-
-        // pointer) so the Snapshot stays trivially copyable / movable.
-        std::uintptr_t           owner_ = 0;
+        std::uint64_t            owner_ = 0;
     };
 
-    LexerModeStack() noexcept = default;
+    LexerModeStack() noexcept;
 
     void push(LexerModeId mode);
     void pop();                                  // fatal on empty
@@ -88,13 +76,15 @@ public:
     void                   restore(Snapshot const& snap);
 
 private:
+    static std::atomic<std::uint64_t> nextInstanceId_;
+    std::uint64_t            instanceId_;
     std::vector<LexerModeId> frames_;
 };
 
-// Metadata for a single named lexer mode. Construct via the factory
-// `make(name, id, defaultToken)` so id is set atomically. Field access
-// stays public (POD discipline) so the loader can fill auxiliary
-// per-mode tables without going through accessors.
+// Metadata for a single named lexer mode. Construct via `make(name, id,
+// defaultToken)`. `id` is required — no default — to keep "Invalid"
+// from sneaking into the factory's contract; callers must commit to
+// a real id at the construction site.
 struct DSS_EXPORT LexerMode {
     std::string                  name;
     LexerModeId                  id;
@@ -102,7 +92,7 @@ struct DSS_EXPORT LexerMode {
 
     [[nodiscard]] static LexerMode make(std::string name,
                                         LexerModeId id,
-                                        std::optional<SchemaTokenId> defaultToken = {}) {
+                                        std::optional<SchemaTokenId> defaultToken) {
         return LexerMode{std::move(name), id, defaultToken};
     }
 };

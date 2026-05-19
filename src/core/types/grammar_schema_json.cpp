@@ -520,10 +520,7 @@ struct PositionBuilder {
             for (auto bid : branches) mergeSorted(ex, positions[bid].expectedSet());
             const auto id = emplace(detail::Position::makeAltChoice(
                 std::move(branches), std::move(ex)));
-            // Speculative-alt metadata. The cursor walker doesn't act on
-            // these today; they're stored for the future parser to read.
-            // Default `lookahead` when `speculative: true` is set without
-            // an explicit count is 8 (per v2 §5.4 design).
+            // Speculative-alt metadata stored for the parser to consume.
             constexpr std::uint16_t kDefaultLookahead = 8;
             bool speculative = false;
             std::uint16_t lookahead = kDefaultLookahead;
@@ -810,16 +807,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     data.schemaTokens = std::make_shared<SchemaTokenInterner>();
 
     // Pass 1: register `lexerModes` names → LexerModeIds before any
-    // token meaning is parsed, so `modeArg` resolves cleanly against
-    // forward references. "main" is synthesized at id 1 so v1 configs
-    // expose a non-empty `lexerModes()`. Slot 0 is the InvalidLexerMode
-    // sentinel (hidden by `GrammarSchema::lexerModes()`).
-    //
-    // Near-miss detection: configs that mix `"String-body"` and
-    // `"string-body"` would silently register two distinct modes
-    // and the author's `modeArg` references would resolve only to
-    // whichever case they typed. Track a case-folded view to surface
-    // collisions.
+    // token meaning is parsed, so `modeArg` references resolve against
+    // forward declarations. Synthesize "main" at id 1; slot 0 is the
+    // InvalidLexerMode sentinel. Case-folded near-miss detection warns
+    // on configs that mix `"String-body"` and `"string-body"`.
     auto toLower = [](std::string s) {
         for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         return s;
@@ -847,7 +838,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         caseFoldedSeen.emplace(folded, name);
         const LexerModeId realId{
             static_cast<std::uint32_t>(data.lexerModes.size())};
-        data.lexerModes.push_back(LexerMode::make(name, realId));
+        data.lexerModes.push_back(LexerMode::make(name, realId, std::nullopt));
         data.lexerModeIds.emplace(name, realId);
         return realId;
     };
@@ -1182,8 +1173,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             if (modeIt == data.lexerModeIds.end()) continue;   // unreachable
             const LexerModeId modeId = modeIt->second;
 
-            // `defaultToken: { "kind": "X" }` — emitted by the tokenizer
-            // when nothing else matches the input.
+            // Parse defaultToken into a local; the mode entry is then
+            // rebuilt via the factory rather than mutated in place.
+            std::optional<SchemaTokenId> defaultToken;
             if (modeObj.contains("defaultToken")) {
                 json const& dt = modeObj.at("defaultToken");
                 if (!dt.is_object() || !dt.contains("kind") ||
@@ -1192,17 +1184,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               std::format("{}/defaultToken", modePath),
                               "'defaultToken' must be an object with a string 'kind'");
                 } else {
-                    data.lexerModes[modeId.v].defaultToken =
-                        data.schemaTokens->intern(dt.at("kind").get<std::string>());
+                    defaultToken = data.schemaTokens->intern(
+                        dt.at("kind").get<std::string>());
                 }
             }
+            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken);
 
-            // `tokens` field: `"default"` inherits the top-level
-            // lexemeTable; an inline object IS the per-mode table.
-            // Per-mode inline object parsing has not yet shipped, so
-            // until it does we surface a warning rather than silently
-            // accept an empty mode-tokens table.
-            if (modeObj.contains("tokens")) {
+            // tokens field: "default" inherits top-level lexemeTable;
+            // an inline object IS the per-mode table (parsing deferred).
+            const bool hasTokens = modeObj.contains("tokens");
+            if (hasTokens) {
                 json const& tk = modeObj.at("tokens");
                 if (tk.is_string() && tk.get<std::string>() == "default") {
                     data.lexerModeTokens[modeId.v] = data.lexemeTable;
@@ -1220,6 +1211,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               std::format("{}/tokens", modePath),
                               "'tokens' must be 'default' or an inline tokens object");
                 }
+            } else if (defaultToken.has_value()) {
+                // A mode with defaultToken but no `tokens` field will
+                // only ever match its defaultToken — legitimate for
+                // string-body-style scanners, but a frequent typo. Warn
+                // so authors who meant `tokens: "default"` don't get a
+                // silently empty mode.
+                coll.emit(DiagnosticCode::C_RedundantField, modePath,
+                          "mode declares 'defaultToken' but no 'tokens' field — "
+                          "only 'defaultToken' will ever match. Add "
+                          "'tokens: \"default\"' if you also want the top-level "
+                          "token map active in this mode",
+                          DiagnosticSeverity::Warning);
             }
         }
     }

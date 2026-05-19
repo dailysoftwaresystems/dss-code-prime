@@ -17,6 +17,11 @@ namespace {
 
 } // namespace
 
+std::atomic<std::uint64_t> LexerModeStack::nextInstanceId_{1};
+
+LexerModeStack::LexerModeStack() noexcept
+    : instanceId_(nextInstanceId_.fetch_add(1, std::memory_order_relaxed)) {}
+
 std::string_view modeOpName(ModeOp op) noexcept {
     switch (op) {
         case ModeOp::None:        return "none";
@@ -58,12 +63,12 @@ LexerModeId LexerModeStack::top() const noexcept {
 LexerModeStack::Snapshot LexerModeStack::snapshot() const {
     Snapshot s;
     s.frames_ = frames_;
-    s.owner_  = reinterpret_cast<std::uintptr_t>(this);
+    s.owner_  = instanceId_;
     return s;
 }
 
 void LexerModeStack::restore(Snapshot const& snap) {
-    if (snap.owner_ != reinterpret_cast<std::uintptr_t>(this)) {
+    if (snap.owner_ != instanceId_) {
         lexerModeFatal("restore() with a snapshot from a different stack");
     }
     frames_ = snap.frames_;

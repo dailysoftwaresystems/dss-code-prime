@@ -159,12 +159,14 @@ struct DSS_EXPORT GrammarSchemaData {
     // also forces `contextual = true` on every keyword's LexemeMeaning.
     ReservedWordPolicy reservedWordPolicy = ReservedWordPolicy::Strict;
 
-    // Lexer-mode tables. Index 0 is the InvalidLexerMode sentinel;
-    // real ids dense 1..N. "main" synthesized at id 1 even when the
-    // config omits `lexerModes`. `lexerModeTokens` keyed by id; "main"
-    // mirrors `lexemeTable`; modes with `tokens: "default"` inherit
-    // it; modes with inline `tokens: {...}` are not yet parsed
-    // (loader emits a warning).
+    // Lexer-mode tables. `lexerModes[0]` is the InvalidLexerMode
+    // sentinel — DO NOT iterate this vector directly from outside
+    // the loader. Use `GrammarSchema::lexerModes()` which hides the
+    // sentinel via `subspan(1)`. Real ids dense 1..N; "main"
+    // synthesized at id 1 even when JSON omits `lexerModes`.
+    // `lexerModeTokens` keyed by id; "main" mirrors `lexemeTable`;
+    // modes with `tokens: "default"` inherit it; inline
+    // `tokens: {...}` parsing is deferred (loader warns).
     std::vector<LexerMode>                            lexerModes;
     std::unordered_map<std::string, LexerModeId>      lexerModeIds;
     std::unordered_map<std::uint32_t,
