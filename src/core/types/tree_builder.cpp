@@ -77,6 +77,10 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // starts at 1. This matches the convention DSS_STRONG_ID enforces:
     // default-constructed = invalid sentinel.
     nodes_.emplace_back();
+    // Initial cursor is invalid — only becomes meaningful on the first
+    // open(rule). Until then there's no expected set for pushToken to
+    // consult, and contextual-keyword resolution stays strict.
+    cursor_ = SchemaCursor{};
 }
 
 NodeId TreeBuilder::emit_(detail::Node n) {
@@ -174,6 +178,12 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
         .cookie     = cookie,
     });
 
+    // Walk the schema cursor in parallel with the open frame. Saving the
+    // parent's cursor lets closeFrame_ resume the parent via leaveRule
+    // when this rule completes.
+    cursorStack_.push_back(cursor_);
+    cursor_ = schema_->enterRule(rule);
+
     return OpenScope{this, cookie};
 }
 
@@ -246,6 +256,18 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             closedCookies_.insert(fr.cookie);
         }
         open_.pop_back();
+        // Pop the matching schema cursor and advance the now-current
+        // parent cursor past the rule-leaf slot we descended through.
+        // leaveRule on a non-RuleLeaf cursor returns invalid, which is
+        // what we want — the schema walk is "off track" for everything
+        // downstream and contextual resolution will stay strict.
+        if (!cursorStack_.empty()) {
+            SchemaCursor savedParent = cursorStack_.back();
+            cursorStack_.pop_back();
+            cursor_ = schema_->leaveRule(savedParent);
+        } else {
+            cursor_ = SchemaCursor{};
+        }
         if (isTarget) break;
         if (open_.empty()) break;
     }
@@ -400,6 +422,45 @@ void TreeBuilder::pushToken(Token const& tok) {
         emitDiagnostic_(std::move(d));
     }
 
+    // Contextual-keyword demotion. When the winning meaning is a soft
+    // keyword (`contextual: true` in JSON, OR every keyword under
+    // `reservedWordPolicy: "contextual"`), the schema cursor's
+    // expectedSet decides whether the keyword survives. Outside the
+    // expected set the lexeme degrades to Identifier and an info-level
+    // P_ContextualKeywordResolution diagnostic records the demotion.
+    //
+    // Conservative fallback: when the cursor is invalid (no shape graph
+    // position known, e.g. the builder hasn't entered any rule yet, or
+    // an earlier advance went off-track) the keyword stays — same as
+    // strict policy. This avoids silently turning every soft keyword
+    // into an identifier when the parser temporarily diverges from the
+    // schema during error recovery.
+    if (resolved.meaning.contextual && cursor_.valid()) {
+        const auto expected = schema_->expectedSet(cursor_);
+        bool inExpected = false;
+        for (auto const& t : expected) {
+            if (t.v == resolved.meaning.id.v) { inExpected = true; break; }
+        }
+        if (!inExpected) {
+            const auto demotedFrom = resolved.meaning.id;
+            const auto identId     = schema_->schemaTokens().find("Identifier");
+            LexemeMeaning ident{};
+            ident.id = identId;
+            resolved.meaning = ident;
+
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::P_ContextualKeywordResolution;
+            d.severity = DiagnosticSeverity::Info;
+            d.buffer   = source_->id();
+            d.span     = tok.span;
+            d.actual   = std::format("'{}' as Identifier (demoted from {})",
+                                     lexeme,
+                                     schema_->schemaTokens().name(demotedFrom));
+            if (!open_.empty()) d.ruleContext = open_.back().rule;
+            emitDiagnostic_(std::move(d));
+        }
+    }
+
     // Apply scope effects from the resolved meaning. Order vs. leaf-
     // attach doesn't change the current token's tree placement (the leaf
     // lands in the open frame regardless), but performing the scope
@@ -420,6 +481,12 @@ void TreeBuilder::pushToken(Token const& tok) {
     leaf.span      = tok.span;
     const NodeId id = emit_(leaf);
     attachToCurrentFrame_(id);
+
+    // Walk the schema cursor by the resolved token kind. If `advance`
+    // returns invalid (token not expected at this position) the cursor
+    // becomes invalid for the remainder of the build, and future
+    // contextual resolutions stay strict per the fallback above.
+    cursor_ = schema_->advance(cursor_, resolved.meaning.id);
 }
 
 // ── pushError ────────────────────────────────────────────────────────────

@@ -48,8 +48,27 @@ struct DSS_EXPORT LexemeMeaning {
     NodeFlags        flagsApplied  = NodeFlags::None;
     ScopeKind        opensScope    = ScopeKind::None;
     bool             closesScope   = false;
+    // Soft / "contextual" keyword. When true, `pushToken` consults the
+    // schema cursor's expectedSet at resolution time: if this meaning's
+    // `id` isn't in the expected set the lexeme degrades to Identifier.
+    // Set per-keyword in JSON (`contextual: true`) or implicitly on every
+    // keyword when the config declares `reservedWordPolicy: "contextual"`.
+    bool             contextual    = false;
     // Empty == "valid in every scope"; non-empty == restrict to listed.
     std::span<ScopeKind const> validScopes;
+};
+
+// How aggressively the builder treats keywords as reserved.
+//
+//   Strict     — every keyword always wins over Identifier (the default;
+//                what every config without a `reservedWordPolicy` field
+//                gets).
+//   Contextual — every keyword degrades to Identifier when not in the
+//                cursor's `expectedSet`. Used by languages like T-SQL
+//                where any keyword may also appear as a plain identifier.
+enum class ReservedWordPolicy : std::uint8_t {
+    Strict,
+    Contextual,
 };
 
 // Standard C++23 fallible result. Error channel is the full list of
@@ -100,6 +119,11 @@ struct DSS_EXPORT GrammarSchemaData {
     // Empty when the config has no `operators` section. Read-only after
     // construction; the loader is the only writer.
     OperatorTable operators;
+
+    // Default Strict — every keyword is reserved. `reservedWordPolicy:
+    // "contextual"` in JSON flips this to Contextual, and the loader
+    // also forces `contextual = true` on every keyword's LexemeMeaning.
+    ReservedWordPolicy reservedWordPolicy = ReservedWordPolicy::Strict;
 };
 
 } // namespace detail
@@ -135,6 +159,11 @@ public:
 
     // ── Operators ──
     [[nodiscard]] OperatorTable const& operatorTable() const noexcept { return d_.operators; }
+
+    // ── Reserved-word policy ──
+    [[nodiscard]] ReservedWordPolicy reservedWordPolicy() const noexcept {
+        return d_.reservedWordPolicy;
+    }
 
     // ── Shape navigation ──
     //

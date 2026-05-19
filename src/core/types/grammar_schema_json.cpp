@@ -587,6 +587,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // reservedWordPolicy: "strict" (default) | "contextual". Contextual
+    // makes every keyword soft — the loader sets `contextual = true` on
+    // every keyword's LexemeMeaning further down. The builder then
+    // demotes any keyword whose schemaTokenId isn't in the cursor's
+    // expectedSet at resolution time.
+    if (doc.contains("reservedWordPolicy")) {
+        if (!doc.at("reservedWordPolicy").is_string()) {
+            coll.emit(DiagnosticCode::C_MissingField, "/reservedWordPolicy",
+                      "'reservedWordPolicy' must be a string ('strict' or 'contextual')");
+        } else {
+            const auto v = doc.at("reservedWordPolicy").get<std::string>();
+            if      (v == "strict")     data.reservedWordPolicy = ReservedWordPolicy::Strict;
+            else if (v == "contextual") data.reservedWordPolicy = ReservedWordPolicy::Contextual;
+            else {
+                coll.emit(DiagnosticCode::C_MissingField, "/reservedWordPolicy",
+                          std::format("unknown reservedWordPolicy '{}' (expected 'strict' or 'contextual')", v));
+            }
+        }
+    }
+
     data.rules        = std::make_shared<RuleInterner>();
     data.schemaTokens = std::make_shared<SchemaTokenInterner>();
 
@@ -643,6 +663,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     lm.priority    = m.value("priority", 0);
                     lm.closesScope = m.value("closesScope", false);
 
+                    // `contextual` is a keyword-only concept. Tokens are
+                    // operators / punctuation / built-ins — they don't
+                    // degrade to identifiers based on parse position.
+                    if (m.contains("contextual")) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  std::format("{}/contextual", entryPath),
+                                  "'contextual' is only valid on keyword entries — tokens never degrade to identifiers");
+                    }
+
                     if (m.contains("flags")) {
                         lm.flagsApplied = parseFlagList(m.at("flags"));
                     }
@@ -694,7 +723,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     // keywords ──
+    // `contextual: true` per entry marks soft keywords (await/yield etc.).
+    // The top-level `reservedWordPolicy: "contextual"` flag forces every
+    // keyword soft regardless of the per-entry setting.
     if (doc.contains("keywords") && doc.at("keywords").is_array()) {
+        const bool forceContextual =
+            (data.reservedWordPolicy == ReservedWordPolicy::Contextual);
         for (std::size_t i = 0; i < doc.at("keywords").size(); ++i) {
             json const& kw = doc.at("keywords").at(i);
             const auto kwPath = std::format("/keywords/{}", i);
@@ -706,6 +740,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             }
             LexemeMeaning lm{};
             lm.id = data.schemaTokens->intern(kw.at("kind").get<std::string>());
+            if (kw.contains("contextual")) {
+                if (!kw.at("contextual").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/contextual", kwPath),
+                              "'contextual' must be a boolean");
+                } else {
+                    lm.contextual = kw.at("contextual").get<bool>();
+                }
+            }
+            if (forceContextual) lm.contextual = true;
             data.lexemeTable[kw.at("word").get<std::string>()].push_back(lm);
         }
     }

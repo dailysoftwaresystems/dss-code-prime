@@ -174,6 +174,15 @@ private:
     std::vector<Frame>                     open_;        // LIFO open-frame stack
     std::vector<ScopeKind>                 scopes_;      // current scope stack
 
+    // Schema cursor mirroring `open_`. Walked through enterRule on open(),
+    // leaveRule on close, and advance on pushToken. Lets `pushToken`
+    // consult `expectedSet(cursor_)` for contextual-keyword resolution.
+    // Goes invalid silently if the caller drives the builder against the
+    // schema's shape — the contextual demotion path treats an invalid
+    // cursor as "no expectations known; keep the keyword."
+    SchemaCursor                           cursor_;
+    std::vector<SchemaCursor>              cursorStack_;
+
     // Cookies that have been "closed" by cascade or by finish() but whose
     // OpenScope guards are still alive (and will eventually call close()
     // when destroyed). A subsequent close() for these is a clean no-op

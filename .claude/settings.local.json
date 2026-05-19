@@ -57,7 +57,12 @@
       "PowerShell(& \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_operator_table.exe\" --gtest_filter=\"OperatorTable.MultiMeaningLexemeWithoutKindIsError\" 2>&1)",
       "PowerShell(& \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_operator_table.exe\" 2>&1 | Select-Object -Last 20)",
       "Bash(cmake --build C:/Source/DailySoftware/dss-code-prime/build --target dss_core_test_schema_cursor)",
-      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;\" + $env:PATH; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_schema_cursor.exe\" 2>&1 | Select-Object -Last 30)"
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;\" + $env:PATH; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_schema_cursor.exe\" 2>&1 | Select-Object -Last 30)",
+      "PowerShell(& \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tree_builder.exe\" 2>&1 | Select-Object -Last 15)",
+      "PowerShell(& \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tree_builder.exe\" --gtest_filter=\"TreeBuilder.AmbiguousMeaningsTieBreakOnFirstDeclared\" 2>&1)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;\" + $env:PATH; foreach \\($b in @\\(\"dss_core_test_tree_builder\",\"dss_core_test_grammar_schema\",\"dss_core_test_schema_cursor\",\"dss_core_test_c_subset\"\\)\\) { $out = & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\$b.exe\" 2>&1 | Select-String \"PASSED|FAILED\" | Select-Object -Last 1; \"$b -> $out\" })",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;\" + $env:PATH; foreach \\($b in @\\(\"dss_core_test_grammar_schema\",\"dss_core_test_c_subset\",\"dss_core_test_schema_cursor\"\\)\\) { $out = & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\$b.exe\" 2>&1 | Select-String \"PASSED|FAILED\" | Select-Object -Last 1; \"$b -> $out\" })",
+      "PowerShell(& \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_c_subset.exe\" --gtest_filter=\"CSubsetEndToEnd.TopLevelVarDeclWithIntInitializer\" 2>&1 | Select-Object -Skip 4 -First 60)"
     ]
   }
 }
