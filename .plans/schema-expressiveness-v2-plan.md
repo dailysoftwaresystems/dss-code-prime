@@ -350,6 +350,65 @@ Each gap becomes a row in `.plans/v2-gap-catalog.md`:
 
 Branch (a) is the expected path for most gaps. Branches (b)/(c) require explicit triage by the author before continuing the PR.
 
+### 4.2 Per-gap placement matrix
+
+Every numbered gap in [`v2-gap-catalog.md`](./v2-gap-catalog.md) has a placement here — either this plan's §5/§7/§9, the parent compiler-implementation plan (tokenizer / parser phases), or "closed in PR0". A gap with no placement is a planning bug; if PR0/PR7 surface one, file it via the §4.1 workflow rather than leaving it dangling.
+
+**Status column legend:**
+- ✅ closed — the gap is no longer actionable in v2 (mechanism shipped OR construct landed in c-subset).
+- 🟡 partial — schema-side mechanism shipped, remaining work belongs to a downstream plan (typically the parser phase).
+- ⏳ pending — a v2 PR will close it.
+- ⏭ deferred — out of v2 scope; logged in §9 (v3) or the parent plan's tokenizer/parser phases.
+
+**Gaps from PR0 c-subset authoring (`v2-gap-catalog.md` §1, rows 1–18):**
+
+| Gap | Symptom (1-line) | Status | Placement |
+|---|---|---|---|
+| 1  | `a + b * c` left-folds; needs operator precedence | 🟡 | §5.1 (PR1) shipped operator table; **tree-shape flip lives in parent plan #6 (parser / Pratt walker)**. `CSubsetEndToEnd.ExpressionWithMixedOpsIsLeftFolded` is the flip-target pin. |
+| 2  | `typedef int MyInt; MyInt x;` — Identifier resolution depends on prior decls | 🟡 | §5.2 (PR2b) shipped contextual-keyword mechanism; **typedef-aware demotion is parent plan #6/#7 (parser + semantic pass)**. |
+| 3  | `//` line + `/* */` block comments as declarative `EmptySpace` | ⏳ | §5.5 (PR5) — lexer modes (comment mode marks token output `EmptySpace`). |
+| 4  | String escapes (`"\\n"`) — per-language rules | ⏳ | §5.6 (PR6) — `stringStyle.escapeKind`. |
+| 5  | Char literal escapes (`'\\n'`) | ⏳ | §5.6 (PR6) — same `stringStyle` machinery via `quoteKind: char`. |
+| 6  | Pointer `*` — needs `Prefix` (deref) + `Postfix-on-typeRef` (declarator) arity | 🟡 | §5.1 (PR1) shipped per-arity precedence; **tree-shape (binding `*` to `typeRef` vs operand) is parent plan #6 (parser)**. Schema-side `Postfix` arity is sufficient. |
+| 7  | Function calls `f(x, y)` — postfix-call shape | 🟡 | §5.1 (PR1) shipped `Postfix` arity; **call-site tree-shape (group args under a call node) is parent plan #6 (parser)**. |
+| 8  | Postfix `x++` / `x--` | 🟡 | §5.1 (PR1) — `Postfix` arity. **Tree-shape parent plan #6 (parser)**. |
+| 9  | `for (init; cond; step) body` | ✅ | Closed in PR0 (`shapes/forStmt` + `varDeclHead` split). Inherits gap #1's parser-phase precedence work. |
+| 10 | `do { ... } while (cond);` | ✅ | Closed in PR0 (`shapes/doStmt`). |
+| 11 | `case` / `default` valid only inside `switch` | ⏳ | §5.3 (PR3) — `scopeRequire.topMustBe: "Switch"`. |
+| 12 | Arrays `int a[10];` + index `a[0]` | 🟡 | §5.1 (PR1) shipped `Postfix` arity for `[`. **Declarator-suffix + index tree-shape is parent plan #6 (parser)**. |
+| 13 | `const` qualifier in `typeRef` | ✅ | Closed in PR0 (`typeRef` accepts optional `ConstKeyword` on either side of `typeBase`). |
+| 14 | Float literal suffixes (`1.0f`, `1e10`) — longest-match + suffix rules | ⏭ | §9 item — v3 candidate (numeric-style descriptor; no v2 target language needs it). |
+| 15 | Bitwise operators `&` `\|` `^` `~` `<<` `>>` | ✅ | Closed in PR0. Inherits gap #1's parser-phase precedence work. |
+| 16 | Compound assignment `+= -= *= /=` | 🟡 | §5.1 (PR1) — once the parser climbs precedence these slot in as right-assoc operators. **Tree-shape parent plan #6 (parser)**. |
+| 17 | Ternary `?:` (mixfix) | ⏭ | §9 item 1 — v3 candidate (`Prefix\|Infix\|Postfix` enum doesn't model mixfix). |
+| 18 | Multi-char operator longest-match (`==` vs `=`) | ⏭ | **Parent plan #5 (tokenizer phase)** — schema declares the tokens; the tokenizer is responsible for longest-match disambiguation. |
+
+**Gaps from PR2b review (`v2-gap-catalog.md` §7, rows 19–22):**
+
+| Gap | Symptom (1-line) | Status | Placement |
+|---|---|---|---|
+| 19 | Schema cursor silently desyncs on `repeat`/`optional`/`alt` parents — `leaveRule` on non-RuleLeaf returns invalid | ✅ | Closed in PR2b review followup. New `GrammarSchema::routeToRuleLeaf` + one-shot `P_SchemaCursorDesync` diagnostic. See §0 "PR2a contracts established for downstream PRs" (`routeToRuleLeaf` bullet) and §0 "PR2b deviations". |
+| 20 | `EmptySpace` tokens invalidate the schema cursor | ✅ | Closed in PR2b review followup. `pushToken` skips `advance` for `EmptySpace` meanings. See §0 "PR2b deviations". |
+| 21 | Multi-level `AltChoice` routing (3+ nested) is untested | 🟡 | **Parent plan #6 (parser)** — when the parser-phase grammar composes `alt` + `optional` + `repeat` arbitrarily, write a stress test pushing `routeToRuleLeaf` through 3+ levels. Open until then. |
+| 22 | Demoted-contextual-keyword cursor advance correctness pin | ✅ | Pinned by `DemotedKeywordAdvancesCursorAsIdentifier` in PR2b review followup. Regression-test only. |
+
+**Roll-up by placement target:**
+
+| Target | Gaps |
+|--------|------|
+| **§5.1 (PR1) — schema-side shipped, tree-shape awaits parser** | 1, 6, 7, 8, 12, 16 |
+| **§5.2 (PR2b) — mechanism shipped, typedef-aware awaits parser+semantic** | 2 |
+| **§5.3 (PR3) — pending** | 11 |
+| **§5.5 (PR5) — pending** | 3 |
+| **§5.6 (PR6) — pending** | 4, 5 |
+| **Closed in PR0** | 9, 10, 13, 15 |
+| **Closed in PR2b review** | 19, 20, 22 |
+| **§9 — v3 candidates** | 14, 17 |
+| **Parent plan #5 — tokenizer phase** | 18 (longest-match), 3 (comment-mode lexing — shared with §5.5) |
+| **Parent plan #6 — parser phase** | 1, 2 (semantic side), 6, 7, 8, 12, 16, 21 |
+
+A gap appearing under **both** a v2 PR row and a parent-plan row means the schema-side mechanism lands in v2 and the consuming tree-shape lands in the parser phase. Neither half is sufficient alone.
+
 ---
 
 ## 5. Per-concern design
