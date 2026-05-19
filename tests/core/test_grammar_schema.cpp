@@ -132,13 +132,15 @@ TEST(GrammarSchema, RootCursorIsValid) {
     EXPECT_TRUE(schema->rootCursor().valid());
 }
 
-TEST(GrammarSchema, ExpectedAtReturnsStableSpan) {
+TEST(GrammarSchema, ExpectedSetReturnsStableSpan) {
     auto schema = *GrammarSchema::loadFromText(kHappyConfig);
     auto root = schema->rootCursor();
-    auto a = schema->expectedAt(root);
-    auto b = schema->expectedAt(root);
+    auto a = schema->expectedSet(root);
+    auto b = schema->expectedSet(root);
     // Pointer identity proves the span comes from schema-owned storage
-    // (no allocation per call).
+    // (no allocation per call). Stable span is the contract every
+    // downstream caller (PR2b contextual keywords, future parser, the
+    // diagnostic renderer) depends on.
     EXPECT_EQ(a.data(), b.data());
     EXPECT_EQ(a.size(), b.size());
 }

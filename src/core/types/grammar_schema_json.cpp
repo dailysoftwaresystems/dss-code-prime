@@ -186,6 +186,282 @@ void collectReferences(json const& body,
     }
 }
 
+// ── Compile pass: FIRST/NULLABLE + position tables ──────────────────────
+//
+// The cursor walks a flat per-rule position table built here. Steps:
+//
+//   1. Iteratively compute per-rule FIRST set and NULLABLE flag until
+//      stable. Cycles in the grammar (A → repeat[B] → A) terminate
+//      because FIRST sets grow monotonically.
+//   2. Build each rule's position table via a recursive walk over the
+//      JSON body, threading a `cont` (continuation position-id) through
+//      children. Repeat uses a tie-the-knot pattern so the loop body's
+//      tail returns to the loop entry.
+//   3. Iteratively compute `nullableTail` per position — true when a
+//      position can complete to end-of-rule without consuming any
+//      further token. canEndSource(cursor) reads this directly.
+
+void insertSorted(std::vector<SchemaTokenId>& v, SchemaTokenId t) {
+    auto it = std::lower_bound(v.begin(), v.end(), t,
+        [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; });
+    if (it == v.end() || it->v != t.v) v.insert(it, t);
+}
+
+void mergeSorted(std::vector<SchemaTokenId>& into,
+                 std::vector<SchemaTokenId> const& from) {
+    for (auto t : from) insertSorted(into, t);
+}
+
+bool nullableOfBody(json const& body,
+                    GrammarSchemaData const& data) {
+    if (body.is_string()) {
+        const auto& name = body.get<std::string>();
+        if (data.rules->contains(name)) {
+            const auto rid = data.rules->find(name);
+            auto it = data.compiledRules.find(rid.v);
+            return it != data.compiledRules.end() && it->second.nullable;
+        }
+        return false;  // token reference is never nullable
+    }
+    if (body.contains("sequence")) {
+        for (auto const& child : body.at("sequence")) {
+            if (!nullableOfBody(child, data)) return false;
+        }
+        return true;
+    }
+    if (body.contains("alt")) {
+        for (auto const& child : body.at("alt")) {
+            if (nullableOfBody(child, data)) return true;
+        }
+        return false;
+    }
+    if (body.contains("optional") || body.contains("repeat")) return true;
+    if (body.contains("expr")) {
+        return nullableOfBody(body.at("expr").at("atom"), data);
+    }
+    return false;
+}
+
+std::vector<SchemaTokenId> firstOfBody(json const& body,
+                                       GrammarSchemaData const& data) {
+    if (body.is_string()) {
+        const auto& name = body.get<std::string>();
+        if (data.rules->contains(name)) {
+            const auto rid = data.rules->find(name);
+            auto it = data.compiledRules.find(rid.v);
+            return it != data.compiledRules.end()
+                ? it->second.firstSet
+                : std::vector<SchemaTokenId>{};
+        }
+        if (data.schemaTokens->contains(name)) {
+            return {data.schemaTokens->find(name)};
+        }
+        return {};
+    }
+    if (body.contains("sequence")) {
+        std::vector<SchemaTokenId> result;
+        for (auto const& child : body.at("sequence")) {
+            mergeSorted(result, firstOfBody(child, data));
+            if (!nullableOfBody(child, data)) break;
+        }
+        return result;
+    }
+    if (body.contains("alt")) {
+        std::vector<SchemaTokenId> result;
+        for (auto const& child : body.at("alt")) {
+            mergeSorted(result, firstOfBody(child, data));
+        }
+        return result;
+    }
+    if (body.contains("optional")) {
+        return firstOfBody(body.at("optional"), data);
+    }
+    if (body.contains("repeat")) {
+        return firstOfBody(body.at("repeat"), data);
+    }
+    if (body.contains("expr")) {
+        return firstOfBody(body.at("expr").at("atom"), data);
+    }
+    return {};
+}
+
+void computeFirstAndNullable(GrammarSchemaData& data, json const& shapesJson) {
+    // Initialise every rule's FIRST = {} and nullable = false. Iterate
+    // until a full pass leaves every rule's values unchanged.
+    for (auto const& [shapeName, _] : shapesJson.items()) {
+        const auto rid = data.rules->find(shapeName);
+        data.compiledRules[rid.v] = detail::CompiledRule{};
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto const& [shapeName, body] : shapesJson.items()) {
+            const auto rid = data.rules->find(shapeName);
+            auto& rule = data.compiledRules[rid.v];
+            auto newFirst    = firstOfBody(body, data);
+            const bool newNul = nullableOfBody(body, data);
+            if (newFirst != rule.firstSet || newNul != rule.nullable) {
+                rule.firstSet = std::move(newFirst);
+                rule.nullable = newNul;
+                changed = true;
+            }
+        }
+    }
+}
+
+struct PositionBuilder {
+    std::vector<detail::Position>& positions;
+    GrammarSchemaData const&       data;
+
+    [[nodiscard]] std::uint32_t alloc() {
+        positions.emplace_back();
+        return static_cast<std::uint32_t>(positions.size() - 1);
+    }
+
+    [[nodiscard]] std::uint32_t allocEnd() {
+        const auto id = alloc();
+        positions[id].slotKind = detail::SlotKind::End;
+        return id;
+    }
+
+    [[nodiscard]] std::uint32_t allocAltChoice(std::vector<std::uint32_t> branches) {
+        const auto id = alloc();
+        auto& p = positions[id];
+        p.slotKind = detail::SlotKind::AltChoice;
+        std::vector<SchemaTokenId> ex;
+        for (auto bid : branches) mergeSorted(ex, positions[bid].expectedSet);
+        p.expectedSet = std::move(ex);
+        p.branches    = std::move(branches);
+        return id;
+    }
+
+    [[nodiscard]] std::uint32_t build(json const& body, std::uint32_t cont) {
+        if (body.is_string()) {
+            const auto& name = body.get<std::string>();
+            if (data.rules->contains(name)) {
+                const auto rid = data.rules->find(name);
+                const auto id  = alloc();
+                auto& p = positions[id];
+                p.slotKind = detail::SlotKind::RuleLeaf;
+                p.ruleId   = rid;
+                p.nextPos  = cont;
+                auto it = data.compiledRules.find(rid.v);
+                if (it != data.compiledRules.end()) {
+                    p.expectedSet = it->second.firstSet;
+                }
+                return id;
+            }
+            if (data.schemaTokens->contains(name)) {
+                const auto tid = data.schemaTokens->find(name);
+                const auto id  = alloc();
+                auto& p = positions[id];
+                p.slotKind   = detail::SlotKind::TokenLeaf;
+                p.tokenId    = tid;
+                p.nextPos    = cont;
+                p.expectedSet = {tid};
+                return id;
+            }
+            return cont;  // unreachable; reference validated earlier
+        }
+        if (body.contains("sequence")) {
+            const auto& seq = body.at("sequence");
+            std::uint32_t curCont = cont;
+            // Build right-to-left so each child's nextPos is its actual successor.
+            for (auto it = seq.rbegin(); it != seq.rend(); ++it) {
+                curCont = build(*it, curCont);
+            }
+            return curCont;
+        }
+        if (body.contains("alt")) {
+            const auto& alt = body.at("alt");
+            std::vector<std::uint32_t> branches;
+            branches.reserve(alt.size());
+            for (auto const& branch : alt) branches.push_back(build(branch, cont));
+            return allocAltChoice(std::move(branches));
+        }
+        if (body.contains("optional")) {
+            const auto innerStart = build(body.at("optional"), cont);
+            return allocAltChoice({innerStart, cont});
+        }
+        if (body.contains("repeat")) {
+            // Tie-the-knot: allocate the loop entry first, build the body
+            // with cont=loopEntry so the body's tail loops back, then fill
+            // in branches + expectedSet now that innerStart is known.
+            const auto loopEntry = alloc();
+            positions[loopEntry].slotKind = detail::SlotKind::AltChoice;
+            const auto innerStart = build(body.at("repeat"), loopEntry);
+            positions[loopEntry].branches = {innerStart, cont};
+            std::vector<SchemaTokenId> ex;
+            mergeSorted(ex, positions[innerStart].expectedSet);
+            mergeSorted(ex, positions[cont].expectedSet);
+            positions[loopEntry].expectedSet = std::move(ex);
+            return loopEntry;
+        }
+        if (body.contains("expr")) {
+            // PR2a treats `expr` as if it were its `atom` rule — the
+            // operator-climbing step is a parser concern that consumes the
+            // operator table at parse time, not at cursor-walk time.
+            return build(body.at("expr").at("atom"), cont);
+        }
+        return cont;
+    }
+};
+
+void buildPositionTables(GrammarSchemaData& data, json const& shapesJson) {
+    for (auto const& [shapeName, body] : shapesJson.items()) {
+        const auto rid = data.rules->find(shapeName);
+        auto& rule = data.compiledRules[rid.v];
+        rule.positions.clear();
+        rule.positions.emplace_back();   // sentinel at index 0; posId 0 = invalid
+        PositionBuilder builder{rule.positions, data};
+        const auto endId   = builder.allocEnd();
+        const auto entryId = builder.build(body, endId);
+        rule.entryPos = entryId;
+    }
+}
+
+void computeNullableTails(GrammarSchemaData& data) {
+    for (auto& [_, rule] : data.compiledRules) {
+        auto& positions = rule.positions;
+        for (auto& p : positions) {
+            p.nullableTail = (p.slotKind == detail::SlotKind::End);
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (auto& p : positions) {
+                bool newVal = p.nullableTail;
+                switch (p.slotKind) {
+                case detail::SlotKind::End:
+                    newVal = true;
+                    break;
+                case detail::SlotKind::TokenLeaf:
+                    newVal = false;
+                    break;
+                case detail::SlotKind::RuleLeaf: {
+                    auto it = data.compiledRules.find(p.ruleId.v);
+                    const bool ruleNullable =
+                        (it != data.compiledRules.end()) && it->second.nullable;
+                    newVal = ruleNullable && positions[p.nextPos].nullableTail;
+                    break;
+                }
+                case detail::SlotKind::AltChoice:
+                    newVal = false;
+                    for (auto bid : p.branches) {
+                        if (positions[bid].nullableTail) { newVal = true; break; }
+                    }
+                    break;
+                }
+                if (newVal != p.nullableTail) {
+                    p.nullableTail = newVal;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
 } // anonymous namespace
 
 LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
@@ -586,23 +862,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             // Pass B: validate references — every string atom must resolve
             // to either a shape (RuleInterner) or a token kind
-            // (SchemaTokenInterner). Build expectedAt in the same walk.
+            // (SchemaTokenInterner). Diagnostics surface here; the compile
+            // pass below trusts the references have already resolved.
             for (auto const& [shapeName, body] : doc.at("shapes").items()) {
                 const auto shapePath = std::format("/shapes/{}", shapeName);
                 std::vector<std::string> refs;
                 collectReferences(body, shapePath, refs, coll);
 
-                std::vector<std::string> expected;
-                expected.reserve(refs.size());
                 for (auto const& r : refs) {
-                    if (data.rules->contains(r))        { expected.push_back(r); continue; }
-                    if (data.schemaTokens->contains(r)) { expected.push_back(r); continue; }
+                    if (data.rules->contains(r))        continue;
+                    if (data.schemaTokens->contains(r)) continue;
                     coll.emit(DiagnosticCode::C_UnknownShape, shapePath,
                               std::format("unknown reference '{}'", r));
                 }
-
-                const auto rid = data.rules->intern(shapeName);
-                data.expectedAt[rid.v] = std::move(expected);
             }
 
             if (data.rules->contains("root")) {
@@ -610,6 +882,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             } else if (!doc.at("shapes").empty()) {
                 coll.emit(DiagnosticCode::C_MissingField, "/shapes",
                           "missing required 'root' shape");
+            }
+
+            // Compile every rule body into a flat position table and
+            // precompute FIRST sets, nullability flags, and per-position
+            // nullable-tail flags. Only worth doing when references
+            // validated cleanly — otherwise the compile pass would crash
+            // on broken references it expects the prior pass to reject.
+            if (!coll.hasErrors()) {
+                computeFirstAndNullable(data, doc.at("shapes"));
+                buildPositionTables    (data, doc.at("shapes"));
+                computeNullableTails   (data);
             }
         }
     }

@@ -92,4 +92,5 @@ Per user decision (Q1 below), rows 9, 10, 13, 15 were landed in the same PR0 com
 
 - **PR0:** ✅ shipped (commits `4aef654` + `3aca464`).
 - **PR1:** ✅ shipped (commits `068b633` + `048953f`). OperatorTable + loader `operators` section + `expr` shape kind + c-subset operators (bumped to `dssSchemaVersion: 2`). Row 1 marked data-resolved; tree-shape flip awaits parser phase. Review followup hardened the table (key-packing fatal guard, duplicate-detect, shape-kind mutual exclusion, `expr` body allowlist) — see plan §0 "PR1 contracts established for downstream PRs".
-- **PR2a..PR8:** ⏳ pending.
+- **PR2a:** ✅ shipped. Real `SchemaCursor` walker — compiled position tables, fixed-point FIRST/NULLABLE, per-position `nullableTail`, `expectedAt` dropped. Closes v1 §0 deviation #7. See plan §0 "PR2a deviations" + "PR2a contracts established for downstream PRs".
+- **PR2b..PR8:** ⏳ pending.

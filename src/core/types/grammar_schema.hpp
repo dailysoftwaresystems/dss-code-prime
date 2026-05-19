@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/compiled_shape.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/rule_id.hpp"
@@ -89,9 +90,11 @@ struct DSS_EXPORT GrammarSchemaData {
     // Root rule's id (the "root" shape from config) — anchors rootCursor().
     RuleId rootRule = InvalidRule;
 
-    // Per-rule "expected names" — populated at load time so expectedAt()
-    // returns a stable span (no allocation per call).
-    std::unordered_map<std::uint32_t, std::vector<std::string>> expectedAt;
+    // Per-rule compiled shape — populated by the loader after shape-reference
+    // validation. Indexed by RuleId.v. Position[0] in every rule's table is
+    // the "invalid sentinel" so 0 is reserved as the invalid posId in
+    // SchemaCursor.
+    std::unordered_map<std::uint32_t, CompiledRule> compiledRules;
 
     // Operator precedence + associativity by (SchemaTokenId, arity).
     // Empty when the config has no `operators` section. Read-only after
@@ -133,9 +136,30 @@ public:
     // ── Operators (v2) ──
     [[nodiscard]] OperatorTable const& operatorTable() const noexcept { return d_.operators; }
 
-    // ── Shape navigation ──
+    // ── Shape navigation (v2 PR2a) ──
+    //
+    // SchemaCursor is a per-rule position. Descent into nested rules is
+    // caller-managed via a stack of cursors. `advance` consumes a token
+    // at the current step (TokenLeaf or AltChoice slots). `enterRule`
+    // returns a fresh cursor at the start of the named rule — the caller
+    // saves the parent cursor so it can resume the parent via `leaveRule`
+    // once the child reaches end-of-body.
+
     [[nodiscard]] SchemaCursor rootCursor() const noexcept;
-    [[nodiscard]] std::span<std::string const> expectedAt(SchemaCursor cur) const noexcept;
+    [[nodiscard]] SchemaCursor enterRule(RuleId rule) const noexcept;
+    [[nodiscard]] SchemaCursor leaveRule(SchemaCursor parentCur) const noexcept;
+    [[nodiscard]] SchemaCursor advance(SchemaCursor cur, SchemaTokenId tok) const noexcept;
+
+    [[nodiscard]] std::span<SchemaTokenId const> expectedSet(SchemaCursor cur) const noexcept;
+
+    [[nodiscard]] detail::SlotKind slotKind(SchemaCursor cur) const noexcept;
+    [[nodiscard]] RuleId           slotRuleRef(SchemaCursor cur) const noexcept;
+    [[nodiscard]] bool             isAtEndOfRule(SchemaCursor cur) const noexcept;
+
+    // Direct per-rule queries — useful for the eventual parser without
+    // needing a cursor instance.
+    [[nodiscard]] std::span<SchemaTokenId const> firstSetOf(RuleId rule) const noexcept;
+    [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,
