@@ -59,6 +59,7 @@ This plan is **deliberately empirical**: PR0 authored a C subset against the v1 
 - **Alt branches must have disjoint FIRST sets.** Loader emits `C_AmbiguousAlternatives` (with the offending shared token name) at load time when two alt branches share a FIRST token. The cursor's `advance` does silent first-branch-wins on overlap — the ambiguity check is the only thing keeping that determinism honest. PR4's speculative `alt` will opt out of this check via the `speculative: true` flag.
 - **Shape bodies must declare exactly one of `sequence|alt|optional|repeat|expr`** AND **`sequence`/`alt` arrays must be non-empty.** Both check at load time (`C_UnknownShape` / `C_MissingField`).
 - **`advance(cur, tok)` on a `RuleLeaf` slot returns invalid** — the caller must `enterRule` to descend. Pinned by `AdvanceOnRuleLeafReturnsInvalid`.
+- **`routeToRuleLeaf(parentCur, rule)` (added in PR2b review followup) walks `AltChoice` positions to find a `RuleLeaf(rule)` branch.** Callers that want `leaveRule` symmetry when the parent slot is an AltChoice (the body of a `repeat`/`optional`/`alt`) route the parent cursor through this before saving it. `TreeBuilder::open` does this automatically; future parser code with its own descent stack should do the same. Returns `parentCur` unchanged when it's already at `RuleLeaf(rule)`; returns invalid when no AltChoice path leads to one.
 
 ### PR2b deviations from this plan
 
