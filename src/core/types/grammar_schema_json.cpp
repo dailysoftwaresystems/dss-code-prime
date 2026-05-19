@@ -126,6 +126,29 @@ void collectReferences(json const& body,
         }
     };
 
+    // The five shape kinds are mutually exclusive — a body declares one of
+    // sequence|alt|optional|repeat|expr, never two. A body declaring two
+    // would silently run both branches; surface that as a load error.
+    {
+        constexpr std::string_view kShapeKinds[] = {
+            "sequence", "alt", "optional", "repeat", "expr",
+        };
+        std::vector<std::string_view> present;
+        for (auto k : kShapeKinds) {
+            if (body.contains(k)) present.push_back(k);
+        }
+        if (present.size() > 1) {
+            std::string joined;
+            for (std::size_t i = 0; i < present.size(); ++i) {
+                if (i) joined += ", ";
+                joined += present[i];
+            }
+            c.emit(DiagnosticCode::C_UnknownShape, path,
+                   std::format("shape body declares multiple kinds ({}) — exactly one of sequence|alt|optional|repeat|expr must be present",
+                               joined));
+        }
+    }
+
     if (body.contains("sequence")) recurseArray(body.at("sequence"), "sequence");
     if (body.contains("alt"))      recurseArray(body.at("alt"),      "alt");
     if (body.contains("optional")) {
@@ -136,10 +159,10 @@ void collectReferences(json const& body,
         collectReferences(body.at("repeat"),
                           std::format("{}/repeat", path), outRefs, c);
     }
-    // `expr` — Pratt-style expression shape. The body is an object with an
-    // `atom` rule reference (required) and an optional `minPrecedence`. The
-    // parser (when it exists) reads `operatorTable()` to climb; the loader
-    // only validates the atom reference resolves to a known rule.
+    // `expr` body is `{ atom: <rule>, minPrecedence?: <int> }`. The loader
+    // validates the atom reference resolves and rejects unknown keys so a
+    // typo (e.g. `minPrecdence`) doesn't silently use the default. Operator-
+    // table consumption is the parser's responsibility, not the loader's.
     if (body.contains("expr")) {
         json const& exprBody = body.at("expr");
         const auto exprPath = std::format("{}/expr", path);
@@ -151,6 +174,14 @@ void collectReferences(json const& body,
                    "'expr' requires a string 'atom' field naming the operand rule");
         } else {
             outRefs.push_back(exprBody.at("atom").get<std::string>());
+            // Allowlist: anything other than atom/minPrecedence is a typo.
+            for (auto const& [k, _] : exprBody.items()) {
+                if (k != "atom" && k != "minPrecedence") {
+                    c.emit(DiagnosticCode::C_UnknownShape,
+                           std::format("{}/{}", exprPath, k),
+                           std::format("unknown 'expr' field '{}' — expected 'atom' or 'minPrecedence'", k));
+                }
+            }
         }
     }
 }
@@ -349,14 +380,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     // operators ──
-    // Lifts the JSON's `operators.groups[]` into the dense OperatorTable.
-    // Runs AFTER tokens + keywords so every referenced lexeme is already
-    // in lexemeTable and every referenced kind is already interned in
-    // schemaTokens. Multi-meaning lexemes require an explicit `kind` field
-    // on the group; single-meaning lexemes resolve automatically. The
-    // single source of truth for operator metadata is data.operators —
-    // LexemeMeaning is deliberately NOT extended with precedence fields,
-    // so lexeme resolution and operator metadata stay decoupled.
+    // Runs after tokens + keywords so referenced lexemes and kinds are
+    // already interned. Operator metadata lives only on data.operators,
+    // not on LexemeMeaning — keeps lexeme resolution and operator
+    // semantics independent. `precedence` is required per group;
+    // `associativity` defaults to None and `arity` defaults to Infix
+    // when omitted. Multi-meaning lexemes require an explicit `kind`.
     if (doc.contains("operators")) {
         json const& opsObj = doc.at("operators");
         if (!opsObj.is_object()) {
@@ -427,7 +456,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
                 // Optional `kind` disambiguates groups whose lexemes have
                 // multiple meanings. When omitted, every lexeme in this
-                // group must have a single meaning.
+                // group must have a single meaning. find() is used (not
+                // intern()) so post-frozen lookup is a pure const op.
                 std::optional<std::string> explicitKind;
                 if (g.contains("kind")) {
                     if (!g.at("kind").is_string()) {
@@ -466,7 +496,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
                     SchemaTokenId targetId;
                     if (explicitKind) {
-                        const auto explicitId = data.schemaTokens->intern(*explicitKind);
+                        const auto explicitId = data.schemaTokens->find(*explicitKind);
                         bool found = false;
                         for (auto const& m : meanings) {
                             if (m.id.v == explicitId.v) { found = true; break; }
@@ -484,6 +514,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
                                   std::format("lexeme '{}' has {} meanings; group must specify 'kind' to disambiguate",
                                               lex, meanings.size()));
+                        continue;
+                    }
+
+                    // Duplicate-detect: two groups stamping the same
+                    // (id, arity) silently lose the first via insert_or_assign.
+                    // Loader rejects so the config bug is visible.
+                    if (data.operators.lookup(targetId, arity).has_value()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                  std::format("operator '{}' ({}) declared twice in the precedence table",
+                                              lex, operatorArityName(arity)));
                         continue;
                     }
 
