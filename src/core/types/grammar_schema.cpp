@@ -208,6 +208,16 @@ bool GrammarSchema::isAtEndOfRule(SchemaCursor cur) const noexcept {
     return p != nullptr && p->slotKind() == SlotKind::End;
 }
 
+bool GrammarSchema::isSpeculativeAlt(SchemaCursor cur) const noexcept {
+    auto const* p = lookupPos(d_, cur);
+    return p != nullptr && p->slotKind() == SlotKind::AltChoice && p->speculative();
+}
+
+std::uint16_t GrammarSchema::lookahead(SchemaCursor cur) const noexcept {
+    auto const* p = lookupPos(d_, cur);
+    return (p != nullptr && p->slotKind() == SlotKind::AltChoice) ? p->lookahead() : 0;
+}
+
 std::span<SchemaTokenId const> GrammarSchema::firstSetOf(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return {};

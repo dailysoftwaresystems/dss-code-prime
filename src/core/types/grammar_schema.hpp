@@ -230,6 +230,15 @@ public:
     [[nodiscard]] RuleId   slotRuleRef(SchemaCursor cur) const noexcept;
     [[nodiscard]] bool     isAtEndOfRule(SchemaCursor cur) const noexcept;
 
+    // Speculative-alt attributes attached to AltChoice slots by configs
+    // declaring `"speculative": true`. Both return defaults (`false`, 0)
+    // for non-AltChoice slots OR non-speculative alts. The cursor walker
+    // does not consume these — they're stored for the future parser to
+    // read when deciding whether to take a `TreeBuilder::Checkpoint`
+    // before exploring a branch.
+    [[nodiscard]] bool         isSpeculativeAlt(SchemaCursor cur) const noexcept;
+    [[nodiscard]] std::uint16_t lookahead(SchemaCursor cur) const noexcept;
+
     // Direct per-rule queries that don't require a cursor instance.
     [[nodiscard]] std::span<SchemaTokenId const> firstSetOf(RuleId rule) const noexcept;
     [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;

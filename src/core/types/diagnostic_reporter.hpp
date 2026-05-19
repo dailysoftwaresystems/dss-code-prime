@@ -87,6 +87,27 @@ public:
 
     [[nodiscard]] Config const& config() const noexcept { return cfg_; }
 
+    // ── Snapshot / restore for speculative rollback ───────────────────
+    //
+    // Opaque-by-convention. The caller (TreeBuilder::Checkpoint) takes
+    // a Snapshot via `snapshotForRollback`, runs speculative work, and
+    // either discards the Snapshot (commit) or passes it to `truncateTo`
+    // (rollback). The Snapshot is only meaningful for the reporter
+    // instance it came from; passing it to a different reporter or
+    // using it after non-monotonic reporter mutations is undefined.
+    //
+    // hitCap_ is a one-way latch in normal operation. Rollback re-opens
+    // it so speculative branches that tripped the cap don't permanently
+    // silence the post-rollback reporter.
+    struct Snapshot {
+        std::size_t                                       allSize;
+        std::unordered_map<DiagnosticCode, std::size_t>   perCode;
+        std::size_t                                       recentSize;
+        bool                                              hitCap;
+    };
+    [[nodiscard]] Snapshot snapshotForRollback() const;
+    void                   truncateTo(Snapshot const& snap);
+
     // Pretty-printers. The registry resolves BufferId → SourceBuffer so
     // multi-file diagnostics (related-locations spanning includes, future)
     // format correctly.

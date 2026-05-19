@@ -59,6 +59,32 @@ std::size_t DiagnosticReporter::warningCount() const noexcept {
         all_, [](ParseDiagnostic const& d) { return d.severity == DiagnosticSeverity::Warning; }));
 }
 
+DiagnosticReporter::Snapshot DiagnosticReporter::snapshotForRollback() const {
+    Snapshot s;
+    s.allSize    = all_.size();
+    s.perCode    = perCode_;
+    s.recentSize = recent_.size();
+    s.hitCap     = hitCap_;
+    return s;
+}
+
+void DiagnosticReporter::truncateTo(Snapshot const& snap) {
+    // Truncate the visible diagnostic stream back to the snapshot size.
+    if (snap.allSize < all_.size()) {
+        all_.resize(snap.allSize);
+    }
+    // Restore per-code counters wholesale — snapshot recorded exact map.
+    perCode_ = snap.perCode;
+    // Restore the dedup window. recent_ is a deque of monotonic hash
+    // appends; truncate from the back to the snapshot length.
+    while (recent_.size() > snap.recentSize) {
+        recent_.pop_back();
+    }
+    // Re-open the cap latch if the speculative branch tripped it. A
+    // committed branch keeps the latch as-is; only rollback reaches here.
+    hitCap_ = snap.hitCap;
+}
+
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
     if (cfg_.policy.suppress.contains(d.code)) {
         return std::nullopt;

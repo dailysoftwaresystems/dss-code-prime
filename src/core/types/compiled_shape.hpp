@@ -74,10 +74,28 @@ public:
     [[nodiscard]] std::span<SchemaTokenId const> expectedSet() const noexcept { return expectedSet_; }
     [[nodiscard]] bool            nullableTail() const noexcept { return nullableTail_; }
 
-    // The only post-construction mutator — called by the loader's
-    // `computeNullableTails` fixed-point. `canEndSource(cursor)` reads
-    // this directly.
+    // Speculative-alt attributes (only meaningful on AltChoice slots
+    // built from an `"alt"` shape carrying `"speculative": true`). The
+    // loader populates these; the cursor walker does NOT act on them.
+    // The future parser/builder will read them to decide whether to
+    // take a `TreeBuilder::Checkpoint` before exploring the branch.
+    //
+    // `speculative()` defaults to false (no speculation requested).
+    // `lookahead()` is the per-branch token budget (default 8 when
+    // `speculative` is set but `lookahead` is omitted).
+    [[nodiscard]] bool            speculative() const noexcept { return speculative_; }
+    [[nodiscard]] std::uint16_t   lookahead()   const noexcept { return lookahead_; }
+
+    // The only post-construction mutators. `setNullableTail` is the
+    // loader's `computeNullableTails` fixed-point; the speculative
+    // setters land at AltChoice construction (kept separate from the
+    // factory so the factory signature doesn't balloon with optional
+    // fields most positions don't use).
     void setNullableTail(bool v) noexcept { nullableTail_ = v; }
+    void setSpeculative(bool spec, std::uint16_t lookahead) noexcept {
+        speculative_ = spec;
+        lookahead_   = lookahead;
+    }
 
 private:
     SlotKind        slotKind_    = SlotKind::End;
@@ -87,6 +105,8 @@ private:
     std::vector<std::uint32_t> branches_;
     std::vector<SchemaTokenId> expectedSet_;
     bool            nullableTail_ = false;
+    bool            speculative_  = false;
+    std::uint16_t   lookahead_    = 0;
 };
 
 struct CompiledRule {

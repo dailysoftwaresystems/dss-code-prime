@@ -36,6 +36,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
         case DiagnosticCode::P_UnfinishedTree:           return "P_UnfinishedTree";
         case DiagnosticCode::P_RecoveryStalled:          return "P_RecoveryStalled";
+        case DiagnosticCode::P_MaxSpeculationDepth:      return "P_MaxSpeculationDepth";
+        case DiagnosticCode::P_UncommittedCheckpoint:    return "P_UncommittedCheckpoint";
+        case DiagnosticCode::P_BacktrackFailed:          return "P_BacktrackFailed";
         case DiagnosticCode::C_MissingField:             return "C_MissingField";
         case DiagnosticCode::C_UnknownShape:             return "C_UnknownShape";
         case DiagnosticCode::C_UnknownToken:             return "C_UnknownToken";

@@ -56,6 +56,9 @@ enum class DiagnosticCode : std::uint16_t {
     P_TooManyDiagnostics          = 0x9001,
     P_UnfinishedTree              = 0x9002,
     P_RecoveryStalled             = 0x9003,
+    P_MaxSpeculationDepth         = 0x9004,
+    P_UncommittedCheckpoint       = 0x9005,
+    P_BacktrackFailed             = 0x9006,
 
     // ── C0xxx — config loader (see plan §5.12) ──
     C_MissingField                = 0xC001,

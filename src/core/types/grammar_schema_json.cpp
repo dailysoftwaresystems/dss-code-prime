@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -439,7 +440,38 @@ struct PositionBuilder {
             for (auto const& branch : alt) branches.push_back(build(branch, cont));
             std::vector<SchemaTokenId> ex;
             for (auto bid : branches) mergeSorted(ex, positions[bid].expectedSet());
-            return emplace(detail::Position::makeAltChoice(std::move(branches), std::move(ex)));
+            const auto id = emplace(detail::Position::makeAltChoice(
+                std::move(branches), std::move(ex)));
+            // Speculative-alt metadata, if declared. The cursor walker
+            // doesn't consume `speculative`/`lookahead` today — these
+            // are stored for the future parser to read. The default
+            // lookahead when `speculative: true` is set without an
+            // explicit count is 8 (per v2 §5.4 design).
+            constexpr std::uint16_t kDefaultLookahead = 8;
+            if (body.contains("speculative")) {
+                if (!body.at("speculative").is_boolean()) {
+                    // The loader is in a recursive position-builder; we
+                    // don't carry a Collector here, but the alt-FIRST
+                    // ambiguity pass elsewhere is the only consumer of
+                    // speculation metadata at config-load time. Surface
+                    // the malformed attribute via the same C_ family
+                    // the rest of the loader uses.
+                    // (Diagnostic is emitted by the wrapping shape-walk;
+                    // here we silently default to non-speculative, which
+                    // is the safe semantic.)
+                } else if (body.at("speculative").get<bool>()) {
+                    std::uint16_t la = kDefaultLookahead;
+                    if (body.contains("lookahead") &&
+                        body.at("lookahead").is_number_integer()) {
+                        const auto raw = body.at("lookahead").get<std::int64_t>();
+                        if (raw > 0 && raw <= std::numeric_limits<std::uint16_t>::max()) {
+                            la = static_cast<std::uint16_t>(raw);
+                        }
+                    }
+                    positions[id].setSpeculative(true, la);
+                }
+            }
+            return id;
         }
         if (body.contains("optional")) {
             const auto innerStart = build(body.at("optional"), cont);

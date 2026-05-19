@@ -56,15 +56,70 @@ void TreeBuilder::OpenScope::close() noexcept {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Checkpoint — RAII guard returned by TreeBuilder::checkpoint()
+// ─────────────────────────────────────────────────────────────────────────
+
+TreeBuilder::Checkpoint::Checkpoint(TreeBuilder* b, std::uint32_t id) noexcept
+    : builder_(b), id_(id) {}
+
+TreeBuilder::Checkpoint::Checkpoint(Checkpoint&& other) noexcept
+    : builder_(other.builder_), id_(other.id_), disp_(other.disp_) {
+    other.builder_ = nullptr;
+    other.id_      = 0;
+    other.disp_    = Disposition::Committed;     // moved-from is inert
+}
+
+TreeBuilder::Checkpoint&
+TreeBuilder::Checkpoint::operator=(Checkpoint&& other) noexcept {
+    if (this != &other) {
+        // If `this` is still pending, the user assigned over a live
+        // guard — roll it back as a defensive default (same as the
+        // destructor would have done).
+        if (builder_ && disp_ == Disposition::Pending) {
+            builder_->rollbackToId_(id_);
+        }
+        builder_       = other.builder_;
+        id_            = other.id_;
+        disp_          = other.disp_;
+        other.builder_ = nullptr;
+        other.id_      = 0;
+        other.disp_    = Disposition::Committed;
+    }
+    return *this;
+}
+
+TreeBuilder::Checkpoint::~Checkpoint() noexcept {
+    if (!builder_ || disp_ != Disposition::Pending) return;
+    // A still-Pending guard at destruction is a forgotten-commit bug.
+    // Roll back to the safest possible recovery and emit a warning so
+    // the bug surfaces in the diagnostic stream instead of silently
+    // corrupting state.
+    builder_->rollbackToId_(id_);
+    disp_ = Disposition::RolledBack;
+
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::P_UncommittedCheckpoint;
+    d.severity = DiagnosticSeverity::Warning;
+    d.buffer   = builder_->source_ ? builder_->source_->id() : InvalidBuffer;
+    d.span     = SourceSpan::empty(0);
+    d.actual   = "Checkpoint destroyed without commit() or rollback() — "
+                 "rolled back as a safe default";
+    builder_->emitDiagnostic_(std::move(d));
+    builder_ = nullptr;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // TreeBuilder
 // ─────────────────────────────────────────────────────────────────────────
 
 TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
                         std::shared_ptr<GrammarSchema const> schema,
-                        DiagnosticReporter::Config           diagConfig)
+                        DiagnosticReporter::Config           diagConfig,
+                        BuilderConfig                        builderConfig)
     : source_(std::move(src))
     , schema_(std::move(schema))
-    , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig))) {
+    , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig)))
+    , builderConfig_(builderConfig) {
     // Constructor preconditions: source_ and schema_ must be non-null.
     // We accept a null source in tests of degenerate paths (the diagnostic
     // emit fallback handles it), but a null schema means pushToken has
@@ -91,12 +146,20 @@ NodeId TreeBuilder::emit_(detail::Node n) {
 
 bool TreeBuilder::attachToCurrentFrame_(NodeId id) {
     if (open_.empty()) return false;
-    open_.back().children.push_back(id);
+    pendingChildren_.push_back(id);
     // Backpatch parent on the just-emitted node so HasError propagation
     // can walk via the stored parent link rather than the open-frame stack
     // (frames may have already closed by the time a deep error fires).
     nodes_[id.v].parent = open_.back().id;
     return true;
+}
+
+// Helper: range of pendingChildren_ belonging to the top open frame.
+// Empty if there's no open frame.
+[[nodiscard]] std::span<NodeId const> TreeBuilder::topFramePendingChildren_() const noexcept {
+    if (open_.empty()) return {};
+    auto const start = open_.back().pendingStart;
+    return std::span<NodeId const>{pendingChildren_}.subspan(start);
 }
 
 void TreeBuilder::emitDiagnostic_(ParseDiagnostic d) {
@@ -168,9 +231,12 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
     // anchor, falling back to source-buffer start. Real span rolls up via
     // SourceSpan::join when children land.
     SourceSpan opener = SourceSpan::empty(0);
-    if (!open_.empty() && !open_.back().children.empty()) {
-        const NodeId lastChild = open_.back().children.back();
-        opener = SourceSpan::empty(nodes_[lastChild.v].span.end());
+    if (!open_.empty()) {
+        const auto parentChildren = topFramePendingChildren_();
+        if (!parentChildren.empty()) {
+            const NodeId lastChild = parentChildren.back();
+            opener = SourceSpan::empty(nodes_[lastChild.v].span.end());
+        }
     }
     n.span = opener;
 
@@ -178,10 +244,10 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
     if (!open_.empty()) {
         nodes_[id.v].parent = open_.back().id;
         // Register the new internal node as a child of the parent frame
-        // now, while parent is still open. closeFrame_ computes the
-        // parent's firstChild/childCount by walking frame.children;
-        // without this push the subtree would vanish from the tree.
-        open_.back().children.push_back(id);
+        // now, while parent is still open. closeFrame_ flushes the
+        // parent's pending range into childIndex_; without this push the
+        // subtree would vanish from the tree.
+        pendingChildren_.push_back(id);
     }
 
     // Wraparound is theoretical (4B opens in one build), but it would
@@ -189,12 +255,14 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
     // violation diagnostics — assert early if it ever happens.
     assert(nextCookie_ != 0 && "TreeBuilder::open: cookie wraparound");
     const std::uint32_t cookie = nextCookie_++;
+    // The new frame owns pendingChildren_ from this point forward.
+    const auto pendingStart = static_cast<std::uint32_t>(pendingChildren_.size());
     open_.push_back(Frame{
-        .id         = id,
-        .rule       = rule,
-        .openerSpan = opener,
-        .children   = {},
-        .cookie     = cookie,
+        .id           = id,
+        .rule         = rule,
+        .openerSpan   = opener,
+        .pendingStart = pendingStart,
+        .cookie       = cookie,
     });
 
     // Walk the schema cursor in parallel with the open frame. Saving the
@@ -238,11 +306,12 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         if (it->cookie == cookie) break;
     }
     if (it == open_.rend()) {
+        auto const topChildren = topFramePendingChildren_();
         addBuilderInvariant_(
             std::format("close() with unknown cookie {}", cookie),
-            open_.back().children.empty()
+            topChildren.empty()
                 ? open_.back().openerSpan
-                : nodes_[open_.back().children.back().v].span);
+                : nodes_[topChildren.back().v].span);
         return;
     }
 
@@ -259,21 +328,29 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         Frame& fr = open_.back();
         detail::Node& node = nodes_[fr.id.v];
 
+        // Flush this frame's pending range to childIndex_ contiguously.
+        // The range is `pendingChildren_[fr.pendingStart..end)`. After
+        // flush, truncate pendingChildren_ back to fr.pendingStart so
+        // the parent frame's region is re-exposed at the top.
         const auto firstChild = static_cast<std::uint32_t>(childIndex_.size());
-        for (NodeId child : fr.children) {
+        const auto pendEnd    = static_cast<std::uint32_t>(pendingChildren_.size());
+        for (std::uint32_t i = fr.pendingStart; i < pendEnd; ++i) {
+            NodeId child = pendingChildren_[i];
             childIndex_.push_back(child);
             // Roll the span up from this child onto our node.
             node.span = SourceSpan::join(node.span, nodes_[child.v].span);
             // OR-reduce HasError. The attach paths already propagated
             // eagerly, but synthetic Missing inserted directly into
-            // fr.children by finish() bypasses attachToCurrentFrame_;
+            // pendingChildren_ by finish() bypasses attachToCurrentFrame_;
             // this loop catches it.
             if (hasError(nodes_[child.v].flags)) {
                 node.flags |= NodeFlags::HasError;
             }
         }
+        const auto childCount = pendEnd - fr.pendingStart;
+        pendingChildren_.resize(fr.pendingStart);
         node.firstChild = firstChild;
-        node.childCount = static_cast<std::uint32_t>(fr.children.size());
+        node.childCount = childCount;
 
         const bool isTarget = (fr.cookie == cookie);
         if (!isTarget) {
@@ -630,11 +707,13 @@ void TreeBuilder::popScope() {
         // Underflow — a recovered close that didn't match anything we
         // opened. P_BuilderInvariant + silent recovery (the rest of the
         // build can keep going).
-        SourceSpan at = open_.empty()
-            ? SourceSpan::empty(0)
-            : (open_.back().children.empty()
-               ? open_.back().openerSpan
-               : nodes_[open_.back().children.back().v].span);
+        SourceSpan at = SourceSpan::empty(0);
+        if (!open_.empty()) {
+            const auto topChildren = topFramePendingChildren_();
+            at = topChildren.empty()
+                ? open_.back().openerSpan
+                : nodes_[topChildren.back().v].span;
+        }
         addBuilderInvariant_("popScope on empty scope stack", at);
         return;
     }
@@ -681,25 +760,25 @@ Tree TreeBuilder::finish() && {
     }
 
     // Synthesize Missing for unclosed shapes + emit one P_PrematureEndOfInput
-    // per unclosed frame. The deepest frame is reported first (it's the
-    // most-specific complaint); each older (outer) frame's diagnostic
-    // attaches the deeper-frame openers as related-locations.
+    // per unclosed frame. Process innermost-out so each Missing child is
+    // appended to the top frame's pendingChildren_ range (the only one
+    // currently accessible) and the frame is closed before moving on to
+    // the next outer one. Each outer frame's diagnostic attaches the
+    // deeper-frame openers as related-locations.
     if (!open_.empty()) {
         SourceSpan eofSpan = SourceSpan::empty(source_ ? source_->size() : 0);
         std::vector<RelatedLocation> ancestors;
         ancestors.reserve(open_.size());
 
-        // Walk from deepest (back) to outermost (front). Insert a Missing
-        // child marker on each open frame so the tree still has a complete
-        // structure that downstream passes can iterate without surprise.
-        for (auto it = open_.rbegin(); it != open_.rend(); ++it) {
+        while (!open_.empty()) {
+            Frame& fr = open_.back();
             detail::Node miss{};
             miss.kind   = NodeKind::Error;
             miss.flags  = NodeFlags::Missing | NodeFlags::Synthetic | NodeFlags::HasError;
             miss.span   = eofSpan;
-            miss.parent = it->id;
+            miss.parent = fr.id;
             const NodeId mid = emit_(miss);
-            it->children.push_back(mid);
+            pendingChildren_.push_back(mid);
 
             // Each frame's diagnostic gets the same EOF span but a
             // distinct ruleContext — the reporter's dedup hash includes
@@ -709,31 +788,26 @@ Tree TreeBuilder::finish() && {
             d.severity    = DiagnosticSeverity::Error;
             d.buffer      = source_ ? source_->id() : InvalidBuffer;
             d.span        = eofSpan;
-            d.ruleContext = it->rule;
+            d.ruleContext = fr.rule;
             d.actual      = std::format("end of input while inside rule '{}'",
-                                        schema_->rules().name(it->rule));
+                                        schema_->rules().name(fr.rule));
             d.related     = ancestors;
             emitDiagnostic_(std::move(d));
 
-            // After emitting, append this frame's opener to `ancestors`
-            // so the next (outer) diagnostic links back to it.
             ancestors.push_back({source_ ? source_->id() : InvalidBuffer,
-                                 it->openerSpan,
+                                 fr.openerSpan,
                                  std::format("inside rule '{}' opened here",
-                                             schema_->rules().name(it->rule))});
+                                             schema_->rules().name(fr.rule))});
 
             propagateHasError_(mid);
-        }
 
-        // Close every still-open frame synthetically. closeFrame_ marks
-        // cascade-closed (non-target) cookies in closedCookies_ already,
-        // but the *target* cookie of each call (the top of the stack) is
-        // not — we mark it manually here so the corresponding OpenScope's
-        // eventual destructor finds it and no-ops cleanly.
-        while (!open_.empty()) {
-            const std::uint32_t topCookie = open_.back().cookie;
-            closeFrame_(topCookie, /*synthetic*/ true);
-            closedCookies_.insert(topCookie);
+            // Close this frame synthetically. closeFrame_ marks cascade-
+            // closed (non-target) cookies in closedCookies_ already, but
+            // the *target* cookie (this frame) is not — mark it manually
+            // so the matching OpenScope's eventual destructor no-ops.
+            const std::uint32_t cookie = fr.cookie;
+            closeFrame_(cookie, /*synthetic*/ true);
+            closedCookies_.insert(cookie);
         }
     }
 
@@ -770,6 +844,119 @@ Tree TreeBuilder::finish() && {
     }
 
     return Tree{std::move(td)};
+}
+
+// ── checkpoint / commit / rollback ───────────────────────────────────────
+
+TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
+    // Watchdog: cap on simultaneously-active speculation. A misbehaving
+    // grammar with deeply-nested speculative alts could otherwise pile
+    // snapshots without bound. Past the cap, the returned Checkpoint is
+    // a "no-op" guard (id=0); commit/rollback on it are no-ops and the
+    // caller's speculative work is effectively non-speculative — which
+    // is the right behavior, since rolling back would also undo any
+    // outer real progress that mingled in.
+    if (checkpointStack_.size() >= builderConfig_.maxSpeculationDepth) {
+        if (!maxSpeculationDepthReached_) {
+            maxSpeculationDepthReached_ = true;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::P_MaxSpeculationDepth;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = source_ ? source_->id() : InvalidBuffer;
+            d.span     = SourceSpan::empty(0);
+            d.actual   = std::format(
+                "speculation depth cap ({}) reached; further checkpoints are no-ops",
+                builderConfig_.maxSpeculationDepth);
+            emitDiagnostic_(std::move(d));
+        }
+        return Checkpoint{this, 0};   // no-op guard
+    }
+
+    CheckpointSnapshot snap;
+    snap.nodesSize           = nodes_.size();
+    snap.childIndexSize      = childIndex_.size();
+    snap.pendingChildrenSize = pendingChildren_.size();
+    snap.openFrames          = open_;
+    snap.scopes              = scopes_;
+    snap.cursor              = cursor_;
+    snap.cursorStack         = cursorStack_;
+    snap.nextCookie          = nextCookie_;
+    snap.closedCookies       = closedCookies_;
+    snap.cursorDesynced      = cursorDesynced_;
+    snap.reporterSnap        = reporter_->snapshotForRollback();
+
+    const auto id = nextCheckpointId_++;
+    checkpointStack_.push_back(std::move(snap));
+    return Checkpoint{this, id};
+}
+
+void TreeBuilder::commit(Checkpoint&& cp) noexcept {
+    if (!cp.builder_ || cp.disp_ != Checkpoint::Disposition::Pending) return;
+    commitToId_(cp.id_);
+    cp.disp_   = Checkpoint::Disposition::Committed;
+    cp.builder_ = nullptr;
+}
+
+void TreeBuilder::rollback(Checkpoint&& cp) noexcept {
+    if (!cp.builder_ || cp.disp_ != Checkpoint::Disposition::Pending) return;
+    rollbackToId_(cp.id_);
+    cp.disp_   = Checkpoint::Disposition::RolledBack;
+    cp.builder_ = nullptr;
+}
+
+void TreeBuilder::commitToId_(std::uint32_t id) noexcept {
+    if (id == 0 || checkpointStack_.empty()) return;
+    // Stack stores snapshots in insertion order. ID-to-index mapping:
+    // index = id - firstId, where firstId is the bottom-most live id.
+    // Commit drops the target snapshot and any deeper ones above it
+    // (cascade discard — committing an outer checkpoint while an inner
+    // is still pending is a caller bug, but the outer commit means the
+    // outer state is final, so inner snapshots are necessarily stale).
+    const auto firstId = nextCheckpointId_ - checkpointStack_.size();
+    if (id < firstId) return;                     // already discarded
+    const auto stackIdx = static_cast<std::size_t>(id - firstId);
+    if (stackIdx >= checkpointStack_.size()) return;
+    checkpointStack_.resize(stackIdx);
+}
+
+void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
+    if (id == 0) return;                          // no-op guard
+    if (checkpointStack_.empty()) return;
+
+    // Find the snapshot at this id. The id-to-index mapping is:
+    // checkpointStack_[index] has id == (index + 1 + base), where base
+    // is the count of cookies popped before this snapshot was taken.
+    // Simpler: walk from the back; the snapshot whose id == requested
+    // id is the one we restore. Pop everything above it; restore from
+    // it; pop it.
+    // The simplest invariant is: stack is in insertion order, ids are
+    // monotonic 1..N, and entries are only removed from the back. So
+    // `id` maps to stack index `id - firstStackId`, where firstStackId
+    // is the id of the bottom-most current entry — we can compute it as
+    // (nextCheckpointId_ - checkpointStack_.size()).
+    const auto firstId = nextCheckpointId_ - checkpointStack_.size();
+    if (id < firstId) return;                     // already discarded
+    const auto stackIdx = static_cast<std::size_t>(id - firstId);
+    if (stackIdx >= checkpointStack_.size()) return;
+
+    // Move the target snapshot out of the stack before truncating so
+    // we don't restore from an about-to-be-destroyed object.
+    CheckpointSnapshot snap = std::move(checkpointStack_[stackIdx]);
+    checkpointStack_.resize(stackIdx);
+
+    // Restore in topological order: arena first, then dependent vectors,
+    // then the cursor/scope/cookie state, then the reporter.
+    nodes_.resize(snap.nodesSize);
+    childIndex_.resize(snap.childIndexSize);
+    pendingChildren_.resize(snap.pendingChildrenSize);
+    open_              = std::move(snap.openFrames);
+    scopes_            = std::move(snap.scopes);
+    cursor_            = snap.cursor;
+    cursorStack_       = std::move(snap.cursorStack);
+    nextCookie_        = snap.nextCookie;
+    closedCookies_     = std::move(snap.closedCookies);
+    cursorDesynced_    = snap.cursorDesynced;
+    reporter_->truncateTo(snap.reporterSnap);
 }
 
 } // namespace dss
