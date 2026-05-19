@@ -91,12 +91,12 @@ public:
         std::uint32_t  cookie_  = 0;
     };
 
-    // ── speculative branching ──
-    //
-    // Move-only RAII guard. Returned by `checkpoint()`. Destructor rolls
-    // back if still Pending — silent commit is exactly the wrong default
-    // for a backtracking primitive. To keep the speculative work, the
-    // caller passes the guard into `commit(std::move(cp))`.
+    // Move-only RAII guard from `checkpoint()`. Dtor rolls back if still
+    // Pending — silent commit is the wrong default for a backtracking
+    // primitive. Precondition: the producing `TreeBuilder` must outlive
+    // this guard. Storing a Checkpoint past the builder's destruction
+    // is UB. TreeBuilder is non-copyable/non-movable, so the back-
+    // pointer stays valid for the builder's lifetime.
     class DSS_EXPORT Checkpoint {
     public:
         enum class Disposition : std::uint8_t { Pending, Committed, RolledBack };
@@ -169,25 +169,12 @@ public:
     // empty post-finish).
     [[nodiscard]] RuleId       currentRule()  const noexcept;
 
-    // ── checkpoint / commit / rollback ──
-    //
-    // Takes a snapshot of the builder's full mutable state (arena size,
-    // child-index size, staging vector size, open-frame stack, scope
-    // stack, cursor + cursor stack, cookie counter, closed-cookie set,
-    // cursor-desync latch, AND the diagnostic reporter's accumulator
-    // state) and returns an RAII guard. Speculative work between
-    // `checkpoint()` and `rollback()` can be undone wholesale; `commit()`
-    // releases the snapshot without touching state.
-    //
-    // Open frames at checkpoint time MUST still be open (or have been
-    // closed within the speculative section) when commit/rollback runs.
-    // Closing an outer frame inside speculation is a builder invariant
-    // violation — diagnostics will fire and the rollback may be partial.
-    //
-    // Hitting `BuilderConfig::maxSpeculationDepth` produces a "no-op"
-    // checkpoint (its `disp_` jumps directly to Committed regardless of
-    // commit/rollback call) and emits one `P_MaxSpeculationDepth` per
-    // build.
+    // Snapshot full builder state (arena, child-index, pending children,
+    // open frames, scope stack, cursor + stack, cookie counter, closed-
+    // cookie set, desync latch, watchdog latch, reporter accumulator).
+    // Closing an outer frame inside speculation emits `P_BuilderInvariant`.
+    // Over-cap produces a no-op guard (`id == kNoOpCheckpointId`); commit/
+    // rollback on it are safe no-ops.
     [[nodiscard]] Checkpoint checkpoint();
     void                     commit(Checkpoint&& cp) noexcept;
     void                     rollback(Checkpoint&& cp) noexcept;
@@ -242,6 +229,7 @@ private:
         std::uint32_t                     nextCookie;
         std::unordered_set<std::uint32_t> closedCookies;
         bool                              cursorDesynced;
+        bool                              maxSpeculationDepthReached;
         DiagnosticReporter::Snapshot      reporterSnap;
     };
 
@@ -250,6 +238,10 @@ private:
     void                    closeFrame_(std::uint32_t cookie, bool synthetic) noexcept;
     void                    propagateHasError_(NodeId start) noexcept;
     void                    emitDiagnostic_(ParseDiagnostic d);
+    // Like emitDiagnostic_ but bypasses the reporter's cap so signals
+    // that callers MUST see (e.g. P_UncommittedCheckpoint from the
+    // Checkpoint dtor) aren't silently swallowed by an at-cap reporter.
+    void                    forceReport_(ParseDiagnostic d);
     void                    addBuilderInvariant_(std::string actual, SourceSpan span);
 
     // Emit P_SchemaCursorDesync exactly once per build the first time the
@@ -322,9 +314,26 @@ private:
     bool                                   finished_   = false;
 
     // ── speculative state ──
+    //
+    // Each entry carries its own id. Lookup by id is a linear search
+    // (depth ≤ maxSpeculationDepth, typically ≤ 64 — trivially fast and
+    // cache-friendly). Index-arithmetic shortcuts (e.g. `firstId =
+    // nextCheckpointId_ - stack.size()`) silently break when `commitToId_`
+    // truncates from the middle of the stack on inner-commit-then-outer-
+    // rollback sequences, so the stable invariant is "each snapshot owns
+    // its id." `kNoOpCheckpointId` is the sentinel returned by
+    // `checkpoint()` when the cap is reached; both commit/rollback paths
+    // short-circuit on it.
+    static constexpr std::uint32_t kNoOpCheckpointId = 0;
+
     BuilderConfig                          builderConfig_{};
-    std::vector<CheckpointSnapshot>        checkpointStack_;
-    std::uint32_t                          nextCheckpointId_ = 1;  // 0 reserved as "no-op"
+    std::vector<std::pair<std::uint32_t,
+                          CheckpointSnapshot>>  checkpointStack_;
+    std::uint32_t                          nextCheckpointId_ = 1;
+    // One-shot per build; snapshotted by Checkpoint so rollback restores
+    // it (otherwise a speculative branch that tripped the cap would
+    // permanently silence the post-rollback emission of legitimate cap
+    // events).
     bool                                   maxSpeculationDepthReached_ = false;
 };
 

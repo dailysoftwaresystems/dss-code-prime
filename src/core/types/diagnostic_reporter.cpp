@@ -61,28 +61,32 @@ std::size_t DiagnosticReporter::warningCount() const noexcept {
 
 DiagnosticReporter::Snapshot DiagnosticReporter::snapshotForRollback() const {
     Snapshot s;
-    s.allSize    = all_.size();
-    s.perCode    = perCode_;
-    s.recentSize = recent_.size();
-    s.hitCap     = hitCap_;
+    s.allSize = all_.size();
+    s.perCode = perCode_;
+    s.recent  = recent_;
+    s.hitCap  = hitCap_;
     return s;
 }
 
+void DiagnosticReporter::forceReport(ParseDiagnostic d) {
+    auto filtered = applyPolicy(std::move(d));
+    if (!filtered) return;
+    perCode_[filtered->code]++;
+    all_.push_back(std::move(*filtered));
+}
+
 void DiagnosticReporter::truncateTo(Snapshot const& snap) {
-    // Truncate the visible diagnostic stream back to the snapshot size.
+    // Restore visible stream length.
     if (snap.allSize < all_.size()) {
         all_.resize(snap.allSize);
     }
-    // Restore per-code counters wholesale — snapshot recorded exact map.
+    // perCode_, recent_, and hitCap_ are restored wholesale. recent_
+    // CANNOT be back-truncated by size alone because pop_front during
+    // speculation may have evicted original entries; only the full
+    // snapshot is mathematically sound.
     perCode_ = snap.perCode;
-    // Restore the dedup window. recent_ is a deque of monotonic hash
-    // appends; truncate from the back to the snapshot length.
-    while (recent_.size() > snap.recentSize) {
-        recent_.pop_back();
-    }
-    // Re-open the cap latch if the speculative branch tripped it. A
-    // committed branch keeps the latch as-is; only rollback reaches here.
-    hitCap_ = snap.hitCap;
+    recent_  = snap.recent;
+    hitCap_  = snap.hitCap;
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {

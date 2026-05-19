@@ -400,6 +400,8 @@ void computeFirstAndNullable(GrammarSchemaData& data, json const& shapesJson) {
 struct PositionBuilder {
     std::vector<detail::Position>& positions;
     GrammarSchemaData const&       data;
+    Collector&                     coll;
+    std::string const&             shapePath;   // e.g. "/shapes/expression"
 
     [[nodiscard]] std::uint32_t emplace(detail::Position p) {
         positions.push_back(std::move(p));
@@ -442,35 +444,50 @@ struct PositionBuilder {
             for (auto bid : branches) mergeSorted(ex, positions[bid].expectedSet());
             const auto id = emplace(detail::Position::makeAltChoice(
                 std::move(branches), std::move(ex)));
-            // Speculative-alt metadata, if declared. The cursor walker
-            // doesn't consume `speculative`/`lookahead` today — these
-            // are stored for the future parser to read. The default
-            // lookahead when `speculative: true` is set without an
-            // explicit count is 8 (per v2 §5.4 design).
+            // Speculative-alt metadata. The cursor walker doesn't act on
+            // these today; they're stored for the future parser to read.
+            // Default `lookahead` when `speculative: true` is set without
+            // an explicit count is 8 (per v2 §5.4 design).
             constexpr std::uint16_t kDefaultLookahead = 8;
+            bool speculative = false;
+            std::uint16_t lookahead = kDefaultLookahead;
             if (body.contains("speculative")) {
-                if (!body.at("speculative").is_boolean()) {
-                    // The loader is in a recursive position-builder; we
-                    // don't carry a Collector here, but the alt-FIRST
-                    // ambiguity pass elsewhere is the only consumer of
-                    // speculation metadata at config-load time. Surface
-                    // the malformed attribute via the same C_ family
-                    // the rest of the loader uses.
-                    // (Diagnostic is emitted by the wrapping shape-walk;
-                    // here we silently default to non-speculative, which
-                    // is the safe semantic.)
-                } else if (body.at("speculative").get<bool>()) {
-                    std::uint16_t la = kDefaultLookahead;
-                    if (body.contains("lookahead") &&
-                        body.at("lookahead").is_number_integer()) {
-                        const auto raw = body.at("lookahead").get<std::int64_t>();
-                        if (raw > 0 && raw <= std::numeric_limits<std::uint16_t>::max()) {
-                            la = static_cast<std::uint16_t>(raw);
-                        }
-                    }
-                    positions[id].setSpeculative(true, la);
+                json const& sv = body.at("speculative");
+                if (!sv.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/speculative", shapePath),
+                              "'speculative' must be a boolean");
+                } else {
+                    speculative = sv.get<bool>();
                 }
             }
+            if (body.contains("lookahead")) {
+                json const& lv = body.at("lookahead");
+                if (!lv.is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/lookahead", shapePath),
+                              "'lookahead' must be a positive integer");
+                } else {
+                    const auto raw = lv.get<std::int64_t>();
+                    if (raw <= 0 ||
+                        raw > std::numeric_limits<std::uint16_t>::max()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/lookahead", shapePath),
+                                  std::format("'lookahead' value {} is out of "
+                                              "range (must be 1..{})",
+                                              raw, std::numeric_limits<std::uint16_t>::max()));
+                    } else {
+                        lookahead = static_cast<std::uint16_t>(raw);
+                    }
+                }
+                if (!speculative) {
+                    coll.emit(DiagnosticCode::C_RedundantField,
+                              std::format("{}/lookahead", shapePath),
+                              "'lookahead' has no effect without 'speculative: true'",
+                              DiagnosticSeverity::Warning);
+                }
+            }
+            if (speculative) positions[id].setSpeculative(true, lookahead);
             return id;
         }
         if (body.contains("optional")) {
@@ -507,7 +524,8 @@ struct PositionBuilder {
     }
 };
 
-void buildPositionTables(GrammarSchemaData& data, json const& shapesJson) {
+void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
+                         Collector& coll) {
     for (auto const& [shapeName, body] : shapesJson.items()) {
         const auto rid = data.rules->find(shapeName);
         auto& rule = data.compiledRules[rid.v];
@@ -515,7 +533,8 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson) {
         // positions[0] is the sentinel for cursor posId==0 (invalid).
         // positions[1] is the End that body completions fall through to.
         rule.positions.emplace_back();
-        PositionBuilder builder{rule.positions, data};
+        const auto shapePath = std::format("/shapes/{}", shapeName);
+        PositionBuilder builder{rule.positions, data, coll, shapePath};
         const auto endId   = builder.emplace(detail::Position::makeEnd());
         const auto entryId = builder.build(body, endId);
         rule.entryPos = entryId;
@@ -526,10 +545,10 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson) {
 // overlap. The cursor's `advance` does silent first-branch-wins on overlap,
 // which is the wrong default for a grammar that wants disjoint alts; this
 // pass surfaces the conflict at load time so the config author resolves
-// it by either restructuring the grammar OR (in PR4) marking the alt as
-// `speculative: true` to opt in to backtracking semantics. Today the
-// `speculative` field doesn't exist yet, so every ambiguous alt is a
-// load error.
+// it by either restructuring the grammar OR marking the alt as
+// `speculative: true` to opt in to backtracking semantics. Speculative
+// alts are exempt from ambiguity-detect — overlapping FIRST sets are the
+// whole reason a config opts in to backtracking.
 void detectAmbiguousAlternatives(GrammarSchemaData& data, Collector& coll,
                                   json const& shapesJson) {
     for (auto const& [shapeName, _] : shapesJson.items()) {
@@ -540,6 +559,10 @@ void detectAmbiguousAlternatives(GrammarSchemaData& data, Collector& coll,
         for (std::size_t posIdx = 0; posIdx < positions.size(); ++posIdx) {
             auto const& p = positions[posIdx];
             if (p.slotKind() != SlotKind::AltChoice) continue;
+            // Speculative alts deliberately allow overlapping FIRST sets
+            // — the whole point is backtracking when the disambiguating
+            // token is N positions deep. Skip the ambiguity check.
+            if (p.speculative()) continue;
             auto branches = p.branches();
             for (std::size_t i = 0; i + 1 < branches.size(); ++i) {
                 auto a = positions[branches[i]].expectedSet();
@@ -1235,7 +1258,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // to surface alt branches whose FIRST sets overlap.
             if (!coll.hasErrors()) {
                 computeFirstAndNullable    (data, doc.at("shapes"));
-                buildPositionTables        (data, doc.at("shapes"));
+                buildPositionTables        (data, doc.at("shapes"), coll);
                 detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
                 computeNullableTails       (data);
             }

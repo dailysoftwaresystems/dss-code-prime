@@ -52,6 +52,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_RedundantScopeRequire:    return "C_RedundantScopeRequire";
         case DiagnosticCode::C_ConflictingField:         return "C_ConflictingField";
         case DiagnosticCode::C_UnknownScopeName:         return "C_UnknownScopeName";
+        case DiagnosticCode::C_RedundantField:           return "C_RedundantField";
     }
     return "Unknown";
 }

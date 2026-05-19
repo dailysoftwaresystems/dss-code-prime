@@ -90,13 +90,21 @@ TreeBuilder::Checkpoint::operator=(Checkpoint&& other) noexcept {
 
 TreeBuilder::Checkpoint::~Checkpoint() noexcept {
     if (!builder_ || disp_ != Disposition::Pending) return;
-    // A still-Pending guard at destruction is a forgotten-commit bug.
-    // Roll back to the safest possible recovery and emit a warning so
-    // the bug surfaces in the diagnostic stream instead of silently
-    // corrupting state.
+    // No-op guard (returned when the speculation-depth cap was hit) has
+    // no captured state, so destroying it without commit/rollback is
+    // not a bug — the P_MaxSpeculationDepth diagnostic already flagged
+    // the cap event. Silently inert.
+    if (id_ == TreeBuilder::kNoOpCheckpointId) {
+        disp_    = Disposition::Committed;
+        builder_ = nullptr;
+        return;
+    }
     builder_->rollbackToId_(id_);
     disp_ = Disposition::RolledBack;
 
+    // Warning goes through forceReport_ so a pre-checkpoint reporter
+    // already at hitCap_ doesn't silently swallow this signal. The
+    // forgotten-commit bug must reach the user.
     ParseDiagnostic d;
     d.code     = DiagnosticCode::P_UncommittedCheckpoint;
     d.severity = DiagnosticSeverity::Warning;
@@ -104,7 +112,7 @@ TreeBuilder::Checkpoint::~Checkpoint() noexcept {
     d.span     = SourceSpan::empty(0);
     d.actual   = "Checkpoint destroyed without commit() or rollback() — "
                  "rolled back as a safe default";
-    builder_->emitDiagnostic_(std::move(d));
+    builder_->forceReport_(std::move(d));
     builder_ = nullptr;
 }
 
@@ -167,6 +175,11 @@ void TreeBuilder::emitDiagnostic_(ParseDiagnostic d) {
     // call sites) so every diagnostic gets it for free.
     d.scopeStack.assign(scopes_.begin(), scopes_.end());
     reporter_->report(std::move(d));
+}
+
+void TreeBuilder::forceReport_(ParseDiagnostic d) {
+    d.scopeStack.assign(scopes_.begin(), scopes_.end());
+    reporter_->forceReport(std::move(d));
 }
 
 void TreeBuilder::noteCursorDesync_(bool wasValid,
@@ -849,13 +862,9 @@ Tree TreeBuilder::finish() && {
 // ── checkpoint / commit / rollback ───────────────────────────────────────
 
 TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
-    // Watchdog: cap on simultaneously-active speculation. A misbehaving
-    // grammar with deeply-nested speculative alts could otherwise pile
-    // snapshots without bound. Past the cap, the returned Checkpoint is
-    // a "no-op" guard (id=0); commit/rollback on it are no-ops and the
-    // caller's speculative work is effectively non-speculative — which
-    // is the right behavior, since rolling back would also undo any
-    // outer real progress that mingled in.
+    // Past the cap, return a no-op guard (id = kNoOpCheckpointId).
+    // commit/rollback on it short-circuit; the dtor recognizes the
+    // sentinel and skips the forgotten-commit warning.
     if (checkpointStack_.size() >= builderConfig_.maxSpeculationDepth) {
         if (!maxSpeculationDepthReached_) {
             maxSpeculationDepthReached_ = true;
@@ -869,24 +878,25 @@ TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
                 builderConfig_.maxSpeculationDepth);
             emitDiagnostic_(std::move(d));
         }
-        return Checkpoint{this, 0};   // no-op guard
+        return Checkpoint{this, kNoOpCheckpointId};
     }
 
     CheckpointSnapshot snap;
-    snap.nodesSize           = nodes_.size();
-    snap.childIndexSize      = childIndex_.size();
-    snap.pendingChildrenSize = pendingChildren_.size();
-    snap.openFrames          = open_;
-    snap.scopes              = scopes_;
-    snap.cursor              = cursor_;
-    snap.cursorStack         = cursorStack_;
-    snap.nextCookie          = nextCookie_;
-    snap.closedCookies       = closedCookies_;
-    snap.cursorDesynced      = cursorDesynced_;
-    snap.reporterSnap        = reporter_->snapshotForRollback();
+    snap.nodesSize                  = nodes_.size();
+    snap.childIndexSize             = childIndex_.size();
+    snap.pendingChildrenSize        = pendingChildren_.size();
+    snap.openFrames                 = open_;
+    snap.scopes                     = scopes_;
+    snap.cursor                     = cursor_;
+    snap.cursorStack                = cursorStack_;
+    snap.nextCookie                 = nextCookie_;
+    snap.closedCookies              = closedCookies_;
+    snap.cursorDesynced             = cursorDesynced_;
+    snap.maxSpeculationDepthReached = maxSpeculationDepthReached_;
+    snap.reporterSnap               = reporter_->snapshotForRollback();
 
     const auto id = nextCheckpointId_++;
-    checkpointStack_.push_back(std::move(snap));
+    checkpointStack_.emplace_back(id, std::move(snap));
     return Checkpoint{this, id};
 }
 
@@ -905,57 +915,66 @@ void TreeBuilder::rollback(Checkpoint&& cp) noexcept {
 }
 
 void TreeBuilder::commitToId_(std::uint32_t id) noexcept {
-    if (id == 0 || checkpointStack_.empty()) return;
-    // Stack stores snapshots in insertion order. ID-to-index mapping:
-    // index = id - firstId, where firstId is the bottom-most live id.
-    // Commit drops the target snapshot and any deeper ones above it
-    // (cascade discard — committing an outer checkpoint while an inner
-    // is still pending is a caller bug, but the outer commit means the
-    // outer state is final, so inner snapshots are necessarily stale).
-    const auto firstId = nextCheckpointId_ - checkpointStack_.size();
-    if (id < firstId) return;                     // already discarded
-    const auto stackIdx = static_cast<std::size_t>(id - firstId);
-    if (stackIdx >= checkpointStack_.size()) return;
-    checkpointStack_.resize(stackIdx);
+    if (id == kNoOpCheckpointId) return;
+    // Linear search by id (depth ≤ maxSpeculationDepth, typically ≤ 64
+    // — trivially fast and cache-friendly vs. a hashmap). The invariant
+    // is "each snapshot owns its id"; index arithmetic against the
+    // stack's size silently breaks on inner-commit-then-outer-rollback
+    // sequences, so we search instead.
+    auto it = std::ranges::find_if(checkpointStack_,
+        [id](auto const& e) { return e.first == id; });
+    if (it == checkpointStack_.end()) {
+        // Stale id — either already finalized or never belonged to
+        // this builder. Caller bug; surface it loudly.
+        addBuilderInvariant_(
+            std::format("commit() with stale or unknown Checkpoint id {}", id),
+            SourceSpan::empty(0));
+        return;
+    }
+    // If this isn't the top of the stack, the caller committed an outer
+    // checkpoint while an inner one is still Pending. Inner snapshots
+    // would silently leak — the user almost certainly didn't intend
+    // this. Surface and cascade-discard.
+    if (it + 1 != checkpointStack_.end()) {
+        addBuilderInvariant_(
+            "commit() on outer Checkpoint while inner Checkpoint is still "
+            "Pending; inner speculative state will be cascade-discarded",
+            SourceSpan::empty(0));
+    }
+    checkpointStack_.erase(it, checkpointStack_.end());
 }
 
 void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
-    if (id == 0) return;                          // no-op guard
-    if (checkpointStack_.empty()) return;
+    if (id == kNoOpCheckpointId) return;
+    auto it = std::ranges::find_if(checkpointStack_,
+        [id](auto const& e) { return e.first == id; });
+    if (it == checkpointStack_.end()) {
+        addBuilderInvariant_(
+            std::format("rollback() with stale or unknown Checkpoint id {}", id),
+            SourceSpan::empty(0));
+        return;
+    }
 
-    // Find the snapshot at this id. The id-to-index mapping is:
-    // checkpointStack_[index] has id == (index + 1 + base), where base
-    // is the count of cookies popped before this snapshot was taken.
-    // Simpler: walk from the back; the snapshot whose id == requested
-    // id is the one we restore. Pop everything above it; restore from
-    // it; pop it.
-    // The simplest invariant is: stack is in insertion order, ids are
-    // monotonic 1..N, and entries are only removed from the back. So
-    // `id` maps to stack index `id - firstStackId`, where firstStackId
-    // is the id of the bottom-most current entry — we can compute it as
-    // (nextCheckpointId_ - checkpointStack_.size()).
-    const auto firstId = nextCheckpointId_ - checkpointStack_.size();
-    if (id < firstId) return;                     // already discarded
-    const auto stackIdx = static_cast<std::size_t>(id - firstId);
-    if (stackIdx >= checkpointStack_.size()) return;
-
-    // Move the target snapshot out of the stack before truncating so
-    // we don't restore from an about-to-be-destroyed object.
-    CheckpointSnapshot snap = std::move(checkpointStack_[stackIdx]);
-    checkpointStack_.resize(stackIdx);
+    // Move the target snapshot out before erasing so we don't restore
+    // from a soon-to-be-destroyed object. Inner snapshots (if any)
+    // become irrelevant — they cover speculative state that the rollback
+    // is about to undo wholesale.
+    CheckpointSnapshot snap = std::move(it->second);
+    checkpointStack_.erase(it, checkpointStack_.end());
 
     // Restore in topological order: arena first, then dependent vectors,
     // then the cursor/scope/cookie state, then the reporter.
     nodes_.resize(snap.nodesSize);
     childIndex_.resize(snap.childIndexSize);
     pendingChildren_.resize(snap.pendingChildrenSize);
-    open_              = std::move(snap.openFrames);
-    scopes_            = std::move(snap.scopes);
-    cursor_            = snap.cursor;
-    cursorStack_       = std::move(snap.cursorStack);
-    nextCookie_        = snap.nextCookie;
-    closedCookies_     = std::move(snap.closedCookies);
-    cursorDesynced_    = snap.cursorDesynced;
+    open_                       = std::move(snap.openFrames);
+    scopes_                     = std::move(snap.scopes);
+    cursor_                     = snap.cursor;
+    cursorStack_                = std::move(snap.cursorStack);
+    nextCookie_                 = snap.nextCookie;
+    closedCookies_              = std::move(snap.closedCookies);
+    cursorDesynced_             = snap.cursorDesynced;
+    maxSpeculationDepthReached_ = snap.maxSpeculationDepthReached;
     reporter_->truncateTo(snap.reporterSnap);
 }
 

@@ -87,26 +87,30 @@ public:
 
     [[nodiscard]] Config const& config() const noexcept { return cfg_; }
 
-    // ── Snapshot / restore for speculative rollback ───────────────────
-    //
-    // Opaque-by-convention. The caller (TreeBuilder::Checkpoint) takes
-    // a Snapshot via `snapshotForRollback`, runs speculative work, and
-    // either discards the Snapshot (commit) or passes it to `truncateTo`
-    // (rollback). The Snapshot is only meaningful for the reporter
-    // instance it came from; passing it to a different reporter or
-    // using it after non-monotonic reporter mutations is undefined.
-    //
-    // hitCap_ is a one-way latch in normal operation. Rollback re-opens
-    // it so speculative branches that tripped the cap don't permanently
-    // silence the post-rollback reporter.
-    struct Snapshot {
-        std::size_t                                       allSize;
+    // Opaque restore token used exclusively by TreeBuilder::Checkpoint.
+    // `recent_` is a sliding window with pop_front, so size-only capture
+    // would lose front entries to speculative pushes; truncateTo would
+    // then restore speculative residue rather than pre-checkpoint state.
+    // Full-deque snapshot is the only mathematically sound shape.
+    // Fields are private; only TreeBuilder reads them via friendship.
+    class DSS_EXPORT Snapshot {
+    private:
+        friend class DiagnosticReporter;
+        std::size_t                                       allSize     = 0;
         std::unordered_map<DiagnosticCode, std::size_t>   perCode;
-        std::size_t                                       recentSize;
-        bool                                              hitCap;
+        std::deque<std::uint64_t>                         recent;
+        bool                                              hitCap      = false;
     };
     [[nodiscard]] Snapshot snapshotForRollback() const;
     void                   truncateTo(Snapshot const& snap);
+
+    // Append a diagnostic bypassing the global cap and dedup window.
+    // Reserved for builder-invariant signals that the cap MUST NOT
+    // silently swallow (forgotten-commit warning, internal-error
+    // notifications). `policy` (suppress/override/warningsAsErrors)
+    // still applies — bypass concerns only the cap, not the user's
+    // explicit filtering choices. Per-code counters still increment.
+    void forceReport(ParseDiagnostic d);
 
     // Pretty-printers. The registry resolves BufferId → SourceBuffer so
     // multi-file diagnostics (related-locations spanning includes, future)
