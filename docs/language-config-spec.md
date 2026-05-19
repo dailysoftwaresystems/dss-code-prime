@@ -23,7 +23,7 @@ A config that loads cleanly produces a `GrammarSchema` you can pass to `TreeBuil
 
 ```jsonc
 {
-  "dssSchemaVersion": 1,         // required — loader emits C_VersionMismatch on mismatch
+  "dssSchemaVersion": 1,         // required — accepted range is 1..2; loader emits C_VersionMismatch on values outside that window
 
   "language": {                  // required — identifies the language
     "name":           "Calc",    // required
@@ -43,7 +43,7 @@ The loader's error catalogue (returned in `ConfigDiagnostic.code`):
 | Code | When |
 |---|---|
 | `C_MalformedJson` | JSON parse failed — bad braces, quotes, etc. |
-| `C_VersionMismatch` | `dssSchemaVersion` missing or not `1`. |
+| `C_VersionMismatch` | `dssSchemaVersion` missing, non-integer, or outside the accepted range (currently `1..2`). |
 | `C_InvalidLanguageName` | `language.name` missing, empty, or not a string. |
 | `C_MissingField` | Required field absent. |
 | `C_UnknownToken` | A `shapes` entry references a token kind that isn't declared in `tokens`, `keywords`, or built-ins. |
@@ -217,7 +217,7 @@ This is a complete, valid `.lang.json` for a tiny calculator language — copy i
 
 Loads cleanly because:
 
-- `dssSchemaVersion: 1` is the current version.
+- `dssSchemaVersion: 1` is inside the loader's accepted window (`1..2`).
 - `language.name`, `version`, `fileExtensions` all present.
 - Every shape reference (`stmt`, `letDecl`, `exprStmt`) resolves to a declared shape.
 - Every token reference (`LetKeyword`, `Identifier`, `EqOp`, `IntLiteral`, `End`) resolves — keywords + tokens + built-in `Identifier`/`IntLiteral`.
@@ -233,7 +233,7 @@ To verify, run any unit test that calls `GrammarSchema::loadShipped("calc")` and
 | Symptom | Likely fix |
 |---|---|
 | `C_MalformedJson` | Run the file through a JSON validator. Trailing commas, unquoted keys, smart quotes. |
-| `C_VersionMismatch` | `"dssSchemaVersion": 1` — must be an integer, not a string. |
+| `C_VersionMismatch` | `"dssSchemaVersion": 1` — must be an integer inside `1..2`, not a string. |
 | `C_UnknownToken: "X"` referenced from `shapes.Y` | `X` isn't declared in `tokens` or `keywords` and isn't a built-in. Check spelling; built-ins are `Identifier`, `IntLiteral`, `FloatLiteral`, `StringLiteral`, `CharLiteral`, `BoolLiteral`, `NullLiteral`. |
 | `C_UnknownShape: "X"` referenced from `shapes.Y` | `Y` references a shape name that isn't a key in `shapes`. |
 | `C_CircularShape: "X"` | Your shape references itself as the first element of its sequence. Insert a literal token before the recursive reference, or split into two shapes. |

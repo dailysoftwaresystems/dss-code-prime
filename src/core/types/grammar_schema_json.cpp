@@ -169,6 +169,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                   "must be a positive integer");
         return std::unexpected(std::move(coll.diagnostics));
     }
+    // Inclusive window of schema versions this loader understands. Bump
+    // the upper bound only after the loader actually parses the new
+    // version's exclusive fields — accepting a version implies all
+    // documented features for that version round-trip cleanly.
     constexpr std::uint32_t kMinSchemaVersion = 1;
     constexpr std::uint32_t kMaxSchemaVersion = 2;
     const auto schemaVer = doc.at("dssSchemaVersion").get<std::uint32_t>();

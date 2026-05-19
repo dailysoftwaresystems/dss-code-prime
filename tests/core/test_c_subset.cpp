@@ -5,9 +5,8 @@
 #include "core/types/token.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_builder.hpp"
-#include "core/types/tree_cursor.hpp"
 #include "core/types/tree_node.hpp"
-#include "core/types/tree_visitor.hpp"
+#include "test_pretty_print.hpp"
 
 #include <gtest/gtest.h>
 
@@ -16,17 +15,19 @@
 #include <string>
 #include <string_view>
 
-// PR0 hand-tokenized end-to-end: drives the c-subset.lang.json config through
-// TreeBuilder for a handful of representative C snippets. The tokenizer
-// doesn't exist yet, so tests synthesize Token objects pointing into the
-// SourceBuffer, exactly like test_tree_end_to_end.cpp does for toy.
+// Hand-tokenized end-to-end tests driving the shipped c-subset.lang.json
+// through TreeBuilder. The tokenizer doesn't exist yet, so each test
+// synthesizes Token objects pointing into the SourceBuffer — the same
+// pattern test_tree_end_to_end.cpp uses for toy.lang.json.
 //
-// These tests are intentionally THIN — they prove the c-subset shape graph
-// accepts the right structural shapes, not that any future parser would
-// produce them correctly. The gap catalog (v2-gap-catalog.md) enumerates
-// what these tests cannot yet verify (operator precedence, typedef, etc.).
+// These tests pin structural shapes, not parser semantics. Operator
+// precedence is NOT modeled by the schema today — see
+// `ExpressionWithMixedOpsIsLeftFolded` for the empirical record of that
+// limitation. When precedence lands in the schema, that test's expected
+// literal flips from a flat sequence to a nested grouping.
 
 using namespace dss;
+using dss::tests::prettyPrint;
 
 namespace {
 
@@ -46,14 +47,24 @@ CSubsetHarness loadShippedCSubset(std::string sourceText) {
     return {SourceBuffer::fromString(std::move(sourceText), "<c-subset>"), *loaded};
 }
 
-// Synthesize a Token at the first occurrence of `text` in `src`. The
-// uniqueness contract matches ToyHarness::tok — tests that need a repeated
-// lexeme should use the offset overload.
+// Synthesize a Token at the first occurrence of `text` in `src`. Caller
+// must ensure `text` is unique in the source — use the offset overload
+// otherwise. On lookup failure, raises ADD_FAILURE and returns a Token
+// with an empty (zero-width at offset 0) span so downstream pushToken
+// won't produce span-overflow garbage that buries the original failure
+// signal.
 Token at(SourceBuffer const& src, std::string_view text,
          CoreTokenKind kind = CoreTokenKind::Operator) {
     const auto sv = src.text();
     const auto first = sv.find(text);
-    EXPECT_NE(first, std::string_view::npos) << "lexeme '" << text << "' not in source";
+    if (first == std::string_view::npos) {
+        ADD_FAILURE() << "lexeme '" << text << "' not in source — test bug";
+        return Token{
+            .coreKind   = kind,
+            .schemaKind = InvalidSchemaToken,
+            .span       = SourceSpan::empty(0),
+        };
+    }
     return Token{
         .coreKind   = kind,
         .schemaKind = InvalidSchemaToken,
@@ -73,34 +84,11 @@ Token at(SourceBuffer const& src, std::string_view text, std::size_t startHint,
     };
 }
 
-// Walk the tree in AST mode emitting "rule:<name>" / tok:"<text>" lines.
-// Same shape as test_tree_end_to_end's prettyPrint — kept local so this
-// file is self-contained and doesn't depend on toy-specific helpers.
-std::string prettyPrint(Tree const& t) {
-    std::string out;
-    if (!t.root().valid()) return out;
-    walkPreOrder(TreeCursor{t, t.root(), CursorMode::Ast},
-                 [&](TreeCursor const& c) {
-        const int d = c.depth();
-        for (int i = 0; i < d; ++i) out += "  ";
-        const auto id = c.current();
-        if (t.kind(id) == NodeKind::Internal) {
-            out += "rule:";
-            out += t.rules().name(t.rule(id));
-        } else {
-            out += "tok:\"";
-            out += t.text(id);
-            out += '"';
-        }
-        out += '\n';
-    });
-    return out;
-}
-
 } // namespace
 
-// `int x = 5;` — typeRef Identifier AssignOp IntLiteral EndStatement,
-// inside topLevel → varDecl.
+// Drives `int x = 5;` through the topLevel → varDecl chain. Pins the
+// varDeclHead refactor (typeRef + Identifier + optional initializer) plus
+// the typeBase nesting under typeRef that carries the future const slot.
 TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     auto h = loadShippedCSubset("int x = 5;");
     ASSERT_NE(h.schema, nullptr);
@@ -154,47 +142,80 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
-// `if (x) { return x; }` — exercises the block/return/Paren scope chain.
-// We open `statement` directly under `root`: the c-subset schema's
-// topLevel-shape enforcement is parser work (not yet implemented), so the
-// builder accepts any rule we ask it to open. Two `x` occurrences need
-// explicit offsets so the second resolves inside the return.
-TEST(CSubsetEndToEnd, IfWithReturnInsideBlock) {
-    auto h = loadShippedCSubset("if (x) { return x; }");
+// Drives `int main(void) { if (x) { return x; } }` through topLevel →
+// funcDecl → block → statement → ifStmt → block → returnStmt. Exercises
+// the actual config path real C source would take, not a synthetic
+// `statement`-under-`root` shortcut: a typo in any of `funcDecl` /
+// `paramList` / `param` / `block` / `ifStmt` / `returnStmt` in the JSON
+// would fail this test.
+TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
+    auto h = loadShippedCSubset("int main(void) { if (x) { return x; } }");
     ASSERT_NE(h.schema, nullptr);
     const auto src = h.src->text();
     const auto x1 = src.find("x");
     const auto x2 = src.find("x", x1 + 1);
+    const auto firstParen   = src.find("(");
+    const auto firstParenC  = src.find(")");
+    const auto secondParen  = src.find("(", firstParen + 1);
+    const auto secondParenC = src.find(")", firstParenC + 1);
+    const auto outerBlockO  = src.find("{");
+    const auto innerBlockO  = src.find("{", outerBlockO + 1);
+    const auto innerBlockC  = src.find("}");
+    const auto outerBlockC  = src.find("}", innerBlockC + 1);
 
     TreeBuilder b{h.src, h.schema};
     {
         auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto ifs  = b.open(h.schema->rules().find("ifStmt"));
-        b.pushToken(at(*h.src, "if", CoreTokenKind::Word));
-        b.pushToken(at(*h.src, "("));
+        auto top  = b.open(h.schema->rules().find("topLevel"));
+        auto fn   = b.open(h.schema->rules().find("funcDecl"));
         {
-            auto expr = b.open(h.schema->rules().find("expression"));
-            auto opr  = b.open(h.schema->rules().find("operand"));
-            b.pushToken(at(*h.src, "x", x1, CoreTokenKind::Word));
+            auto ty = b.open(h.schema->rules().find("typeRef"));
+            auto tb = b.open(h.schema->rules().find("typeBase"));
+            b.pushToken(at(*h.src, "int", CoreTokenKind::Word));
         }
-        b.pushToken(at(*h.src, ")"));
+        b.pushToken(at(*h.src, "main", CoreTokenKind::Word));
+        b.pushToken(at(*h.src, "(", firstParen));
         {
-            auto innerStmt = b.open(h.schema->rules().find("statement"));
-            auto blk       = b.open(h.schema->rules().find("block"));
-            b.pushToken(at(*h.src, "{"));
+            auto pl = b.open(h.schema->rules().find("paramList"));
+            auto p  = b.open(h.schema->rules().find("param"));
+            auto ty = b.open(h.schema->rules().find("typeRef"));
+            auto tb = b.open(h.schema->rules().find("typeBase"));
+            b.pushToken(at(*h.src, "void", CoreTokenKind::Word));
+        }
+        b.pushToken(at(*h.src, ")", firstParenC));
+        {
+            auto blk = b.open(h.schema->rules().find("block"));
+            b.pushToken(at(*h.src, "{", outerBlockO));
             {
-                auto innerInner = b.open(h.schema->rules().find("statement"));
-                auto rs         = b.open(h.schema->rules().find("returnStmt"));
-                b.pushToken(at(*h.src, "return", CoreTokenKind::Word));
+                auto stmt = b.open(h.schema->rules().find("statement"));
+                auto ifs  = b.open(h.schema->rules().find("ifStmt"));
+                b.pushToken(at(*h.src, "if", CoreTokenKind::Word));
+                b.pushToken(at(*h.src, "(", secondParen));
                 {
-                    auto retExpr = b.open(h.schema->rules().find("expression"));
-                    auto retOpr  = b.open(h.schema->rules().find("operand"));
-                    b.pushToken(at(*h.src, "x", x2, CoreTokenKind::Word));
+                    auto expr = b.open(h.schema->rules().find("expression"));
+                    auto opr  = b.open(h.schema->rules().find("operand"));
+                    b.pushToken(at(*h.src, "x", x1, CoreTokenKind::Word));
                 }
-                b.pushToken(at(*h.src, ";"));
+                b.pushToken(at(*h.src, ")", secondParenC));
+                {
+                    auto innerStmt = b.open(h.schema->rules().find("statement"));
+                    auto innerBlk  = b.open(h.schema->rules().find("block"));
+                    b.pushToken(at(*h.src, "{", innerBlockO));
+                    {
+                        auto retStmt = b.open(h.schema->rules().find("statement"));
+                        auto rs      = b.open(h.schema->rules().find("returnStmt"));
+                        b.pushToken(at(*h.src, "return", CoreTokenKind::Word));
+                        {
+                            auto retExpr = b.open(h.schema->rules().find("expression"));
+                            auto retOpr  = b.open(h.schema->rules().find("operand"));
+                            b.pushToken(at(*h.src, "x", x2, CoreTokenKind::Word));
+                        }
+                        b.pushToken(at(*h.src, ";"));
+                    }
+                    b.pushToken(at(*h.src, "}", innerBlockC));
+                }
             }
-            b.pushToken(at(*h.src, "}"));
+            b.pushToken(at(*h.src, "}", outerBlockC));
         }
     }
     Tree t = std::move(b).finish();
@@ -204,38 +225,56 @@ TEST(CSubsetEndToEnd, IfWithReturnInsideBlock) {
             ? "<none>"
             : diagnosticCodeName(t.diagnostics().all()[0].code));
     EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_FALSE(hasError(t.flags(t.root())));
 
     const std::string_view expected =
         "rule:root\n"
-        "  rule:statement\n"
-        "    rule:ifStmt\n"
-        "      tok:\"if\"\n"
+        "  rule:topLevel\n"
+        "    rule:funcDecl\n"
+        "      rule:typeRef\n"
+        "        rule:typeBase\n"
+        "          tok:\"int\"\n"
+        "      tok:\"main\"\n"
         "      tok:\"(\"\n"
-        "      rule:expression\n"
-        "        rule:operand\n"
-        "          tok:\"x\"\n"
+        "      rule:paramList\n"
+        "        rule:param\n"
+        "          rule:typeRef\n"
+        "            rule:typeBase\n"
+        "              tok:\"void\"\n"
         "      tok:\")\"\n"
-        "      rule:statement\n"
-        "        rule:block\n"
-        "          tok:\"{\"\n"
-        "          rule:statement\n"
-        "            rule:returnStmt\n"
-        "              tok:\"return\"\n"
-        "              rule:expression\n"
-        "                rule:operand\n"
-        "                  tok:\"x\"\n"
-        "              tok:\";\"\n"
-        "          tok:\"}\"\n";
+        "      rule:block\n"
+        "        tok:\"{\"\n"
+        "        rule:statement\n"
+        "          rule:ifStmt\n"
+        "            tok:\"if\"\n"
+        "            tok:\"(\"\n"
+        "            rule:expression\n"
+        "              rule:operand\n"
+        "                tok:\"x\"\n"
+        "            tok:\")\"\n"
+        "            rule:statement\n"
+        "              rule:block\n"
+        "                tok:\"{\"\n"
+        "                rule:statement\n"
+        "                  rule:returnStmt\n"
+        "                    tok:\"return\"\n"
+        "                    rule:expression\n"
+        "                      rule:operand\n"
+        "                        tok:\"x\"\n"
+        "                    tok:\";\"\n"
+        "                tok:\"}\"\n"
+        "        tok:\"}\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
-// `a + b * c;` — exercises the gap-#1 wrong-precedence behavior. We assert
-// the CURRENT (incorrect) left-fold shape; this test will be updated when
-// PR1 lands operator precedence.
-//
-// The shape captured here is the empirical evidence of the gap — flipping
-// the assertion after PR1 will be the visible signal that precedence works.
-TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsCurrentlyLeftFolded) {
+// Pins the current shape of `a + b * c;` — a flat left-fold under one
+// expression node rather than the (a + (b * c)) grouping C requires.
+// The schema as shipped today has no concept of operator precedence;
+// `expression` is `operand (binaryOp operand)*` with no grouping rule.
+// When precedence lands, this test's expected literal flips from a flat
+// sequence to a nested binaryExpr grouping — that flip is the visible
+// signal the limitation has been removed.
+TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
     auto h = loadShippedCSubset("a + b * c;");
     ASSERT_NE(h.schema, nullptr);
 
@@ -272,10 +311,9 @@ TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsCurrentlyLeftFolded) {
     Tree t = std::move(b).finish();
 
     EXPECT_TRUE(t.diagnostics().all().empty());
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_FALSE(hasError(t.flags(t.root())));
 
-    // Flat left-fold: a + b * c is a flat sequence of operand/binaryOp/
-    // operand/binaryOp/operand under one expression node. No grouping.
-    // PR1 (precedence) is what introduces the (a + (b * c)) grouping.
     const std::string_view expected =
         "rule:root\n"
         "  rule:statement\n"

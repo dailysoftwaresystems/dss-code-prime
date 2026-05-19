@@ -40,7 +40,18 @@
       "Bash(gh pr *)",
       "Bash(git fetch *)",
       "Bash(gh run *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(wsl.exe *)",
+      "Skill(dss-code-prime)",
+      "Bash(cmake --build C:/Source/DailySoftware/dss-code-prime/build --target dss_core_test_grammar_schema)",
+      "Bash(ctest --test-dir C:/Source/DailySoftware/dss-code-prime/build --output-on-failure -R \"grammar_schema\")",
+      "Bash(cmake --build C:/Source/DailySoftware/dss-code-prime/build)",
+      "Bash(./bin/dss/dss_core_test_grammar_schema.exe)",
+      "PowerShell(& \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_grammar_schema.exe\" 2>&1 | Select-Object -Last 10; \"ExitCode=$LASTEXITCODE\")",
+      "Bash(ctest --test-dir C:/Source/DailySoftware/dss-code-prime/build --output-on-failure)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;\" + $env:PATH; foreach \\($t in @\\(\"dss_core_test_grammar_schema\",\"dss_core_test_tree_visitor\",\"dss_core_test_tree_end_to_end\"\\)\\) { $out = & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\$t.exe\" 2>&1 | Select-String -Pattern \"PASSED|FAILED\" | Select-Object -Last 1; \"$t -> $out \\(rc=$LASTEXITCODE\\)\" })",
+      "Bash(cmake --build C:/Source/DailySoftware/dss-code-prime/build --target dss_core_test_c_subset)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;\" + $env:PATH; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_c_subset.exe\" 2>&1 | Select-Object -Last 20; \"rc=$LASTEXITCODE\")"
     ]
   }
 }
