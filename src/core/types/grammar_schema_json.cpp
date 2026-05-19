@@ -72,6 +72,28 @@ struct Collector {
     }
 };
 
+// Parse a JSON array of scope names into vector<ScopeKind>. Unknown
+// names emit C_UnclosableScope and are dropped; the walk continues so
+// one bad entry doesn't hide a subsequent one.
+std::vector<ScopeKind> parseScopeArray(json const& arr,
+                                       std::string const& fieldPath,
+                                       Collector& c) {
+    std::vector<ScopeKind> out;
+    if (!arr.is_array()) return out;
+    out.reserve(arr.size());
+    for (auto const& sn : arr) {
+        if (!sn.is_string()) continue;
+        const auto sk = parseScopeName(sn.get<std::string>());
+        if (!sk) {
+            c.emit(DiagnosticCode::C_UnclosableScope, fieldPath,
+                   std::format("unknown scope '{}'", sn.get<std::string>()));
+            continue;
+        }
+        out.push_back(*sk);
+    }
+    return out;
+}
+
 bool present(json const& j, std::string_view key, Collector& c, std::string const& path) {
     if (!j.contains(key) || j.at(key).is_null()) {
         c.emit(DiagnosticCode::C_MissingField, path,
@@ -621,17 +643,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             coll.emit(DiagnosticCode::C_MissingField, "/tokens",
                       "'tokens' must be an object");
         } else {
-            // Pass A: count entries with validScopes to reserve the pool
-            // exactly. Reserving avoids reallocation that would invalidate
-            // the LexemeMeaning::validScopes spans we set up next.
+            // Pass A: count anyOf/forbid lists upfront to reserve the
+            // backing pool exactly. Reallocation would invalidate the
+            // ScopeMatch spans we set up next.
+            //   - legacy `validScopes`         → 1 list (anyOf)
+            //   - `scopeRequire.anyOf`         → 1 list
+            //   - `scopeRequire.forbid`        → 1 list
             std::size_t poolNeeded = 0;
             for (auto const& [lex, arr] : doc.at("tokens").items()) {
                 if (!arr.is_array()) continue;
                 for (auto const& m : arr) {
-                    if (m.is_object() && m.contains("validScopes")) ++poolNeeded;
+                    if (!m.is_object()) continue;
+                    if (m.contains("validScopes")) ++poolNeeded;
+                    if (m.contains("scopeRequire") && m.at("scopeRequire").is_object()) {
+                        auto const& sr = m.at("scopeRequire");
+                        if (sr.contains("anyOf"))  ++poolNeeded;
+                        if (sr.contains("forbid")) ++poolNeeded;
+                    }
                 }
             }
-            data.validScopesPool.reserve(poolNeeded);
+            data.scopeListPool.reserve(poolNeeded);
 
             // Pass B: populate lexemeTable + spans.
             for (auto const& [lex, arr] : doc.at("tokens").items()) {
@@ -688,23 +719,82 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             lm.opensScope = *sk;
                         }
                     }
-                    if (m.contains("validScopes") && m.at("validScopes").is_array()) {
-                        std::vector<ScopeKind> scopes;
-                        scopes.reserve(m.at("validScopes").size());
-                        for (auto const& sn : m.at("validScopes")) {
-                            if (!sn.is_string()) continue;
-                            const auto sk = parseScopeName(sn.get<std::string>());
-                            if (!sk) {
-                                coll.emit(DiagnosticCode::C_UnclosableScope, entryPath,
-                                          std::format("unknown scope '{}' in validScopes",
-                                                      sn.get<std::string>()));
-                                continue;
-                            }
-                            scopes.push_back(*sk);
+                    // scopeRequire — new in v2. Reject co-existence with
+                    // legacy validScopes; the loader insists on exactly
+                    // one source of truth per meaning so spans don't
+                    // collide and the author can't accidentally split
+                    // their intent across two fields.
+                    const bool hasLegacy = m.contains("validScopes");
+                    const bool hasNew    = m.contains("scopeRequire");
+                    if (hasLegacy && hasNew) {
+                        coll.emit(DiagnosticCode::C_MissingField, entryPath,
+                                  "meaning declares both 'validScopes' and "
+                                  "'scopeRequire' — use 'scopeRequire' only "
+                                  "(v1 'validScopes' is shorthand for 'scopeRequire.anyOf')");
+                    } else if (hasLegacy && m.at("validScopes").is_array()) {
+                        auto anyOf = parseScopeArray(m.at("validScopes"),
+                                                     std::format("{}/validScopes", entryPath),
+                                                     coll);
+                        if (!anyOf.empty()) {
+                            data.scopeListPool.push_back(std::move(anyOf));
+                            lm.scopeRequire.anyOf = std::span<ScopeKind const>{
+                                data.scopeListPool.back()};
                         }
-                        data.validScopesPool.push_back(std::move(scopes));
-                        auto const& backing = data.validScopesPool.back();
-                        lm.validScopes = std::span<ScopeKind const>{backing};
+                    } else if (hasNew && m.at("scopeRequire").is_object()) {
+                        json const& sr = m.at("scopeRequire");
+                        if (sr.contains("anyOf") && sr.at("anyOf").is_array()) {
+                            auto anyOf = parseScopeArray(sr.at("anyOf"),
+                                                         std::format("{}/scopeRequire/anyOf", entryPath),
+                                                         coll);
+                            if (!anyOf.empty()) {
+                                data.scopeListPool.push_back(std::move(anyOf));
+                                lm.scopeRequire.anyOf = std::span<ScopeKind const>{
+                                    data.scopeListPool.back()};
+                            }
+                        }
+                        if (sr.contains("forbid") && sr.at("forbid").is_array()) {
+                            auto forbid = parseScopeArray(sr.at("forbid"),
+                                                          std::format("{}/scopeRequire/forbid", entryPath),
+                                                          coll);
+                            if (!forbid.empty()) {
+                                data.scopeListPool.push_back(std::move(forbid));
+                                lm.scopeRequire.forbid = std::span<ScopeKind const>{
+                                    data.scopeListPool.back()};
+                            }
+                        }
+                        if (sr.contains("topMustBe") && sr.at("topMustBe").is_string()) {
+                            const auto sk = parseScopeName(sr.at("topMustBe").get<std::string>());
+                            if (!sk) {
+                                coll.emit(DiagnosticCode::C_UnclosableScope,
+                                          std::format("{}/scopeRequire/topMustBe", entryPath),
+                                          std::format("unknown scope '{}'",
+                                                      sr.at("topMustBe").get<std::string>()));
+                            } else {
+                                lm.scopeRequire.topMustBe = *sk;
+                            }
+                        }
+                        if (sr.contains("outermost") && sr.at("outermost").is_string()) {
+                            const auto sk = parseScopeName(sr.at("outermost").get<std::string>());
+                            if (!sk) {
+                                coll.emit(DiagnosticCode::C_UnclosableScope,
+                                          std::format("{}/scopeRequire/outermost", entryPath),
+                                          std::format("unknown scope '{}'",
+                                                      sr.at("outermost").get<std::string>()));
+                            } else {
+                                lm.scopeRequire.outermost = *sk;
+                            }
+                        }
+                        // topMustBe makes anyOf redundant: a topMustBe match
+                        // implies the named scope is on the stack, which is
+                        // strictly stronger than anyOf. Warn but accept.
+                        if (lm.scopeRequire.topMustBe.has_value() &&
+                            !lm.scopeRequire.anyOf.empty()) {
+                            coll.emit(DiagnosticCode::C_RedundantScopeRequire,
+                                      std::format("{}/scopeRequire", entryPath),
+                                      "'anyOf' is redundant when 'topMustBe' is set "
+                                      "(topMustBe is the stricter constraint)",
+                                      DiagnosticSeverity::Warning);
+                        }
                     }
 
                     meanings.push_back(lm);

@@ -316,23 +316,48 @@ struct ResolvedMeaning {
     std::size_t   matchCount = 0;
 };
 
-// Per-meaning scope filter — the LexemeMeaning::validScopes field on a
-// token entry. Documented as: empty == valid everywhere; non-empty ==
-// require at least one of the listed scopes to be on the active stack.
+// Per-meaning scope filter — the LexemeMeaning::scopeRequire field on
+// a token entry. Check order is `forbid → topMustBe → outermost → anyOf`;
+// first failure rejects the meaning.
+//
+//   forbid    — none of these scopes may be on the stack.
+//   topMustBe — innermost active scope must equal this kind.
+//   outermost — bottom-of-stack scope must equal this kind.
+//   anyOf     — at least one of these must be on the stack (empty = no constraint).
 //
 // Distinct from `schema.isTokenValidInScope` which enforces the schema's
 // top-level `scopes.validity[].forbid` rules (per-scope, not per-token).
 // Both checks are AND'd in `resolveMeaning`.
-[[nodiscard]] bool meaningAllowedByValidScopes(
+[[nodiscard]] bool meaningAllowedByScopeRequire(
     LexemeMeaning const& m,
     std::span<ScopeKind const> scopes) noexcept {
-    if (m.validScopes.empty()) return true;
-    for (ScopeKind required : m.validScopes) {
+    auto const& sr = m.scopeRequire;
+    // forbid
+    for (ScopeKind f : sr.forbid) {
         for (ScopeKind active : scopes) {
-            if (required == active) return true;
+            if (f == active) return false;
         }
     }
-    return false;
+    // topMustBe — innermost is the last element (stack grows back).
+    if (sr.topMustBe.has_value()) {
+        if (scopes.empty() || scopes.back() != *sr.topMustBe) return false;
+    }
+    // outermost — bottom-of-stack is the first element.
+    if (sr.outermost.has_value()) {
+        if (scopes.empty() || scopes.front() != *sr.outermost) return false;
+    }
+    // anyOf — at least one of the listed must be active.
+    if (!sr.anyOf.empty()) {
+        bool any = false;
+        for (ScopeKind required : sr.anyOf) {
+            for (ScopeKind active : scopes) {
+                if (required == active) { any = true; break; }
+            }
+            if (any) break;
+        }
+        if (!any) return false;
+    }
+    return true;
 }
 
 ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
@@ -343,10 +368,10 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     if (candidates.empty()) return out;
 
     // A candidate survives iff BOTH the schema's per-scope forbid rules
-    // AND the candidate's per-meaning validScopes allow it.
+    // AND the candidate's per-meaning scopeRequire allow it.
     auto candidateAllowed = [&](LexemeMeaning const& m) {
         return schema.isTokenValidInScope(m.id, scopes)
-            && meaningAllowedByValidScopes(m, scopes);
+            && meaningAllowedByScopeRequire(m, scopes);
     };
 
     // Candidates arrive pre-sorted by priority (lowest first, stable on

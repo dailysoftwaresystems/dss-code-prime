@@ -15,6 +15,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -38,6 +39,25 @@ struct DSS_EXPORT ConfigDiagnostic {
     std::string         message;
 };
 
+// Per-meaning scope-stack constraints. Replaces v1's flat
+// `validScopes: [...]`. Every field defaults to "no constraint":
+//   anyOf empty       — no anyOf requirement
+//   forbid empty      — no forbid requirement
+//   topMustBe unset   — no innermost-scope requirement
+//   outermost unset   — no outermost-scope requirement
+//
+// Builder checks in `pushToken` in this order — first failure rejects
+// the meaning: forbid → topMustBe → outermost → anyOf.
+//
+// Backwards compat: v1 flat `validScopes: [...]` loads as
+// `scopeRequire.anyOf = [...]` with everything else default.
+struct DSS_EXPORT ScopeMatch {
+    std::span<ScopeKind const>  anyOf;
+    std::span<ScopeKind const>  forbid;
+    std::optional<ScopeKind>    topMustBe;
+    std::optional<ScopeKind>    outermost;
+};
+
 // One resolved meaning of a lexeme, sourced from a single entry under
 // the config's `tokens` map. A lexeme may have several meanings — the
 // builder filters by scope/position, then breaks ties on `priority`
@@ -52,8 +72,7 @@ struct DSS_EXPORT LexemeMeaning {
     // Identifier. Set per-keyword (`contextual: true`) or by policy
     // (`reservedWordPolicy: "contextual"`).
     bool             contextual    = false;
-    // Empty == "valid in every scope"; non-empty == restrict to listed.
-    std::span<ScopeKind const> validScopes;
+    ScopeMatch       scopeRequire{};
 };
 
 // How aggressively the builder treats keywords as reserved.
@@ -92,10 +111,10 @@ struct DSS_EXPORT GrammarSchemaData {
     // declaration order wins on ties).
     std::unordered_map<std::string, std::vector<LexemeMeaning>> lexemeTable;
 
-    // Backing storage for LexemeMeaning::validScopes spans. Reserved up
+    // Backing storage for ScopeMatch.anyOf / .forbid spans. Reserved up
     // front by the loader so no reallocation occurs — the spans inside
-    // LexemeMeaning point into stable storage.
-    std::vector<std::vector<ScopeKind>>               validScopesPool;
+    // LexemeMeaning::scopeRequire point into stable storage.
+    std::vector<std::vector<ScopeKind>>               scopeListPool;
 
     // O(1) "is this token EmptySpace?" without scanning lexemeTable.
     std::unordered_set<std::uint32_t>                 emptySpaceTokens;
