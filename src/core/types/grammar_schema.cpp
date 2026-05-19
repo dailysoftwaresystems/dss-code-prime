@@ -89,16 +89,20 @@ bool GrammarSchema::isEmptySpace(SchemaTokenId id) const noexcept {
     return d_.emptySpaceTokens.contains(id.v);
 }
 
+std::span<LexerMode const> GrammarSchema::lexerModes() const noexcept {
+    // Slot 0 is the InvalidLexerMode sentinel — internal indexing
+    // detail. Real modes start at index 1; subspan(1) hides the
+    // sentinel from every iterating consumer.
+    if (d_.lexerModes.size() <= 1) return {};
+    return std::span<LexerMode const>(d_.lexerModes).subspan(1);
+}
+
 LexerModeId GrammarSchema::findLexerMode(std::string_view name) const noexcept {
     auto it = d_.lexerModeIds.find(std::string{name});
     return (it == d_.lexerModeIds.end()) ? InvalidLexerMode : it->second;
 }
 
 LexerMode const& GrammarSchema::lexerMode(LexerModeId id) const noexcept {
-    // Strong-id contract: out-of-range is a caller bug. With the
-    // synthesized "main" mode the table is never empty, and ids are
-    // dense [1..N], so bounds-check + abort matches the rest of the
-    // schema's id-keyed accessors.
     if (!id.valid() || id.v >= d_.lexerModes.size()) {
         std::fputs("dss::GrammarSchema::lexerMode: invalid LexerModeId\n", stderr);
         std::abort();
@@ -108,6 +112,10 @@ LexerMode const& GrammarSchema::lexerMode(LexerModeId id) const noexcept {
 
 std::span<LexemeMeaning const>
 GrammarSchema::lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept {
+    if (!mode.valid() || mode.v >= d_.lexerModes.size()) {
+        std::fputs("dss::GrammarSchema::lookupLexemeInMode: invalid LexerModeId\n", stderr);
+        std::abort();
+    }
     auto modeIt = d_.lexerModeTokens.find(mode.v);
     if (modeIt == d_.lexerModeTokens.end()) return {};
     auto lexIt = modeIt->second.find(std::string{lexeme});

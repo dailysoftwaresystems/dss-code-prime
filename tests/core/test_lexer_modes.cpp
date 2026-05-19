@@ -16,7 +16,39 @@ TEST(LexerModeStack, EmptyAtConstruction) {
     LexerModeStack s;
     EXPECT_TRUE(s.empty());
     EXPECT_EQ(s.depth(), 0u);
-    EXPECT_FALSE(s.top().valid());
+    EXPECT_FALSE(s.topOrInvalid().valid());
+}
+
+TEST(LexerModeStackDeath, TopOnEmptyAborts) {
+    LexerModeStack s;
+    EXPECT_DEATH({ (void)s.top(); }, "top\\(\\) on empty stack");
+}
+
+TEST(LexerModeStackDeath, PopOnEmptyAborts) {
+    LexerModeStack s;
+    EXPECT_DEATH({ s.pop(); }, "pop\\(\\) on empty stack");
+}
+
+TEST(LexerModeStackDeath, ReplaceTopOnEmptyAborts) {
+    LexerModeStack s;
+    EXPECT_DEATH({ s.replaceTop(LexerModeId{1}); }, "replaceTop\\(\\) on empty stack");
+}
+
+TEST(LexerModeStack, TryPopOnEmptyReturnsFalse) {
+    LexerModeStack s;
+    EXPECT_FALSE(s.tryPop());
+    s.push(LexerModeId{1});
+    EXPECT_TRUE(s.tryPop());
+    EXPECT_TRUE(s.empty());
+}
+
+TEST(LexerModeStack, ClearDropsAllFrames) {
+    LexerModeStack s;
+    s.push(LexerModeId{1});
+    s.push(LexerModeId{2});
+    s.push(LexerModeId{3});
+    s.clear();
+    EXPECT_TRUE(s.empty());
 }
 
 TEST(LexerModeStack, PushPopRoundTrip) {
@@ -37,12 +69,6 @@ TEST(LexerModeStack, PushPopRoundTrip) {
     EXPECT_TRUE(s.empty());
 }
 
-TEST(LexerModeStack, PopOnEmptyIsNoOp) {
-    LexerModeStack s;
-    s.pop();                                          // no abort, no UB
-    EXPECT_TRUE(s.empty());
-}
-
 TEST(LexerModeStack, ReplaceTopSwapsWithoutNesting) {
     LexerModeStack s;
     s.push(LexerModeId{1});
@@ -50,12 +76,6 @@ TEST(LexerModeStack, ReplaceTopSwapsWithoutNesting) {
     s.replaceTop(LexerModeId{3});
     EXPECT_EQ(s.depth(), 2u);
     EXPECT_EQ(s.top().v, 3u);
-}
-
-TEST(LexerModeStack, ReplaceTopOnEmptyIsNoOp) {
-    LexerModeStack s;
-    s.replaceTop(LexerModeId{1});
-    EXPECT_TRUE(s.empty());
 }
 
 TEST(LexerModeStack, ApplyDispatches) {
@@ -110,12 +130,29 @@ TEST(LexerModeStack, SnapshotIsValueIndependent) {
 
     s.push(LexerModeId{2});
     s.pop();
-    s.pop();
-    EXPECT_TRUE(s.empty());
+    EXPECT_FALSE(s.empty());                          // back to 1 frame
 
     s.restore(snap);
     EXPECT_EQ(s.depth(), 1u);
     EXPECT_EQ(s.top().v, 1u);
+}
+
+TEST(LexerModeStack, SnapshotOfEmptyStackRoundTrip) {
+    LexerModeStack s;
+    auto snap = s.snapshot();
+    s.push(LexerModeId{1});
+    s.push(LexerModeId{2});
+    s.restore(snap);
+    EXPECT_TRUE(s.empty());
+}
+
+TEST(LexerModeStackDeath, CrossStackRestoreAborts) {
+    LexerModeStack a;
+    LexerModeStack b;
+    a.push(LexerModeId{1});
+    auto snapA = a.snapshot();
+    EXPECT_DEATH({ b.restore(snapA); },
+                 "restore\\(\\) with a snapshot from a different stack");
 }
 
 // ── modeOpName helper ───────────────────────────────────────────────────
@@ -364,6 +401,232 @@ TEST(LexerModesLoader, CSubsetConfigStillLoadsAndHasMainMode) {
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
     auto const& s = **loaded;
     EXPECT_TRUE(s.findLexerMode("main").valid());
+}
+
+// ── replaceMode loader parsing ──────────────────────────────────────────
+
+TEST(LexerModesLoader, ReplaceModeWithModeArgParses) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "@": [{ "kind": "AtOp", "modeOp": "replaceMode", "modeArg": "string-body" }]
+      },
+      "shapes": { "root": { "sequence": [ "AtOp" ] } },
+      "lexerModes": { "string-body": { } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    auto const& m = (*loaded)->lookupLexeme("@");
+    ASSERT_EQ(m.size(), 1u);
+    EXPECT_EQ(m[0].modeOp, ModeOp::ReplaceMode);
+    EXPECT_TRUE(m[0].modeArg.valid());
+}
+
+TEST(LexerModesLoader, ReplaceModeWithoutModeArgIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "@": [{ "kind": "AtOp", "modeOp": "replaceMode" }]
+      },
+      "shapes": { "root": { "sequence": [ "AtOp" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("'modeOp: replaceMode' requires 'modeArg'") != std::string::npos;
+    }));
+}
+
+TEST(LexerModesLoader, NonStringModeArgIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "@": [{ "kind": "AtOp", "modeOp": "pushMode", "modeArg": 42 }]
+      },
+      "shapes": { "root": { "sequence": [ "AtOp" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.path.find("modeArg") != std::string::npos;
+    }));
+}
+
+// ── Malformed defaultToken diagnostics ──────────────────────────────────
+
+TEST(LexerModesLoader, DefaultTokenWrongTypeIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": { "m": { "defaultToken": "StringChar" } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_MissingField &&
+               d.path.find("defaultToken") != std::string::npos;
+    }));
+}
+
+TEST(LexerModesLoader, DefaultTokenMissingKindIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": { "m": { "defaultToken": { } } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_MissingField &&
+               d.path.find("defaultToken") != std::string::npos;
+    }));
+}
+
+TEST(LexerModesLoader, TokensWrongTypeIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": { "m": { "tokens": 42 } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.path.find("tokens") != std::string::npos;
+    }));
+}
+
+// ── Inline tokens deferral warning + `tokens: "default"` inheritance ────
+
+TEST(LexerModesLoader, InlineTokensObjectEmitsDeferralWarning) {
+    // The warning doesn't fail the load on its own; pair with an
+    // ambiguity error so the diagnostic vector reaches us.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": {
+        "root":      { "alt": ["A", "B"] },
+        "A":         { "sequence": [ "PlusOp" ] },
+        "B":         { "sequence": [ "PlusOp" ] }
+      },
+      "lexerModes": {
+        "m": { "tokens": { "@": [{ "kind": "AtOp" }] } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_RedundantField &&
+               d.message.find("not yet parsed") != std::string::npos;
+    }));
+}
+
+TEST(LexerModesLoader, NonMainModeTokensDefaultInheritsFromTopLevel) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "$$": [{ "kind": "DoubleDollar" }] },
+      "shapes": { "root": { "sequence": [ "DoubleDollar" ] } },
+      "lexerModes": { "alt-mode": { "tokens": "default" } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value());
+    auto const& s = **loaded;
+    const auto altId = s.findLexerMode("alt-mode");
+    ASSERT_TRUE(altId.valid());
+    auto entries = s.lookupLexemeInMode(altId, "$$");
+    EXPECT_FALSE(entries.empty())
+        << "tokens: \"default\" on a non-main mode must inherit top-level table";
+}
+
+// ── lexerModes() span hides the sentinel ────────────────────────────────
+
+TEST(LexerModesLoader, LexerModesSpanHidesSentinel) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": { "alpha": { }, "beta": { } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value());
+    auto modes = (*loaded)->lexerModes();
+    // Three real modes: main (synthesized) + alpha + beta.
+    ASSERT_EQ(modes.size(), 3u);
+    for (auto const& m : modes) {
+        EXPECT_FALSE(m.name.empty()) << "no sentinel entry should be exposed";
+        EXPECT_TRUE(m.id.valid());
+    }
+}
+
+// ── Keywords reject modeOp/modeArg (C1) ─────────────────────────────────
+
+TEST(LexerModesLoader, KeywordWithModeOpIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "keywords": [
+        { "word": "if", "kind": "IfKw", "modeOp": "pushMode", "modeArg": "main" }
+      ],
+      "shapes": { "root": { "sequence": [ "IfKw" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("keywords cannot switch lexer modes") != std::string::npos;
+    }));
+}
+
+// ── Case-fold near-miss warning ─────────────────────────────────────────
+
+TEST(LexerModesLoader, CaseFoldedDuplicateModeWarns) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": {
+        "root":      { "alt": ["A", "B"] },
+        "A":         { "sequence": [ "PlusOp" ] },
+        "B":         { "sequence": [ "PlusOp" ] }
+      },
+      "lexerModes": { "string-body": { }, "String-Body": { } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("differs only by case") != std::string::npos;
+    }));
+}
+
+// ── lookupLexemeInMode aborts on invalid id (C4) ────────────────────────
+
+TEST(LookupLexemeInModeDeath, InvalidLexerModeIdAborts) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_DEATH({ (void)(*loaded)->lookupLexemeInMode(InvalidLexerMode, "+"); },
+                 "invalid LexerModeId");
 }
 
 // ── No mode metadata on a meaning means ModeOp::None ────────────────────

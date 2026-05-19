@@ -1,8 +1,21 @@
 #include "core/types/lexer_mode.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 namespace dss {
+
+namespace {
+
+[[noreturn]] void lexerModeFatal(char const* msg) noexcept {
+    std::fputs("dss::LexerModeStack fatal: ", stderr);
+    std::fputs(msg, stderr);
+    std::fputs("\n", stderr);
+    std::abort();
+}
+
+} // namespace
 
 std::string_view modeOpName(ModeOp op) noexcept {
     switch (op) {
@@ -19,11 +32,12 @@ void LexerModeStack::push(LexerModeId mode) {
 }
 
 void LexerModeStack::pop() {
-    if (!frames_.empty()) frames_.pop_back();
+    if (frames_.empty()) lexerModeFatal("pop() on empty stack");
+    frames_.pop_back();
 }
 
 void LexerModeStack::replaceTop(LexerModeId mode) {
-    if (frames_.empty()) return;
+    if (frames_.empty()) lexerModeFatal("replaceTop() on empty stack");
     frames_.back() = mode;
 }
 
@@ -37,16 +51,21 @@ void LexerModeStack::apply(ModeOp op, LexerModeId arg) {
 }
 
 LexerModeId LexerModeStack::top() const noexcept {
-    return frames_.empty() ? LexerModeId{} : frames_.back();
+    if (frames_.empty()) lexerModeFatal("top() on empty stack");
+    return frames_.back();
 }
 
 LexerModeStack::Snapshot LexerModeStack::snapshot() const {
     Snapshot s;
     s.frames_ = frames_;
+    s.owner_  = reinterpret_cast<std::uintptr_t>(this);
     return s;
 }
 
 void LexerModeStack::restore(Snapshot const& snap) {
+    if (snap.owner_ != reinterpret_cast<std::uintptr_t>(this)) {
+        lexerModeFatal("restore() with a snapshot from a different stack");
+    }
     frames_ = snap.frames_;
 }
 

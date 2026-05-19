@@ -12,13 +12,10 @@
 
 namespace dss {
 
-// What a lexeme's resolution does to the tokenizer's mode stack. Set
-// on `LexemeMeaning::modeOp` by the loader; consumed by the tokenizer
-// (when authored) immediately after producing the token.
-//
-//   None         — no mode-stack effect (the default; matches v1).
+// What a lexeme's resolution does to the tokenizer's mode stack.
+//   None         — no mode-stack effect.
 //   PushMode     — push `modeArg` onto the top of the stack.
-//   PopMode      — pop the current mode off; `modeArg` is ignored.
+//   PopMode      — pop the top; `modeArg` is ignored.
 //   ReplaceMode  — swap the top of the stack with `modeArg` (no nest).
 enum class ModeOp : std::uint8_t {
     None,
@@ -31,37 +28,60 @@ enum class ModeOp : std::uint8_t {
 
 // Stack of active lexer modes the tokenizer is currently inside. The
 // top of the stack is the mode that decides which tokens the tokenizer
-// will produce next. Nested-interpolation languages push a new mode
-// when entering each `{ ... }` interpolation block, and pop when the
-// closing `}` is matched.
+// will produce next.
 //
-// PR5 ships this type for the future tokenizer to consume. TreeBuilder
-// does NOT integrate it yet — when the tokenizer phase lands, it will
-// own the live stack and surface snapshot/restore to TreeBuilder's
-// Checkpoint (see schema-expressiveness-v2 §5.4).
+// Strict-ops policy: `pop`/`replaceTop`/`top` abort via the project's
+// `*Fatal` pattern when called on an empty stack. Reaching this state
+// means the schema and tokenizer disagree on Push/Pop pairing — a real
+// bug, not a recoverable condition. Lenient callers explicitly opt in
+// via `tryPop()` / `topOrInvalid()`.
+//
+// Tokenizer integration deferred — TreeBuilder::Checkpoint will route
+// snapshot/restore through this type when the tokenizer phase lands.
 class DSS_EXPORT LexerModeStack {
 public:
-    // Snapshot for speculative rollback. Opaque-by-friendship —
-    // produced/consumed only by LexerModeStack itself. Captures the
-    // full stack contents (not just depth) because PushMode under
-    // speculation may interleave with the existing stack and there's
-    // no constant-time inverse for "what was here before."
+    // Snapshot for speculative rollback. Captures the full frames
+    // vector (not just depth) — PushMode under speculation may
+    // arbitrarily reshape the stack, and there's no constant-time
+    // inverse for "what was here before." Stamped with the originating
+    // stack's identity so `restore` can refuse cross-stack mixups.
     class DSS_EXPORT Snapshot {
     private:
         friend class LexerModeStack;
         std::vector<LexerModeId> frames_;
+        // Identity stamp captured at snapshot() time. Asserted equal
+        // to `&stack` in restore() to catch the speculative-Checkpoint
+        // class of bug where a Snapshot from one stack is restored
+        // into a different one. Stored as raw uintptr_t (not a back-
+        // pointer) so the Snapshot stays trivially copyable / movable.
+        std::uintptr_t           owner_ = 0;
     };
 
     LexerModeStack() noexcept = default;
 
     void push(LexerModeId mode);
-    void pop();                                  // no-op on empty
-    void replaceTop(LexerModeId mode);           // no-op on empty
+    void pop();                                  // fatal on empty
+    void replaceTop(LexerModeId mode);           // fatal on empty
     void apply(ModeOp op, LexerModeId arg);
+    // Drop every frame. Used by the tokenizer to recover after a fatal
+    // lex error or to reset between files.
+    void clear() noexcept { frames_.clear(); }
 
     [[nodiscard]] bool        empty() const noexcept { return frames_.empty(); }
     [[nodiscard]] std::size_t depth() const noexcept { return frames_.size(); }
-    [[nodiscard]] LexerModeId top()   const noexcept;
+    // Strict accessor: fatal on empty. Use `topOrInvalid()` when an
+    // empty stack is a legitimate observable state at the call site.
+    [[nodiscard]] LexerModeId top() const noexcept;
+    // Lenient peek: returns InvalidLexerMode when the stack is empty.
+    [[nodiscard]] LexerModeId topOrInvalid() const noexcept {
+        return frames_.empty() ? LexerModeId{} : frames_.back();
+    }
+    // Lenient pop: returns false (no-op) when empty; true on success.
+    bool tryPop() noexcept {
+        if (frames_.empty()) return false;
+        frames_.pop_back();
+        return true;
+    }
     [[nodiscard]] std::span<LexerModeId const> frames() const noexcept { return frames_; }
 
     [[nodiscard]] Snapshot snapshot() const;
@@ -71,18 +91,20 @@ private:
     std::vector<LexerModeId> frames_;
 };
 
-// Metadata for a single named lexer mode. Loader fills these in;
-// readers consume via GrammarSchema::lexerModes(). The per-mode tokens
-// table (lexeme → meanings) lives on GrammarSchemaData keyed by id,
-// not on this struct, so we can keep LexerMode itself a small POD
-// without dragging LexemeMeaning's definition into this header.
+// Metadata for a single named lexer mode. Construct via the factory
+// `make(name, id, defaultToken)` so id is set atomically. Field access
+// stays public (POD discipline) so the loader can fill auxiliary
+// per-mode tables without going through accessors.
 struct DSS_EXPORT LexerMode {
     std::string                  name;
     LexerModeId                  id;
-    // Empty = no default-token; the tokenizer falls back to its error
-    // path. Present = produce this meaning whenever no lexeme entry
-    // matches (used inside e.g. a `string-body` mode to scan free text).
     std::optional<SchemaTokenId> defaultToken;
+
+    [[nodiscard]] static LexerMode make(std::string name,
+                                        LexerModeId id,
+                                        std::optional<SchemaTokenId> defaultToken = {}) {
+        return LexerMode{std::move(name), id, defaultToken};
+    }
 };
 
 } // namespace dss

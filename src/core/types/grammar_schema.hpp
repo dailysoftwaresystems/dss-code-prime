@@ -80,11 +80,10 @@ struct DSS_EXPORT LexemeMeaning {
     // (`reservedWordPolicy: "contextual"`).
     bool             contextual    = false;
     ScopeMatch       scopeRequire{};
-    // Lexer-mode-stack effect applied by the tokenizer (when it lands)
-    // immediately after this meaning is produced. v1 configs have no
-    // mode info — defaults to `None` (no effect). `modeArg` references
-    // the target mode for Push/Replace; ignored for Pop. Resolved at
-    // load time so the tokenizer doesn't re-walk strings per token.
+    // Lexer-mode-stack effect applied by the tokenizer after this
+    // meaning is produced. `modeArg` is the target mode for
+    // Push/Replace (ignored for Pop); resolved at load time so the
+    // tokenizer doesn't re-walk mode-name strings per token.
     ModeOp           modeOp        = ModeOp::None;
     LexerModeId      modeArg{};
 };
@@ -160,21 +159,12 @@ struct DSS_EXPORT GrammarSchemaData {
     // also forces `contextual = true` on every keyword's LexemeMeaning.
     ReservedWordPolicy reservedWordPolicy = ReservedWordPolicy::Strict;
 
-    // ── Lexer-mode tables ──
-    // `lexerModes` holds the metadata (name, id, defaultToken) for each
-    // declared mode; indexed by LexerModeId.v. Always contains at least
-    // one mode ("main") — the loader synthesizes it when `lexerModes`
-    // is absent from JSON, so consumers can pull from `lexerModes` even
-    // for v1 configs without special-casing.
-    //
-    // `lexerModeIds` is the reverse map for loader-time name resolution.
-    //
-    // `lexerModeTokens` is per-mode lexeme → meanings. Keyed by
-    // LexerModeId.v. The "main" mode's table is a superset of the
-    // top-level `tokens` map plus any inline tokens declared on
-    // `lexerModes.main`; on per-lexeme conflict, inline wins. Other
-    // modes hold whatever the config declared inline (plus the
-    // top-level map when they say `tokens: "default"`).
+    // Lexer-mode tables. Index 0 is the InvalidLexerMode sentinel;
+    // real ids dense 1..N. "main" synthesized at id 1 even when the
+    // config omits `lexerModes`. `lexerModeTokens` keyed by id; "main"
+    // mirrors `lexemeTable`; modes with `tokens: "default"` inherit
+    // it; modes with inline `tokens: {...}` are not yet parsed
+    // (loader emits a warning).
     std::vector<LexerMode>                            lexerModes;
     std::unordered_map<std::string, LexerModeId>      lexerModeIds;
     std::unordered_map<std::uint32_t,
@@ -222,12 +212,11 @@ public:
         return d_.reservedWordPolicy;
     }
 
-    // ── Lexer modes ──
-    // The compiled mode table. Always non-empty: contains at least
-    // "main" (synthesized when `lexerModes` is absent from JSON).
-    [[nodiscard]] std::span<LexerMode const> lexerModes() const noexcept {
-        return d_.lexerModes;
-    }
+    // The compiled mode table. Always non-empty (synthesized "main"
+    // mode for v1 configs). The returned span hides the internal
+    // index-0 sentinel — every visible element is a real declared
+    // or synthesized mode.
+    [[nodiscard]] std::span<LexerMode const> lexerModes() const noexcept;
 
     // Lookup a mode by name. Returns InvalidLexerMode if not found.
     [[nodiscard]] LexerModeId findLexerMode(std::string_view name) const noexcept;
@@ -236,9 +225,10 @@ public:
     // doesn't refer to a real mode in this schema.
     [[nodiscard]] LexerMode const& lexerMode(LexerModeId id) const noexcept;
 
-    // Per-mode lexeme lookup. Empty span if the mode has no entries
-    // for `lexeme`. Mode-aware analogue of `lookupLexeme(lexeme)`,
-    // which queries the "main" mode by convention.
+    // Per-mode lexeme lookup. Empty span when the mode has no entries
+    // for `lexeme`. Aborts on `InvalidLexerMode` or out-of-range id —
+    // matches `lexerMode(id)`'s strong-id contract so an empty span
+    // always means "no meanings for this lexeme," never "wrong id."
     [[nodiscard]] std::span<LexemeMeaning const>
         lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept;
 
