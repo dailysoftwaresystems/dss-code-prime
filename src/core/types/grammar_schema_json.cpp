@@ -169,11 +169,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                   "must be a positive integer");
         return std::unexpected(std::move(coll.diagnostics));
     }
+    constexpr std::uint32_t kMinSchemaVersion = 1;
+    constexpr std::uint32_t kMaxSchemaVersion = 2;
     const auto schemaVer = doc.at("dssSchemaVersion").get<std::uint32_t>();
-    if (schemaVer < 1 || schemaVer > 1) {   // currently only v1 supported
+    if (schemaVer < kMinSchemaVersion || schemaVer > kMaxSchemaVersion) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
-                  std::format("unsupported dssSchemaVersion {} (this build supports 1)",
-                              schemaVer));
+                  std::format("unsupported dssSchemaVersion {} (this build supports {}..{})",
+                              schemaVer, kMinSchemaVersion, kMaxSchemaVersion));
         return std::unexpected(std::move(coll.diagnostics));
     }
 

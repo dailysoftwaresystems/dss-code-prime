@@ -1,0 +1,210 @@
+{
+  "dssSchemaVersion": 1,
+
+  "language": {
+    "name":           "CSubset",
+    "version":        "0.1.0",
+    "fileExtensions": [".c", ".h"]
+  },
+
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+
+    "(":  [{ "kind": "ParenOpen",     "opensScope": "Paren"   }],
+    ")":  [{ "kind": "ParenClose",    "closesScope": true     }],
+    "{":  [{ "kind": "BlockOpen",     "opensScope": "Block"   }],
+    "}":  [{ "kind": "BlockClose",    "closesScope": true     }],
+    "[":  [{ "kind": "BracketOpen",   "opensScope": "Bracket" }],
+    "]":  [{ "kind": "BracketClose",  "closesScope": true     }],
+
+    ";":  [{ "kind": "EndStatement" }],
+    ",":  [{ "kind": "Comma" }],
+
+    "=":  [{ "kind": "AssignOp" }],
+    "+":  [{ "kind": "PlusOp"   }],
+    "-":  [{ "kind": "MinusOp"  }],
+    "*":  [{ "kind": "StarOp"   }],
+    "/":  [{ "kind": "SlashOp"  }],
+    "!":  [{ "kind": "BangOp"   }],
+
+    "==": [{ "kind": "EqEqOp" }],
+    "!=": [{ "kind": "NotEqOp" }],
+    "<":  [{ "kind": "LtOp" }],
+    ">":  [{ "kind": "GtOp" }],
+    "<=": [{ "kind": "LtEqOp" }],
+    ">=": [{ "kind": "GtEqOp" }],
+    "&&": [{ "kind": "AndAndOp" }],
+    "||": [{ "kind": "OrOrOp"  }],
+
+    "&":  [{ "kind": "BitAndOp" }],
+    "|":  [{ "kind": "BitOrOp"  }],
+    "^":  [{ "kind": "BitXorOp" }],
+    "~":  [{ "kind": "TildeOp"  }],
+    "<<": [{ "kind": "ShlOp"    }],
+    ">>": [{ "kind": "ShrOp"    }]
+  },
+
+  "keywords": [
+    { "word": "void",   "kind": "VoidKeyword"   },
+    { "word": "int",    "kind": "IntKeyword"    },
+    { "word": "char",   "kind": "CharKeyword"   },
+    { "word": "const",  "kind": "ConstKeyword"  },
+
+    { "word": "if",     "kind": "IfKeyword"     },
+    { "word": "else",   "kind": "ElseKeyword"   },
+    { "word": "while",  "kind": "WhileKeyword"  },
+    { "word": "do",     "kind": "DoKeyword"     },
+    { "word": "for",    "kind": "ForKeyword"    },
+    { "word": "return", "kind": "ReturnKeyword" }
+  ],
+
+  "shapes": {
+    "root": { "sequence": [ { "repeat": "topLevel" } ] },
+
+    "topLevel": { "alt": [ "funcDecl", "varDecl" ] },
+
+    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword" ] },
+
+    "typeRef": {
+      "sequence": [
+        { "optional": "ConstKeyword" },
+        "typeBase",
+        { "optional": "ConstKeyword" }
+      ]
+    },
+
+    "varDeclHead": {
+      "sequence": [
+        "typeRef",
+        "Identifier",
+        { "optional": { "sequence": [ "AssignOp", "expression" ] } }
+      ]
+    },
+
+    "varDecl": { "sequence": [ "varDeclHead", "EndStatement" ] },
+
+    "funcDecl": {
+      "sequence": [
+        "typeRef",
+        "Identifier",
+        "ParenOpen",
+        { "optional": "paramList" },
+        "ParenClose",
+        "block"
+      ]
+    },
+
+    "paramList": {
+      "sequence": [
+        "param",
+        { "repeat": { "sequence": [ "Comma", "param" ] } }
+      ]
+    },
+
+    "param": { "sequence": [ "typeRef", "Identifier" ] },
+
+    "block": {
+      "sequence": [
+        "BlockOpen",
+        { "repeat": "statement" },
+        "BlockClose"
+      ]
+    },
+
+    "statement": {
+      "alt": [
+        "varDecl",
+        "block",
+        "ifStmt",
+        "whileStmt",
+        "doStmt",
+        "forStmt",
+        "returnStmt",
+        "exprStmt"
+      ]
+    },
+
+    "ifStmt": {
+      "sequence": [
+        "IfKeyword",
+        "ParenOpen", "expression", "ParenClose",
+        "statement",
+        { "optional": { "sequence": [ "ElseKeyword", "statement" ] } }
+      ]
+    },
+
+    "whileStmt": {
+      "sequence": [
+        "WhileKeyword",
+        "ParenOpen", "expression", "ParenClose",
+        "statement"
+      ]
+    },
+
+    "doStmt": {
+      "sequence": [
+        "DoKeyword",
+        "statement",
+        "WhileKeyword",
+        "ParenOpen", "expression", "ParenClose",
+        "EndStatement"
+      ]
+    },
+
+    "forStmt": {
+      "sequence": [
+        "ForKeyword",
+        "ParenOpen",
+        { "optional": { "alt": [ "varDeclHead", "expression" ] } },
+        "EndStatement",
+        { "optional": "expression" },
+        "EndStatement",
+        { "optional": "expression" },
+        "ParenClose",
+        "statement"
+      ]
+    },
+
+    "returnStmt": {
+      "sequence": [
+        "ReturnKeyword",
+        { "optional": "expression" },
+        "EndStatement"
+      ]
+    },
+
+    "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
+
+    "expression": {
+      "sequence": [
+        "operand",
+        { "repeat": { "sequence": [ "binaryOp", "operand" ] } }
+      ]
+    },
+
+    "binaryOp": {
+      "alt": [
+        "AssignOp",
+        "PlusOp", "MinusOp", "StarOp", "SlashOp",
+        "EqEqOp", "NotEqOp", "LtOp", "GtOp", "LtEqOp", "GtEqOp",
+        "AndAndOp", "OrOrOp",
+        "BitAndOp", "BitOrOp", "BitXorOp", "ShlOp", "ShrOp"
+      ]
+    },
+
+    "operand": {
+      "alt": [
+        "Identifier",
+        "IntLiteral",
+        "CharLiteral",
+        "StringLiteral",
+        { "sequence": [ "BangOp",   "operand" ] },
+        { "sequence": [ "MinusOp",  "operand" ] },
+        { "sequence": [ "TildeOp",  "operand" ] },
+        { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
+      ]
+    }
+  }
+}

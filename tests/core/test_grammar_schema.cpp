@@ -261,6 +261,49 @@ TEST(GrammarSchema, LoadShippedToy) {
     }
 }
 
+// v2 PR0 — the conservative c-subset config must load cleanly under the
+// v2 loader. Pins both schema-version acceptance and the config itself.
+TEST(GrammarSchema, LoadShippedCSubset) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    if (!result.has_value()) {
+        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message
+               << " (cwd=" << std::filesystem::current_path().string() << ")";
+    } else {
+        EXPECT_EQ((*result)->name(), "CSubset");
+        EXPECT_EQ((*result)->schemaVersion(), 1u);
+        // BlockOpen opens Block — verify a representative scope token.
+        auto const blockOpen = (*result)->lookupLexeme("{");
+        ASSERT_EQ(blockOpen.size(), 1u);
+        EXPECT_EQ(blockOpen[0].opensScope, ScopeKind::Block);
+    }
+}
+
+// v2 PR0 — the loader's accepted-version window is [1, 2] today. Pins both
+// the accept side (v2 doc loads when otherwise valid) and the reject side
+// (v3 doc fails with C_VersionMismatch and a message naming the window).
+TEST(GrammarSchema, SchemaVersionTwoAccepted) {
+    auto result = GrammarSchema::loadFromText(
+        R"({"dssSchemaVersion":2,"language":{"name":"X","version":"0.1.0"}})");
+    ASSERT_TRUE(result.has_value())
+        << "v2 doc should load: "
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    EXPECT_EQ((*result)->schemaVersion(), 2u);
+}
+
+TEST(GrammarSchema, SchemaVersionThreeRejectedWithRangeMessage) {
+    auto result = GrammarSchema::loadFromText(
+        R"({"dssSchemaVersion":3,"language":{"name":"X","version":"0.1.0"}})");
+    ASSERT_FALSE(result.has_value());
+    auto const& diags = result.error();
+    auto it = std::ranges::find_if(diags, [](auto const& d) {
+        return d.code == DiagnosticCode::C_VersionMismatch;
+    });
+    ASSERT_NE(it, diags.end());
+    EXPECT_NE(it->message.find("1..2"), std::string::npos)
+        << "version-mismatch message should name the supported range; got: "
+        << it->message;
+}
+
 // Pins the cookbook example in docs/language-config-spec.md §7 against the
 // loader. If this fails, the doc's "Loads cleanly because:" claims are wrong.
 TEST(GrammarSchema, DocsCookbookCalcExampleLoadsCleanly) {
