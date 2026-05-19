@@ -337,17 +337,76 @@ The builder applies the four constraints in order `forbid → topMustBe → oute
 | `C_UnknownScopeName` | A scope name (in `anyOf` / `forbid` / `topMustBe` / `outermost` / `opensScope` / `scopes.validity[].scope`) isn't a recognized built-in. Replaces the historical reuse of `C_UnclosableScope` for this case. |
 | `C_RedundantScopeRequire` | Warning. Fires on: `topMustBe + anyOf` (anyOf redundant), `topMustBe == outermost` (rule matches only single-scope stacks), `forbid` containing `topMustBe`/`outermost` or intersecting `anyOf` (rule can never match), explicit empty array, or oversize list (>32 entries). |
 
-### 9.5 Updated version window
+### 9.5 Speculative `alt` (PR4)
+
+Standard `alt` is first-match-on-FIRST. When two alternatives share a prefix and the disambiguator lives N tokens deep, mark the alt speculative:
+
+```jsonc
+"shapes": {
+  "expression": {
+    "alt": ["patternMatchExpr", "regularExpr"],
+    "speculative": true,
+    "lookahead": 6       // optional; default = 8
+  }
+}
+```
+
+The parser (when authored) takes a `TreeBuilder::Checkpoint`, tries the first branch up to `lookahead` tokens, and commits or rolls back. Speculative alts are exempt from the load-time ambiguity check (`C_AmbiguousAlternatives`) — overlapping FIRST sets are the whole point. Malformed `speculative`/`lookahead` emits `C_ConflictingField`; `lookahead` without `speculative: true` emits `C_RedundantField` warning.
+
+### 9.6 Lexer modes (PR5)
+
+Tokenizers for interpolated strings, here-strings, and multi-language embeddings need a mode stack — the lexeme `"` means different things inside a string body vs. in normal grammar. Declare modes at top level:
+
+```jsonc
+{
+  "lexerModes": {
+    "main":        { "tokens": "default" },                    // inherits top-level `tokens`
+    "string-body": { "defaultToken": { "kind": "StringChar" } }
+  },
+  "tokens": {
+    "$\"":  [{ "kind": "InterpStart", "modeOp": "pushMode", "modeArg": "string-body" }],
+    "\"":   [{ "kind": "StringEnd",   "modeOp": "popMode" }]
+  }
+}
+```
+
+**Per-meaning fields** (any token entry):
+
+| Field | Required | Notes |
+|---|---|---|
+| `modeOp` | no | `"pushMode"`, `"popMode"`, or `"replaceMode"`. Default = no mode-stack effect. |
+| `modeArg` | required for `pushMode`/`replaceMode` | Target mode name. Must be declared in `lexerModes`. |
+
+**Per-mode fields** (entries under `lexerModes`):
+
+| Field | Required | Notes |
+|---|---|---|
+| `tokens` | no | `"default"` inherits the top-level `tokens` map. Inline `{ ... }` object is parsed-deferred (warning emitted; lookup table stays empty until per-mode-inline-tokens lands). |
+| `defaultToken` | no | `{ "kind": "X" }`. Emitted by the tokenizer when nothing else matches the input. Common for `string-body` modes whose body is mostly free text. |
+
+**Backward compat.** If `lexerModes` is absent the loader synthesizes a `"main"` mode pointing at the top-level `tokens` map. v1 configs continue to load unchanged.
+
+**Keywords cannot carry `modeOp`** — soft-keyword demotion (contextual resolution) and lexer-mode switching are distinct mechanisms. Mixing them on a `keywords[]` entry emits `C_ConflictingField`. Move the entry to `tokens` to switch modes.
+
+**Cyclic mode references are normal**, not an error. `main` pushes `string-body`; `string-body` pushes `main` (for `{...}` interpolation expressions); they recurse arbitrarily.
+
+### 9.7 Updated version window
 
 `dssSchemaVersion` accepts the range `1..2`. v2 configs that use any of the fields above SHOULD set `"dssSchemaVersion": 2`. The loader still accepts `1` for any field combination — version bumping is documentation, not enforcement.
 
-### 9.6 Troubleshooting (v2 codes)
+### 9.8 Troubleshooting (v2 codes)
 
 | Symptom | Likely fix |
 |---|---|
 | `C_InvalidPrecedenceTable` | Duplicate `(kind, arity)` declared twice, or `precedence` not an integer. |
 | `C_ConflictingField` on `scopeRequire` | Meaning declares both `validScopes` AND `scopeRequire`, or a sub-field is the wrong type (e.g., `anyOf` as a string). |
+| `C_ConflictingField` on `modeOp`/`modeArg` | Wrong-type field, unknown `modeOp` string, missing `modeArg` on `pushMode`/`replaceMode`, `modeArg` without `modeOp`, or `modeOp`/`modeArg` placed on a keyword entry instead of a token. |
+| `C_ConflictingField` on `speculative`/`lookahead` | Non-boolean `speculative`, non-integer or out-of-range `lookahead`. |
 | `C_UnknownScopeName` | The scope name doesn't match any built-in (`None`, `Root`, `Block`, `Paren`, `Bracket`, `Generic`, `String`, `Comment`). |
-| `C_RedundantScopeRequire` (warning) | Your `scopeRequire` has a contradiction or redundancy. Read the message — the rule still loads, but probably doesn't do what you intended. |
+| `C_UnknownLexerMode` | A `modeArg` references a mode that wasn't declared in `lexerModes`. |
+| `C_RedundantScopeRequire` (warning) | Your `scopeRequire` has a contradiction or redundancy. The rule still loads. |
+| `C_RedundantField` (warning) | `lookahead` without `speculative: true`; `modeArg` with `popMode`; case-folded duplicate mode name; mode with only `defaultToken` and no `tokens` field; inline per-mode `tokens` object (not yet parsed). The rule still loads. |
 | `P_ContextualKeywordResolution` (info, at parse) | A soft keyword demoted to `Identifier`. Expected behavior when the cursor's expected set excludes the keyword. |
 | `P_SchemaCursorDesync` (info, one-shot) | The schema cursor went off-track. Usually means a caller drove the builder against a sequence the schema doesn't expect. Contextual resolution stays strict from this point. |
+| `P_MaxSpeculationDepth` (error, one-shot) | `TreeBuilder::Checkpoint` stack exceeded `BuilderConfig::maxSpeculationDepth` (default 64). Subsequent `checkpoint()` calls return no-op guards. |
+| `P_UncommittedCheckpoint` (warning) | A `Checkpoint` guard was destroyed without `commit()` or `rollback()` — the dtor rolled it back. Indicates a forgotten-commit bug in the caller. |
