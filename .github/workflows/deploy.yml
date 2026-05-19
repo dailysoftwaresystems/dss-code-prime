@@ -1,0 +1,38 @@
+name: Deploy
+
+# Calls the reusable C++ app deploy workflow in DSS.DevOps.
+# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v2/.github/workflows/cpp-app-deploy.yml
+#
+# Two channels:
+#   - beta:   main → release/beta. Bumps VERSION (minor++ by default,
+#             or use the explicit `version` input).
+#   - stable: release/beta → release/stable. No bump — same version
+#             ships from beta to stable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Deploy channel"
+        required: true
+        type: choice
+        options:
+          - beta
+          - stable
+      version:
+        description: "New version (optional, beta channel only — Major.Minor.Patch)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-deploy.yml@v2
+    with:
+      channel: ${{ inputs.channel }}
+      version: ${{ inputs.version }}
+    secrets:
+      DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
+      DSS_BOTS_APP_PRIVATE_KEY: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}

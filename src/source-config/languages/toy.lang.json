@@ -1,0 +1,49 @@
+{
+  "dssSchemaVersion": 1,
+
+  "language": {
+    "name": "Toy",
+    "version": "0.1.0",
+    "fileExtensions": [".toy"]
+  },
+
+  "tokens": {
+    " ":  [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",      "flags": ["EmptySpace"] }],
+
+    "+":  [
+      { "kind": "SumOperator",          "priority": 10 },
+      { "kind": "StringAppendOperator", "priority": 20 }
+    ],
+    "<":  [
+      { "kind": "LtOperator",              "priority": 10 },
+      { "kind": "GenericDefinitionOpener", "priority": 5, "opensScope": "Generic" }
+    ],
+    "{":  [{ "kind": "BlockOpen",          "opensScope": "Block" }],
+    "}":  [{ "kind": "BlockClose",         "closesScope": true }],
+    "(":  [{ "kind": "ParenOpen",          "opensScope": "Paren" }],
+    ")":  [{ "kind": "ParenClose",         "closesScope": true }],
+    ";":  [{ "kind": "EndCommand" }],
+    "=":  [{ "kind": "AssignmentOperator" }]
+  },
+
+  "keywords": [
+    { "word": "var", "kind": "VarKeyword" },
+    { "word": "if",  "kind": "IfKeyword" }
+  ],
+
+  "scopes": {
+    "validity": [
+      { "scope": "Generic", "forbid": ["LtOperator"] }
+    ]
+  },
+
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "statement" }] },
+    "statement":  { "alt":      ["varDecl", "exprStmt"] },
+    "varDecl":    { "sequence": ["VarKeyword", "Identifier", "AssignmentOperator", "expression", "EndCommand"] },
+    "exprStmt":   { "sequence": ["expression", "EndCommand"] },
+    "expression": { "sequence": ["Identifier"] }
+  }
+}

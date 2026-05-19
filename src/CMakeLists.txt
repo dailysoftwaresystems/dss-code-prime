@@ -6,10 +6,13 @@ add_subdirectory(program)
 # All compiler functionality in a single shared library for embedding in other projects.
 add_library(dss-code-prime-lib SHARED $<TARGET_OBJECTS:core> $<TARGET_OBJECTS:gen> $<TARGET_OBJECTS:program>)
 target_include_directories(dss-code-prime-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_definitions(dss-code-prime-lib
-    PUBLIC  DSS_SHARED_BUILD
-    PRIVATE DSS_BUILDING_DLL
-)
+
+# PUBLIC propagates to consumers (the CLI exe, tests) so they see
+# __declspec(dllimport) at compile time. The matching DSS_BUILDING_DLL lives
+# on each OBJECT lib (core/gen/program) — not here — because this target has
+# no sources of its own, only aggregated $<TARGET_OBJECTS:...>.
+target_compile_definitions(dss-code-prime-lib PUBLIC DSS_SHARED_BUILD)
+
 set_target_properties(dss-code-prime-lib PROPERTIES
     OUTPUT_NAME "dss-code-prime"
 )

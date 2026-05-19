@@ -1,0 +1,28 @@
+name: Pipeline
+
+# Calls the reusable C++ app PR workflow in DSS.DevOps.
+# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v2/.github/workflows/cpp-app-pr.yml
+
+on:
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+# Reusable workflows inherit the caller's GITHUB_TOKEN scope. Without
+# `statuses: write` granted here, the rollup `ci-check` job inside the
+# reusable can't post the "Pipeline / ci-check result" commit status,
+# which leaves branch protection stuck in "Expected — Waiting" forever.
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+  statuses: write
+
+jobs:
+  pipeline-pr:
+    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pr.yml@v2
+    with:
+      cmake-version: "latest"
+    secrets:
+      DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
+      DSS_BOTS_APP_PRIVATE_KEY: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}
