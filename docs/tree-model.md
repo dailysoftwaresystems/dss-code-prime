@@ -252,6 +252,9 @@ The codes you'll see during parsing (full list in `parse_diagnostic.hpp`):
 | `P_PrematureEndOfInput` | `finish()` ran with frames still open — one per open frame. |
 | `P_BuilderInvariant` | Sequence/scope-stack invariant violated mid-build (e.g., `}` with no `{`). |
 | `P_TooManyDiagnostics` | Reporter cap reached; later diagnostics dropped. |
+| `P_AmbiguousToken` | Warning. Two equal-priority meanings survived the scope filter; first-declared won. Disambiguate the config or accept the determinism. |
+| `P_ContextualKeywordResolution` | Info, v2. A soft keyword (`contextual: true` or under `reservedWordPolicy: "contextual"`) demoted to `Identifier` because the schema cursor's expected set didn't contain it. |
+| `P_SchemaCursorDesync` | Info, v2, one-shot. The schema cursor went from valid to invalid for the first time this build. Contextual-keyword resolution stays strict for the remainder. |
 
 Recovery is sound: even a broken parse produces a walkable tree with the `HasError` flag propagated up to the root. `prettyPrint` (see `test_tree_end_to_end.cpp`) does not surface flags by default — broken-tree assertions in tests scan `t.flags(id)` for `hasError`.
 

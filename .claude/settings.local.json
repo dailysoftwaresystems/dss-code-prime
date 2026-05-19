@@ -69,7 +69,12 @@
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_c_subset.exe\" --gtest_filter=CSubsetEndToEnd.TopLevelVarDeclWithIntInitializer 2>&1 | Select-Object -Last 40)",
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_c_subset.exe\" --gtest_filter=CSubsetEndToEnd.TopLevelVarDeclWithIntInitializer 2>&1 | Select-Object -Last 30)",
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_c_subset.exe\" 2>&1 | Select-Object -Last 40)",
-      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_contextual_keywords.exe\" 2>&1 | Select-Object -Last 40)"
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_contextual_keywords.exe\" 2>&1 | Select-Object -Last 40)",
+      "Bash(cmake -B C:/Source/DailySoftware/dss-code-prime/build C:/Source/DailySoftware/dss-code-prime)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_scope_require.exe\" 2>&1 | Select-Object -Last 50)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_scope_require.exe\" 2>&1 | Select-String -Pattern \"\\(FAILED|Expected|Actual\\)\" | Select-Object -First 30)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_grammar_schema.exe\" 2>&1 | Select-String -Pattern \"\\(FAILED|Expected|Actual\\)\" | Select-Object -First 30)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_scope_require.exe\" 2>&1 | Select-String \"PASSED\" | Select-Object -Last 1)"
     ]
   }
 }

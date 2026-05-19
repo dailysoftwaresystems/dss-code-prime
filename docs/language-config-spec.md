@@ -12,8 +12,10 @@ A `.lang.json` config defines a single source language: its tokens, keywords, sc
 
 Two design choices to internalize before writing one:
 
-1. **Tokens are multi-typed.** One lexeme (e.g., `+`, `<`) may resolve to several token kinds depending on scope and priority. The loader doesn't pick — the schema captures all alternatives and the builder picks at parse time using `validScopes` and `priority`.
+1. **Tokens are multi-typed.** One lexeme (e.g., `+`, `<`) may resolve to several token kinds depending on scope and priority. The loader doesn't pick — the schema captures all alternatives and the builder picks at parse time using the per-meaning `scopeRequire` (v2 §9.4; flat `validScopes: [...]` in v1) and `priority`.
 2. **Shapes describe valid tree structure, not parsing strategy.** Today's `TreeBuilder` validates *within* a frame (lexeme resolution, scope filter, recovery). Sequence-level "is this token valid here?" enforcement lands when the parser does — but the schema declares the shape so the future parser doesn't have to invent it.
+
+**v2 additions appear in [§9](#9-v2-additions).** Configs that touch `operators`, `expr` shape, `reservedWordPolicy`, `contextual` keywords, or `scopeRequire` are using v2 features.
 
 A config that loads cleanly produces a `GrammarSchema` you can pass to `TreeBuilder`. A config with errors produces a `std::expected<...>` with a vector of `ConfigDiagnostic` — none of which are fatal at file-author time, but all of which will block parsing.
 
@@ -90,7 +92,9 @@ Each meaning object accepts:
 | `kind` | string | **yes** | Token-kind name. Interned into `schema.schemaTokens()`. |
 | `flags` | array of strings | no | Currently: `["EmptySpace"]` — flagged tokens are skipped by AST cursors. |
 | `priority` | integer | no | Lower wins on multi-meaning lexemes. Equal priorities → first-declared wins + `P_AmbiguousToken` diagnostic at parse time. |
-| `validScopes` | array of strings | no | Whitelist of scope names where this meaning is valid. Empty/absent means "valid everywhere." |
+| `validScopes` | array of strings | no | Whitelist of scope names where this meaning is valid. Empty/absent means "valid everywhere." **v2**: superseded by the richer `scopeRequire` object — see [§9.4](#94-scoperequire--per-meaning-scope-stack-constraints-pr3). Legacy syntax still loads. |
+| `scopeRequire` | object | no | **v2.** Four-axis constraint with `anyOf` / `forbid` / `topMustBe` / `outermost`. See [§9.4](#94-scoperequire--per-meaning-scope-stack-constraints-pr3). Mutually exclusive with `validScopes`. |
+| `contextual` | boolean | no | **v2, keywords only.** Marks a soft keyword that demotes to `Identifier` when not in the cursor's expected set. See [§9.3](#93-reservedwordpolicy--keywordscontextual-pr2b). |
 | `opensScope` | string | no | Push this scope name onto the builder's scope stack when this token is consumed. |
 | `closesScope` | boolean | no | `true` → pop the current scope on consumption. |
 | `until` | string | no | Tokenizer hint for `LineComment` (`"newline"`) and `BlockComment` (closing delimiter). Currently informational; lexer doesn't ship yet. |
@@ -241,3 +245,109 @@ To verify, run any unit test that calls `GrammarSchema::loadShipped("calc")` and
 | `C_UnclosableScope: "X"` | Some token has `"opensScope": "X"` but nothing reachable inside X has `"closesScope": true`. |
 
 For parse-time diagnostics (P_*), see [`tree-model.md` §6](./tree-model.md#6-diagnostics--when-something-goes-wrong).
+
+---
+
+## 9. v2 additions
+
+These fields and shape kinds were added by the v2 schema-expressiveness work after the spec was first authored. They are **opt-in**: any config that doesn't use them keeps loading exactly as it did under v1, and the same `.lang.json` file may declare `"dssSchemaVersion": 1` until it references a v2-only field. Use `2` once any v2 field appears.
+
+### 9.1 `operators` — precedence groups (PR1)
+
+```jsonc
+"operators": {
+  "groups": [
+    { "precedence": 90, "arity": "Prefix",  "associativity": "Right", "kinds": ["BangOp", "MinusOp"] },
+    { "precedence": 70, "arity": "Infix",   "associativity": "Left",  "kinds": ["StarOp", "SlashOp"] },
+    { "precedence": 60, "arity": "Infix",   "associativity": "Left",  "kinds": ["PlusOp", "MinusOp"] },
+    { "precedence": 10, "arity": "Infix",   "associativity": "Right", "kinds": ["AssignOp"] }
+  ]
+}
+```
+
+Each group declares one or more `kinds` (token-kind names) sharing a precedence + arity + associativity. Multi-meaning lexemes require explicit `kinds` per group — `-` as prefix lives in one group with `arity: Prefix`, `-` as infix lives in another with `arity: Infix`. Lookup at runtime: `schema.operatorTable().lookup(kind, arity)`.
+
+| Field | Required | Notes |
+|---|---|---|
+| `precedence` | yes | Integer; higher binds tighter. |
+| `arity` | no | `"Prefix"`, `"Infix"`, or `"Postfix"`. Defaults to `Infix`. |
+| `associativity` | no | `"Left"`, `"Right"`, or `"None"`. Defaults to `None`. |
+| `kinds` | yes | Array of token-kind names declared in `tokens`. |
+
+**New diagnostic code:** `C_InvalidPrecedenceTable` — malformed `operators` block, duplicate `(kind, arity)` keys, or non-integer precedence.
+
+### 9.2 `expr` shape kind (PR1)
+
+A new shape body kind for operator-bearing expressions:
+
+```jsonc
+"shapes": {
+  "expression": { "expr": { "atom": "operand" } }
+}
+```
+
+The cursor walks `expr` as a reference to the `atom` rule. Operator climbing is the parser's job — `operators.groups` provides the data; the schema layer doesn't fold the tree. The only recognized field inside `expr` is `atom`; any other key emits `C_UnknownShape`.
+
+### 9.3 `reservedWordPolicy` + `keywords[].contextual` (PR2b)
+
+```jsonc
+{
+  "reservedWordPolicy": "contextual",          // optional; default "strict"
+  "keywords": [
+    { "word": "if",     "kind": "IfKw" },                          // hard keyword
+    { "word": "await",  "kind": "AwaitKw", "contextual": true }    // soft keyword
+  ]
+}
+```
+
+- **`reservedWordPolicy: "strict"`** (default) — every keyword always wins over `Identifier`. Matches v1 behavior; configs without this field get strict.
+- **`reservedWordPolicy: "contextual"`** — every keyword is implicitly soft. Useful for SQL-family languages where any keyword may also appear as an identifier (`CREATE TABLE Select(Order int)` parses).
+- **`contextual: true` per-entry** — marks one keyword as soft regardless of policy. The keyword's `kind` may NOT be `Identifier` (would be a no-op identity demotion — loader emits `C_MissingField`).
+
+Soft keyword resolution: at `pushToken` time, the builder consults the schema cursor's `expectedSet`. If the soft keyword's kind is in the expected set, it wins; otherwise it demotes to `Identifier` and emits an info-level `P_ContextualKeywordResolution` diagnostic. When the schema cursor goes off-track (first `valid → invalid` transition during a parse), the builder emits a one-shot `P_SchemaCursorDesync` info diagnostic and falls back to strict resolution for the remainder.
+
+### 9.4 `scopeRequire` — per-meaning scope-stack constraints (PR3)
+
+Replaces v1's flat `validScopes: [...]` with a four-axis constraint object on every token-meaning entry:
+
+```jsonc
+"tokens": {
+  "case": [
+    { "kind": "CaseKw",
+      "scopeRequire": {
+        "anyOf":     ["Block"],          // empty/absent = no anyOf requirement
+        "forbid":    ["Generic"],        // none of these may be on the stack
+        "topMustBe": "Block",            // innermost scope must equal this
+        "outermost": "Root"              // bottom-of-stack scope must equal this
+      }
+    }
+  ]
+}
+```
+
+The builder applies the four constraints in order `forbid → topMustBe → outermost → anyOf` inside the `pushToken` candidate filter. First failure rejects the meaning. Empty `anyOf` / `forbid` means "no constraint on this axis"; unset `topMustBe` / `outermost` means the same.
+
+**Backward compat.** Legacy flat `"validScopes": ["Block"]` loads as `scopeRequire.anyOf = ["Block"]` with everything else default. A meaning may NOT declare both `validScopes` and `scopeRequire` (loader emits `C_ConflictingField`).
+
+**Diagnostics added in PR3:**
+
+| Code | When |
+|---|---|
+| `C_ConflictingField` | A meaning declares both `validScopes` and `scopeRequire`, or a `scopeRequire` sub-field has the wrong JSON type. |
+| `C_UnknownScopeName` | A scope name (in `anyOf` / `forbid` / `topMustBe` / `outermost` / `opensScope` / `scopes.validity[].scope`) isn't a recognized built-in. Replaces the historical reuse of `C_UnclosableScope` for this case. |
+| `C_RedundantScopeRequire` | Warning. Fires on: `topMustBe + anyOf` (anyOf redundant), `topMustBe == outermost` (rule matches only single-scope stacks), `forbid` containing `topMustBe`/`outermost` or intersecting `anyOf` (rule can never match), explicit empty array, or oversize list (>32 entries). |
+
+### 9.5 Updated version window
+
+`dssSchemaVersion` accepts the range `1..2`. v2 configs that use any of the fields above SHOULD set `"dssSchemaVersion": 2`. The loader still accepts `1` for any field combination — version bumping is documentation, not enforcement.
+
+### 9.6 Troubleshooting (v2 codes)
+
+| Symptom | Likely fix |
+|---|---|
+| `C_InvalidPrecedenceTable` | Duplicate `(kind, arity)` declared twice, or `precedence` not an integer. |
+| `C_ConflictingField` on `scopeRequire` | Meaning declares both `validScopes` AND `scopeRequire`, or a sub-field is the wrong type (e.g., `anyOf` as a string). |
+| `C_UnknownScopeName` | The scope name doesn't match any built-in (`None`, `Root`, `Block`, `Paren`, `Bracket`, `Generic`, `String`, `Comment`). |
+| `C_RedundantScopeRequire` (warning) | Your `scopeRequire` has a contradiction or redundancy. Read the message — the rule still loads, but probably doesn't do what you intended. |
+| `P_ContextualKeywordResolution` (info, at parse) | A soft keyword demoted to `Identifier`. Expected behavior when the cursor's expected set excludes the keyword. |
+| `P_SchemaCursorDesync` (info, one-shot) | The schema cursor went off-track. Usually means a caller drove the builder against a sequence the schema doesn't expect. Contextual resolution stays strict from this point. |
