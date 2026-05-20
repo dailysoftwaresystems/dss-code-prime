@@ -458,7 +458,8 @@ struct ResolvedMeaning {
 
 ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
                                std::string_view lexeme,
-                               std::span<ScopeKind const> scopes) {
+                               std::span<ScopeKind const> scopes,
+                               SchemaTokenId preResolved = InvalidSchemaToken) {
     ResolvedMeaning out;
     const auto candidates = schema.lookupLexeme(lexeme);
     if (candidates.empty()) return out;
@@ -469,6 +470,24 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
         return schema.isTokenValidInScope(m.id, scopes)
             && meaningAllowedByScopeRequire(m, scopes);
     };
+
+    // Fast path: tokenizer pre-resolved a `schemaKind`. Skip the
+    // priority scan; if the named meaning survives the scope filter,
+    // it's the winner. Otherwise fall through to the full scan so a
+    // scope-rejected pre-resolution doesn't break multi-meaning
+    // disambiguation (e.g. toy's `<` outside vs inside Generic scope).
+    if (preResolved.valid()) {
+        for (auto const& m : candidates) {
+            if (m.id == preResolved) {
+                if (candidateAllowed(m)) {
+                    out.meaning    = m;
+                    out.matchCount = 1;
+                    return out;
+                }
+                break;   // matched the id but scope-rejected — full scan
+            }
+        }
+    }
 
     // Candidates arrive pre-sorted by priority (lowest first, stable on
     // ties). Find the first that survives.
@@ -519,11 +538,14 @@ void TreeBuilder::pushToken(Token const& tok) {
     const std::string_view lexeme = source_->slice(tok.span);
 
     // Resolve the schema meaning. Three paths:
-    //  1. Direct lexeme match (operator / punctuation / keyword).
+    //  1. Direct lexeme match (operator / punctuation / keyword). When
+    //     `tok.schemaKind` is valid (tokenizer pre-resolved) the
+    //     resolveMeaning fast-path short-circuits the priority scan.
     //  2. Word fallback to Identifier when the lexeme isn't a keyword.
     //  3. No match at all → Error leaf + P_UnknownToken.
     ResolvedMeaning resolved = resolveMeaning(
-        *schema_, lexeme, std::span<ScopeKind const>{scopes_});
+        *schema_, lexeme, std::span<ScopeKind const>{scopes_},
+        tok.schemaKind);
 
     if (resolved.matchCount == 0 && tok.coreKind == CoreTokenKind::Word) {
         // Fallback: alphanumeric word that isn't a keyword → Identifier.

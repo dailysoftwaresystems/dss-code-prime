@@ -14,6 +14,8 @@
 #include "core/types/tree_visitor.hpp"
 #include "core/types/well_known_names.hpp"
 #include "test_pretty_print.hpp"
+#include "tokenizer/tokenizer.hpp"
+#include "tokenizer/token_stream.hpp"
 #include "toy_harness.hpp"
 
 #include <gtest/gtest.h>
@@ -28,54 +30,35 @@
 #include <vector>
 
 // End-to-end integration test for the core tree stack: shipped JSON config
-// → SourceBuffer → GrammarSchema → TreeBuilder driven by synthetic tokens
-// → Tree → walk via visitor → pretty-printed AST → DiagnosticReporter →
-// typed views. Happy-path tests assert the full pretty-printed AST against
-// a string literal; broken-path tests assert specific diagnostic codes and
-// that the recovered tree still walks.
+// → SourceBuffer → GrammarSchema → Tokenizer (TZ1) → TokenStream →
+// TreeBuilder → Tree → walk via visitor → pretty-printed AST →
+// DiagnosticReporter → typed views. Happy-path tests assert the full
+// pretty-printed AST against a string literal; broken-path tests assert
+// specific diagnostic codes and that the recovered tree still walks.
+//
+// Pre-TZ1 the token stream was hand-fabricated via a `TokenSeq` helper
+// that fetched tokens by lexeme; TZ1 replaced that with a real
+// `Tokenizer`-produced `TokenStream`. Every test now exercises the live
+// tokenize → resolve → build pipeline.
 
 using namespace dss;
 using dss::tests::ToyHarness;
 
 namespace {
 
-// Sequential token emitter — finds the next occurrence of `text` at or
-// after the cursor, advancing the cursor past the match. Lets tests
-// pass through sources with repeated lexemes (";", "=") without per-call
-// startHints.
-class TokenSeq {
-public:
-    explicit TokenSeq(SourceBuffer const& src) : src_(&src) {}
-
-    Token next(std::string_view text, CoreTokenKind kind = CoreTokenKind::Operator) {
-        const auto sv = src_->text();
-        const auto found = sv.find(text, pos_);
-        EXPECT_NE(found, std::string_view::npos)
-            << "TokenSeq: lexeme '" << text << "' not found after offset " << pos_;
-        if (found == std::string_view::npos) {
-            return Token{.coreKind = kind, .schemaKind = InvalidSchemaToken,
-                         .span = SourceSpan::of(static_cast<ByteOffset>(pos_),
-                                                 static_cast<ByteOffset>(pos_))};
-        }
-        pos_ = found + text.size();
-        return Token{
-            .coreKind   = kind,
-            .schemaKind = InvalidSchemaToken,
-            .span       = SourceSpan::of(static_cast<ByteOffset>(found),
-                                          static_cast<ByteOffset>(pos_)),
-        };
-    }
-
-    Token word(std::string_view text) { return next(text, CoreTokenKind::Word); }
-    Token ws(std::string_view text)   { return next(text, CoreTokenKind::Whitespace); }
-    Token op(std::string_view text)   { return next(text, CoreTokenKind::Operator); }
-
-private:
-    SourceBuffer const* src_;
-    std::size_t         pos_ = 0;
+// Bundle of the harness + a live tokenized stream. Built once per test via
+// `tokenizeShipped()`; the test consumes tokens sequentially through
+// `b.pushToken(stream.advance())`. Pre-TZ1 the equivalent class was
+// `TokenSeq`, which fabricated tokens by lexeme lookup — see this
+// file's header comment for context.
+struct E2EHarness {
+    std::shared_ptr<SourceBuffer>        src;
+    std::shared_ptr<GrammarSchema const> schema;
+    TokenStream                          stream;
+    std::unique_ptr<DiagnosticReporter>  lexerDiags;
 };
 
-ToyHarness loadShippedHarness(std::string sourceText) {
+[[nodiscard]] ToyHarness loadShippedHarness(std::string sourceText) {
     auto loaded = GrammarSchema::loadShipped("toy");
     if (!loaded) {
         ADD_FAILURE() << "loadShipped(\"toy\") failed — config missing or malformed";
@@ -87,6 +70,19 @@ ToyHarness loadShippedHarness(std::string sourceText) {
     return ToyHarness{
         .src    = SourceBuffer::fromString(std::move(sourceText), "<e2e>"),
         .schema = *loaded,
+    };
+}
+
+[[nodiscard]] E2EHarness tokenizeShipped(std::string sourceText) {
+    auto h = loadShippedHarness(std::move(sourceText));
+    if (!h.schema) return E2EHarness{.src = h.src, .schema = nullptr};
+    Tokenizer tk{h.src, h.schema};
+    auto [stream, reporter] = std::move(tk).tokenize();
+    return E2EHarness{
+        .src        = h.src,
+        .schema     = h.schema,
+        .stream     = std::move(stream),
+        .lexerDiags = std::move(reporter),
     };
 }
 
@@ -111,46 +107,47 @@ std::size_t countErrorDescendants(Tree const& t, NodeId start) {
     return n;
 }
 
-// Drive a "var <name> = <value>;" statement.
-void driveVarDecl(TreeBuilder& b, TokenSeq& ts, ToyHarness const& h,
-                  std::string_view name, std::string_view value) {
-    auto stmt = b.open(h.schema->rules().find("statement"));
-    auto vd   = b.open(h.schema->rules().find("varDecl"));
-    b.pushToken(ts.word("var"));
-    b.pushToken(ts.ws(" "));
-    b.pushToken(ts.word(name));
-    b.pushToken(ts.ws(" "));
-    b.pushToken(ts.op("="));
-    b.pushToken(ts.ws(" "));
+// Drive a "var <name> = <value>;" statement by consuming the next 8
+// tokens from `ts` in order: var, ' ', name, ' ', =, ' ', value, ;.
+// The token stream supplies the actual lexemes — the helper is
+// parameterless because the source bytes drive what each advance()
+// yields.
+void driveVarDecl(TreeBuilder& b, TokenStream& ts, GrammarSchema const& schema) {
+    auto stmt = b.open(schema.rules().find("statement"));
+    auto vd   = b.open(schema.rules().find("varDecl"));
+    b.pushToken(ts.advance());   // var
+    b.pushToken(ts.advance());   // ' '
+    b.pushToken(ts.advance());   // identifier
+    b.pushToken(ts.advance());   // ' '
+    b.pushToken(ts.advance());   // =
+    b.pushToken(ts.advance());   // ' '
     {
-        auto expr = b.open(h.schema->rules().find("expression"));
-        b.pushToken(ts.word(value));
+        auto expr = b.open(schema.rules().find("expression"));
+        b.pushToken(ts.advance());   // identifier (rhs)
     }
-    b.pushToken(ts.op(";"));
+    b.pushToken(ts.advance());   // ;
 }
 
-void driveExprStmt(TreeBuilder& b, TokenSeq& ts, ToyHarness const& h,
-                   std::string_view name) {
-    auto stmt = b.open(h.schema->rules().find("statement"));
-    auto es   = b.open(h.schema->rules().find("exprStmt"));
+void driveExprStmt(TreeBuilder& b, TokenStream& ts, GrammarSchema const& schema) {
+    auto stmt = b.open(schema.rules().find("statement"));
+    auto es   = b.open(schema.rules().find("exprStmt"));
     {
-        auto expr = b.open(h.schema->rules().find("expression"));
-        b.pushToken(ts.word(name));
+        auto expr = b.open(schema.rules().find("expression"));
+        b.pushToken(ts.advance());   // identifier
     }
-    b.pushToken(ts.op(";"));
+    b.pushToken(ts.advance());   // ;
 }
 
 } // namespace
 
 TEST(TreeEndToEnd, HappyPath_SingleVarDecl_PrintsExpectedTree) {
-    auto h = loadShippedHarness("var x = y;");
+    auto h = tokenizeShipped("var x = y;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
     {
         auto root = b.open(h.schema->rules().find("root"));
-        driveVarDecl(b, ts, h, "x", "y");
+        driveVarDecl(b, h.stream, *h.schema);
     }
     Tree t = std::move(b).finish();
 
@@ -172,14 +169,13 @@ TEST(TreeEndToEnd, HappyPath_SingleVarDecl_PrintsExpectedTree) {
 }
 
 TEST(TreeEndToEnd, HappyPath_SingleExprStmt_PrintsExpectedTree) {
-    auto h = loadShippedHarness("y;");
+    auto h = tokenizeShipped("y;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
     {
         auto root = b.open(h.schema->rules().find("root"));
-        driveExprStmt(b, ts, h, "y");
+        driveExprStmt(b, h.stream, *h.schema);
     }
     Tree t = std::move(b).finish();
 
@@ -197,18 +193,17 @@ TEST(TreeEndToEnd, HappyPath_SingleExprStmt_PrintsExpectedTree) {
 }
 
 TEST(TreeEndToEnd, HappyPath_MultipleStatements_PrintsExpectedTree) {
-    auto h = loadShippedHarness("var x = a; y; var w = b;");
+    auto h = tokenizeShipped("var x = a; y; var w = b;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
     {
         auto root = b.open(h.schema->rules().find("root"));
-        driveVarDecl(b, ts, h, "x", "a");
-        b.pushToken(ts.ws(" "));
-        driveExprStmt(b, ts, h, "y");
-        b.pushToken(ts.ws(" "));
-        driveVarDecl(b, ts, h, "w", "b");
+        driveVarDecl(b, h.stream, *h.schema);
+        b.pushToken(h.stream.advance());   // inter-statement ' '
+        driveExprStmt(b, h.stream, *h.schema);
+        b.pushToken(h.stream.advance());   // inter-statement ' '
+        driveVarDecl(b, h.stream, *h.schema);
     }
     Tree t = std::move(b).finish();
 
@@ -250,18 +245,17 @@ TEST(TreeEndToEnd, HappyPath_MultipleStatements_PrintsExpectedTree) {
 }
 
 TEST(TreeEndToEnd, HappyPath_ViewsResolveOnRealParse) {
-    auto h = loadShippedHarness("var x = a; y; var w = b;");
+    auto h = tokenizeShipped("var x = a; y; var w = b;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
     {
         auto root = b.open(h.schema->rules().find("root"));
-        driveVarDecl(b, ts, h, "x", "a");
-        b.pushToken(ts.ws(" "));
-        driveExprStmt(b, ts, h, "y");
-        b.pushToken(ts.ws(" "));
-        driveVarDecl(b, ts, h, "w", "b");
+        driveVarDecl(b, h.stream, *h.schema);
+        b.pushToken(h.stream.advance());   // inter-statement ' '
+        driveExprStmt(b, h.stream, *h.schema);
+        b.pushToken(h.stream.advance());   // inter-statement ' '
+        driveVarDecl(b, h.stream, *h.schema);
     }
     Tree t = std::move(b).finish();
     ASSERT_FALSE(t.diagnostics().hasErrors());
@@ -303,23 +297,19 @@ TEST(TreeEndToEnd, HappyPath_ViewsResolveOnRealParse) {
 }
 
 TEST(TreeEndToEnd, BrokenPath_UnknownTokenRecovered) {
-    auto h = loadShippedHarness("var x = @;");
+    auto h = tokenizeShipped("var x = @;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto vd   = b.open(h.schema->rules().find("varDecl"));
-        b.pushToken(ts.word("var"));
-        b.pushToken(ts.ws(" "));
-        b.pushToken(ts.word("x"));
-        b.pushToken(ts.ws(" "));
-        b.pushToken(ts.op("="));
-        b.pushToken(ts.ws(" "));
-        b.pushToken(ts.op("@"));
-        b.pushToken(ts.op(";"));
+        // Push every token straight through: var, ' ', x, ' ', =, ' ',
+        // @, ;, Eof. The tokenizer emits `@` as an Error token (with
+        // a P_IllegalChar entry in `h.lexerDiags`); the builder still
+        // emits P_UnknownToken when it can't resolve the lexeme.
+        while (!h.stream.isAtEnd()) b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
 
@@ -343,11 +333,10 @@ TEST(TreeEndToEnd, BrokenPath_UnknownTokenRecovered) {
 }
 
 TEST(TreeEndToEnd, BrokenPath_UnclosedScopesAtEof) {
-    auto h = loadShippedHarness("var x");
+    auto h = tokenizeShipped("var x");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
 
     // Guards held in a heap vector and dropped after finish() — otherwise
     // their destructors would close the frames before finish() sees them.
@@ -355,9 +344,7 @@ TEST(TreeEndToEnd, BrokenPath_UnclosedScopesAtEof) {
     guards->push_back(b.open(h.schema->rules().find("root")));
     guards->push_back(b.open(h.schema->rules().find("statement")));
     guards->push_back(b.open(h.schema->rules().find("varDecl")));
-    b.pushToken(ts.word("var"));
-    b.pushToken(ts.ws(" "));
-    b.pushToken(ts.word("x"));
+    while (!h.stream.isAtEnd()) b.pushToken(h.stream.advance());
 
     Tree t = std::move(b).finish();
     guards.reset();   // safe: closeFrame_ no-ops on a finished builder
@@ -369,16 +356,15 @@ TEST(TreeEndToEnd, BrokenPath_UnclosedScopesAtEof) {
 }
 
 TEST(TreeEndToEnd, BrokenPath_TruncatedAfterKeyword) {
-    auto h = loadShippedHarness("var");
+    auto h = tokenizeShipped("var");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
     auto guards = std::make_unique<std::vector<TreeBuilder::OpenScope>>();
     guards->push_back(b.open(h.schema->rules().find("root")));
     guards->push_back(b.open(h.schema->rules().find("statement")));
     guards->push_back(b.open(h.schema->rules().find("varDecl")));
-    b.pushToken(ts.word("var"));
+    b.pushToken(h.stream.advance());   // var
 
     Tree t = std::move(b).finish();
     guards.reset();
@@ -397,25 +383,25 @@ TEST(TreeEndToEnd, BrokenPath_PushErrorRecovered) {
     // Error leaf, emits P_UnexpectedToken, propagates HasError to root.
     // Distinct from BrokenPath_UnknownTokenRecovered which exercises
     // schema-rejects-lexeme; this covers parser-rejects-token.
-    auto h = loadShippedHarness("var x = ?;");
+    auto h = tokenizeShipped("var x = ?;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto vd   = b.open(h.schema->rules().find("varDecl"));
-        b.pushToken(ts.word("var"));
-        b.pushToken(ts.ws(" "));
-        b.pushToken(ts.word("x"));
-        b.pushToken(ts.ws(" "));
-        b.pushToken(ts.op("="));
-        b.pushToken(ts.ws(" "));
+        // Consume the prefix `var x = ` (6 tokens including spaces),
+        // then synthesize the parser-level error instead of pushing
+        // the tokenized `?` (which would also produce an Error leaf —
+        // but via the schema-resolves-empty path, not via pushError).
+        for (int i = 0; i < 6; ++i) b.pushToken(h.stream.advance());
         b.pushError(SourceSpan::of(8, 9), std::nullopt,
                     h.schema->schemaTokens().find(tokens::kIdentifier),
                     "expected expression");
-        b.pushToken(ts.op(";"));
+        // Skip past the `?` token the tokenizer produced.
+        (void)h.stream.advance();
+        b.pushToken(h.stream.advance());   // ;
     }
     Tree t = std::move(b).finish();
 
@@ -433,14 +419,13 @@ TEST(TreeEndToEnd, BrokenPath_PopScopeUnderflow) {
     // resolution is wired up at the E2E level (T5 doesn't yet emit
     // the dedicated P_UnmatchedClose code — that's reserved for a
     // future parser-level enhancement).
-    auto h = loadShippedHarness("}");
+    auto h = tokenizeShipped("}");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
-    TokenSeq    ts{*h.src};
     {
         auto root = b.open(h.schema->rules().find("root"));
-        b.pushToken(ts.op("}"));
+        b.pushToken(h.stream.advance());   // }
     }
     Tree t = std::move(b).finish();
 

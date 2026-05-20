@@ -38,9 +38,20 @@ enum class CoreTokenKind : std::uint16_t {
 
 // One token in the source stream.
 //
-// - coreKind   : assigned by the tokenizer.
-// - schemaKind : assigned by the schema-aware resolver inside TreeBuilder::pushToken.
-//                Invalid (SchemaTokenId{0}) until the builder resolves it.
+// - coreKind   : assigned by the tokenizer (e.g. Word / Operator / IntLiteral).
+// - schemaKind : assigned by the tokenizer via mode-aware lookup against
+//                `GrammarSchema::lookupLexeme` / `lookupLexemeInMode`.
+//                Picks the priority-winner candidate (lowest `priority` value;
+//                declaration order on ties). Scope-stack filtering and
+//                contextual-keyword demotion remain TreeBuilder::pushToken's
+//                job — those need state the tokenizer does not track.
+//                May be left InvalidSchemaToken in two cases:
+//                  - hand-built tokens (tests that fabricate Tokens directly);
+//                  - Word fallback (the lexeme isn't a keyword — builder
+//                    promotes to Identifier).
+//                The builder treats schemaKind as a hint: when valid AND
+//                scope-allowed, trust it; otherwise re-resolve from the
+//                lexeme via the full candidate-filter path.
 // - span       : byte range in the source buffer. The lexeme text is recovered
 //                via SourceBuffer::slice(span); never stored on the token itself.
 struct DSS_EXPORT Token {
