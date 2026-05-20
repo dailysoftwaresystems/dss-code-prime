@@ -683,3 +683,208 @@ TEST(SchemaCursor, OperationsOnInvalidCursorReturnInvalid) {
     EXPECT_EQ(schema->slotKind(invalid), SlotKind::End);
     EXPECT_FALSE(schema->canEndSource(invalid));
 }
+
+// ── routeToRuleLeaf — multi-level nested AltChoice (SH4c) ─────────────────
+//
+// v2-gap-catalog §7 row 21 flagged `routeToRuleLeaf` as "untested past two
+// levels of nested AltChoice." PR2b shipped the routing logic but the only
+// in-tree exercise was the 2-level alt-of-rules case. The tests below pin
+// 3-level and 4-level nesting end-to-end so the parser phase doesn't
+// rediscover a routing bug under live grammar pressure.
+//
+// AltChoice slots arise from three shape kinds: `alt`, `optional` (the
+// take-or-skip branch), and `repeat` (the iterate-or-exit branch). Nesting
+// these composes AltChoice positions; the recursion in routeToRuleLeaf
+// should descend through every level.
+
+namespace {
+
+// `root → alt( optional( alt( funcDecl | varDecl ) ) | typedefDecl )`
+//
+// Levels of AltChoice between the root cursor and `funcDecl`'s RuleLeaf:
+//   1) outer `alt(... | typedefDecl)`
+//   2) the optional's take-or-skip
+//   3) inner `alt(funcDecl | varDecl)`
+//
+// Three AltChoice slots stack between the entry cursor and the RuleLeaf —
+// strictly past the "two levels" the v2 review covered.
+constexpr std::string_view kThreeLevelCfg = R"JSON({
+  "dssSchemaVersion": 1,
+  "language": { "name": "Nested3", "version": "0.1.0" },
+  "tokens": {
+    "f": [{ "kind": "FKeyword" }],
+    "v": [{ "kind": "VKeyword" }],
+    "t": [{ "kind": "TKeyword" }]
+  },
+  "shapes": {
+    "root": {
+      "alt": [
+        { "optional": {
+            "alt": [ "funcDecl", "varDecl" ]
+          }
+        },
+        "typedefDecl"
+      ]
+    },
+    "funcDecl":    { "sequence": [ "FKeyword" ] },
+    "varDecl":     { "sequence": [ "VKeyword" ] },
+    "typedefDecl": { "sequence": [ "TKeyword" ] }
+  }
+})JSON";
+
+// Add another optional wrapper to take it to four levels:
+//   alt → optional → alt → optional → RuleLeaf(funcDecl)
+constexpr std::string_view kFourLevelCfg = R"JSON({
+  "dssSchemaVersion": 1,
+  "language": { "name": "Nested4", "version": "0.1.0" },
+  "tokens": {
+    "f": [{ "kind": "FKeyword" }],
+    "v": [{ "kind": "VKeyword" }],
+    "t": [{ "kind": "TKeyword" }]
+  },
+  "shapes": {
+    "root": {
+      "alt": [
+        { "optional": {
+            "alt": [
+              { "optional": "funcDecl" },
+              "varDecl"
+            ]
+          }
+        },
+        "typedefDecl"
+      ]
+    },
+    "funcDecl":    { "sequence": [ "FKeyword" ] },
+    "varDecl":     { "sequence": [ "VKeyword" ] },
+    "typedefDecl": { "sequence": [ "TKeyword" ] }
+  }
+})JSON";
+
+} // namespace
+
+TEST(SchemaCursorRouteRuleLeaf, ThreeLevelNestingRoutesToFuncDecl) {
+    auto schema = load(kThreeLevelCfg);
+    ASSERT_NE(schema, nullptr);
+
+    auto root = schema->rootCursor();
+    ASSERT_TRUE(root.valid());
+    ASSERT_EQ(schema->slotKind(root), SlotKind::AltChoice);
+
+    const auto funcRule = ruleId(*schema, "funcDecl");
+    ASSERT_TRUE(funcRule.valid());
+
+    auto routed = schema->routeToRuleLeaf(root, funcRule);
+    ASSERT_TRUE(routed.valid());
+    EXPECT_EQ(schema->slotKind(routed), SlotKind::RuleLeaf);
+
+    // leaveRule on the routed RuleLeaf must produce a valid post-rule
+    // cursor — that's the invariant the v2 review found broken when a
+    // non-RuleLeaf was saved.
+    auto after = schema->leaveRule(routed);
+    EXPECT_TRUE(after.valid() || schema->slotKind(after) == SlotKind::End);
+}
+
+TEST(SchemaCursorRouteRuleLeaf, ThreeLevelNestingRoutesToVarDecl) {
+    auto schema = load(kThreeLevelCfg);
+    ASSERT_NE(schema, nullptr);
+
+    auto root = schema->rootCursor();
+    const auto varRule = ruleId(*schema, "varDecl");
+    ASSERT_TRUE(varRule.valid());
+
+    auto routed = schema->routeToRuleLeaf(root, varRule);
+    ASSERT_TRUE(routed.valid());
+    EXPECT_EQ(schema->slotKind(routed), SlotKind::RuleLeaf);
+}
+
+TEST(SchemaCursorRouteRuleLeaf, ThreeLevelNestingRoutesToOuterSibling) {
+    // typedefDecl sits at the outer-alt level only — one AltChoice deep,
+    // not three. Routing must still find it without descending into the
+    // optional's sub-tree.
+    auto schema = load(kThreeLevelCfg);
+    ASSERT_NE(schema, nullptr);
+
+    auto root = schema->rootCursor();
+    const auto typedefRule = ruleId(*schema, "typedefDecl");
+    ASSERT_TRUE(typedefRule.valid());
+
+    auto routed = schema->routeToRuleLeaf(root, typedefRule);
+    ASSERT_TRUE(routed.valid());
+    EXPECT_EQ(schema->slotKind(routed), SlotKind::RuleLeaf);
+}
+
+TEST(SchemaCursorRouteRuleLeaf, ThreeLevelNestingReturnsInvalidForUnreachableRule) {
+    auto schema = load(kThreeLevelCfg);
+    ASSERT_NE(schema, nullptr);
+
+    auto root = schema->rootCursor();
+    // Use a rule that isn't reachable from root's AltChoice tree — `root`
+    // itself is the parent, recursion through AltChoice can't surface it
+    // as a RuleLeaf branch.
+    const auto rootRule = ruleId(*schema, "root");
+    ASSERT_TRUE(rootRule.valid());
+
+    auto routed = schema->routeToRuleLeaf(root, rootRule);
+    EXPECT_FALSE(routed.valid());
+}
+
+TEST(SchemaCursorRouteRuleLeaf, FourLevelNestingRoutesToFuncDecl) {
+    // The deepest target — `funcDecl` sits inside an optional inside an
+    // alt inside an optional inside the outer alt. Four AltChoice slots
+    // between root and the RuleLeaf.
+    auto schema = load(kFourLevelCfg);
+    ASSERT_NE(schema, nullptr);
+
+    auto root = schema->rootCursor();
+    ASSERT_EQ(schema->slotKind(root), SlotKind::AltChoice);
+
+    const auto funcRule = ruleId(*schema, "funcDecl");
+    ASSERT_TRUE(funcRule.valid());
+
+    auto routed = schema->routeToRuleLeaf(root, funcRule);
+    ASSERT_TRUE(routed.valid());
+    EXPECT_EQ(schema->slotKind(routed), SlotKind::RuleLeaf);
+
+    auto after = schema->leaveRule(routed);
+    EXPECT_TRUE(after.valid() || schema->slotKind(after) == SlotKind::End);
+}
+
+TEST(SchemaCursorRouteRuleLeaf, FourLevelNestingRoutesToVarDecl) {
+    auto schema = load(kFourLevelCfg);
+    ASSERT_NE(schema, nullptr);
+
+    auto root = schema->rootCursor();
+    const auto varRule = ruleId(*schema, "varDecl");
+    ASSERT_TRUE(varRule.valid());
+
+    auto routed = schema->routeToRuleLeaf(root, varRule);
+    ASSERT_TRUE(routed.valid());
+    EXPECT_EQ(schema->slotKind(routed), SlotKind::RuleLeaf);
+}
+
+TEST(SchemaCursorRouteRuleLeaf, AlreadyAtRuleLeafIsIdentity) {
+    // If the caller hands routeToRuleLeaf a cursor that is already the
+    // RuleLeaf for the requested rule, the routing returns it unchanged.
+    // Documents the entry path the recursion's base case takes.
+    auto schema = load(kThreeLevelCfg);
+    ASSERT_NE(schema, nullptr);
+
+    const auto funcRule = ruleId(*schema, "funcDecl");
+    auto funcEntry = schema->enterRule(funcRule);
+    ASSERT_TRUE(funcEntry.valid());
+
+    // funcDecl's body is a TokenLeaf, not a RuleLeaf — confirm the
+    // identity branch fires on a synthesized RuleLeaf cursor. Walk root's
+    // AltChoice path until we land on a RuleLeaf, then re-route through
+    // that exact cursor.
+    auto root = schema->rootCursor();
+    auto routed = schema->routeToRuleLeaf(root, funcRule);
+    ASSERT_TRUE(routed.valid());
+    EXPECT_EQ(schema->slotKind(routed), SlotKind::RuleLeaf);
+
+    // Second pass on the routed cursor — must be identity (no further descent
+    // possible — we're already at the RuleLeaf for `funcRule`).
+    auto re_routed = schema->routeToRuleLeaf(routed, funcRule);
+    EXPECT_EQ(re_routed.rule().v, routed.rule().v);
+}

@@ -107,7 +107,8 @@
       "Bash(py *)",
       "Bash(echo \"Re-check exit: $?\")",
       "Bash(echo \"check exit: $?\")",
-      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' ctest --test-dir build)"
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' ctest --test-dir build)",
+      "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\" --target dss_core_test_schema_cursor)"
     ]
   }
 }
