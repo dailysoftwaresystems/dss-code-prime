@@ -1692,6 +1692,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // Longest declared lexeme key — consumed by the tokenizer (TZ1+)
+    // to cap its longest-match probe length. Iterate every per-mode
+    // table too in case a mode-only token exceeds the main table's max.
+    data.maxLexemeLength = 0;
+    for (auto const& [lex, meanings] : data.lexemeTable) {
+        (void)meanings;
+        if (lex.size() > data.maxLexemeLength) data.maxLexemeLength = lex.size();
+    }
+    for (auto const& [modeId, table] : data.lexerModeTokens) {
+        (void)modeId;
+        for (auto const& [lex, meanings] : table) {
+            (void)meanings;
+            if (lex.size() > data.maxLexemeLength) data.maxLexemeLength = lex.size();
+        }
+    }
+
     if (coll.hasErrors()) {
         return std::unexpected(std::move(coll.diagnostics));
     }

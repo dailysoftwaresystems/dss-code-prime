@@ -92,7 +92,7 @@ TEST(TokenStream, RewindRepositionsCursor) {
     auto s = stream("var x");
     (void)s.advance();
     (void)s.advance();
-    EXPECT_GE(s.position(), 2u);
+    EXPECT_EQ(s.position(), 2u);   // var, ' ' consumed → exactly 2
     s.rewind(0);
     EXPECT_EQ(s.position(), 0u);
     EXPECT_EQ(s.peek().coreKind, CoreTokenKind::Word);
@@ -120,7 +120,8 @@ TEST(TokenStreamDeath, RestoreOnDefaultBookmarkAborts) {
     auto s = stream("var");
     TokenStream::Bookmark bm{};
     EXPECT_FALSE(bm.valid());
-    EXPECT_DEATH({ s.restore(bm); }, "default-constructed Bookmark");
+    EXPECT_DEATH({ s.restore(bm); },
+                 "dss::TokenStream fatal: restore on default-constructed Bookmark");
 }
 
 TEST(TokenStreamDeath, RestoreCrossInstanceAborts) {
@@ -129,7 +130,33 @@ TEST(TokenStreamDeath, RestoreCrossInstanceAborts) {
     auto bmA = a.mark();
     // bmA is owned by `a`; using it on `b` is the misuse the
     // owner-stamp guards against.
-    EXPECT_DEATH({ b.restore(bmA); }, "different TokenStream instance");
+    EXPECT_DEATH({ b.restore(bmA); },
+                 "dss::TokenStream fatal: restore on Bookmark from a different");
+}
+
+namespace {
+void peekOnDefault() {
+    TokenStream s;            // default-constructed: empty tokens_, id == 0
+    (void)s.peek();
+}
+void advanceOnMovedFrom() {
+    auto live = stream("var");
+    TokenStream gutted = std::move(live);   // `live` is now moved-from
+    (void)live.advance();
+}
+} // namespace
+
+TEST(TokenStreamDeath, DefaultConstructedPeekAborts) {
+    // SKILL.md's fail-loud discipline: default-constructed / moved-from
+    // streams must not silently succeed with UB. Guard fires before
+    // size()-1 underflow.
+    EXPECT_DEATH(peekOnDefault(),
+                 "dss::TokenStream fatal: operation on default-constructed or moved-from");
+}
+
+TEST(TokenStreamDeath, MovedFromAdvanceAborts) {
+    EXPECT_DEATH(advanceOnMovedFrom(),
+                 "dss::TokenStream fatal: operation on default-constructed or moved-from");
 }
 
 TEST(TokenStream, EmittedTokensHaveResolvedSchemaKind) {

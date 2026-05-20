@@ -180,14 +180,17 @@ TEST(Tokenizer, FloatLiteralWithFSuffixPromotesIntToFloat) {
 }
 
 TEST(Tokenizer, BareENotConsumedAsExponentWhenNoDigitFollows) {
-    // `1e+` is NOT a float — no digit after the sign. Tokenizer
-    // should emit `1` as IntLiteral and let `e+` be re-tokenized
-    // separately.
+    // `1e+` is NOT a float — no digit after the sign. Tokenizer emits
+    // exactly three tokens: IntLiteral("1"), Word("e"), Operator("+").
     auto h      = loadToy("1e+");
     auto result = lex(h);
-    ASSERT_GE(result.tokens.size(), 1u);
+    ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "1");
+    EXPECT_EQ(result.tokens[1].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "e");
+    EXPECT_EQ(result.tokens[2].coreKind, CoreTokenKind::Operator);
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "+");
 }
 
 TEST(Tokenizer, MemberAccessDotIsNotPartOfFloat) {
@@ -196,11 +199,78 @@ TEST(Tokenizer, MemberAccessDotIsNotPartOfFloat) {
     // `a` starts a word.
     auto h      = loadCSubset("3.foo");
     auto result = lex(h);
-    // Expected: IntLiteral("3"), Punctuation("."), Word("foo")
-    ASSERT_GE(result.tokens.size(), 3u);
+    // Expected: IntLiteral("3"), Punctuation("."), Word("foo") — exactly 3.
+    ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "3");
     EXPECT_EQ(textOf(*h.src, result.tokens[2]), "foo");
+}
+
+TEST(Tokenizer, HexLiteralLexedAsOneIntToken) {
+    // `0xff` MUST become one IntLiteral, not `0` + identifier `xff`.
+    auto h      = loadCSubset("0xff");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0xff");
+}
+
+TEST(Tokenizer, HexLiteralWithUnderscoreSeparators) {
+    auto h      = loadCSubset("0xDEAD_BEEF");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0xDEAD_BEEF");
+}
+
+TEST(Tokenizer, BinaryLiteralLexedAsOneIntToken) {
+    auto h      = loadCSubset("0b1010_0101");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b1010_0101");
+}
+
+TEST(Tokenizer, OctalLiteralLexedAsOneIntToken) {
+    auto h      = loadCSubset("0o755");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0o755");
+}
+
+TEST(Tokenizer, ZeroFollowedByLetterIsNotHexUnlessLetterIsValidDigit) {
+    // `0xy` is NOT a hex literal because `y` isn't a hex digit. The
+    // tokenizer falls back to plain decimal `0`, then `xy` as a word.
+    auto h      = loadCSubset("0xy");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0");
+    EXPECT_EQ(result.tokens[1].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "xy");
+}
+
+TEST(Tokenizer, NumericSuffixRestrictedToTypeLetters) {
+    // `123abc` was a single-token regression risk pre-review-fix. The
+    // suffix scanner now only accepts u/U/l/L/f/F/d/D, so `123abc`
+    // becomes `123` (Int) + `abc` (Word).
+    auto h      = loadCSubset("123abc");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "123");
+    EXPECT_EQ(result.tokens[1].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "abc");
+}
+
+TEST(Tokenizer, IntegerWithULSuffixStillIntegerKind) {
+    // `42ull` — recognised C unsigned-long-long suffix. Stays IntLiteral.
+    auto h      = loadCSubset("42ull");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42ull");
 }
 
 // ── operators / punctuation ───────────────────────────────────────────────
@@ -277,6 +347,46 @@ TEST(Tokenizer, MultipleIllegalCharsEmitSeparateTokensAndDiagnostics) {
     EXPECT_EQ(result.diags.size(), 3u);
 }
 
+// ── UTF-8 ─────────────────────────────────────────────────────────────────
+
+TEST(Tokenizer, Utf8BomAtStartIsSkippedSilently) {
+    // Some editors prepend the UTF-8 BOM (EF BB BF). The tokenizer
+    // must NOT treat it as a 3-byte identifier (the prior `isIdStart`
+    // accepted any byte ≥ 0x80). Source "\xEF\xBB\xBFvar" should
+    // tokenize as just `var`.
+    auto h      = loadToy("\xEF\xBB\xBF""var");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "var");
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, LoneUtf8ContinuationByteIsIllegal) {
+    // 0xA9 alone (a continuation byte appearing without a leading byte)
+    // is malformed UTF-8. Tokenizer emits Error + P_IllegalChar rather
+    // than silently classifying it as an identifier.
+    auto h      = loadToy("\xA9");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Error);
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_IllegalChar);
+}
+
+TEST(Tokenizer, MultiByteUtf8IdentifierAcceptedAsOneToken) {
+    // A 2-byte UTF-8 sequence (`é` = C3 A9) is a valid identifier in
+    // the byte-pass-through model — the schema's lexeme keys are byte
+    // strings, so multi-byte chars in identifiers are accepted as one
+    // contiguous Word token.
+    auto h      = loadToy("\xC3\xA9x");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "\xC3\xA9x");
+    EXPECT_TRUE(result.diags.empty());
+}
+
 // ── integration: real source ──────────────────────────────────────────────
 
 TEST(Tokenizer, FullVarDeclProducesExpectedStream) {
@@ -327,10 +437,12 @@ void makeWithNullSchema(std::shared_ptr<SourceBuffer> src) {
 TEST(TokenizerDeath, NullSourceAborts) {
     auto loaded = GrammarSchema::loadShipped("toy");
     ASSERT_TRUE(loaded.has_value());
-    EXPECT_DEATH(makeWithNullSource(*loaded), "source is null");
+    EXPECT_DEATH(makeWithNullSource(*loaded),
+                 "dss::Tokenizer fatal: source is null");
 }
 
 TEST(TokenizerDeath, NullSchemaAborts) {
     auto src = SourceBuffer::fromString("", "<test>");
-    EXPECT_DEATH(makeWithNullSchema(src), "schema is null");
+    EXPECT_DEATH(makeWithNullSchema(src),
+                 "dss::Tokenizer fatal: schema is null");
 }

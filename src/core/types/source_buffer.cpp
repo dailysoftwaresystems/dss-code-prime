@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -16,6 +19,24 @@ namespace {
 std::uint32_t nextBufferIdValue() {
     static std::atomic<std::uint32_t> counter{0};
     return ++counter;
+}
+
+[[noreturn]] void bufferFatal(char const* what) {
+    std::fputs("dss::SourceBuffer fatal: ", stderr);
+    std::fputs(what, stderr);
+    std::fputc('\n', stderr);
+    std::abort();
+}
+
+// SourceSpan stores offsets as `ByteOffset` (alias for `uint32_t`) —
+// see `source_span.hpp` for the 4 GiB cap documentation. A buffer that
+// exceeds that cap would mint spans whose offsets silently wrap, so
+// the limit must be enforced at construction. Reject loudly rather
+// than let a 4-GiB-plus source mis-tokenize half-way through.
+void enforceSizeLimit(std::size_t n) {
+    if (n > std::numeric_limits<std::uint32_t>::max()) {
+        bufferFatal("source exceeds 4 GiB ByteOffset limit");
+    }
 }
 
 // Precomputes byte offsets of each line start. Handles \n, \r\n, and lone \r
@@ -54,14 +75,17 @@ std::shared_ptr<SourceBuffer> SourceBuffer::fromFile(std::filesystem::path const
     }
     std::ostringstream buf;
     buf << in.rdbuf();
+    auto contents = std::move(buf).str();
+    enforceSizeLimit(contents.size());
     // Use new-delete-friendly construction since the constructor is private.
     return std::shared_ptr<SourceBuffer>(
         new SourceBuffer(BufferId{nextBufferIdValue()},
-                         std::move(buf).str(),
+                         std::move(contents),
                          path.string()));
 }
 
 std::shared_ptr<SourceBuffer> SourceBuffer::fromString(std::string text, std::string name) {
+    enforceSizeLimit(text.size());
     return std::shared_ptr<SourceBuffer>(
         new SourceBuffer(BufferId{nextBufferIdValue()},
                          std::move(text),

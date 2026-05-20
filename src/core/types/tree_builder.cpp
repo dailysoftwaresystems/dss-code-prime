@@ -471,22 +471,41 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
             && meaningAllowedByScopeRequire(m, scopes);
     };
 
-    // Fast path: tokenizer pre-resolved a `schemaKind`. Skip the
-    // priority scan; if the named meaning survives the scope filter,
-    // it's the winner. Otherwise fall through to the full scan so a
-    // scope-rejected pre-resolution doesn't break multi-meaning
-    // disambiguation (e.g. toy's `<` outside vs inside Generic scope).
+    // Fast path: tokenizer pre-resolved a `schemaKind`. Find the named
+    // meaning, confirm it survives the scope filter, then still run the
+    // same-priority ambiguity scan the slow path runs — bypassing the
+    // priority scan must NOT bypass the P_AmbiguousToken warning the
+    // builder would otherwise emit.
+    //
+    // Falls through to the full scan when the fast-path can't satisfy
+    // its winner (preResolved missing from candidates OR scope-
+    // rejected) — that keeps multi-meaning-with-scope cases like toy's
+    // `<` outside-vs-inside-Generic working correctly.
     if (preResolved.valid()) {
-        for (auto const& m : candidates) {
-            if (m.id == preResolved) {
-                if (candidateAllowed(m)) {
-                    out.meaning    = m;
-                    out.matchCount = 1;
-                    return out;
-                }
-                break;   // matched the id but scope-rejected — full scan
+        std::optional<std::size_t> winnerIdx;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (candidates[i].id == preResolved && candidateAllowed(candidates[i])) {
+                winnerIdx = i;
+                break;
             }
         }
+        if (winnerIdx) {
+            out.meaning    = candidates[*winnerIdx];
+            out.matchCount = 1;
+            // Same-priority ambiguity check — first declared still
+            // wins (consistent with the slow path), but the warning
+            // surfaces so the config author can disambiguate.
+            for (std::size_t i = *winnerIdx + 1; i < candidates.size(); ++i) {
+                if (candidates[i].priority != out.meaning.priority) break;
+                if (candidateAllowed(candidates[i])) {
+                    out.ambiguous = true;
+                    break;
+                }
+            }
+            return out;
+        }
+        // preResolved missing-or-rejected — fall through to the full
+        // scan so scope-driven multi-meaning resolution still works.
     }
 
     // Candidates arrive pre-sorted by priority (lowest first, stable on

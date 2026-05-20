@@ -196,6 +196,12 @@ struct DSS_EXPORT GrammarSchemaData {
     // `m` was copied out of a different schema. Allocated by the loader
     // before any LexemeMeaning is populated.
     SchemaId                                          id{};
+
+    // Longest declared lexeme key, in bytes. Computed by the loader
+    // once `lexemeTable` is finalized; consumed by the tokenizer to
+    // cap its longest-match probe length. Zero only for a schema with
+    // no declared `tokens` entries.
+    std::size_t                                       maxLexemeLength = 0;
 };
 
 } // namespace detail
@@ -228,6 +234,12 @@ public:
     // ── Token recognition ──
     [[nodiscard]] std::span<LexemeMeaning const> lookupLexeme(std::string_view lexeme) const noexcept;
     [[nodiscard]] bool isEmptySpace(SchemaTokenId id) const noexcept;
+
+    // Longest declared lexeme key in bytes — used by the tokenizer to
+    // bound its longest-match probe length so 5+ char lexemes can't
+    // silently truncate. Computed at load time; zero only for an
+    // empty lexemeTable.
+    [[nodiscard]] std::size_t maxLexemeLength() const noexcept { return d_.maxLexemeLength; }
 
     // ── Operators ──
     [[nodiscard]] OperatorTable const& operatorTable() const noexcept { return d_.operators; }
