@@ -6,7 +6,7 @@
 
 | | |
 |---|---|
-| Status        | 🔵 **in progress.** TZ1 pending. |
+| Status        | 🔵 **in progress.** TZ1 shipped (bare tokenizer + toy.lang.json E2E flip; 576 cases / 29 suites). TZ2 next. |
 | Predecessors  | ✅ v1 T0–T12 (`tree-node-model-plan.md`); ✅ v2 PR0–PR8 (`schema-expressiveness-v2-plan.md`); ✅ SH1–SH4 (`substrate-hardening-plan.md`). |
 | Successors    | Master plan phase #6 (`analysis-lexical`) **subsumed** into this plan + builder — the v2 schema-aware builder already does the validation phase 6 was envisioned for. Master plan phase #7 (`analysis-syntactic`) becomes the next-up phase once TZ3 lands. |
 | Scope         | **Bounded.** TZ1: bare tokenizer + toy.lang.json. TZ2: lexer modes + strings + comments. TZ3: c-subset + tsql-subset end-to-end. Anything new (interpolated strings, `schema-expressiveness-v3-plan.md`-class gaps surfaced by TZ3) becomes a separate sub-plan. |
@@ -15,7 +15,7 @@
 
 | PR | Status | Commit / notes |
 |---|---|---|
-| TZ1 | ⏳ pending | Bare tokenizer skeleton (`src/tokenizer/`) — `SourceReader` + `Tokenizer` + `TokenStream`. Whitespace, single-char punctuation, identifiers/keywords, integer + float literals (hand-coded), Eof. No lexer modes, no string styles, no comments. Existing `test_tree_end_to_end.cpp` tests flip from hand-tokenization to real tokenization against `toy.lang.json`. <!-- LANDING-LOG-HASHES: TZ1 --><!-- /LANDING-LOG-HASHES --> |
+| TZ1 | ✅ done | Bare tokenizer skeleton (`src/tokenizer/`) — `SourceReader` + `Tokenizer` + `TokenStream`. Whitespace, single-char punctuation, identifiers/keywords, integer + float literals (hand-coded), Eof. No lexer modes, no string styles, no comments. `Token.schemaKind` ownership moved from builder to tokenizer; `Builder.pushToken` gains a fast-path that trusts `tok.schemaKind` when scope-allowed, falls back to full lookup otherwise. New diagnostic code `P_IllegalChar`. Existing `test_tree_end_to_end.cpp` (9 tests) flipped from hand-tokenization to real tokenization against `toy.lang.json` — all pass identically. 45 new tokenizer unit tests across 3 suites. 576 ctest cases / 29 suites, 100% pass. <!-- LANDING-LOG-HASHES: TZ1 -->`5d1d95d`<!-- /LANDING-LOG-HASHES --> |
 | TZ2 | ⏳ pending | Lexer modes + strings + comments. Tokenizer owns a `LexerModeStack`; mode-aware `lookupLexemeInMode` for token resolution; per-char `defaultToken` in non-main modes; `stringStyle` handling for delimited bodies (`endsAt`, `escapeKind`, `endsAtLongestMatch`, dynamic `tagPattern`); comment modes follow the same pattern. `c-subset.lang.json` gains a `line-comment` + `block-comment` mode (closes `v2-gap-catalog.md` row 3's authoring task). <!-- LANDING-LOG-HASHES: TZ2 --><!-- /LANDING-LOG-HASHES --> |
 | TZ3 | ⏳ pending | All-language end-to-end. Every existing E2E test flipped from hand-tokenization to real tokenization: `toy`, `c-subset` (incl. SH4b's switch shapes), `tsql-subset` (three lexer modes, doubled-delimiter strings, bracket-quoted identifiers, three-part qualified names). Surfaces any v3-candidate schema gaps (interpolation, non-C float syntax, `endsAt: longestMatch` corner cases) as `v2-gap-catalog.md` § entries. <!-- LANDING-LOG-HASHES: TZ3 --><!-- /LANDING-LOG-HASHES --> |
 
