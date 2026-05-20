@@ -30,3 +30,28 @@ jobs:
     secrets:
       DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
       DSS_BOTS_APP_PRIVATE_KEY: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}
+
+  # Catches the recurring "missing commit hash in landing log" bug class
+  # by regenerating the hash anchors from `git log` and failing if they
+  # drift from what's checked in. See .plans/substrate-hardening-plan.md
+  # SH1 (the tool) and SH4a (this job). Intentionally ungated by the
+  # `Run Pipes` label — plan-doc hygiene matters on every PR.
+  landing-log-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # `tools/refresh_landing_log.py` shells `git log` to find PR
+          # commits; shallow clones return only HEAD and silently miss
+          # every prior landing, producing a false drift signal.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run unit tests
+        run: python tools/test_refresh_landing_log.py
+
+      - name: Check landing-log hash anchors
+        run: python tools/refresh_landing_log.py --check

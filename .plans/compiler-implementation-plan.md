@@ -5,7 +5,7 @@
 >
 > - **[`tree-node-model-plan.md`](./tree-node-model-plan.md)** — the tree/node data structure, `GrammarSchema` config loader, `TreeBuilder`, diagnostics. **Supersedes** the relevant pieces of §4.2.2 (`ast.hpp`), §4.3 (config JSON shape), §4.4 (`source-factory/` internals), §4.5 (tokenizer trivia handling), and §4.6.2 (parser/AST construction) of this document. Where this document and the sub-plan disagree, **the sub-plan wins**; in-line `> AMENDED:` notes in the sections below redirect readers.
 > - **[`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md)** — additive extensions to the v1 schema for operator precedence, contextual keywords, scope-stack patterns, speculative `alt`, string interpolation, and custom string-literal variants. **✅ done.** PR0 (c-subset + gap catalog), PR1 (operator precedence), PR2a (real `SchemaCursor` walker), PR2b (contextual keywords + `reservedWordPolicy`), PR3 (`scopeRequire`), PR4 (`TreeBuilder::Checkpoint` + speculative-alt loader plumbing), PR5 (`lexerModes` + `LexerModeStack` + `modeOp`), PR6 (`stringStyle` + `SchemaId`/`StringStyleId` strong ids), PR7 (tsql-subset stress test proving v2 is empirically sufficient), PR8 (cross-plan close-out) all shipped + review-fixed. Unlocks the eventual `languages-onboarding-plan.md`.
-> - **[`substrate-hardening-plan.md`](./substrate-hardening-plan.md)** — three small de-risking PRs that land **between v2 and the tokenizer phase**: SH1 landing-log generator (kills the recurring hash-backfill bug class), SH2 Linux CI matrix entry (verifies the cross-platform claim), SH3 cross-tree `NodeId` guard (closes the documented `tree-model.md` §5.10 caveat). **✅ done.** SH2 satisfied by `DSS.DevOps@v2` (multi-OS matrix default-enabled; macOS opted in here). SH3 ships `NodeId.treeTag` + tag-validation in `NodeAttribute<T>` / `Tree::node_`. SH1 ships `tools/refresh_landing_log.py` with paired markers and a section gate. Parent phase #5 (tokenizer) is now unblocked.
+> - **[`substrate-hardening-plan.md`](./substrate-hardening-plan.md)** — originally three small de-risking PRs that land **between v2 and the tokenizer phase**: SH1 landing-log generator, SH2 Linux CI matrix, SH3 cross-tree `NodeId` guard. **🔵 in progress.** SH1–SH3 shipped. SH4 (v2 follow-ups: CI hygiene + c-subset `scopeRequire` adoption + multi-level AltChoice nesting stress test) lands next, then parent phase #5 (tokenizer) opens.
 >
 > See §8 (Implementation Phases) for the current cross-plan dependency view.
 
@@ -17,9 +17,9 @@
 | Core types — full sub-plan T0–T12 (tree/node/diagnostics/schema + `TreeBuilder` + `TreeCursor` + `tree_visitor` + `NodeAttribute<T>` + typed views + E2E + CMake wireup + onboarding docs) | ✅ **complete** |
 | Schema expressiveness v2 (sub-plan PR0–PR8) — c-subset + operator precedence (`OperatorTable`) + real `SchemaCursor` walker + contextual keywords + `scopeRequire` + `TreeBuilder::Checkpoint` + `lexerModes`/`LexerModeStack`/`modeOp` + `stringStyle` descriptor + tsql-subset empirical stress + cross-plan close-out | ✅ **done** — all 10 PRs (PR0, PR1, PR2a, PR2b, PR3–PR8) shipped + review-fixed |
 | **Total ctest cases (post SH3)** | **523 cases across 26 suites, 100% pass** |
-| Substrate hardening (sub-plan SH1–SH3) — landing-log generator + Linux CI matrix + cross-tree `NodeId` guard | ✅ **done** — all three PRs shipped. Parent phase #5 (tokenizer) unblocked. |
+| Substrate hardening (sub-plan SH1–SH4) — landing-log generator + Linux CI matrix + cross-tree `NodeId` guard + v2 follow-ups | 🔵 **in progress** — SH1/SH2/SH3 shipped; SH4 (CI hygiene + `scopeRequire` adoption + multi-level AltChoice nesting test) pending. |
 | `source-factory/` thin facade | ⏳ waiting on remaining core-types work |
-| `tokenizer/` + `analysis/{lexical,syntactic,semantic}/` | 🔵 **next** — Substrate Hardening done; tokenizer phase opens |
+| `tokenizer/` + `analysis/{lexical,syntactic,semantic}/` | ⏳ blocked on SH4 |
 | `gen/intermediate/` + `gen/optimizer/` | ⏳ pending |
 | `gen/link/` Windows PE demo | 🟦 standalone (not yet IR-driven) |
 | `program/` driver | 🟦 skeleton with `--demo-gui` (compile* methods are TODO) |

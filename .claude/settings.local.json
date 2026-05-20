@@ -89,7 +89,25 @@
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tsql_subset.exe\" 2>&1 | Select-Object -Last 40)",
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tsql_subset.exe\" --gtest_filter=TsqlSubset.SimpleSelectStar 2>&1 | Select-Object -Last 15)",
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tsql_subset.exe\" --gtest_filter=TsqlSubset.SelectFromQualifiedThreePartName 2>&1 | Select-Object -Last 5)",
-      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tsql_subset.exe\" 2>&1 | Select-String \"FAILED|PASSED\" | Select-Object -Last 5)"
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tsql_subset.exe\" 2>&1 | Select-String \"FAILED|PASSED\" | Select-Object -Last 5)",
+      "Bash(cmake --build C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build)",
+      "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\")",
+      "Bash(ctest --test-dir \"C:/Source/DailySoftware/dss-code-prime/build\" --output-on-failure)",
+      "Bash(\"C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_core_test_strong_ids.exe\")",
+      "Bash(\"C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_core_test_tree.exe\")",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\" --clean-first --target dss_core_test_tree)",
+      "Bash(objdump -p dss_core_test_tree.exe)",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' ./dss_core_test_tree.exe)",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' ctest --test-dir C:/Source/DailySoftware/dss-code-prime/build --output-on-failure)",
+      "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\" --target dss_core_test_tree_attrs)",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' ctest --test-dir C:/Source/DailySoftware/dss-code-prime/build)",
+      "Bash(python -c \"import unittest; print\\('unittest OK'\\)\")",
+      "Bash(py --version)",
+      "Bash(py *)",
+      "Bash(echo \"Re-check exit: $?\")",
+      "Bash(echo \"check exit: $?\")",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' ctest --test-dir build)"
     ]
   }
 }

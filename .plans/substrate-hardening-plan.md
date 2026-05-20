@@ -6,10 +6,10 @@
 
 | | |
 |---|---|
-| Status        | ✅ **done.** SH1, SH2, SH3 all shipped. Successor: parent plan #5 (`tokenizer`) is now unblocked. |
+| Status        | 🔵 **in progress.** SH1, SH2, SH3 shipped. SH4 (v2 follow-ups: CI hygiene + adopted-mechanism gaps) lands next, then parent plan #5 (`tokenizer`) opens. |
 | Predecessors  | ✅ v1 T0–T12 (`tree-node-model-plan.md`); ✅ v2 PR0–PR8 (`schema-expressiveness-v2-plan.md`). |
 | Successors    | Parent plan phase #5 (tokenizer). Cleanly verifying the schema against real tokens is what makes phase #7 (parser) tractable and what surfaces v3 schema gaps in time to act on them. |
-| Scope         | **Bounded.** SH1: landing-log generator. SH2: Linux CI matrix entry. SH3: cross-tree NodeId guard. No other items will be added to this plan — anything new becomes a separate sub-plan. |
+| Scope         | Originally bounded to SH1–SH3 (de-risking). SH4 extends the plan by **explicit user direction** to bundle three small v2-era follow-ups — close-out tightening rather than new substrate work. Anything beyond SH4 still becomes a separate sub-plan. |
 
 ### PR landing log
 
@@ -17,7 +17,8 @@
 |---|---|---|
 | SH2 | ✅ done | Multi-OS matrix already shipped by `DSS.DevOps@v2` (`cpp-app-pr.yml`): Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, all default-enabled and green on recent PRs. This PR opts the consumer wiring into the `run-macos` leg (AppleClang on Homebrew LLVM). <!-- LANDING-LOG-HASHES: SH2 -->`ab0800e`<!-- /LANDING-LOG-HASHES --> |
 | SH3 | ✅ done | `NodeId` grew an 8-byte `treeTag` field; `TreeBuilder` mints `TreeId` eagerly at ctor and stamps every emitted id; `NodeAttribute<T>::validateId_` + `Tree::node_` abort on tag mismatch with both ids in the message. 523 ctest cases / 26 suites still 100% pass; 14 new death tests added. <!-- LANDING-LOG-HASHES: SH3 -->`ac76408`<!-- /LANDING-LOG-HASHES --> |
-| SH1 | ✅ done | `tools/refresh_landing_log.py` regenerates hash anchors in landing-log tables from `git log`, gated by paired `<!-- LANDING-LOG-HASHES: <PR> -->...<!-- /LANDING-LOG-HASHES -->` markers and a `### PR landing log` section gate so prose references to the marker format aren't mistaken for live anchors. `tools/landing-log-config.json` maps each plan to a commit-subject regex. `--check` is the CI gate (exits non-zero on drift); `--write` applies the rewrite. 20 stdlib-only unittests cover render shapes, idempotency, section gating, missing-close-marker insertion, cross-line containment. <!-- LANDING-LOG-HASHES: SH1 --><!-- /LANDING-LOG-HASHES --> |
+| SH1 | ✅ done | `tools/refresh_landing_log.py` regenerates hash anchors in landing-log tables from `git log`, gated by paired `<!-- LANDING-LOG-HASHES: <PR> -->...<!-- /LANDING-LOG-HASHES -->` markers and a `### PR landing log` section gate so prose references to the marker format aren't mistaken for live anchors. `tools/landing-log-config.json` maps each plan to a commit-subject regex. `--check` is the CI gate (exits non-zero on drift); `--write` applies the rewrite. 20 stdlib-only unittests cover render shapes, idempotency, section gating, missing-close-marker insertion, cross-line containment. <!-- LANDING-LOG-HASHES: SH1 -->`05d5c80`<!-- /LANDING-LOG-HASHES --> |
+| SH4 | ⏳ pending | v2 follow-ups: (a) wire `tools/refresh_landing_log.py --check` into PR CI as a separate job (SH1's named "out of scope" follow-up); (b) adopt `scopeRequire` in `c-subset.lang.json` for `case`/`default` inside `switch` (v2-gap-catalog row 11); (c) multi-level AltChoice nesting stress test pinning `routeToRuleLeaf` past two levels (v2-gap-catalog §7 row 21). <!-- LANDING-LOG-HASHES: SH4 --><!-- /LANDING-LOG-HASHES --> |
 
 ---
 
@@ -136,15 +137,73 @@ Why `NodeId` carries the tag rather than just the `Node` (as the plan's Option A
 
 ---
 
+### SH4 — v2 follow-ups (CI hygiene + adopted-mechanism gaps)
+
+**Goal.** Close three small v2-era loose ends before the tokenizer phase opens. Each item is independent; bundled into one PR because individually they're not worth a round-trip.
+
+**Why now (deviation from the "bounded" §0 promise).** The original SH plan declared "no other items will be added — anything new becomes a separate sub-plan." SH4 is added by **explicit user direction** after surveying `.plans/v2-gap-catalog.md` against the now-shipped substrate. All three items are close-out cleanup of mechanisms that already exist; none is new substrate work and none warrants a standalone sub-plan.
+
+#### SH4a — `landing-log-check` CI job
+
+SH1's named "out of scope" follow-up. SH1 shipped the tool; SH4a runs it in CI.
+
+**Surface.**
+- `.github/workflows/pipeline-pr.yml`: add a `landing-log-check` job alongside the existing `pipeline-pr` reusable-workflow call. Runs on `ubuntu-latest`, checks out with `fetch-depth: 0` (the script needs full git history for `git log`), sets up Python 3, runs `python tools/refresh_landing_log.py --check`. Exits non-zero on drift, surfacing the diff in the Actions log.
+- No gate on the `Run Pipes` label — plan-doc hygiene matters even for label-less PRs.
+
+**Acceptance.** Pushing a PR with a stale landing-log hash fails the new check; running `python tools/refresh_landing_log.py --write` locally + pushing the diff makes it pass.
+
+**Out of scope.** Wiring `--check` into the DSS.DevOps reusable workflow itself (cross-repo; the consumer wiring is the cleanest seam).
+
+#### SH4b — Adopt `scopeRequire` for `switch`/`case` in `c-subset.lang.json`
+
+Closes v2-gap-catalog row 11. PR3 shipped the mechanism (`scopeRequire: { topMustBe: "Switch" }`); c-subset never adopted it because the `switch` statement was omitted from PR0's conservative cut.
+
+**Surface.**
+- `src/source-config/languages/c-subset.lang.json`: add `SwitchKeyword`, `CaseKeyword`, `DefaultKeyword`, `ColonOp` if not present; add `shapes/switchStmt`; declare a `Switch` scope kind via `opensScope`/`closesScope` on `switch (` and the matching `)` / `{` / `}` (modeled on how `block` opens `Block`); mark `case`/`default` token meanings with `scopeRequire: { topMustBe: "Switch" }`.
+- `tests/core/test_c_subset.cpp`: at least two new tests:
+  - `SwitchStmtParsesHappyPath` — full switch with two case arms and a default, asserts via pretty-print equality.
+  - `CaseOutsideSwitchIsRejected` — `case 1: foo;` at top-level produces a diagnostic (the exact code is whatever `scopeRequire` emits today — likely `P_UnexpectedToken` or a tag-specific code; pin it in the test).
+
+**Acceptance.** End-to-end test pins both happy path AND the abort path; existing c-subset tests stay green.
+
+**Out of scope.** Statement-body shape inside `case` (probably `statement*` until the next case-or-`}` — mirrors C's case-fallthrough semantics). Full `break` flow analysis (semantic-pass concern).
+
+#### SH4c — Multi-level AltChoice nesting stress test
+
+Closes v2-gap-catalog §7 row 21. PR2b review flagged `routeToRuleLeaf` as "untested past two levels of nested AltChoice." Substrate is small now; cheaper to write the stress test now than rediscover the bug from the parser phase.
+
+**Surface.**
+- `tests/core/test_schema_cursor.cpp` (or a new `test_grammar_schema_nested_alt.cpp` if scope grows): author an inline `.lang.json` config with the grammar shape:
+
+  ```
+  root  → topLevel*
+  topLevel → alt(optional(alt(funcDecl | varDecl)) | typedef)
+  funcDecl → ...
+  varDecl  → ...
+  typedef  → ...
+  ```
+
+  Then drive a `TreeBuilder` through each of the three reachable rule leaves and assert `routeToRuleLeaf` produced a valid `SchemaCursor` after `open()` in every case (cursor `valid() == true`; the saved RuleLeaf for `leaveRule` matches the entered rule).
+- At least one negative case: drive the builder through a token sequence that doesn't match any nested alt branch, assert one-shot `P_SchemaCursorDesync` fires exactly once (the existing one-shot latch should still work at three levels).
+
+**Acceptance.** New test pins multi-level routing; the rest of test_schema_cursor.cpp stays green.
+
+**Out of scope.** Fixing any bug the test surfaces — if `routeToRuleLeaf` does NOT walk past two levels, that becomes a follow-up commit on the same PR (small fix in `grammar_schema.cpp`). The plan budgets 2-4 hours for this item.
+
+---
+
 ## 3. Sequencing
 
-SH1, SH2, SH3 are independent — any order works. Original recommended order: **SH2 first** (cross-platform safety net), then **SH3**, then **SH1** (dogfoods itself). With SH2 collapsed to a no-op (matrix already shipped upstream), realised order is **SH2 → SH3 → SH1**.
+SH1, SH2, SH3 were independent — any order worked. Realised order: SH2 → SH3 → SH1.
+
+SH4's three sub-items are also independent: SH4a (CI YAML), SH4b (config + test), SH4c (test). Recommended order within SH4: **SH4a first** (smallest, lowest risk — green CI signal protects the rest), then **SH4c** (test-only, no production code), then **SH4b** (touches the c-subset config + adds end-to-end tests). One commit per sub-item, all on the `feature/substrate-hardening` branch, then SH4 closes out the plan.
 
 Per-PR cadence reuses the v2 discipline: implement → 5-agent review → comprehensive fix-all → cross-plan refresh → commit.
 
 ## 4. What comes after
 
-Once SH1–SH3 land:
+Once SH1–SH4 all land:
 - `compiler-implementation-plan.md` §0 status table: SH row flips to ✅ done.
-- Parent plan phase #5 (tokenizer) opens. The lexer can now be the *first* consumer of the schema with confidence that the substrate beneath it is verified across two platforms with no cross-tree footguns.
-- v2 schema gaps that the tokenizer surfaces (lookahead variants, custom literal patterns, etc.) become candidates for a future `schema-expressiveness-v3-plan.md`.
+- Parent plan phase #5 (tokenizer) opens. The lexer can now be the *first* consumer of the schema with confidence that the substrate beneath it is verified across two platforms with no cross-tree footguns AND that nested-alt routing is robust under stress AND that the existing PR3 scope-require mechanism is exercised end-to-end by a real grammar.
+- v2 schema gaps that the tokenizer surfaces (lookahead variants, custom literal patterns, float-literal styling, ternary operator) become candidates for a future `schema-expressiveness-v3-plan.md`.
