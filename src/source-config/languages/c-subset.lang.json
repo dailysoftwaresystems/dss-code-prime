@@ -21,6 +21,7 @@
 
     ";":  [{ "kind": "EndStatement" }],
     ",":  [{ "kind": "Comma" }],
+    ":":  [{ "kind": "Colon" }],
 
     "=":  [{ "kind": "AssignOp" }],
     "+":  [{ "kind": "PlusOp"   }],
@@ -69,12 +70,16 @@
     { "word": "char",   "kind": "CharKeyword"   },
     { "word": "const",  "kind": "ConstKeyword"  },
 
-    { "word": "if",     "kind": "IfKeyword"     },
-    { "word": "else",   "kind": "ElseKeyword"   },
-    { "word": "while",  "kind": "WhileKeyword"  },
-    { "word": "do",     "kind": "DoKeyword"     },
-    { "word": "for",    "kind": "ForKeyword"    },
-    { "word": "return", "kind": "ReturnKeyword" }
+    { "word": "if",      "kind": "IfKeyword"      },
+    { "word": "else",    "kind": "ElseKeyword"    },
+    { "word": "while",   "kind": "WhileKeyword"   },
+    { "word": "do",      "kind": "DoKeyword"      },
+    { "word": "for",     "kind": "ForKeyword"     },
+    { "word": "return",  "kind": "ReturnKeyword"  },
+    { "word": "switch",  "kind": "SwitchKeyword"  },
+    { "word": "case",    "kind": "CaseKeyword"    },
+    { "word": "default", "kind": "DefaultKeyword" },
+    { "word": "break",   "kind": "BreakKeyword"   }
   ],
 
   "shapes": {
@@ -147,6 +152,8 @@
         "whileStmt",
         "doStmt",
         "forStmt",
+        "switchStmt",
+        "breakStmt",
         "returnStmt",
         "exprStmt"
       ]
@@ -200,6 +207,28 @@
         "EndStatement"
       ]
     },
+
+    "breakStmt": { "sequence": [ "BreakKeyword", "EndStatement" ] },
+
+    "switchStmt": {
+      "sequence": [
+        "SwitchKeyword",
+        "ParenOpen", "expression", "ParenClose",
+        "BlockOpen",
+        { "repeat": "switchBodyItem" },
+        "BlockClose"
+      ]
+    },
+
+    "switchBodyItem": { "alt": [ "caseLabel", "statement" ] },
+
+    "caseLabel": {
+      "alt": [
+        { "sequence": [ "CaseKeyword", "expression", "Colon" ] },
+        { "sequence": [ "DefaultKeyword", "Colon" ] }
+      ]
+    },
+
 
     "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
 

@@ -39,6 +39,17 @@ namespace detail::attr {
     std::abort();
 }
 
+// Cross-tree variant — emits both TreeIds so death-test regex can pin
+// both numbers without parsing pointer addresses.
+[[noreturn]] inline void crossTreeFatal(std::uint32_t boundTreeId, std::uint32_t idTreeTag) {
+    std::fputs("dss::NodeAttribute fatal: ", stderr);
+    std::fprintf(stderr,
+                 "NodeAttribute bound to TreeId=%u got NodeId from TreeId=%u",
+                 boundTreeId, idTreeTag);
+    std::fputc('\n', stderr);
+    std::abort();
+}
+
 // Sparse → dense once coverage reaches kPromoteCoverageNumer /
 // kPromoteCoverageDenom (50%). Below kPromoteFloor nodes, stay sparse —
 // dense's per-slot std::optional<T> overhead dominates on tiny trees.
@@ -182,6 +193,12 @@ private:
             detail::attr::attrFatal("invalid NodeId (NodeId{} sentinel)");
         if (id.v >= tree_->nodeCount())
             detail::attr::attrFatal("NodeId out of bounds for bound Tree");
+        // Untagged NodeId (treeTag == 0) passes — preserves the existing
+        // test ergonomics of literal `NodeId{N}`. A non-zero tag that
+        // differs from the bound tree's id means the caller pulled this
+        // NodeId from a different Tree; fail loud with both ids.
+        if (id.treeTag != 0 && id.treeTag != treeId_.v)
+            detail::attr::crossTreeFatal(treeId_.v, id.treeTag);
     }
 
     template <typename Self>
@@ -262,7 +279,13 @@ public:
             return value_type{it->first, it->second};
         }
         auto const& [vec, idx] = std::get<DensePos_>(state_);
-        return value_type{NodeId{static_cast<std::uint32_t>(idx)}, *(*vec)[idx]};
+        // Tag the synthesized NodeId with the bound tree's id so cross-
+        // tree validators trip when an iterator-produced id is handed
+        // off to a foreign attribute. The sparse path already returns
+        // whatever the user inserted, so equivalent fidelity falls out
+        // of the storage in that mode.
+        return value_type{NodeId{static_cast<std::uint32_t>(idx), treeTag_},
+                          *(*vec)[idx]};
     }
 
     Iterator_& operator++() {
@@ -291,10 +314,11 @@ private:
     using DensePos_    = std::pair<DenseVecPtr_, std::size_t>;
 
     explicit Iterator_(MapIter_ it) noexcept : state_(it) {}
-    Iterator_(DenseVecPtr_ vec, std::size_t idx) noexcept
-        : state_(DensePos_{vec, idx}) {}
+    Iterator_(DenseVecPtr_ vec, std::size_t idx, std::uint32_t treeTag) noexcept
+        : state_(DensePos_{vec, idx}), treeTag_(treeTag) {}
 
     std::variant<MapIter_, DensePos_> state_;
+    std::uint32_t                     treeTag_ = 0;
 };
 
 template <typename T>
@@ -303,7 +327,7 @@ auto NodeAttribute<T>::begin() -> iterator {
         auto& vec = std::get<DenseVec_>(storage_);
         std::size_t idx = 0;
         while (idx < vec.size() && !vec[idx].has_value()) ++idx;
-        return iterator{&vec, idx};
+        return iterator{&vec, idx, treeId_.v};
     }
     return iterator{std::get<SparseMap_>(storage_).begin()};
 }
@@ -312,7 +336,7 @@ template <typename T>
 auto NodeAttribute<T>::end() -> iterator {
     if (isDense()) {
         auto& vec = std::get<DenseVec_>(storage_);
-        return iterator{&vec, vec.size()};
+        return iterator{&vec, vec.size(), treeId_.v};
     }
     return iterator{std::get<SparseMap_>(storage_).end()};
 }
@@ -323,7 +347,7 @@ auto NodeAttribute<T>::begin() const -> const_iterator {
         auto const& vec = std::get<DenseVec_>(storage_);
         std::size_t idx = 0;
         while (idx < vec.size() && !vec[idx].has_value()) ++idx;
-        return const_iterator{&vec, idx};
+        return const_iterator{&vec, idx, treeId_.v};
     }
     return const_iterator{std::get<SparseMap_>(storage_).begin()};
 }
@@ -332,7 +356,7 @@ template <typename T>
 auto NodeAttribute<T>::end() const -> const_iterator {
     if (isDense()) {
         auto const& vec = std::get<DenseVec_>(storage_);
-        return const_iterator{&vec, vec.size()};
+        return const_iterator{&vec, vec.size(), treeId_.v};
     }
     return const_iterator{std::get<SparseMap_>(storage_).end()};
 }

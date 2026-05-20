@@ -125,6 +125,15 @@ public:
                 DiagnosticReporter::Config           diagConfig    = {},
                 BuilderConfig                        builderConfig = {});
 
+    // Process-wide monotonic allocator. Public so test helpers that
+    // fabricate trees outside `TreeBuilder` (e.g. `RawTreeBuilder`) can
+    // share the same counter and never collide.
+    [[nodiscard]] static TreeId nextTreeId() noexcept;
+
+    // TreeId minted at construction. Stamped onto every NodeId this
+    // builder emits so cross-tree usage of those ids aborts loudly.
+    [[nodiscard]] TreeId treeId() const noexcept { return treeId_; }
+
     // Single-use: copy/move would leave dangling OpenScope owners.
     TreeBuilder(TreeBuilder const&)            = delete;
     TreeBuilder& operator=(TreeBuilder const&) = delete;
@@ -276,6 +285,7 @@ private:
     std::shared_ptr<SourceBuffer>          source_;
     std::shared_ptr<GrammarSchema const>   schema_;
     std::unique_ptr<DiagnosticReporter>    reporter_;
+    TreeId                                 treeId_;
 
     std::vector<detail::Node>              nodes_;       // arena under construction
     std::vector<NodeId>                    childIndex_;  // flat children table under construction

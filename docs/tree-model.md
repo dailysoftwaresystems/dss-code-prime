@@ -230,7 +230,16 @@ std::size_t covered = nodeTypes.size();
 
 **Storage promotes automatically.** Starts sparse (`unordered_map`); once coverage ≥ 50% **and** `tree.nodeCount() ≥ 16`, an internal `set()` promotes to dense (`vector<optional<T>>` indexed by `NodeId.v`). The public API is identical in either mode; `attr.isDense()` is available if you need to know.
 
-**Bounds-check fatals.** Every API entry validates `id.valid() && id.v < tree.nodeCount()`; out-of-bounds aborts with a clear message (same pattern as `treeFatal`). The cross-tree guard is bounds-based — a `NodeId` from a smaller second tree that happens to fall within this tree's range is **not** detected.
+**Bounds-check fatals.** Every API entry validates `id.valid() && id.v < tree.nodeCount()`; out-of-bounds aborts with a clear message (same pattern as `treeFatal`).
+
+**Cross-tree guard.** Every `NodeId` minted by `TreeBuilder` (or by the test `RawTreeBuilder`) carries a `treeTag` — a snapshot of its source tree's id. Pass a `NodeId` from tree `B` to a `NodeAttribute` bound to tree `A` (or to any `Tree::children` / `Tree::kind` / etc. on tree `A`) and the access aborts with both ids in the message:
+
+```
+dss::NodeAttribute fatal: NodeAttribute bound to TreeId=A got NodeId from TreeId=B
+dss::Tree fatal: Tree::node_: NodeId from TreeId=B used on TreeId=A
+```
+
+Hand-fabricated literal `NodeId{N}` constants (treeTag == 0) bypass the cross-tree check so existing tests that mix literal and tree-emitted ids continue to assert structurally; the bounds check is still the catch for genuinely-bad untagged ids. `NodeId` equality and `std::hash<NodeId>` compare `.v` only — the tag is provenance metadata, not identity.
 
 ---
 

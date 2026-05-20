@@ -64,5 +64,36 @@ TEST(StrongIds, InvalidSentinelsHaveExpectedValue) {
 TEST(StrongIds, IsTriviallyCopyable) {
     static_assert(std::is_trivially_copyable_v<NodeId>);
     static_assert(std::is_trivially_copyable_v<RuleId>);
-    static_assert(sizeof(NodeId) == sizeof(std::uint32_t));
+    // NodeId carries an extra `treeTag` field (see strong_ids.hpp comment)
+    // so cross-tree usage of NodeIds aborts loudly. The other strong ids
+    // remain bare-uint32 sized.
+    static_assert(sizeof(NodeId) == 2 * sizeof(std::uint32_t));
+    static_assert(sizeof(RuleId) == sizeof(std::uint32_t));
+}
+
+TEST(StrongIds, NodeIdEqualityIgnoresTreeTag) {
+    // The treeTag is provenance metadata, NOT identity. Two NodeIds with
+    // the same `.v` but different tags MUST compare equal so existing
+    // tests that mix literal NodeId{N} with tagged-from-tree NodeIds
+    // continue to assert structurally. The cross-tree validator is the
+    // enforcement point.
+    EXPECT_EQ(NodeId{3}, NodeId(3, 0));
+    EXPECT_EQ(NodeId{3}, NodeId(3, 42));
+    EXPECT_EQ(NodeId(3, 7), NodeId(3, 42));
+    EXPECT_NE(NodeId{3}, NodeId{4});
+
+    // Hash matches equality — also tag-insensitive.
+    auto const h1 = std::hash<NodeId>{}(NodeId{3});
+    auto const h2 = std::hash<NodeId>{}(NodeId(3, 99));
+    EXPECT_EQ(h1, h2);
+}
+
+TEST(StrongIds, NodeIdTwoArgCtorStoresTag) {
+    NodeId id{7, 42};
+    EXPECT_EQ(id.v, 7u);
+    EXPECT_EQ(id.treeTag, 42u);
+
+    NodeId untagged{7};
+    EXPECT_EQ(untagged.v, 7u);
+    EXPECT_EQ(untagged.treeTag, 0u);
 }

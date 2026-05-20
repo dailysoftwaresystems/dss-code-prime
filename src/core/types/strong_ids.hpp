@@ -28,7 +28,7 @@ namespace dss {
         constexpr auto operator<=>(Name const&) const = default;             \
     }
 
-DSS_STRONG_ID(NodeId);
+// NodeId is special — see definition below.
 DSS_STRONG_ID(RuleId);
 DSS_STRONG_ID(SchemaTokenId);
 DSS_STRONG_ID(BufferId);
@@ -39,6 +39,33 @@ DSS_STRONG_ID(StringStyleId);
 DSS_STRONG_ID(SchemaId);
 
 #undef DSS_STRONG_ID
+
+// NodeId carries its source tree's id (`treeTag`) alongside the arena
+// index (`v`). `treeTag == 0` is the "untagged" sentinel — literal
+// `NodeId{3}` constructed in tests passes validators, while a tagged
+// NodeId obtained from one tree and handed to another aborts with both
+// TreeIds in the message. Closes the §5.10 caveat documented in
+// `docs/tree-model.md`.
+//
+// Equality and ordering compare `.v` only; `treeTag` is provenance
+// metadata, not identity. Same-arena-slot NodeIds from different trees
+// compare equal so that existing tests that mix tagged-from-tree and
+// untagged literal NodeIds remain valid. The validators are the
+// enforcement point, not equality.
+struct NodeId {
+    constexpr NodeId() noexcept = default;
+    constexpr explicit NodeId(std::uint32_t value) noexcept : v(value) {}
+    constexpr NodeId(std::uint32_t value, std::uint32_t tag) noexcept
+        : v(value), treeTag(tag) {}
+
+    std::uint32_t v       = 0;
+    std::uint32_t treeTag = 0;
+
+    [[nodiscard]] constexpr bool valid() const noexcept { return v != 0; }
+
+    constexpr bool operator==(NodeId const& o) const noexcept { return v == o.v; }
+    constexpr auto operator<=>(NodeId const& o) const noexcept { return v <=> o.v; }
+};
 
 inline constexpr NodeId          InvalidNode{};
 inline constexpr RuleId          InvalidRule{};

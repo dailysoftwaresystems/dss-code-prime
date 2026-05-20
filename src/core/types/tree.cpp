@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <utility>
 
 namespace dss {
@@ -80,6 +81,15 @@ std::size_t Tree::nodeCount() const noexcept { return data_.nodes.size(); }
 detail::Node const& Tree::node_(NodeId id) const {
     if (!id.valid() || id.v >= data_.nodes.size()) {
         treeFatal("Tree::node_: NodeId out of range");
+    }
+    // Untagged NodeId (treeTag == 0) passes — covers hand-fabricated test
+    // literals like `NodeId{3}`. A non-zero tag MUST match this tree's id
+    // or the access is cross-tree and aborts with both ids in the message.
+    if (id.treeTag != 0 && id.treeTag != data_.id.v) {
+        auto const msg = std::format(
+            "Tree::node_: NodeId from TreeId={} used on TreeId={}",
+            id.treeTag, data_.id.v);
+        treeFatal(msg.c_str());
     }
     return data_.nodes[id.v];
 }
