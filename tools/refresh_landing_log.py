@@ -73,7 +73,7 @@ def _landing_log_section(text: str) -> tuple[int, int] | None:
 @dataclass
 class Commit:
     sha: str
-    kind: str  # "initial" | "review" | "round-N"
+    kind: str  # "initial" | "review" | "round-N" | "sub:<full-id>"
 
 
 @dataclass
@@ -113,14 +113,37 @@ def git_log_subjects() -> list[tuple[str, str]]:
 
 
 def classify_commit(match: re.Match[str]) -> str:
-    """Map a subject-pattern match's optional groups to a Commit.kind."""
+    """Map a subject-pattern match's optional groups to a Commit.kind.
+
+    Groups recognised:
+      1: PR id (e.g. "SH4")  — the landing-log row key.
+      2: optional "review" marker.
+      3: optional round-N number.
+
+    The match's full leading text (`match.group(0)`) is inspected
+    separately for a sub-deliverable letter immediately after the
+    captured PR id (e.g. "SH4a", "SH4c"). Sub-deliverables render as
+    `<sha>` (SH4a), keeping each sub-PR identifiable in the landing log
+    without inventing a parallel row per sub.
+    """
     groups = match.groups()
     has_review_marker = len(groups) >= 2 and groups[1]
     round_n = groups[2] if len(groups) >= 3 else None
+    pr_id = groups[0]
+    # Detect a single letter suffix between the captured PR id and the
+    # next regex-consumed text. `m.group(0)` covers the whole match;
+    # `m.end(1)` is the byte index right after the captured PR id.
+    suffix_start = match.end(1)
+    rest = match.group(0)[suffix_start - match.start():]
+    suffix = ""
+    if rest and rest[0].isalpha():
+        suffix = rest[0]
     if round_n:
         return f"round-{round_n}"
     if has_review_marker:
         return "review"
+    if suffix:
+        return f"sub:{pr_id}{suffix}"
     return "initial"
 
 
@@ -138,21 +161,51 @@ def collect_commits_by_pr(
     return by_pr
 
 
+def _kind_label(kind: str) -> str:
+    """Render a Commit.kind for inclusion in a hash block annotation."""
+    if kind == "review":
+        return "review followup"
+    if kind.startswith("sub:"):
+        return kind[len("sub:"):]
+    return kind
+
+
 def render_hash_block(commits: list[Commit]) -> str:
     """Inline-render commits as `sha1` + `sha2` (kind) + `sha3` (kind).
 
-    The first commit is bare (initial implies it); subsequent commits
-    annotate their kind. Returns the empty string for an empty list.
+    Two flavours of layout:
+      - All commits classified as `initial` (the normal case for a
+        single-deliverable PR): render the first bare, no others — the
+        invariant "1 commit per PR" makes annotation redundant.
+      - Any non-`initial` kind present (review followups, round-N
+        followups, OR sub-deliverable letters SH4a/SH4b/...): annotate
+        every commit beyond the first with its kind. Sub-deliverable
+        kinds carry their full PR id (e.g. `SH4a`) so reviewers can map
+        each hash back to the sub-PR without consulting git.
+
+    Returns the empty string for an empty list.
     """
     if not commits:
         return ""
+    if all(c.kind == "initial" for c in commits):
+        # The single-commit case; multi-commit "all initial" is degenerate
+        # but possible if a config bug groups unrelated commits into one
+        # PR — render only the first to surface the misconfiguration.
+        return f"`{commits[0].sha}`"
+    # Annotate every commit (including the first) when we have a mix:
+    # this keeps sub-deliverable PRs readable (SH4a / SH4b / SH4c each
+    # carries its own label rather than the first being implicit-initial).
+    if any(c.kind.startswith("sub:") for c in commits):
+        parts = [f"`{c.sha}` ({_kind_label(c.kind)})" for c in commits]
+        return " + ".join(parts)
+    # Single deliverable with review followups: classic shape — first
+    # bare, followups annotated.
     parts: list[str] = []
     for i, c in enumerate(commits):
         if i == 0:
             parts.append(f"`{c.sha}`")
             continue
-        label = "review followup" if c.kind == "review" else c.kind
-        parts.append(f"`{c.sha}` ({label})")
+        parts.append(f"`{c.sha}` ({_kind_label(c.kind)})")
     return " + ".join(parts)
 
 

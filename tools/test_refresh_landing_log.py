@@ -28,7 +28,7 @@ from refresh_landing_log import (  # noqa: E402  (path bootstrap above)
 
 
 SUBJECT_PATTERN = re.compile(
-    r"^Substrate hardening (SH[0-9]+)(?:\s+(review)(?:\s+round-([0-9]+))?)?:"
+    r"^Substrate hardening (SH[0-9]+)[a-z]?(?:\s+(review)(?:\s+round-([0-9]+))?)?:"
 )
 
 
@@ -63,6 +63,31 @@ class RenderHashBlockTest(unittest.TestCase):
             "`aaaaaaa` + `bbbbbbb` (round-1) + `ccccccc` (round-2)",
         )
 
+    def test_three_sub_deliverables_each_labeled(self):
+        # SH4 lands as three sub-PRs (SH4a, SH4c, SH4b). Each carries its
+        # full PR id as the label so reviewers can map hashes to sub-PRs
+        # without consulting git.
+        out = render_hash_block(
+            [
+                Commit("e22a728", "sub:SH4a"),
+                Commit("ded11d3", "sub:SH4c"),
+                Commit("130d5b1", "sub:SH4b"),
+            ]
+        )
+        self.assertEqual(
+            out,
+            "`e22a728` (SH4a) + `ded11d3` (SH4c) + `130d5b1` (SH4b)",
+        )
+
+    def test_mixed_all_initial_renders_first_only(self):
+        # Defensive: two commits both classified as `initial` would mean
+        # the config grouped unrelated commits — render only the first to
+        # surface the misconfiguration rather than fabricate a label.
+        out = render_hash_block(
+            [Commit("aaa", "initial"), Commit("bbb", "initial")]
+        )
+        self.assertEqual(out, "`aaa`")
+
 
 class ClassifyCommitTest(unittest.TestCase):
     def _match(self, subject: str) -> re.Match[str]:
@@ -83,6 +108,23 @@ class ClassifyCommitTest(unittest.TestCase):
         self.assertEqual(
             classify_commit(self._match("Substrate hardening SH3 review round-2: bar")),
             "round-2",
+        )
+
+    def test_sub_deliverable(self):
+        # `SH4a:` (sub-PR letter, no review marker) classifies as
+        # sub:<full-id> so the renderer can label it `(SH4a)`.
+        self.assertEqual(
+            classify_commit(self._match("Substrate hardening SH4a: foo")),
+            "sub:SH4a",
+        )
+
+    def test_sub_deliverable_with_review_marker_prefers_round_or_review(self):
+        # If somehow both a sub letter AND a review marker appear, the
+        # review classification wins (the suffix is metadata, but a
+        # review followup is the more load-bearing kind).
+        self.assertEqual(
+            classify_commit(self._match("Substrate hardening SH4a review: bar")),
+            "review",
         )
 
 

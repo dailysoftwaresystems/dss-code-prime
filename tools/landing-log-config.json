@@ -1,8 +1,9 @@
 {
   "plans": [
     {
+      "_comment": "Captures `SH4`, `SH4 review`, `SH4 review round-2`, AND sub-deliverable subjects like `SH4a`/`SH4b`/`SH4c` — the trailing `[a-z]?` lives OUTSIDE capture group 1 so SH4a and SH4 both map to the same landing-log row.",
       "path": ".plans/substrate-hardening-plan.md",
-      "subjectPattern": "^Substrate hardening (SH[0-9]+)(?:\\s+(review)(?:\\s+round-([0-9]+))?)?:"
+      "subjectPattern": "^Substrate hardening (SH[0-9]+)[a-z]?(?:\\s+(review)(?:\\s+round-([0-9]+))?)?:"
     },
     {
       "path": ".plans/schema-expressiveness-v2-plan.md",
