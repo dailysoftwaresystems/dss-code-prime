@@ -1,0 +1,12 @@
+{
+  "plans": [
+    {
+      "path": ".plans/substrate-hardening-plan.md",
+      "subjectPattern": "^Substrate hardening (SH[0-9]+)(?:\\s+(review)(?:\\s+round-([0-9]+))?)?:"
+    },
+    {
+      "path": ".plans/schema-expressiveness-v2-plan.md",
+      "subjectPattern": "^Schema expressiveness v2 (PR[0-9]+[a-z]?)(?:\\s+(review)(?:\\s+round-([0-9]+))?)?:"
+    }
+  ]
+}

@@ -6,7 +6,7 @@
 
 | | |
 |---|---|
-| Status        | 🔵 **in progress.** SH2 + SH3 done. SH1 remains. Trigger: v2 sub-plan ✅ done (PR8 + `4547301` followup). Successor: parent plan #5 (`tokenizer`). |
+| Status        | ✅ **done.** SH1, SH2, SH3 all shipped. Successor: parent plan #5 (`tokenizer`) is now unblocked. |
 | Predecessors  | ✅ v1 T0–T12 (`tree-node-model-plan.md`); ✅ v2 PR0–PR8 (`schema-expressiveness-v2-plan.md`). |
 | Successors    | Parent plan phase #5 (tokenizer). Cleanly verifying the schema against real tokens is what makes phase #7 (parser) tractable and what surfaces v3 schema gaps in time to act on them. |
 | Scope         | **Bounded.** SH1: landing-log generator. SH2: Linux CI matrix entry. SH3: cross-tree NodeId guard. No other items will be added to this plan — anything new becomes a separate sub-plan. |
@@ -15,9 +15,9 @@
 
 | PR | Status | Commit / notes |
 |---|---|---|
-| SH2 | ✅ done | Multi-OS matrix already shipped by `DSS.DevOps@v2` (`cpp-app-pr.yml`): Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, all default-enabled and green on recent PRs. This PR opts the consumer wiring into the `run-macos` leg (AppleClang on Homebrew LLVM). <!-- LANDING-LOG-HASHES: SH2 --> |
-| SH3 | ✅ done | `NodeId` grew an 8-byte `treeTag` field; `TreeBuilder` mints `TreeId` eagerly at ctor and stamps every emitted id; `NodeAttribute<T>::validateId_` + `Tree::node_` abort on tag mismatch with both ids in the message. 523 ctest cases / 26 suites still 100% pass; 14 new death tests added. <!-- LANDING-LOG-HASHES: SH3 --> |
-| SH1 | ⏳ pending | Landing-log generator script. |
+| SH2 | ✅ done | Multi-OS matrix already shipped by `DSS.DevOps@v2` (`cpp-app-pr.yml`): Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, all default-enabled and green on recent PRs. This PR opts the consumer wiring into the `run-macos` leg (AppleClang on Homebrew LLVM). <!-- LANDING-LOG-HASHES: SH2 -->`ab0800e`<!-- /LANDING-LOG-HASHES --> |
+| SH3 | ✅ done | `NodeId` grew an 8-byte `treeTag` field; `TreeBuilder` mints `TreeId` eagerly at ctor and stamps every emitted id; `NodeAttribute<T>::validateId_` + `Tree::node_` abort on tag mismatch with both ids in the message. 523 ctest cases / 26 suites still 100% pass; 14 new death tests added. <!-- LANDING-LOG-HASHES: SH3 -->`ac76408`<!-- /LANDING-LOG-HASHES --> |
+| SH1 | ✅ done | `tools/refresh_landing_log.py` regenerates hash anchors in landing-log tables from `git log`, gated by paired `<!-- LANDING-LOG-HASHES: <PR> -->...<!-- /LANDING-LOG-HASHES -->` markers and a `### PR landing log` section gate so prose references to the marker format aren't mistaken for live anchors. `tools/landing-log-config.json` maps each plan to a commit-subject regex. `--check` is the CI gate (exits non-zero on drift); `--write` applies the rewrite. 20 stdlib-only unittests cover render shapes, idempotency, section gating, missing-close-marker insertion, cross-line containment. <!-- LANDING-LOG-HASHES: SH1 --><!-- /LANDING-LOG-HASHES --> |
 
 ---
 
@@ -37,31 +37,36 @@ None of these block forward progress today. All three become substantially more 
 
 ## 2. PRs
 
-### SH1 — Landing-log generator script
+### SH1 — Landing-log generator script ✅
 
 **Goal.** Eliminate the entire class of "missing commit hash in landing log" bugs by generating the landing-log tables from `git log` instead of hand-editing them.
 
-**Surface.**
-- `tools/refresh_landing_log.ps1` (PowerShell, Windows-first per repo convention) — also a `tools/refresh_landing_log.py` cross-platform variant if SH2 lands Linux CI first.
-- Scans `git log feature/v2..HEAD` (or whatever range arg is passed) for commit subjects matching `^(PR\w+)(?:\s+review)?(?:\s+round-\d+)?:` — pairs initial commits with their `review followup` / `round-N` siblings into landing-log row entries.
-- Rewrites the `### PR landing log` table in `schema-expressiveness-v2-plan.md`, `substrate-hardening-plan.md`, and any future sub-plan with the same convention. The script reads a small `tools/landing-log-config.json` declaring which plan files have landing logs.
-- Body-text of each row stays hand-written (the script never overwrites human prose) — only the **hash column** is regenerated. The script uses a single-line marker (`<!-- LANDING-LOG-HASHES: PR3 -->`) inside the row to find which line to rewrite; missing markers mean the row is hand-managed.
-- Exits non-zero if any landed PR commit is missing from a landing log → CI can run this as a check.
+**Outcome — Python-only, stdlib-only.** Originally scoped as "PowerShell first, Python if SH2 lands Linux CI." With SH2 already done (Linux + macOS CI active), the PowerShell variant gives no extra value over Python, so it's deferred. `py tools/refresh_landing_log.py --check` runs on every host the CI matrix covers.
 
-**Tests.** Unit tests in PowerShell using Pester (or pytest if Python variant) covering:
-- Single-commit PR row.
-- Initial + one review followup.
-- Initial + two review rounds (PR5 shape).
-- Missing-from-log detection.
-- Marker-absent row is left untouched.
-- Idempotency: running twice produces identical output.
+**Surface — final.**
+- `tools/refresh_landing_log.py`: single-file Python 3 script (no external deps; works on the Strawberry-Python that ships with the dev env and on the ubuntu/macos runners that already have system Python).
+- `tools/landing-log-config.json`: lists each plan + a commit-subject regex whose first capture group is the PR identifier and optional second/third groups identify review-followup / round-N commits.
+- `tools/test_refresh_landing_log.py`: 20 unittest cases (stdlib `unittest`, no pytest), runs in <1 s.
+
+**Marker design — paired markers within a section gate.**
+- Opening marker (hand-placed): `<!-- LANDING-LOG-HASHES: SH3 -->`. Closing marker (script-managed): `<!-- /LANDING-LOG-HASHES -->`. Content between the pair is the hash block.
+- First run on a hand-marked row inserts the closing marker immediately after the opener and fills the block; subsequent runs are idempotent (same input → same output byte-for-byte).
+- A **section gate** restricts marker hunting to the `### PR landing log` table — prose references to the marker format elsewhere in the document (e.g., this very paragraph) are NOT picked up as live anchors.
+- The closing-marker search is **line-bounded**: an unclosed opener on row N never matches a closer on row N+1, so prose between two rows is never silently swallowed.
+
+**Hash rendering.**
+- Single commit: `` `ab0800e` ``
+- Initial + review followup: `` `ab0800e` + `def0123` (review followup) ``
+- Initial + multiple rounds: `` `aaa` + `bbb` (round-1) + `ccc` (round-2) ``
 
 **Diagnostics.**
-- Script prints a unified diff of what changed.
-- `--check` flag exits non-zero on any drift (CI-friendly).
-- `--write` flag actually applies the rewrite.
+- `--check` (CI gate): prints a unified diff of any drift; exits non-zero if at least one plan would change.
+- `--write`: applies the rewrite in place.
 
-**Out of scope.** Auto-writing the body prose of new rows (humans still author that). Auto-detecting new PR landings without a marker (intentional — the marker is the "this is tracked" opt-in).
+**Out of scope.**
+- Auto-writing the body prose of new rows. The marker is opt-in; humans still author the row body when a PR lands.
+- Cross-PR-shape regenerated body text (status emoji, descriptive paragraphs). The script only touches the hash block between the markers.
+- A `--check` job in the CI pipeline. Adding it lives in the next plan-doc-hygiene PR; SH1 ships the tool itself.
 
 ---
 
