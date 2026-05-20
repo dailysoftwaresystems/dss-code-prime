@@ -31,9 +31,10 @@ Updated as work progresses. Detailed phase status lives in §7.
 |---|---|
 | CMake floor | **4.0** (latest stable on inception; tested with 4.3.2) |
 | C++ standard | **23** |
-| Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows |
+| Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows. Linux GCC verification pending [`substrate-hardening-plan.md`](./substrate-hardening-plan.md) SH2. |
 | Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
 | Test suite | **509 cases across 26 ctest suites — 100% pass** (v1 T0–T12 baseline + v2 PR0–PR8 complete; see [`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §0 for per-PR test counts) |
+| Substrate hardening | 🔵 next — see [`substrate-hardening-plan.md`](./substrate-hardening-plan.md). SH3 closes the cross-tree `NodeId` caveat documented in §5.10 below. |
 
 **Files now in `src/core/types/` (all on `core` static lib):**
 
