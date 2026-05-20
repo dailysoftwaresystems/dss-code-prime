@@ -15,7 +15,7 @@ Two design choices to internalize before writing one:
 1. **Tokens are multi-typed.** One lexeme (e.g., `+`, `<`) may resolve to several token kinds depending on scope and priority. The loader doesn't pick — the schema captures all alternatives and the builder picks at parse time using the per-meaning `scopeRequire` (v2 §9.4; flat `validScopes: [...]` in v1) and `priority`.
 2. **Shapes describe valid tree structure, not parsing strategy.** Today's `TreeBuilder` validates *within* a frame (lexeme resolution, scope filter, recovery). Sequence-level "is this token valid here?" enforcement lands when the parser does — but the schema declares the shape so the future parser doesn't have to invent it.
 
-**v2 additions appear in [§9](#9-v2-additions).** Configs that touch `operators`, `expr` shape, `reservedWordPolicy`, `contextual` keywords, or `scopeRequire` are using v2 features.
+**v2 additions appear in [§9](#9-v2-additions).** Configs that touch `operators`, `expr` shape, `reservedWordPolicy`, `contextual` keywords, `scopeRequire`, `speculative` alts, `lexerModes` / `modeOp`, or `stringStyle` are using v2 features.
 
 A config that loads cleanly produces a `GrammarSchema` you can pass to `TreeBuilder`. A config with errors produces a `std::expected<...>` with a vector of `ConfigDiagnostic` — none of which are fatal at file-author time, but all of which will block parsing.
 
@@ -390,11 +390,56 @@ Tokenizers for interpolated strings, here-strings, and multi-language embeddings
 
 **Cyclic mode references are normal**, not an error. `main` pushes `string-body`; `string-body` pushes `main` (for `{...}` interpolation expressions); they recurse arbitrarily.
 
-### 9.7 Updated version window
+### 9.7 `stringStyle` descriptor (PR6)
+
+Delimited string literals — `"hello"`, `@"verbatim ""quotes"""`, `R"DELIM(raw)DELIM"`, `"""triple"""` — declare their escape rules and termination as `stringStyle` on the opening-delimiter token's meaning:
+
+```jsonc
+"tokens": {
+  "\"":     [{ "kind": "StringStart",
+                "modeOp": "pushMode", "modeArg": "string-body",
+                "stringStyle": { "escapeKind": "char",
+                                  "escapeChar": "\\",
+                                  "endsAt":     "\"" } }],
+  "@\"":    [{ "kind": "VerbatimStringStart",
+                "modeOp": "pushMode", "modeArg": "verbatim-body",
+                "stringStyle": { "escapeKind": "doubled-delimiter",
+                                  "endsAt":     "\"" } }],
+  "R\"":    [{ "kind": "RawStringStart",
+                "modeOp": "pushMode", "modeArg": "raw-body",
+                "stringStyle": { "escapeKind":   "none",
+                                  "endsAt":       ")\"",
+                                  "delimiterTag": "matched",
+                                  "tagPattern":   "[A-Za-z_]{0,16}" } }],
+  "\"\"\"":  [{ "kind": "TripleStringStart",
+                "modeOp": "pushMode", "modeArg": "triple-body",
+                "stringStyle": { "escapeKind":         "char",
+                                  "escapeChar":         "\\",
+                                  "endsAt":             "\"\"\"",
+                                  "endsAtLongestMatch": true,
+                                  "multiline":          true } }]
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `escapeKind` | enum string | **yes** | `"char"`, `"doubled-delimiter"`, or `"none"`. |
+| `escapeChar` | single ASCII char | only when `escapeKind: "char"` | The lead character for escape pairs (typically `\`). Must be exactly one byte. |
+| `endsAt` | non-empty string | **yes** | The literal sequence that terminates the body. |
+| `endsAtLongestMatch` | bool | no (default `false`) | For triple-quotes — consume the longest run matching `endsAt` from the end. |
+| `delimiterTag` | string `"matched"` | no | Enables dynamically-captured delimiter tags (C++ `R"DELIM(...)DELIM"`). Only `"matched"` is a valid value. |
+| `tagPattern` | regex string | no (default `[A-Za-z0-9_]{0,16}` when `delimiterTag` is set) | Constraint on what characters are valid in the captured tag. Compiled at load time — invalid regexes are rejected with `C_InvalidStringStyle`. Must be paired with `delimiterTag: "matched"`. |
+| `multiline` | bool | no (default `false`) | Whether newlines are allowed in the body. |
+
+**Keywords cannot carry `stringStyle`** — word-shaped tokens can't open delimited strings. Use a `tokens` entry instead.
+
+**Loader fail-fasts** on these config errors: `escapeChar` set when `escapeKind != "char"`; `tagPattern` set without `delimiterTag: "matched"`; missing/empty `endsAt`; multi-byte `escapeChar`; unknown `escapeKind`; non-`"matched"` `delimiterTag`; wrong-type fields. Cross-field warning: `endsAtLongestMatch: true` with a 1-character `endsAt` (the flag is a no-op for single-char terminators).
+
+### 9.8 Updated version window
 
 `dssSchemaVersion` accepts the range `1..2`. v2 configs that use any of the fields above SHOULD set `"dssSchemaVersion": 2`. The loader still accepts `1` for any field combination — version bumping is documentation, not enforcement.
 
-### 9.8 Troubleshooting (v2 codes)
+### 9.9 Troubleshooting (v2 codes)
 
 | Symptom | Likely fix |
 |---|---|
@@ -404,6 +449,7 @@ Tokenizers for interpolated strings, here-strings, and multi-language embeddings
 | `C_ConflictingField` on `speculative`/`lookahead` | Non-boolean `speculative`, non-integer or out-of-range `lookahead`. |
 | `C_UnknownScopeName` | The scope name doesn't match any built-in (`None`, `Root`, `Block`, `Paren`, `Bracket`, `Generic`, `String`, `Comment`). |
 | `C_UnknownLexerMode` | A `modeArg` references a mode that wasn't declared in `lexerModes`. |
+| `C_InvalidStringStyle` | A `stringStyle` block is malformed — see §9.7 (missing/empty `endsAt`; `escapeChar` without `escapeKind: "char"`; `tagPattern` without `delimiterTag: "matched"`; invalid `tagPattern` regex; unknown `escapeKind`; non-`"matched"` `delimiterTag` value; wrong-typed sub-field). |
 | `C_RedundantScopeRequire` (warning) | Your `scopeRequire` has a contradiction or redundancy. The rule still loads. |
 | `C_RedundantField` (warning) | `lookahead` without `speculative: true`; `modeArg` with `popMode`; case-folded duplicate mode name; mode with only `defaultToken` and no `tokens` field; inline per-mode `tokens` object (not yet parsed). The rule still loads. |
 | `P_ContextualKeywordResolution` (info, at parse) | A soft keyword demoted to `Identifier`. Expected behavior when the cursor's expected set excludes the keyword. |
