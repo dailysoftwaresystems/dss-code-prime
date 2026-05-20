@@ -108,7 +108,14 @@
       "Bash(echo \"Re-check exit: $?\")",
       "Bash(echo \"check exit: $?\")",
       "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' ctest --test-dir build)",
-      "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\" --target dss_core_test_schema_cursor)"
+      "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\" --target dss_core_test_schema_cursor)",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_core_test_schema_cursor.exe --gtest_filter=SchemaCursorRouteRuleLeaf.*)",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_core_test_schema_cursor.exe)",
+      "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\" --target dss_core_test_c_subset)",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_core_test_c_subset.exe)",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_core_test_c_subset.exe --gtest_filter=*SwitchStmt*)",
+      "Bash(echo \"Final check exit: $?\")",
+      "Bash(echo \"Final landing-log check exit: $?\")"
     ]
   }
 }
