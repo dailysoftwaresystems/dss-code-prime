@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <format>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -46,7 +48,6 @@ TEST(StringStyleLoader, CStyleQuotedStringLoadsAndPopulates) {
     EXPECT_EQ(style->escapeChar, '\\');
     EXPECT_EQ(style->endsAt, "\"");
     EXPECT_FALSE(style->endsAtLongestMatch);
-    EXPECT_FALSE(style->hasMatchedDelimiterTag);
     EXPECT_FALSE(style->multiline);
     EXPECT_TRUE(style->tagPattern.empty());
 }
@@ -93,7 +94,8 @@ TEST(StringStyleLoader, RawStringMatchedDelimiterTagPopulates) {
     auto const* style = (*loaded)->stringStyle(m[0]);
     ASSERT_NE(style, nullptr);
     EXPECT_EQ(style->escapeKind, EscapeKind::None);
-    EXPECT_TRUE(style->hasMatchedDelimiterTag);
+    EXPECT_FALSE(style->tagPattern.empty())
+        << "non-empty tagPattern IS the dynamic-tag signal";
     EXPECT_EQ(style->tagPattern, "[A-Za-z0-9_]{0,16}")
         << "delimiterTag: 'matched' without explicit tagPattern must default to "
            "[A-Za-z0-9_]{0,16}";
@@ -365,7 +367,7 @@ TEST(StringStyleLoader, TokenWithoutStringStyleHasNoMetadata) {
     ASSERT_TRUE(loaded.has_value());
     auto const& m = (*loaded)->lookupLexeme("+");
     ASSERT_EQ(m.size(), 1u);
-    EXPECT_FALSE(m[0].stringStyleIdx.has_value());
+    EXPECT_FALSE(m[0].stringStyleId.valid());
     EXPECT_EQ((*loaded)->stringStyle(m[0]), nullptr);
 }
 
@@ -403,9 +405,9 @@ TEST(StringStyleLoader, MultipleStringStylesAllocateDistinctIndices) {
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
     auto const& a = (*loaded)->lookupLexeme("\"")[0];
     auto const& b = (*loaded)->lookupLexeme("@\"")[0];
-    ASSERT_TRUE(a.stringStyleIdx.has_value());
-    ASSERT_TRUE(b.stringStyleIdx.has_value());
-    EXPECT_NE(*a.stringStyleIdx, *b.stringStyleIdx);
+    ASSERT_TRUE(a.stringStyleId.valid());
+    ASSERT_TRUE(b.stringStyleId.valid());
+    EXPECT_NE(a.stringStyleId.v, b.stringStyleId.v);
 
     auto const* styleA = (*loaded)->stringStyle(a);
     auto const* styleB = (*loaded)->stringStyle(b);
@@ -413,4 +415,170 @@ TEST(StringStyleLoader, MultipleStringStylesAllocateDistinctIndices) {
     ASSERT_NE(styleB, nullptr);
     EXPECT_EQ(styleA->escapeKind, EscapeKind::Char);
     EXPECT_EQ(styleB->escapeKind, EscapeKind::DoubledDelimiter);
+}
+
+// ── C1: escapeChar with non-Char escapeKind now fail-fast ──────────────
+
+TEST(StringStyleLoader, EscapeCharWithNonCharKindIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "StringStart",
+                  "stringStyle": { "escapeKind": "none",
+                                    "escapeChar": "\\",
+                                    "endsAt":     "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "StringStart" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_InvalidStringStyle &&
+               d.message.find("only meaningful when escapeKind is 'char'") != std::string::npos;
+    }));
+}
+
+// ── C2: tagPattern without delimiterTag is now a load error ────────────
+
+TEST(StringStyleLoader, TagPatternWithoutDelimiterTagIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "R\"": [{ "kind": "RawStringStart",
+                   "stringStyle": { "escapeKind": "none",
+                                     "endsAt":     ")\"",
+                                     "tagPattern": "[a-z]+" } }]
+      },
+      "shapes": { "root": { "sequence": [ "RawStringStart" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_InvalidStringStyle &&
+               d.message.find("requires 'delimiterTag: \"matched\"'") != std::string::npos;
+    }));
+}
+
+// ── C4: out-of-range stringStyleId aborts ──────────────────────────────
+
+TEST(StringStyleDeath, OutOfRangeStringStyleIdAborts) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value());
+    LexemeMeaning fake = (*loaded)->lookupLexeme("+")[0];
+    fake.stringStyleId = StringStyleId{999};  // out of range
+    EXPECT_DEATH({ (void)(*loaded)->stringStyle(fake); },
+                 "out-of-range stringStyleId");
+}
+
+// ── C3: cross-schema stringStyle lookup aborts ─────────────────────────
+
+TEST(StringStyleDeath, CrossSchemaStringStyleLookupAborts) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } }
+    })JSON";
+    auto loadedA = GrammarSchema::loadFromText(kCfg);
+    auto loadedB = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loadedA.has_value());
+    ASSERT_TRUE(loadedB.has_value());
+    LexemeMeaning fromA = (*loadedA)->lookupLexeme("+")[0];
+    EXPECT_DEATH({ (void)(*loadedB)->stringStyle(fromA); },
+                 "belongs to a different schema");
+}
+
+TEST(StringStyle, SchemaIdStampedOnMeanings) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value());
+    auto const& m = (*loaded)->lookupLexeme("+")[0];
+    EXPECT_EQ(m.schemaId.v, (*loaded)->schemaId().v);
+    EXPECT_TRUE(m.schemaId.valid());
+}
+
+// ── S1: pool stress — many stringStyles allocate distinct ids ──────────
+
+TEST(StringStyleLoader, ManyStringStylesGetDistinctIds) {
+    // Build a config with 50 string-opener tokens, each with a
+    // stringStyle. Verify every meaning gets a distinct, valid
+    // StringStyleId and `stringStyle(m)` resolves correctly across the
+    // full pool — guards against future pool-storage regressions that
+    // might invalidate ids on growth.
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {)JSON";
+    for (int i = 0; i < 50; ++i) {
+        if (i > 0) cfg += ",";
+        cfg += std::format(R"JSON(
+            "tok{}": [{{ "kind": "Tok{}",
+                          "stringStyle": {{ "escapeKind": "none",
+                                             "endsAt":     "end{}" }} }}])JSON",
+                            i, i, i);
+    }
+    cfg += R"JSON(
+      },
+      "shapes": { "root": { "sequence": [ "Tok0" ] } }
+    })JSON";
+
+    auto loaded = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+
+    std::set<std::uint32_t> seenIds;
+    for (int i = 0; i < 50; ++i) {
+        const auto lex = std::format("tok{}", i);
+        auto const& m = (*loaded)->lookupLexeme(lex);
+        ASSERT_EQ(m.size(), 1u) << "tok" << i;
+        ASSERT_TRUE(m[0].stringStyleId.valid()) << "tok" << i;
+        EXPECT_TRUE(seenIds.insert(m[0].stringStyleId.v).second)
+            << "duplicate stringStyleId at tok" << i;
+
+        auto const* style = (*loaded)->stringStyle(m[0]);
+        ASSERT_NE(style, nullptr) << "tok" << i;
+        EXPECT_EQ(style->endsAt, std::format("end{}", i));
+    }
+    EXPECT_EQ(seenIds.size(), 50u);
+}
+
+// ── S2: endsAtLongestMatch + 1-char endsAt warns ───────────────────────
+
+TEST(StringStyleLoader, LongestMatchWithSingleCharEndsAtWarns) {
+    // Pair with a sibling ambiguity error so the diagnostic vector
+    // reaches the test via the error channel.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "StringStart",
+                  "stringStyle": { "escapeKind":        "none",
+                                    "endsAt":            "\"",
+                                    "endsAtLongestMatch": true } }]
+      },
+      "shapes": {
+        "root":   { "alt": ["A", "B"] },
+        "A":      { "sequence": [ "StringStart" ] },
+        "B":      { "sequence": [ "StringStart" ] }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_RedundantField &&
+               d.message.find("1-character 'endsAt'") != std::string::npos;
+    }));
 }

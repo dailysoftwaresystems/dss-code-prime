@@ -87,11 +87,16 @@ struct DSS_EXPORT LexemeMeaning {
     // tokenizer doesn't re-walk mode-name strings per token.
     ModeOp           modeOp        = ModeOp::None;
     LexerModeId      modeArg{};
-    // Index into `GrammarSchemaData::stringStyles` when this meaning
-    // is a delimited-string opener (e.g. `"`, `@"`, `R"`). Empty for
-    // every other meaning. Pool-indexed (not embedded) so LexemeMeaning
-    // stays trivially copyable.
-    std::optional<std::uint32_t> stringStyleIdx;
+    // Strong id into `GrammarSchemaData::stringStyles` when this meaning
+    // opens a delimited string (e.g. `"`, `@"`, `R"`). Default-invalid
+    // for every other meaning. Pool-indexed (not embedded) so
+    // LexemeMeaning stays trivially copyable.
+    StringStyleId    stringStyleId{};
+    // Identifies the schema that owns this meaning. Stamped by the
+    // loader at construction; consumed by `GrammarSchema::stringStyle()`
+    // and similar lookups to catch cross-schema misuse where a caller
+    // copies a meaning out of schema A and queries schema B.
+    SchemaId         schemaId{};
 };
 
 static_assert(std::is_trivially_copyable_v<LexemeMeaning>,
@@ -180,11 +185,17 @@ struct DSS_EXPORT GrammarSchemaData {
                                           std::vector<LexemeMeaning>>>
                                                       lexerModeTokens;
 
-    // Indexed by `LexemeMeaning::stringStyleIdx`. Stored by value so
-    // each StringStyle owns its `endsAt`/`tagPattern` strings; the
-    // vector is allowed to reallocate (LexemeMeaning carries the
-    // index, not a pointer).
+    // Pool indexed by `LexemeMeaning::stringStyleId`. Slot 0 is the
+    // InvalidStringStyle sentinel; real ids 1..N. Each StringStyle
+    // owns its `endsAt`/`tagPattern` strings; the vector may reallocate
+    // (LexemeMeaning carries the id, not a pointer).
     std::vector<StringStyle>                          stringStyles;
+
+    // Per-instance monotonic id stamped onto every LexemeMeaning so
+    // cross-schema lookups (`stringStyle(m)` etc.) catch the case where
+    // `m` was copied out of a different schema. Allocated by the loader
+    // before any LexemeMeaning is populated.
+    SchemaId                                          id{};
 };
 
 } // namespace detail
@@ -246,10 +257,18 @@ public:
     [[nodiscard]] std::span<LexemeMeaning const>
         lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept;
 
+    // Per-instance schema id stamped onto every owned `LexemeMeaning`.
+    // Used by accessors like `stringStyle(m)` to assert that `m`
+    // actually came from this schema rather than a copy from another.
+    [[nodiscard]] SchemaId schemaId() const noexcept { return d_.id; }
+
     // String-literal metadata for a meaning that opens a delimited
     // string body. Returns nullptr when the meaning has no `stringStyle`
-    // declared (the common case). Aborts on an out-of-range index —
-    // strong-id-style contract.
+    // declared (the common case). Aborts on (a) an `m.schemaId` that
+    // doesn't match this schema (cross-schema misuse) or (b) an out-of-
+    // range id (corrupted meaning). Both are caller bugs; the abort
+    // surfaces them at the failing call site rather than letting the
+    // wrong-but-plausible StringStyle propagate silently.
     [[nodiscard]] StringStyle const* stringStyle(LexemeMeaning const& m) const noexcept;
 
     // ── Shape navigation ──

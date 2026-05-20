@@ -10,14 +10,11 @@ namespace dss {
 
 // How the tokenizer interprets escape sequences inside a delimited
 // string body.
-//   None             — no escape mechanism; every char is literal until `endsAt`.
-//                      Used by raw strings (R"(...)", here-strings, etc.).
-//   Char             — a single lead character (typically `\`) introduces an
-//                      escape pair. The tokenizer consumes the lead + the
-//                      next char as a single escape sequence.
-//   DoubledDelimiter — the terminator character doubled within the body
-//                      means "literal terminator." Used by SQL (`'a''b'`),
-//                      C# verbatim (`@"a""b"`), Pascal (`'a''b'`).
+//   None             — every char literal until `endsAt` (raw strings).
+//   Char             — single lead character (typically `\`) starts an
+//                      escape pair. Lead + next char consumed together.
+//   DoubledDelimiter — terminator doubled within the body is a literal
+//                      terminator. SQL `'a''b'`, C# `@"a""b"`, Pascal.
 enum class EscapeKind : std::uint8_t {
     None,
     Char,
@@ -26,25 +23,24 @@ enum class EscapeKind : std::uint8_t {
 
 [[nodiscard]] DSS_EXPORT std::string_view escapeKindName(EscapeKind k) noexcept;
 
-// Tokenizer-side metadata for a delimited string literal. Attached to
-// the meaning of the OPENING delimiter token (e.g. `"`, `@"`, `R"`).
-// The tokenizer (when authored) reads this off the meaning, switches
-// into the string-body mode, and consumes characters according to the
-// rules below until `endsAt` is matched.
+// Tokenizer metadata for a delimited string literal. Attached to the
+// opening-delimiter token's meaning (e.g. `"`, `@"`, `R"`).
 //
-// Strings are owned (not span-into-pool) because each StringStyle has
-// at most two of them and the records live in a single
-// `GrammarSchemaData::stringStyles` vector indexed by
-// `LexemeMeaning::stringStyleIdx`. LexemeMeaning stays trivially
-// copyable because it only carries the index.
+// Invariants (enforced by the loader; do not construct outside it):
+//   - `escapeChar` is meaningful only when `escapeKind == Char`;
+//     interpreted as a single ASCII byte.
+//   - `tagPattern` non-empty IS the signal that the delimiter carries
+//     a dynamically-captured tag (C++ R"DELIM(...)DELIM", Rust r#"..."#).
+//     Default pattern when the JSON sets `delimiterTag: "matched"` but
+//     omits `tagPattern` is `[A-Za-z0-9_]{0,16}`.
+//   - `endsAt` is required, non-empty.
 struct DSS_EXPORT StringStyle {
     EscapeKind   escapeKind         = EscapeKind::None;
-    char         escapeChar         = 0;        // valid when escapeKind == Char
-    bool         endsAtLongestMatch = false;    // greedy run-of-terminator match
-    bool         hasMatchedDelimiterTag = false;
+    char         escapeChar         = 0;        // ASCII byte; valid iff escapeKind == Char
+    bool         endsAtLongestMatch = false;
     bool         multiline          = false;
-    std::string  endsAt;                        // required terminator sequence
-    std::string  tagPattern;                    // valid when hasMatchedDelimiterTag
+    std::string  endsAt;
+    std::string  tagPattern;                    // non-empty ⇒ dynamic delimiter tag
 };
 
 } // namespace dss

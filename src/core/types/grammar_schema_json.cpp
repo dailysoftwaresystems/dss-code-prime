@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <format>
@@ -177,6 +178,7 @@ inline std::optional<StringStyle> parseStringStyle(json const& obj,
 std::optional<StringStyle> parseStringStyle(json const& obj,
                                             std::string const& path,
                                             Collector& c) {
+    // Top-level shape.
     if (!obj.is_object()) {
         c.emit(DiagnosticCode::C_InvalidStringStyle, path,
                "'stringStyle' must be an object");
@@ -204,7 +206,10 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         return std::nullopt;
     }
 
-    // escapeChar — required if escapeKind == Char; rejected otherwise.
+    // escapeChar — required iff escapeKind == Char. Other escapeKinds
+    // must not carry one; mixing them is always a config bug. Single
+    // ASCII byte; multi-byte UTF-8 chars are rejected (the tokenizer
+    // works on raw bytes).
     const bool hasEsc = obj.contains("escapeChar");
     if (s.escapeKind == EscapeKind::Char) {
         if (!hasEsc || !obj.at("escapeChar").is_string() ||
@@ -212,7 +217,7 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
             c.emit(DiagnosticCode::C_InvalidStringStyle,
                    std::format("{}/escapeChar", path),
                    "'escapeChar' is required when escapeKind is 'char' and "
-                   "must be a single-character string");
+                   "must be a single ASCII character");
             return std::nullopt;
         }
         s.escapeChar = obj.at("escapeChar").get<std::string>().front();
@@ -220,7 +225,7 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         c.emit(DiagnosticCode::C_InvalidStringStyle,
                std::format("{}/escapeChar", path),
                "'escapeChar' is only meaningful when escapeKind is 'char'");
-        // Continue — the field is just ignored; not a fatal error.
+        return std::nullopt;
     }
 
     // endsAt — required, non-empty.
@@ -243,6 +248,15 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         }
         s.endsAtLongestMatch = obj.at("endsAtLongestMatch").get<bool>();
     }
+    // Cross-field warning: longest-match with a 1-char terminator is
+    // a no-op (the longest run of one char IS that char). Surface so
+    // the author notices their intent didn't take effect.
+    if (s.endsAtLongestMatch && s.endsAt.size() == 1) {
+        c.emit(DiagnosticCode::C_RedundantField,
+               std::format("{}/endsAtLongestMatch", path),
+               "'endsAtLongestMatch' has no effect with a 1-character 'endsAt'",
+               DiagnosticSeverity::Warning);
+    }
 
     // multiline — optional bool.
     if (obj.contains("multiline")) {
@@ -255,7 +269,10 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         s.multiline = obj.at("multiline").get<bool>();
     }
 
-    // delimiterTag — optional; only "matched" is recognized.
+    // delimiterTag — optional. Only "matched" is recognized; presence
+    // enables dynamic-tag capture. The signal at runtime is
+    // `tagPattern.empty()` — non-empty pattern means dynamic tag.
+    bool dynamicTagRequested = false;
     if (obj.contains("delimiterTag")) {
         if (!obj.at("delimiterTag").is_string() ||
             obj.at("delimiterTag").get<std::string>() != "matched") {
@@ -264,13 +281,20 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
                    "'delimiterTag' is optional; the only recognized value is 'matched'");
             return std::nullopt;
         }
-        s.hasMatchedDelimiterTag = true;
+        dynamicTagRequested = true;
     }
 
-    // tagPattern — optional regex (default applied when delimiterTag
-    // is "matched" and tagPattern is omitted).
+    // tagPattern — optional regex. Must accompany delimiterTag:"matched"
+    // (otherwise the pattern is dead data). Default applied when
+    // delimiterTag is "matched" but tagPattern is omitted.
     constexpr std::string_view kDefaultTagPattern = "[A-Za-z0-9_]{0,16}";
     if (obj.contains("tagPattern")) {
+        if (!dynamicTagRequested) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/tagPattern", path),
+                   "'tagPattern' requires 'delimiterTag: \"matched\"'");
+            return std::nullopt;
+        }
         if (!obj.at("tagPattern").is_string()) {
             c.emit(DiagnosticCode::C_InvalidStringStyle,
                    std::format("{}/tagPattern", path),
@@ -278,12 +302,13 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
             return std::nullopt;
         }
         s.tagPattern = obj.at("tagPattern").get<std::string>();
-    } else if (s.hasMatchedDelimiterTag) {
+    } else if (dynamicTagRequested) {
         s.tagPattern = kDefaultTagPattern;
     }
 
-    // Validate regex at load time. std::regex throws regex_error on
-    // malformed patterns; convert to C_InvalidStringStyle.
+    // Validate regex at load. Catch std::regex_error specifically; any
+    // other exception (std::bad_alloc, system errors) signals a deeper
+    // problem we don't want to silently translate to a diagnostic.
     if (!s.tagPattern.empty()) {
         try {
             std::regex compiled(s.tagPattern);
@@ -292,6 +317,11 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
             c.emit(DiagnosticCode::C_InvalidStringStyle,
                    std::format("{}/tagPattern", path),
                    std::format("'tagPattern' is not a valid regex: {}", e.what()));
+            return std::nullopt;
+        } catch (std::exception const& e) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/tagPattern", path),
+                   std::format("'tagPattern' regex compile failed: {}", e.what()));
             return std::nullopt;
         }
     }
@@ -920,6 +950,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     data.name          = langObj.at("name").get<std::string>();
     data.version       = langObj.at("version").get<std::string>();
     data.schemaVersion = schemaVer;
+    // Per-instance monotonic schema id stamped onto every LexemeMeaning
+    // so cross-schema misuse is catchable at the failing lookup.
+    static std::atomic<std::uint32_t> sNextSchemaId{1};
+    data.id            = SchemaId{sNextSchemaId.fetch_add(1, std::memory_order_relaxed)};
 
     if (langObj.contains("fileExtensions") && langObj.at("fileExtensions").is_array()) {
         for (auto const& ext : langObj.at("fileExtensions")) {
@@ -1231,8 +1265,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                    std::format("{}/stringStyle", entryPath),
                                                    coll);
                         if (ss.has_value()) {
-                            lm.stringStyleIdx = static_cast<std::uint32_t>(
-                                data.stringStyles.size());
+                            // Reserve slot 0 as the InvalidStringStyle
+                            // sentinel; real ids 1..N. Matches the
+                            // LexerModeId / NodeId / RuleId convention.
+                            if (data.stringStyles.empty()) {
+                                data.stringStyles.push_back(StringStyle{});
+                            }
+                            lm.stringStyleId = StringStyleId{
+                                static_cast<std::uint32_t>(data.stringStyles.size())};
                             data.stringStyles.push_back(std::move(*ss));
                         }
                     }
@@ -1636,6 +1676,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     // Freeze interners — post-load, no further internment allowed.
     data.rules->freeze();
     data.schemaTokens->freeze();
+
+    // Stamp every LexemeMeaning with the owning schema's id. Done in a
+    // single pass after all parsing so loader code never has to thread
+    // the id through dozens of construction sites.
+    for (auto& [lex, meanings] : data.lexemeTable) {
+        (void)lex;
+        for (auto& m : meanings) m.schemaId = data.id;
+    }
+    for (auto& [modeId, table] : data.lexerModeTokens) {
+        (void)modeId;
+        for (auto& [lex, meanings] : table) {
+            (void)lex;
+            for (auto& m : meanings) m.schemaId = data.id;
+        }
+    }
 
     if (coll.hasErrors()) {
         return std::unexpected(std::move(coll.diagnostics));

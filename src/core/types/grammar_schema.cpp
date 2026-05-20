@@ -114,15 +114,22 @@ LexerMode const& GrammarSchema::lexerMode(LexerModeId id) const noexcept {
 }
 
 StringStyle const* GrammarSchema::stringStyle(LexemeMeaning const& m) const noexcept {
-    if (!m.stringStyleIdx.has_value()) return nullptr;
-    if (*m.stringStyleIdx >= d_.stringStyles.size()) {
+    if (m.schemaId.v != d_.id.v) {
         std::fprintf(stderr,
-            "dss::GrammarSchema::stringStyle: out-of-range stringStyleIdx "
-            "(idx=%u, pool_size=%zu)\n",
-            *m.stringStyleIdx, d_.stringStyles.size());
+            "dss::GrammarSchema::stringStyle: LexemeMeaning belongs to a "
+            "different schema (meaning.schemaId=%u, this.schemaId=%u)\n",
+            m.schemaId.v, d_.id.v);
         std::abort();
     }
-    return &d_.stringStyles[*m.stringStyleIdx];
+    if (!m.stringStyleId.valid()) return nullptr;
+    if (m.stringStyleId.v >= d_.stringStyles.size()) {
+        std::fprintf(stderr,
+            "dss::GrammarSchema::stringStyle: out-of-range stringStyleId "
+            "(v=%u, pool_size=%zu)\n",
+            m.stringStyleId.v, d_.stringStyles.size());
+        std::abort();
+    }
+    return &d_.stringStyles[m.stringStyleId.v];
 }
 
 std::span<LexemeMeaning const>
