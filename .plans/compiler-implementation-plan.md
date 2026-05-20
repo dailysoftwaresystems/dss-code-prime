@@ -16,14 +16,14 @@
 | Build system (CMake 4.0 floor, C++23, FetchContent of nlohmann/json 3.12.0 + GoogleTest 1.17.0) | ✅ working |
 | Core types — full sub-plan T0–T12 (tree/node/diagnostics/schema + `TreeBuilder` + `TreeCursor` + `tree_visitor` + `NodeAttribute<T>` + typed views + E2E + CMake wireup + onboarding docs) | ✅ **complete** |
 | Schema expressiveness v2 (sub-plan PR0–PR8) — c-subset + operator precedence (`OperatorTable`) + real `SchemaCursor` walker + contextual keywords + `scopeRequire` + `TreeBuilder::Checkpoint` + `lexerModes`/`LexerModeStack`/`modeOp` + `stringStyle` descriptor + tsql-subset empirical stress + cross-plan close-out | ✅ **done** — all 10 PRs (PR0, PR1, PR2a, PR2b, PR3–PR8) shipped + review-fixed |
-| **Total ctest cases (post SH3)** | **523 cases across 26 suites, 100% pass** |
+| **Total ctest cases (post SH4)** | **531 cases across 26 suites, 100% pass** |
 | Substrate hardening (sub-plan SH1–SH4) — landing-log generator + Linux CI matrix + cross-tree `NodeId` guard + v2 follow-ups | ✅ **done** — all four PRs shipped. Parent phase #5 (tokenizer) unblocked. |
 | `source-factory/` thin facade | ⏳ waiting on remaining core-types work |
 | `tokenizer/` + `analysis/{lexical,syntactic,semantic}/` | 🔵 **next** — Substrate Hardening done; tokenizer phase opens |
 | `gen/intermediate/` + `gen/optimizer/` | ⏳ pending |
 | `gen/link/` Windows PE demo | 🟦 standalone (not yet IR-driven) |
 | `program/` driver | 🟦 skeleton with `--demo-gui` (compile* methods are TODO) |
-| CI/CD pipelines (`cpp-app-pr.yml` / `pkg.yml` / `deploy.yml` in [DSS.DevOps](../../DSS.DevOps/.github/workflows/) + consumer wiring) | ✅ landed (v2). Per-PR matrix: Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, macOS/AppleClang/Release. |
+| CI/CD pipelines (`cpp-app-pr.yml` / `pkg.yml` / `deploy.yml` in [DSS.DevOps](../../DSS.DevOps/.github/workflows/) + consumer wiring) | ✅ landed (v2). Per-PR matrix: Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, macOS/AppleClang/Release. Plan-doc hygiene gate: `landing-log-check` job (SH4a) runs `python tools/refresh_landing_log.py --check` on every PR. |
 | Docker / cross-compile toolchains | ⏳ pending |
 
 Drill into the [sub-plan §0 status table](./tree-node-model-plan.md#0-current-status-snapshot) for tree/node phase detail.

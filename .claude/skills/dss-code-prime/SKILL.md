@@ -24,12 +24,14 @@ reference — when this skill and a doc disagree, **the doc and the plan win**.
 - **DSS Code Prime** is a universal, configurable C++ compiler frontend. Both the source language
   AND the target platform are intended to be configurable — a single C++ engine compiles *any*
   defined language to *any* supported target.
-- **Status today:** the tree/node model foundation (sub-plan T0–T12) is complete and shipping.
-  The lexer, parser, semantic analyzer, IR, optimizer, and codegen layers do **not yet exist**.
-  Everything in this repo is the substrate every later layer will build on.
+- **Status today:** the tree/node model foundation (sub-plan T0–T12), schema-expressiveness v2
+  (PR0–PR8), and substrate hardening (SH1–SH4) are all complete and shipping. The lexer,
+  parser, semantic analyzer, IR, optimizer, and codegen layers do **not yet exist** — that's
+  the next-up parent-plan phase #5. Everything in this repo is the substrate every later layer
+  will build on.
 - **Main technologies:** C++23, CMake 4.0+, FetchContent for `nlohmann/json` 3.12.0 and
-  GoogleTest 1.17.0, MinGW GCC 13.2 (ucrt) on Windows. Cross-platform is a stated goal; only
-  Windows has been exercised so far.
+  GoogleTest 1.17.0. Local dev on Windows uses MinGW GCC 13.2 (ucrt); CI exercises
+  Linux/GCC-13, Linux/Clang-19+ASan, Windows/MSVC, and macOS/AppleClang on every PR.
 - **Design discipline:** strongly-typed IDs, immutable post-build `Tree`, fail-loud invariant
   guards via local `*Fatal` helpers (no `<cassert>`), header-only templates where possible,
   config-driven languages (no compiled language definitions).
@@ -556,32 +558,49 @@ heap-allocated `std::vector` and reset it AFTER `finish()` (see
 - Seven typed views + `well_known_names.hpp`.
 - End-to-end integration test exercising the full stack against `toy.lang.json`.
 - Onboarding docs (`docs/tree-model.md`, `docs/language-config-spec.md`).
-- **278 ctest cases across 17 suites, 100% pass.**
+- **531 ctest cases across 26 suites, 100% pass.** (v1 T0–T12 baseline + v2 PR0–PR8 + SH1–SH4.)
+- **Schema-expressiveness v2 (PR0–PR8): done.** Operator precedence + arity (`OperatorTable`),
+  contextual keywords + `reservedWordPolicy`, `scopeRequire` (anyOf/forbid/topMustBe/outermost),
+  `TreeBuilder::Checkpoint` + speculative-alt loader plumbing, `lexerModes` + `LexerModeStack` +
+  `modeOp`, `stringStyle` descriptor with `EscapeKind` + dynamic tag patterns. Two real grammars
+  ship: `toy.lang.json` and `tsql-subset.lang.json` (empirical stress proves v2 is sufficient
+  for non-trivial languages). See `.plans/schema-expressiveness-v2-plan.md`.
+- **Substrate hardening (SH1–SH4): done.** SH2 confirmed the multi-OS CI matrix (Linux/GCC,
+  Linux/Clang+ASan, Windows/MSVC, macOS/AppleClang). SH3 closed the cross-tree `NodeId` caveat
+  (`NodeId.treeTag` + tag validation in `NodeAttribute<T>` and `Tree::node_`). SH1 ships
+  `tools/refresh_landing_log.py` for plan-doc hygiene; SH4a wires its `--check` into CI. SH4b
+  adopted `switch`/`case`/`default`/`break` in c-subset via shape-based positioning. SH4c
+  pinned multi-level AltChoice routing.
+- **Three shipped `.lang.json` configs**: `toy.lang.json`, `c-subset.lang.json`,
+  `tsql-subset.lang.json`.
 
 ### NOT done yet
 
 - **The lexer.** The current code drives `TreeBuilder` from hand-constructed tokens — no real
-  tokenizer exists.
+  tokenizer exists. Substrate hardening is done; tokenizer phase is the next-up parent-plan
+  phase.
 - **The parser.** `TreeBuilder` validates *within* a frame but the sequence/alt/repeat shape
-  walker isn't implemented. The "is `open(varDecl)` valid here?" check is the parser's job.
-- **Real-language grammars.** Only `toy.lang.json` ships. C#, Dart, T-SQL, SQLite are promised
-  but not authored. The schema's expressive ceiling is **not** validated against a realistic
-  language.
-- **Schema-expressiveness v2.** Operator precedence, contextual keywords, scope-stack patterns,
-  speculative `alt`, string interpolation, custom string variants — all deferred to
-  `.plans/schema-expressiveness-v2-plan.md`. The v1 schema as-shipped cannot express most
-  mainstream languages.
+  walker isn't fully consumer-driven. The "is `open(varDecl)` valid here?" check is the
+  parser's job. The schema cursor walks correctly through arbitrary AltChoice nesting (SH4c
+  pin) — that mechanism is ready for a real parser.
+- **Most real-language grammars.** Only `toy`, `c-subset`, and `tsql-subset` ship. C#, Dart,
+  SQLite are promised but not authored. Float-literal styling and ternary operators are not
+  yet schema-expressible (v3 candidates).
 - **Semantic analyzer, IR, optimizer, codegen, linker.** None exist. `src/core/compiler.cpp`
   is a placeholder.
-- **Cross-platform.** Only MinGW GCC 13.2 on Windows has been exercised. Linux / macOS /
-  iOS / Android / WASM are stated goals; untested.
+- **Cross-platform — partial.** CI matrix exercises Linux/GCC-13, Linux/Clang-19+ASan,
+  Windows/MSVC, and macOS/AppleClang on every PR (SH2 + SH4a). iOS / Android / WASM are stated
+  goals; untested. Local dev convention on Windows is MinGW GCC 13.2; production code paths
+  are toolchain-portable (proven by green CI on all four legs).
 
 ### The biggest near-term risk
 
-Until a realistic grammar (something with binary operators + precedence + scoped identifiers)
-is authored and parsed, we don't know whether the v1 schema is expressive enough or whether
-v2 features will force changes back into the v1 types. The empirical-validation step is the
-single largest open question.
+The tokenizer phase (parent plan #5) opens next. v2 has been validated against tsql-subset
+end-to-end at the schema level (PR7) and c-subset adopted shape-based switch/case (SH4b), so
+the substrate is empirically sufficient for non-trivial languages. The first real test will
+be when an actual lexer drives `TreeBuilder::pushToken` from real source bytes — that's where
+PR5 (lexer modes) and PR6 (string styles) get exercised under non-stub-driver pressure for
+the first time. Expect a v2-fixup pass once the tokenizer surfaces gaps.
 
 ---
 
