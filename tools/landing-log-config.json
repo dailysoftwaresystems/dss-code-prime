@@ -8,6 +8,11 @@
     {
       "path": ".plans/schema-expressiveness-v2-plan.md",
       "subjectPattern": "^Schema expressiveness v2 (PR[0-9]+[a-z]?)(?:\\s+(review)(?:\\s+round-([0-9]+))?)?:"
+    },
+    {
+      "_comment": "TZ1/TZ2/TZ3 + optional letter sub-deliverables (TZ1a, etc).",
+      "path": ".plans/tokenizer-plan.md",
+      "subjectPattern": "^Tokenizer (TZ[0-9]+)[a-z]?(?:\\s+(review)(?:\\s+round-([0-9]+))?)?:"
     }
   ]
 }
