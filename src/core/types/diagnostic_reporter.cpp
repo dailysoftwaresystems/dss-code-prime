@@ -59,6 +59,36 @@ std::size_t DiagnosticReporter::warningCount() const noexcept {
         all_, [](ParseDiagnostic const& d) { return d.severity == DiagnosticSeverity::Warning; }));
 }
 
+DiagnosticReporter::Snapshot DiagnosticReporter::snapshotForRollback() const {
+    Snapshot s;
+    s.allSize = all_.size();
+    s.perCode = perCode_;
+    s.recent  = recent_;
+    s.hitCap  = hitCap_;
+    return s;
+}
+
+void DiagnosticReporter::forceReport(ParseDiagnostic d) {
+    auto filtered = applyPolicy(std::move(d));
+    if (!filtered) return;
+    perCode_[filtered->code]++;
+    all_.push_back(std::move(*filtered));
+}
+
+void DiagnosticReporter::truncateTo(Snapshot const& snap) {
+    // Restore visible stream length.
+    if (snap.allSize < all_.size()) {
+        all_.resize(snap.allSize);
+    }
+    // perCode_, recent_, and hitCap_ are restored wholesale. recent_
+    // CANNOT be back-truncated by size alone because pop_front during
+    // speculation may have evicted original entries; only the full
+    // snapshot is mathematically sound.
+    perCode_ = snap.perCode;
+    recent_  = snap.recent;
+    hitCap_  = snap.hitCap;
+}
+
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
     if (cfg_.policy.suppress.contains(d.code)) {
         return std::nullopt;

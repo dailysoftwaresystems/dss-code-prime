@@ -56,15 +56,78 @@ void TreeBuilder::OpenScope::close() noexcept {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Checkpoint — RAII guard returned by TreeBuilder::checkpoint()
+// ─────────────────────────────────────────────────────────────────────────
+
+TreeBuilder::Checkpoint::Checkpoint(TreeBuilder* b, std::uint32_t id) noexcept
+    : builder_(b), id_(id) {}
+
+TreeBuilder::Checkpoint::Checkpoint(Checkpoint&& other) noexcept
+    : builder_(other.builder_), id_(other.id_), disp_(other.disp_) {
+    other.builder_ = nullptr;
+    other.id_      = 0;
+    other.disp_    = Disposition::Committed;     // moved-from is inert
+}
+
+TreeBuilder::Checkpoint&
+TreeBuilder::Checkpoint::operator=(Checkpoint&& other) noexcept {
+    if (this != &other) {
+        // If `this` is still pending, the user assigned over a live
+        // guard — roll it back as a defensive default (same as the
+        // destructor would have done).
+        if (builder_ && disp_ == Disposition::Pending) {
+            builder_->rollbackToId_(id_);
+        }
+        builder_       = other.builder_;
+        id_            = other.id_;
+        disp_          = other.disp_;
+        other.builder_ = nullptr;
+        other.id_      = 0;
+        other.disp_    = Disposition::Committed;
+    }
+    return *this;
+}
+
+TreeBuilder::Checkpoint::~Checkpoint() noexcept {
+    if (!builder_ || disp_ != Disposition::Pending) return;
+    // No-op guard (returned when the speculation-depth cap was hit) has
+    // no captured state, so destroying it without commit/rollback is
+    // not a bug — the P_MaxSpeculationDepth diagnostic already flagged
+    // the cap event. Silently inert.
+    if (id_ == TreeBuilder::kNoOpCheckpointId) {
+        disp_    = Disposition::Committed;
+        builder_ = nullptr;
+        return;
+    }
+    builder_->rollbackToId_(id_);
+    disp_ = Disposition::RolledBack;
+
+    // Warning goes through forceReport_ so a pre-checkpoint reporter
+    // already at hitCap_ doesn't silently swallow this signal. The
+    // forgotten-commit bug must reach the user.
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::P_UncommittedCheckpoint;
+    d.severity = DiagnosticSeverity::Warning;
+    d.buffer   = builder_->source_ ? builder_->source_->id() : InvalidBuffer;
+    d.span     = SourceSpan::empty(0);
+    d.actual   = "Checkpoint destroyed without commit() or rollback() — "
+                 "rolled back as a safe default";
+    builder_->forceReport_(std::move(d));
+    builder_ = nullptr;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // TreeBuilder
 // ─────────────────────────────────────────────────────────────────────────
 
 TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
                         std::shared_ptr<GrammarSchema const> schema,
-                        DiagnosticReporter::Config           diagConfig)
+                        DiagnosticReporter::Config           diagConfig,
+                        BuilderConfig                        builderConfig)
     : source_(std::move(src))
     , schema_(std::move(schema))
-    , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig))) {
+    , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig)))
+    , builderConfig_(builderConfig) {
     // Constructor preconditions: source_ and schema_ must be non-null.
     // We accept a null source in tests of degenerate paths (the diagnostic
     // emit fallback handles it), but a null schema means pushToken has
@@ -77,6 +140,10 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // starts at 1. This matches the convention DSS_STRONG_ID enforces:
     // default-constructed = invalid sentinel.
     nodes_.emplace_back();
+    // Initial cursor is invalid — only becomes meaningful on the first
+    // open(rule). Until then there's no expected set for pushToken to
+    // consult, and contextual-keyword resolution stays strict.
+    cursor_ = SchemaCursor{};
 }
 
 NodeId TreeBuilder::emit_(detail::Node n) {
@@ -87,7 +154,7 @@ NodeId TreeBuilder::emit_(detail::Node n) {
 
 bool TreeBuilder::attachToCurrentFrame_(NodeId id) {
     if (open_.empty()) return false;
-    open_.back().children.push_back(id);
+    pendingChildren_.push_back(id);
     // Backpatch parent on the just-emitted node so HasError propagation
     // can walk via the stored parent link rather than the open-frame stack
     // (frames may have already closed by the time a deep error fires).
@@ -95,11 +162,43 @@ bool TreeBuilder::attachToCurrentFrame_(NodeId id) {
     return true;
 }
 
+// Helper: range of pendingChildren_ belonging to the top open frame.
+// Empty if there's no open frame.
+[[nodiscard]] std::span<NodeId const> TreeBuilder::topFramePendingChildren_() const noexcept {
+    if (open_.empty()) return {};
+    auto const start = open_.back().pendingStart;
+    return std::span<NodeId const>{pendingChildren_}.subspan(start);
+}
+
 void TreeBuilder::emitDiagnostic_(ParseDiagnostic d) {
     // Snapshot the scope stack at error-time. Done here (rather than at
     // call sites) so every diagnostic gets it for free.
     d.scopeStack.assign(scopes_.begin(), scopes_.end());
     reporter_->report(std::move(d));
+}
+
+void TreeBuilder::forceReport_(ParseDiagnostic d) {
+    d.scopeStack.assign(scopes_.begin(), scopes_.end());
+    reporter_->forceReport(std::move(d));
+}
+
+void TreeBuilder::noteCursorDesync_(bool wasValid,
+                                    bool nowValid,
+                                    SourceSpan span,
+                                    std::optional<RuleId> rule) {
+    if (cursorDesynced_) return;
+    if (!(wasValid && !nowValid)) return;
+    cursorDesynced_ = true;
+
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::P_SchemaCursorDesync;
+    d.severity = DiagnosticSeverity::Info;
+    d.buffer   = source_ ? source_->id() : InvalidBuffer;
+    d.span     = span;
+    d.ruleContext = rule;
+    d.actual   = "schema cursor went off-track; contextual keyword "
+                 "resolution will stay strict for the remainder of the build";
+    emitDiagnostic_(std::move(d));
 }
 
 void TreeBuilder::addBuilderInvariant_(std::string actual, SourceSpan span) {
@@ -145,9 +244,12 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
     // anchor, falling back to source-buffer start. Real span rolls up via
     // SourceSpan::join when children land.
     SourceSpan opener = SourceSpan::empty(0);
-    if (!open_.empty() && !open_.back().children.empty()) {
-        const NodeId lastChild = open_.back().children.back();
-        opener = SourceSpan::empty(nodes_[lastChild.v].span.end());
+    if (!open_.empty()) {
+        const auto parentChildren = topFramePendingChildren_();
+        if (!parentChildren.empty()) {
+            const NodeId lastChild = parentChildren.back();
+            opener = SourceSpan::empty(nodes_[lastChild.v].span.end());
+        }
     }
     n.span = opener;
 
@@ -155,10 +257,10 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
     if (!open_.empty()) {
         nodes_[id.v].parent = open_.back().id;
         // Register the new internal node as a child of the parent frame
-        // now, while parent is still open. closeFrame_ computes the
-        // parent's firstChild/childCount by walking frame.children;
-        // without this push the subtree would vanish from the tree.
-        open_.back().children.push_back(id);
+        // now, while parent is still open. closeFrame_ flushes the
+        // parent's pending range into childIndex_; without this push the
+        // subtree would vanish from the tree.
+        pendingChildren_.push_back(id);
     }
 
     // Wraparound is theoretical (4B opens in one build), but it would
@@ -166,13 +268,29 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
     // violation diagnostics — assert early if it ever happens.
     assert(nextCookie_ != 0 && "TreeBuilder::open: cookie wraparound");
     const std::uint32_t cookie = nextCookie_++;
+    // The new frame owns pendingChildren_ from this point forward.
+    const auto pendingStart = static_cast<std::uint32_t>(pendingChildren_.size());
     open_.push_back(Frame{
-        .id         = id,
-        .rule       = rule,
-        .openerSpan = opener,
-        .children   = {},
-        .cookie     = cookie,
+        .id           = id,
+        .rule         = rule,
+        .openerSpan   = opener,
+        .pendingStart = pendingStart,
+        .cookie       = cookie,
     });
+
+    // Walk the schema cursor in parallel with the open frame. Saving the
+    // parent's cursor lets closeFrame_ resume the parent via leaveRule
+    // when this rule completes. `leaveRule` requires the saved cursor be
+    // at a RuleLeaf slot — if the parent cursor is at an AltChoice (the
+    // body of a `repeat`/`optional`/`alt`), route it to the RuleLeaf
+    // branch for `rule` first so close() can resume cleanly.
+    SchemaCursor savedParent = cursor_;
+    if (savedParent.valid()) {
+        auto routed = schema_->routeToRuleLeaf(savedParent, rule);
+        if (routed.valid()) savedParent = routed;
+    }
+    cursorStack_.push_back(savedParent);
+    cursor_ = schema_->enterRule(rule);
 
     return OpenScope{this, cookie};
 }
@@ -201,11 +319,12 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         if (it->cookie == cookie) break;
     }
     if (it == open_.rend()) {
+        auto const topChildren = topFramePendingChildren_();
         addBuilderInvariant_(
             std::format("close() with unknown cookie {}", cookie),
-            open_.back().children.empty()
+            topChildren.empty()
                 ? open_.back().openerSpan
-                : nodes_[open_.back().children.back().v].span);
+                : nodes_[topChildren.back().v].span);
         return;
     }
 
@@ -222,21 +341,29 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         Frame& fr = open_.back();
         detail::Node& node = nodes_[fr.id.v];
 
+        // Flush this frame's pending range to childIndex_ contiguously.
+        // The range is `pendingChildren_[fr.pendingStart..end)`. After
+        // flush, truncate pendingChildren_ back to fr.pendingStart so
+        // the parent frame's region is re-exposed at the top.
         const auto firstChild = static_cast<std::uint32_t>(childIndex_.size());
-        for (NodeId child : fr.children) {
+        const auto pendEnd    = static_cast<std::uint32_t>(pendingChildren_.size());
+        for (std::uint32_t i = fr.pendingStart; i < pendEnd; ++i) {
+            NodeId child = pendingChildren_[i];
             childIndex_.push_back(child);
             // Roll the span up from this child onto our node.
             node.span = SourceSpan::join(node.span, nodes_[child.v].span);
             // OR-reduce HasError. The attach paths already propagated
             // eagerly, but synthetic Missing inserted directly into
-            // fr.children by finish() bypasses attachToCurrentFrame_;
+            // pendingChildren_ by finish() bypasses attachToCurrentFrame_;
             // this loop catches it.
             if (hasError(nodes_[child.v].flags)) {
                 node.flags |= NodeFlags::HasError;
             }
         }
+        const auto childCount = pendEnd - fr.pendingStart;
+        pendingChildren_.resize(fr.pendingStart);
         node.firstChild = firstChild;
-        node.childCount = static_cast<std::uint32_t>(fr.children.size());
+        node.childCount = childCount;
 
         const bool isTarget = (fr.cookie == cookie);
         if (!isTarget) {
@@ -246,6 +373,20 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             closedCookies_.insert(fr.cookie);
         }
         open_.pop_back();
+        // Invariant: cursorStack_.size() == open_.size() at every
+        // open/close boundary. leaveRule on a non-RuleLeaf saved cursor
+        // returns invalid and trips noteCursorDesync_ — strict-only
+        // contextual resolution for the remainder of the build.
+        if (!cursorStack_.empty()) {
+            SchemaCursor savedParent = cursorStack_.back();
+            cursorStack_.pop_back();
+            const bool wasValid = savedParent.valid();
+            cursor_ = schema_->leaveRule(savedParent);
+            noteCursorDesync_(wasValid, cursor_.valid(), fr.openerSpan,
+                              std::optional<RuleId>{fr.rule});
+        } else {
+            cursor_ = SchemaCursor{};
+        }
         if (isTarget) break;
         if (open_.empty()) break;
     }
@@ -265,23 +406,48 @@ struct ResolvedMeaning {
     std::size_t   matchCount = 0;
 };
 
-// Per-meaning scope filter — the LexemeMeaning::validScopes field on a
-// token entry. Documented as: empty == valid everywhere; non-empty ==
-// require at least one of the listed scopes to be on the active stack.
+// Per-meaning scope filter — the LexemeMeaning::scopeRequire field on
+// a token entry. Check order is `forbid → topMustBe → outermost → anyOf`;
+// first failure rejects the meaning.
+//
+//   forbid    — none of these scopes may be on the stack.
+//   topMustBe — innermost active scope must equal this kind.
+//   outermost — bottom-of-stack scope must equal this kind.
+//   anyOf     — at least one of these must be on the stack (empty = no constraint).
 //
 // Distinct from `schema.isTokenValidInScope` which enforces the schema's
 // top-level `scopes.validity[].forbid` rules (per-scope, not per-token).
 // Both checks are AND'd in `resolveMeaning`.
-[[nodiscard]] bool meaningAllowedByValidScopes(
+[[nodiscard]] bool meaningAllowedByScopeRequire(
     LexemeMeaning const& m,
     std::span<ScopeKind const> scopes) noexcept {
-    if (m.validScopes.empty()) return true;
-    for (ScopeKind required : m.validScopes) {
+    auto const& sr = m.scopeRequire;
+    // forbid
+    for (ScopeKind f : sr.forbid) {
         for (ScopeKind active : scopes) {
-            if (required == active) return true;
+            if (f == active) return false;
         }
     }
-    return false;
+    // topMustBe — innermost is the last element (stack grows back).
+    if (sr.topMustBe.has_value()) {
+        if (scopes.empty() || scopes.back() != *sr.topMustBe) return false;
+    }
+    // outermost — bottom-of-stack is the first element.
+    if (sr.outermost.has_value()) {
+        if (scopes.empty() || scopes.front() != *sr.outermost) return false;
+    }
+    // anyOf — at least one of the listed must be active.
+    if (!sr.anyOf.empty()) {
+        bool any = false;
+        for (ScopeKind required : sr.anyOf) {
+            for (ScopeKind active : scopes) {
+                if (required == active) { any = true; break; }
+            }
+            if (any) break;
+        }
+        if (!any) return false;
+    }
+    return true;
 }
 
 ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
@@ -292,10 +458,10 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     if (candidates.empty()) return out;
 
     // A candidate survives iff BOTH the schema's per-scope forbid rules
-    // AND the candidate's per-meaning validScopes allow it.
+    // AND the candidate's per-meaning scopeRequire allow it.
     auto candidateAllowed = [&](LexemeMeaning const& m) {
         return schema.isTokenValidInScope(m.id, scopes)
-            && meaningAllowedByValidScopes(m, scopes);
+            && meaningAllowedByScopeRequire(m, scopes);
     };
 
     // Candidates arrive pre-sorted by priority (lowest first, stable on
@@ -400,6 +566,59 @@ void TreeBuilder::pushToken(Token const& tok) {
         emitDiagnostic_(std::move(d));
     }
 
+    // Contextual-keyword demotion. When the winning meaning is a soft
+    // keyword (`contextual: true` in JSON, OR every keyword under
+    // `reservedWordPolicy: "contextual"`), the schema cursor's
+    // expectedSet decides whether the keyword survives. Outside the
+    // expected set the lexeme degrades to Identifier and an info-level
+    // P_ContextualKeywordResolution diagnostic records the demotion.
+    //
+    // Conservative fallback: when the cursor is invalid (no shape graph
+    // position known, e.g. the builder hasn't entered any rule yet, or
+    // an earlier advance went off-track) the keyword stays — same as
+    // strict policy. This avoids silently turning every soft keyword
+    // into an identifier when the parser temporarily diverges from the
+    // schema during error recovery.
+    if (resolved.meaning.contextual) {
+        // Defense-in-depth: loader rejects `contextual: true` on the
+        // Identifier kind (see grammar_schema_json.cpp), but anyone
+        // fabricating a LexemeMeaning by hand would skip that check.
+        // The demotion target equals the source → infinite no-op
+        // identity; abort early with a clear message.
+        const auto identId = schema_->schemaTokens().find("Identifier");
+        if (resolved.meaning.id.v == identId.v) {
+            std::fputs("dss::TreeBuilder fatal: contextual meaning resolved to "
+                       "Identifier (the demotion target); config bypassed the "
+                       "loader's C_MissingField check\n", stderr);
+            std::abort();
+        }
+    }
+    if (resolved.meaning.contextual && cursor_.valid()) {
+        const auto expected = schema_->expectedSet(cursor_);
+        bool inExpected = false;
+        for (auto const& t : expected) {
+            if (t.v == resolved.meaning.id.v) { inExpected = true; break; }
+        }
+        if (!inExpected) {
+            const auto demotedFrom = resolved.meaning.id;
+            const auto identId     = schema_->schemaTokens().find("Identifier");
+            LexemeMeaning ident{};
+            ident.id = identId;
+            resolved.meaning = ident;
+
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::P_ContextualKeywordResolution;
+            d.severity = DiagnosticSeverity::Info;
+            d.buffer   = source_->id();
+            d.span     = tok.span;
+            d.actual   = std::format("'{}' as Identifier (demoted from {})",
+                                     lexeme,
+                                     schema_->schemaTokens().name(demotedFrom));
+            if (!open_.empty()) d.ruleContext = open_.back().rule;
+            emitDiagnostic_(std::move(d));
+        }
+    }
+
     // Apply scope effects from the resolved meaning. Order vs. leaf-
     // attach doesn't change the current token's tree placement (the leaf
     // lands in the open frame regardless), but performing the scope
@@ -420,6 +639,25 @@ void TreeBuilder::pushToken(Token const& tok) {
     leaf.span      = tok.span;
     const NodeId id = emit_(leaf);
     attachToCurrentFrame_(id);
+
+    // Walk the schema cursor by the resolved token kind. EmptySpace
+    // tokens never appear in the schema's expected sets — whitespace is
+    // off-grammar by design — so don't advance through them; doing so
+    // would invalidate the cursor on every space and trip the desync
+    // diagnostic on every otherwise-clean parse. For non-EmptySpace
+    // tokens, if `advance` returns invalid (token not expected at this
+    // position) the cursor becomes invalid for the remainder of the
+    // build, future contextual resolutions stay strict per the fallback
+    // above, and the first valid → invalid transition surfaces one
+    // P_SchemaCursorDesync.
+    if (!isEmptySpace(resolved.meaning.flagsApplied)) {
+        const bool wasValid = cursor_.valid();
+        cursor_ = schema_->advance(cursor_, resolved.meaning.id);
+        noteCursorDesync_(wasValid, cursor_.valid(), tok.span,
+                          open_.empty()
+                              ? std::optional<RuleId>{}
+                              : std::optional<RuleId>{open_.back().rule});
+    }
 }
 
 // ── pushError ────────────────────────────────────────────────────────────
@@ -482,11 +720,13 @@ void TreeBuilder::popScope() {
         // Underflow — a recovered close that didn't match anything we
         // opened. P_BuilderInvariant + silent recovery (the rest of the
         // build can keep going).
-        SourceSpan at = open_.empty()
-            ? SourceSpan::empty(0)
-            : (open_.back().children.empty()
-               ? open_.back().openerSpan
-               : nodes_[open_.back().children.back().v].span);
+        SourceSpan at = SourceSpan::empty(0);
+        if (!open_.empty()) {
+            const auto topChildren = topFramePendingChildren_();
+            at = topChildren.empty()
+                ? open_.back().openerSpan
+                : nodes_[topChildren.back().v].span;
+        }
         addBuilderInvariant_("popScope on empty scope stack", at);
         return;
     }
@@ -533,25 +773,25 @@ Tree TreeBuilder::finish() && {
     }
 
     // Synthesize Missing for unclosed shapes + emit one P_PrematureEndOfInput
-    // per unclosed frame. The deepest frame is reported first (it's the
-    // most-specific complaint); each older (outer) frame's diagnostic
-    // attaches the deeper-frame openers as related-locations.
+    // per unclosed frame. Process innermost-out so each Missing child is
+    // appended to the top frame's pendingChildren_ range (the only one
+    // currently accessible) and the frame is closed before moving on to
+    // the next outer one. Each outer frame's diagnostic attaches the
+    // deeper-frame openers as related-locations.
     if (!open_.empty()) {
         SourceSpan eofSpan = SourceSpan::empty(source_ ? source_->size() : 0);
         std::vector<RelatedLocation> ancestors;
         ancestors.reserve(open_.size());
 
-        // Walk from deepest (back) to outermost (front). Insert a Missing
-        // child marker on each open frame so the tree still has a complete
-        // structure that downstream passes can iterate without surprise.
-        for (auto it = open_.rbegin(); it != open_.rend(); ++it) {
+        while (!open_.empty()) {
+            Frame& fr = open_.back();
             detail::Node miss{};
             miss.kind   = NodeKind::Error;
             miss.flags  = NodeFlags::Missing | NodeFlags::Synthetic | NodeFlags::HasError;
             miss.span   = eofSpan;
-            miss.parent = it->id;
+            miss.parent = fr.id;
             const NodeId mid = emit_(miss);
-            it->children.push_back(mid);
+            pendingChildren_.push_back(mid);
 
             // Each frame's diagnostic gets the same EOF span but a
             // distinct ruleContext — the reporter's dedup hash includes
@@ -561,31 +801,26 @@ Tree TreeBuilder::finish() && {
             d.severity    = DiagnosticSeverity::Error;
             d.buffer      = source_ ? source_->id() : InvalidBuffer;
             d.span        = eofSpan;
-            d.ruleContext = it->rule;
+            d.ruleContext = fr.rule;
             d.actual      = std::format("end of input while inside rule '{}'",
-                                        schema_->rules().name(it->rule));
+                                        schema_->rules().name(fr.rule));
             d.related     = ancestors;
             emitDiagnostic_(std::move(d));
 
-            // After emitting, append this frame's opener to `ancestors`
-            // so the next (outer) diagnostic links back to it.
             ancestors.push_back({source_ ? source_->id() : InvalidBuffer,
-                                 it->openerSpan,
+                                 fr.openerSpan,
                                  std::format("inside rule '{}' opened here",
-                                             schema_->rules().name(it->rule))});
+                                             schema_->rules().name(fr.rule))});
 
             propagateHasError_(mid);
-        }
 
-        // Close every still-open frame synthetically. closeFrame_ marks
-        // cascade-closed (non-target) cookies in closedCookies_ already,
-        // but the *target* cookie of each call (the top of the stack) is
-        // not — we mark it manually here so the corresponding OpenScope's
-        // eventual destructor finds it and no-ops cleanly.
-        while (!open_.empty()) {
-            const std::uint32_t topCookie = open_.back().cookie;
-            closeFrame_(topCookie, /*synthetic*/ true);
-            closedCookies_.insert(topCookie);
+            // Close this frame synthetically. closeFrame_ marks cascade-
+            // closed (non-target) cookies in closedCookies_ already, but
+            // the *target* cookie (this frame) is not — mark it manually
+            // so the matching OpenScope's eventual destructor no-ops.
+            const std::uint32_t cookie = fr.cookie;
+            closeFrame_(cookie, /*synthetic*/ true);
+            closedCookies_.insert(cookie);
         }
     }
 
@@ -622,6 +857,125 @@ Tree TreeBuilder::finish() && {
     }
 
     return Tree{std::move(td)};
+}
+
+// ── checkpoint / commit / rollback ───────────────────────────────────────
+
+TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
+    // Past the cap, return a no-op guard (id = kNoOpCheckpointId).
+    // commit/rollback on it short-circuit; the dtor recognizes the
+    // sentinel and skips the forgotten-commit warning.
+    if (checkpointStack_.size() >= builderConfig_.maxSpeculationDepth) {
+        if (!maxSpeculationDepthReached_) {
+            maxSpeculationDepthReached_ = true;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::P_MaxSpeculationDepth;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = source_ ? source_->id() : InvalidBuffer;
+            d.span     = SourceSpan::empty(0);
+            d.actual   = std::format(
+                "speculation depth cap ({}) reached; further checkpoints are no-ops",
+                builderConfig_.maxSpeculationDepth);
+            emitDiagnostic_(std::move(d));
+        }
+        return Checkpoint{this, kNoOpCheckpointId};
+    }
+
+    CheckpointSnapshot snap;
+    snap.nodesSize                  = nodes_.size();
+    snap.childIndexSize             = childIndex_.size();
+    snap.pendingChildrenSize        = pendingChildren_.size();
+    snap.openFrames                 = open_;
+    snap.scopes                     = scopes_;
+    snap.cursor                     = cursor_;
+    snap.cursorStack                = cursorStack_;
+    snap.nextCookie                 = nextCookie_;
+    snap.closedCookies              = closedCookies_;
+    snap.cursorDesynced             = cursorDesynced_;
+    snap.maxSpeculationDepthReached = maxSpeculationDepthReached_;
+    snap.reporterSnap               = reporter_->snapshotForRollback();
+
+    const auto id = nextCheckpointId_++;
+    checkpointStack_.emplace_back(id, std::move(snap));
+    return Checkpoint{this, id};
+}
+
+void TreeBuilder::commit(Checkpoint&& cp) noexcept {
+    if (!cp.builder_ || cp.disp_ != Checkpoint::Disposition::Pending) return;
+    commitToId_(cp.id_);
+    cp.disp_   = Checkpoint::Disposition::Committed;
+    cp.builder_ = nullptr;
+}
+
+void TreeBuilder::rollback(Checkpoint&& cp) noexcept {
+    if (!cp.builder_ || cp.disp_ != Checkpoint::Disposition::Pending) return;
+    rollbackToId_(cp.id_);
+    cp.disp_   = Checkpoint::Disposition::RolledBack;
+    cp.builder_ = nullptr;
+}
+
+void TreeBuilder::commitToId_(std::uint32_t id) noexcept {
+    if (id == kNoOpCheckpointId) return;
+    // Linear search by id (depth ≤ maxSpeculationDepth, typically ≤ 64
+    // — trivially fast and cache-friendly vs. a hashmap). The invariant
+    // is "each snapshot owns its id"; index arithmetic against the
+    // stack's size silently breaks on inner-commit-then-outer-rollback
+    // sequences, so we search instead.
+    auto it = std::ranges::find_if(checkpointStack_,
+        [id](auto const& e) { return e.first == id; });
+    if (it == checkpointStack_.end()) {
+        // Stale id — either already finalized or never belonged to
+        // this builder. Caller bug; surface it loudly.
+        addBuilderInvariant_(
+            std::format("commit() with stale or unknown Checkpoint id {}", id),
+            SourceSpan::empty(0));
+        return;
+    }
+    // If this isn't the top of the stack, the caller committed an outer
+    // checkpoint while an inner one is still Pending. Inner snapshots
+    // would silently leak — the user almost certainly didn't intend
+    // this. Surface and cascade-discard.
+    if (it + 1 != checkpointStack_.end()) {
+        addBuilderInvariant_(
+            "commit() on outer Checkpoint while inner Checkpoint is still "
+            "Pending; inner speculative state will be cascade-discarded",
+            SourceSpan::empty(0));
+    }
+    checkpointStack_.erase(it, checkpointStack_.end());
+}
+
+void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
+    if (id == kNoOpCheckpointId) return;
+    auto it = std::ranges::find_if(checkpointStack_,
+        [id](auto const& e) { return e.first == id; });
+    if (it == checkpointStack_.end()) {
+        addBuilderInvariant_(
+            std::format("rollback() with stale or unknown Checkpoint id {}", id),
+            SourceSpan::empty(0));
+        return;
+    }
+
+    // Move the target snapshot out before erasing so we don't restore
+    // from a soon-to-be-destroyed object. Inner snapshots (if any)
+    // become irrelevant — they cover speculative state that the rollback
+    // is about to undo wholesale.
+    CheckpointSnapshot snap = std::move(it->second);
+    checkpointStack_.erase(it, checkpointStack_.end());
+
+    // Restore in topological order: arena first, then dependent vectors,
+    // then the cursor/scope/cookie state, then the reporter.
+    nodes_.resize(snap.nodesSize);
+    childIndex_.resize(snap.childIndexSize);
+    pendingChildren_.resize(snap.pendingChildrenSize);
+    open_                       = std::move(snap.openFrames);
+    scopes_                     = std::move(snap.scopes);
+    cursor_                     = snap.cursor;
+    cursorStack_                = std::move(snap.cursorStack);
+    nextCookie_                 = snap.nextCookie;
+    closedCookies_              = std::move(snap.closedCookies);
+    cursorDesynced_             = snap.cursorDesynced;
+    maxSpeculationDepthReached_ = snap.maxSpeculationDepthReached;
+    reporter_->truncateTo(snap.reporterSnap);
 }
 
 } // namespace dss

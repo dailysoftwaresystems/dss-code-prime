@@ -1,6 +1,7 @@
 #include "core/types/grammar_schema_json.hpp"
 
 #include "core/types/grammar_schema.hpp"
+#include "core/types/operator_table.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
@@ -9,10 +10,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -71,6 +76,321 @@ struct Collector {
     }
 };
 
+// Soft upper bound on how many entries a single scopeRequire list may
+// hold. Real configs use 1–4; anything larger is almost certainly a
+// config bug. Exceeding this is a load warning, not an error — the
+// builder still works, but every pushToken pays an O(N×stack) scan.
+constexpr std::size_t kScopeListSoftCap = 32;
+
+void parseModeFields(json const& m,
+                     std::string const& entryPath,
+                     std::unordered_map<std::string, LexerModeId> const& modeIds,
+                     LexemeMeaning& lm,
+                     Collector& c) {
+    const bool hasOp  = m.contains("modeOp");
+    const bool hasArg = m.contains("modeArg");
+    if (!hasOp && !hasArg) return;
+
+    if (!hasOp) {
+        c.emit(DiagnosticCode::C_ConflictingField,
+               std::format("{}/modeArg", entryPath),
+               "'modeArg' is meaningless without 'modeOp'");
+        return;
+    }
+    if (!m.at("modeOp").is_string()) {
+        c.emit(DiagnosticCode::C_ConflictingField,
+               std::format("{}/modeOp", entryPath),
+               "'modeOp' must be a string ('pushMode' | 'popMode' | 'replaceMode')");
+        return;
+    }
+    const auto opStr = m.at("modeOp").get<std::string>();
+    ModeOp op = ModeOp::None;
+    if      (opStr == "pushMode")    op = ModeOp::PushMode;
+    else if (opStr == "popMode")     op = ModeOp::PopMode;
+    else if (opStr == "replaceMode") op = ModeOp::ReplaceMode;
+    else {
+        c.emit(DiagnosticCode::C_ConflictingField,
+               std::format("{}/modeOp", entryPath),
+               std::format("unknown modeOp '{}' (expected 'pushMode' | 'popMode' | 'replaceMode')",
+                           opStr));
+        return;
+    }
+
+    LexerModeId arg{};
+    if (hasArg) {
+        if (!m.at("modeArg").is_string()) {
+            c.emit(DiagnosticCode::C_ConflictingField,
+                   std::format("{}/modeArg", entryPath),
+                   "'modeArg' must be a string mode name");
+            return;
+        }
+        const auto target = m.at("modeArg").get<std::string>();
+        auto it = modeIds.find(target);
+        if (it == modeIds.end()) {
+            c.emit(DiagnosticCode::C_UnknownLexerMode,
+                   std::format("{}/modeArg", entryPath),
+                   std::format("unknown lexer mode '{}'", target));
+            return;
+        }
+        arg = it->second;
+    }
+
+    if (op == ModeOp::PushMode || op == ModeOp::ReplaceMode) {
+        if (!hasArg) {
+            c.emit(DiagnosticCode::C_ConflictingField,
+                   std::format("{}/modeOp", entryPath),
+                   std::format("'modeOp: {}' requires 'modeArg' naming the target mode",
+                               opStr));
+            return;
+        }
+    } else if (op == ModeOp::PopMode) {
+        if (hasArg) {
+            c.emit(DiagnosticCode::C_RedundantField,
+                   std::format("{}/modeArg", entryPath),
+                   "'modeArg' has no effect with 'modeOp: popMode'",
+                   DiagnosticSeverity::Warning);
+            arg = LexerModeId{};                     // ignore the value
+        }
+    }
+
+    lm.modeOp  = op;
+    lm.modeArg = arg;
+}
+
+// Parse a `stringStyle` object on a token meaning. Returns the parsed
+// StringStyle when the field is present and well-formed. Returns
+// nullopt when the field is absent OR when parsing failed (in which
+// case at least one diagnostic was emitted). Caller decides whether
+// to attach the resulting style to a LexemeMeaning.
+//
+// Validation:
+//   - `escapeKind`: required string, one of "char"/"doubled-delimiter"/"none".
+//   - `escapeChar`: required when escapeKind == "char"; single character.
+//   - `endsAt`: required non-empty string.
+//   - `endsAtLongestMatch`/`multiline`: optional bools.
+//   - `delimiterTag`: optional string; only "matched" is recognized.
+//   - `tagPattern`: optional regex string (default `[A-Za-z0-9_]{0,16}`);
+//     compiled at load time via std::regex to surface malformed patterns.
+inline std::optional<StringStyle> parseStringStyle(json const& obj,
+                                                   std::string const& path,
+                                                   struct Collector& c);
+
+std::optional<StringStyle> parseStringStyle(json const& obj,
+                                            std::string const& path,
+                                            Collector& c) {
+    // Top-level shape.
+    if (!obj.is_object()) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle, path,
+               "'stringStyle' must be an object");
+        return std::nullopt;
+    }
+
+    StringStyle s;
+
+    // escapeKind — required.
+    if (!obj.contains("escapeKind") || !obj.at("escapeKind").is_string()) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/escapeKind", path),
+               "'escapeKind' is required and must be a string "
+               "('char' | 'doubled-delimiter' | 'none')");
+        return std::nullopt;
+    }
+    const auto ek = obj.at("escapeKind").get<std::string>();
+    if      (ek == "none")              s.escapeKind = EscapeKind::None;
+    else if (ek == "char")              s.escapeKind = EscapeKind::Char;
+    else if (ek == "doubled-delimiter") s.escapeKind = EscapeKind::DoubledDelimiter;
+    else {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/escapeKind", path),
+               std::format("unknown escapeKind '{}'", ek));
+        return std::nullopt;
+    }
+
+    // escapeChar — required iff escapeKind == Char. Other escapeKinds
+    // must not carry one; mixing them is always a config bug. Single
+    // ASCII byte; multi-byte UTF-8 chars are rejected (the tokenizer
+    // works on raw bytes).
+    const bool hasEsc = obj.contains("escapeChar");
+    if (s.escapeKind == EscapeKind::Char) {
+        if (!hasEsc || !obj.at("escapeChar").is_string() ||
+            obj.at("escapeChar").get<std::string>().size() != 1) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/escapeChar", path),
+                   "'escapeChar' is required when escapeKind is 'char' and "
+                   "must be a single ASCII character");
+            return std::nullopt;
+        }
+        s.escapeChar = obj.at("escapeChar").get<std::string>().front();
+    } else if (hasEsc) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/escapeChar", path),
+               "'escapeChar' is only meaningful when escapeKind is 'char'");
+        return std::nullopt;
+    }
+
+    // endsAt — required, non-empty.
+    if (!obj.contains("endsAt") || !obj.at("endsAt").is_string() ||
+        obj.at("endsAt").get<std::string>().empty()) {
+        c.emit(DiagnosticCode::C_MissingField,
+               std::format("{}/endsAt", path),
+               "'endsAt' is required and must be a non-empty string");
+        return std::nullopt;
+    }
+    s.endsAt = obj.at("endsAt").get<std::string>();
+
+    // endsAtLongestMatch — optional bool.
+    if (obj.contains("endsAtLongestMatch")) {
+        if (!obj.at("endsAtLongestMatch").is_boolean()) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/endsAtLongestMatch", path),
+                   "'endsAtLongestMatch' must be a boolean");
+            return std::nullopt;
+        }
+        s.endsAtLongestMatch = obj.at("endsAtLongestMatch").get<bool>();
+    }
+    // Cross-field warning: longest-match with a 1-char terminator is
+    // a no-op (the longest run of one char IS that char). Surface so
+    // the author notices their intent didn't take effect.
+    if (s.endsAtLongestMatch && s.endsAt.size() == 1) {
+        c.emit(DiagnosticCode::C_RedundantField,
+               std::format("{}/endsAtLongestMatch", path),
+               "'endsAtLongestMatch' has no effect with a 1-character 'endsAt'",
+               DiagnosticSeverity::Warning);
+    }
+
+    // multiline — optional bool.
+    if (obj.contains("multiline")) {
+        if (!obj.at("multiline").is_boolean()) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/multiline", path),
+                   "'multiline' must be a boolean");
+            return std::nullopt;
+        }
+        s.multiline = obj.at("multiline").get<bool>();
+    }
+
+    // delimiterTag — optional. Only "matched" is recognized; presence
+    // enables dynamic-tag capture. The signal at runtime is
+    // `tagPattern.empty()` — non-empty pattern means dynamic tag.
+    bool dynamicTagRequested = false;
+    if (obj.contains("delimiterTag")) {
+        if (!obj.at("delimiterTag").is_string() ||
+            obj.at("delimiterTag").get<std::string>() != "matched") {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/delimiterTag", path),
+                   "'delimiterTag' is optional; the only recognized value is 'matched'");
+            return std::nullopt;
+        }
+        dynamicTagRequested = true;
+    }
+
+    // tagPattern — optional regex. Must accompany delimiterTag:"matched"
+    // (otherwise the pattern is dead data). Default applied when
+    // delimiterTag is "matched" but tagPattern is omitted.
+    constexpr std::string_view kDefaultTagPattern = "[A-Za-z0-9_]{0,16}";
+    if (obj.contains("tagPattern")) {
+        if (!dynamicTagRequested) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/tagPattern", path),
+                   "'tagPattern' requires 'delimiterTag: \"matched\"'");
+            return std::nullopt;
+        }
+        if (!obj.at("tagPattern").is_string()) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/tagPattern", path),
+                   "'tagPattern' must be a regex string");
+            return std::nullopt;
+        }
+        s.tagPattern = obj.at("tagPattern").get<std::string>();
+    } else if (dynamicTagRequested) {
+        s.tagPattern = kDefaultTagPattern;
+    }
+
+    // Validate regex at load. Catch std::regex_error specifically; any
+    // other exception (std::bad_alloc, system errors) signals a deeper
+    // problem we don't want to silently translate to a diagnostic.
+    if (!s.tagPattern.empty()) {
+        try {
+            std::regex compiled(s.tagPattern);
+            (void)compiled;
+        } catch (std::regex_error const& e) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/tagPattern", path),
+                   std::format("'tagPattern' is not a valid regex: {}", e.what()));
+            return std::nullopt;
+        } catch (std::exception const& e) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle,
+                   std::format("{}/tagPattern", path),
+                   std::format("'tagPattern' regex compile failed: {}", e.what()));
+            return std::nullopt;
+        }
+    }
+
+    return s;
+}
+
+// Parse a JSON array of scope names into vector<ScopeKind>. Unknown
+// names emit C_UnknownScopeName and are dropped; non-string elements
+// emit C_ConflictingField with the index path. The walk continues on
+// either error so one bad entry doesn't hide a subsequent one.
+std::vector<ScopeKind> parseScopeArray(json const& arr,
+                                       std::string const& fieldPath,
+                                       Collector& c) {
+    std::vector<ScopeKind> out;
+    if (!arr.is_array()) return out;
+    out.reserve(arr.size());
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        json const& sn = arr[i];
+        if (!sn.is_string()) {
+            c.emit(DiagnosticCode::C_ConflictingField,
+                   std::format("{}/{}", fieldPath, i),
+                   "scope-list entry must be a string");
+            continue;
+        }
+        const auto sk = parseScopeName(sn.get<std::string>());
+        if (!sk) {
+            c.emit(DiagnosticCode::C_UnknownScopeName, fieldPath,
+                   std::format("unknown scope '{}'", sn.get<std::string>()));
+            continue;
+        }
+        out.push_back(*sk);
+    }
+    if (out.size() > kScopeListSoftCap) {
+        c.emit(DiagnosticCode::C_RedundantScopeRequire, fieldPath,
+               std::format("scope list has {} entries (soft cap is {}); "
+                           "consider tightening the constraint",
+                           out.size(), kScopeListSoftCap),
+               DiagnosticSeverity::Warning);
+    }
+    return out;
+}
+
+// Parse a single scope-name string field into ScopeKind. Returns
+// nullopt if the field is missing, wrong type, or names a scope the
+// loader doesn't recognize — emitting diagnostics in the latter two
+// cases so the author isn't left wondering why their constraint
+// silently disappeared.
+std::optional<ScopeKind> parseScopeNameField(json const& parent,
+                                             std::string_view key,
+                                             std::string const& parentPath,
+                                             Collector& c) {
+    if (!parent.contains(key)) return std::nullopt;
+    json const& v = parent.at(key);
+    const auto fieldPath = std::format("{}/{}", parentPath, key);
+    if (!v.is_string()) {
+        c.emit(DiagnosticCode::C_ConflictingField, fieldPath,
+               std::format("'{}' must be a string scope name", key));
+        return std::nullopt;
+    }
+    const auto sk = parseScopeName(v.get<std::string>());
+    if (!sk) {
+        c.emit(DiagnosticCode::C_UnknownScopeName, fieldPath,
+               std::format("unknown scope '{}'", v.get<std::string>()));
+        return std::nullopt;
+    }
+    return *sk;
+}
+
 bool present(json const& j, std::string_view key, Collector& c, std::string const& path) {
     if (!j.contains(key) || j.at(key).is_null()) {
         c.emit(DiagnosticCode::C_MissingField, path,
@@ -119,11 +439,46 @@ void collectReferences(json const& body,
                    std::format("'{}' must be an array", kind));
             return;
         }
+        if (arr.empty()) {
+            c.emit(DiagnosticCode::C_MissingField,
+                   std::format("{}/{}", path, kind),
+                   std::format("'{}' must contain at least one element", kind));
+            return;
+        }
         for (std::size_t i = 0; i < arr.size(); ++i) {
             collectReferences(arr[i], std::format("{}/{}/{}", path, kind, i),
                               outRefs, c);
         }
     };
+
+    // The five shape kinds are mutually exclusive — a body declares one of
+    // sequence|alt|optional|repeat|expr, never two — and a body must declare
+    // at least one. A body with zero kinds silently produces a no-op rule
+    // (the position builder falls through to `return cont`); a body with
+    // multiple kinds silently runs every matching branch. Both are surface
+    // misfires that this guard turns into load errors.
+    {
+        constexpr std::string_view kShapeKinds[] = {
+            "sequence", "alt", "optional", "repeat", "expr",
+        };
+        std::vector<std::string_view> present;
+        for (auto k : kShapeKinds) {
+            if (body.contains(k)) present.push_back(k);
+        }
+        if (present.empty()) {
+            c.emit(DiagnosticCode::C_UnknownShape, path,
+                   "shape body declares no kind — expected exactly one of sequence|alt|optional|repeat|expr");
+        } else if (present.size() > 1) {
+            std::string joined;
+            for (std::size_t i = 0; i < present.size(); ++i) {
+                if (i) joined += ", ";
+                joined += present[i];
+            }
+            c.emit(DiagnosticCode::C_UnknownShape, path,
+                   std::format("shape body declares multiple kinds ({}) — exactly one of sequence|alt|optional|repeat|expr must be present",
+                               joined));
+        }
+    }
 
     if (body.contains("sequence")) recurseArray(body.at("sequence"), "sequence");
     if (body.contains("alt"))      recurseArray(body.at("alt"),      "alt");
@@ -135,7 +490,401 @@ void collectReferences(json const& body,
         collectReferences(body.at("repeat"),
                           std::format("{}/repeat", path), outRefs, c);
     }
-    // `binary` etc. — future expansion. Silently skip.
+    // `expr` body is `{ atom: <rule>, minPrecedence?: <int> }`. The loader
+    // validates the atom reference resolves and rejects unknown keys so a
+    // typo (e.g. `minPrecdence`) doesn't silently use the default. Operator-
+    // table consumption is the parser's responsibility, not the loader's.
+    if (body.contains("expr")) {
+        json const& exprBody = body.at("expr");
+        const auto exprPath = std::format("{}/expr", path);
+        if (!exprBody.is_object()) {
+            c.emit(DiagnosticCode::C_MissingField, exprPath,
+                   "'expr' body must be an object with an 'atom' field");
+        } else if (!exprBody.contains("atom") || !exprBody.at("atom").is_string()) {
+            c.emit(DiagnosticCode::C_MissingField, exprPath,
+                   "'expr' requires a string 'atom' field naming the operand rule");
+        } else {
+            outRefs.push_back(exprBody.at("atom").get<std::string>());
+            // Allowlist: anything other than atom/minPrecedence is a typo.
+            for (auto const& [k, _] : exprBody.items()) {
+                if (k != "atom" && k != "minPrecedence") {
+                    c.emit(DiagnosticCode::C_UnknownShape,
+                           std::format("{}/{}", exprPath, k),
+                           std::format("unknown 'expr' field '{}' — expected 'atom' or 'minPrecedence'", k));
+                }
+            }
+        }
+    }
+}
+
+// ── Compile pass: FIRST/NULLABLE + position tables ──────────────────────
+//
+// The cursor walks a flat per-rule position table built here. Steps:
+//
+//   1. Iteratively compute per-rule FIRST set and NULLABLE flag until
+//      stable. Cycles in the grammar (A → repeat[B] → A) terminate
+//      because FIRST sets grow monotonically.
+//   2. Build each rule's position table via a recursive walk over the
+//      JSON body, threading a `cont` (continuation position-id) through
+//      children. Repeat uses a tie-the-knot pattern so the loop body's
+//      tail returns to the loop entry.
+//   3. Iteratively compute `nullableTail` per position — true when a
+//      position can complete to end-of-rule without consuming any
+//      further token. canEndSource(cursor) reads this directly.
+
+void insertSorted(std::vector<SchemaTokenId>& v, SchemaTokenId t) {
+    auto it = std::lower_bound(v.begin(), v.end(), t,
+        [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; });
+    if (it == v.end() || it->v != t.v) v.insert(it, t);
+}
+
+void mergeSorted(std::vector<SchemaTokenId>& into,
+                 std::span<SchemaTokenId const> from) {
+    for (auto t : from) insertSorted(into, t);
+}
+
+bool nullableOfBody(json const& body,
+                    GrammarSchemaData const& data) {
+    if (body.is_string()) {
+        const auto& name = body.get<std::string>();
+        if (data.rules->contains(name)) {
+            const auto rid = data.rules->find(name);
+            auto it = data.compiledRules.find(rid.v);
+            return it != data.compiledRules.end() && it->second.nullable;
+        }
+        return false;  // token reference is never nullable
+    }
+    if (body.contains("sequence")) {
+        for (auto const& child : body.at("sequence")) {
+            if (!nullableOfBody(child, data)) return false;
+        }
+        return true;
+    }
+    if (body.contains("alt")) {
+        for (auto const& child : body.at("alt")) {
+            if (nullableOfBody(child, data)) return true;
+        }
+        return false;
+    }
+    if (body.contains("optional") || body.contains("repeat")) return true;
+    if (body.contains("expr")) {
+        return nullableOfBody(body.at("expr").at("atom"), data);
+    }
+    return false;
+}
+
+std::vector<SchemaTokenId> firstOfBody(json const& body,
+                                       GrammarSchemaData const& data) {
+    if (body.is_string()) {
+        const auto& name = body.get<std::string>();
+        if (data.rules->contains(name)) {
+            const auto rid = data.rules->find(name);
+            auto it = data.compiledRules.find(rid.v);
+            return it != data.compiledRules.end()
+                ? it->second.firstSet
+                : std::vector<SchemaTokenId>{};
+        }
+        if (data.schemaTokens->contains(name)) {
+            return {data.schemaTokens->find(name)};
+        }
+        return {};
+    }
+    if (body.contains("sequence")) {
+        std::vector<SchemaTokenId> result;
+        for (auto const& child : body.at("sequence")) {
+            mergeSorted(result, firstOfBody(child, data));
+            if (!nullableOfBody(child, data)) break;
+        }
+        return result;
+    }
+    if (body.contains("alt")) {
+        std::vector<SchemaTokenId> result;
+        for (auto const& child : body.at("alt")) {
+            mergeSorted(result, firstOfBody(child, data));
+        }
+        return result;
+    }
+    if (body.contains("optional")) {
+        return firstOfBody(body.at("optional"), data);
+    }
+    if (body.contains("repeat")) {
+        return firstOfBody(body.at("repeat"), data);
+    }
+    if (body.contains("expr")) {
+        return firstOfBody(body.at("expr").at("atom"), data);
+    }
+    return {};
+}
+
+void computeFirstAndNullable(GrammarSchemaData& data, json const& shapesJson) {
+    // Initialise every rule's FIRST = {} and nullable = false. Iterate
+    // until a full pass leaves every rule's values unchanged. FIRST sets
+    // only grow (via insertSorted's dedup) and nullable only flips
+    // false→true, so the loop is monotone over a finite lattice. The
+    // iteration cap is a safety net — if a future refactor breaks
+    // monotonicity, we abort rather than hanging silently.
+    for (auto const& [shapeName, _] : shapesJson.items()) {
+        const auto rid = data.rules->find(shapeName);
+        data.compiledRules[rid.v] = detail::CompiledRule{};
+    }
+
+    constexpr int kMaxIters = 10000;
+    bool changed = true;
+    int iters = 0;
+    while (changed && iters++ < kMaxIters) {
+        changed = false;
+        for (auto const& [shapeName, body] : shapesJson.items()) {
+            const auto rid = data.rules->find(shapeName);
+            auto& rule = data.compiledRules[rid.v];
+            auto newFirst     = firstOfBody(body, data);
+            const bool newNul = nullableOfBody(body, data);
+            if (newFirst != rule.firstSet || newNul != rule.nullable) {
+                rule.firstSet = std::move(newFirst);
+                rule.nullable = newNul;
+                changed = true;
+            }
+        }
+    }
+}
+
+struct PositionBuilder {
+    std::vector<detail::Position>& positions;
+    GrammarSchemaData const&       data;
+    Collector&                     coll;
+    std::string const&             shapePath;   // e.g. "/shapes/expression"
+
+    [[nodiscard]] std::uint32_t emplace(detail::Position p) {
+        positions.push_back(std::move(p));
+        return static_cast<std::uint32_t>(positions.size() - 1);
+    }
+
+    // `cont` is the position-id the built body falls through to when it
+    // completes. Threaded right-to-left through sequence children so each
+    // child's `nextPos` points at its actual successor.
+    [[nodiscard]] std::uint32_t build(json const& body, std::uint32_t cont) {
+        if (body.is_string()) {
+            const auto& name = body.get<std::string>();
+            if (data.rules->contains(name)) {
+                const auto rid = data.rules->find(name);
+                std::vector<SchemaTokenId> firstSet;
+                auto it = data.compiledRules.find(rid.v);
+                if (it != data.compiledRules.end()) firstSet = it->second.firstSet;
+                return emplace(detail::Position::makeRuleLeaf(rid, cont, std::move(firstSet)));
+            }
+            if (data.schemaTokens->contains(name)) {
+                return emplace(detail::Position::makeTokenLeaf(
+                    data.schemaTokens->find(name), cont));
+            }
+            return cont;  // unreachable; references validated earlier
+        }
+        if (body.contains("sequence")) {
+            const auto& seq = body.at("sequence");
+            std::uint32_t curCont = cont;
+            for (auto it = seq.rbegin(); it != seq.rend(); ++it) {
+                curCont = build(*it, curCont);
+            }
+            return curCont;
+        }
+        if (body.contains("alt")) {
+            const auto& alt = body.at("alt");
+            std::vector<std::uint32_t> branches;
+            branches.reserve(alt.size());
+            for (auto const& branch : alt) branches.push_back(build(branch, cont));
+            std::vector<SchemaTokenId> ex;
+            for (auto bid : branches) mergeSorted(ex, positions[bid].expectedSet());
+            const auto id = emplace(detail::Position::makeAltChoice(
+                std::move(branches), std::move(ex)));
+            // Speculative-alt metadata stored for the parser to consume.
+            constexpr std::uint16_t kDefaultLookahead = 8;
+            bool speculative = false;
+            std::uint16_t lookahead = kDefaultLookahead;
+            if (body.contains("speculative")) {
+                json const& sv = body.at("speculative");
+                if (!sv.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/speculative", shapePath),
+                              "'speculative' must be a boolean");
+                } else {
+                    speculative = sv.get<bool>();
+                }
+            }
+            if (body.contains("lookahead")) {
+                json const& lv = body.at("lookahead");
+                if (!lv.is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/lookahead", shapePath),
+                              "'lookahead' must be a positive integer");
+                } else {
+                    const auto raw = lv.get<std::int64_t>();
+                    if (raw <= 0 ||
+                        raw > std::numeric_limits<std::uint16_t>::max()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/lookahead", shapePath),
+                                  std::format("'lookahead' value {} is out of "
+                                              "range (must be 1..{})",
+                                              raw, std::numeric_limits<std::uint16_t>::max()));
+                    } else {
+                        lookahead = static_cast<std::uint16_t>(raw);
+                    }
+                }
+                if (!speculative) {
+                    coll.emit(DiagnosticCode::C_RedundantField,
+                              std::format("{}/lookahead", shapePath),
+                              "'lookahead' has no effect without 'speculative: true'",
+                              DiagnosticSeverity::Warning);
+                }
+            }
+            if (speculative) positions[id].setSpeculative(true, lookahead);
+            return id;
+        }
+        if (body.contains("optional")) {
+            const auto innerStart = build(body.at("optional"), cont);
+            std::vector<SchemaTokenId> ex;
+            mergeSorted(ex, positions[innerStart].expectedSet());
+            mergeSorted(ex, positions[cont].expectedSet());
+            return emplace(detail::Position::makeAltChoice({innerStart, cont}, std::move(ex)));
+        }
+        if (body.contains("repeat")) {
+            // Tie-the-knot: reserve a slot for the loop entry first, build
+            // the body with cont=loopEntry so the body's tail loops back,
+            // then overwrite the reserved slot with a real AltChoice once
+            // `innerStart` is known. Nothing reads `positions[loopEntry]`
+            // mid-recursion — child positions only read sibling rules'
+            // `firstSet` from `data.compiledRules`, which is pre-populated
+            // by `computeFirstAndNullable`.
+            const auto loopEntry  = emplace(detail::Position::makeEnd());
+            const auto innerStart = build(body.at("repeat"), loopEntry);
+            std::vector<SchemaTokenId> ex;
+            mergeSorted(ex, positions[innerStart].expectedSet());
+            mergeSorted(ex, positions[cont].expectedSet());
+            positions[loopEntry] = detail::Position::makeAltChoice(
+                {innerStart, cont}, std::move(ex));
+            return loopEntry;
+        }
+        if (body.contains("expr")) {
+            // Treat the `expr` shape as its `atom` rule reference — the
+            // Pratt operator-climbing step is the parser's job, not the
+            // cursor's.
+            return build(body.at("expr").at("atom"), cont);
+        }
+        return cont;
+    }
+};
+
+void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
+                         Collector& coll) {
+    for (auto const& [shapeName, body] : shapesJson.items()) {
+        const auto rid = data.rules->find(shapeName);
+        auto& rule = data.compiledRules[rid.v];
+        rule.positions.clear();
+        // positions[0] is the sentinel for cursor posId==0 (invalid).
+        // positions[1] is the End that body completions fall through to.
+        rule.positions.emplace_back();
+        const auto shapePath = std::format("/shapes/{}", shapeName);
+        PositionBuilder builder{rule.positions, data, coll, shapePath};
+        const auto endId   = builder.emplace(detail::Position::makeEnd());
+        const auto entryId = builder.build(body, endId);
+        rule.entryPos = entryId;
+    }
+}
+
+// Scan every compiled AltChoice for branches whose precomputed FIRST sets
+// overlap. The cursor's `advance` does silent first-branch-wins on overlap,
+// which is the wrong default for a grammar that wants disjoint alts; this
+// pass surfaces the conflict at load time so the config author resolves
+// it by either restructuring the grammar OR marking the alt as
+// `speculative: true` to opt in to backtracking semantics. Speculative
+// alts are exempt from ambiguity-detect — overlapping FIRST sets are the
+// whole reason a config opts in to backtracking.
+void detectAmbiguousAlternatives(GrammarSchemaData& data, Collector& coll,
+                                  json const& shapesJson) {
+    for (auto const& [shapeName, _] : shapesJson.items()) {
+        const auto rid = data.rules->find(shapeName);
+        auto it = data.compiledRules.find(rid.v);
+        if (it == data.compiledRules.end()) continue;
+        auto const& positions = it->second.positions;
+        for (std::size_t posIdx = 0; posIdx < positions.size(); ++posIdx) {
+            auto const& p = positions[posIdx];
+            if (p.slotKind() != SlotKind::AltChoice) continue;
+            // Speculative alts deliberately allow overlapping FIRST sets
+            // — the whole point is backtracking when the disambiguating
+            // token is N positions deep. Skip the ambiguity check.
+            if (p.speculative()) continue;
+            auto branches = p.branches();
+            for (std::size_t i = 0; i + 1 < branches.size(); ++i) {
+                auto a = positions[branches[i]].expectedSet();
+                for (std::size_t j = i + 1; j < branches.size(); ++j) {
+                    auto b = positions[branches[j]].expectedSet();
+                    // Both sets are sorted by SchemaTokenId.v; linear merge
+                    // detects overlap in O(|a|+|b|).
+                    std::size_t ai = 0, bi = 0;
+                    SchemaTokenId overlap{};
+                    bool found = false;
+                    while (ai < a.size() && bi < b.size()) {
+                        if (a[ai].v == b[bi].v) {
+                            overlap = a[ai]; found = true; break;
+                        }
+                        if (a[ai].v < b[bi].v) ++ai; else ++bi;
+                    }
+                    if (found) {
+                        coll.emit(DiagnosticCode::C_AmbiguousAlternatives,
+                                  std::format("/shapes/{}", shapeName),
+                                  std::format("alt branches share FIRST token '{}' — the cursor would silently take the first branch; restructure the alt or factor the shared prefix",
+                                              data.schemaTokens->name(overlap)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+void computeNullableTails(GrammarSchemaData& data) {
+    // Fixed point over a finite lattice (false ⇒ true is monotone). Cap
+    // iterations as a safety net — if a future refactor accidentally
+    // flips a flag back, we'd otherwise hang silently.
+    constexpr int kMaxIters = 10000;
+    for (auto& [_, rule] : data.compiledRules) {
+        auto& positions = rule.positions;
+        for (auto& p : positions) {
+            p.setNullableTail(p.slotKind() == SlotKind::End);
+        }
+        bool changed = true;
+        int iters = 0;
+        while (changed && iters++ < kMaxIters) {
+            changed = false;
+            for (auto& p : positions) {
+                bool newVal = p.nullableTail();
+                switch (p.slotKind()) {
+                case SlotKind::End:
+                    newVal = true;
+                    break;
+                case SlotKind::TokenLeaf:
+                    newVal = false;
+                    break;
+                case SlotKind::RuleLeaf: {
+                    // Crossing a rule boundary requires both legs to be
+                    // nullable — the callee rule itself AND the parent's
+                    // continuation. Dropping either invalidates the path.
+                    auto it = data.compiledRules.find(p.ruleId().v);
+                    const bool ruleNullable =
+                        (it != data.compiledRules.end()) && it->second.nullable;
+                    newVal = ruleNullable && positions[p.nextPos()].nullableTail();
+                    break;
+                }
+                case SlotKind::AltChoice:
+                    newVal = false;
+                    for (auto bid : p.branches()) {
+                        if (positions[bid].nullableTail()) { newVal = true; break; }
+                    }
+                    break;
+                }
+                if (newVal != p.nullableTail()) {
+                    p.setNullableTail(newVal);
+                    changed = true;
+                }
+            }
+        }
+    }
 }
 
 } // anonymous namespace
@@ -169,11 +918,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                   "must be a positive integer");
         return std::unexpected(std::move(coll.diagnostics));
     }
+    // Inclusive window of schema versions this loader understands. Bump
+    // the upper bound only after the loader actually parses the new
+    // version's exclusive fields — accepting a version implies all
+    // documented features for that version round-trip cleanly.
+    constexpr std::uint32_t kMinSchemaVersion = 1;
+    constexpr std::uint32_t kMaxSchemaVersion = 2;
     const auto schemaVer = doc.at("dssSchemaVersion").get<std::uint32_t>();
-    if (schemaVer < 1 || schemaVer > 1) {   // currently only v1 supported
+    if (schemaVer < kMinSchemaVersion || schemaVer > kMaxSchemaVersion) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
-                  std::format("unsupported dssSchemaVersion {} (this build supports 1)",
-                              schemaVer));
+                  std::format("unsupported dssSchemaVersion {} (this build supports {}..{})",
+                              schemaVer, kMinSchemaVersion, kMaxSchemaVersion));
         return std::unexpected(std::move(coll.diagnostics));
     }
 
@@ -195,6 +950,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     data.name          = langObj.at("name").get<std::string>();
     data.version       = langObj.at("version").get<std::string>();
     data.schemaVersion = schemaVer;
+    // Per-instance monotonic schema id stamped onto every LexemeMeaning
+    // so cross-schema misuse is catchable at the failing lookup.
+    static std::atomic<std::uint32_t> sNextSchemaId{1};
+    data.id            = SchemaId{sNextSchemaId.fetch_add(1, std::memory_order_relaxed)};
 
     if (langObj.contains("fileExtensions") && langObj.at("fileExtensions").is_array()) {
         for (auto const& ext : langObj.at("fileExtensions")) {
@@ -202,8 +961,78 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // reservedWordPolicy: "strict" (default) | "contextual". Contextual
+    // makes every keyword soft — the loader sets `contextual = true` on
+    // every keyword's LexemeMeaning further down. The builder then
+    // demotes any keyword whose schemaTokenId isn't in the cursor's
+    // expectedSet at resolution time.
+    if (doc.contains("reservedWordPolicy")) {
+        if (!doc.at("reservedWordPolicy").is_string()) {
+            coll.emit(DiagnosticCode::C_MissingField, "/reservedWordPolicy",
+                      "'reservedWordPolicy' must be a string ('strict' or 'contextual')");
+        } else {
+            const auto v = doc.at("reservedWordPolicy").get<std::string>();
+            if      (v == "strict")     data.reservedWordPolicy = ReservedWordPolicy::Strict;
+            else if (v == "contextual") data.reservedWordPolicy = ReservedWordPolicy::Contextual;
+            else {
+                coll.emit(DiagnosticCode::C_MissingField, "/reservedWordPolicy",
+                          std::format("unknown reservedWordPolicy '{}' (expected 'strict' or 'contextual')", v));
+            }
+        }
+    }
+
     data.rules        = std::make_shared<RuleInterner>();
     data.schemaTokens = std::make_shared<SchemaTokenInterner>();
+
+    // Pass 1: register `lexerModes` names → LexerModeIds before any
+    // token meaning is parsed, so `modeArg` references resolve against
+    // forward declarations. Synthesize "main" at id 1; slot 0 is the
+    // InvalidLexerMode sentinel. Case-folded near-miss detection warns
+    // on configs that mix `"String-body"` and `"string-body"`.
+    auto toLower = [](std::string s) {
+        for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return s;
+    };
+    std::unordered_map<std::string, std::string> caseFoldedSeen;
+    auto registerMode = [&](std::string const& name) -> LexerModeId {
+        if (auto it = data.lexerModeIds.find(name); it != data.lexerModeIds.end()) {
+            return it->second;
+        }
+        // Slot 0 = InvalidLexerMode sentinel; real ids start at 1.
+        if (data.lexerModes.empty()) {
+            data.lexerModes.push_back(LexerMode{});
+        }
+        const auto folded = toLower(name);
+        if (auto seenIt = caseFoldedSeen.find(folded);
+            seenIt != caseFoldedSeen.end()) {
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      std::format("/lexerModes/{}", name),
+                      std::format("mode name '{}' differs only by case from "
+                                  "already-declared mode '{}' — references will "
+                                  "resolve unpredictably; pick one spelling",
+                                  name, seenIt->second),
+                      DiagnosticSeverity::Warning);
+        }
+        caseFoldedSeen.emplace(folded, name);
+        const LexerModeId realId{
+            static_cast<std::uint32_t>(data.lexerModes.size())};
+        data.lexerModes.push_back(LexerMode::make(name, realId, std::nullopt));
+        data.lexerModeIds.emplace(name, realId);
+        return realId;
+    };
+
+    const LexerModeId mainModeId = registerMode("main");
+
+    if (doc.contains("lexerModes")) {
+        if (!doc.at("lexerModes").is_object()) {
+            coll.emit(DiagnosticCode::C_ConflictingField, "/lexerModes",
+                      "'lexerModes' must be an object");
+        } else {
+            for (auto const& [modeName, _] : doc.at("lexerModes").items()) {
+                (void)registerMode(modeName);
+            }
+        }
+    }
 
     // Pre-intern built-in token kinds.
     for (auto name : kBuiltinTokenKindNames) {
@@ -216,17 +1045,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             coll.emit(DiagnosticCode::C_MissingField, "/tokens",
                       "'tokens' must be an object");
         } else {
-            // Pass A: count entries with validScopes to reserve the pool
-            // exactly. Reserving avoids reallocation that would invalidate
-            // the LexemeMeaning::validScopes spans we set up next.
+            // Pass A: count anyOf/forbid lists upfront to reserve the
+            // backing pool exactly. Reallocation would invalidate the
+            // ScopeMatch spans we set up next.
+            //   - legacy `validScopes`         → 1 list (anyOf)
+            //   - `scopeRequire.anyOf`         → 1 list
+            //   - `scopeRequire.forbid`        → 1 list
             std::size_t poolNeeded = 0;
             for (auto const& [lex, arr] : doc.at("tokens").items()) {
                 if (!arr.is_array()) continue;
                 for (auto const& m : arr) {
-                    if (m.is_object() && m.contains("validScopes")) ++poolNeeded;
+                    if (!m.is_object()) continue;
+                    if (m.contains("validScopes")) ++poolNeeded;
+                    if (m.contains("scopeRequire") && m.at("scopeRequire").is_object()) {
+                        auto const& sr = m.at("scopeRequire");
+                        if (sr.contains("anyOf"))  ++poolNeeded;
+                        if (sr.contains("forbid")) ++poolNeeded;
+                    }
                 }
             }
-            data.validScopesPool.reserve(poolNeeded);
+            data.scopeListPool.reserve(poolNeeded);
 
             // Pass B: populate lexemeTable + spans.
             for (auto const& [lex, arr] : doc.at("tokens").items()) {
@@ -258,6 +1096,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     lm.priority    = m.value("priority", 0);
                     lm.closesScope = m.value("closesScope", false);
 
+                    // `contextual` is a keyword-only concept. Tokens are
+                    // operators / punctuation / built-ins — they don't
+                    // degrade to identifiers based on parse position.
+                    if (m.contains("contextual")) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  std::format("{}/contextual", entryPath),
+                                  "'contextual' is only valid on keyword entries — tokens never degrade to identifiers");
+                    }
+
                     if (m.contains("flags")) {
                         lm.flagsApplied = parseFlagList(m.at("flags"));
                     }
@@ -267,39 +1114,174 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     if (m.contains("opensScope") && m.at("opensScope").is_string()) {
                         const auto sk = parseScopeName(m.at("opensScope").get<std::string>());
                         if (!sk) {
-                            coll.emit(DiagnosticCode::C_UnclosableScope, entryPath,
+                            coll.emit(DiagnosticCode::C_UnknownScopeName, entryPath,
                                       std::format("unknown scope name '{}'",
                                                   m.at("opensScope").get<std::string>()));
                         } else {
                             lm.opensScope = *sk;
                         }
                     }
-                    if (m.contains("validScopes") && m.at("validScopes").is_array()) {
-                        std::vector<ScopeKind> scopes;
-                        scopes.reserve(m.at("validScopes").size());
-                        for (auto const& sn : m.at("validScopes")) {
-                            if (!sn.is_string()) continue;
-                            const auto sk = parseScopeName(sn.get<std::string>());
-                            if (!sk) {
-                                coll.emit(DiagnosticCode::C_UnclosableScope, entryPath,
-                                          std::format("unknown scope '{}' in validScopes",
-                                                      sn.get<std::string>()));
-                                continue;
+                    // Reject co-existence of legacy `validScopes` and
+                    // `scopeRequire`. One source of truth per meaning
+                    // keeps span backing unambiguous and prevents an
+                    // author from splitting their intent across two
+                    // fields and ending up with neither.
+                    const bool hasLegacy = m.contains("validScopes");
+                    const bool hasNew    = m.contains("scopeRequire");
+                    bool scopeRequireFatal = false;
+                    if (hasLegacy && hasNew) {
+                        coll.emit(DiagnosticCode::C_ConflictingField, entryPath,
+                                  "meaning declares both 'validScopes' and "
+                                  "'scopeRequire' — use 'scopeRequire' only "
+                                  "(legacy 'validScopes' is shorthand for 'scopeRequire.anyOf')");
+                        scopeRequireFatal = true;
+                    } else if (hasLegacy) {
+                        if (!m.at("validScopes").is_array()) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      std::format("{}/validScopes", entryPath),
+                                      "'validScopes' must be an array of scope-name strings");
+                        } else {
+                            auto anyOf = parseScopeArray(m.at("validScopes"),
+                                                         std::format("{}/validScopes", entryPath),
+                                                         coll);
+                            if (!anyOf.empty()) {
+                                data.scopeListPool.push_back(std::move(anyOf));
+                                lm.scopeRequire.anyOf = std::span<ScopeKind const>{
+                                    data.scopeListPool.back()};
+                            } else if (!m.at("validScopes").empty()) {
+                                // Author wrote a non-empty array but every
+                                // entry failed parsing — the diagnostics
+                                // already flagged each bad name. No extra
+                                // emission needed; the meaning loads with
+                                // no anyOf constraint, the way it would
+                                // have with an explicit `[]`.
+                            } else {
+                                coll.emit(DiagnosticCode::C_RedundantScopeRequire,
+                                          std::format("{}/validScopes", entryPath),
+                                          "'validScopes' is an empty array — drop the "
+                                          "field or list at least one scope",
+                                          DiagnosticSeverity::Warning);
                             }
-                            scopes.push_back(*sk);
                         }
-                        data.validScopesPool.push_back(std::move(scopes));
-                        auto const& backing = data.validScopesPool.back();
-                        lm.validScopes = std::span<ScopeKind const>{backing};
+                    } else if (hasNew) {
+                        if (!m.at("scopeRequire").is_object()) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      std::format("{}/scopeRequire", entryPath),
+                                      "'scopeRequire' must be an object");
+                        } else {
+                            json const& sr = m.at("scopeRequire");
+                            auto loadList = [&](std::string_view key,
+                                                std::span<ScopeKind const>& outSpan) {
+                                if (!sr.contains(key)) return;
+                                json const& v = sr.at(key);
+                                const auto path = std::format("{}/scopeRequire/{}",
+                                                              entryPath, key);
+                                if (!v.is_array()) {
+                                    coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                              std::format("'{}' must be an array of scope-name strings", key));
+                                    return;
+                                }
+                                if (v.empty()) {
+                                    coll.emit(DiagnosticCode::C_RedundantScopeRequire, path,
+                                              std::format("'{}' is an empty array — drop the field "
+                                                          "or list at least one scope", key),
+                                              DiagnosticSeverity::Warning);
+                                    return;
+                                }
+                                auto parsed = parseScopeArray(v, path, coll);
+                                if (!parsed.empty()) {
+                                    data.scopeListPool.push_back(std::move(parsed));
+                                    outSpan = std::span<ScopeKind const>{
+                                        data.scopeListPool.back()};
+                                }
+                            };
+                            loadList("anyOf",  lm.scopeRequire.anyOf);
+                            loadList("forbid", lm.scopeRequire.forbid);
+                            lm.scopeRequire.topMustBe =
+                                parseScopeNameField(sr, "topMustBe", entryPath + "/scopeRequire", coll);
+                            lm.scopeRequire.outermost =
+                                parseScopeNameField(sr, "outermost", entryPath + "/scopeRequire", coll);
+
+                            // Redundancy / contradiction checks. None of
+                            // these reject the meaning — the builder will
+                            // run the rule as-written — but the author
+                            // almost always wants to know.
+                            auto const& sm = lm.scopeRequire;
+                            const auto srPath = std::format("{}/scopeRequire", entryPath);
+                            if (sm.topMustBe.has_value() && !sm.anyOf.empty()) {
+                                coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                                          "'anyOf' is redundant when 'topMustBe' is set "
+                                          "(topMustBe is the stricter constraint)",
+                                          DiagnosticSeverity::Warning);
+                            }
+                            if (sm.topMustBe.has_value() && sm.outermost.has_value() &&
+                                *sm.topMustBe == *sm.outermost) {
+                                coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                                          "'topMustBe' and 'outermost' name the same scope; "
+                                          "the rule matches only single-scope stacks",
+                                          DiagnosticSeverity::Warning);
+                            }
+                            auto forbidContains = [&](ScopeKind k) {
+                                for (auto x : sm.forbid) if (x == k) return true;
+                                return false;
+                            };
+                            if (sm.topMustBe.has_value() && forbidContains(*sm.topMustBe)) {
+                                coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                                          "'forbid' lists the same scope as 'topMustBe' — "
+                                          "the rule can never match",
+                                          DiagnosticSeverity::Warning);
+                            }
+                            if (sm.outermost.has_value() && forbidContains(*sm.outermost)) {
+                                coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                                          "'forbid' lists the same scope as 'outermost' — "
+                                          "the rule can never match",
+                                          DiagnosticSeverity::Warning);
+                            }
+                            for (auto a : sm.anyOf) {
+                                if (forbidContains(a)) {
+                                    coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                                              std::format("scope '{}' appears in both "
+                                                          "'anyOf' and 'forbid' — the rule "
+                                                          "can never match",
+                                                          scopeName(a)),
+                                              DiagnosticSeverity::Warning);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (scopeRequireFatal) {
+                        // Don't push a meaning with no constraint when the
+                        // author asked for one via conflicting fields —
+                        // skip it entirely so the rest of the schema isn't
+                        // weakened by the loader's silent fallback.
+                        continue;
+                    }
+                    parseModeFields(m, entryPath, data.lexerModeIds, lm, coll);
+
+                    if (m.contains("stringStyle")) {
+                        auto ss = parseStringStyle(m.at("stringStyle"),
+                                                   std::format("{}/stringStyle", entryPath),
+                                                   coll);
+                        if (ss.has_value()) {
+                            // Reserve slot 0 as the InvalidStringStyle
+                            // sentinel; real ids 1..N. Matches the
+                            // LexerModeId / NodeId / RuleId convention.
+                            if (data.stringStyles.empty()) {
+                                data.stringStyles.push_back(StringStyle{});
+                            }
+                            lm.stringStyleId = StringStyleId{
+                                static_cast<std::uint32_t>(data.stringStyles.size())};
+                            data.stringStyles.push_back(std::move(*ss));
+                        }
                     }
 
                     meanings.push_back(lm);
                 }
 
-                // Deterministic ordering: stable sort by (priority asc).
-                // Stable so original declaration order breaks ties — the
-                // rigor review mandates "lowest priority wins, then first-
-                // declared wins".
+                // Deterministic ordering: lowest priority wins; ties
+                // broken by declaration order (hence stable_sort).
                 std::stable_sort(meanings.begin(), meanings.end(),
                     [](LexemeMeaning const& a, LexemeMeaning const& b) {
                         return a.priority < b.priority;
@@ -309,7 +1291,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     // keywords ──
+    // `contextual: true` per entry marks soft keywords (await/yield etc.).
+    // The top-level `reservedWordPolicy: "contextual"` flag forces every
+    // keyword soft regardless of the per-entry setting.
     if (doc.contains("keywords") && doc.at("keywords").is_array()) {
+        const bool forceContextual =
+            (data.reservedWordPolicy == ReservedWordPolicy::Contextual);
         for (std::size_t i = 0; i < doc.at("keywords").size(); ++i) {
             json const& kw = doc.at("keywords").at(i);
             const auto kwPath = std::format("/keywords/{}", i);
@@ -319,9 +1306,279 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                           "keyword entry needs string 'word' and string 'kind'");
                 continue;
             }
+            // Mode operations and string-style descriptors belong on
+            // `tokens` entries — keywords resolve contextually (soft-
+            // keyword demotion), a distinct mechanism from mode
+            // switching or delimited-string opening. Reject loudly.
+            if (kw.contains("modeOp") || kw.contains("modeArg")) {
+                coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
+                          "mode operations belong on 'tokens' entries; keywords "
+                          "cannot switch lexer modes — move the entry to "
+                          "'tokens' or drop the mode fields");
+                continue;
+            }
+            if (kw.contains("stringStyle")) {
+                coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
+                          "'stringStyle' belongs on 'tokens' entries; keywords "
+                          "are word-shaped and cannot open delimited strings");
+                continue;
+            }
             LexemeMeaning lm{};
             lm.id = data.schemaTokens->intern(kw.at("kind").get<std::string>());
+            if (kw.contains("contextual")) {
+                if (!kw.at("contextual").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/contextual", kwPath),
+                              "'contextual' must be a boolean");
+                } else {
+                    lm.contextual = kw.at("contextual").get<bool>();
+                }
+            }
+            if (forceContextual) lm.contextual = true;
+
+            // Identifier IS the demotion target for contextual keywords.
+            // A keyword whose own kind is Identifier cannot meaningfully
+            // be contextual — the would-be demotion is a no-op, and the
+            // marking is almost always a config mistake (Identifier
+            // declared as a keyword by accident). Reject loudly rather
+            // than silently treat the entry as plain Identifier.
+            if (lm.contextual &&
+                kw.at("kind").get<std::string>() == "Identifier") {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          std::format("{}/contextual", kwPath),
+                          std::format("keyword '{}' cannot be contextual: "
+                                      "kind 'Identifier' is itself the "
+                                      "contextual-demotion target",
+                                      kw.at("word").get<std::string>()));
+                continue;
+            }
+
             data.lexemeTable[kw.at("word").get<std::string>()].push_back(lm);
+        }
+    }
+
+    // Pass 2: populate per-mode tokens + defaultToken. "main" inherits
+    // top-level lexemeTable; other modes parse inline.
+    if (mainModeId.valid()) {
+        data.lexerModeTokens[mainModeId.v] = data.lexemeTable;
+    }
+    if (doc.contains("lexerModes") && doc.at("lexerModes").is_object()) {
+        for (auto const& [modeName, modeObj] : doc.at("lexerModes").items()) {
+            const auto modePath = std::format("/lexerModes/{}", modeName);
+            if (!modeObj.is_object()) {
+                coll.emit(DiagnosticCode::C_ConflictingField, modePath,
+                          "mode definition must be an object");
+                continue;
+            }
+            auto modeIt = data.lexerModeIds.find(modeName);
+            if (modeIt == data.lexerModeIds.end()) continue;   // unreachable
+            const LexerModeId modeId = modeIt->second;
+
+            // Parse defaultToken into a local; the mode entry is then
+            // rebuilt via the factory rather than mutated in place.
+            std::optional<SchemaTokenId> defaultToken;
+            if (modeObj.contains("defaultToken")) {
+                json const& dt = modeObj.at("defaultToken");
+                if (!dt.is_object() || !dt.contains("kind") ||
+                    !dt.at("kind").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/defaultToken", modePath),
+                              "'defaultToken' must be an object with a string 'kind'");
+                } else {
+                    defaultToken = data.schemaTokens->intern(
+                        dt.at("kind").get<std::string>());
+                }
+            }
+            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken);
+
+            // tokens field: "default" inherits top-level lexemeTable;
+            // an inline object IS the per-mode table (parsing deferred).
+            const bool hasTokens = modeObj.contains("tokens");
+            if (hasTokens) {
+                json const& tk = modeObj.at("tokens");
+                if (tk.is_string() && tk.get<std::string>() == "default") {
+                    data.lexerModeTokens[modeId.v] = data.lexemeTable;
+                } else if (tk.is_object()) {
+                    coll.emit(DiagnosticCode::C_RedundantField,
+                              std::format("{}/tokens", modePath),
+                              "per-mode inline 'tokens' objects are not yet "
+                              "parsed; the mode's lookup table will be empty. "
+                              "Use 'tokens: \"default\"' to inherit the top-level "
+                              "map, or list mode-specific tokens at top-level "
+                              "with appropriate 'modeOp' entries to switch in",
+                              DiagnosticSeverity::Warning);
+                } else {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/tokens", modePath),
+                              "'tokens' must be 'default' or an inline tokens object");
+                }
+            } else if (defaultToken.has_value()) {
+                // A mode with defaultToken but no `tokens` field will
+                // only ever match its defaultToken — legitimate for
+                // string-body-style scanners, but a frequent typo. Warn
+                // so authors who meant `tokens: "default"` don't get a
+                // silently empty mode.
+                coll.emit(DiagnosticCode::C_RedundantField, modePath,
+                          "mode declares 'defaultToken' but no 'tokens' field — "
+                          "only 'defaultToken' will ever match. Add "
+                          "'tokens: \"default\"' if you also want the top-level "
+                          "token map active in this mode",
+                          DiagnosticSeverity::Warning);
+            }
+        }
+    }
+
+    // operators ──
+    // Runs after tokens + keywords so referenced lexemes and kinds are
+    // already interned. Operator metadata lives only on data.operators,
+    // not on LexemeMeaning — keeps lexeme resolution and operator
+    // semantics independent. `precedence` is required per group;
+    // `associativity` defaults to None and `arity` defaults to Infix
+    // when omitted. Multi-meaning lexemes require an explicit `kind`.
+    if (doc.contains("operators")) {
+        json const& opsObj = doc.at("operators");
+        if (!opsObj.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, "/operators",
+                      "'operators' must be an object");
+        } else if (!opsObj.contains("groups") || !opsObj.at("groups").is_array()) {
+            coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, "/operators/groups",
+                      "'operators.groups' must be an array");
+        } else {
+            json const& groups = opsObj.at("groups");
+            for (std::size_t i = 0; i < groups.size(); ++i) {
+                json const& g = groups[i];
+                const auto gPath = std::format("/operators/groups/{}", i);
+
+                if (!g.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "group must be an object");
+                    continue;
+                }
+                if (!g.contains("precedence") || !g.at("precedence").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "group requires integer 'precedence'");
+                    continue;
+                }
+                const auto precedence = g.at("precedence").get<std::int32_t>();
+
+                OperatorAssoc assoc = OperatorAssoc::None;
+                if (g.contains("associativity")) {
+                    if (!g.at("associativity").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'associativity' must be a string");
+                        continue;
+                    }
+                    const auto a = g.at("associativity").get<std::string>();
+                    if      (a == "left")  assoc = OperatorAssoc::Left;
+                    else if (a == "right") assoc = OperatorAssoc::Right;
+                    else if (a == "none")  assoc = OperatorAssoc::None;
+                    else {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("unknown associativity '{}' (expected left|right|none)", a));
+                        continue;
+                    }
+                }
+
+                OperatorArity arity = OperatorArity::Infix;
+                if (g.contains("arity")) {
+                    if (!g.at("arity").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'arity' must be a string");
+                        continue;
+                    }
+                    const auto a = g.at("arity").get<std::string>();
+                    if      (a == "infix")   arity = OperatorArity::Infix;
+                    else if (a == "prefix")  arity = OperatorArity::Prefix;
+                    else if (a == "postfix") arity = OperatorArity::Postfix;
+                    else {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("unknown arity '{}' (expected infix|prefix|postfix)", a));
+                        continue;
+                    }
+                }
+
+                if (!g.contains("operators") || !g.at("operators").is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "group requires an 'operators' array");
+                    continue;
+                }
+
+                // Optional `kind` disambiguates groups whose lexemes have
+                // multiple meanings. When omitted, every lexeme in this
+                // group must have a single meaning. find() is used (not
+                // intern()) so post-frozen lookup is a pure const op.
+                std::optional<std::string> explicitKind;
+                if (g.contains("kind")) {
+                    if (!g.at("kind").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'kind' must be a string");
+                        continue;
+                    }
+                    explicitKind = g.at("kind").get<std::string>();
+                    if (!data.schemaTokens->contains(*explicitKind)) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("group 'kind' '{}' is not a declared token kind",
+                                              *explicitKind));
+                        continue;
+                    }
+                }
+
+                const OperatorTable::Entry entry{precedence, assoc};
+
+                for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
+                    json const& op = g.at("operators")[j];
+                    const auto opPath = std::format("{}/operators/{}", gPath, j);
+                    if (!op.is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                  "operator entry must be a string lexeme");
+                        continue;
+                    }
+                    const auto lex = op.get<std::string>();
+
+                    auto it = data.lexemeTable.find(lex);
+                    if (it == data.lexemeTable.end() || it->second.empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                  std::format("operator lexeme '{}' is not declared in 'tokens' or 'keywords'", lex));
+                        continue;
+                    }
+                    auto const& meanings = it->second;
+
+                    SchemaTokenId targetId;
+                    if (explicitKind) {
+                        const auto explicitId = data.schemaTokens->find(*explicitKind);
+                        bool found = false;
+                        for (auto const& m : meanings) {
+                            if (m.id.v == explicitId.v) { found = true; break; }
+                        }
+                        if (!found) {
+                            coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                      std::format("group 'kind' '{}' is not a meaning of lexeme '{}'",
+                                                  *explicitKind, lex));
+                            continue;
+                        }
+                        targetId = explicitId;
+                    } else if (meanings.size() == 1) {
+                        targetId = meanings[0].id;
+                    } else {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                  std::format("lexeme '{}' has {} meanings; group must specify 'kind' to disambiguate",
+                                              lex, meanings.size()));
+                        continue;
+                    }
+
+                    // Duplicate-detect: two groups stamping the same
+                    // (id, arity) silently lose the first via insert_or_assign.
+                    // Loader rejects so the config bug is visible.
+                    if (data.operators.lookup(targetId, arity).has_value()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, opPath,
+                                  std::format("operator '{}' ({}) declared twice in the precedence table",
+                                              lex, operatorArityName(arity)));
+                        continue;
+                    }
+
+                    data.operators.insert(targetId, arity, entry);
+                }
+            }
         }
     }
 
@@ -339,7 +1596,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
                 const auto sk = parseScopeName(v.at("scope").get<std::string>());
                 if (!sk) {
-                    coll.emit(DiagnosticCode::C_UnclosableScope, vp,
+                    coll.emit(DiagnosticCode::C_UnknownScopeName, vp,
                               std::format("unknown scope '{}'",
                                           v.at("scope").get<std::string>()));
                     continue;
@@ -378,23 +1635,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             // Pass B: validate references — every string atom must resolve
             // to either a shape (RuleInterner) or a token kind
-            // (SchemaTokenInterner). Build expectedAt in the same walk.
+            // (SchemaTokenInterner). Diagnostics surface here; the compile
+            // pass below trusts the references have already resolved.
             for (auto const& [shapeName, body] : doc.at("shapes").items()) {
                 const auto shapePath = std::format("/shapes/{}", shapeName);
                 std::vector<std::string> refs;
                 collectReferences(body, shapePath, refs, coll);
 
-                std::vector<std::string> expected;
-                expected.reserve(refs.size());
                 for (auto const& r : refs) {
-                    if (data.rules->contains(r))        { expected.push_back(r); continue; }
-                    if (data.schemaTokens->contains(r)) { expected.push_back(r); continue; }
+                    if (data.rules->contains(r))        continue;
+                    if (data.schemaTokens->contains(r)) continue;
                     coll.emit(DiagnosticCode::C_UnknownShape, shapePath,
                               std::format("unknown reference '{}'", r));
                 }
-
-                const auto rid = data.rules->intern(shapeName);
-                data.expectedAt[rid.v] = std::move(expected);
             }
 
             if (data.rules->contains("root")) {
@@ -403,12 +1656,41 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 coll.emit(DiagnosticCode::C_MissingField, "/shapes",
                           "missing required 'root' shape");
             }
+
+            // Compile every rule body into a flat position table and
+            // precompute FIRST sets, nullability flags, and per-position
+            // nullable-tail flags. Only worth doing when references
+            // validated cleanly — otherwise the compile pass would crash
+            // on broken references it expects the prior pass to reject.
+            // Ambiguity detection runs last: it reads the position tables
+            // to surface alt branches whose FIRST sets overlap.
+            if (!coll.hasErrors()) {
+                computeFirstAndNullable    (data, doc.at("shapes"));
+                buildPositionTables        (data, doc.at("shapes"), coll);
+                detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
+                computeNullableTails       (data);
+            }
         }
     }
 
     // Freeze interners — post-load, no further internment allowed.
     data.rules->freeze();
     data.schemaTokens->freeze();
+
+    // Stamp every LexemeMeaning with the owning schema's id. Done in a
+    // single pass after all parsing so loader code never has to thread
+    // the id through dozens of construction sites.
+    for (auto& [lex, meanings] : data.lexemeTable) {
+        (void)lex;
+        for (auto& m : meanings) m.schemaId = data.id;
+    }
+    for (auto& [modeId, table] : data.lexerModeTokens) {
+        (void)modeId;
+        for (auto& [lex, meanings] : table) {
+            (void)lex;
+            for (auto& m : meanings) m.schemaId = data.id;
+        }
+    }
 
     if (coll.hasErrors()) {
         return std::unexpected(std::move(coll.diagnostics));

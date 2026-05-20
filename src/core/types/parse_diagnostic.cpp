@@ -28,10 +28,17 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_NoAlternativeMatched:     return "P_NoAlternativeMatched";
         case DiagnosticCode::P_UnclosedScope:            return "P_UnclosedScope";
         case DiagnosticCode::P_UnmatchedClose:           return "P_UnmatchedClose";
+        case DiagnosticCode::P_ContextualKeywordResolution:
+            return "P_ContextualKeywordResolution";
+        case DiagnosticCode::P_SchemaCursorDesync:
+            return "P_SchemaCursorDesync";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
         case DiagnosticCode::P_UnfinishedTree:           return "P_UnfinishedTree";
         case DiagnosticCode::P_RecoveryStalled:          return "P_RecoveryStalled";
+        case DiagnosticCode::P_MaxSpeculationDepth:      return "P_MaxSpeculationDepth";
+        case DiagnosticCode::P_UncommittedCheckpoint:    return "P_UncommittedCheckpoint";
+        case DiagnosticCode::P_BacktrackFailed:          return "P_BacktrackFailed";
         case DiagnosticCode::C_MissingField:             return "C_MissingField";
         case DiagnosticCode::C_UnknownShape:             return "C_UnknownShape";
         case DiagnosticCode::C_UnknownToken:             return "C_UnknownToken";
@@ -41,6 +48,13 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_UnclosableScope:          return "C_UnclosableScope";
         case DiagnosticCode::C_MalformedJson:            return "C_MalformedJson";
         case DiagnosticCode::C_InvalidLanguageName:      return "C_InvalidLanguageName";
+        case DiagnosticCode::C_InvalidPrecedenceTable:   return "C_InvalidPrecedenceTable";
+        case DiagnosticCode::C_RedundantScopeRequire:    return "C_RedundantScopeRequire";
+        case DiagnosticCode::C_ConflictingField:         return "C_ConflictingField";
+        case DiagnosticCode::C_UnknownScopeName:         return "C_UnknownScopeName";
+        case DiagnosticCode::C_RedundantField:           return "C_RedundantField";
+        case DiagnosticCode::C_UnknownLexerMode:         return "C_UnknownLexerMode";
+        case DiagnosticCode::C_InvalidStringStyle:       return "C_InvalidStringStyle";
     }
     return "Unknown";
 }

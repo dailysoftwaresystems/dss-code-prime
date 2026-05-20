@@ -1,50 +1,52 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/rule_id.hpp"
 
 #include <compare>
 #include <cstdint>
+#include <type_traits>
 
 namespace dss {
 
 class GrammarSchema;   // friend
 
-// Opaque cursor into a compiled GrammarSchema shape graph. Trivially
-// copyable, passed by value through the builder. Construction is
-// schema-internal — `GrammarSchema::rootCursor()` returns the only
-// publicly-reachable starting state; subsequent positions come from
-// `advance()` / `enterRule()` / `leaveRule()`.
+// Opaque cursor into a compiled GrammarSchema shape graph. Represents one
+// position in one rule's body; descent into nested rules is caller-managed
+// via a stack of cursors. The schema methods `enterRule` / `leaveRule` /
+// `advance` each return a new cursor; nothing mutates through this type.
 //
-// A default-constructed cursor is invalid (valid() == false).
+// `posId == 0` is the per-rule invalid sentinel; default-construction
+// yields an invalid cursor. The only publicly-reachable starting state is
+// `GrammarSchema::rootCursor()`.
+
 class DSS_EXPORT SchemaCursor {
 public:
     constexpr SchemaCursor() noexcept = default;
 
-    [[nodiscard]] constexpr bool valid() const noexcept { return shapeId_ != 0; }
+    [[nodiscard]] constexpr bool valid() const noexcept {
+        return rule_.v != 0 && posId_ != 0;
+    }
 
     constexpr bool operator==(SchemaCursor const&) const noexcept = default;
     constexpr auto operator<=>(SchemaCursor const&) const noexcept = default;
 
-    // Public accessors for tests / debugging only; the schema is the only
-    // entity that interprets these.
-    [[nodiscard]] constexpr std::uint32_t shapeId()   const noexcept { return shapeId_; }
-    [[nodiscard]] constexpr std::uint32_t position()  const noexcept { return position_; }
-    [[nodiscard]] constexpr std::uint32_t parentRet() const noexcept { return parentRet_; }
-    [[nodiscard]] constexpr std::uint16_t altIndex()  const noexcept { return altIndex_; }
+    [[nodiscard]] constexpr RuleId        rule()  const noexcept { return rule_; }
+    [[nodiscard]] constexpr std::uint32_t posId() const noexcept { return posId_; }
 
 private:
     friend class GrammarSchema;
 
-    constexpr SchemaCursor(std::uint32_t shape, std::uint32_t pos,
-                           std::uint32_t parent = 0, std::uint16_t alt = 0) noexcept
-        : shapeId_(shape), position_(pos), parentRet_(parent), altIndex_(alt) {}
+    constexpr SchemaCursor(RuleId rule, std::uint32_t pos) noexcept
+        : rule_(rule), posId_(pos) {}
 
-    std::uint32_t shapeId_   = 0;   // index into schema's compiled shape table; 0 = invalid
-    std::uint32_t position_  = 0;   // step within the shape's production
-    std::uint32_t parentRet_ = 0;   // saved return position for nested rule descent
-    std::uint16_t altIndex_  = 0;   // which alternative was taken (for diagnostics)
-    std::uint16_t _pad_      = 0;
+    RuleId        rule_;          // current rule; default-constructed RuleId is invalid
+    std::uint32_t posId_  = 0;    // position-id within the rule's compiled positions table; 0 = invalid
 };
-static_assert(sizeof(SchemaCursor) == 16, "SchemaCursor target size: 16 bytes");
+
+static_assert(sizeof(SchemaCursor) == 8,
+              "SchemaCursor target size: 8 bytes (4 ruleId + 4 posId)");
+static_assert(std::is_trivially_copyable_v<SchemaCursor>,
+              "SchemaCursor must be trivially copyable for value-pass semantics");
 
 } // namespace dss

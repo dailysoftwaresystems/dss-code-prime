@@ -258,7 +258,7 @@ TEST(TreeBuilder, AmbiguousMeaningsTieBreakOnFirstDeclared) {
           { "kind": "MeaningB", "priority": 10 }
         ]
       },
-      "shapes": { "root": { "sequence": [] } }
+      "shapes": { "root": { "sequence": ["Identifier"] } }
     })JSON";
     auto schema = *GrammarSchema::loadFromText(amb);
     auto src    = SourceBuffer::fromString("?", "<amb>");
@@ -590,7 +590,7 @@ TEST(TreeBuilder, PerMeaningValidScopesFiltersResolution) {
       "tokens": {
         "%": [{ "kind": "BlockOnlyOperator", "validScopes": ["Block"] }]
       },
-      "shapes": { "root": { "sequence": [] } }
+      "shapes": { "root": { "sequence": ["Identifier"] } }
     })JSON";
     auto schema = *GrammarSchema::loadFromText(cfg);
     auto src    = SourceBuffer::fromString("%", "<vs>");

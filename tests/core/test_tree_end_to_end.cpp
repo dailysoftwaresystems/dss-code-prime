@@ -13,6 +13,7 @@
 #include "core/types/tree_views.hpp"
 #include "core/types/tree_visitor.hpp"
 #include "core/types/well_known_names.hpp"
+#include "test_pretty_print.hpp"
 #include "toy_harness.hpp"
 
 #include <gtest/gtest.h>
@@ -89,32 +90,7 @@ ToyHarness loadShippedHarness(std::string sourceText) {
     };
 }
 
-// Walk the tree in AST mode, emitting "rule:<name>" for Internal nodes and
-// tok:"<text>" for visible Token leaves. Indent is two spaces per depth
-// level. The output is the structural fingerprint that string-equality
-// assertions in happy-path tests compare against. Error/Missing/Synthetic
-// flags are intentionally NOT surfaced; broken-path tests verify them via
-// a separate walk over `tree.flags(id)`.
-std::string prettyPrint(Tree const& t) {
-    std::string out;
-    if (!t.root().valid()) return out;
-    walkPreOrder(TreeCursor{t, t.root(), CursorMode::Ast},
-                 [&](TreeCursor const& c) {
-        const int d = c.depth();
-        for (int i = 0; i < d; ++i) out += "  ";
-        const auto id = c.current();
-        if (t.kind(id) == NodeKind::Internal) {
-            out += "rule:";
-            out += t.rules().name(t.rule(id));
-        } else {
-            out += "tok:\"";
-            out += t.text(id);
-            out += '"';
-        }
-        out += '\n';
-    });
-    return out;
-}
+using dss::tests::prettyPrint;
 
 std::size_t countCode(std::span<ParseDiagnostic const> diags, DiagnosticCode code) {
     std::size_t n = 0;

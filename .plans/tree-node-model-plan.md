@@ -31,9 +31,10 @@ Updated as work progresses. Detailed phase status lives in §7.
 |---|---|
 | CMake floor | **4.0** (latest stable on inception; tested with 4.3.2) |
 | C++ standard | **23** |
-| Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows |
+| Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows. Linux GCC verification pending [`substrate-hardening-plan.md`](./substrate-hardening-plan.md) SH2. |
 | Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
-| Test suite | **278 cases across 17 ctest suites — 100% pass** |
+| Test suite | **509 cases across 26 ctest suites — 100% pass** (v1 T0–T12 baseline + v2 PR0–PR8 complete; see [`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §0 for per-PR test counts) |
+| Substrate hardening | 🔵 next — see [`substrate-hardening-plan.md`](./substrate-hardening-plan.md). SH3 closes the cross-tree `NodeId` caveat documented in §5.10 below. |
 
 **Files now in `src/core/types/` (all on `core` static lib):**
 
@@ -88,7 +89,7 @@ tree_views.hpp               ← header-only typed views (Identifier/Literal/Bin
    - `Bookmark` embeds `TreeId` for ABA protection — `restore()` validates the captured TreeId matches the cursor's tree.
    - Cycle caps in `depth()` (returns `-1` on corruption since it's `noexcept`) and AST `gotoParent` (aborts with a clear message — symmetric with `Tree::children()`'s release-mode bounds check).
    - Convenience forwarders on the cursor: `text()`, `span()`, `rule()`, `tokenKind()` — save consumers the `c.tree().X(c.current())` boilerplate.
-10. **`LexemeMeaning::validScopes` wired into `TreeBuilder::pushToken`.** v1 originally documented the field as "empty == valid everywhere; non-empty == restrict to listed" but `pushToken` ignored it (pure dead exposure). Now `resolveMeaning` AND's the per-meaning `validScopes` check with the schema-level `forbid` check from `isTokenValidInScope`. v2 §5.3 will replace this flat field with the richer `scopeRequire` object; until then, the field earns its keep.
+10. **Per-meaning scope filter wired into `TreeBuilder::pushToken`.** v1 originally documented `LexemeMeaning::validScopes` as "empty == valid everywhere; non-empty == restrict to listed" but `pushToken` ignored it (pure dead exposure). The T6 review-fix sweep wired `resolveMeaning` to AND a per-meaning scope check with the schema-level `forbid` check from `isTokenValidInScope`. **v2 PR3 replaced the flat `validScopes` field with the richer `ScopeMatch { anyOf, forbid, topMustBe, outermost }` object** ([`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §5.3); the legacy `validScopes: [...]` syntax still loads as `scopeRequire.anyOf` for backward compat.
 11. **Test infrastructure extracted from duplication:**
     - `tests/core/toy_harness.hpp` — `dss::tests::ToyHarness` (shared schema-load + Token-synthesis helper).
     - `tests/core/raw_tree_builder.hpp` — `dss::tests::RawTreeBuilder` for hand-fabricating trees with shapes `TreeBuilder` can't produce. Adopted by `test_tree`, `test_tree_cursor`; `test_tree_builder` uses the harness only (its trees come from the real builder).

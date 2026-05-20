@@ -48,12 +48,17 @@ enum class DiagnosticCode : std::uint16_t {
     P_NoAlternativeMatched        = 0x0009,
     P_UnclosedScope               = 0x000A,
     P_UnmatchedClose              = 0x000B,
+    P_ContextualKeywordResolution = 0x000C,
+    P_SchemaCursorDesync          = 0x000D,
 
     // ── P9xxx — builder internal-invariant violations (release-mode rescues) ──
     P_BuilderInvariant            = 0x9000,
     P_TooManyDiagnostics          = 0x9001,
     P_UnfinishedTree              = 0x9002,
     P_RecoveryStalled             = 0x9003,
+    P_MaxSpeculationDepth         = 0x9004,
+    P_UncommittedCheckpoint       = 0x9005,
+    P_BacktrackFailed             = 0x9006,
 
     // ── C0xxx — config loader (see plan §5.12) ──
     C_MissingField                = 0xC001,
@@ -65,6 +70,13 @@ enum class DiagnosticCode : std::uint16_t {
     C_UnclosableScope             = 0xC011,
     C_MalformedJson               = 0xC020,
     C_InvalidLanguageName         = 0xC021,
+    C_InvalidPrecedenceTable      = 0xC022,
+    C_RedundantScopeRequire       = 0xC023,
+    C_ConflictingField            = 0xC024,
+    C_UnknownScopeName            = 0xC025,
+    C_RedundantField              = 0xC026,
+    C_UnknownLexerMode            = 0xC027,
+    C_InvalidStringStyle          = 0xC028,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
@@ -94,7 +106,8 @@ struct DSS_EXPORT ParseDiagnostic {
     std::optional<RuleId> ruleContext;   // which expected shape was active
 
     // What the schema would have accepted at this position. Pre-rendered
-    // strings sourced from GrammarSchema::expectedAt() — e.g. {"';'", "expression"}.
+    // strings — the builder populates these from `schemaTokens().name()` /
+    // `rules().name()` at emit time, e.g. {"';'", "expression"}.
     std::vector<std::string> expected;
 
     // What was actually seen — lexeme text or token-kind name.

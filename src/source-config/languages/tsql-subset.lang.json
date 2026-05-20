@@ -1,0 +1,231 @@
+{
+  "dssSchemaVersion": 2,
+
+  "language": {
+    "name":           "TsqlSubset",
+    "version":        "0.1.0",
+    "fileExtensions": [".sql", ".tsql"]
+  },
+
+  "reservedWordPolicy": "contextual",
+
+  "lexerModes": {
+    "main":            { "tokens": "default" },
+    "bracket-id":      { "defaultToken": { "kind": "BracketIdChar" } },
+    "single-string":   { "defaultToken": { "kind": "StringChar" } },
+    "unicode-string":  { "defaultToken": { "kind": "StringChar" } }
+  },
+
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "\r": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+
+    "(":  [{ "kind": "ParenOpen",  "opensScope": "Paren" }],
+    ")":  [{ "kind": "ParenClose", "closesScope": true }],
+    ";":  [{ "kind": "EndStatement" }],
+    ",":  [{ "kind": "Comma" }],
+    ".":  [{ "kind": "Dot" }],
+
+    "*":  [{ "kind": "StarOp"   }],
+    "+":  [{ "kind": "PlusOp"   }],
+    "-":  [{ "kind": "MinusOp"  }],
+    "/":  [{ "kind": "SlashOp"  }],
+    "%":  [{ "kind": "ModOp"    }],
+
+    "=":  [{ "kind": "EqOp"     }],
+    "<":  [{ "kind": "LtOp"     }],
+    ">":  [{ "kind": "GtOp"     }],
+    "<=": [{ "kind": "LtEqOp"   }],
+    ">=": [{ "kind": "GtEqOp"   }],
+    "<>": [{ "kind": "NotEqOp"  }],
+    "!=": [{ "kind": "NotEqOp2" }],
+
+    "'":  [{
+      "kind": "StringStart",
+      "modeOp": "pushMode", "modeArg": "single-string",
+      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "'" }
+    }],
+    "N'": [{
+      "kind": "UnicodeStringStart",
+      "modeOp": "pushMode", "modeArg": "unicode-string",
+      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "'" }
+    }],
+    "[":  [{
+      "kind": "BracketIdStart",
+      "modeOp": "pushMode", "modeArg": "bracket-id",
+      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "]" }
+    }]
+  },
+
+  "operators": {
+    "groups": [
+      { "precedence": 10, "associativity": "left",                       "operators": ["="]                                  },
+      { "precedence": 20, "associativity": "left",                       "operators": ["<>", "!=", "<", ">", "<=", ">="]    },
+      { "precedence": 30, "associativity": "left",                       "operators": ["+", "-"]                            },
+      { "precedence": 40, "associativity": "left",                       "operators": ["*", "/", "%"]                       },
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["-"]                                 }
+    ]
+  },
+
+  "keywords": [
+    { "word": "SELECT", "kind": "SelectKw" },
+    { "word": "FROM",   "kind": "FromKw"   },
+    { "word": "WHERE",  "kind": "WhereKw"  },
+    { "word": "AS",     "kind": "AsKw"     },
+    { "word": "AND",    "kind": "AndKw"    },
+    { "word": "OR",     "kind": "OrKw"     },
+    { "word": "NOT",    "kind": "NotKw"    },
+    { "word": "NULL",   "kind": "NullKw"   },
+    { "word": "IS",     "kind": "IsKw"     },
+    { "word": "IN",     "kind": "InKw"     },
+    { "word": "INSERT", "kind": "InsertKw" },
+    { "word": "INTO",   "kind": "IntoKw"   },
+    { "word": "VALUES", "kind": "ValuesKw" },
+    { "word": "UPDATE", "kind": "UpdateKw" },
+    { "word": "SET",    "kind": "SetKw"    },
+    { "word": "DELETE", "kind": "DeleteKw" },
+    { "word": "CREATE", "kind": "CreateKw" },
+    { "word": "TABLE",  "kind": "TableKw"  },
+    { "word": "INT",    "kind": "IntKw"    },
+    { "word": "VARCHAR","kind": "VarcharKw" },
+    { "word": "BIT",    "kind": "BitKw"    }
+  ],
+
+  "shapes": {
+    "root": { "sequence": [ { "repeat": "statement" } ] },
+
+    "statement": {
+      "alt": [
+        "selectStmt",
+        "insertStmt",
+        "updateStmt",
+        "deleteStmt",
+        "createTableStmt"
+      ]
+    },
+
+    "selectStmt": {
+      "sequence": [
+        "SelectKw",
+        "selectList",
+        "FromKw",
+        "qualifiedName",
+        { "optional": "whereClause" },
+        "EndStatement"
+      ]
+    },
+
+    "selectList": { "alt": [ "selectStar", "selectItemList" ] },
+    "selectStar": { "sequence": [ "StarOp" ] },
+    "selectItemList": {
+      "sequence": [
+        "selectItem",
+        { "repeat": { "sequence": [ "Comma", "selectItem" ] } }
+      ]
+    },
+    "selectItem": {
+      "sequence": [
+        "expression",
+        { "optional": { "sequence": [ "AsKw", "nameAtom" ] } }
+      ]
+    },
+
+    "whereClause": { "sequence": [ "WhereKw", "expression" ] },
+
+    "qualifiedName": {
+      "sequence": [
+        "nameAtom",
+        { "repeat": { "sequence": [ "Dot", "nameAtom" ] } }
+      ]
+    },
+    "nameAtom": { "alt": [ "Identifier", "BracketIdStart" ] },
+
+    "insertStmt": {
+      "sequence": [
+        "InsertKw", "IntoKw", "qualifiedName",
+        "ParenOpen", "columnList", "ParenClose",
+        "ValuesKw",
+        "ParenOpen", "valueList", "ParenClose",
+        "EndStatement"
+      ]
+    },
+    "columnList": {
+      "sequence": [ "nameAtom", { "repeat": { "sequence": [ "Comma", "nameAtom" ] } } ]
+    },
+    "valueList": {
+      "sequence": [ "expression", { "repeat": { "sequence": [ "Comma", "expression" ] } } ]
+    },
+
+    "updateStmt": {
+      "sequence": [
+        "UpdateKw", "qualifiedName", "SetKw", "assignList",
+        { "optional": "whereClause" },
+        "EndStatement"
+      ]
+    },
+    "assignList": {
+      "sequence": [ "assignment", { "repeat": { "sequence": [ "Comma", "assignment" ] } } ]
+    },
+    "assignment": { "sequence": [ "nameAtom", "EqOp", "expression" ] },
+
+    "deleteStmt": {
+      "sequence": [
+        "DeleteKw", "FromKw", "qualifiedName",
+        { "optional": "whereClause" },
+        "EndStatement"
+      ]
+    },
+
+    "createTableStmt": {
+      "sequence": [
+        "CreateKw", "TableKw", "qualifiedName",
+        "ParenOpen", "columnDeclList", "ParenClose",
+        "EndStatement"
+      ]
+    },
+    "columnDeclList": {
+      "sequence": [
+        "columnDecl",
+        { "repeat": { "sequence": [ "Comma", "columnDecl" ] } }
+      ]
+    },
+    "columnDecl": {
+      "sequence": [
+        "nameAtom",
+        "typeRef",
+        { "optional": "notNullClause" }
+      ]
+    },
+    "typeRef": { "alt": [ "IntKw", "VarcharKw", "BitKw" ] },
+    "notNullClause": { "sequence": [ "NotKw", "NullKw" ] },
+
+    "expression": {
+      "sequence": [
+        "operand",
+        { "repeat": { "sequence": [ "binaryOp", "operand" ] } }
+      ]
+    },
+
+    "binaryOp": {
+      "alt": [
+        "EqOp", "NotEqOp", "NotEqOp2", "LtOp", "GtOp", "LtEqOp", "GtEqOp",
+        "PlusOp", "MinusOp", "StarOp", "SlashOp", "ModOp"
+      ]
+    },
+
+    "operand": {
+      "alt": [
+        "Identifier",
+        "IntLiteral",
+        "StringStart",
+        "UnicodeStringStart",
+        "BracketIdStart",
+        "NullKw",
+        { "sequence": [ "MinusOp", "operand" ] },
+        { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
+      ]
+    }
+  }
+}

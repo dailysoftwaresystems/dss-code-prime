@@ -12,8 +12,10 @@ A `.lang.json` config defines a single source language: its tokens, keywords, sc
 
 Two design choices to internalize before writing one:
 
-1. **Tokens are multi-typed.** One lexeme (e.g., `+`, `<`) may resolve to several token kinds depending on scope and priority. The loader doesn't pick — the schema captures all alternatives and the builder picks at parse time using `validScopes` and `priority`.
+1. **Tokens are multi-typed.** One lexeme (e.g., `+`, `<`) may resolve to several token kinds depending on scope and priority. The loader doesn't pick — the schema captures all alternatives and the builder picks at parse time using the per-meaning `scopeRequire` (v2 §9.4; flat `validScopes: [...]` in v1) and `priority`.
 2. **Shapes describe valid tree structure, not parsing strategy.** Today's `TreeBuilder` validates *within* a frame (lexeme resolution, scope filter, recovery). Sequence-level "is this token valid here?" enforcement lands when the parser does — but the schema declares the shape so the future parser doesn't have to invent it.
+
+**v2 additions appear in [§9](#9-v2-additions).** Configs that touch `operators`, `expr` shape, `reservedWordPolicy`, `contextual` keywords, `scopeRequire`, `speculative` alts, `lexerModes` / `modeOp`, or `stringStyle` are using v2 features.
 
 A config that loads cleanly produces a `GrammarSchema` you can pass to `TreeBuilder`. A config with errors produces a `std::expected<...>` with a vector of `ConfigDiagnostic` — none of which are fatal at file-author time, but all of which will block parsing.
 
@@ -23,7 +25,7 @@ A config that loads cleanly produces a `GrammarSchema` you can pass to `TreeBuil
 
 ```jsonc
 {
-  "dssSchemaVersion": 1,         // required — loader emits C_VersionMismatch on mismatch
+  "dssSchemaVersion": 1,         // required — accepted range is 1..2; loader emits C_VersionMismatch on values outside that window
 
   "language": {                  // required — identifies the language
     "name":           "Calc",    // required
@@ -43,7 +45,7 @@ The loader's error catalogue (returned in `ConfigDiagnostic.code`):
 | Code | When |
 |---|---|
 | `C_MalformedJson` | JSON parse failed — bad braces, quotes, etc. |
-| `C_VersionMismatch` | `dssSchemaVersion` missing or not `1`. |
+| `C_VersionMismatch` | `dssSchemaVersion` missing, non-integer, or outside the accepted range (currently `1..2`). |
 | `C_InvalidLanguageName` | `language.name` missing, empty, or not a string. |
 | `C_MissingField` | Required field absent. |
 | `C_UnknownToken` | A `shapes` entry references a token kind that isn't declared in `tokens`, `keywords`, or built-ins. |
@@ -90,7 +92,9 @@ Each meaning object accepts:
 | `kind` | string | **yes** | Token-kind name. Interned into `schema.schemaTokens()`. |
 | `flags` | array of strings | no | Currently: `["EmptySpace"]` — flagged tokens are skipped by AST cursors. |
 | `priority` | integer | no | Lower wins on multi-meaning lexemes. Equal priorities → first-declared wins + `P_AmbiguousToken` diagnostic at parse time. |
-| `validScopes` | array of strings | no | Whitelist of scope names where this meaning is valid. Empty/absent means "valid everywhere." |
+| `validScopes` | array of strings | no | Whitelist of scope names where this meaning is valid. Empty/absent means "valid everywhere." **v2**: superseded by the richer `scopeRequire` object — see [§9.4](#94-scoperequire--per-meaning-scope-stack-constraints-pr3). Legacy syntax still loads. |
+| `scopeRequire` | object | no | **v2.** Four-axis constraint with `anyOf` / `forbid` / `topMustBe` / `outermost`. See [§9.4](#94-scoperequire--per-meaning-scope-stack-constraints-pr3). Mutually exclusive with `validScopes`. |
+| `contextual` | boolean | no | **v2, keywords only.** Marks a soft keyword that demotes to `Identifier` when not in the cursor's expected set. See [§9.3](#93-reservedwordpolicy--keywordscontextual-pr2b). |
 | `opensScope` | string | no | Push this scope name onto the builder's scope stack when this token is consumed. |
 | `closesScope` | boolean | no | `true` → pop the current scope on consumption. |
 | `until` | string | no | Tokenizer hint for `LineComment` (`"newline"`) and `BlockComment` (closing delimiter). Currently informational; lexer doesn't ship yet. |
@@ -217,7 +221,7 @@ This is a complete, valid `.lang.json` for a tiny calculator language — copy i
 
 Loads cleanly because:
 
-- `dssSchemaVersion: 1` is the current version.
+- `dssSchemaVersion: 1` is inside the loader's accepted window (`1..2`).
 - `language.name`, `version`, `fileExtensions` all present.
 - Every shape reference (`stmt`, `letDecl`, `exprStmt`) resolves to a declared shape.
 - Every token reference (`LetKeyword`, `Identifier`, `EqOp`, `IntLiteral`, `End`) resolves — keywords + tokens + built-in `Identifier`/`IntLiteral`.
@@ -233,7 +237,7 @@ To verify, run any unit test that calls `GrammarSchema::loadShipped("calc")` and
 | Symptom | Likely fix |
 |---|---|
 | `C_MalformedJson` | Run the file through a JSON validator. Trailing commas, unquoted keys, smart quotes. |
-| `C_VersionMismatch` | `"dssSchemaVersion": 1` — must be an integer, not a string. |
+| `C_VersionMismatch` | `"dssSchemaVersion": 1` — must be an integer inside `1..2`, not a string. |
 | `C_UnknownToken: "X"` referenced from `shapes.Y` | `X` isn't declared in `tokens` or `keywords` and isn't a built-in. Check spelling; built-ins are `Identifier`, `IntLiteral`, `FloatLiteral`, `StringLiteral`, `CharLiteral`, `BoolLiteral`, `NullLiteral`. |
 | `C_UnknownShape: "X"` referenced from `shapes.Y` | `Y` references a shape name that isn't a key in `shapes`. |
 | `C_CircularShape: "X"` | Your shape references itself as the first element of its sequence. Insert a literal token before the recursive reference, or split into two shapes. |
@@ -241,3 +245,214 @@ To verify, run any unit test that calls `GrammarSchema::loadShipped("calc")` and
 | `C_UnclosableScope: "X"` | Some token has `"opensScope": "X"` but nothing reachable inside X has `"closesScope": true`. |
 
 For parse-time diagnostics (P_*), see [`tree-model.md` §6](./tree-model.md#6-diagnostics--when-something-goes-wrong).
+
+---
+
+## 9. v2 additions
+
+These fields and shape kinds were added by the v2 schema-expressiveness work after the spec was first authored. They are **opt-in**: any config that doesn't use them keeps loading exactly as it did under v1, and the same `.lang.json` file may declare `"dssSchemaVersion": 1` until it references a v2-only field. Use `2` once any v2 field appears.
+
+### 9.1 `operators` — precedence groups (PR1)
+
+```jsonc
+"operators": {
+  "groups": [
+    { "precedence": 90, "arity": "Prefix",  "associativity": "Right", "kinds": ["BangOp", "MinusOp"] },
+    { "precedence": 70, "arity": "Infix",   "associativity": "Left",  "kinds": ["StarOp", "SlashOp"] },
+    { "precedence": 60, "arity": "Infix",   "associativity": "Left",  "kinds": ["PlusOp", "MinusOp"] },
+    { "precedence": 10, "arity": "Infix",   "associativity": "Right", "kinds": ["AssignOp"] }
+  ]
+}
+```
+
+Each group declares one or more `kinds` (token-kind names) sharing a precedence + arity + associativity. Multi-meaning lexemes require explicit `kinds` per group — `-` as prefix lives in one group with `arity: Prefix`, `-` as infix lives in another with `arity: Infix`. Lookup at runtime: `schema.operatorTable().lookup(kind, arity)`.
+
+| Field | Required | Notes |
+|---|---|---|
+| `precedence` | yes | Integer; higher binds tighter. |
+| `arity` | no | `"Prefix"`, `"Infix"`, or `"Postfix"`. Defaults to `Infix`. |
+| `associativity` | no | `"Left"`, `"Right"`, or `"None"`. Defaults to `None`. |
+| `kinds` | yes | Array of token-kind names declared in `tokens`. |
+
+**New diagnostic code:** `C_InvalidPrecedenceTable` — malformed `operators` block, duplicate `(kind, arity)` keys, or non-integer precedence.
+
+### 9.2 `expr` shape kind (PR1)
+
+A new shape body kind for operator-bearing expressions:
+
+```jsonc
+"shapes": {
+  "expression": { "expr": { "atom": "operand" } }
+}
+```
+
+The cursor walks `expr` as a reference to the `atom` rule. Operator climbing is the parser's job — `operators.groups` provides the data; the schema layer doesn't fold the tree. The only recognized field inside `expr` is `atom`; any other key emits `C_UnknownShape`.
+
+### 9.3 `reservedWordPolicy` + `keywords[].contextual` (PR2b)
+
+```jsonc
+{
+  "reservedWordPolicy": "contextual",          // optional; default "strict"
+  "keywords": [
+    { "word": "if",     "kind": "IfKw" },                          // hard keyword
+    { "word": "await",  "kind": "AwaitKw", "contextual": true }    // soft keyword
+  ]
+}
+```
+
+- **`reservedWordPolicy: "strict"`** (default) — every keyword always wins over `Identifier`. Matches v1 behavior; configs without this field get strict.
+- **`reservedWordPolicy: "contextual"`** — every keyword is implicitly soft. Useful for SQL-family languages where any keyword may also appear as an identifier (`CREATE TABLE Select(Order int)` parses).
+- **`contextual: true` per-entry** — marks one keyword as soft regardless of policy. The keyword's `kind` may NOT be `Identifier` (would be a no-op identity demotion — loader emits `C_MissingField`).
+
+Soft keyword resolution: at `pushToken` time, the builder consults the schema cursor's `expectedSet`. If the soft keyword's kind is in the expected set, it wins; otherwise it demotes to `Identifier` and emits an info-level `P_ContextualKeywordResolution` diagnostic. When the schema cursor goes off-track (first `valid → invalid` transition during a parse), the builder emits a one-shot `P_SchemaCursorDesync` info diagnostic and falls back to strict resolution for the remainder.
+
+### 9.4 `scopeRequire` — per-meaning scope-stack constraints (PR3)
+
+Replaces v1's flat `validScopes: [...]` with a four-axis constraint object on every token-meaning entry:
+
+```jsonc
+"tokens": {
+  "case": [
+    { "kind": "CaseKw",
+      "scopeRequire": {
+        "anyOf":     ["Block"],          // empty/absent = no anyOf requirement
+        "forbid":    ["Generic"],        // none of these may be on the stack
+        "topMustBe": "Block",            // innermost scope must equal this
+        "outermost": "Root"              // bottom-of-stack scope must equal this
+      }
+    }
+  ]
+}
+```
+
+The builder applies the four constraints in order `forbid → topMustBe → outermost → anyOf` inside the `pushToken` candidate filter. First failure rejects the meaning. Empty `anyOf` / `forbid` means "no constraint on this axis"; unset `topMustBe` / `outermost` means the same.
+
+**Backward compat.** Legacy flat `"validScopes": ["Block"]` loads as `scopeRequire.anyOf = ["Block"]` with everything else default. A meaning may NOT declare both `validScopes` and `scopeRequire` (loader emits `C_ConflictingField`).
+
+**Diagnostics added in PR3:**
+
+| Code | When |
+|---|---|
+| `C_ConflictingField` | A meaning declares both `validScopes` and `scopeRequire`, or a `scopeRequire` sub-field has the wrong JSON type. |
+| `C_UnknownScopeName` | A scope name (in `anyOf` / `forbid` / `topMustBe` / `outermost` / `opensScope` / `scopes.validity[].scope`) isn't a recognized built-in. Replaces the historical reuse of `C_UnclosableScope` for this case. |
+| `C_RedundantScopeRequire` | Warning. Fires on: `topMustBe + anyOf` (anyOf redundant), `topMustBe == outermost` (rule matches only single-scope stacks), `forbid` containing `topMustBe`/`outermost` or intersecting `anyOf` (rule can never match), explicit empty array, or oversize list (>32 entries). |
+
+### 9.5 Speculative `alt` (PR4)
+
+Standard `alt` is first-match-on-FIRST. When two alternatives share a prefix and the disambiguator lives N tokens deep, mark the alt speculative:
+
+```jsonc
+"shapes": {
+  "expression": {
+    "alt": ["patternMatchExpr", "regularExpr"],
+    "speculative": true,
+    "lookahead": 6       // optional; default = 8
+  }
+}
+```
+
+The parser (when authored) takes a `TreeBuilder::Checkpoint`, tries the first branch up to `lookahead` tokens, and commits or rolls back. Speculative alts are exempt from the load-time ambiguity check (`C_AmbiguousAlternatives`) — overlapping FIRST sets are the whole point. Malformed `speculative`/`lookahead` emits `C_ConflictingField`; `lookahead` without `speculative: true` emits `C_RedundantField` warning.
+
+### 9.6 Lexer modes (PR5)
+
+Tokenizers for interpolated strings, here-strings, and multi-language embeddings need a mode stack — the lexeme `"` means different things inside a string body vs. in normal grammar. Declare modes at top level:
+
+```jsonc
+{
+  "lexerModes": {
+    "main":        { "tokens": "default" },                    // inherits top-level `tokens`
+    "string-body": { "defaultToken": { "kind": "StringChar" } }
+  },
+  "tokens": {
+    "$\"":  [{ "kind": "InterpStart", "modeOp": "pushMode", "modeArg": "string-body" }],
+    "\"":   [{ "kind": "StringEnd",   "modeOp": "popMode" }]
+  }
+}
+```
+
+**Per-meaning fields** (any token entry):
+
+| Field | Required | Notes |
+|---|---|---|
+| `modeOp` | no | `"pushMode"`, `"popMode"`, or `"replaceMode"`. Default = no mode-stack effect. |
+| `modeArg` | required for `pushMode`/`replaceMode` | Target mode name. Must be declared in `lexerModes`. |
+
+**Per-mode fields** (entries under `lexerModes`):
+
+| Field | Required | Notes |
+|---|---|---|
+| `tokens` | no | `"default"` inherits the top-level `tokens` map. Inline `{ ... }` object is parsed-deferred (warning emitted; lookup table stays empty until per-mode-inline-tokens lands). |
+| `defaultToken` | no | `{ "kind": "X" }`. Emitted by the tokenizer when nothing else matches the input. Common for `string-body` modes whose body is mostly free text. |
+
+**Backward compat.** If `lexerModes` is absent the loader synthesizes a `"main"` mode pointing at the top-level `tokens` map. v1 configs continue to load unchanged.
+
+**Keywords cannot carry `modeOp`** — soft-keyword demotion (contextual resolution) and lexer-mode switching are distinct mechanisms. Mixing them on a `keywords[]` entry emits `C_ConflictingField`. Move the entry to `tokens` to switch modes.
+
+**Cyclic mode references are normal**, not an error. `main` pushes `string-body`; `string-body` pushes `main` (for `{...}` interpolation expressions); they recurse arbitrarily.
+
+### 9.7 `stringStyle` descriptor (PR6)
+
+Delimited string literals — `"hello"`, `@"verbatim ""quotes"""`, `R"DELIM(raw)DELIM"`, `"""triple"""` — declare their escape rules and termination as `stringStyle` on the opening-delimiter token's meaning:
+
+```jsonc
+"tokens": {
+  "\"":     [{ "kind": "StringStart",
+                "modeOp": "pushMode", "modeArg": "string-body",
+                "stringStyle": { "escapeKind": "char",
+                                  "escapeChar": "\\",
+                                  "endsAt":     "\"" } }],
+  "@\"":    [{ "kind": "VerbatimStringStart",
+                "modeOp": "pushMode", "modeArg": "verbatim-body",
+                "stringStyle": { "escapeKind": "doubled-delimiter",
+                                  "endsAt":     "\"" } }],
+  "R\"":    [{ "kind": "RawStringStart",
+                "modeOp": "pushMode", "modeArg": "raw-body",
+                "stringStyle": { "escapeKind":   "none",
+                                  "endsAt":       ")\"",
+                                  "delimiterTag": "matched",
+                                  "tagPattern":   "[A-Za-z_]{0,16}" } }],
+  "\"\"\"":  [{ "kind": "TripleStringStart",
+                "modeOp": "pushMode", "modeArg": "triple-body",
+                "stringStyle": { "escapeKind":         "char",
+                                  "escapeChar":         "\\",
+                                  "endsAt":             "\"\"\"",
+                                  "endsAtLongestMatch": true,
+                                  "multiline":          true } }]
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `escapeKind` | enum string | **yes** | `"char"`, `"doubled-delimiter"`, or `"none"`. |
+| `escapeChar` | single ASCII char | only when `escapeKind: "char"` | The lead character for escape pairs (typically `\`). Must be exactly one byte. |
+| `endsAt` | non-empty string | **yes** | The literal sequence that terminates the body. |
+| `endsAtLongestMatch` | bool | no (default `false`) | For triple-quotes — consume the longest run matching `endsAt` from the end. |
+| `delimiterTag` | string `"matched"` | no | Enables dynamically-captured delimiter tags (C++ `R"DELIM(...)DELIM"`). Only `"matched"` is a valid value. |
+| `tagPattern` | regex string | no (default `[A-Za-z0-9_]{0,16}` when `delimiterTag` is set) | Constraint on what characters are valid in the captured tag. Compiled at load time — invalid regexes are rejected with `C_InvalidStringStyle`. Must be paired with `delimiterTag: "matched"`. |
+| `multiline` | bool | no (default `false`) | Whether newlines are allowed in the body. |
+
+**Keywords cannot carry `stringStyle`** — word-shaped tokens can't open delimited strings. Use a `tokens` entry instead.
+
+**Loader fail-fasts** on these config errors: `escapeChar` set when `escapeKind != "char"`; `tagPattern` set without `delimiterTag: "matched"`; missing/empty `endsAt`; multi-byte `escapeChar`; unknown `escapeKind`; non-`"matched"` `delimiterTag`; wrong-type fields. Cross-field warning: `endsAtLongestMatch: true` with a 1-character `endsAt` (the flag is a no-op for single-char terminators).
+
+### 9.8 Updated version window
+
+`dssSchemaVersion` accepts the range `1..2`. v2 configs that use any of the fields above SHOULD set `"dssSchemaVersion": 2`. The loader still accepts `1` for any field combination — version bumping is documentation, not enforcement.
+
+### 9.9 Troubleshooting (v2 codes)
+
+| Symptom | Likely fix |
+|---|---|
+| `C_InvalidPrecedenceTable` | Duplicate `(kind, arity)` declared twice, or `precedence` not an integer. |
+| `C_ConflictingField` on `scopeRequire` | Meaning declares both `validScopes` AND `scopeRequire`, or a sub-field is the wrong type (e.g., `anyOf` as a string). |
+| `C_ConflictingField` on `modeOp`/`modeArg` | Wrong-type field, unknown `modeOp` string, missing `modeArg` on `pushMode`/`replaceMode`, `modeArg` without `modeOp`, or `modeOp`/`modeArg` placed on a keyword entry instead of a token. |
+| `C_ConflictingField` on `speculative`/`lookahead` | Non-boolean `speculative`, non-integer or out-of-range `lookahead`. |
+| `C_UnknownScopeName` | The scope name doesn't match any built-in (`None`, `Root`, `Block`, `Paren`, `Bracket`, `Generic`, `String`, `Comment`). |
+| `C_UnknownLexerMode` | A `modeArg` references a mode that wasn't declared in `lexerModes`. |
+| `C_InvalidStringStyle` | A `stringStyle` block is malformed — see §9.7 (missing/empty `endsAt`; `escapeChar` without `escapeKind: "char"`; `tagPattern` without `delimiterTag: "matched"`; invalid `tagPattern` regex; unknown `escapeKind`; non-`"matched"` `delimiterTag` value; wrong-typed sub-field). |
+| `C_RedundantScopeRequire` (warning) | Your `scopeRequire` has a contradiction or redundancy. The rule still loads. |
+| `C_RedundantField` (warning) | `lookahead` without `speculative: true`; `modeArg` with `popMode`; case-folded duplicate mode name; mode with only `defaultToken` and no `tokens` field; inline per-mode `tokens` object (not yet parsed). The rule still loads. |
+| `P_ContextualKeywordResolution` (info, at parse) | A soft keyword demoted to `Identifier`. Expected behavior when the cursor's expected set excludes the keyword. |
+| `P_SchemaCursorDesync` (info, one-shot) | The schema cursor went off-track. Usually means a caller drove the builder against a sequence the schema doesn't expect. Contextual resolution stays strict from this point. |
+| `P_MaxSpeculationDepth` (error, one-shot) | `TreeBuilder::Checkpoint` stack exceeded `BuilderConfig::maxSpeculationDepth` (default 64). Subsequent `checkpoint()` calls return no-op guards. |
+| `P_UncommittedCheckpoint` (warning) | A `Checkpoint` guard was destroyed without `commit()` or `rollback()` — the dtor rolled it back. Indicates a forgotten-commit bug in the caller. |

@@ -132,13 +132,15 @@ TEST(GrammarSchema, RootCursorIsValid) {
     EXPECT_TRUE(schema->rootCursor().valid());
 }
 
-TEST(GrammarSchema, ExpectedAtReturnsStableSpan) {
+TEST(GrammarSchema, ExpectedSetReturnsStableSpan) {
     auto schema = *GrammarSchema::loadFromText(kHappyConfig);
     auto root = schema->rootCursor();
-    auto a = schema->expectedAt(root);
-    auto b = schema->expectedAt(root);
+    auto a = schema->expectedSet(root);
+    auto b = schema->expectedSet(root);
     // Pointer identity proves the span comes from schema-owned storage
-    // (no allocation per call).
+    // (no allocation per call). Every downstream consumer that holds an
+    // expectedSet across schema-cursor operations depends on this
+    // stability invariant.
     EXPECT_EQ(a.data(), b.data());
     EXPECT_EQ(a.size(), b.size());
 }
@@ -201,7 +203,7 @@ TEST(GrammarSchema, ForbidReferencingUnknownTokenReportsCode) {
       "dssSchemaVersion": 1,
       "language": { "name": "X", "version": "0.1.0" },
       "scopes": { "validity": [ { "scope": "Generic", "forbid": ["NotDeclared"] } ] },
-      "shapes": { "root": { "sequence": [] } }
+      "shapes": { "root": { "sequence": ["Identifier"] } }
     })";
     auto result = GrammarSchema::loadFromText(bad);
     ASSERT_FALSE(result.has_value());
@@ -216,13 +218,13 @@ TEST(GrammarSchema, UnknownScopeNameReportsCode) {
       "dssSchemaVersion": 1,
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { "<": [{ "kind": "K", "opensScope": "Fictional" }] },
-      "shapes": { "root": { "sequence": [] } }
+      "shapes": { "root": { "sequence": ["Identifier"] } }
     })";
     auto result = GrammarSchema::loadFromText(bad);
     ASSERT_FALSE(result.has_value());
     auto const& diags = result.error();
     EXPECT_TRUE(std::ranges::any_of(diags, [](auto const& d) {
-        return d.code == DiagnosticCode::C_UnclosableScope;
+        return d.code == DiagnosticCode::C_UnknownScopeName;
     }));
 }
 
@@ -230,7 +232,7 @@ TEST(GrammarSchema, MissingRootShapeReportsCode) {
     constexpr std::string_view bad = R"({
       "dssSchemaVersion": 1,
       "language": { "name": "X", "version": "0.1.0" },
-      "shapes": { "alpha": { "sequence": [] } }
+      "shapes": { "alpha": { "sequence": ["Identifier"] } }
     })";
     auto result = GrammarSchema::loadFromText(bad);
     ASSERT_FALSE(result.has_value());
@@ -259,6 +261,97 @@ TEST(GrammarSchema, LoadShippedToy) {
         EXPECT_TRUE((*result)->isEmptySpace(
             (*result)->lookupLexeme(" ")[0].id));
     }
+}
+
+// The shipped c-subset config must load cleanly and round-trip every rule
+// the JSON declares. Pins three layers: (a) loader accepts the file, (b)
+// each named shape resolves via `rules().find(...)` so a typo in any
+// shape key wouldn't slip through as "loaded but unusable at first call",
+// (c) representative tokens and keywords carry the right meanings.
+TEST(GrammarSchema, LoadShippedCSubset) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    if (!result.has_value()) {
+        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message
+               << " (cwd=" << std::filesystem::current_path().string() << ")";
+    }
+    auto const& schema = **result;
+
+    EXPECT_EQ(schema.name(), "CSubset");
+    EXPECT_EQ(schema.schemaVersion(), 2u);
+
+    // Every shape name declared in the JSON must resolve. A typo would
+    // currently load cleanly and only fail when a caller asks for the
+    // missing name; pinning here makes the regression visible at load.
+    for (std::string_view rule : {"root", "topLevel", "topLevelTail",
+                                  "funcTail", "varDeclTail",
+                                  "typeBase", "typeRef",
+                                  "varDeclHead", "varDecl",
+                                  "paramList", "param", "block", "statement",
+                                  "ifStmt", "whileStmt", "doStmt", "forStmt",
+                                  "returnStmt", "exprStmt", "expression",
+                                  "binaryOp", "operand"}) {
+        EXPECT_TRUE(schema.rules().find(rule).valid()) << rule;
+    }
+
+    // BlockOpen opens Block — representative scope token.
+    auto const blockOpen = schema.lookupLexeme("{");
+    ASSERT_EQ(blockOpen.size(), 1u);
+    EXPECT_EQ(blockOpen[0].opensScope, ScopeKind::Block);
+
+    // Each declared keyword resolves to a single meaning with the
+    // expected schema-token name; a regression in the keyword loader
+    // (silently dropping entries or remapping kinds) would fail here.
+    auto const forKw = schema.lookupLexeme("for");
+    ASSERT_EQ(forKw.size(), 1u);
+    EXPECT_EQ(schema.schemaTokens().name(forKw[0].id), "ForKeyword");
+
+    // `typedef` is not a keyword in this config (deferred — see
+    // v2-gap-catalog row 2). Confirm the lexeme has no meaning so a
+    // future regression that silently adds it gets caught.
+    EXPECT_TRUE(schema.lookupLexeme("typedef").empty());
+}
+
+// `typeRef` admits `const int const x` (double-const). Real C allows
+// double-const only with intervening type modifiers; the c-subset is
+// deliberately more permissive while precedence/arity are deferred.
+// Pinned so a future PR doesn't tighten this without intent.
+TEST(GrammarSchema, CSubsetTypeRefAllowsDoubleConst) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    if (!result.has_value()) {
+        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
+    }
+    EXPECT_TRUE((*result)->rules().find("typeRef").valid());
+}
+
+// dssSchemaVersion 2 is the upper bound of the loader's accepted window.
+// A valid v2 document must load AND emit zero diagnostics — a future
+// warning-on-version-2 regression would silently pass without this.
+TEST(GrammarSchema, SchemaVersionTwoAccepted) {
+    auto result = GrammarSchema::loadFromText(
+        R"({"dssSchemaVersion":2,"language":{"name":"X","version":"0.1.0"}})");
+    ASSERT_TRUE(result.has_value())
+        << "v2 doc should load: "
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    EXPECT_EQ((*result)->schemaVersion(), 2u);
+}
+
+// Outside the accepted window, the loader must emit C_VersionMismatch
+// with a message naming the supported range. The range string is the
+// load-bearing fragment — full-message equality would over-pin the
+// surrounding prose, but the range itself MUST be there or the
+// diagnostic is uselessly opaque.
+TEST(GrammarSchema, SchemaVersionThreeRejectedWithRangeMessage) {
+    auto result = GrammarSchema::loadFromText(
+        R"({"dssSchemaVersion":3,"language":{"name":"X","version":"0.1.0"}})");
+    ASSERT_FALSE(result.has_value());
+    auto const& diags = result.error();
+    auto it = std::ranges::find_if(diags, [](auto const& d) {
+        return d.code == DiagnosticCode::C_VersionMismatch;
+    });
+    ASSERT_NE(it, diags.end());
+    EXPECT_NE(it->message.find("1..2"), std::string::npos)
+        << "version-mismatch message should name the supported range; got: "
+        << it->message;
 }
 
 // Pins the cookbook example in docs/language-config-spec.md §7 against the

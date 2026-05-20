@@ -23,6 +23,16 @@
 
 namespace dss {
 
+// Builder-level knobs that are NOT diagnostic-reporter concerns.
+struct DSS_EXPORT BuilderConfig {
+    // Hard cap on simultaneously-active checkpoints (depth). Pathological
+    // grammars could otherwise pile speculative frames without bound.
+    // Exceeded → `P_MaxSpeculationDepth` (one-shot per build) and the
+    // returned Checkpoint is a no-op guard (commit + rollback are no-ops
+    // and no state was captured).
+    std::size_t maxSpeculationDepth = 64;
+};
+
 // Schema-aware mutable tree assembler. Constructed with a source buffer +
 // GrammarSchema, drives the building of a single Tree, and is consumed by
 // `finish() &&`.
@@ -81,10 +91,39 @@ public:
         std::uint32_t  cookie_  = 0;
     };
 
+    // Move-only RAII guard from `checkpoint()`. Dtor rolls back if still
+    // Pending — silent commit is the wrong default for a backtracking
+    // primitive. Precondition: the producing `TreeBuilder` must outlive
+    // this guard. Storing a Checkpoint past the builder's destruction
+    // is UB. TreeBuilder is non-copyable/non-movable, so the back-
+    // pointer stays valid for the builder's lifetime.
+    class DSS_EXPORT Checkpoint {
+    public:
+        enum class Disposition : std::uint8_t { Pending, Committed, RolledBack };
+
+        Checkpoint(Checkpoint&& other) noexcept;
+        Checkpoint& operator=(Checkpoint&& other) noexcept;
+        Checkpoint(Checkpoint const&)            = delete;
+        Checkpoint& operator=(Checkpoint const&) = delete;
+        ~Checkpoint() noexcept;
+
+        [[nodiscard]] Disposition disposition() const noexcept { return disp_; }
+        [[nodiscard]] bool        isPending()   const noexcept { return disp_ == Disposition::Pending; }
+
+    private:
+        friend class TreeBuilder;
+        Checkpoint(TreeBuilder* b, std::uint32_t id) noexcept;
+
+        TreeBuilder*  builder_ = nullptr;
+        std::uint32_t id_      = 0;        // index into `checkpointStack_`
+        Disposition   disp_    = Disposition::Pending;
+    };
+
     // ── construction ──
     TreeBuilder(std::shared_ptr<SourceBuffer>        src,
                 std::shared_ptr<GrammarSchema const> schema,
-                DiagnosticReporter::Config           diagConfig = {});
+                DiagnosticReporter::Config           diagConfig    = {},
+                BuilderConfig                        builderConfig = {});
 
     // Single-use: copy/move would leave dangling OpenScope owners.
     TreeBuilder(TreeBuilder const&)            = delete;
@@ -130,6 +169,16 @@ public:
     // empty post-finish).
     [[nodiscard]] RuleId       currentRule()  const noexcept;
 
+    // Snapshot full builder state (arena, child-index, pending children,
+    // open frames, scope stack, cursor + stack, cookie counter, closed-
+    // cookie set, desync latch, watchdog latch, reporter accumulator).
+    // Closing an outer frame inside speculation emits `P_BuilderInvariant`.
+    // Over-cap produces a no-op guard (`id == kNoOpCheckpointId`); commit/
+    // rollback on it are safe no-ops.
+    [[nodiscard]] Checkpoint checkpoint();
+    void                     commit(Checkpoint&& cp) noexcept;
+    void                     rollback(Checkpoint&& cp) noexcept;
+
     // ── finalize ──
     // Single-use: consumes the builder. Any frames still open are closed
     // synthetically and emit one P_PrematureEndOfInput per unclosed frame
@@ -143,12 +192,45 @@ public:
 
 private:
     // ── per-open-frame state ──
+    //
+    // Children collected while a frame is open live in the shared
+    // `pendingChildren_` vector, at the contiguous range
+    // `[pendingStart, pendingChildren_.size())`. On close, that range
+    // is flushed to `childIndex_` in order and the staging vector is
+    // truncated back to `pendingStart` (the parent frame's region is
+    // re-exposed at the top). Storing children as offsets into one
+    // vector keeps the per-frame footprint small and makes speculative
+    // rollback an integer truncation rather than N per-frame resizes.
     struct Frame {
         NodeId               id;           // the Internal node being built
         RuleId               rule;
         SourceSpan           openerSpan;   // first source position seen at open() — used as opener for Missing diags
-        std::vector<NodeId>  children;     // collected while open; flushed to childIndex on close
+        std::uint32_t        pendingStart; // index into pendingChildren_ where this frame's children begin
         std::uint32_t        cookie;       // matches OpenScope::cookie_
+    };
+
+    // ── speculative checkpoint state ──
+    //
+    // One CheckpointSnapshot per outstanding `checkpoint()` call. The
+    // Checkpoint guard carries an index into `checkpointStack_`; commit
+    // and rollback pop entries above that index (cascade-cleanup if a
+    // caller forgot to commit/rollback an inner checkpoint before an
+    // outer one). Snapshots are O(open_frames + cursorStack.size()
+    // + closedCookies_.size()) — small, but not zero, so unlimited
+    // depth is gated by BuilderConfig::maxSpeculationDepth.
+    struct CheckpointSnapshot {
+        std::size_t                       nodesSize;
+        std::size_t                       childIndexSize;
+        std::size_t                       pendingChildrenSize;
+        std::vector<Frame>                openFrames;          // snapshot copy
+        std::vector<ScopeKind>            scopes;
+        SchemaCursor                      cursor;
+        std::vector<SchemaCursor>         cursorStack;
+        std::uint32_t                     nextCookie;
+        std::unordered_set<std::uint32_t> closedCookies;
+        bool                              cursorDesynced;
+        bool                              maxSpeculationDepthReached;
+        DiagnosticReporter::Snapshot      reporterSnap;
     };
 
     // ── helpers ──
@@ -156,12 +238,39 @@ private:
     void                    closeFrame_(std::uint32_t cookie, bool synthetic) noexcept;
     void                    propagateHasError_(NodeId start) noexcept;
     void                    emitDiagnostic_(ParseDiagnostic d);
+    // Like emitDiagnostic_ but bypasses the reporter's cap so signals
+    // that callers MUST see (e.g. P_UncommittedCheckpoint from the
+    // Checkpoint dtor) aren't silently swallowed by an at-cap reporter.
+    void                    forceReport_(ParseDiagnostic d);
     void                    addBuilderInvariant_(std::string actual, SourceSpan span);
+
+    // Emit P_SchemaCursorDesync exactly once per build the first time the
+    // schema cursor goes from valid to invalid. `wasValid` is the state
+    // before the most recent walk step (advance or leaveRule); `nowValid`
+    // is the result. `span` and `rule` populate the diagnostic location.
+    void                    noteCursorDesync_(bool wasValid,
+                                              bool nowValid,
+                                              SourceSpan span,
+                                              std::optional<RuleId> rule);
 
     // Attach a node id to the current frame's children list. Returns false
     // when there's no open frame (caller must have already emitted a
     // P_BuilderInvariant for that case).
     bool                    attachToCurrentFrame_(NodeId id);
+
+    // View of `pendingChildren_` covering the top open frame's region.
+    // Empty when no frame is open. Read-only.
+    [[nodiscard]] std::span<NodeId const> topFramePendingChildren_() const noexcept;
+
+    // Restore builder state from the snapshot at `checkpointStack_[id-1]`
+    // (id is 1-based; id=0 is the no-op marker). Drops the snapshot and
+    // any deeper ones. Used by both rollback() and the Checkpoint
+    // destructor's defensive fallback. No-op for the no-op marker id=0.
+    void                    rollbackToId_(std::uint32_t id) noexcept;
+
+    // Drop the snapshot at the given id and any deeper ones, WITHOUT
+    // restoring state. Used by commit(). No-op for the no-op marker.
+    void                    commitToId_(std::uint32_t id) noexcept;
 
     // ── state ──
     std::shared_ptr<SourceBuffer>          source_;
@@ -171,8 +280,28 @@ private:
     std::vector<detail::Node>              nodes_;       // arena under construction
     std::vector<NodeId>                    childIndex_;  // flat children table under construction
 
+    // Staging vector for children of open frames. Each open Frame owns the
+    // range `[pendingStart, pendingChildren_.size())`. On close, the
+    // range is flushed to `childIndex_` and the staging vector truncates
+    // back to the parent's range. `attachToCurrentFrame_` appends here.
+    std::vector<NodeId>                    pendingChildren_;
+
     std::vector<Frame>                     open_;        // LIFO open-frame stack
     std::vector<ScopeKind>                 scopes_;      // current scope stack
+
+    // Schema cursor mirroring `open_`. Walked through enterRule on open(),
+    // leaveRule on close, and advance on pushToken. Invariant:
+    // `cursorStack_.size() == open_.size()` before/after every open/close
+    // operation. Goes invalid when the caller drives the builder against
+    // the schema's shape; the contextual demotion path treats an invalid
+    // cursor as "no expectations known; keep the keyword."
+    SchemaCursor                           cursor_;
+    std::vector<SchemaCursor>              cursorStack_;
+    // One-shot — true after the first valid → invalid cursor transition.
+    // Bounds the P_SchemaCursorDesync diagnostic to one emission per
+    // build so a long parse that goes off-track doesn't flood the
+    // diagnostic stream.
+    bool                                   cursorDesynced_ = false;
 
     // Cookies that have been "closed" by cascade or by finish() but whose
     // OpenScope guards are still alive (and will eventually call close()
@@ -183,6 +312,29 @@ private:
 
     std::uint32_t                          nextCookie_ = 1;   // 0 reserved as "invalid"
     bool                                   finished_   = false;
+
+    // ── speculative state ──
+    //
+    // Each entry carries its own id. Lookup by id is a linear search
+    // (depth ≤ maxSpeculationDepth, typically ≤ 64 — trivially fast and
+    // cache-friendly). Index-arithmetic shortcuts (e.g. `firstId =
+    // nextCheckpointId_ - stack.size()`) silently break when `commitToId_`
+    // truncates from the middle of the stack on inner-commit-then-outer-
+    // rollback sequences, so the stable invariant is "each snapshot owns
+    // its id." `kNoOpCheckpointId` is the sentinel returned by
+    // `checkpoint()` when the cap is reached; both commit/rollback paths
+    // short-circuit on it.
+    static constexpr std::uint32_t kNoOpCheckpointId = 0;
+
+    BuilderConfig                          builderConfig_{};
+    std::vector<std::pair<std::uint32_t,
+                          CheckpointSnapshot>>  checkpointStack_;
+    std::uint32_t                          nextCheckpointId_ = 1;
+    // One-shot per build; snapshotted by Checkpoint so rollback restores
+    // it (otherwise a speculative branch that tripped the cap would
+    // permanently silence the post-rollback emission of legitimate cap
+    // events).
+    bool                                   maxSpeculationDepthReached_ = false;
 };
 
 } // namespace dss

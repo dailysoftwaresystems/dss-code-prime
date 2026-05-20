@@ -87,6 +87,31 @@ public:
 
     [[nodiscard]] Config const& config() const noexcept { return cfg_; }
 
+    // Opaque restore token used exclusively by TreeBuilder::Checkpoint.
+    // `recent_` is a sliding window with pop_front, so size-only capture
+    // would lose front entries to speculative pushes; truncateTo would
+    // then restore speculative residue rather than pre-checkpoint state.
+    // Full-deque snapshot is the only mathematically sound shape.
+    // Fields are private; only TreeBuilder reads them via friendship.
+    class DSS_EXPORT Snapshot {
+    private:
+        friend class DiagnosticReporter;
+        std::size_t                                       allSize     = 0;
+        std::unordered_map<DiagnosticCode, std::size_t>   perCode;
+        std::deque<std::uint64_t>                         recent;
+        bool                                              hitCap      = false;
+    };
+    [[nodiscard]] Snapshot snapshotForRollback() const;
+    void                   truncateTo(Snapshot const& snap);
+
+    // Append a diagnostic bypassing the global cap and dedup window.
+    // Reserved for builder-invariant signals that the cap MUST NOT
+    // silently swallow (forgotten-commit warning, internal-error
+    // notifications). `policy` (suppress/override/warningsAsErrors)
+    // still applies — bypass concerns only the cap, not the user's
+    // explicit filtering choices. Per-code counters still increment.
+    void forceReport(ParseDiagnostic d);
+
     // Pretty-printers. The registry resolves BufferId → SourceBuffer so
     // multi-file diagnostics (related-locations spanning includes, future)
     // format correctly.
