@@ -666,3 +666,152 @@ TEST(NodeAttribute, EmptyTreeIterationYieldsNothing) {
     EXPECT_TRUE(attr.empty());
     EXPECT_EQ(attr.begin(), attr.end());
 }
+
+// ── cross-tree NodeId guard (SH3) ────────────────────────────────────────
+//
+// `NodeAttribute<T>` is bound to one Tree at construction. Passing a NodeId
+// that was minted by a different Tree must abort with both TreeIds in the
+// message so the death-test regex can pin both numbers. Untagged literals
+// (`NodeId{N}`) bypass the cross-tree check — those are the existing test-
+// ergonomic path; the bounds check still catches out-of-range untagged ids.
+
+namespace {
+Tree buildFlatTreeWithId(int leafCount, TreeId id) {
+    std::string source(static_cast<std::size_t>(leafCount), 'x');
+    RawTreeBuilder rb{std::move(source), "<test>", id};
+    const auto rule = rb.internRule("root");
+    std::vector<NodeId> kids;
+    for (int i = 0; i < leafCount; ++i) {
+        kids.push_back(NodeId{static_cast<std::uint32_t>(i + 2)});
+    }
+    rb.addNode(NodeKind::Internal, rule, SourceSpan::of(0, leafCount),
+               NodeFlags::None, InvalidNode, std::move(kids));
+    for (int i = 0; i < leafCount; ++i) {
+        rb.addNode(NodeKind::Token, InvalidRule,
+                   SourceSpan::of(static_cast<ByteOffset>(i),
+                                  static_cast<ByteOffset>(i + 1)),
+                   NodeFlags::None, NodeId{1});
+    }
+    return std::move(rb).finish(/*root=*/ NodeId{1});
+}
+} // namespace
+
+TEST(NodeAttributeDeath, SetWithForeignTreeNodeIdAborts) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    NodeAttribute<int> attrA{a};
+    NodeId idFromB = b.root();
+    ASSERT_NE(idFromB.treeTag, 0u);
+    EXPECT_DEATH({ attrA.set(idFromB, 1); },
+                 "NodeAttribute bound to TreeId=111 got NodeId from TreeId=222");
+}
+
+TEST(NodeAttributeDeath, GetWithForeignTreeNodeIdAborts) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    NodeAttribute<int> attrA{a};
+    attrA.set(NodeId{1}, 7);
+    EXPECT_DEATH({ (void)attrA.get(b.root()); },
+                 "NodeAttribute bound to TreeId=111 got NodeId from TreeId=222");
+}
+
+TEST(NodeAttributeDeath, HasWithForeignTreeNodeIdAborts) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    NodeAttribute<int> attrA{a};
+    EXPECT_DEATH({ (void)attrA.has(b.root()); },
+                 "NodeAttribute bound to TreeId=111 got NodeId from TreeId=222");
+}
+
+TEST(NodeAttributeDeath, TryGetWithForeignTreeNodeIdAborts) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    NodeAttribute<int> attrA{a};
+    EXPECT_DEATH({ (void)attrA.tryGet(b.root()); },
+                 "NodeAttribute bound to TreeId=111 got NodeId from TreeId=222");
+}
+
+TEST(NodeAttributeDeath, EraseWithForeignTreeNodeIdAborts) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    NodeAttribute<int> attrA{a};
+    attrA.set(NodeId{1}, 7);
+    EXPECT_DEATH({ (void)attrA.erase(b.root()); },
+                 "NodeAttribute bound to TreeId=111 got NodeId from TreeId=222");
+}
+
+TEST(NodeAttribute, UntaggedLiteralPassesValidator) {
+    // Hand-fabricated NodeId literals (treeTag == 0) MUST pass the cross-
+    // tree validator — existing tests rely on `NodeId{N}` shorthand. The
+    // bounds check is still the catch for genuinely-bad ids.
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    NodeAttribute<int> attrA{a};
+    NodeId untagged{1};
+    ASSERT_EQ(untagged.treeTag, 0u);
+    attrA.set(untagged, 42);
+    EXPECT_EQ(attrA.get(untagged), 42);
+    EXPECT_EQ(attrA.get(NodeId(1, 111)), 42);  // same .v, tagged equivalent
+}
+
+TEST(NodeAttribute, MoveTransfersBoundTreeId) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    NodeAttribute<int> attrA{a};
+    attrA.set(NodeId{1}, 7);
+    NodeAttribute<int> moved = std::move(attrA);
+    EXPECT_EQ(moved.tree(), a.id());
+    EXPECT_EQ(moved.get(NodeId{1}), 7);
+}
+
+TEST(NodeAttributeDeath, MovedAttributeRejectsForeignNodeId) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    NodeAttribute<int> attrA{a};
+    NodeAttribute<int> moved = std::move(attrA);
+    EXPECT_DEATH({ moved.set(b.root(), 1); },
+                 "NodeAttribute bound to TreeId=111 got NodeId from TreeId=222");
+}
+
+TEST(NodeAttributeDeath, IteratorYieldsTaggedIdsAfterPromotion) {
+    // Verify dense-mode iteration produces tagged NodeIds (bug class: post-
+    // promotion iteration synthesizes a NodeId from just the arena index;
+    // without explicit tagging, those would be untagged and cross-tree-
+    // pass silently when forwarded to another attribute).
+    Tree a = buildFlatTreeWithId(20, TreeId{111});
+    Tree b = buildFlatTreeWithId(20, TreeId{222});
+    NodeAttribute<int> attrA{a};
+    for (std::uint32_t v = 1; v <= 11; ++v) attrA.set(NodeId{v}, static_cast<int>(v));
+    ASSERT_TRUE(attrA.isDense());
+
+    NodeAttribute<int> attrB{b};
+    auto it = attrA.begin();
+    NodeId yielded = (*it).first;
+    EXPECT_EQ(yielded.treeTag, 111u);
+    EXPECT_DEATH({ attrB.set(yielded, 1); },
+                 "NodeAttribute bound to TreeId=222 got NodeId from TreeId=111");
+}
+
+// ── cross-tree Tree::children / accessors (SH3) ──────────────────────────
+
+TEST(TreeDeath, ChildrenWithForeignNodeIdAborts) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    EXPECT_DEATH({ (void)a.children(b.root()); },
+                 "NodeId from TreeId=222 used on TreeId=111");
+}
+
+TEST(TreeDeath, KindWithForeignNodeIdAborts) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    Tree b = buildFlatTreeWithId(3, TreeId{222});
+    EXPECT_DEATH({ (void)a.kind(b.root()); },
+                 "NodeId from TreeId=222 used on TreeId=111");
+}
+
+TEST(Tree, ChildrenOnSameTreeReturnsTaggedIds) {
+    Tree a = buildFlatTreeWithId(3, TreeId{111});
+    auto kids = a.children(a.root());
+    ASSERT_EQ(kids.size(), 3u);
+    for (NodeId k : kids) {
+        EXPECT_EQ(k.treeTag, 111u);
+    }
+}

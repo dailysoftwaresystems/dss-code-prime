@@ -6,7 +6,7 @@
 
 | | |
 |---|---|
-| Status        | 🔵 **in progress.** SH2 closed by `DSS.DevOps@v2` upstream + macOS opt-in here. SH3 + SH1 remain. Trigger: v2 sub-plan ✅ done (PR8 + `4547301` followup). Successor: parent plan #5 (`tokenizer`). |
+| Status        | 🔵 **in progress.** SH2 + SH3 done. SH1 remains. Trigger: v2 sub-plan ✅ done (PR8 + `4547301` followup). Successor: parent plan #5 (`tokenizer`). |
 | Predecessors  | ✅ v1 T0–T12 (`tree-node-model-plan.md`); ✅ v2 PR0–PR8 (`schema-expressiveness-v2-plan.md`). |
 | Successors    | Parent plan phase #5 (tokenizer). Cleanly verifying the schema against real tokens is what makes phase #7 (parser) tractable and what surfaces v3 schema gaps in time to act on them. |
 | Scope         | **Bounded.** SH1: landing-log generator. SH2: Linux CI matrix entry. SH3: cross-tree NodeId guard. No other items will be added to this plan — anything new becomes a separate sub-plan. |
@@ -16,7 +16,7 @@
 | PR | Status | Commit / notes |
 |---|---|---|
 | SH2 | ✅ done | Multi-OS matrix already shipped by `DSS.DevOps@v2` (`cpp-app-pr.yml`): Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, all default-enabled and green on recent PRs. This PR opts the consumer wiring into the `run-macos` leg (AppleClang on Homebrew LLVM). <!-- LANDING-LOG-HASHES: SH2 --> |
-| SH3 | ⏳ pending | Cross-tree NodeId guard. |
+| SH3 | ✅ done | `NodeId` grew an 8-byte `treeTag` field; `TreeBuilder` mints `TreeId` eagerly at ctor and stamps every emitted id; `NodeAttribute<T>::validateId_` + `Tree::node_` abort on tag mismatch with both ids in the message. 523 ctest cases / 26 suites still 100% pass; 14 new death tests added. <!-- LANDING-LOG-HASHES: SH3 --> |
 | SH1 | ⏳ pending | Landing-log generator script. |
 
 ---
@@ -89,33 +89,45 @@ So the original "Linux GCC" deliverable was already met, and the original "out o
 
 ---
 
-### SH3 — Cross-tree `NodeId` guard
+### SH3 — Cross-tree `NodeId` guard ✅
 
 **Goal.** Make cross-tree `NodeId` usage a loud failure instead of a silent bounds-check pass.
 
-**Design call.** Two viable approaches, picked at implementation time based on which is smaller:
+**Design as shipped (deviates from the plan as originally written).** The original plan offered Option A ("stamp each Node with a TreeId; `NodeAttribute<T>` validates on access") and Option B (debug-only registry). On implementation, Option A as literally written is tautological: a `NodeAttribute<T>` reading the stamp from its *own bound tree* always observes a stamp equal to that bound tree's id, so cross-tree access — where a foreign `NodeId` is used to index into the bound tree's arena — never trips. The only way to detect provenance is to **carry it on the `NodeId` itself**.
 
-- **Option A — `Tree` stamps each Node with a generation counter, `NodeAttribute<T>` validates on access.** Adds 4 bytes per `Node` (currently ~40 bytes → ~44 bytes; ~10% growth). On `NodeAttribute<T>::get/set/tryGet`, the stored Tree pointer's generation is compared against the `Node`'s stamp. Cross-tree usage trips a `*Fatal` with both tree IDs in the message. Cost: per-access load + compare. Bounded.
+Shipped design:
 
-- **Option B — Debug-only NodeId → TreeId registry.** A static-singleton `unordered_map<uint64_t, TreeId>` (NodeId.v + a small disambiguator) populated on every NodeId allocation in debug builds. `NodeAttribute<T>::get/set/tryGet` consults it. Free in release. Catches everything in debug. Cost: every NodeId allocation does a map insert in debug builds.
+- **`NodeId` grows to 8 bytes**: `{ uint32_t v; uint32_t treeTag; }`. The `treeTag` is the source tree's id; `0` is the untagged sentinel.
+- **Equality / `std::hash` compare `.v` only.** The tag is provenance metadata, not identity. Two `NodeId{3}` values compare equal even with different tags — this keeps existing tests that mix literal `NodeId{N}` with tagged-from-tree ids working without churn. The cross-tree validator is the enforcement point, not equality.
+- **`TreeBuilder` mints `TreeId` eagerly at construction** (was: at `finish()` from a local static counter). Tags every NodeId it emits. The static counter moved to `TreeBuilder::nextTreeId()` so test helpers can share it.
+- **`RawTreeBuilder`** accepts an explicit `TreeId` at construction (default `TreeId{1}` preserved for the existing `test_tree.cpp` assertion); tags every NodeId it creates and retags input parent/child references so callers can keep using literal `NodeId{N}` shorthand.
+- **`Tree::node_`** (the universal accessor used by `kind`/`flags`/`children`/`parent`/`text`/...) validates `id.treeTag == 0 || id.treeTag == this.id().v`; mismatch aborts via `treeFatal` with both ids in the message.
+- **`NodeAttribute<T>::validateId_`** does the same check against its captured `treeId_`; mismatch aborts via a new `crossTreeFatal(boundId, idTag)` helper. Untagged literals continue to bypass the tag check (test ergonomics); bounds check still catches genuinely-bad untagged ids.
+- **Dense-iterator NodeIds synthesized post-promotion get the bound tree's tag** so iteration after sparse→dense promotion doesn't silently strip provenance.
 
-**Recommendation: Option A.** The 4-byte per-Node cost is paid once (immutable arena), the validation is per-access but trivial, and the protection is permanent (works in release builds). The `Node` struct is already 40 bytes — growing to 44 is well within the comfort zone. SH3 PR implements Option A unless concrete profiling pushes back.
+Why `NodeId` carries the tag rather than just the `Node` (as the plan's Option A suggested): see the tautology argument above. The plan's "4 bytes per `Node`" cost estimate maps onto an effectively identical cost: `Node.parent` is a `NodeId`, so growing `NodeId` from 4 → 8 grows `Node.parent` by 4. The existing 4-byte trailing padding on `Node` (40-byte struct with `alignas(8)`, 36 bytes of named fields) absorbs the growth — `sizeof(detail::Node)` stays at 40. The real memory hit is `Tree::data_.childIndex` doubling (now 8 bytes / entry).
 
-**Surface.**
-- `Tree` gets `treeId() -> TreeId` (already exists from skill description). On `TreeBuilder::finish()`, every `Node` in the arena gets stamped with this TreeId.
-- `NodeAttribute<T>` captures `tree.treeId()` at ctor; every accessor validates the incoming `NodeId`'s stamp matches.
-- `*Fatal` message: `"NodeAttribute<T> bound to TreeId=N got NodeId from TreeId=M"` — both IDs in the message so a death test can pin both.
-- Death tests in `test_tree_attrs.cpp` covering: read-after-cross-set, write-with-foreign-id, `tryGet` returns nullptr-or-aborts (pick one — recommend abort, matches the rest of the file's discipline).
-- `docs/tree-model.md` §5.10 caveat updated: strike "cross-tree confusion slips through"; add "cross-tree usage aborts with both TreeIds in the message."
+**Surface — final.**
+- `src/core/types/strong_ids.hpp`: special-case `NodeId` outside the `DSS_STRONG_ID` macro to add `treeTag`. `std::hash<NodeId>` still keys on `.v` (the macro-emitted spec works as-is).
+- `src/core/types/tree_builder.{hpp,cpp}`: new `treeId_` member, new `static TreeId nextTreeId() noexcept` factory, new `[[nodiscard]] TreeId treeId() const noexcept` accessor. `emit_` returns `NodeId{value, treeId_.v}`. `finish()` reuses `treeId_` for `td.id` and tags `td.root`.
+- `src/core/types/tree.cpp`: `node_` validates the tag and emits `"Tree::node_: NodeId from TreeId={B} used on TreeId={A}"` on mismatch.
+- `src/core/types/tree_attrs.hpp`: new `detail::attr::crossTreeFatal(boundId, idTag)` helper emits `"NodeAttribute bound to TreeId={A} got NodeId from TreeId={B}"`; `validateId_` calls it on mismatch. Dense iterator carries `treeTag_` so synthesized NodeIds inherit the bound tree's tag.
+- `tests/core/raw_tree_builder.hpp`: ctor takes `TreeId` (default `TreeId{1}`); `addNode` retags untagged parent/child references; `finish` takes `optional<TreeId>` override.
 
-**Tests.** 8–12 new test cases:
-- Same-tree happy path (already covered — pin the count).
-- Two-Tree cross-attack on `set`, `get`, `tryGet`, `erase`.
-- Iterator validity across Tree drop (existing test — pin the count).
-- Death-test regex matches both TreeIds in fatal message.
-- Move-construction transfers the bound TreeId.
+**Tests added (14 new cases in `test_tree_attrs.cpp`, +3 in `test_strong_ids.cpp`):**
+- `NodeAttributeDeath`: cross-tree {Set, Get, Has, TryGet, Erase} all match the expected "TreeId=111 ... TreeId=222" message.
+- `NodeAttributeDeath.MovedAttributeRejectsForeignNodeId` — move transfers the bound TreeId.
+- `NodeAttributeDeath.IteratorYieldsTaggedIdsAfterPromotion` — pins the dense-iter tagging fix.
+- `NodeAttribute.UntaggedLiteralPassesValidator` + `MoveTransfersBoundTreeId` — same-tree happy paths.
+- `TreeDeath`: cross-tree `children`, `kind` abort via `node_`.
+- `Tree.ChildrenOnSameTreeReturnsTaggedIds` — pins the round-trip tagging on the child-table return.
+- `StrongIds`: `NodeIdEqualityIgnoresTreeTag`, `NodeIdTwoArgCtorStoresTag`, `IsTriviallyCopyable` updated for `sizeof(NodeId) == 8`.
 
-**Out of scope.** Cross-tree `Tree::children(NodeId)` walks — same class of bug, but the walks already abort on out-of-range; the same-range case is fixable by checking `node.treeId == tree.treeId` before returning the span. Bundle into the same PR; reuse the same `*Fatal` path.
+`docs/tree-model.md` §5 caveat rewritten: strikes "same-range cross-tree confusion slips through"; adds the new fatal message format. Skill (`SKILL.md`) sections updated for both the `NodeId` shape and the `NodeAttribute` invariant.
+
+**Out of scope (carried forward to potential future SH or v3 work).**
+- `TreeCursor::Bookmark`'s existing `TreeId` ABA-detection is unchanged — it was already correct and remains so.
+- The `SchemaTreeBuilder` test helper in `test_tree_views.cpp` doesn't tag its NodeIds (it predates SH3 and has no cross-tree test needs). Same-tree access works because untagged passes the validator.
 
 ---
 

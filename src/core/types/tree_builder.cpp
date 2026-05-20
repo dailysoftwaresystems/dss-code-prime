@@ -120,6 +120,11 @@ TreeBuilder::Checkpoint::~Checkpoint() noexcept {
 // TreeBuilder
 // ─────────────────────────────────────────────────────────────────────────
 
+TreeId TreeBuilder::nextTreeId() noexcept {
+    static std::atomic<std::uint32_t> sCounter{0};
+    return TreeId{++sCounter};
+}
+
 TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
                         std::shared_ptr<GrammarSchema const> schema,
                         DiagnosticReporter::Config           diagConfig,
@@ -127,6 +132,7 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     : source_(std::move(src))
     , schema_(std::move(schema))
     , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig)))
+    , treeId_(nextTreeId())
     , builderConfig_(builderConfig) {
     // Constructor preconditions: source_ and schema_ must be non-null.
     // We accept a null source in tests of degenerate paths (the diagnostic
@@ -149,7 +155,7 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
 NodeId TreeBuilder::emit_(detail::Node n) {
     const auto value = static_cast<std::uint32_t>(nodes_.size());
     nodes_.push_back(n);
-    return NodeId{value};
+    return NodeId{value, treeId_.v};
 }
 
 bool TreeBuilder::attachToCurrentFrame_(NodeId id) {
@@ -824,9 +830,9 @@ Tree TreeBuilder::finish() && {
         }
     }
 
-    // Mint a monotonic TreeId so attribute side-tables can disambiguate
-    // values keyed against this tree.
-    static std::atomic<std::uint32_t> sTreeIdCounter{0};
+    // TreeId was minted at construction (treeId_) so every NodeId emit_
+    // produced already carries its tag. Reuse it here for td.id and the
+    // root NodeId so the bundle round-trips with consistent tagging.
 
     // If open() was never called, the arena holds only the sentinel.
     // Emit an empty Tree with no root rather than claiming NodeId{1} —
@@ -841,7 +847,7 @@ Tree TreeBuilder::finish() && {
     td.rules      = std::shared_ptr<RuleInterner const>(schema_, &schema_->rules());
     td.schema     = schema_;
     td.diagnostics = std::move(reporter_);
-    td.id          = TreeId{++sTreeIdCounter};
+    td.id          = treeId_;
 
     if (neverOpened) {
         // Drop the lone sentinel: Tree's invariant is "nodes empty XOR
@@ -853,7 +859,7 @@ Tree TreeBuilder::finish() && {
     } else {
         td.nodes       = std::move(nodes_);
         td.childIndex  = std::move(childIndex_);
-        td.root        = NodeId{1};      // first real node = the root open()
+        td.root        = NodeId{1, treeId_.v};  // first real node = the root open()
     }
 
     return Tree{std::move(td)};

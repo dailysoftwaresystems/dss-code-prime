@@ -89,9 +89,13 @@ before touching any of it.
 **Key invariants:**
 - Slot 0 is the `InvalidNode` sentinel; real nodes start at index 1.
 - Tree is immutable after `finish()`. All semantic annotation goes through `NodeAttribute<T>` side-tables.
-- `NodeId` is a strong type wrapping `uint32_t` with `valid()` predicate (zero == invalid).
-- Cross-tree NodeId usage is NOT detectable at the NodeId level — bounds checks on `NodeAttribute`
-  / `Tree::children` catch out-of-range; same-range cross-tree confusion slips through.
+- `NodeId` is a strong type wrapping `{uint32_t v; uint32_t treeTag}` with `valid()` predicate
+  (`v != 0` == invalid; `treeTag == 0` == untagged literal). Equality and `std::hash` compare `.v` only.
+- Cross-tree NodeId usage **is** detectable: `TreeBuilder::emit_` and `RawTreeBuilder` stamp every
+  emitted `NodeId` with the source tree's id; `NodeAttribute<T>` and `Tree::node_` validate the tag
+  on every access. Tagged-from-foreign-tree aborts with both ids in the fatal message; untagged
+  literals (`NodeId{3}`) bypass the check (test ergonomics) but are still bounds-checked. See
+  `docs/tree-model.md` §5 cross-tree guard section.
 
 ### 4.2 Strong IDs (`strong_ids.hpp`)
 
@@ -161,8 +165,10 @@ auto const* t = nodeTypes.tryGet(id);       // nullptr on absent
   `vector<optional<T>>` when coverage ≥ 50% AND `tree.nodeCount() ≥ 16`. `clear()` resets to sparse.
 - **Move-only** with custom move ops that reset the source's `denseCount_` + variant so
   moved-from state is observably consistent (rather than std-lib's "valid but unspecified").
-- **Bounds-check on every entry**; cross-tree guard is bounds-based, not membership-based —
-  documented caveat.
+- **Bounds-check + cross-tree-tag-check on every entry**. NodeIds carry a `treeTag` (set by
+  `TreeBuilder::emit_` / `RawTreeBuilder::addNode`); foreign-tree usage aborts with both
+  TreeIds in the fatal message. Untagged literals (`NodeId{N}` from test code) bypass the
+  tag check but are still bounds-checked.
 
 ### 4.6 Typed Views (`tree_views.hpp` + `well_known_names.hpp` — header-only)
 
