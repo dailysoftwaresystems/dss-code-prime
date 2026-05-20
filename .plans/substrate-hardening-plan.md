@@ -6,7 +6,7 @@
 
 | | |
 |---|---|
-| Status        | ⏳ **Not started.** Trigger: v2 sub-plan ✅ done (PR8 + `4547301` followup). Successor: parent plan #5 (`tokenizer`). |
+| Status        | 🔵 **in progress.** SH2 closed by `DSS.DevOps@v2` upstream + macOS opt-in here. SH3 + SH1 remain. Trigger: v2 sub-plan ✅ done (PR8 + `4547301` followup). Successor: parent plan #5 (`tokenizer`). |
 | Predecessors  | ✅ v1 T0–T12 (`tree-node-model-plan.md`); ✅ v2 PR0–PR8 (`schema-expressiveness-v2-plan.md`). |
 | Successors    | Parent plan phase #5 (tokenizer). Cleanly verifying the schema against real tokens is what makes phase #7 (parser) tractable and what surfaces v3 schema gaps in time to act on them. |
 | Scope         | **Bounded.** SH1: landing-log generator. SH2: Linux CI matrix entry. SH3: cross-tree NodeId guard. No other items will be added to this plan — anything new becomes a separate sub-plan. |
@@ -15,9 +15,9 @@
 
 | PR | Status | Commit / notes |
 |---|---|---|
-| SH1 | ⏳ pending | Landing-log generator script. |
-| SH2 | ⏳ pending | Linux CI matrix entry. |
+| SH2 | ✅ done | Multi-OS matrix already shipped by `DSS.DevOps@v2` (`cpp-app-pr.yml`): Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, all default-enabled and green on recent PRs. This PR opts the consumer wiring into the `run-macos` leg (AppleClang on Homebrew LLVM). <!-- LANDING-LOG-HASHES: SH2 --> |
 | SH3 | ⏳ pending | Cross-tree NodeId guard. |
+| SH1 | ⏳ pending | Landing-log generator script. |
 
 ---
 
@@ -65,22 +65,27 @@ None of these block forward progress today. All three become substantially more 
 
 ---
 
-### SH2 — Linux CI matrix entry
+### SH2 — Linux CI matrix entry ✅
 
 **Goal.** Verify the cross-platform claim by running the full ctest suite on Ubuntu GCC in CI on every PR.
 
-**Surface.**
-- Extend `dss-code-prime/.github/workflows/cpp-app-pr.yml` (the consumer wiring) to add a `matrix.os: [windows-latest, ubuntu-latest]` axis.
-- Reuse the existing `DSS.DevOps/.github/workflows/cpp-app-pr.yml` reusable workflow — confirm it already supports Linux GCC; if not, add the toolchain there as the smallest possible edit.
-- Use Ubuntu 22.04 + system GCC 13 (or 13.2 to match Windows MinGW exactly — pick whichever is available without manual install).
-- ctest runs the full 509-case suite. Expect 0 failures.
-- Fix any Windows-isms surfaced — most likely: forward-slash path assumptions, line-ending sensitivity in test goldens, `.dll` vs `.so` lookup paths.
+**Outcome.** Closed by upstream + a one-line opt-in here. The plan as originally written assumed CI was MinGW-on-Windows only and that a new matrix axis had to be added. Reality on inspection: `DSS.DevOps/.github/workflows/cpp-app-pr.yml@v2` already builds the matrix dynamically from `run-linux-gcc` / `run-linux-clang` / `run-windows-msvc` / `run-macos` boolean inputs, with the first three defaulting to true. The consumer wiring at `dss-code-prime/.github/workflows/pipeline-pr.yml` was already inheriting all three default-enabled legs and they were already green on recent PRs (verified on PR runs for `feature/v2`):
 
-**Acceptance.**
-- PR review CI shows two green checks (Windows + Linux) on PRs.
-- README badge or status table in `compiler-implementation-plan.md` §0 reflects both.
+- `linux-gcc-release` — ubuntu-latest, GCC 13 / g++ 13, Release ✅
+- `linux-clang-asan` — ubuntu-latest, Clang 19 / clang++ 19, Debug + ASan + UBSan ✅
+- `windows-msvc-release` — windows-latest, MSVC 2022, Release ✅
 
-**Out of scope.** macOS (deferred to a later SH-2.x or to the targets-expand phase). ASAN/UBSAN/TSAN jobs (deferred — though if a Linux GCC job is trivially extensible to ASAN, opportunistically add it). MSVC on Windows (deferred — MinGW is the verified Windows toolchain).
+So the original "Linux GCC" deliverable was already met, and the original "out of scope" ASAN/UBSAN bullet was also already met (Linux Clang leg). The "MinGW vs MSVC on Windows" caveat in the original surface description is also now stale: CI standardised on MSVC; MinGW remains the local-dev convention for the project author. Tests are green on both toolchains because the code path is the same.
+
+**Diff in this PR.**
+- Flip `run-macos: true` on the consumer call site (`pipeline-pr.yml`). The reusable workflow handles the Homebrew-LLVM stdlib bootstrap so AppleClang's lagging C++23 stdlib coverage doesn't bite.
+- Refresh master-plan §0 status table to reflect the actual matrix that has been running. The "v1 tagged" label was rotted; it's `v2` now.
+
+**Acceptance — verification path.**
+- PR labeled `Run Pipes` triggers all four legs.
+- All four conclude `success` on `ci-check`. Linux/macOS will surface any Windows-isms (forward-slash path assumptions, line-ending sensitivity in test goldens, `.dll` vs `.so` / `.dylib` lookup paths). If macOS fails, the smallest fix-it pattern is: a `target_compile_definitions` shim or a conditional `set(CMAKE_INSTALL_RPATH …)`. Larger Apple-Clang stdlib gaps revert the `run-macos: true` opt-in and file a follow-up SH-2.x — the multi-OS coverage from the three default legs is what closes SH2's stated goal.
+
+**Out of scope.** Cross-compile docker toolchains (deferred — `docker/` is still empty). MSVC version pinning (handled by the runner image). Any change to the reusable workflow itself.
 
 ---
 
@@ -116,7 +121,7 @@ None of these block forward progress today. All three become substantially more 
 
 ## 3. Sequencing
 
-SH1, SH2, SH3 are independent — any order works. Recommended: **SH2 first** (gets us the cross-platform safety net before SH3 touches hot-path code), then **SH3** (real substrate change benefits from a working CI matrix), then **SH1** (the script will sweep the SH2/SH3 hashes into the landing log on first run, dogfooding itself).
+SH1, SH2, SH3 are independent — any order works. Original recommended order: **SH2 first** (cross-platform safety net), then **SH3**, then **SH1** (dogfoods itself). With SH2 collapsed to a no-op (matrix already shipped upstream), realised order is **SH2 → SH3 → SH1**.
 
 Per-PR cadence reuses the v2 discipline: implement → 5-agent review → comprehensive fix-all → cross-plan refresh → commit.
 

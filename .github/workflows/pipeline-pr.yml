@@ -23,6 +23,10 @@ jobs:
     uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pr.yml@v2
     with:
       cmake-version: "latest"
+      # Apple Clang lags upstream on C++23 stdlib; the reusable workflow
+      # installs Homebrew LLVM on macos-latest to recover C++23 coverage.
+      # See .plans/substrate-hardening-plan.md SH2.
+      run-macos: true
     secrets:
       DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
       DSS_BOTS_APP_PRIVATE_KEY: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}
