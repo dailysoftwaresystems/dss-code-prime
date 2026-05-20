@@ -33,7 +33,7 @@ Updated as work progresses. Detailed phase status lives in §7.
 | C++ standard | **23** |
 | Compilers verified | GCC 13.2 (MinGW-W64 ucrt) on Windows |
 | Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
-| Test suite | **486 cases across 25 ctest suites — 100% pass** (v1 T0–T12 baseline + v2 PR0–PR6 additions; see [`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §0 for per-PR test counts) |
+| Test suite | **509 cases across 26 ctest suites — 100% pass** (v1 T0–T12 baseline + v2 PR0–PR8 complete; see [`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §0 for per-PR test counts) |
 
 **Files now in `src/core/types/` (all on `core` static lib):**
 

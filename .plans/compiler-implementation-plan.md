@@ -4,7 +4,7 @@
 > Detailed designs for individual modules now live in dedicated sub-plans:
 >
 > - **[`tree-node-model-plan.md`](./tree-node-model-plan.md)** — the tree/node data structure, `GrammarSchema` config loader, `TreeBuilder`, diagnostics. **Supersedes** the relevant pieces of §4.2.2 (`ast.hpp`), §4.3 (config JSON shape), §4.4 (`source-factory/` internals), §4.5 (tokenizer trivia handling), and §4.6.2 (parser/AST construction) of this document. Where this document and the sub-plan disagree, **the sub-plan wins**; in-line `> AMENDED:` notes in the sections below redirect readers.
-> - **[`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md)** — additive extensions to the v1 schema for operator precedence, contextual keywords, scope-stack patterns, speculative `alt`, string interpolation, and custom string-literal variants. **🟡 In flight** — PR0 (c-subset + gap catalog), PR1 (operator precedence), PR2a (real `SchemaCursor` walker), PR2b (contextual keywords + `reservedWordPolicy`), PR3 (`scopeRequire`), PR4 (`TreeBuilder::Checkpoint` + speculative-alt loader plumbing), PR5 (`lexerModes` + `LexerModeStack` + `modeOp`), PR6 (`stringStyle` descriptor + `SchemaId`/`StringStyleId` strong ids) shipped + review-fixed. PR7 (tsql stress), PR8 (close-out) pending. Will unlock the eventual `languages-onboarding-plan.md`.
+> - **[`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md)** — additive extensions to the v1 schema for operator precedence, contextual keywords, scope-stack patterns, speculative `alt`, string interpolation, and custom string-literal variants. **✅ done.** PR0 (c-subset + gap catalog), PR1 (operator precedence), PR2a (real `SchemaCursor` walker), PR2b (contextual keywords + `reservedWordPolicy`), PR3 (`scopeRequire`), PR4 (`TreeBuilder::Checkpoint` + speculative-alt loader plumbing), PR5 (`lexerModes` + `LexerModeStack` + `modeOp`), PR6 (`stringStyle` + `SchemaId`/`StringStyleId` strong ids), PR7 (tsql-subset stress test proving v2 is empirically sufficient), PR8 (cross-plan close-out) all shipped + review-fixed. Unlocks the eventual `languages-onboarding-plan.md`.
 >
 > See §8 (Implementation Phases) for the current cross-plan dependency view.
 
@@ -14,8 +14,8 @@
 |---|---|
 | Build system (CMake 4.0 floor, C++23, FetchContent of nlohmann/json 3.12.0 + GoogleTest 1.17.0) | ✅ working |
 | Core types — full sub-plan T0–T12 (tree/node/diagnostics/schema + `TreeBuilder` + `TreeCursor` + `tree_visitor` + `NodeAttribute<T>` + typed views + E2E + CMake wireup + onboarding docs) | ✅ **complete** |
-| Schema expressiveness v2 (sub-plan PR0–PR6) — c-subset stress + operator precedence (`OperatorTable`) + real `SchemaCursor` walker + contextual keywords + `scopeRequire` + `TreeBuilder::Checkpoint` + `lexerModes`/`LexerModeStack`/`modeOp` + `stringStyle` descriptor | 🟡 **in flight** — PR0–PR6 shipped + review-fixed; PR7 (tsql stress), PR8 (cross-plan close-out) pending |
-| **Total ctest cases across both plans** | **486 cases across 25 suites, 100% pass** |
+| Schema expressiveness v2 (sub-plan PR0–PR8) — c-subset + operator precedence (`OperatorTable`) + real `SchemaCursor` walker + contextual keywords + `scopeRequire` + `TreeBuilder::Checkpoint` + `lexerModes`/`LexerModeStack`/`modeOp` + `stringStyle` descriptor + tsql-subset empirical stress + cross-plan close-out | ✅ **done** — all 9 PRs shipped + review-fixed |
+| **Total ctest cases across both plans** | **509 cases across 26 suites, 100% pass** |
 | `source-factory/` thin facade | ⏳ waiting on remaining core-types work |
 | `tokenizer/` + `analysis/{lexical,syntactic,semantic}/` | ⏳ pending |
 | `gen/intermediate/` + `gen/optimizer/` | ⏳ pending |
