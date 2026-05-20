@@ -6,7 +6,7 @@
 
 | | |
 |---|---|
-| Status        | 🔵 **in progress.** SH1, SH2, SH3 shipped. SH4 (v2 follow-ups: CI hygiene + adopted-mechanism gaps) lands next, then parent plan #5 (`tokenizer`) opens. |
+| Status        | ✅ **done.** SH1–SH4 all shipped. Parent plan #5 (`tokenizer`) is now unblocked. |
 | Predecessors  | ✅ v1 T0–T12 (`tree-node-model-plan.md`); ✅ v2 PR0–PR8 (`schema-expressiveness-v2-plan.md`). |
 | Successors    | Parent plan phase #5 (tokenizer). Cleanly verifying the schema against real tokens is what makes phase #7 (parser) tractable and what surfaces v3 schema gaps in time to act on them. |
 | Scope         | Originally bounded to SH1–SH3 (de-risking). SH4 extends the plan by **explicit user direction** to bundle three small v2-era follow-ups — close-out tightening rather than new substrate work. Anything beyond SH4 still becomes a separate sub-plan. |
@@ -18,7 +18,7 @@
 | SH2 | ✅ done | Multi-OS matrix already shipped by `DSS.DevOps@v2` (`cpp-app-pr.yml`): Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, all default-enabled and green on recent PRs. This PR opts the consumer wiring into the `run-macos` leg (AppleClang on Homebrew LLVM). <!-- LANDING-LOG-HASHES: SH2 -->`ab0800e`<!-- /LANDING-LOG-HASHES --> |
 | SH3 | ✅ done | `NodeId` grew an 8-byte `treeTag` field; `TreeBuilder` mints `TreeId` eagerly at ctor and stamps every emitted id; `NodeAttribute<T>::validateId_` + `Tree::node_` abort on tag mismatch with both ids in the message. 523 ctest cases / 26 suites still 100% pass; 14 new death tests added. <!-- LANDING-LOG-HASHES: SH3 -->`ac76408`<!-- /LANDING-LOG-HASHES --> |
 | SH1 | ✅ done | `tools/refresh_landing_log.py` regenerates hash anchors in landing-log tables from `git log`, gated by paired `<!-- LANDING-LOG-HASHES: <PR> -->...<!-- /LANDING-LOG-HASHES -->` markers and a `### PR landing log` section gate so prose references to the marker format aren't mistaken for live anchors. `tools/landing-log-config.json` maps each plan to a commit-subject regex. `--check` is the CI gate (exits non-zero on drift); `--write` applies the rewrite. 20 stdlib-only unittests cover render shapes, idempotency, section gating, missing-close-marker insertion, cross-line containment. <!-- LANDING-LOG-HASHES: SH1 -->`05d5c80`<!-- /LANDING-LOG-HASHES --> |
-| SH4 | ⏳ pending | v2 follow-ups: (a) wire `tools/refresh_landing_log.py --check` into PR CI as a separate job (SH1's named "out of scope" follow-up); (b) adopt `scopeRequire` in `c-subset.lang.json` for `case`/`default` inside `switch` (v2-gap-catalog row 11); (c) multi-level AltChoice nesting stress test pinning `routeToRuleLeaf` past two levels (v2-gap-catalog §7 row 21). <!-- LANDING-LOG-HASHES: SH4 --><!-- /LANDING-LOG-HASHES --> |
+| SH4 | ✅ done | v2 follow-ups: (a) `landing-log-check` CI job in `pipeline-pr.yml` runs `python tools/refresh_landing_log.py --check` (SH1's "out of scope" follow-up); (b) c-subset gains `switch`/`case`/`default`/`break` via shape-based positioning — design call deviates from the catalog's `scopeRequire` guess (`Block`-not-`Switch` is innermost in a switch body); v2-gap-catalog row 11 updated; (c) 7 new tests in `test_schema_cursor.cpp` pin `routeToRuleLeaf` through 3-level and 4-level nested AltChoice (`alt → optional → alt [→ optional] → RuleLeaf`). 1 new c-subset test (`SwitchStmtParsesAllArmKinds`) pins the case+default+break tree shape via full pretty-print equality. <!-- LANDING-LOG-HASHES: SH4 --><!-- /LANDING-LOG-HASHES --> |
 
 ---
 
@@ -155,19 +155,27 @@ SH1's named "out of scope" follow-up. SH1 shipped the tool; SH4a runs it in CI.
 
 **Out of scope.** Wiring `--check` into the DSS.DevOps reusable workflow itself (cross-repo; the consumer wiring is the cleanest seam).
 
-#### SH4b — Adopt `scopeRequire` for `switch`/`case` in `c-subset.lang.json`
+#### SH4b — Adopt `switch`/`case` in `c-subset.lang.json` (shape-based, NOT `scopeRequire`)
 
-Closes v2-gap-catalog row 11. PR3 shipped the mechanism (`scopeRequire: { topMustBe: "Switch" }`); c-subset never adopted it because the `switch` statement was omitted from PR0's conservative cut.
+Closes v2-gap-catalog row 11. PR3 shipped the `scopeRequire` mechanism; the catalog row guessed at how c-subset would adopt it ("`scopeRequire: { topMustBe: Switch }`"). On investigation that guess doesn't work cleanly with the current scope mechanism: scopes open via per-token `opensScope` (no token-sequence opens), and inside a switch body `Block` is the innermost scope, not `Switch`, so `topMustBe: "Switch"` would never match. Multiple workaround designs (multi-meaning `{`, `SwitchSig` shim scope) all leak scope-stack state across `}` and don't naturally close.
+
+The cleaner fix is **shape-based positioning**: declare a dedicated `switchStmt` shape, a `caseLabel` shape, and a `switchBody` that's `repeat( alt[ caseLabel, statement ] )`. The schema's existing alt/sequence/repeat machinery is enough; `case` and `default` are valid only at positions where `caseLabel` is expected by the cursor. The `scopeRequire` mechanism is already exercised by tsql-subset's stress test and the loader-level scopeRequire tests — adding a contrived c-subset adoption would not add coverage.
 
 **Surface.**
-- `src/source-config/languages/c-subset.lang.json`: add `SwitchKeyword`, `CaseKeyword`, `DefaultKeyword`, `ColonOp` if not present; add `shapes/switchStmt`; declare a `Switch` scope kind via `opensScope`/`closesScope` on `switch (` and the matching `)` / `{` / `}` (modeled on how `block` opens `Block`); mark `case`/`default` token meanings with `scopeRequire: { topMustBe: "Switch" }`.
-- `tests/core/test_c_subset.cpp`: at least two new tests:
-  - `SwitchStmtParsesHappyPath` — full switch with two case arms and a default, asserts via pretty-print equality.
-  - `CaseOutsideSwitchIsRejected` — `case 1: foo;` at top-level produces a diagnostic (the exact code is whatever `scopeRequire` emits today — likely `P_UnexpectedToken` or a tag-specific code; pin it in the test).
+- `src/source-config/languages/c-subset.lang.json`:
+  - Add to `keywords`: `switch`, `case`, `default`, `break`.
+  - Add to `tokens`: `":"` as `Colon`.
+  - Add shapes: `switchStmt`, `switchBody`, `caseLabel`, `breakStmt`.
+  - Add `switchStmt` and `breakStmt` to the `statement` alt.
+- `tests/core/test_c_subset.cpp`: one happy-path test (`SwitchStmtParsesAllArmKinds`) driving a switch with a case arm, a default arm, and a `break` statement; asserts via full pretty-print equality.
+- Update `.plans/v2-gap-catalog.md` row 11 to record the design call (shape-based, not `scopeRequire`).
 
-**Acceptance.** End-to-end test pins both happy path AND the abort path; existing c-subset tests stay green.
+**Acceptance.** Happy-path tree shape matches the inline expected literal; existing c-subset and toy tests stay green; the loader still loads c-subset cleanly under `loadShipped`.
 
-**Out of scope.** Statement-body shape inside `case` (probably `statement*` until the next case-or-`}` — mirrors C's case-fallthrough semantics). Full `break` flow analysis (semantic-pass concern).
+**Out of scope.**
+- `case` fall-through semantics (no `break` after a case arm). The schema captures the structural shape — flow analysis is semantic-pass work.
+- A "case at top level should be rejected" negative test. Without a tokenizer + driver-level shape enforcement, manually-driven `pushToken` calls don't naturally surface this; the parser phase is the right place to add it.
+- Range-case (GCC extension `case 1 ... 5:`) and label statements (`label:` followed by a statement). Out of plain-C scope for c-subset; deferred.
 
 #### SH4c — Multi-level AltChoice nesting stress test
 

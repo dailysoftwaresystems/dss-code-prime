@@ -385,3 +385,129 @@ TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
         "      tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
+
+// SH4b: end-to-end parse of a switch statement with a `case` arm + a
+// `default` arm + a `break`. Closes v2-gap-catalog row 11. The design
+// is shape-based positioning (`caseLabel` shape inside `switchBodyItem`),
+// NOT `scopeRequire` — the catalog's original guess at scopeRequire-based
+// adoption doesn't fit C's scope mechanics (Block is innermost inside a
+// switch body, not Switch). See `.plans/substrate-hardening-plan.md` SH4b
+// for the design call.
+TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
+    auto h = loadShippedCSubset("switch (x) { case 1: break; default: break; }");
+    ASSERT_NE(h.schema, nullptr);
+    const auto src = h.src->text();
+    const auto firstParen   = src.find("(");
+    const auto firstParenC  = src.find(")");
+    const auto bodyOpen     = src.find("{");
+    const auto bodyClose    = src.find("}");
+    const auto firstBreak   = src.find("break");
+    const auto secondBreak  = src.find("break", firstBreak + 1);
+    const auto firstSemi    = src.find(";");
+    const auto secondSemi   = src.find(";", firstSemi + 1);
+    const auto firstColon   = src.find(":");
+    const auto secondColon  = src.find(":", firstColon + 1);
+
+    TreeBuilder b{h.src, h.schema};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        auto stmt = b.open(h.schema->rules().find("statement"));
+        auto sw   = b.open(h.schema->rules().find("switchStmt"));
+        b.pushToken(at(*h.src, "switch", CoreTokenKind::Word));
+        b.pushToken(at(*h.src, "(", firstParen));
+        {
+            auto expr = b.open(h.schema->rules().find("expression"));
+            auto opr  = b.open(h.schema->rules().find("operand"));
+            b.pushToken(at(*h.src, "x", CoreTokenKind::Word));
+        }
+        b.pushToken(at(*h.src, ")", firstParenC));
+        b.pushToken(at(*h.src, "{", bodyOpen));
+        // ── case arm
+        {
+            auto item = b.open(h.schema->rules().find("switchBodyItem"));
+            auto lbl  = b.open(h.schema->rules().find("caseLabel"));
+            b.pushToken(at(*h.src, "case", CoreTokenKind::Word));
+            {
+                auto expr = b.open(h.schema->rules().find("expression"));
+                auto opr  = b.open(h.schema->rules().find("operand"));
+                b.pushToken(at(*h.src, "1", CoreTokenKind::Word));
+            }
+            b.pushToken(at(*h.src, ":", firstColon));
+        }
+        // ── break inside the case arm (parses as a sibling switchBodyItem
+        //    statement, not a child of caseLabel — C's case fall-through
+        //    structure is "label then statements", not "label containing
+        //    statements").
+        {
+            auto item = b.open(h.schema->rules().find("switchBodyItem"));
+            auto inner = b.open(h.schema->rules().find("statement"));
+            auto br    = b.open(h.schema->rules().find("breakStmt"));
+            b.pushToken(at(*h.src, "break", firstBreak, CoreTokenKind::Word));
+            b.pushToken(at(*h.src, ";", firstSemi));
+        }
+        // ── default arm
+        {
+            auto item = b.open(h.schema->rules().find("switchBodyItem"));
+            auto lbl  = b.open(h.schema->rules().find("caseLabel"));
+            b.pushToken(at(*h.src, "default", CoreTokenKind::Word));
+            b.pushToken(at(*h.src, ":", secondColon));
+        }
+        {
+            auto item = b.open(h.schema->rules().find("switchBodyItem"));
+            auto inner = b.open(h.schema->rules().find("statement"));
+            auto br    = b.open(h.schema->rules().find("breakStmt"));
+            b.pushToken(at(*h.src, "break", secondBreak, CoreTokenKind::Word));
+            b.pushToken(at(*h.src, ";", secondSemi));
+        }
+        b.pushToken(at(*h.src, "}", bodyClose));
+    }
+    Tree t = std::move(b).finish();
+
+    // The test opens `statement` directly under `root` (bypassing the
+    // topLevel → funcTail path), so the cursor desyncs once on the first
+    // off-schema open — same one-shot info diagnostic as
+    // ExpressionWithMixedOpsIsLeftFolded above. No errors.
+    auto const& diags = t.diagnostics().all();
+    EXPECT_EQ(diags.size(), 1u);
+    if (!diags.empty()) {
+        EXPECT_EQ(diags.front().code, DiagnosticCode::P_SchemaCursorDesync);
+        EXPECT_EQ(diags.front().severity, DiagnosticSeverity::Info);
+    }
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_FALSE(hasError(t.flags(t.root())));
+
+    const std::string_view expected =
+        "rule:root\n"
+        "  rule:statement\n"
+        "    rule:switchStmt\n"
+        "      tok:\"switch\"\n"
+        "      tok:\"(\"\n"
+        "      rule:expression\n"
+        "        rule:operand\n"
+        "          tok:\"x\"\n"
+        "      tok:\")\"\n"
+        "      tok:\"{\"\n"
+        "      rule:switchBodyItem\n"
+        "        rule:caseLabel\n"
+        "          tok:\"case\"\n"
+        "          rule:expression\n"
+        "            rule:operand\n"
+        "              tok:\"1\"\n"
+        "          tok:\":\"\n"
+        "      rule:switchBodyItem\n"
+        "        rule:statement\n"
+        "          rule:breakStmt\n"
+        "            tok:\"break\"\n"
+        "            tok:\";\"\n"
+        "      rule:switchBodyItem\n"
+        "        rule:caseLabel\n"
+        "          tok:\"default\"\n"
+        "          tok:\":\"\n"
+        "      rule:switchBodyItem\n"
+        "        rule:statement\n"
+        "          rule:breakStmt\n"
+        "            tok:\"break\"\n"
+        "            tok:\";\"\n"
+        "      tok:\"}\"\n";
+    EXPECT_EQ(prettyPrint(t), expected);
+}
