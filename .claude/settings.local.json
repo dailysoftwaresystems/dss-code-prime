@@ -85,7 +85,8 @@
       "Bash(cmake --build . --clean-first)",
       "Bash(cmake --build .)",
       "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_string_style.exe\" 2>&1 | Select-Object -Last 8)",
-      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_string_style.exe\" 2>&1 | Select-String \"PASSED\" | Select-Object -Last 1)"
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_string_style.exe\" 2>&1 | Select-String \"PASSED\" | Select-Object -Last 1)",
+      "PowerShell($env:PATH = \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss;$env:PATH\"; & \"C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss\\\\dss_core_test_tsql_subset.exe\" 2>&1 | Select-Object -Last 40)"
     ]
   }
 }
