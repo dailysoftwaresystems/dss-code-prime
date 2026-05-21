@@ -899,6 +899,34 @@ void computeNullableTails(GrammarSchemaData& data) {
     }
 }
 
+// Reject any rule shape that references a SchemaTokenId declared as a
+// lexer mode's `defaultToken.kind`. Body-default kinds are off-grammar
+// by construction (see `TreeBuilder::bodyDefaultTokenKinds_`): the
+// cursor-advance gate silently skips them, so a shape reference would
+// never match. Surface the bug at load time instead.
+void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll) {
+    std::unordered_set<SchemaTokenId> bodyKinds;
+    for (auto const& mode : data.lexerModes) {
+        if (mode.defaultToken) bodyKinds.insert(mode.defaultToken->kind);
+    }
+    if (bodyKinds.empty()) return;
+
+    for (auto const& [ruleIdV, rule] : data.compiledRules) {
+        const auto ruleName = data.rules->name(RuleId{ruleIdV});
+        for (auto const& p : rule.positions) {
+            if (p.slotKind() != SlotKind::TokenLeaf) continue;
+            if (!bodyKinds.contains(p.tokenId())) continue;
+            coll.emit(DiagnosticCode::C_BodyDefaultKindInShape,
+                      std::format("/shapes/{}", ruleName),
+                      std::format("token '{}' is declared as a lexer mode's "
+                                  "defaultToken.kind and is therefore off-"
+                                  "grammar — referencing it from a shape "
+                                  "would silently never match",
+                                  data.schemaTokens->name(p.tokenId())));
+        }
+    }
+}
+
 } // anonymous namespace
 
 LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
@@ -1718,6 +1746,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 buildPositionTables        (data, doc.at("shapes"), coll);
                 detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
                 computeNullableTails       (data);
+                validateBodyDefaultKindsOffGrammar(data, coll);
             }
         }
     }

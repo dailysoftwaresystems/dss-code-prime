@@ -1157,3 +1157,121 @@ TEST(Tokenizer, TokenFlags_PropagateToBuilderLeafFlags) {
         << "Token.flags did not OR-merge into the leaf's effective flags — "
         << "CR1's effectiveFlags wiring is regressed";
 }
+
+// ── identifier-branch probe (id-start byte vs longer global lexeme) ─────
+
+namespace {
+
+// Schema where `N` is a 1-byte global lexeme AND `N'` is a 2-byte
+// global lexeme. The identifier branch must prefer the longer global
+// hit when it strictly beats the id-run, and prefer the id-run when
+// the global hit is shorter or equal.
+constexpr std::string_view kIdProbeSchema = R"JSON({
+  "dssSchemaVersion": 1,
+  "language": { "name": "IdProbe", "version": "0.1.0" },
+  "tokens": {
+    "N":  [{ "kind": "ShortN" }],
+    "N'": [{ "kind": "UniStringStart" }],
+    "'":  [{ "kind": "Apostrophe" }],
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    ";":  [{ "kind": "EndCommand" }]
+  },
+  "keywords": [
+    { "word": "if", "kind": "IfKeyword" }
+  ],
+  "shapes": { "root": { "sequence": [{ "repeat": "Identifier" }] } }
+})JSON";
+
+} // namespace
+
+// `N'` strictly beats the 1-byte id-run, so the global hit wins. The
+// emitted token must cover both bytes with UniStringStart.
+TEST(Tokenizer, IdStartProbe_LongerGlobalLexemeBeatsIdRun) {
+    auto loaded = GrammarSchema::loadFromText(kIdProbeSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("N'", "<idprobe>");
+
+    Tokenizer tk{src, schema};
+    auto res = std::move(tk).tokenize();
+    ASSERT_FALSE(res.stream.isAtEnd());
+    const Token first = res.stream.advance();
+
+    EXPECT_EQ(first.span.length(), 2u);
+    EXPECT_EQ(first.schemaKind.v,
+              schema->schemaTokens().find("UniStringStart").v);
+}
+
+// `Nxyz` extends past the global `N` lexeme, so the id-run (4 bytes)
+// strictly beats the 1-byte global hit. Token must be a single
+// Identifier covering `Nxyz`, not a ShortN + identifier split. Pinning
+// this catches a regression that flipped `>` to `>=` (which would let
+// the global hit win on equal length and split the identifier).
+TEST(Tokenizer, IdStartProbe_LongerIdRunBeatsShorterGlobalLexeme) {
+    auto loaded = GrammarSchema::loadFromText(kIdProbeSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("Nxyz", "<idprobe>");
+
+    Tokenizer tk{src, schema};
+    auto res = std::move(tk).tokenize();
+    ASSERT_FALSE(res.stream.isAtEnd());
+    const Token first = res.stream.advance();
+
+    EXPECT_EQ(first.span.length(), 4u);
+    EXPECT_EQ(first.coreKind, CoreTokenKind::Word);
+    // `Nxyz` isn't a keyword; tokenizer leaves schemaKind invalid for
+    // the builder's Identifier fallback to take over.
+    EXPECT_FALSE(first.schemaKind.valid());
+    // No subsequent ShortN — the whole 4-byte run is one token.
+    const Token next = res.stream.advance();
+    EXPECT_EQ(next.coreKind, CoreTokenKind::Eof);
+}
+
+// Equal-length case: global lexeme `N` is 1 byte; id-run for `N` alone
+// is also 1 byte. The strict `>` gate keeps the keyword/global hit
+// from stealing — but only when the next byte isn't id-continue. With
+// only `N` as input, both paths produce a 1-byte token; the global
+// hit's `ShortN` wins because it's a real schema entry.
+TEST(Tokenizer, IdStartProbe_EqualLengthFavorsIdRun) {
+    auto loaded = GrammarSchema::loadFromText(kIdProbeSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("N", "<idprobe>");
+
+    Tokenizer tk{src, schema};
+    auto res = std::move(tk).tokenize();
+    ASSERT_FALSE(res.stream.isAtEnd());
+    const Token first = res.stream.advance();
+
+    EXPECT_EQ(first.span.length(), 1u);
+    // Equal-length: id-run fall-through path runs longestMatch over
+    // the lexeme `N` and finds ShortN — the identifier branch's
+    // `fullMatch` gate kicks in and stamps the keyword/short-lexeme
+    // schemaKind on the Word token.
+    EXPECT_EQ(first.coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(first.schemaKind.v,
+              schema->schemaTokens().find("ShortN").v);
+}
+
+// `if_foo` must stay a single identifier despite `if` being a keyword.
+// The id-run length (6) strictly beats `if`'s 2-byte global hit, so
+// the longer-wins gate sends the lexer down the id-run path. Pinning
+// this catches a regression where the prefer-longer branch flipped
+// the comparison or dropped the strict ordering.
+TEST(Tokenizer, IdStartProbe_KeywordPrefixDoesNotSplitIdentifier) {
+    auto loaded = GrammarSchema::loadFromText(kIdProbeSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("if_foo", "<idprobe>");
+
+    Tokenizer tk{src, schema};
+    auto res = std::move(tk).tokenize();
+    ASSERT_FALSE(res.stream.isAtEnd());
+    const Token first = res.stream.advance();
+
+    EXPECT_EQ(first.span.length(), 6u);
+    EXPECT_EQ(first.coreKind, CoreTokenKind::Word);
+    EXPECT_FALSE(first.schemaKind.valid())
+        << "if_foo must NOT resolve to IfKeyword — only the exact lexeme `if` should";
+}

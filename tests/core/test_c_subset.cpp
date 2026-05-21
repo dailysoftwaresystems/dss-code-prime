@@ -17,16 +17,12 @@
 #include <string_view>
 
 // End-to-end tests driving the shipped c-subset.lang.json through the
-// live tokenize → resolve → build pipeline (TZ3). Pre-TZ3 these tests
-// hand-fabricated Token objects via `at()` substring-lookup helpers;
-// the tokenizer now produces a real TokenStream from the source bytes
-// and the tests consume it via `h.stream.advance()`.
-//
-// These tests pin structural shapes, not parser semantics. Operator
-// precedence is NOT modeled by the schema today — see
-// `ExpressionWithMixedOpsIsLeftFolded` for the empirical record of that
-// limitation. When precedence lands in the schema, that test's expected
-// literal flips from a flat sequence to a nested grouping.
+// live tokenize → resolve → build pipeline. These pin structural
+// shapes, not parser semantics. Operator precedence is NOT modeled by
+// the schema today — see `ExpressionWithMixedOpsIsLeftFolded` for the
+// empirical record of that limitation. When precedence lands in the
+// schema, that test's expected literal flips from a flat sequence to
+// a nested grouping.
 
 using namespace dss;
 using dss::tests::drainWhitespace;
@@ -50,22 +46,22 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
-            b.pushToken(h.stream.advance());   // int
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());       // x
+        b.pushToken(h.stream.advance());
         {
             auto tail   = b.open(h.schema->rules().find("topLevelTail"));
             auto vdTail = b.open(h.schema->rules().find("varDeclTail"));
             drainWhitespace(b, h.stream);
-            b.pushToken(h.stream.advance());   // =
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance());   // 5
+                b.pushToken(h.stream.advance());
             }
-            b.pushToken(h.stream.advance());       // ;
+            b.pushToken(h.stream.advance());
         }
     }
     Tree t = std::move(b).finish();
@@ -109,63 +105,63 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
-            b.pushToken(h.stream.advance());   // int
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());       // main
+        b.pushToken(h.stream.advance());
         {
             auto tail = b.open(h.schema->rules().find("topLevelTail"));
             auto fn   = b.open(h.schema->rules().find("funcTail"));
-            b.pushToken(h.stream.advance());   // (
+            b.pushToken(h.stream.advance());
             {
                 auto pl = b.open(h.schema->rules().find("paramList"));
                 auto p  = b.open(h.schema->rules().find("param"));
                 auto ty = b.open(h.schema->rules().find("typeRef"));
                 auto tb = b.open(h.schema->rules().find("typeBase"));
-                b.pushToken(h.stream.advance());   // void
+                b.pushToken(h.stream.advance());
             }
-            b.pushToken(h.stream.advance());       // )
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             {
                 auto blk = b.open(h.schema->rules().find("block"));
-                b.pushToken(h.stream.advance());   // {
+                b.pushToken(h.stream.advance());
                 drainWhitespace(b, h.stream);
                 {
                     auto stmt = b.open(h.schema->rules().find("statement"));
                     auto ifs  = b.open(h.schema->rules().find("ifStmt"));
-                    b.pushToken(h.stream.advance());   // if
+                    b.pushToken(h.stream.advance());
                     drainWhitespace(b, h.stream);
-                    b.pushToken(h.stream.advance());   // (
+                    b.pushToken(h.stream.advance());
                     {
                         auto expr = b.open(h.schema->rules().find("expression"));
                         auto opr  = b.open(h.schema->rules().find("operand"));
-                        b.pushToken(h.stream.advance());   // x
+                        b.pushToken(h.stream.advance());
                     }
-                    b.pushToken(h.stream.advance());       // )
+                    b.pushToken(h.stream.advance());
                     drainWhitespace(b, h.stream);
                     {
                         auto innerStmt = b.open(h.schema->rules().find("statement"));
                         auto innerBlk  = b.open(h.schema->rules().find("block"));
-                        b.pushToken(h.stream.advance());   // {
+                        b.pushToken(h.stream.advance());
                         drainWhitespace(b, h.stream);
                         {
                             auto retStmt = b.open(h.schema->rules().find("statement"));
                             auto rs      = b.open(h.schema->rules().find("returnStmt"));
-                            b.pushToken(h.stream.advance());   // return
+                            b.pushToken(h.stream.advance());
                             drainWhitespace(b, h.stream);
                             {
                                 auto retExpr = b.open(h.schema->rules().find("expression"));
                                 auto retOpr  = b.open(h.schema->rules().find("operand"));
-                                b.pushToken(h.stream.advance());   // x
+                                b.pushToken(h.stream.advance());
                             }
-                            b.pushToken(h.stream.advance());       // ;
+                            b.pushToken(h.stream.advance());
                         }
                         drainWhitespace(b, h.stream);
-                        b.pushToken(h.stream.advance());           // }
+                        b.pushToken(h.stream.advance());
                     }
                 }
                 drainWhitespace(b, h.stream);
-                b.pushToken(h.stream.advance());                   // }
+                b.pushToken(h.stream.advance());
             }
         }
     }
@@ -281,30 +277,30 @@ TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
             auto expr = b.open(h.schema->rules().find("expression"));
             {
                 auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance());   // a
+                b.pushToken(h.stream.advance());
             }
             drainWhitespace(b, h.stream);
             {
                 auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(h.stream.advance());   // +
+                b.pushToken(h.stream.advance());
             }
             drainWhitespace(b, h.stream);
             {
                 auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance());   // b
+                b.pushToken(h.stream.advance());
             }
             drainWhitespace(b, h.stream);
             {
                 auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(h.stream.advance());   // *
+                b.pushToken(h.stream.advance());
             }
             drainWhitespace(b, h.stream);
             {
                 auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance());   // c
+                b.pushToken(h.stream.advance());
             }
         }
-        b.pushToken(h.stream.advance());           // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
 
@@ -359,30 +355,30 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sw   = b.open(h.schema->rules().find("switchStmt"));
-        b.pushToken(h.stream.advance());           // switch
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());           // (
+        b.pushToken(h.stream.advance());
         {
             auto expr = b.open(h.schema->rules().find("expression"));
             auto opr  = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());       // x
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());           // )
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());           // {
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         // ── case arm
         {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto lbl  = b.open(h.schema->rules().find("caseLabel"));
-            b.pushToken(h.stream.advance());       // case
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance());   // 1
+                b.pushToken(h.stream.advance());
             }
-            b.pushToken(h.stream.advance());       // :
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
         // ── break inside the case arm (parses as a sibling switchBodyItem
@@ -393,27 +389,27 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto inner = b.open(h.schema->rules().find("statement"));
             auto br    = b.open(h.schema->rules().find("breakStmt"));
-            b.pushToken(h.stream.advance());       // break
-            b.pushToken(h.stream.advance());       // ;
+            b.pushToken(h.stream.advance());
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
         // ── default arm
         {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto lbl  = b.open(h.schema->rules().find("caseLabel"));
-            b.pushToken(h.stream.advance());       // default
-            b.pushToken(h.stream.advance());       // :
+            b.pushToken(h.stream.advance());
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
         {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto inner = b.open(h.schema->rules().find("statement"));
             auto br    = b.open(h.schema->rules().find("breakStmt"));
-            b.pushToken(h.stream.advance());       // break
-            b.pushToken(h.stream.advance());       // ;
+            b.pushToken(h.stream.advance());
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());           // }
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
 

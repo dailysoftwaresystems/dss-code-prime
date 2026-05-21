@@ -151,16 +151,16 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // consult, and contextual-keyword resolution stays strict.
     cursor_ = SchemaCursor{};
 
-    // Snapshot the schema's body-mode defaultToken kinds. These appear
-    // only inside string / comment / bracket-id bodies (never in any
-    // shape) — advancing the schema cursor with them always desyncs.
-    // Pre-compute the lookup set so the pushToken cursor-advance gate
-    // can skip them in O(1).
+    // Snapshot body-mode defaultToken kinds + the error sentinel. Both
+    // are needed on the per-token resolveMeaning hot path; the set is
+    // a function of the (immutable) schema, so the ctor is the right
+    // place to compute it once.
     for (auto const& mode : schema_->lexerModes()) {
         if (mode.defaultToken) {
-            bodyDefaultTokenKinds_.insert(mode.defaultToken->kind.v);
+            bodyDefaultTokenKinds_.insert(mode.defaultToken->kind);
         }
     }
+    errorKind_ = schema_->schemaTokens().find("Error");
 }
 
 NodeId TreeBuilder::emit_(detail::Node n) {
@@ -467,25 +467,63 @@ struct ResolvedMeaning {
     return true;
 }
 
+// Built-in literal kinds the tokenizer is allowed to pre-resolve. These
+// names are predeclared at schema load (see kBuiltinTokenKindNames in
+// grammar_schema_json.cpp) so the interner always has them. The list is
+// the synthesis-allowlist's "non-body-mode" half — body kinds come from
+// the caller's `bodyKinds` set.
+[[nodiscard]] bool isBuiltinLiteralKind(GrammarSchema const& schema,
+                                        SchemaTokenId id) noexcept {
+    static constexpr std::string_view kLiterals[] = {
+        "IntLiteral", "FloatLiteral", "StringLiteral",
+        "CharLiteral", "BoolLiteral", "NullLiteral",
+    };
+    const auto name = schema.schemaTokens().name(id);
+    for (auto lit : kLiterals) {
+        if (name == lit) return true;
+    }
+    return false;
+}
+
+// Build the ResolvedMeaning for a synthesis path (paths A and B in
+// resolveMeaning). Asserts the synthesized kind is either a body-mode
+// defaultToken kind or a known literal — the only cases the tokenizer
+// is licensed to pre-resolve without a per-lexeme schema entry.
+[[nodiscard]] ResolvedMeaning makeSyntheticMeaning(
+    GrammarSchema const& schema,
+    SchemaTokenId preResolved,
+    std::unordered_set<SchemaTokenId> const& bodyKinds) noexcept {
+    assert((bodyKinds.contains(preResolved)
+            || isBuiltinLiteralKind(schema, preResolved))
+           && "resolveMeaning synthesizing for a kind that is neither a "
+              "body-mode defaultToken nor a built-in literal — likely a "
+              "tokenizer/schema drift bug");
+    (void)schema; // referenced only in the assertion above
+    ResolvedMeaning out;
+    LexemeMeaning synthetic{};
+    synthetic.id   = preResolved;
+    out.meaning    = synthetic;
+    out.matchCount = 1;
+    return out;
+}
+
 ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
                                std::string_view lexeme,
                                std::span<ScopeKind const> scopes,
+                               std::unordered_set<SchemaTokenId> const& bodyKinds,
+                               SchemaTokenId errorKind,
                                SchemaTokenId preResolved = InvalidSchemaToken) {
     ResolvedMeaning out;
     const auto candidates = schema.lookupLexeme(lexeme);
 
-    // Pre-resolved built-in kind when the per-lexeme table has no
-    // entry at all (numeric/string literals, body-mode defaultToken
-    // emissions). Handled before the empty-candidates early return so
-    // the tokenizer's resolution survives. Excludes Error — recovery
-    // must still go through P_UnknownToken.
+    // Path A: tokenizer pre-resolved a built-in/body kind and the per-
+    // lexeme table has nothing for this lexeme at all (numeric literals
+    // like `5`, body-mode chars). Trust the tokenizer; the slow path
+    // has no candidate to consider. Error stays excluded so recovery
+    // continues through P_UnknownToken.
     if (candidates.empty() && preResolved.valid()) {
-        const auto errorKind = schema.schemaTokens().find("Error");
-        if (preResolved.v != errorKind.v) {
-            LexemeMeaning synthetic{};
-            synthetic.id   = preResolved;
-            out.meaning    = synthetic;
-            out.matchCount = 1;
+        if (preResolved != errorKind) {
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds);
         }
         return out;
     }
@@ -538,38 +576,20 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
             }
             return out;
         }
-        // preResolved isn't in `candidates` at all — the tokenizer pre-
-        // resolved a built-in kind that the schema declares globally
-        // (literals like IntLiteral, body-mode defaultToken kinds like
-        // StringChar emitted while the next byte at the close ALSO
-        // matches a global lexeme like `'`). Trust the tokenizer's
-        // pre-resolution unconditionally; the schema's per-lexeme
-        // table never had this kind so the slow path would pick a
-        // different meaning. The tokenizer is authoritative for body-
-        // mode and built-in kinds.
-        //
-        // Exclude `Error` — its semantic is "tokenizer couldn't
-        // resolve this byte", and the builder must fall through to
-        // the P_UnknownToken / Error-leaf recovery path.
-        //
-        // Distinct from the scope-rejected case: if preResolved IS in
-        // candidates but scope-rejected, fall through so a sibling
-        // candidate that IS scope-allowed can win (toy `<` in Generic).
+        // Path B: preResolved is a built-in/body kind that the schema's
+        // per-lexeme table doesn't list at all. Trust the tokenizer —
+        // the slow path would pick a different meaning. Excludes Error
+        // (recovery via P_UnknownToken). Distinct from the scope-
+        // rejected case below: if preResolved IS in candidates but
+        // scope-rejected, fall through so a sibling candidate that IS
+        // scope-allowed can win (toy `<` outside-vs-inside-Generic).
         bool preResolvedInCandidates = false;
         for (auto const& m : candidates) {
             if (m.id == preResolved) { preResolvedInCandidates = true; break; }
         }
-        const auto errorKind = schema.schemaTokens().find("Error");
-        if (!preResolvedInCandidates && preResolved.v != errorKind.v) {
-            LexemeMeaning synthetic{};
-            synthetic.id = preResolved;
-            out.meaning   = synthetic;
-            out.matchCount = 1;
-            return out;
+        if (!preResolvedInCandidates && preResolved != errorKind) {
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds);
         }
-        // preResolved IS in candidates but scope-rejected — fall through
-        // to the full scan so scope-driven multi-meaning resolution
-        // still works (toy `<` outside-vs-inside-Generic).
     }
 
     // Candidates arrive pre-sorted by priority (lowest first, stable on
@@ -628,15 +648,12 @@ void TreeBuilder::pushToken(Token const& tok) {
     //  3. No match at all → Error leaf + P_UnknownToken.
     ResolvedMeaning resolved = resolveMeaning(
         *schema_, lexeme, std::span<ScopeKind const>{scopes_},
-        tok.schemaKind);
+        bodyDefaultTokenKinds_, errorKind_, tok.schemaKind);
 
     if (resolved.matchCount == 0 && tok.coreKind == CoreTokenKind::Word) {
         // Fallback: alphanumeric word that isn't a keyword → Identifier.
-        // "Identifier" is pre-interned at schema load time, so a const
-        // lookup against the frozen interner always succeeds. The
-        // built-in-kind fallback (e.g. IntLiteral whose lexeme isn't in
-        // the table) is handled in `resolveMeaning`'s fast-path B —
-        // matchCount==0 here means the lexeme wasn't even pre-resolved.
+        // Identifier is pre-interned at load (kBuiltinTokenKindNames),
+        // so the lookup against the frozen interner always succeeds.
         LexemeMeaning ident{};
         ident.id = schema_->schemaTokens().find("Identifier");
         resolved.meaning   = ident;
@@ -781,7 +798,7 @@ void TreeBuilder::pushToken(Token const& tok) {
     // valid → invalid transition surfaces one P_SchemaCursorDesync.
     const bool isOffGrammar =
         isEmptySpace(effectiveFlags)
-        || bodyDefaultTokenKinds_.contains(resolved.meaning.id.v);
+        || bodyDefaultTokenKinds_.contains(resolved.meaning.id);
     if (!isOffGrammar) {
         const bool wasValid = cursor_.valid();
         cursor_ = schema_->advance(cursor_, resolved.meaning.id);

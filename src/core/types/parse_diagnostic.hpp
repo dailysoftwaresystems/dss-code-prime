@@ -82,6 +82,11 @@ enum class DiagnosticCode : std::uint16_t {
     C_RedundantField              = 0xC026,
     C_UnknownLexerMode            = 0xC027,
     C_InvalidStringStyle          = 0xC028,
+    // A `lexerModes.<m>.defaultToken.kind` was also referenced from a
+    // `shapes/*` rule. The builder treats body-default kinds as off-
+    // grammar (cursor-skip), so a shape reference would silently never
+    // match — surface it at load time instead.
+    C_BodyDefaultKindInShape      = 0xC029,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

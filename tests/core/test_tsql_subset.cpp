@@ -19,10 +19,7 @@
 
 // End-to-end pin for the shipped tsql-subset.lang.json — three lexer
 // modes (single-string, unicode-string, bracket-id), doubled-delimiter
-// escapes, contextual reserved-word policy, qualified names. TZ3 flipped
-// every tree-building test from hand-tokenization to live tokenization;
-// the schema-only inspection tests still load via the same harness with
-// an empty source.
+// escapes, contextual reserved-word policy, qualified names.
 
 using namespace dss;
 using dss::tests::drainWhitespace;
@@ -32,14 +29,7 @@ using dss::tests::tokenizeShipped;
 
 namespace {
 
-// Tokenize body-mode tokens until the next token's schemaKind is no
-// longer the body's defaultToken kind. The tokenizer emits one
-// defaultToken per codepoint inside a string/bracket body (plus a
-// final close emission of the same kind covering the endsAt bytes);
-// once the body pops, the next token is back in main mode.
-//
-// `bodyKind` is what the body emits — `StringChar` for single/
-// unicode-string modes, `BracketIdChar` for bracket-id mode.
+// Pull body-mode tokens of `bodyKind` until the body pops.
 void drainBody(TreeBuilder& b, TokenStream& s, SchemaTokenId bodyKind) {
     while (!s.isAtEnd() && s.peek().schemaKind.v == bodyKind.v) {
         b.pushToken(s.advance());
@@ -170,22 +160,22 @@ TEST(TsqlSubset, SimpleSelectStar) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        b.pushToken(h.stream.advance());                   // SELECT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto list = b.open(h.schema->rules().find("selectList"));
             auto star = b.open(h.schema->rules().find("selectStar"));
-            b.pushToken(h.stream.advance());               // *
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty())
@@ -216,7 +206,7 @@ TEST(TsqlSubset, SelectFromQualifiedThreePartName) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        b.pushToken(h.stream.advance());                   // SELECT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto list = b.open(h.schema->rules().find("selectList"));
@@ -224,23 +214,23 @@ TEST(TsqlSubset, SelectFromQualifiedThreePartName) {
             auto item  = b.open(h.schema->rules().find("selectItem"));
             auto expr  = b.open(h.schema->rules().find("expression"));
             auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());               // a
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             { auto na = b.open(h.schema->rules().find("nameAtom"));
               b.pushToken(h.stream.advance()); }           // db
-            b.pushToken(h.stream.advance());               // .
+            b.pushToken(h.stream.advance());
             { auto na = b.open(h.schema->rules().find("nameAtom"));
               b.pushToken(h.stream.advance()); }           // schema
-            b.pushToken(h.stream.advance());               // .
+            b.pushToken(h.stream.advance());
             { auto na = b.open(h.schema->rules().find("nameAtom"));
               b.pushToken(h.stream.advance()); }           // t
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -272,12 +262,11 @@ TEST(TsqlSubset, SelectFromQualifiedThreePartName) {
 }
 
 TEST(TsqlSubset, SelectWithUnicodeLiteralOpener) {
-    // Live tokenization: the N' opener pushes unicode-string mode and
-    // the tokenizer emits one StringChar per body codepoint (h/e/l/l/o)
-    // plus a final StringChar covering the closing `'`. The body
-    // tokens land as siblings of the opener inside `operand`. The
-    // contract pinned here is structural (token-kind shape) rather
-    // than prettyPrint identity — pre-TZ3 the body was omitted entirely.
+    // The N' opener pushes unicode-string mode; the tokenizer emits
+    // one StringChar per body codepoint plus a final StringChar
+    // covering the closing `'`. Body tokens land as siblings of the
+    // opener inside `operand`. The contract is structural — operator
+    // shape, not prettyPrint identity.
     auto h = tokenizeShipped("tsql-subset", "SELECT N'hello' FROM t;");
     ASSERT_NE(h.schema, nullptr);
     const auto unicodeStartKind = h.schema->schemaTokens().find("UnicodeStringStart");
@@ -287,7 +276,7 @@ TEST(TsqlSubset, SelectWithUnicodeLiteralOpener) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        b.pushToken(h.stream.advance());                   // SELECT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto list  = b.open(h.schema->rules().find("selectList"));
@@ -297,18 +286,18 @@ TEST(TsqlSubset, SelectWithUnicodeLiteralOpener) {
             auto opr   = b.open(h.schema->rules().find("operand"));
             // Opener + 5 body chars + 1 close emission = 7 leaves
             // under `operand`.
-            b.pushToken(h.stream.advance());               // N' (opener)
-            drainBody(b, h.stream, stringCharKind);        // hello + '
+            b.pushToken(h.stream.advance());
+            drainBody(b, h.stream, stringCharKind);
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -344,7 +333,7 @@ TEST(TsqlSubset, SelectWithBracketIdentifier) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        b.pushToken(h.stream.advance());                   // SELECT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto list  = b.open(h.schema->rules().find("selectList"));
@@ -352,28 +341,26 @@ TEST(TsqlSubset, SelectWithBracketIdentifier) {
             auto item  = b.open(h.schema->rules().find("selectItem"));
             auto expr  = b.open(h.schema->rules().find("expression"));
             auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());               // [
-            drainBody(b, h.stream, bracketCharKind);       // Order Date]
+            b.pushToken(h.stream.advance());
+            drainBody(b, h.stream, bracketCharKind);
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // [
-            drainBody(b, h.stream, bracketCharKind);       // My Table]
+            b.pushToken(h.stream.advance());
+            drainBody(b, h.stream, bracketCharKind);
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
     EXPECT_TRUE(h.lexerDiags->all().empty());
 
     // Pin the alt-resolution: both `[` openers must land as BracketIdStart
-    // leaves (not Identifier). Body chars total = 10 + 8 = 18 (9 body
-    // codepoints for "Order Date" — incl. space — + close; 7 for "My Table"
-    // + close; the close emissions are BracketIdChar-kind covering `]`).
+    // leaves (not Identifier).
     std::size_t bracketOpeners = 0;
     std::size_t bracketChars   = 0;
     for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
@@ -384,10 +371,9 @@ TEST(TsqlSubset, SelectWithBracketIdentifier) {
     }
     EXPECT_EQ(bracketOpeners, 2u)
         << "both `[` lexemes must resolve to BracketIdStart, not Identifier";
-    // First bracket body `Order Date]` = 11 BracketIdChars (10 body
-    // codepoints + the `]` close emission). Second bracket body
-    // `My Table]` = 9 BracketIdChars. Total = 20.
-    EXPECT_EQ(bracketChars, 20u);
+    // BracketIdChar counts: `Order Date` (10) + close `]` (1) = 11,
+    // `My Table` (8) + close `]` (1) = 9, total 20.
+    EXPECT_EQ(bracketChars, 11u + 9u);
 }
 
 TEST(TsqlSubset, InsertIntoValues) {
@@ -398,44 +384,44 @@ TEST(TsqlSubset, InsertIntoValues) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto ins  = b.open(h.schema->rules().find("insertStmt"));
-        b.pushToken(h.stream.advance());                   // INSERT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // INTO
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // (
+        b.pushToken(h.stream.advance());
         {
             auto cl = b.open(h.schema->rules().find("columnList"));
             { auto na = b.open(h.schema->rules().find("nameAtom"));
               b.pushToken(h.stream.advance()); }           // a
-            b.pushToken(h.stream.advance());               // ,
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             { auto na = b.open(h.schema->rules().find("nameAtom"));
               b.pushToken(h.stream.advance()); }           // b
         }
-        b.pushToken(h.stream.advance());                   // )
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // VALUES
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // (
+        b.pushToken(h.stream.advance());
         {
             auto vl = b.open(h.schema->rules().find("valueList"));
             { auto e = b.open(h.schema->rules().find("expression"));
               auto o = b.open(h.schema->rules().find("operand"));
               b.pushToken(h.stream.advance()); }           // 1
-            b.pushToken(h.stream.advance());               // ,
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             { auto e = b.open(h.schema->rules().find("expression"));
               auto o = b.open(h.schema->rules().find("operand"));
               b.pushToken(h.stream.advance()); }           // 2
         }
-        b.pushToken(h.stream.advance());                   // )
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -481,15 +467,15 @@ TEST(TsqlSubset, UpdateSetWhere) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto upd  = b.open(h.schema->rules().find("updateStmt"));
-        b.pushToken(h.stream.advance());                   // UPDATE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // SET
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto al = b.open(h.schema->rules().find("assignList"));
@@ -497,7 +483,7 @@ TEST(TsqlSubset, UpdateSetWhere) {
             { auto na = b.open(h.schema->rules().find("nameAtom"));
               b.pushToken(h.stream.advance()); }           // a
             drainWhitespace(b, h.stream);
-            b.pushToken(h.stream.advance());               // =
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             { auto e = b.open(h.schema->rules().find("expression"));
               auto o = b.open(h.schema->rules().find("operand"));
@@ -506,7 +492,7 @@ TEST(TsqlSubset, UpdateSetWhere) {
         drainWhitespace(b, h.stream);
         {
             auto w = b.open(h.schema->rules().find("whereClause"));
-            b.pushToken(h.stream.advance());               // WHERE
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             auto e = b.open(h.schema->rules().find("expression"));
             { auto o = b.open(h.schema->rules().find("operand"));
@@ -514,13 +500,13 @@ TEST(TsqlSubset, UpdateSetWhere) {
             drainWhitespace(b, h.stream);
             {
                 auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(h.stream.advance());           // =
+                b.pushToken(h.stream.advance());
             }
             drainWhitespace(b, h.stream);
             { auto o = b.open(h.schema->rules().find("operand"));
               b.pushToken(h.stream.advance()); }           // 5
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -564,19 +550,19 @@ TEST(TsqlSubset, DeleteFromWhere) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto del  = b.open(h.schema->rules().find("deleteStmt"));
-        b.pushToken(h.stream.advance());                   // DELETE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
         {
             auto w = b.open(h.schema->rules().find("whereClause"));
-            b.pushToken(h.stream.advance());               // WHERE
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             auto e = b.open(h.schema->rules().find("expression"));
             { auto o = b.open(h.schema->rules().find("operand"));
@@ -588,7 +574,7 @@ TEST(TsqlSubset, DeleteFromWhere) {
             { auto o = b.open(h.schema->rules().find("operand"));
               b.pushToken(h.stream.advance()); }           // 5
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -624,17 +610,17 @@ TEST(TsqlSubset, CreateTableWithTypes) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto cr   = b.open(h.schema->rules().find("createTableStmt"));
-        b.pushToken(h.stream.advance());                   // CREATE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // TABLE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // (
+        b.pushToken(h.stream.advance());
         {
             auto cdl = b.open(h.schema->rules().find("columnDeclList"));
             { auto cd = b.open(h.schema->rules().find("columnDecl"));
@@ -643,7 +629,7 @@ TEST(TsqlSubset, CreateTableWithTypes) {
               drainWhitespace(b, h.stream);
               { auto tr = b.open(h.schema->rules().find("typeRef"));
                 b.pushToken(h.stream.advance()); } }       // INT
-            b.pushToken(h.stream.advance());               // ,
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             { auto cd = b.open(h.schema->rules().find("columnDecl"));
               { auto na = b.open(h.schema->rules().find("nameAtom"));
@@ -652,8 +638,8 @@ TEST(TsqlSubset, CreateTableWithTypes) {
               { auto tr = b.open(h.schema->rules().find("typeRef"));
                 b.pushToken(h.stream.advance()); } }       // VARCHAR
         }
-        b.pushToken(h.stream.advance());                   // )
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -697,17 +683,17 @@ TEST(TsqlSubset, ContextualKeywordDemotesToIdentifierInNamePosition) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto cr   = b.open(h.schema->rules().find("createTableStmt"));
-        b.pushToken(h.stream.advance());                   // CREATE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // TABLE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // SELECT (demoted)
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // (
+        b.pushToken(h.stream.advance());
         {
             auto cdl = b.open(h.schema->rules().find("columnDeclList"));
             auto cd  = b.open(h.schema->rules().find("columnDecl"));
@@ -717,8 +703,8 @@ TEST(TsqlSubset, ContextualKeywordDemotesToIdentifierInNamePosition) {
             { auto tr = b.open(h.schema->rules().find("typeRef"));
               b.pushToken(h.stream.advance()); }           // INT
         }
-        b.pushToken(h.stream.advance());                   // )
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -758,22 +744,22 @@ TEST(TsqlSubset, ParsesMultipleStatements) {
     auto buildSelectStar = [&] {
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        b.pushToken(h.stream.advance());                   // SELECT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto list = b.open(h.schema->rules().find("selectList"));
             auto star = b.open(h.schema->rules().find("selectStar"));
-            b.pushToken(h.stream.advance());               // *
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t / u
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     };
     {
         auto root = b.open(h.schema->rules().find("root"));
@@ -804,15 +790,15 @@ TEST(TsqlSubset, OperatorPrecedenceConsumedInExpression) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto upd  = b.open(h.schema->rules().find("updateStmt"));
-        b.pushToken(h.stream.advance());                   // UPDATE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // SET
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto al = b.open(h.schema->rules().find("assignList"));
@@ -820,7 +806,7 @@ TEST(TsqlSubset, OperatorPrecedenceConsumedInExpression) {
             { auto na = b.open(h.schema->rules().find("nameAtom"));
               b.pushToken(h.stream.advance()); }           // a
             drainWhitespace(b, h.stream);
-            b.pushToken(h.stream.advance());               // =
+            b.pushToken(h.stream.advance());
             drainWhitespace(b, h.stream);
             { auto e = b.open(h.schema->rules().find("expression"));
               { auto o = b.open(h.schema->rules().find("operand"));
@@ -839,7 +825,7 @@ TEST(TsqlSubset, OperatorPrecedenceConsumedInExpression) {
                 b.pushToken(h.stream.advance()); }         // d
             }
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -887,17 +873,17 @@ TEST(TsqlSubset, NotNullClauseInCreateTable) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto cr   = b.open(h.schema->rules().find("createTableStmt"));
-        b.pushToken(h.stream.advance());                   // CREATE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // TABLE
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // (
+        b.pushToken(h.stream.advance());
         {
             auto cdl = b.open(h.schema->rules().find("columnDeclList"));
             auto cd  = b.open(h.schema->rules().find("columnDecl"));
@@ -908,12 +894,12 @@ TEST(TsqlSubset, NotNullClauseInCreateTable) {
               b.pushToken(h.stream.advance()); }           // INT
             drainWhitespace(b, h.stream);
             { auto nn = b.open(h.schema->rules().find("notNullClause"));
-              b.pushToken(h.stream.advance());             // NOT
+              b.pushToken(h.stream.advance());
               drainWhitespace(b, h.stream);
               b.pushToken(h.stream.advance()); }           // NULL
         }
-        b.pushToken(h.stream.advance());                   // )
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -928,11 +914,7 @@ TEST(TsqlSubset, SchemaIdsAreDistinctPerLoad) {
     EXPECT_NE((*a)->schemaId().v, (*b)->schemaId().v);
 }
 
-// ── TZ3 body-mode E2E pins ───────────────────────────────────────────────
-//
-// Three additional tests added during TZ3 to pin body-mode tokenizer
-// behavior end-to-end. The body modes are the highest-risk surface
-// since the pre-TZ3 hand-tokenization completely sidestepped them.
+// ── Body-mode E2E pins ───────────────────────────────────────────────────
 
 TEST(TsqlSubset, DoubledDelimiterEscapeInsideSingleString) {
     // `'it''s'` represents the literal `it's` — the doubled `''` is a
@@ -948,7 +930,7 @@ TEST(TsqlSubset, DoubledDelimiterEscapeInsideSingleString) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        b.pushToken(h.stream.advance());                   // SELECT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto list  = b.open(h.schema->rules().find("selectList"));
@@ -956,18 +938,18 @@ TEST(TsqlSubset, DoubledDelimiterEscapeInsideSingleString) {
             auto item  = b.open(h.schema->rules().find("selectItem"));
             auto expr  = b.open(h.schema->rules().find("expression"));
             auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());               // '
+            b.pushToken(h.stream.advance());
             drainBody(b, h.stream, stringCharKind);
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -1008,7 +990,7 @@ TEST(TsqlSubset, EmptyStringLiteralOpensAndImmediatelyCloses) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        b.pushToken(h.stream.advance());                   // SELECT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto list  = b.open(h.schema->rules().find("selectList"));
@@ -1016,18 +998,18 @@ TEST(TsqlSubset, EmptyStringLiteralOpensAndImmediatelyCloses) {
             auto item  = b.open(h.schema->rules().find("selectItem"));
             auto expr  = b.open(h.schema->rules().find("expression"));
             auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());               // '
-            drainBody(b, h.stream, stringCharKind);        // just the close
+            b.pushToken(h.stream.advance());
+            drainBody(b, h.stream, stringCharKind);
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());
@@ -1058,7 +1040,7 @@ TEST(TsqlSubset, UnicodeStringBodyAcceptsMultiByteUTF8) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        b.pushToken(h.stream.advance());                   // SELECT
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto list  = b.open(h.schema->rules().find("selectList"));
@@ -1066,18 +1048,18 @@ TEST(TsqlSubset, UnicodeStringBodyAcceptsMultiByteUTF8) {
             auto item  = b.open(h.schema->rules().find("selectItem"));
             auto expr  = b.open(h.schema->rules().find("expression"));
             auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());               // N'
+            b.pushToken(h.stream.advance());
             drainBody(b, h.stream, stringCharKind);
         }
         drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());                   // FROM
+        b.pushToken(h.stream.advance());
         drainWhitespace(b, h.stream);
         {
             auto qn = b.open(h.schema->rules().find("qualifiedName"));
             auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());               // t
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());                   // ;
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
     EXPECT_TRUE(t.diagnostics().all().empty());

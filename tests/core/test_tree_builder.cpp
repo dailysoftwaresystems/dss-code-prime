@@ -627,3 +627,152 @@ TEST(TreeBuilder, PerMeaningValidScopesFiltersResolution) {
         EXPECT_EQ(t.kind(kids[0]), NodeKind::Token);
     }
 }
+
+// ── resolveMeaning synthesis path ───────────────────────────────────────
+
+// Pin: tokenizer pre-resolves to a built-in literal kind (IntLiteral)
+// whose lexeme isn't in the schema's per-lexeme table. resolveMeaning
+// must synthesize a LexemeMeaning from `tok.schemaKind`; no
+// P_UnknownToken; the resulting leaf carries the IntLiteral kind.
+TEST(TreeBuilder, SynthesizesMeaningForBuiltinLiteralKind) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "LitSyn", "version": "0.1.0" },
+      "tokens": {
+        ";": [{ "kind": "EndCommand" }]
+      },
+      "shapes": {
+        "root": { "sequence": [{ "repeat": "stmt" }] },
+        "stmt": { "sequence": ["IntLiteral", "EndCommand"] }
+      }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("5;", "<litsyn>");
+    const auto intLitKind = schema->schemaTokens().find("IntLiteral");
+    ASSERT_TRUE(intLitKind.valid());
+
+    Token five{
+        .coreKind   = CoreTokenKind::IntLiteral,
+        .schemaKind = intLitKind,
+        .span       = SourceSpan::of(0, 1),
+    };
+    Token semi{
+        .coreKind   = CoreTokenKind::Operator,
+        .schemaKind = InvalidSchemaToken,
+        .span       = SourceSpan::of(1, 2),
+    };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        auto stmt = b.open(schema->rules().find("stmt"));
+        b.pushToken(five);
+        b.pushToken(semi);
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_UnknownToken), 0u)
+        << "synthesis from tok.schemaKind must not fire P_UnknownToken";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_SchemaCursorDesync), 0u)
+        << "synthesized IntLiteral must satisfy stmt's first slot";
+    // Leaf kinds in order: IntLiteral, EndCommand.
+    std::vector<SchemaTokenId> leafKinds;
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Token) leafKinds.push_back(t.tokenKind(id));
+    }
+    ASSERT_EQ(leafKinds.size(), 2u);
+    EXPECT_EQ(leafKinds[0].v, intLitKind.v)
+        << "synthesized meaning's id must equal tok.schemaKind";
+    EXPECT_EQ(leafKinds[1].v, schema->schemaTokens().find("EndCommand").v);
+}
+
+// Negative pin: tok.schemaKind == Error must NOT trigger synthesis.
+// The builder must fall through to the P_UnknownToken / Error-leaf
+// recovery path so a downstream caller still sees the failure. A
+// regression that loosened the exclusion (e.g. `preResolved.valid()`
+// alone) would silently turn every Error into a clean leaf.
+TEST(TreeBuilder, SynthesisExcludesErrorKindAndEmitsUnknownToken) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "ErrSyn", "version": "0.1.0" },
+      "tokens": {
+        ";": [{ "kind": "EndCommand" }]
+      },
+      "shapes": {
+        "root": { "sequence": [{ "repeat": "stmt" }] },
+        "stmt": { "sequence": ["EndCommand"] }
+      }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("@", "<errsyn>");
+    const auto errorKind = schema->schemaTokens().find("Error");
+    ASSERT_TRUE(errorKind.valid());
+
+    Token bad{
+        .coreKind   = CoreTokenKind::Error,
+        .schemaKind = errorKind,
+        .span       = SourceSpan::of(0, 1),
+    };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        b.pushToken(bad);
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_UnknownToken), 1u);
+    auto kids = t.children(t.root());
+    ASSERT_EQ(kids.size(), 1u);
+    EXPECT_EQ(t.kind(kids[0]), NodeKind::Error)
+        << "Error-kind preResolved must produce an Error leaf, not a synthesized Token leaf";
+}
+
+// Pin: bodyDefaultTokenKinds_ is populated only from
+// lexerModes.*.defaultToken. A schema with no body modes (toy) must
+// have an empty set — observable here as: a token whose schemaKind is
+// a generic built-in still drives the cursor through the schema's
+// expected slot. No "off-grammar skip" can shadow real grammar tokens.
+TEST(TreeBuilder, BodyDefaultKindsEmptyWhenSchemaHasNoBodyModes) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "NoBody", "version": "0.1.0" },
+      "tokens": {
+        ";": [{ "kind": "EndCommand" }]
+      },
+      "shapes": {
+        "root": { "sequence": [{ "repeat": "stmt" }] },
+        "stmt": { "sequence": ["IntLiteral", "EndCommand"] }
+      }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("5", "<nobody>");
+    const auto intLitKind = schema->schemaTokens().find("IntLiteral");
+
+    Token five{
+        .coreKind   = CoreTokenKind::IntLiteral,
+        .schemaKind = intLitKind,
+        .span       = SourceSpan::of(0, 1),
+    };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        auto stmt = b.open(schema->rules().find("stmt"));
+        b.pushToken(five);
+        // Don't push the trailing `;` — finish() will synthesize a
+        // close, and we want to observe what the cursor saw after `5`.
+    }
+    Tree t = std::move(b).finish();
+
+    // No body-mode kinds means no off-grammar-skip — the cursor must
+    // have advanced through `stmt`'s first slot (IntLiteral), so a
+    // regression that mis-populated the skip set with random kinds
+    // would surface as `P_SchemaCursorDesync` here.
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_SchemaCursorDesync), 0u);
+}

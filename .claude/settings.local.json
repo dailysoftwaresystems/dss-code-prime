@@ -121,7 +121,12 @@
       "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\" --target tokenizer)",
       "Bash(cmake --build \"C:/Source/DailySoftware/dss-code-prime/build\" --target dss_tokenizer_test_tokenizer)",
       "Bash(echo \"check: $?\")",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(cmake --build build)",
+      "Bash(./dss_core_test_tree_builder.exe --gtest_list_tests)",
+      "Bash(./build/bin/dss/dss_core_test_tree_builder.exe --gtest_list_tests)",
+      "Bash(./build/bin/dss/dss_core_test_tree_builder.exe)",
+      "Bash(echo \"EXIT=$?\")"
     ]
   }
 }

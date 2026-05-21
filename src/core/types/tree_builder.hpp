@@ -315,12 +315,18 @@ private:
 
     // Body-mode `defaultToken.kind` SchemaTokenIds collected from
     // `schema_->lexerModes()` at construction time. Tokens with one of
-    // these kinds are off-grammar (the kind never appears in any
-    // `shapes/*` position by construction — it's only declared on a
-    // lexer mode), so the cursor advance is silently skipped to avoid
-    // a spurious P_SchemaCursorDesync per body codepoint. Populated
-    // once in the ctor; queried in pushToken's cursor-advance gate.
-    std::unordered_set<std::uint32_t>      bodyDefaultTokenKinds_;
+    // these kinds are off-grammar — advancing the schema cursor with
+    // them always desyncs — and they are the only kinds (alongside
+    // built-in literals) the tokenizer is allowed to pre-resolve into
+    // a synthesized LexemeMeaning. Frozen after ctor; the schema is
+    // immutable.
+    std::unordered_set<SchemaTokenId>      bodyDefaultTokenKinds_;
+
+    // Schema's "Error" SchemaTokenId, cached at ctor so the per-token
+    // resolveMeaning path doesn't re-walk the interner. Predeclared by
+    // the loader (see kBuiltinTokenKindNames), so this is always valid
+    // for any well-formed schema.
+    SchemaTokenId                          errorKind_{};
 
     // Cookies that have been "closed" by cascade or by finish() but whose
     // OpenScope guards are still alive (and will eventually call close()

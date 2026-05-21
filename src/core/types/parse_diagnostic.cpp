@@ -60,6 +60,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_RedundantField:           return "C_RedundantField";
         case DiagnosticCode::C_UnknownLexerMode:         return "C_UnknownLexerMode";
         case DiagnosticCode::C_InvalidStringStyle:       return "C_InvalidStringStyle";
+        case DiagnosticCode::C_BodyDefaultKindInShape:   return "C_BodyDefaultKindInShape";
     }
     return "Unknown";
 }
