@@ -25,7 +25,7 @@ jobs:
       cmake-version: "latest"
       # Apple Clang lags upstream on C++23 stdlib; the reusable workflow
       # installs Homebrew LLVM on macos-latest to recover C++23 coverage.
-      # See .plans/substrate-hardening-plan.md SH2.
+      # See .plans/03-substrate-hardening-plan - ok.md SH2.
       run-macos: true
     secrets:
       DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
@@ -33,7 +33,7 @@ jobs:
 
   # Catches the recurring "missing commit hash in landing log" bug class
   # by regenerating the hash anchors from `git log` and failing if they
-  # drift from what's checked in. See .plans/substrate-hardening-plan.md
+  # drift from what's checked in. See .plans/03-substrate-hardening-plan - ok.md
   # SH1 (the tool) and SH4a (this job). Intentionally ungated by the
   # `Run Pipes` label — plan-doc hygiene matters on every PR.
   landing-log-check:

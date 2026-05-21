@@ -343,7 +343,7 @@ TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
 // is shape-based positioning (`caseLabel` shape inside `switchBodyItem`),
 // NOT `scopeRequire` — the catalog's original guess at scopeRequire-based
 // adoption doesn't fit C's scope mechanics (Block is innermost inside a
-// switch body, not Switch). See `.plans/substrate-hardening-plan.md` SH4b
+// switch body, not Switch). See `.plans/03-substrate-hardening-plan - ok.md` SH4b
 // for the design call.
 TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
     auto h = tokenizeShipped("c-subset",

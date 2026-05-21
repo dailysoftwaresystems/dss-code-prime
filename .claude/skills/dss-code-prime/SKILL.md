@@ -47,7 +47,7 @@ reference — when this skill and a doc disagree, **the doc and the plan win**.
 | `src/source-config/languages/` | Shipped `.lang.json` grammar configs (`toy.lang.json` only so far) |
 | `tests/core/` | GoogleTest unit + integration tests (one executable per file) |
 | `docs/` | User-facing onboarding docs (`tree-model.md`, `language-config-spec.md`) |
-| `.plans/` | Internal design records and roadmap (`compiler-implementation-plan.md`, `tree-node-model-plan.md`, `schema-expressiveness-v2-plan.md`) |
+| `.plans/` | Internal design records and roadmap (`00-compiler-implementation-plan - tbd.md`, `01-tree-node-model-plan - ok.md`, `02-schema-expressiveness-v2-plan - ok.md`) |
 | `build/` | CMake build dir (gitignored) |
 | `libs/`, `docker/`, `integrated_tests/` | Reserved for later phases |
 
@@ -414,8 +414,8 @@ locally. Death tests should:
 Internal design records live under `.plans/`. **They are NOT user docs** — the user-facing docs
 are in `docs/`. The plans capture:
 
-- The roadmap (`.plans/compiler-implementation-plan.md`).
-- Sub-plans per major area (`.plans/tree-node-model-plan.md`, `.plans/schema-expressiveness-v2-plan.md`).
+- The roadmap (`.plans/00-compiler-implementation-plan - tbd.md`).
+- Sub-plans per major area (`.plans/01-tree-node-model-plan - ok.md`, `.plans/02-schema-expressiveness-v2-plan - ok.md`).
 - Status snapshots at the top of each sub-plan (the §0 status tables).
 - **Honest deviation lists** — the §0 deviations document every "the plan said X but we did Y"
   call with a reason. This is load-bearing for future contributors.
@@ -510,7 +510,7 @@ move ctor / move assign that resets the source to its empty state.
    `src/core/CMakeLists.txt`. If header-only → no `.cpp`, no CMake change.
 3. `DSS_EXPORT` on the class (if non-template) or omit (if template/inline-only).
 4. Test file `tests/core/test_foo.cpp` registered via `dss_add_test`.
-5. Update `.plans/tree-node-model-plan.md`'s §0 status + §7 row table (if it's a sub-plan
+5. Update `.plans/01-tree-node-model-plan - ok.md`'s §0 status + §7 row table (if it's a sub-plan
    deliverable).
 
 ### 10.2 Adding a typed view
@@ -564,7 +564,7 @@ heap-allocated `std::vector` and reset it AFTER `finish()` (see
   `TreeBuilder::Checkpoint` + speculative-alt loader plumbing, `lexerModes` + `LexerModeStack` +
   `modeOp`, `stringStyle` descriptor with `EscapeKind` + dynamic tag patterns. Two real grammars
   ship: `toy.lang.json` and `tsql-subset.lang.json` (empirical stress proves v2 is sufficient
-  for non-trivial languages). See `.plans/schema-expressiveness-v2-plan.md`.
+  for non-trivial languages). See `.plans/02-schema-expressiveness-v2-plan - ok.md`.
 - **Substrate hardening (SH1–SH4): done.** SH2 confirmed the multi-OS CI matrix (Linux/GCC,
   Linux/Clang+ASan, Windows/MSVC, macOS/AppleClang). SH3 closed the cross-tree `NodeId` caveat
   (`NodeId.treeTag` + tag validation in `NodeAttribute<T>` and `Tree::node_`). SH1 ships

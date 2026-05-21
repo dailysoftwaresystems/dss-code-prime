@@ -1,6 +1,6 @@
 # DSS Code Prime — Tree / Node Model Implementation Plan
 
-> Sub-plan of [`compiler-implementation-plan.md`](./compiler-implementation-plan.md).
+> Sub-plan of [`00-compiler-implementation-plan - tbd.md`](./00-compiler-implementation-plan - tbd.md).
 > Defines the **core data structure** that every later module (tokenizer, parser, semantic analyzer, IR generator) reads from or writes to.
 
 ---
@@ -31,10 +31,10 @@ Updated as work progresses. Detailed phase status lives in §7.
 |---|---|
 | CMake floor | **4.0** (latest stable on inception; tested with 4.3.2) |
 | C++ standard | **23** |
-| Compilers verified | Local dev: GCC 13.2 (MinGW-W64 ucrt) on Windows. CI matrix: Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, macOS/AppleClang+Homebrew-LLVM/Release — all green per [`substrate-hardening-plan.md`](./substrate-hardening-plan.md) SH2 + SH4a. |
+| Compilers verified | Local dev: GCC 13.2 (MinGW-W64 ucrt) on Windows. CI matrix: Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, macOS/AppleClang+Homebrew-LLVM/Release — all green per [`03-substrate-hardening-plan - ok.md`](./03-substrate-hardening-plan - ok.md) SH2 + SH4a. |
 | Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
 | Test suite | **531 cases across 26 ctest suites — 100% pass** (v1 T0–T12 baseline + v2 PR0–PR8 + SH3 cross-tree death tests + SH4c nested-AltChoice tests + SH4b switch end-to-end). |
-| Substrate hardening | ✅ done — SH1, SH2, SH3, SH4 all shipped. See [`substrate-hardening-plan.md`](./substrate-hardening-plan.md). The cross-tree `NodeId` caveat that used to live in §5.10 below is **closed by SH3** — `NodeId` carries a `treeTag`; cross-tree access aborts loudly with both tree ids in the message. |
+| Substrate hardening | ✅ done — SH1, SH2, SH3, SH4 all shipped. See [`03-substrate-hardening-plan - ok.md`](./03-substrate-hardening-plan - ok.md). The cross-tree `NodeId` caveat that used to live in §5.10 below is **closed by SH3** — `NodeId` carries a `treeTag`; cross-tree access aborts loudly with both tree ids in the message. |
 
 **Files now in `src/core/types/` (all on `core` static lib):**
 
@@ -89,7 +89,7 @@ tree_views.hpp               ← header-only typed views (Identifier/Literal/Bin
    - `Bookmark` embeds `TreeId` for ABA protection — `restore()` validates the captured TreeId matches the cursor's tree.
    - Cycle caps in `depth()` (returns `-1` on corruption since it's `noexcept`) and AST `gotoParent` (aborts with a clear message — symmetric with `Tree::children()`'s release-mode bounds check).
    - Convenience forwarders on the cursor: `text()`, `span()`, `rule()`, `tokenKind()` — save consumers the `c.tree().X(c.current())` boilerplate.
-10. **Per-meaning scope filter wired into `TreeBuilder::pushToken`.** v1 originally documented `LexemeMeaning::validScopes` as "empty == valid everywhere; non-empty == restrict to listed" but `pushToken` ignored it (pure dead exposure). The T6 review-fix sweep wired `resolveMeaning` to AND a per-meaning scope check with the schema-level `forbid` check from `isTokenValidInScope`. **v2 PR3 replaced the flat `validScopes` field with the richer `ScopeMatch { anyOf, forbid, topMustBe, outermost }` object** ([`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §5.3); the legacy `validScopes: [...]` syntax still loads as `scopeRequire.anyOf` for backward compat.
+10. **Per-meaning scope filter wired into `TreeBuilder::pushToken`.** v1 originally documented `LexemeMeaning::validScopes` as "empty == valid everywhere; non-empty == restrict to listed" but `pushToken` ignored it (pure dead exposure). The T6 review-fix sweep wired `resolveMeaning` to AND a per-meaning scope check with the schema-level `forbid` check from `isTokenValidInScope`. **v2 PR3 replaced the flat `validScopes` field with the richer `ScopeMatch { anyOf, forbid, topMustBe, outermost }` object** ([`02-schema-expressiveness-v2-plan - ok.md`](./02-schema-expressiveness-v2-plan - ok.md) §5.3); the legacy `validScopes: [...]` syntax still loads as `scopeRequire.anyOf` for backward compat.
 11. **Test infrastructure extracted from duplication:**
     - `tests/core/toy_harness.hpp` — `dss::tests::ToyHarness` (shared schema-load + Token-synthesis helper).
     - `tests/core/raw_tree_builder.hpp` — `dss::tests::RawTreeBuilder` for hand-fabricating trees with shapes `TreeBuilder` can't produce. Adopted by `test_tree`, `test_tree_cursor`; `test_tree_builder` uses the harness only (its trees come from the real builder).
@@ -737,7 +737,7 @@ All implemented over `TreeCursor`. No dynamic dispatch.
 
 ### 5.10 `tree_attrs.hpp` — Attribute side-tables
 
-Bound to a specific `Tree` via `Tree const&` at construction (stashes `&tree` + `tree.id()`). Every API entry bounds-checks `id.valid() && id.v < tree.nodeCount()` and aborts via local `attrFatal` (same posture as `treeFatal`/`cursorFatal`) on violation. **Cross-tree guard — closed in SH3** (`substrate-hardening-plan.md`): the original "NodeId is plain `uint32_t` for size" call was reversed. `NodeId` now carries an 8-byte payload `{ v, treeTag }`; `TreeBuilder::emit_` stamps every emitted NodeId with the source tree's id; `NodeAttribute<T>::validateId_` aborts via `crossTreeFatal(boundTreeId, idTreeTag)` with both ids in the message when a foreign NodeId is passed in. Untagged literals (`NodeId{N}` from test code) bypass the cross-tree check but are still bounds-checked. Equality and `std::hash` key on `.v` only — the tag is provenance metadata, not identity. Two storage strategies pick themselves at runtime (sparse vs dense) based on actual coverage.
+Bound to a specific `Tree` via `Tree const&` at construction (stashes `&tree` + `tree.id()`). Every API entry bounds-checks `id.valid() && id.v < tree.nodeCount()` and aborts via local `attrFatal` (same posture as `treeFatal`/`cursorFatal`) on violation. **Cross-tree guard — closed in SH3** (`03-substrate-hardening-plan - ok.md`): the original "NodeId is plain `uint32_t` for size" call was reversed. `NodeId` now carries an 8-byte payload `{ v, treeTag }`; `TreeBuilder::emit_` stamps every emitted NodeId with the source tree's id; `NodeAttribute<T>::validateId_` aborts via `crossTreeFatal(boundTreeId, idTreeTag)` with both ids in the message when a foreign NodeId is passed in. Untagged literals (`NodeId{N}` from test code) bypass the cross-tree check but are still bounds-checked. Equality and `std::hash` key on `.v` only — the tag is provenance metadata, not identity. Two storage strategies pick themselves at runtime (sparse vs dense) based on actual coverage.
 
 ```cpp
 template <typename T>
@@ -1303,7 +1303,7 @@ Downstream phases now have well-defined inputs/outputs against the tree:
 
 #### Amendments to the parent plan
 
-These supersede the corresponding sections of `compiler-implementation-plan.md`:
+These supersede the corresponding sections of `00-compiler-implementation-plan - tbd.md`:
 
 - **§2 / §4.2.2 (core-types).** The placeholder `ast.hpp` is *replaced* by the tree/node types defined in this sub-plan (§5.1–§5.11). Parent-plan phase #2 (`core-types`) now consists of this sub-plan's T1–T12 plus, separately, `core/error/` (subsumed by `DiagnosticReporter` here — drop the duplicate) and `core/utils/`.
 - **§4.4 (source-factory).** `LanguageConfig` + model classes + `ConfigValidator` are *replaced* by `GrammarSchema` (§5.12 here). The `source-factory/models/` directory is removed; `source-factory/validators/` is removed. What remains of `source-factory` is a thin facade that resolves a language name to a config-file path and calls `GrammarSchema::loadFromFile`.
@@ -1320,14 +1320,14 @@ These supersede the corresponding sections of `compiler-implementation-plan.md`:
 1. **Attribute storage strategy per attribute.** Sparse hash map vs dense vector — measure once a real attribute exists (TypeInfo, after semantic phase lands).
 2. **Identifier/string interning.** A second interner alongside `RuleInterner` / `SchemaTokenInterner`, for identifier lexemes. Defer until tokenizer lands; the cost-benefit depends on actual program sizes.
 3. **`SchemaCursor` implementation strategy.** Three viable approaches: (a) interpreter that walks the compiled shape tree node-by-node (simplest, slowest), (b) state-machine table generated from the shape graph at load time (medium, faster), (c) JIT-compiled cursor advance (overkill). Default to (a) for T4; revisit if profiling shows it dominates.
-4. ~~**Schema expressiveness for context-sensitive languages.**~~ **Tracked by [`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §5.1 (precedence), §5.2 (contextual keywords + reserved-word policy), §5.4 (speculative alt).** v2 lands additively after the E2E milestone, when authoring `c-subset.lang.json` makes the gaps concrete.
-5. ~~**Scope-dependent token meaning expressiveness.**~~ **Tracked by [`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §5.3 (`scopeRequire` object with `anyOf` / `forbid` / `topMustBe` / `outermost`).**
+4. ~~**Schema expressiveness for context-sensitive languages.**~~ **Tracked by [`02-schema-expressiveness-v2-plan - ok.md`](./02-schema-expressiveness-v2-plan - ok.md) §5.1 (precedence), §5.2 (contextual keywords + reserved-word policy), §5.4 (speculative alt).** v2 lands additively after the E2E milestone, when authoring `c-subset.lang.json` makes the gaps concrete.
+5. ~~**Scope-dependent token meaning expressiveness.**~~ **Tracked by [`02-schema-expressiveness-v2-plan - ok.md`](./02-schema-expressiveness-v2-plan - ok.md) §5.3 (`scopeRequire` object with `anyOf` / `forbid` / `topMustBe` / `outermost`).**
 6. **Schema versioning compatibility window.** `dssSchemaVersion` rejects mismatches today. As the schema format evolves, decide: (a) only the current major version, (b) auto-migrate older versions, (c) parallel loaders per major version. Defer until v2.
 7. **Incremental re-parsing.** The arena + immutable-tree design *permits* it (build a new tree referencing unchanged subtrees), but the API for it is out of scope here.
 8. **Persistence / on-disk caching.** Indices serialize trivially. Schema versioning is needed before this is useful. Defer.
 9. **Concurrency model.** `Tree` and `GrammarSchema` are immutable after `finish()` / `load*()` (interners frozen). Concurrent readers safe without sync; concurrent attribute writes need per-attribute locking — left to the consumer. Document `thread_compatible` everywhere it applies.
 10. **Hot-reload of user configs.** An IDE may want to live-edit a `.lang.json`. The loader is idempotent and cheap; full reload is simpler than a diff/patch API. Document but don't build a watcher.
-11. ~~**Backtracking-on-`alt` escape hatch.**~~ **Tracked by [`schema-expressiveness-v2-plan.md`](./schema-expressiveness-v2-plan.md) §5.4 — `speculative: true` flag + `lookahead` bound + `TreeBuilder::Checkpoint`/`rollback` primitives.**
+11. ~~**Backtracking-on-`alt` escape hatch.**~~ **Tracked by [`02-schema-expressiveness-v2-plan - ok.md`](./02-schema-expressiveness-v2-plan - ok.md) §5.4 — `speculative: true` flag + `lookahead` bound + `TreeBuilder::Checkpoint`/`rollback` primitives.**
 
 ---
 

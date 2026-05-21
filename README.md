@@ -265,4 +265,4 @@ cmake --build build --target test
 
 ## Documentation
 
-- [Implementation Plan](.plans/compiler-implementation-plan.md) — Full architecture, file structure, module docs, and JSON config spec
+- [Implementation Plan](.plans/00-compiler-implementation-plan - tbd.md) — Full architecture, file structure, module docs, and JSON config spec
