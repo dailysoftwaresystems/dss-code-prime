@@ -33,6 +33,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_SchemaCursorDesync:
             return "P_SchemaCursorDesync";
         case DiagnosticCode::P_IllegalChar:              return "P_IllegalChar";
+        case DiagnosticCode::P_MalformedNumber:          return "P_MalformedNumber";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
         case DiagnosticCode::P_UnfinishedTree:           return "P_UnfinishedTree";

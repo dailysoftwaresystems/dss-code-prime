@@ -75,6 +75,13 @@ std::shared_ptr<SourceBuffer> SourceBuffer::fromFile(std::filesystem::path const
     }
     std::ostringstream buf;
     buf << in.rdbuf();
+    // `in.rdbuf()` can silently truncate on mid-stream IO errors (disk
+    // failure, network share disconnect). Check the stream state
+    // explicitly so a truncated read becomes a loud error rather than
+    // a quietly-incorrect tokenization of half the file.
+    if (in.bad()) {
+        throw std::runtime_error("SourceBuffer::fromFile: read error on " + path.string());
+    }
     auto contents = std::move(buf).str();
     enforceSizeLimit(contents.size());
     // Use new-delete-friendly construction since the constructor is private.

@@ -5,6 +5,7 @@
 #include "core/types/strong_ids.hpp"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace dss {
 
@@ -60,5 +61,11 @@ struct DSS_EXPORT Token {
     SourceSpan    span       = SourceSpan::empty(0);
 };
 static_assert(sizeof(Token) <= 16, "Token should stay small");
+// Token is copied across every tokenize() emission and every
+// builder.pushToken() — keep it cheap and ABI-stable. Adding a non-
+// trivial field would silently regress hot-path performance and force
+// every consumer through a non-memcpy copy.
+static_assert(std::is_trivially_copyable_v<Token>,
+              "Token must stay trivially-copyable for the hot path");
 
 } // namespace dss

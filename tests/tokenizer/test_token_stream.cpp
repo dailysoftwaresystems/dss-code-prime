@@ -27,7 +27,7 @@ struct H {
 [[nodiscard]] TokenStream stream(std::string text) {
     auto h = loadToy(std::move(text));
     Tokenizer t{h.src, h.schema};
-    return std::move(t).tokenize().first;
+    return std::move(std::move(t).tokenize().stream);
 }
 
 } // namespace

@@ -25,6 +25,34 @@ TokenStream::TokenStream(std::vector<Token> tokens,
     if (tokens_.empty()) streamFatal("constructed with empty token vector");
     if (instanceId_ == 0)
         streamFatal("constructed with zero instance id — Tokenizer bug");
+    // Belt-and-braces: every Tokenizer code path appends a trailing
+    // Eof before constructing this stream, but an upstream bug that
+    // appends the wrong kind would otherwise leak into the parser as a
+    // silent peek-past-end shape change. The check is cheap (one enum
+    // compare on a small back element) and pinned by `peek_past_eof`-
+    // style tests.
+    if (tokens_.back().coreKind != CoreTokenKind::Eof)
+        streamFatal("constructed with non-Eof trailing token — Tokenizer bug");
+}
+
+TokenStream::TokenStream(TokenStream&& other) noexcept
+    : tokens_(std::move(other.tokens_))
+    , pos_(other.pos_)
+    , instanceId_(other.instanceId_) {
+    other.tokens_.clear();
+    other.pos_        = 0;
+    other.instanceId_ = 0;
+}
+
+TokenStream& TokenStream::operator=(TokenStream&& other) noexcept {
+    if (this == &other) return *this;
+    tokens_     = std::move(other.tokens_);
+    pos_        = other.pos_;
+    instanceId_ = other.instanceId_;
+    other.tokens_.clear();
+    other.pos_        = 0;
+    other.instanceId_ = 0;
+    return *this;
 }
 
 // A default-constructed or moved-from stream has empty `tokens_`,

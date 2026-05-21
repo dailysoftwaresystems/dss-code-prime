@@ -490,8 +490,15 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
             }
         }
         if (winnerIdx) {
-            out.meaning    = candidates[*winnerIdx];
-            out.matchCount = 1;
+            out.meaning = candidates[*winnerIdx];
+            // matchCount mirrors the slow path: count every scope-
+            // allowed candidate, not just the winner. Downstream code
+            // only checks `matchCount == 0` today, but keeping the
+            // value parity-equivalent across fast/slow paths avoids
+            // future divergence if a consumer starts using it.
+            for (auto const& m : candidates) {
+                if (candidateAllowed(m)) ++out.matchCount;
+            }
             // Same-priority ambiguity check — first declared still
             // wins (consistent with the slow path), but the warning
             // surfaces so the config author can disambiguate.

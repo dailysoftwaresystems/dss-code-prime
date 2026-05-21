@@ -7,18 +7,26 @@
 #include "tokenizer/token_stream.hpp"
 
 #include <memory>
-#include <utility>
 
 namespace dss {
+
+// Return aggregate from `Tokenizer::tokenize()`. Named fields beat
+// `std::pair` for self-documenting call sites and survive future
+// additions (TZ2 will likely surface lexer-mode-stack residue and per-
+// run stats) without rippling through every caller.
+struct DSS_EXPORT TokenizeResult {
+    TokenStream                         stream;
+    std::unique_ptr<DiagnosticReporter> diagnostics;
+};
 
 // Schema-aware byte-stream tokenizer. Single-use:
 //
 //   Tokenizer tk{src, schema};
-//   auto [stream, reporter] = std::move(tk).tokenize();
+//   auto [stream, diagnostics] = std::move(tk).tokenize();
 //
-// Owns the LexerModeStack instance for its lifetime. TZ1 ships the
-// no-modes path only (always operates in the schema's "main" mode);
-// TZ2 wires real mode-stack management.
+// TZ1 ships the no-modes path only — always operates in the schema's
+// "main" mode. TZ2 will add a `LexerModeStack` member and wire mode-
+// aware lookup via `GrammarSchema::lookupLexemeInMode`.
 //
 // Emits *every* token including whitespace, comments, and the trailing
 // Eof. Schema `EmptySpace` flagging is applied via the meaning's
@@ -26,11 +34,10 @@ namespace dss {
 // coalesce whitespace.
 //
 // Schema resolution: Token.schemaKind is filled by the tokenizer via
-// `GrammarSchema::lookupLexeme` (TZ1) / `lookupLexemeInMode` (TZ2),
-// picking the highest-priority candidate. Scope filtering and
-// contextual-keyword demotion remain `TreeBuilder::pushToken`'s job —
-// those need the schema cursor + scope stack, which the tokenizer
-// doesn't track.
+// `GrammarSchema::lookupLexeme`, picking the highest-priority
+// candidate. Scope filtering and contextual-keyword demotion remain
+// `TreeBuilder::pushToken`'s job — those need the schema cursor +
+// scope stack, which the tokenizer doesn't track.
 class DSS_EXPORT Tokenizer {
 public:
     Tokenizer(std::shared_ptr<SourceBuffer>        src,
@@ -44,10 +51,9 @@ public:
 
     // Consume the entire source buffer. Returns the stream + the
     // diagnostic reporter ownership. The reporter holds every diagnostic
-    // emitted during tokenization (`P_IllegalChar`, future TZ2 codes
-    // like `P_UnterminatedString`, etc.).
-    [[nodiscard]] std::pair<TokenStream, std::unique_ptr<DiagnosticReporter>>
-        tokenize() &&;
+    // emitted during tokenization (`P_IllegalChar`, `P_MalformedNumber`,
+    // and any future tokenizer-emitted codes).
+    [[nodiscard]] TokenizeResult tokenize() &&;
 
 private:
     std::shared_ptr<SourceBuffer>        source_;

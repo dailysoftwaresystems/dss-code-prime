@@ -153,48 +153,72 @@ struct LookupHit {
     return c >= '0' && c <= '7';
 }
 
-// Recognised numeric-suffix START characters. `e`/`E` are excluded
-// (those are exponent introducers handled separately). Other letters
-// terminate the number — a `123abc` slug becomes two tokens, not one.
-[[nodiscard]] constexpr bool isNumberSuffixStart(char c) noexcept {
+// Recognised numeric-suffix characters — used both as start- and
+// continue-predicate (`42ull` walks four chars through this). `e`/`E`
+// are excluded (those are exponent introducers handled separately).
+// Other letters terminate the number — `123abc` becomes two tokens.
+[[nodiscard]] constexpr bool isNumberSuffixChar(char c) noexcept {
     return c == 'u' || c == 'U' || c == 'l' || c == 'L'
         || c == 'f' || c == 'F' || c == 'd' || c == 'D';
 }
 
-void scanNumber(SourceReader& r, bool& outIsFloat) noexcept {
-    outIsFloat = false;
+// Result of `scanNumber`: float vs int + malformed signal. Malformed
+// fires for base-prefixed literals that have a prefix but no actual
+// digits — `0x_`, `0b__`, `0o`. The token is still emitted (so the
+// source span is covered), but the caller emits P_MalformedNumber so
+// the diagnostic surfaces.
+struct NumberScan {
+    bool isFloat   = false;
+    bool malformed = false;
+};
+
+// Helper: consume a base-prefix body (digits + underscores). Returns
+// true if at least one *digit* was seen (not just underscores).
+template <typename DigitPred>
+[[nodiscard]] bool consumeBaseBody(SourceReader& r, DigitPred isBaseDigit) noexcept {
+    bool sawDigit = false;
+    while (isBaseDigit(r.peek()) || r.peek() == '_') {
+        if (isBaseDigit(r.peek())) sawDigit = true;
+        r.advance(1);
+    }
+    return sawDigit;
+}
+
+[[nodiscard]] NumberScan scanNumber(SourceReader& r) noexcept {
+    NumberScan out;
 
     // Base-prefixed integer literals: 0x / 0b / 0o. Consume only when
     // the *first* digit was `0` AND the next char is one of x/X/b/B/o/O
-    // AND the char after that is a valid digit for the base. The
-    // last condition keeps `0xy` (the var `xy` after a literal `0`)
-    // tokenized as `0` + `xy`.
+    // AND the char after that is a valid digit for the base OR an
+    // underscore. Pure-letter tails like `0xy` stay tokenized as `0`
+    // plus identifier `xy`. Pure-underscore tails like `0x_` consume
+    // the body and set `malformed` so the caller emits a diagnostic.
     if (r.peek() == '0') {
         const char p1 = r.peek(1);
         const char p2 = r.peek(2);
+        auto consumeSuffix = [&] {
+            while (isNumberSuffixChar(r.peek())) r.advance(1);
+        };
         if ((p1 == 'x' || p1 == 'X') && (isHexDigit(p2) || p2 == '_')) {
             r.advance(2);
-            while (isHexDigit(r.peek()) || r.peek() == '_') r.advance(1);
-            if (isNumberSuffixStart(r.peek())) {
-                while (isNumberSuffixStart(r.peek())) r.advance(1);
-            }
-            return;   // hex never floats
+            const bool sawDigit = consumeBaseBody(r, isHexDigit);
+            consumeSuffix();
+            out.malformed = !sawDigit;
+            return out;
         }
         if ((p1 == 'b' || p1 == 'B') && (isBinDigit(p2) || p2 == '_')) {
             r.advance(2);
-            while (isBinDigit(r.peek()) || r.peek() == '_') r.advance(1);
-            if (isNumberSuffixStart(r.peek())) {
-                while (isNumberSuffixStart(r.peek())) r.advance(1);
-            }
-            return;
+            const bool sawDigit = consumeBaseBody(r, isBinDigit);
+            consumeSuffix();
+            out.malformed = !sawDigit;
+            return out;
         }
         if ((p1 == 'o' || p1 == 'O') && (isOctDigit(p2) || p2 == '_')) {
             r.advance(2);
-            while (isOctDigit(r.peek()) || r.peek() == '_') r.advance(1);
-            if (isNumberSuffixStart(r.peek())) {
-                while (isNumberSuffixStart(r.peek())) r.advance(1);
-            }
-            return;
+            const bool sawDigit = consumeBaseBody(r, isOctDigit);
+            consumeSuffix();
+            out.malformed = !sawDigit;
+            return out;
         }
     }
 
@@ -205,22 +229,21 @@ void scanNumber(SourceReader& r, bool& outIsFloat) noexcept {
     // member access (caller ensures we entered scanNumber on a digit;
     // the `.` is fractional only when more digits follow).
     if (r.peek() == '.' && isDigit(r.peek(1))) {
-        outIsFloat = true;
+        out.isFloat = true;
         r.advance(1);                                  // '.'
         while (isDigit(r.peek())) r.advance(1);
     }
 
-    // Exponent.
+    // Exponent. `1e+5` / `1e-5` / `1e5` all valid; bare `1e` (no
+    // digit) is not. When the exponent fails, mark the `e` as off-
+    // limits to the suffix scan so it stays available as a fresh-
+    // start identifier for the next tokenize iteration.
     bool sawEButNoExp = false;
     if (r.peek() == 'e' || r.peek() == 'E') {
-        // `1e+5` / `1e-5` / `1e5` all valid; bare `1e` (no digit) is
-        // not. When the exponent fails, mark the `e` as off-limits to
-        // the suffix scan so it stays available as a fresh-start
-        // identifier for the next tokenize iteration.
         std::size_t look = 1;
         if (r.peek(1) == '+' || r.peek(1) == '-') look = 2;
         if (isDigit(r.peek(look))) {
-            outIsFloat = true;
+            out.isFloat = true;
             r.advance(look + 1);
             while (isDigit(r.peek())) r.advance(1);
         } else {
@@ -231,13 +254,15 @@ void scanNumber(SourceReader& r, bool& outIsFloat) noexcept {
     // Suffix (restricted set — u/U/l/L promote nothing; f/F/d/D promote
     // an otherwise-int literal to float). Skipped when we just bailed
     // on a non-exponent `e`/`E`; the char belongs to the next token.
-    if (!sawEButNoExp && isNumberSuffixStart(r.peek())) {
+    if (!sawEButNoExp && isNumberSuffixChar(r.peek())) {
         const char first = r.peek();
         if (first == 'f' || first == 'F' || first == 'd' || first == 'D') {
-            outIsFloat = true;
+            out.isFloat = true;
         }
-        while (isNumberSuffixStart(r.peek())) r.advance(1);
+        while (isNumberSuffixChar(r.peek())) r.advance(1);
     }
+
+    return out;
 }
 
 } // namespace
@@ -252,8 +277,7 @@ Tokenizer::Tokenizer(std::shared_ptr<SourceBuffer>        src,
     if (!schema_) tokenizerFatal("schema is null");
 }
 
-std::pair<TokenStream, std::unique_ptr<DiagnosticReporter>>
-Tokenizer::tokenize() && {
+TokenizeResult Tokenizer::tokenize() && {
     SourceReader r{*source_};
     std::vector<Token> tokens;
 
@@ -291,8 +315,20 @@ Tokenizer::tokenize() && {
 
     // UTF-8 BOM at the start of the source: skip silently. Some
     // editors / git templates prepend it; treating it as an identifier
-    // (`isIdStart` previously accepted any byte ≥ 0x80) leaks three
-    // garbage bytes into the first identifier of the file.
+    // (`isIdStart` previously accepted any byte ≥ 0x80) would leak
+    // three garbage bytes into the first identifier of the file.
+    //
+    // A stray BOM AFTER position 0 cannot be distinguished from a
+    // legitimate U+FEFF zero-width-no-break-space codepoint — both
+    // are the byte sequence `EF BB BF`. Per the byte-pass-through
+    // identifier model, mid-source BOM bytes get absorbed by any
+    // surrounding identifier scan (i.e. `var<BOM>x` is one Word
+    // token, just like a deliberately-pasted U+FEFF would be). The
+    // silent-failure-hunter review surfaced this trade-off; the
+    // resolution is to accept it as a v3-class concern. Full Unicode
+    // identifier semantics (XID_Start / XID_Continue) would let us
+    // distinguish "control-class" from "letter-class" codepoints and
+    // properly reject stray BOM bytes.
     if (r.size() >= 3
         && static_cast<unsigned char>(r.peek(0)) == 0xEF
         && static_cast<unsigned char>(r.peek(1)) == 0xBB
@@ -304,7 +340,9 @@ Tokenizer::tokenize() && {
         start = static_cast<ByteOffset>(r.position());
         const char c = r.peek();
 
-        // ── whitespace (one byte per token; matches per-char schema convention) ──
+        // Whitespace runs emit one token per byte (matches the per-char
+        // schema convention) — the pre-resolved kinds avoid the
+        // longest-match loop for these known single-byte lookups.
         if (c == '\n') {
             r.advance(1);
             emit(CoreTokenKind::Newline, newlineKind);
@@ -316,7 +354,10 @@ Tokenizer::tokenize() && {
             continue;
         }
 
-        // ── identifier / keyword ──
+        // Identifier or keyword: alphanumeric/underscore run; the
+        // schema lookup decides if the resulting lexeme is a keyword
+        // (schemaKind valid) or a plain identifier (schemaKind invalid;
+        // builder's pushToken fallback promotes to Identifier).
         if (isIdStart(c)) {
             r.advance(1);
             while (isIdContinue(r.peek())) r.advance(1);
@@ -329,16 +370,30 @@ Tokenizer::tokenize() && {
             continue;
         }
 
-        // ── numeric ──
+        // Numeric literals — hand-coded; see `scanNumber` for the
+        // grammar. Int vs Float is decided inside `scanNumber` based
+        // on whether `.`/`e`/`E` or a float-marker suffix was consumed.
+        // Malformed base-prefix literals (`0x_` with no actual digit)
+        // still get a token emitted but also produce P_MalformedNumber.
         if (isDigit(c)) {
-            bool isFloat = false;
-            scanNumber(r, isFloat);
-            emit(isFloat ? CoreTokenKind::FloatLiteral : CoreTokenKind::IntLiteral,
-                 isFloat ? floatLitKind : intLitKind);
+            const auto scan = scanNumber(r);
+            emit(scan.isFloat ? CoreTokenKind::FloatLiteral : CoreTokenKind::IntLiteral,
+                 scan.isFloat ? floatLitKind : intLitKind);
+            if (scan.malformed) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::P_MalformedNumber;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = source_->id();
+                d.span     = SourceSpan::of(start, static_cast<ByteOffset>(r.position()));
+                d.actual   = std::format("'{}'", r.slice(start, r.position()));
+                reporter_->report(std::move(d));
+            }
             continue;
         }
 
-        // ── operator / punctuation longest-match ──
+        // Operator or punctuation: longest-match against the schema's
+        // declared lexeme keys, bounded by the schema's longest key
+        // length (no silent truncation on a future 5+ char lexeme).
         const auto hit = longestMatch(*schema_, r.remaining(), lexemeProbeMax);
         if (hit.length > 0) {
             r.advance(hit.length);
@@ -346,9 +401,8 @@ Tokenizer::tokenize() && {
             continue;
         }
 
-        // ── illegal char ──
-        //
-        // Nothing matched; consume one byte and emit an Error token.
+        // Illegal char fallback: nothing matched; consume one byte
+        // and emit an Error token plus a diagnostic.
         // Tokenization continues so a single bad byte doesn't truncate
         // the rest of the stream. Bare UTF-8 continuation bytes
         // (0x80-0xBF — only valid as the tail of a multi-byte sequence)
@@ -366,16 +420,16 @@ Tokenizer::tokenize() && {
         reporter_->report(std::move(d));
     }
 
-    // ── trailing Eof ──
-    //
-    // Span is zero-width at end-of-buffer. TokenStream's contract
+    // Trailing Eof: span is zero-width at end-of-buffer. TokenStream's contract
     // requires this final entry; peek() past it keeps returning the
     // same Eof so parsers don't need an isAtEnd() guard at every step.
     start = static_cast<ByteOffset>(r.size());
     emit(CoreTokenKind::Eof, eofKind);
 
-    return { TokenStream{std::move(tokens), nextStreamInstanceId()},
-             std::move(reporter_) };
+    return TokenizeResult{
+        .stream      = TokenStream{std::move(tokens), nextStreamInstanceId()},
+        .diagnostics = std::move(reporter_),
+    };
 }
 
 } // namespace dss

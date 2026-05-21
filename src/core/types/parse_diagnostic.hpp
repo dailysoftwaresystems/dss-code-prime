@@ -51,6 +51,7 @@ enum class DiagnosticCode : std::uint16_t {
     P_ContextualKeywordResolution = 0x000C,
     P_SchemaCursorDesync          = 0x000D,
     P_IllegalChar                 = 0x000E,
+    P_MalformedNumber             = 0x000F,
 
     // ── P9xxx — builder internal-invariant violations (release-mode rescues) ──
     P_BuilderInvariant            = 0x9000,

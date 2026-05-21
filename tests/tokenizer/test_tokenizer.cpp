@@ -2,6 +2,8 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/token.hpp"
+#include "core/types/tree.hpp"
+#include "core/types/tree_builder.hpp"
 #include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
@@ -38,9 +40,6 @@ struct H {
     };
 }
 
-// Collect every non-Eof token from a tokenize() call, plus the
-// diagnostic reporter's contents. Caller asserts shape against the
-// returned vectors.
 struct LexResult {
     std::vector<Token>              tokens;
     std::vector<ParseDiagnostic>    diags;
@@ -62,7 +61,6 @@ struct LexResult {
 
 } // namespace
 
-// ── empty / EOF ───────────────────────────────────────────────────────────
 
 TEST(Tokenizer, EmptySourceEmitsOnlyEof) {
     auto h = loadToy("");
@@ -84,7 +82,6 @@ TEST(Tokenizer, EofSpanIsZeroWidthAtEndOfBuffer) {
     EXPECT_EQ(eof.span.end(),   3u);
 }
 
-// ── whitespace ────────────────────────────────────────────────────────────
 
 TEST(Tokenizer, WhitespaceRunsEmitOneTokenPerChar) {
     auto h     = loadToy("  \t\n");
@@ -106,7 +103,6 @@ TEST(Tokenizer, WhitespaceCarriesSchemaKindWithEmptySpaceFlag) {
     EXPECT_TRUE(h.schema->isEmptySpace(result.tokens[0].schemaKind));
 }
 
-// ── identifiers + keywords ────────────────────────────────────────────────
 
 TEST(Tokenizer, KeywordResolvesToSchemaKind) {
     auto h      = loadToy("var");
@@ -136,7 +132,6 @@ TEST(Tokenizer, IdentifiersAcceptUnderscoreAndDigits) {
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "_x9");
 }
 
-// ── numeric literals ──────────────────────────────────────────────────────
 
 TEST(Tokenizer, IntegerLiteral) {
     auto h      = loadToy("12345");
@@ -273,7 +268,6 @@ TEST(Tokenizer, IntegerWithULSuffixStillIntegerKind) {
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42ull");
 }
 
-// ── operators / punctuation ───────────────────────────────────────────────
 
 TEST(Tokenizer, SingleCharOperatorResolves) {
     auto h      = loadToy("+");
@@ -318,7 +312,6 @@ TEST(Tokenizer, LongestMatchDistinguishesAdjacentLexemes) {
               h.schema->schemaTokens().find("AssignOp"));
 }
 
-// ── error recovery ────────────────────────────────────────────────────────
 
 TEST(Tokenizer, IllegalCharEmitsErrorTokenAndContinues) {
     auto h      = loadToy("$x");
@@ -347,7 +340,196 @@ TEST(Tokenizer, MultipleIllegalCharsEmitSeparateTokensAndDiagnostics) {
     EXPECT_EQ(result.diags.size(), 3u);
 }
 
-// ── UTF-8 ─────────────────────────────────────────────────────────────────
+TEST(Tokenizer, EmptyHexPrefixFallsBackToZeroPlusWord) {
+    // `0x` alone (no digit, no underscore, EOF after) must NOT be
+    // consumed as a hex literal. Tokenizer emits `0` (Int) then `x`
+    // (Word). Companion to ZeroFollowedByLetterIsNotHexUnlessLetterIsValidDigit
+    // for the EOF-after-prefix case.
+    auto h      = loadCSubset("0x");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0");
+    EXPECT_EQ(result.tokens[1].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "x");
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, HexPrefixFollowedByUnderscoreOnlyEmitsMalformedDiagnostic) {
+    // `0x_` has no actual hex digits — only the underscore that the
+    // base-prefix branch accepts as a body char. The tokenizer still
+    // emits a single IntLiteral spanning `0x_` (so the source span is
+    // covered) but flags it with P_MalformedNumber for the downstream
+    // value parser. Companion: `0b_`, `0o_` behave identically.
+    auto h      = loadCSubset("0x_");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x_");
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
+    EXPECT_EQ(result.diags[0].severity, DiagnosticSeverity::Error);
+}
+
+TEST(Tokenizer, BinaryPrefixFollowedByUnderscoreOnlyIsMalformed) {
+    auto h      = loadCSubset("0b___");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b___");
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
+}
+
+TEST(Tokenizer, ValidHexWithLeadingUnderscoreThenDigitIsAccepted) {
+    // `0x_ff` is well-formed: the underscore is a digit-separator and
+    // `ff` provides actual hex digits. No P_MalformedNumber.
+    auto h      = loadCSubset("0x_ff");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x_ff");
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, ZeroFollowedByLetterPinsSchemaKindAsIntLiteral) {
+    // Tightens the previous `ZeroFollowedByLetter...` test: also pin
+    // the `0` token's schemaKind to the IntLiteral built-in. Catches
+    // a regression where decimal `0` is mis-tagged.
+    auto h      = loadCSubset("0xy");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              h.schema->schemaTokens().find("IntLiteral"));
+}
+
+// ── UTF-8 boundary tests (D1) ────────────────────────────────────────────
+
+TEST(Tokenizer, Utf8LeadByteBoundary_0xC1IsRejected) {
+    // 0xC1 is in the reserved range 0xC0..0xC1 — never appears in
+    // well-formed UTF-8. Tokenizer routes it through the illegal-char
+    // path rather than starting an identifier.
+    auto h      = loadToy("\xC1");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Error);
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_IllegalChar);
+}
+
+TEST(Tokenizer, Utf8LeadByteBoundary_0xC2IsAcceptedAsIdStart) {
+    // 0xC2 is the smallest valid UTF-8 lead byte. Combined with a
+    // continuation byte it forms a 2-byte codepoint; the tokenizer
+    // accepts the pair as a single Word token.
+    auto h      = loadToy("\xC2\xA0");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, Utf8FourByteLeadAcceptedAsIdStart) {
+    // 0xF0 starts a 4-byte UTF-8 sequence (e.g., emoji). Tokenizer
+    // accepts the lead byte as identifier-start; subsequent
+    // continuation bytes are picked up by `isIdContinue`.
+    auto h      = loadToy("\xF0\x9F\x98\x80");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, MidSourceBomBytesAreAbsorbedByIdentifierScan) {
+    // Stray BOM bytes mid-source are indistinguishable from a
+    // legitimate U+FEFF codepoint. The byte-pass-through identifier
+    // model absorbs the three BOM bytes into whatever identifier
+    // scan is in flight — `var\xEF\xBB\xBFx` produces ONE Word token
+    // spanning all 7 bytes. Documenting this here as a deliberate
+    // design choice (see tokenizer.cpp BOM-handling comment). Full
+    // Unicode identifier semantics would let us reject control-class
+    // codepoints; that's v3 territory.
+    auto h      = loadToy("var\xEF\xBB\xBFx");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "var\xEF\xBB\xBFx");
+    EXPECT_TRUE(result.diags.empty());
+}
+
+// ── resolveMeaning fast-path ambiguity (CR1) ──────────────────────────────
+//
+// The TZ1 review-fix added a same-priority ambiguity scan to the
+// tokenizer-pre-resolved fast-path in `tree_builder.cpp::resolveMeaning`.
+// Toy's `+` has different priorities (10 vs 20), so the existing
+// `SingleCharOperatorResolves` test never exercises the ambiguity
+// branch. Use an inline schema with two same-priority meanings for
+// the same lexeme to pin the warning end-to-end through tokenizer
+// → builder.
+
+namespace {
+
+constexpr std::string_view kAmbiguousSchema = R"JSON({
+  "dssSchemaVersion": 1,
+  "language": { "name": "Ambig", "version": "0.1.0" },
+  "tokens": {
+    "?": [
+      { "kind": "MeaningA", "priority": 10 },
+      { "kind": "MeaningB", "priority": 10 }
+    ]
+  },
+  "shapes": { "root": { "sequence": [ "MeaningA" ] } }
+})JSON";
+
+} // namespace
+
+TEST(Tokenizer, AmbiguousMeaningsEmitWarningViaFastPath) {
+    auto loaded = GrammarSchema::loadFromText(kAmbiguousSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src = SourceBuffer::fromString("?", "<ambig>");
+
+    Tokenizer tk{src, schema};
+    auto res = std::move(tk).tokenize();
+    ASSERT_FALSE(res.stream.isAtEnd());
+
+    // The tokenizer-resolved schemaKind is the priority-winner
+    // (first declared on tie = MeaningA). Drive the token through
+    // the builder; expect P_AmbiguousToken to fire via the fast-
+    // path's same-priority scan.
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        b.pushToken(res.stream.advance());
+    }
+    Tree t = std::move(b).finish();
+
+    const auto diags = t.diagnostics().all();
+    std::size_t ambiguousCount = 0;
+    for (auto const& d : diags) {
+        if (d.code == DiagnosticCode::P_AmbiguousToken) ++ambiguousCount;
+    }
+    EXPECT_EQ(ambiguousCount, 1u)
+        << "fast-path ambiguity scan must emit one P_AmbiguousToken";
+}
+
+TEST(TokenStream, DefaultThenAssignedTokenStreamWorks) {
+    // The E2EHarness pattern depends on TokenStream being default-
+    // constructible AND survivable through move-assignment from a
+    // real Tokenizer output. Pin that pattern explicitly.
+    TokenStream s;
+    {
+        auto h = loadToy("var");
+        Tokenizer t{h.src, h.schema};
+        s = std::move(t).tokenize().stream;
+    }
+    // After move-assignment from a Tokenizer-produced stream, every
+    // method works normally.
+    EXPECT_EQ(s.peek().coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(s.advance().coreKind, CoreTokenKind::Word);
+    EXPECT_TRUE(s.isAtEnd());
+    EXPECT_EQ(s.advance().coreKind, CoreTokenKind::Eof);
+}
+
 
 TEST(Tokenizer, Utf8BomAtStartIsSkippedSilently) {
     // Some editors prepend the UTF-8 BOM (EF BB BF). The tokenizer
@@ -387,7 +569,6 @@ TEST(Tokenizer, MultiByteUtf8IdentifierAcceptedAsOneToken) {
     EXPECT_TRUE(result.diags.empty());
 }
 
-// ── integration: real source ──────────────────────────────────────────────
 
 TEST(Tokenizer, FullVarDeclProducesExpectedStream) {
     auto h      = loadToy("var x = y;");
@@ -417,7 +598,6 @@ TEST(Tokenizer, SchemaKindsMatchExpectedForVarDecl) {
     EXPECT_EQ(result.tokens[7].schemaKind, sch.find("EndCommand"));
 }
 
-// ── ctor invariants ───────────────────────────────────────────────────────
 //
 // EXPECT_DEATH is a macro; commas in the body land in macro-arg territory.
 // Helper free functions keep the action expression comma-free.

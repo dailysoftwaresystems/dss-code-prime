@@ -30,8 +30,15 @@ public:
     TokenStream() = default;
     TokenStream(TokenStream const&)            = delete;
     TokenStream& operator=(TokenStream const&) = delete;
-    TokenStream(TokenStream&&) noexcept            = default;
-    TokenStream& operator=(TokenStream&&) noexcept = default;
+    // Move ops are explicit (not `= default`) because every public
+    // method's empty-stream guard relies on a moved-from instance
+    // observably reporting `tokens_.empty() == true`. `std::vector`'s
+    // defaulted-move-from state is "valid but unspecified" — most
+    // implementations leave the source empty, but the standard does
+    // not require it. The custom move clears the source explicitly,
+    // mirroring `NodeAttribute<T>`'s move-ops discipline from SH3.
+    TokenStream(TokenStream&& other) noexcept;
+    TokenStream& operator=(TokenStream&& other) noexcept;
 
     // ── peek / advance ──
     //
