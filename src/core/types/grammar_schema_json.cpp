@@ -1377,6 +1377,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // Parse defaultToken into a local; the mode entry is then
             // rebuilt via the factory rather than mutated in place.
             std::optional<SchemaTokenId> defaultToken;
+            NodeFlags                    defaultTokenFlags = NodeFlags::None;
             if (modeObj.contains("defaultToken")) {
                 json const& dt = modeObj.at("defaultToken");
                 if (!dt.is_object() || !dt.contains("kind") ||
@@ -1387,9 +1388,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 } else {
                     defaultToken = data.schemaTokens->intern(
                         dt.at("kind").get<std::string>());
+                    // Optional `flags` field — propagates onto every
+                    // per-codepoint emission the tokenizer makes in
+                    // this mode. Lets a comment-body mode flag its
+                    // chars as EmptySpace so the AST cursor skips them
+                    // wholesale (closes v2-gap-catalog row 3 cleanly).
+                    if (dt.contains("flags")) {
+                        defaultTokenFlags = parseFlagList(dt.at("flags"));
+                    }
                 }
             }
-            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken);
+            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken, defaultTokenFlags);
 
             // tokens field: "default" inherits top-level lexemeTable;
             // an inline object IS the per-mode table (parsing deferred).

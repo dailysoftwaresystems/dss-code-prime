@@ -1,6 +1,8 @@
 #include "tokenizer/tokenizer.hpp"
 
+#include "core/types/lexer_mode.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/string_style.hpp"
 #include "tokenizer/source_reader.hpp"
 
 #include <atomic>
@@ -8,7 +10,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <regex>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -113,6 +118,68 @@ struct LookupHit {
         return LookupHit{ .length = len, .meaning = cands[0] };
     }
     return {};
+}
+
+// ── UTF-8 codepoint length ────────────────────────────────────────────────
+//
+// In a body mode (where the user chose per-codepoint defaultToken
+// emission — see `.plans/tokenizer-plan.md` §2.3), the tokenizer needs
+// to advance one codepoint at a time, not one byte. UTF-8 lead-byte
+// ranges:
+//   0x00-0x7F   single-byte ASCII (1)
+//   0xC2-0xDF   2-byte lead       (2)
+//   0xE0-0xEF   3-byte lead       (3)
+//   0xF0-0xF4   4-byte lead       (4)
+// Ill-formed leads (0x80-0xC1, 0xF5-0xFF) consume a single byte so the
+// tokenizer makes progress; the illegal-char path picked them up before
+// body-mode entry in well-behaved sources.
+[[nodiscard]] constexpr std::size_t codepointByteCount(char leadByte) noexcept {
+    const auto u = static_cast<unsigned char>(leadByte);
+    if (u < 0x80) return 1;
+    if (u < 0xC2) return 1;
+    if (u < 0xE0) return 2;
+    if (u < 0xF0) return 3;
+    if (u < 0xF5) return 4;
+    return 1;
+}
+
+// ── body-mode close-pattern matching ──────────────────────────────────────
+//
+// Check whether the current SourceReader position starts a body-mode
+// close pattern. Returns the byte count to consume (0 on no match).
+//
+// `endsAt`        — the static suffix from the StringStyle (e.g. `'`,
+//                   `*/`, `\n`).
+// `dynamicSuffix` — the captured-at-opener tag for tagPattern-style
+//                   raw strings (C++ `R"DELIM(...)DELIM"`). The full
+//                   close pattern is `endsAt + dynamicSuffix`. Empty
+//                   for static-endsAt configs (the common case).
+// `longestMatch`  — when true, accept the longest run of `endsAt`'s
+//                   single character (e.g. Lua `[==[ ... ]==]` where
+//                   the closer count must match the opener's). When
+//                   the dynamicSuffix is non-empty this flag is
+//                   irrelevant (the dynamic tag IS the disambiguator).
+[[nodiscard]] std::size_t matchEndsAt(SourceReader const& r,
+                                      std::string_view endsAt,
+                                      std::string_view dynamicSuffix,
+                                      bool longestMatch) noexcept {
+    const auto remaining = r.remaining();
+    const std::size_t totalLen = endsAt.size() + dynamicSuffix.size();
+    if (remaining.size() < totalLen) return 0;
+    if (remaining.substr(0, endsAt.size()) != endsAt) return 0;
+    if (!dynamicSuffix.empty()
+        && remaining.substr(endsAt.size(), dynamicSuffix.size()) != dynamicSuffix) {
+        return 0;
+    }
+    if (longestMatch && endsAt.size() == 1 && dynamicSuffix.empty()) {
+        // Eat the longest run of the single ends-at character (Lua /
+        // shell heredoc style). Caller's responsibility to declare a
+        // single-character endsAt when this is on.
+        std::size_t n = 0;
+        while (n < remaining.size() && remaining[n] == endsAt[0]) ++n;
+        return n;
+    }
+    return totalLen;
 }
 
 // ── numeric scan ──────────────────────────────────────────────────────────
@@ -300,17 +367,93 @@ TokenizeResult Tokenizer::tokenize() && {
     // pin it once for the entire tokenize() invocation.
     const std::size_t lexemeProbeMax = schema_->maxLexemeLength();
 
+    // ── lexer-mode stack ─────────────────────────────────────────────────
+    //
+    // Push the schema's "main" mode at start. Every schema synthesizes
+    // "main" at load time (see PR5 loader), so `findLexerMode("main")`
+    // always succeeds in well-formed configs. If for some reason the
+    // schema dropped it we treat as fatal — body-mode lookups would
+    // otherwise have nothing to fall back to.
+    LexerModeStack modeStack;
+    const auto mainModeId = schema_->findLexerMode("main");
+    if (!mainModeId.valid()) tokenizerFatal("schema has no 'main' lexer mode");
+    modeStack.push(mainModeId);
+
+    // Parallel stacks for body-mode metadata. Indexed by mode-stack
+    // depth - 1 (i.e. `styles[i]` is the StringStyle active at depth
+    // i+1). The main mode has no style, so the stacks start empty.
+    // `dynamicSuffix` holds the runtime-captured tag for stringStyles
+    // with non-empty `tagPattern` (C++ raw strings, Rust r#"...#"); an
+    // empty string means "static endsAt only."
+    std::vector<StringStyle const*> styleStack;
+    std::vector<std::string>        dynamicSuffix;
+
     // Locally-scoped emit helper — collapses the five "construct span +
     // push Token" sites that previously appeared once per branch. The
     // capture-by-reference includes the running `tokens` vector and the
     // `start` offset the loop body sets at each iteration's top.
     ByteOffset start = 0;
-    auto emit = [&](CoreTokenKind ck, SchemaTokenId sk) {
+    auto emit = [&](CoreTokenKind ck, SchemaTokenId sk,
+                    NodeFlags flagsApplied = NodeFlags::None) {
+        (void)flagsApplied;   // reserved — Token has no flags field today
         tokens.push_back(Token{
             .coreKind   = ck,
             .schemaKind = sk,
             .span       = SourceSpan::of(start, static_cast<ByteOffset>(r.position())),
         });
+    };
+
+    // Apply a meaning's mode-stack side-effect after the corresponding
+    // token has been emitted. `stringStyleId` is also threaded so a
+    // pushMode-with-stringStyle correctly stacks the active style.
+    auto applyMeaningSideEffects = [&](LexemeMeaning const& m) {
+        switch (m.modeOp) {
+            case ModeOp::None: break;
+            case ModeOp::PushMode: {
+                modeStack.push(m.modeArg);
+                StringStyle const* style = schema_->stringStyle(m);
+                styleStack.push_back(style);
+                dynamicSuffix.emplace_back();
+                // Dynamic tagPattern: capture at opener time so the
+                // body-mode close pattern is `endsAt + capturedTag`.
+                // Only fires when the style has a non-empty tagPattern.
+                if (style && !style->tagPattern.empty()) {
+                    try {
+                        std::regex re(style->tagPattern);
+                        std::cmatch match;
+                        const auto remaining = r.remaining();
+                        // `match_continuous` anchors at the start of
+                        // remaining; greedy by default.
+                        if (std::regex_search(remaining.data(),
+                                              remaining.data() + remaining.size(),
+                                              match, re,
+                                              std::regex_constants::match_continuous)) {
+                            dynamicSuffix.back().assign(match[0].first, match[0].second);
+                            r.advance(static_cast<std::size_t>(match[0].length()));
+                        }
+                    } catch (std::exception const&) {
+                        // tagPattern is loader-validated; a runtime
+                        // regex failure here is a deep config bug. Keep
+                        // tokenizing without a dynamic tag rather than
+                        // crash.
+                    }
+                }
+                break;
+            }
+            case ModeOp::PopMode: {
+                if (!modeStack.tryPop()) break;
+                if (!styleStack.empty()) styleStack.pop_back();
+                if (!dynamicSuffix.empty()) dynamicSuffix.pop_back();
+                break;
+            }
+            case ModeOp::ReplaceMode:
+                if (modeStack.depth() > 0) modeStack.replaceTop(m.modeArg);
+                if (!styleStack.empty()) {
+                    styleStack.back() = schema_->stringStyle(m);
+                    if (!dynamicSuffix.empty()) dynamicSuffix.back().clear();
+                }
+                break;
+        }
     };
 
     // UTF-8 BOM at the start of the source: skip silently. Some
@@ -338,6 +481,80 @@ TokenizeResult Tokenizer::tokenize() && {
 
     while (!r.isAtEnd()) {
         start = static_cast<ByteOffset>(r.position());
+
+        // ── body-mode branch ────────────────────────────────────────
+        //
+        // When the current mode declares a `defaultToken`, we're inside
+        // a string body, a comment, or any other "consume until endsAt"
+        // construct. The mode's per-token table is empty (per PR5's
+        // design); resolution is: try endsAt → try escape → emit one
+        // codepoint as defaultToken.
+        const auto& currentMode = schema_->lexerMode(modeStack.top());
+        if (currentMode.defaultToken.has_value()) {
+            StringStyle const* style = styleStack.empty()
+                ? nullptr
+                : styleStack.back();
+            std::string_view suffix = dynamicSuffix.empty()
+                ? std::string_view{}
+                : std::string_view{dynamicSuffix.back()};
+
+            if (style) {
+                // 1. Doubled-delimiter escape: `''` inside a SQL
+                //    string is a literal `'`, NOT the end of the
+                //    body. Check before plain endsAt match so the
+                //    longer match wins.
+                if (style->escapeKind == EscapeKind::DoubledDelimiter
+                    && r.remaining().size() >= 2 * style->endsAt.size()
+                    && r.remaining().substr(0, style->endsAt.size()) == style->endsAt
+                    && r.remaining().substr(style->endsAt.size(), style->endsAt.size()) == style->endsAt) {
+                    r.advance(2 * style->endsAt.size());
+                    emit(CoreTokenKind::Operator, *currentMode.defaultToken);
+                    continue;
+                }
+
+                // 2. Static-or-dynamic endsAt match: consume + pop mode.
+                if (const auto n = matchEndsAt(r, style->endsAt, suffix,
+                                               style->endsAtLongestMatch);
+                    n > 0) {
+                    r.advance(n);
+                    emit(CoreTokenKind::Operator, *currentMode.defaultToken);
+                    if (!modeStack.tryPop()) tokenizerFatal("mode stack underflow at endsAt");
+                    if (!styleStack.empty()) styleStack.pop_back();
+                    if (!dynamicSuffix.empty()) dynamicSuffix.pop_back();
+                    continue;
+                }
+
+                // 3. Char-escape: lead byte + next codepoint emitted
+                //    as one defaultToken. Permissive — any byte after
+                //    the lead is accepted (P_InvalidEscape only fires
+                //    when the lead is the last byte of the source).
+                if (style->escapeKind == EscapeKind::Char
+                    && static_cast<unsigned char>(r.peek()) == static_cast<unsigned char>(style->escapeChar)) {
+                    r.advance(1);
+                    if (r.isAtEnd()) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::P_InvalidEscape;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = source_->id();
+                        d.span     = SourceSpan::of(start, static_cast<ByteOffset>(r.position()));
+                        d.actual   = "escape lead at end of source";
+                        reporter_->report(std::move(d));
+                    } else {
+                        r.advance(codepointByteCount(r.peek()));
+                    }
+                    emit(CoreTokenKind::Operator, *currentMode.defaultToken);
+                    continue;
+                }
+            }
+
+            // 4. Default: consume one codepoint as the body's default
+            //    token kind. UTF-8 multi-byte sequences land in one
+            //    token (per user-chosen per-codepoint granularity).
+            r.advance(codepointByteCount(r.peek()));
+            emit(CoreTokenKind::Operator, *currentMode.defaultToken);
+            continue;
+        }
+
         const char c = r.peek();
 
         // Whitespace runs emit one token per byte (matches the per-char
@@ -365,8 +582,10 @@ TokenizeResult Tokenizer::tokenize() && {
             const auto hit = longestMatch(*schema_, lexeme, lexemeProbeMax);
             // Only honor the lookup when it covers the entire run; a
             // schema entry like `int` shouldn't claim part of `integer`.
-            const auto sk = (hit.length == lexeme.size()) ? hit.meaning.id : InvalidSchemaToken;
+            const bool fullMatch = (hit.length == lexeme.size());
+            const auto sk = fullMatch ? hit.meaning.id : InvalidSchemaToken;
             emit(CoreTokenKind::Word, sk);
+            if (fullMatch) applyMeaningSideEffects(hit.meaning);
             continue;
         }
 
@@ -398,6 +617,7 @@ TokenizeResult Tokenizer::tokenize() && {
         if (hit.length > 0) {
             r.advance(hit.length);
             emit(coreKindForByte(c), hit.meaning.id);
+            applyMeaningSideEffects(hit.meaning);
             continue;
         }
 
@@ -418,6 +638,29 @@ TokenizeResult Tokenizer::tokenize() && {
         d.actual   = std::format("illegal character 0x{:02x}",
                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
         reporter_->report(std::move(d));
+    }
+
+    // Unterminated body mode: source ended before the active body's
+    // endsAt was matched. Emit one diagnostic per unterminated mode
+    // (excluding the always-on "main"). Diagnostic flavor picks string
+    // vs comment heuristically off the mode name — a config can choose
+    // whichever is most useful for its IDE renderer.
+    while (modeStack.depth() > 1) {
+        const auto& mode = schema_->lexerMode(modeStack.top());
+        const bool looksLikeComment = mode.name.find("comment") != std::string::npos;
+        ParseDiagnostic d;
+        d.code     = looksLikeComment
+            ? DiagnosticCode::P_UnterminatedComment
+            : DiagnosticCode::P_UnterminatedString;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = source_->id();
+        d.span     = SourceSpan::of(static_cast<ByteOffset>(r.size()),
+                                    static_cast<ByteOffset>(r.size()));
+        d.actual   = std::format("EOF inside lexer mode '{}'", mode.name);
+        reporter_->report(std::move(d));
+        modeStack.tryPop();
+        if (!styleStack.empty()) styleStack.pop_back();
+        if (!dynamicSuffix.empty()) dynamicSuffix.pop_back();
     }
 
     // Trailing Eof: span is zero-width at end-of-buffer. TokenStream's contract

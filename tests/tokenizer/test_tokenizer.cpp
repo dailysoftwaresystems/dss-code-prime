@@ -626,3 +626,176 @@ TEST(TokenizerDeath, NullSchemaAborts) {
     EXPECT_DEATH(makeWithNullSchema(src),
                  "dss::Tokenizer fatal: schema is null");
 }
+
+// ── TZ2: lexer modes + string/comment body lexing ─────────────────────────
+//
+// TZ2 wires the LexerModeStack into Tokenizer. The body-mode branch
+// honors `stringStyle.endsAt` / `escapeKind` / `endsAtLongestMatch`
+// and the new `defaultToken.flags` field on `LexerMode`. Comment
+// modes in c-subset (line-comment + block-comment) close
+// v2-gap-catalog row 3's authoring task.
+
+namespace {
+
+[[nodiscard]] H loadTsql(std::string text) {
+    auto loaded = GrammarSchema::loadShipped("tsql-subset");
+    EXPECT_TRUE(loaded.has_value()) << "tsql-subset.lang.json load failed";
+    return H{
+        .src    = SourceBuffer::fromString(std::move(text), "<test>"),
+        .schema = loaded.has_value() ? *loaded : nullptr,
+    };
+}
+
+} // namespace
+
+TEST(Tokenizer, LineCommentEmitsOpenerThenCommentCharsToNewline) {
+    // c-subset line-comment mode: `//` pushes mode; everything up to
+    // the next `\n` becomes a CommentChar; the `\n` consumed as the
+    // closer (last CommentChar in body mode). Tokenizer should then
+    // be back in main mode for any trailing source.
+    auto h      = loadCSubset("// hi\nvar x;");
+    auto result = lex(h);
+    // Tokens: LineCommentStart, ' ', 'h', 'i', '\n', Word("var"),
+    // ' ', Word("x"), Punctuation(';')  ⇒ 9
+    ASSERT_EQ(result.tokens.size(), 9u);
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              h.schema->schemaTokens().find("LineCommentStart"));
+    // Body chars all share the CommentChar schemaKind.
+    const auto commentCharKind = h.schema->schemaTokens().find("CommentChar");
+    EXPECT_EQ(result.tokens[1].schemaKind, commentCharKind);
+    EXPECT_EQ(result.tokens[2].schemaKind, commentCharKind);
+    EXPECT_EQ(result.tokens[3].schemaKind, commentCharKind);
+    EXPECT_EQ(result.tokens[4].schemaKind, commentCharKind);
+    // After the comment body closes, we're back in main mode.
+    EXPECT_EQ(result.tokens[5].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[5]), "var");
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, BlockCommentEmitsOpenerCharsAndClosing) {
+    auto h      = loadCSubset("/* hi */var");
+    auto result = lex(h);
+    // BlockCommentStart, ' ', 'h', 'i', ' ', '*/' (closer chunked
+    // as one defaultToken because endsAt is 2 bytes), Word("var")
+    ASSERT_EQ(result.tokens.size(), 7u);
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              h.schema->schemaTokens().find("BlockCommentStart"));
+    EXPECT_EQ(result.tokens[6].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[6]), "var");
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, UnterminatedLineCommentEmitsDiagnostic) {
+    // Line comment that runs to EOF without a newline. Tokenizer
+    // emits the opener + body chars + a P_UnterminatedComment when
+    // EOF is reached with the mode stack still open.
+    auto h      = loadCSubset("// no newline");
+    auto result = lex(h);
+    EXPECT_GE(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              h.schema->schemaTokens().find("LineCommentStart"));
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedComment);
+}
+
+TEST(Tokenizer, UnterminatedBlockCommentEmitsDiagnostic) {
+    auto h      = loadCSubset("/* nope");
+    auto result = lex(h);
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedComment);
+}
+
+TEST(Tokenizer, TsqlSingleStringDoubledDelimiterEscape) {
+    // SQL string with a doubled single-quote — `'a''b'` represents the
+    // literal `a'b`. The doubled-delimiter branch consumes both quotes
+    // as one StringChar; the trailing `'` closes the mode.
+    auto h      = loadTsql("'a''b'");
+    auto result = lex(h);
+    // StringStart, 'a', "''" (one StringChar), 'b', "'" closer
+    // The closer is emitted by the body-mode endsAt match as the
+    // last StringChar covering the closing `'`.
+    ASSERT_GE(result.tokens.size(), 4u);
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              h.schema->schemaTokens().find("StringStart"));
+    const auto stringCharKind = h.schema->schemaTokens().find("StringChar");
+    EXPECT_EQ(result.tokens[1].schemaKind, stringCharKind);
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, TsqlBracketIdScansToClosingBracket) {
+    // T-SQL bracket-id (`[col name]`) uses doubled-delimiter escape on
+    // `]`. The body mode scans to `]` and emits per-char defaultTokens.
+    auto h      = loadTsql("[col name]");
+    auto result = lex(h);
+    // BracketIdStart, c, o, l, ' ', n, a, m, e, ] (last one closes)
+    ASSERT_GE(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              h.schema->schemaTokens().find("BracketIdStart"));
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, UnterminatedTsqlStringEmitsP_UnterminatedString) {
+    auto h      = loadTsql("'open");
+    auto result = lex(h);
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedString);
+}
+
+TEST(Tokenizer, NestedBlockCommentsDoNotNestPerCStandard) {
+    // C block comments do not nest — `/* /* */ */` closes on the
+    // first `*/`. Tokenizer should pop the block-comment mode at the
+    // first `*/`; the trailing `*/` becomes a stray operator pair in
+    // main mode.
+    auto h      = loadCSubset("/* /* */ */");
+    auto result = lex(h);
+    EXPECT_TRUE(result.diags.empty());
+    // First token is the BlockCommentStart opener.
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              h.schema->schemaTokens().find("BlockCommentStart"));
+    // Some token in the stream is `*` then `/` in main mode (after the
+    // first `*/` closed the body). Find the trailing main-mode StarOp.
+    bool sawTrailingStar = false;
+    for (auto const& tok : result.tokens) {
+        if (tok.schemaKind == h.schema->schemaTokens().find("StarOp")) {
+            sawTrailingStar = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawTrailingStar)
+        << "trailing `*` should appear in main mode (block comments don't nest)";
+}
+
+TEST(Tokenizer, ModeStackResetsBetweenTopLevelStatements) {
+    // After a closed comment, main mode is restored. Multiple comments
+    // in sequence each open + close their own mode without leaking.
+    auto h      = loadCSubset("// one\n/* two */// three\nvar");
+    auto result = lex(h);
+    EXPECT_TRUE(result.diags.empty());
+    // Last non-Eof token must be `var` in main mode.
+    EXPECT_EQ(result.tokens.back().coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens.back()), "var");
+}
+
+TEST(Tokenizer, CommentDefaultTokenFlagsAreEmptySpaceForAstCursorSkip) {
+    // Closes v2-gap-catalog row 3 — the test that pins the contract:
+    // body-mode defaultTokens carry the EmptySpace flag declared in
+    // the schema's `lexerModes.<mode>.defaultToken.flags`. Without
+    // this, the AST cursor wouldn't skip comment bodies.
+    //
+    // The flag travels through the schema, not the Token itself
+    // (TZ1's Token has no flags field; flags are applied at builder
+    // time via `meaning.flagsApplied`). The relevant assertion is
+    // that the schema's CommentChar registration carries the flag,
+    // which the builder applies on pushToken. Pin the schema-side
+    // half here; the builder-side half is exercised by the c-subset
+    // E2E test in TZ3.
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const auto lineCommentModeId = schema->findLexerMode("line-comment");
+    ASSERT_TRUE(lineCommentModeId.valid());
+    auto const& mode = schema->lexerMode(lineCommentModeId);
+    ASSERT_TRUE(mode.defaultToken.has_value());
+    EXPECT_TRUE(isEmptySpace(mode.defaultTokenFlags))
+        << "line-comment defaultToken.flags must include EmptySpace";
+}

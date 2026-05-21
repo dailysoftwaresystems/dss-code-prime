@@ -52,6 +52,9 @@ enum class DiagnosticCode : std::uint16_t {
     P_SchemaCursorDesync          = 0x000D,
     P_IllegalChar                 = 0x000E,
     P_MalformedNumber             = 0x000F,
+    P_UnterminatedString          = 0x0010,
+    P_UnterminatedComment         = 0x0011,
+    P_InvalidEscape               = 0x0012,
 
     // ── P9xxx — builder internal-invariant violations (release-mode rescues) ──
     P_BuilderInvariant            = 0x9000,

@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/tree_node.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -82,18 +83,25 @@ private:
 };
 
 // Metadata for a single named lexer mode. Construct via `make(name, id,
-// defaultToken)`. `id` is required — no default — to keep "Invalid"
-// from sneaking into the factory's contract; callers must commit to
-// a real id at the construction site.
+// defaultToken, defaultTokenFlags)`. `id` is required — no default — to
+// keep "Invalid" from sneaking into the factory's contract; callers
+// must commit to a real id at the construction site.
+//
+// `defaultTokenFlags` lets a config flag every per-codepoint emission
+// in a body mode (e.g. `EmptySpace` on `CommentChar` so the AST cursor
+// skips comment bodies wholesale). Empty when not declared — matches
+// `LexemeMeaning::flagsApplied`'s default.
 struct DSS_EXPORT LexerMode {
     std::string                  name;
     LexerModeId                  id;
     std::optional<SchemaTokenId> defaultToken;
+    NodeFlags                    defaultTokenFlags = NodeFlags::None;
 
     [[nodiscard]] static LexerMode make(std::string name,
                                         LexerModeId id,
-                                        std::optional<SchemaTokenId> defaultToken) {
-        return LexerMode{std::move(name), id, defaultToken};
+                                        std::optional<SchemaTokenId> defaultToken,
+                                        NodeFlags defaultTokenFlags = NodeFlags::None) {
+        return LexerMode{std::move(name), id, defaultToken, defaultTokenFlags};
     }
 };
 

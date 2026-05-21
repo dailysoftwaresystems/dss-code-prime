@@ -115,7 +115,9 @@
       "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_core_test_c_subset.exe)",
       "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_core_test_c_subset.exe --gtest_filter=*SwitchStmt*)",
       "Bash(echo \"Final check exit: $?\")",
-      "Bash(echo \"Final landing-log check exit: $?\")"
+      "Bash(echo \"Final landing-log check exit: $?\")",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' ctest --test-dir build --output-on-failure)",
+      "Bash(PATH='C:\\\\Strawberry\\\\c\\\\bin:__TRACKED_VAR__' build/bin/dss/dss_tokenizer_test_tokenizer.exe --gtest_filter=*MidSourceBom*)"
     ]
   }
 }
