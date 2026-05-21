@@ -154,11 +154,16 @@ struct LookupHit {
 //                   raw strings (C++ `R"DELIM(...)DELIM"`). The full
 //                   close pattern is `endsAt + dynamicSuffix`. Empty
 //                   for static-endsAt configs (the common case).
-// `longestMatch`  — when true, accept the longest run of `endsAt`'s
-//                   single character (e.g. Lua `[==[ ... ]==]` where
-//                   the closer count must match the opener's). When
-//                   the dynamicSuffix is non-empty this flag is
-//                   irrelevant (the dynamic tag IS the disambiguator).
+// `longestMatch`  — when true AND `endsAt.size() == 1` AND no
+//                   dynamicSuffix, eat the entire run of consecutive
+//                   `endsAt` bytes as one close emission (Lua / shell
+//                   heredoc style). Note: this does NOT enforce that
+//                   the closer's run length matches the opener's —
+//                   any non-empty run terminates. When `endsAt` is
+//                   multi-char OR dynamicSuffix is non-empty the flag
+//                   is silently a no-op (exact-length match runs).
+//                   The loader rejects the longestMatch + tagPattern
+//                   combo at load time.
 [[nodiscard]] std::size_t matchEndsAt(SourceReader const& r,
                                       std::string_view endsAt,
                                       std::string_view dynamicSuffix,
@@ -367,92 +372,136 @@ TokenizeResult Tokenizer::tokenize() && {
     // pin it once for the entire tokenize() invocation.
     const std::size_t lexemeProbeMax = schema_->maxLexemeLength();
 
-    // ── lexer-mode stack ─────────────────────────────────────────────────
-    //
-    // Push the schema's "main" mode at start. Every schema synthesizes
-    // "main" at load time (see PR5 loader), so `findLexerMode("main")`
-    // always succeeds in well-formed configs. If for some reason the
-    // schema dropped it we treat as fatal — body-mode lookups would
-    // otherwise have nothing to fall back to.
-    LexerModeStack modeStack;
+    // One stack of `Frame { mode, style, dynamicSuffix }` rather than
+    // three parallel vectors. Atomic push/pop/replace closes the
+    // desync class of bug surfaced in TZ2 review (defensive
+    // `if (!styleStack.empty())` guards used to mask drift between the
+    // three vectors). Every site now goes through frames.push_back /
+    // pop_back / `frames.back() = …` — defensive guards become asserts.
+    struct Frame {
+        LexerModeId        mode;
+        StringStyle const* style;        // null when mode has no opener-stringStyle
+        std::string        dynamicSuffix;
+    };
+    std::vector<Frame> frames;
+
     const auto mainModeId = schema_->findLexerMode("main");
     if (!mainModeId.valid()) tokenizerFatal("schema has no 'main' lexer mode");
-    modeStack.push(mainModeId);
-
-    // Parallel stacks for body-mode metadata. Indexed by mode-stack
-    // depth - 1 (i.e. `styles[i]` is the StringStyle active at depth
-    // i+1). The main mode has no style, so the stacks start empty.
-    // `dynamicSuffix` holds the runtime-captured tag for stringStyles
-    // with non-empty `tagPattern` (C++ raw strings, Rust r#"...#"); an
-    // empty string means "static endsAt only."
-    std::vector<StringStyle const*> styleStack;
-    std::vector<std::string>        dynamicSuffix;
+    frames.push_back(Frame{ .mode = mainModeId, .style = nullptr, .dynamicSuffix = {} });
 
     // Locally-scoped emit helper — collapses the five "construct span +
     // push Token" sites that previously appeared once per branch. The
     // capture-by-reference includes the running `tokens` vector and the
     // `start` offset the loop body sets at each iteration's top.
+    //
+    // `flagsApplied` lets a body-mode emission propagate the mode's
+    // `defaultToken.flags` onto the resulting Token. The builder
+    // OR-merges with the schema meaning's `flagsApplied` at pushToken
+    // time so both sources of flag intent reach the AST.
     ByteOffset start = 0;
     auto emit = [&](CoreTokenKind ck, SchemaTokenId sk,
                     NodeFlags flagsApplied = NodeFlags::None) {
-        (void)flagsApplied;   // reserved — Token has no flags field today
         tokens.push_back(Token{
             .coreKind   = ck,
+            .flags      = flagsApplied,
             .schemaKind = sk,
             .span       = SourceSpan::of(start, static_cast<ByteOffset>(r.position())),
         });
     };
 
+    // Tokenizer-local cache of compiled tagPattern regexes, keyed by
+    // StringStyleId.v. `std::regex` construction is expensive and the
+    // schema's tagPattern is constant per StringStyle for the
+    // tokenizer's lifetime — compiling once per opener was a real perf
+    // cliff for raw-string-heavy sources. Lazily populated on first use.
+    std::unordered_map<std::uint32_t, std::regex> tagRegexCache;
+
     // Apply a meaning's mode-stack side-effect after the corresponding
-    // token has been emitted. `stringStyleId` is also threaded so a
-    // pushMode-with-stringStyle correctly stacks the active style.
+    // token has been emitted. Every mutation to the frame stack lives
+    // here (and at the endsAt-pop site inside the body branch) — no
+    // ad-hoc push/pop scattered around the function.
     auto applyMeaningSideEffects = [&](LexemeMeaning const& m) {
         switch (m.modeOp) {
             case ModeOp::None: break;
             case ModeOp::PushMode: {
-                modeStack.push(m.modeArg);
                 StringStyle const* style = schema_->stringStyle(m);
-                styleStack.push_back(style);
-                dynamicSuffix.emplace_back();
-                // Dynamic tagPattern: capture at opener time so the
-                // body-mode close pattern is `endsAt + capturedTag`.
-                // Only fires when the style has a non-empty tagPattern.
+                // Sanity check: pushing into a defaultToken-bearing
+                // mode without a stringStyle would silently consume
+                // the rest of the source (no escape, no close
+                // detection). That's a schema-author bug; fail loud.
+                if (style == nullptr
+                    && m.modeArg.valid()
+                    && schema_->lexerMode(m.modeArg).defaultToken.has_value()) {
+                    tokenizerFatal("PushMode into a defaultToken-bearing mode without a stringStyle");
+                }
+                std::string captured;
                 if (style && !style->tagPattern.empty()) {
-                    try {
-                        std::regex re(style->tagPattern);
-                        std::cmatch match;
-                        const auto remaining = r.remaining();
-                        // `match_continuous` anchors at the start of
-                        // remaining; greedy by default.
-                        if (std::regex_search(remaining.data(),
-                                              remaining.data() + remaining.size(),
-                                              match, re,
-                                              std::regex_constants::match_continuous)) {
-                            dynamicSuffix.back().assign(match[0].first, match[0].second);
-                            r.advance(static_cast<std::size_t>(match[0].length()));
+                    // Dynamic tagPattern: capture at opener time so
+                    // the body-mode close pattern is `endsAt + tag`.
+                    // Cache keyed by `m.stringStyleId.v` — same
+                    // StringStyle slot reused across multiple openers
+                    // gets a single compiled regex.
+                    auto it = tagRegexCache.find(m.stringStyleId.v);
+                    if (it == tagRegexCache.end()) {
+                        try {
+                            it = tagRegexCache.emplace(m.stringStyleId.v,
+                                                       std::regex(style->tagPattern)).first;
+                        } catch (std::exception const&) {
+                            // Loader pre-validates tagPattern (see
+                            // grammar_schema_json), so a runtime
+                            // construction failure means a deep config
+                            // bug. Surface it loudly rather than
+                            // silently swallowing — would otherwise
+                            // mis-tokenize as static-endsAt only.
+                            tokenizerFatal("tagPattern regex failed to compile at runtime");
                         }
-                    } catch (std::exception const&) {
-                        // tagPattern is loader-validated; a runtime
-                        // regex failure here is a deep config bug. Keep
-                        // tokenizing without a dynamic tag rather than
-                        // crash.
+                    }
+                    std::cmatch match;
+                    const auto remaining = r.remaining();
+                    if (std::regex_search(remaining.data(),
+                                          remaining.data() + remaining.size(),
+                                          match, it->second,
+                                          std::regex_constants::match_continuous)) {
+                        captured.assign(match[0].first, match[0].second);
+                        r.advance(static_cast<std::size_t>(match[0].length()));
                     }
                 }
+                frames.push_back(Frame{
+                    .mode          = m.modeArg,
+                    .style         = style,
+                    .dynamicSuffix = std::move(captured),
+                });
                 break;
             }
             case ModeOp::PopMode: {
-                if (!modeStack.tryPop()) break;
-                if (!styleStack.empty()) styleStack.pop_back();
-                if (!dynamicSuffix.empty()) dynamicSuffix.pop_back();
+                // Main mode (depth 1) must never pop.
+                if (frames.size() <= 1) {
+                    tokenizerFatal("PopMode would underflow the frame stack (main mode unreachable)");
+                }
+                frames.pop_back();
                 break;
             }
-            case ModeOp::ReplaceMode:
-                if (modeStack.depth() > 0) modeStack.replaceTop(m.modeArg);
-                if (!styleStack.empty()) {
-                    styleStack.back() = schema_->stringStyle(m);
-                    if (!dynamicSuffix.empty()) dynamicSuffix.back().clear();
+            case ModeOp::ReplaceMode: {
+                // Replace must operate on a real body frame; replacing
+                // main mode would break the depth-1 invariant.
+                if (frames.size() <= 1) {
+                    tokenizerFatal("ReplaceMode applied at main-mode depth");
                 }
+                StringStyle const* style = schema_->stringStyle(m);
+                // The replaced frame starts with no dynamicSuffix.
+                // Dynamic-tag capture happens only at pushMode time —
+                // a replaceMode meaning that names a tagPattern-bearing
+                // style would silently get an empty suffix here. No
+                // shipped config exercises that combo; if a future one
+                // does, capture logic needs to be hoisted out of the
+                // PushMode arm and applied here too.
+                frames.back() = Frame{
+                    .mode          = m.modeArg,
+                    .style         = style,
+                    .dynamicSuffix = {},
+                };
                 break;
+            }
         }
     };
 
@@ -482,45 +531,48 @@ TokenizeResult Tokenizer::tokenize() && {
     while (!r.isAtEnd()) {
         start = static_cast<ByteOffset>(r.position());
 
-        // ── body-mode branch ────────────────────────────────────────
+        // Body-mode branch — when the current mode declares a
+        // `defaultToken`, we're inside a string body, a comment, or
+        // any other "consume until endsAt" construct. Resolution
+        // order:
+        //   1. doubled-delimiter escape (runs FIRST so `''` reads as
+        //      literal `'`, not opener+closer)
+        //   2. static- or dynamic-endsAt match (closes the body)
+        //   3. char-escape (escapeKind::Char + escape lead char)
+        //   4. one-codepoint fallback emitting the mode's defaultToken
         //
-        // When the current mode declares a `defaultToken`, we're inside
-        // a string body, a comment, or any other "consume until endsAt"
-        // construct. The mode's per-token table is empty (per PR5's
-        // design); resolution is: try endsAt → try escape → emit one
-        // codepoint as defaultToken.
-        const auto& currentMode = schema_->lexerMode(modeStack.top());
+        // `flagsApplied` carries the mode's `defaultToken.flags` to
+        // every body emission — that's how `EmptySpace` reaches the
+        // AST for comment bodies (closes v2-gap-catalog row 3).
+        const auto& topFrame = frames.back();
+        const auto& currentMode = schema_->lexerMode(topFrame.mode);
         if (currentMode.defaultToken.has_value()) {
-            StringStyle const* style = styleStack.empty()
-                ? nullptr
-                : styleStack.back();
-            std::string_view suffix = dynamicSuffix.empty()
-                ? std::string_view{}
-                : std::string_view{dynamicSuffix.back()};
+            const auto& bodyToken = *currentMode.defaultToken;
+            StringStyle const* style = topFrame.style;
+            std::string_view suffix{topFrame.dynamicSuffix};
 
             if (style) {
                 // 1. Doubled-delimiter escape: `''` inside a SQL
-                //    string is a literal `'`, NOT the end of the
-                //    body. Check before plain endsAt match so the
-                //    longer match wins.
+                //    string is a literal `'`, NOT the end of the body.
                 if (style->escapeKind == EscapeKind::DoubledDelimiter
                     && r.remaining().size() >= 2 * style->endsAt.size()
                     && r.remaining().substr(0, style->endsAt.size()) == style->endsAt
                     && r.remaining().substr(style->endsAt.size(), style->endsAt.size()) == style->endsAt) {
                     r.advance(2 * style->endsAt.size());
-                    emit(CoreTokenKind::Operator, *currentMode.defaultToken);
+                    emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
                     continue;
                 }
 
-                // 2. Static-or-dynamic endsAt match: consume + pop mode.
+                // 2. Static-or-dynamic endsAt match: consume + pop frame.
                 if (const auto n = matchEndsAt(r, style->endsAt, suffix,
                                                style->endsAtLongestMatch);
                     n > 0) {
                     r.advance(n);
-                    emit(CoreTokenKind::Operator, *currentMode.defaultToken);
-                    if (!modeStack.tryPop()) tokenizerFatal("mode stack underflow at endsAt");
-                    if (!styleStack.empty()) styleStack.pop_back();
-                    if (!dynamicSuffix.empty()) dynamicSuffix.pop_back();
+                    emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
+                    if (frames.size() <= 1) {
+                        tokenizerFatal("frame stack underflow at endsAt (main mode is unreachable)");
+                    }
+                    frames.pop_back();
                     continue;
                 }
 
@@ -528,6 +580,15 @@ TokenizeResult Tokenizer::tokenize() && {
                 //    as one defaultToken. Permissive — any byte after
                 //    the lead is accepted (P_InvalidEscape only fires
                 //    when the lead is the last byte of the source).
+                //
+                //    A loader bug that sets escapeKind::Char without a
+                //    real escapeChar would default to byte 0 and match
+                //    every NUL byte in the source as an escape lead.
+                //    Loader pre-validates per PR6, but a runtime sanity
+                //    check is cheap belt-and-braces.
+                if (style->escapeKind == EscapeKind::Char && style->escapeChar == 0) {
+                    tokenizerFatal("StringStyle escapeKind=Char with escapeChar=0 — schema bug");
+                }
                 if (style->escapeKind == EscapeKind::Char
                     && static_cast<unsigned char>(r.peek()) == static_cast<unsigned char>(style->escapeChar)) {
                     r.advance(1);
@@ -542,7 +603,7 @@ TokenizeResult Tokenizer::tokenize() && {
                     } else {
                         r.advance(codepointByteCount(r.peek()));
                     }
-                    emit(CoreTokenKind::Operator, *currentMode.defaultToken);
+                    emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
                     continue;
                 }
             }
@@ -551,7 +612,7 @@ TokenizeResult Tokenizer::tokenize() && {
             //    token kind. UTF-8 multi-byte sequences land in one
             //    token (per user-chosen per-codepoint granularity).
             r.advance(codepointByteCount(r.peek()));
-            emit(CoreTokenKind::Operator, *currentMode.defaultToken);
+            emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
             continue;
         }
 
@@ -640,27 +701,32 @@ TokenizeResult Tokenizer::tokenize() && {
         reporter_->report(std::move(d));
     }
 
-    // Unterminated body mode: source ended before the active body's
-    // endsAt was matched. Emit one diagnostic per unterminated mode
-    // (excluding the always-on "main"). Diagnostic flavor picks string
-    // vs comment heuristically off the mode name — a config can choose
-    // whichever is most useful for its IDE renderer.
-    while (modeStack.depth() > 1) {
-        const auto& mode = schema_->lexerMode(modeStack.top());
-        const bool looksLikeComment = mode.name.find("comment") != std::string::npos;
+    // Unterminated body modes: source ended before the active body's
+    // endsAt was matched. Emit one diagnostic per unterminated frame
+    // (excluding the always-on "main" at frames[0]). The diagnostic
+    // flavor comes from the schema-declared `unterminatedFlavor` on
+    // the mode — no more substring-sniffing the mode name. Generic
+    // falls back to P_UnterminatedString since that's the closest
+    // single-code match.
+    while (frames.size() > 1) {
+        const auto& mode = schema_->lexerMode(frames.back().mode);
         ParseDiagnostic d;
-        d.code     = looksLikeComment
-            ? DiagnosticCode::P_UnterminatedComment
-            : DiagnosticCode::P_UnterminatedString;
+        switch (mode.unterminatedFlavor) {
+            case UnterminatedFlavor::Comment:
+                d.code = DiagnosticCode::P_UnterminatedComment;
+                break;
+            case UnterminatedFlavor::String:
+            case UnterminatedFlavor::Generic:
+                d.code = DiagnosticCode::P_UnterminatedString;
+                break;
+        }
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = source_->id();
         d.span     = SourceSpan::of(static_cast<ByteOffset>(r.size()),
                                     static_cast<ByteOffset>(r.size()));
         d.actual   = std::format("EOF inside lexer mode '{}'", mode.name);
         reporter_->report(std::move(d));
-        modeStack.tryPop();
-        if (!styleStack.empty()) styleStack.pop_back();
-        if (!dynamicSuffix.empty()) dynamicSuffix.pop_back();
+        frames.pop_back();
     }
 
     // Trailing Eof: span is zero-width at end-of-buffer. TokenStream's contract

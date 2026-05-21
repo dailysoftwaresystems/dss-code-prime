@@ -82,26 +82,43 @@ private:
     std::vector<LexerModeId> frames_;
 };
 
+// How the tokenizer should flavor a `P_Unterminated*` diagnostic for a
+// mode that's still open at EOF. Schema-declared (not heuristically
+// inferred from the mode name).
+enum class UnterminatedFlavor : std::uint8_t {
+    String,    // default for delimited-string-style modes
+    Comment,   // line- or block-comment modes
+    Generic,   // mode names not in either family
+};
+
+// Schema-declared specification for a body-mode's default token. The
+// bundle makes illegal states unrepresentable: a mode without a
+// defaultToken cannot accidentally carry flags meant for one.
+struct DSS_EXPORT DefaultTokenSpec {
+    SchemaTokenId kind;
+    NodeFlags     flags = NodeFlags::None;
+};
+
 // Metadata for a single named lexer mode. Construct via `make(name, id,
-// defaultToken, defaultTokenFlags)`. `id` is required — no default — to
-// keep "Invalid" from sneaking into the factory's contract; callers
-// must commit to a real id at the construction site.
+// defaultToken, unterminatedFlavor)`. `id` is required — no default —
+// to keep "Invalid" from sneaking into the factory's contract.
 //
-// `defaultTokenFlags` lets a config flag every per-codepoint emission
-// in a body mode (e.g. `EmptySpace` on `CommentChar` so the AST cursor
-// skips comment bodies wholesale). Empty when not declared — matches
-// `LexemeMeaning::flagsApplied`'s default.
+// `defaultToken` is a bundle (kind + flags). Absent when the mode is a
+// pure main-style mode (only per-mode tokens, no per-codepoint
+// fallback). Present for body modes — the flags propagate onto every
+// per-codepoint emission (e.g. `EmptySpace` on a comment body so the
+// AST cursor skips wholesale).
 struct DSS_EXPORT LexerMode {
-    std::string                  name;
-    LexerModeId                  id;
-    std::optional<SchemaTokenId> defaultToken;
-    NodeFlags                    defaultTokenFlags = NodeFlags::None;
+    std::string                       name;
+    LexerModeId                       id;
+    std::optional<DefaultTokenSpec>   defaultToken;
+    UnterminatedFlavor                unterminatedFlavor = UnterminatedFlavor::String;
 
     [[nodiscard]] static LexerMode make(std::string name,
                                         LexerModeId id,
-                                        std::optional<SchemaTokenId> defaultToken,
-                                        NodeFlags defaultTokenFlags = NodeFlags::None) {
-        return LexerMode{std::move(name), id, defaultToken, defaultTokenFlags};
+                                        std::optional<DefaultTokenSpec> defaultToken,
+                                        UnterminatedFlavor flavor = UnterminatedFlavor::String) {
+        return LexerMode{std::move(name), id, defaultToken, flavor};
     }
 };
 

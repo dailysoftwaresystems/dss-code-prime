@@ -685,11 +685,17 @@ void TreeBuilder::pushToken(Token const& tok) {
         popScope();    // emits P_BuilderInvariant on underflow
     }
 
-    // Emit the leaf.
+    // Emit the leaf. The effective flag set is the OR of the schema
+    // meaning's `flagsApplied` (set declaratively on the lexeme entry)
+    // and the tokenizer-supplied `tok.flags` (e.g. `EmptySpace` on
+    // body-mode emissions where the LexerMode declared
+    // `defaultToken.flags`). Both sources of flag intent reach the
+    // AST; closes the v2-gap-catalog row 3 path end-to-end.
+    const NodeFlags effectiveFlags = resolved.meaning.flagsApplied | tok.flags;
     detail::Node leaf{};
     leaf.kind      = NodeKind::Token;
     leaf.tokenKind = resolved.meaning.id;
-    leaf.flags     = resolved.meaning.flagsApplied;
+    leaf.flags     = effectiveFlags;
     leaf.span      = tok.span;
     const NodeId id = emit_(leaf);
     attachToCurrentFrame_(id);
@@ -704,7 +710,7 @@ void TreeBuilder::pushToken(Token const& tok) {
     // build, future contextual resolutions stay strict per the fallback
     // above, and the first valid → invalid transition surfaces one
     // P_SchemaCursorDesync.
-    if (!isEmptySpace(resolved.meaning.flagsApplied)) {
+    if (!isEmptySpace(effectiveFlags)) {
         const bool wasValid = cursor_.valid();
         cursor_ = schema_->advance(cursor_, resolved.meaning.id);
         noteCursorDesync_(wasValid, cursor_.valid(), tok.span,

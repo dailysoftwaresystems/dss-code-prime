@@ -680,6 +680,18 @@ TEST(Tokenizer, BlockCommentEmitsOpenerCharsAndClosing) {
     ASSERT_EQ(result.tokens.size(), 7u);
     EXPECT_EQ(result.tokens[0].schemaKind,
               h.schema->schemaTokens().find("BlockCommentStart"));
+    const auto commentCharKind = h.schema->schemaTokens().find("CommentChar");
+    EXPECT_EQ(result.tokens[1].schemaKind, commentCharKind);
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), " ");
+    EXPECT_EQ(result.tokens[2].schemaKind, commentCharKind);
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "h");
+    EXPECT_EQ(result.tokens[3].schemaKind, commentCharKind);
+    EXPECT_EQ(textOf(*h.src, result.tokens[3]), "i");
+    EXPECT_EQ(result.tokens[4].schemaKind, commentCharKind);
+    EXPECT_EQ(textOf(*h.src, result.tokens[4]), " ");
+    EXPECT_EQ(result.tokens[5].schemaKind, commentCharKind);
+    EXPECT_EQ(textOf(*h.src, result.tokens[5]), "*/");
+    EXPECT_EQ(result.tokens[5].span.length(), 2u);
     EXPECT_EQ(result.tokens[6].coreKind, CoreTokenKind::Word);
     EXPECT_EQ(textOf(*h.src, result.tokens[6]), "var");
     EXPECT_TRUE(result.diags.empty());
@@ -687,13 +699,19 @@ TEST(Tokenizer, BlockCommentEmitsOpenerCharsAndClosing) {
 
 TEST(Tokenizer, UnterminatedLineCommentEmitsDiagnostic) {
     // Line comment that runs to EOF without a newline. Tokenizer
-    // emits the opener + body chars + a P_UnterminatedComment when
-    // EOF is reached with the mode stack still open.
+    // emits the opener + 11 body chars (` no newline` = 11 bytes) +
+    // a P_UnterminatedComment when EOF is reached with the frame
+    // stack still open.
     auto h      = loadCSubset("// no newline");
     auto result = lex(h);
-    EXPECT_GE(result.tokens.size(), 1u);
+    ASSERT_EQ(result.tokens.size(), 12u);
     EXPECT_EQ(result.tokens[0].schemaKind,
               h.schema->schemaTokens().find("LineCommentStart"));
+    const auto commentCharKind = h.schema->schemaTokens().find("CommentChar");
+    for (std::size_t i = 1; i < result.tokens.size(); ++i) {
+        EXPECT_EQ(result.tokens[i].schemaKind, commentCharKind)
+            << "token " << i << " should be CommentChar";
+    }
     ASSERT_EQ(result.diags.size(), 1u);
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedComment);
 }
@@ -707,30 +725,42 @@ TEST(Tokenizer, UnterminatedBlockCommentEmitsDiagnostic) {
 
 TEST(Tokenizer, TsqlSingleStringDoubledDelimiterEscape) {
     // SQL string with a doubled single-quote — `'a''b'` represents the
-    // literal `a'b`. The doubled-delimiter branch consumes both quotes
-    // as one StringChar; the trailing `'` closes the mode.
+    // literal `a'b`. Token breakdown:
+    //   [0] `'`  StringStart (opener)
+    //   [1] `a`  StringChar  (per-codepoint default)
+    //   [2] `''` StringChar  (doubled-delim escape — 2 bytes)
+    //   [3] `b`  StringChar  (per-codepoint default)
+    //   [4] `'`  StringChar  (endsAt-match close — pops frame)
     auto h      = loadTsql("'a''b'");
     auto result = lex(h);
-    // StringStart, 'a', "''" (one StringChar), 'b', "'" closer
-    // The closer is emitted by the body-mode endsAt match as the
-    // last StringChar covering the closing `'`.
-    ASSERT_GE(result.tokens.size(), 4u);
+    ASSERT_EQ(result.tokens.size(), 5u);
     EXPECT_EQ(result.tokens[0].schemaKind,
               h.schema->schemaTokens().find("StringStart"));
     const auto stringCharKind = h.schema->schemaTokens().find("StringChar");
     EXPECT_EQ(result.tokens[1].schemaKind, stringCharKind);
+    EXPECT_EQ(result.tokens[2].schemaKind, stringCharKind);
+    EXPECT_EQ(result.tokens[3].schemaKind, stringCharKind);
+    EXPECT_EQ(result.tokens[4].schemaKind, stringCharKind);
+    // The doubled-delim token spans 2 bytes; the close spans 1.
+    EXPECT_EQ(result.tokens[2].span.length(), 2u);
+    EXPECT_EQ(result.tokens[4].span.length(), 1u);
     EXPECT_TRUE(result.diags.empty());
 }
 
 TEST(Tokenizer, TsqlBracketIdScansToClosingBracket) {
     // T-SQL bracket-id (`[col name]`) uses doubled-delimiter escape on
-    // `]`. The body mode scans to `]` and emits per-char defaultTokens.
+    // `]`. The body mode emits per-codepoint defaultTokens. Token
+    // breakdown: BracketIdStart + 8 chars (`col name`) + `]` closer = 10.
     auto h      = loadTsql("[col name]");
     auto result = lex(h);
-    // BracketIdStart, c, o, l, ' ', n, a, m, e, ] (last one closes)
-    ASSERT_GE(result.tokens.size(), 2u);
+    ASSERT_EQ(result.tokens.size(), 10u);
     EXPECT_EQ(result.tokens[0].schemaKind,
               h.schema->schemaTokens().find("BracketIdStart"));
+    const auto bracketCharKind = h.schema->schemaTokens().find("BracketIdChar");
+    for (std::size_t i = 1; i < result.tokens.size(); ++i) {
+        EXPECT_EQ(result.tokens[i].schemaKind, bracketCharKind)
+            << "token " << i << " should be BracketIdChar (body defaultToken)";
+    }
     EXPECT_TRUE(result.diags.empty());
 }
 
@@ -743,34 +773,58 @@ TEST(Tokenizer, UnterminatedTsqlStringEmitsP_UnterminatedString) {
 
 TEST(Tokenizer, NestedBlockCommentsDoNotNestPerCStandard) {
     // C block comments do not nest — `/* /* */ */` closes on the
-    // first `*/`. Tokenizer should pop the block-comment mode at the
-    // first `*/`; the trailing `*/` becomes a stray operator pair in
-    // main mode.
+    // first `*/`. Token-by-token breakdown (source positions):
+    //   [0] `/*`  (0..2) BlockCommentStart  opener pushes body mode
+    //   [1] ` `   (2)    CommentChar         body codepoint
+    //   [2] `/`   (3)    CommentChar         body codepoint (NOT opener — we're in body)
+    //   [3] `*`   (4)    CommentChar         body codepoint
+    //   [4] ` `   (5)    CommentChar         body codepoint
+    //   [5] `*/`  (6..8) CommentChar         endsAt match closes body
+    //   [6] ` `   (8)    Whitespace          back in main mode
+    //   [7] `*`   (9)    StarOp              stray main-mode operator
+    //   [8] `/`   (10)   SlashOp             stray main-mode operator
     auto h      = loadCSubset("/* /* */ */");
     auto result = lex(h);
     EXPECT_TRUE(result.diags.empty());
-    // First token is the BlockCommentStart opener.
+    ASSERT_EQ(result.tokens.size(), 9u);
     EXPECT_EQ(result.tokens[0].schemaKind,
               h.schema->schemaTokens().find("BlockCommentStart"));
-    // Some token in the stream is `*` then `/` in main mode (after the
-    // first `*/` closed the body). Find the trailing main-mode StarOp.
-    bool sawTrailingStar = false;
-    for (auto const& tok : result.tokens) {
-        if (tok.schemaKind == h.schema->schemaTokens().find("StarOp")) {
-            sawTrailingStar = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(sawTrailingStar)
-        << "trailing `*` should appear in main mode (block comments don't nest)";
+    EXPECT_EQ(result.tokens[5].schemaKind,
+              h.schema->schemaTokens().find("CommentChar"));
+    EXPECT_EQ(textOf(*h.src, result.tokens[5]), "*/");
+    // Pin position: trailing `*` must be at source byte 9 (the second
+    // `*/` pair), not somewhere earlier where a regression that
+    // mishandled the nested `/*` would mis-place it.
+    EXPECT_EQ(result.tokens[7].schemaKind,
+              h.schema->schemaTokens().find("StarOp"));
+    EXPECT_EQ(result.tokens[7].span.start(), 9u);
+    EXPECT_EQ(result.tokens[8].schemaKind,
+              h.schema->schemaTokens().find("SlashOp"));
+    EXPECT_EQ(result.tokens[8].span.start(), 10u);
 }
 
 TEST(Tokenizer, ModeStackResetsBetweenTopLevelStatements) {
     // After a closed comment, main mode is restored. Multiple comments
     // in sequence each open + close their own mode without leaking.
+    // Token breakdown for `// one\n/* two */// three\nvar`:
+    //   `// one\n`     → 1 opener + 5 body chars (` one\n` close) = 6
+    //   `/* two */`    → 1 opener + 6 body chars (` two `, `*/` close) = 7
+    //   `// three\n`   → 1 opener + 7 body chars (` three\n` close) = 8
+    //   `var`          → 1 Word = 1
+    // Total = 22 tokens (Eof is not pushed into the test vector).
     auto h      = loadCSubset("// one\n/* two */// three\nvar");
     auto result = lex(h);
     EXPECT_TRUE(result.diags.empty());
+    ASSERT_EQ(result.tokens.size(), 22u);
+    // Openers land at the expected indices — proves frames closed
+    // correctly between them (otherwise the second comment would
+    // never run its opener; its `/*`/`//` would be body chars).
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              h.schema->schemaTokens().find("LineCommentStart"));
+    EXPECT_EQ(result.tokens[6].schemaKind,
+              h.schema->schemaTokens().find("BlockCommentStart"));
+    EXPECT_EQ(result.tokens[13].schemaKind,
+              h.schema->schemaTokens().find("LineCommentStart"));
     // Last non-Eof token must be `var` in main mode.
     EXPECT_EQ(result.tokens.back().coreKind, CoreTokenKind::Word);
     EXPECT_EQ(textOf(*h.src, result.tokens.back()), "var");
@@ -796,6 +850,310 @@ TEST(Tokenizer, CommentDefaultTokenFlagsAreEmptySpaceForAstCursorSkip) {
     ASSERT_TRUE(lineCommentModeId.valid());
     auto const& mode = schema->lexerMode(lineCommentModeId);
     ASSERT_TRUE(mode.defaultToken.has_value());
-    EXPECT_TRUE(isEmptySpace(mode.defaultTokenFlags))
+    EXPECT_TRUE(isEmptySpace(mode.defaultToken->flags))
         << "line-comment defaultToken.flags must include EmptySpace";
+}
+
+// ── TZ2 review-fix: previously-untested body-mode branches (H6–H10) ──────
+//
+// The shipped configs exercise the doubled-delimiter and no-escape branches
+// of the body-mode dispatcher. The remaining four branches — char-escape,
+// endsAtLongestMatch, replaceMode, and explicit popMode — had no end-to-end
+// tokenizer coverage prior to the TZ2 review. Inline schemas pin each.
+
+namespace {
+
+// H6: escapeKind:"char" — backslash escape fuses lead byte + next
+// codepoint into one defaultToken. Body branch order puts char-escape
+// AFTER the endsAt check, so `\"` inside the string does NOT close.
+constexpr std::string_view kCharEscapeSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "X", "version": "0.1.0" },
+  "lexerModes": {
+    "main":   { "tokens": "default" },
+    "string": {
+      "defaultToken":   { "kind": "StringChar" },
+      "unterminatedAs": "string"
+    }
+  },
+  "tokens": {
+    "\"": [{
+      "kind":        "StringStart",
+      "modeOp":      "pushMode",
+      "modeArg":     "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }]
+  },
+  "shapes": { "root": { "sequence": [ "StringStart" ] } }
+})JSON";
+
+// H7: endsAtLongestMatch with a 1-char endsAt. Body's `]` close eats
+// the entire trailing run (Lua heredoc-style — 3 `]` produce ONE close
+// emission, not three).
+constexpr std::string_view kLongestMatchSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "X", "version": "0.1.0" },
+  "lexerModes": {
+    "main":   { "tokens": "default" },
+    "heredoc": {
+      "defaultToken":   { "kind": "HereChar" },
+      "unterminatedAs": "string"
+    }
+  },
+  "tokens": {
+    "[": [{
+      "kind":        "HereOpen",
+      "modeOp":      "pushMode",
+      "modeArg":     "heredoc",
+      "stringStyle": { "escapeKind": "none", "endsAt": "]", "endsAtLongestMatch": true }
+    }]
+  },
+  "shapes": { "root": { "sequence": [ "HereOpen" ] } }
+})JSON";
+
+// H8: replaceMode swaps the active body without push/pop. Mode-a has
+// no defaultToken so the global lookup runs there — `@` resolves to
+// the Swap meaning, replacing frames.back() with mode-b. The `]` then
+// pops; frame stack ends at depth-1 (no unterminated diagnostic).
+constexpr std::string_view kReplaceModeSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "X", "version": "0.1.0" },
+  "lexerModes": {
+    "main":   { "tokens": "default" },
+    "mode-a": { },
+    "mode-b": { }
+  },
+  "tokens": {
+    "[": [{ "kind": "AStart", "modeOp": "pushMode",    "modeArg": "mode-a" }],
+    "@": [{ "kind": "Swap",   "modeOp": "replaceMode", "modeArg": "mode-b" }],
+    "]": [{ "kind": "BEnd",   "modeOp": "popMode" }]
+  },
+  "shapes": { "root": { "sequence": [ "AStart" ] } }
+})JSON";
+
+// H9: explicit popMode — independent of stringStyle.endsAt. The body's
+// own opener pushes mode; an explicit `>` token (in non-body subMode)
+// pops it. Distinct from comment modes which pop via endsAt match.
+constexpr std::string_view kExplicitPopSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "X", "version": "0.1.0" },
+  "lexerModes": {
+    "main": { "tokens": "default" },
+    "sub":  { }
+  },
+  "tokens": {
+    "<": [{ "kind": "SubOpen",  "modeOp": "pushMode", "modeArg": "sub" }],
+    ">": [{ "kind": "SubClose", "modeOp": "popMode" }]
+  },
+  "shapes": { "root": { "sequence": [ "SubOpen" ] } }
+})JSON";
+
+// H10: doubledDelimiter — a non-doubled endsAt closes the body. The
+// branch order is doubled-delim FIRST, endsAt SECOND; pin that a
+// single occurrence falls through to endsAt and pops the frame.
+constexpr std::string_view kDoubledDelimSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "X", "version": "0.1.0" },
+  "lexerModes": {
+    "main":   { "tokens": "default" },
+    "string": {
+      "defaultToken":   { "kind": "StringChar" },
+      "unterminatedAs": "string"
+    }
+  },
+  "tokens": {
+    "'": [{
+      "kind":        "StringStart",
+      "modeOp":      "pushMode",
+      "modeArg":     "string",
+      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "'" }
+    }]
+  },
+  "shapes": { "root": { "sequence": [ "StringStart" ] } }
+})JSON";
+
+[[nodiscard]] LexResult lexInline(std::string_view schemaText, std::string sourceText) {
+    auto loaded = GrammarSchema::loadFromText(schemaText);
+    EXPECT_TRUE(loaded.has_value())
+        << "inline schema load failed: "
+        << (loaded.has_value() ? "<ok>" : loaded.error()[0].message);
+    H h{
+        .src    = SourceBuffer::fromString(std::move(sourceText), "<inline>"),
+        .schema = loaded.has_value() ? *loaded : nullptr,
+    };
+    return lex(std::move(h));
+}
+
+} // namespace
+
+TEST(Tokenizer, CharEscapeBranchFusesLeadAndNextCodepoint) {
+    // Source: `"a\"b"` — opener, 'a', escape-pair `\"`, 'b', closer = 5.
+    // The `\"` MUST NOT close the string; it's swallowed by char-escape.
+    auto result = lexInline(kCharEscapeSchema, "\"a\\\"b\"");
+    ASSERT_EQ(result.tokens.size(), 5u);
+    EXPECT_TRUE(result.diags.empty());
+    // First token is the opener; remaining four are StringChar.
+    auto loaded = GrammarSchema::loadFromText(kCharEscapeSchema);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              (*loaded)->schemaTokens().find("StringStart"));
+    const auto stringChar = (*loaded)->schemaTokens().find("StringChar");
+    EXPECT_EQ(result.tokens[1].schemaKind, stringChar);  // 'a'
+    EXPECT_EQ(result.tokens[2].schemaKind, stringChar);  // '\"' fused
+    EXPECT_EQ(result.tokens[3].schemaKind, stringChar);  // 'b'
+    EXPECT_EQ(result.tokens[4].schemaKind, stringChar);  // closer
+    // The escape-pair token is 2 bytes wide (`\` + `"`), not 1.
+    EXPECT_EQ(result.tokens[2].span.length(), 2u);
+}
+
+TEST(Tokenizer, EndsAtLongestMatchEatsConsecutiveRun) {
+    // Source: `[x]]]`. After the opener, body emits one HereChar for
+    // 'x' then a single endsAt match consuming THREE `]` chars (the
+    // longest-run rule). Total tokens: opener + 'x' + close = 3.
+    auto result = lexInline(kLongestMatchSchema, "[x]]]");
+    EXPECT_TRUE(result.diags.empty());
+    ASSERT_EQ(result.tokens.size(), 3u);
+    auto loaded = GrammarSchema::loadFromText(kLongestMatchSchema);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              (*loaded)->schemaTokens().find("HereOpen"));
+    const auto hereChar = (*loaded)->schemaTokens().find("HereChar");
+    EXPECT_EQ(result.tokens[1].schemaKind, hereChar);
+    EXPECT_EQ(result.tokens[2].schemaKind, hereChar);
+    // The close token covers all three `]` bytes.
+    EXPECT_EQ(result.tokens[2].span.length(), 3u);
+}
+
+TEST(Tokenizer, ReplaceModeSwapsActiveFrameWithoutDepthChange) {
+    // Source: `[@]`. AStart pushes mode-a (depth 2); `@` runs Swap
+    // which replaceMode's frames.back() to mode-b (still depth 2);
+    // `]` runs BEnd popMode (depth 1). No unterminated diagnostic.
+    auto result = lexInline(kReplaceModeSchema, "[@]");
+    EXPECT_TRUE(result.diags.empty());
+    ASSERT_EQ(result.tokens.size(), 3u);
+    auto loaded = GrammarSchema::loadFromText(kReplaceModeSchema);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              (*loaded)->schemaTokens().find("AStart"));
+    EXPECT_EQ(result.tokens[1].schemaKind,
+              (*loaded)->schemaTokens().find("Swap"));
+    EXPECT_EQ(result.tokens[2].schemaKind,
+              (*loaded)->schemaTokens().find("BEnd"));
+}
+
+TEST(Tokenizer, ExplicitPopModeClosesFrameWithoutEndsAt) {
+    // Source: `<>`. SubOpen pushes mode `sub`; SubClose pops it.
+    // No defaultToken means the global lookup runs inside `sub` — the
+    // popMode path is exercised independently of endsAt-based close.
+    auto result = lexInline(kExplicitPopSchema, "<>");
+    EXPECT_TRUE(result.diags.empty());
+    ASSERT_EQ(result.tokens.size(), 2u);
+    auto loaded = GrammarSchema::loadFromText(kExplicitPopSchema);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              (*loaded)->schemaTokens().find("SubOpen"));
+    EXPECT_EQ(result.tokens[1].schemaKind,
+              (*loaded)->schemaTokens().find("SubClose"));
+}
+
+TEST(Tokenizer, DoubledDelimiterSingleOccurrenceClosesBody) {
+    // Source: `'a'`. Body branch order: doubled-delim FIRST (needs 2
+    // `'`, fails — only 1 left). Falls through to endsAt match (1 `'`,
+    // succeeds). Body pops; total tokens: opener + 'a' + close = 3.
+    auto result = lexInline(kDoubledDelimSchema, "'a'");
+    EXPECT_TRUE(result.diags.empty());
+    ASSERT_EQ(result.tokens.size(), 3u);
+    auto loaded = GrammarSchema::loadFromText(kDoubledDelimSchema);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(result.tokens[0].schemaKind,
+              (*loaded)->schemaTokens().find("StringStart"));
+    const auto stringChar = (*loaded)->schemaTokens().find("StringChar");
+    EXPECT_EQ(result.tokens[1].schemaKind, stringChar);
+    EXPECT_EQ(result.tokens[2].schemaKind, stringChar);
+    // The closer is 1 byte; the doubled-delim branch did NOT swallow it.
+    EXPECT_EQ(result.tokens[2].span.length(), 1u);
+}
+
+// ── CR1 follow-on: Token.flags reach AST nodes via TreeBuilder ───────────
+//
+// The CommentDefaultTokenFlagsAreEmptySpaceForAstCursorSkip test pins
+// the schema half (the mode's defaultToken.flags carries EmptySpace).
+// This test pins the end-to-end half: tokenizer stamps Token.flags from
+// the mode's defaultToken.flags, TreeBuilder's effectiveFlags OR-merges
+// `meaning.flagsApplied | tok.flags`, and the leaf node carries the bit.
+//
+// Constructing a config where the OR truly *needs* `tok.flags` requires
+// the body's schemaKind to resolve via the global lexeme table to a
+// meaning whose own flagsApplied does NOT carry EmptySpace. That way a
+// regression that drops `tok.flags` from the merge would leave the
+// resulting node without EmptySpace, and the test fails loudly.
+//
+// `plain` token (no flags) appears in the global table; the lexer mode
+// `body` declares defaultToken { kind: Plain, flags: ["EmptySpace"] }.
+// The body emits `plain`-kind tokens with EmptySpace set on Token.flags.
+// The builder's resolveMeaning re-looks-up `x` against the global table,
+// finds the Plain meaning (no flags), then OR-merges Token.flags →
+// effectiveFlags = EmptySpace. Drop the OR and the leaf loses the bit.
+
+namespace {
+
+constexpr std::string_view kFlagPropagationSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "X", "version": "0.1.0" },
+  "lexerModes": {
+    "main": { "tokens": "default" },
+    "body": {
+      "defaultToken":   { "kind": "Plain", "flags": ["EmptySpace"] },
+      "unterminatedAs": "string"
+    }
+  },
+  "tokens": {
+    "x": [{ "kind": "Plain" }],
+    "(": [{
+      "kind": "BodyOpen", "modeOp": "pushMode", "modeArg": "body",
+      "stringStyle": { "escapeKind": "none", "endsAt": ")" }
+    }]
+  },
+  "shapes": { "root": { "sequence": [ "BodyOpen" ] } }
+})JSON";
+
+} // namespace
+
+TEST(Tokenizer, TokenFlags_PropagateToBuilderLeafFlags) {
+    auto loaded = GrammarSchema::loadFromText(kFlagPropagationSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("(x)", "<flag-prop>");
+
+    Tokenizer tk{src, schema};
+    auto tokenizeResult = std::move(tk).tokenize();
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        while (!tokenizeResult.stream.isAtEnd()) {
+            b.pushToken(tokenizeResult.stream.advance());
+        }
+    }
+    Tree t = std::move(b).finish();
+
+    // Locate the `x` leaf. Its global meaning is Plain (no flags), so
+    // any EmptySpace flag on the resulting node MUST have come from
+    // Token.flags via the effectiveFlags OR.
+    const auto plainKind = schema->schemaTokens().find("Plain");
+    NodeId xLeaf{};
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) != NodeKind::Token) continue;
+        if (t.tokenKind(id) != plainKind) continue;
+        // The `x` byte is at source position 1 (opener `(` is byte 0).
+        if (t.span(id).start() != 1) continue;
+        xLeaf = id;
+        break;
+    }
+    ASSERT_TRUE(xLeaf.valid()) << "Plain leaf for `x` not found in tree";
+    EXPECT_TRUE(isEmptySpace(t.flags(xLeaf)))
+        << "Token.flags did not OR-merge into the leaf's effective flags — "
+        << "CR1's effectiveFlags wiring is regressed";
 }

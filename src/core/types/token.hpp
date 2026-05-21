@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/tree_node.hpp"
 
 #include <cstdint>
 #include <type_traits>
@@ -55,8 +56,18 @@ enum class CoreTokenKind : std::uint16_t {
 //                lexeme via the full candidate-filter path.
 // - span       : byte range in the source buffer. The lexeme text is recovered
 //                via SourceBuffer::slice(span); never stored on the token itself.
+// Tokenizer-supplied flags. Today this is just `EmptySpace` flagged by
+// the tokenizer on body-mode emissions when the mode declares
+// `defaultToken.flags`. The builder OR-merges these with the
+// resolved meaning's `flagsApplied` at pushToken time so both sources
+// of flag intent propagate to the resulting Node.
+//
+// (`Missing`/`Synthetic`/`HasError` are set by the builder, never the
+// tokenizer — but the field is the same type to keep the merge
+// boolean-OR simple.)
 struct DSS_EXPORT Token {
     CoreTokenKind coreKind   = CoreTokenKind::Unknown;
+    NodeFlags     flags      = NodeFlags::None;
     SchemaTokenId schemaKind = InvalidSchemaToken;
     SourceSpan    span       = SourceSpan::empty(0);
 };

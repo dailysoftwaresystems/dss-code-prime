@@ -306,6 +306,18 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         s.tagPattern = kDefaultTagPattern;
     }
 
+    // Cross-field validation: longest-match terminator does not
+    // compose with dynamic-tag matching. The tokenizer's tag-aware
+    // close (regex+endsAt) doesn't honor longest-match, so the two
+    // flags silently disagree if both are set. Reject at load.
+    if (s.endsAtLongestMatch && !s.tagPattern.empty()) {
+        c.emit(DiagnosticCode::C_ConflictingField,
+               std::format("{}/endsAtLongestMatch", path),
+               "'endsAtLongestMatch' is incompatible with 'delimiterTag: \"matched\"' "
+               "(longest-match close is not honored for dynamic tags)");
+        return std::nullopt;
+    }
+
     // Validate regex at load. Catch std::regex_error specifically; any
     // other exception (std::bad_alloc, system errors) signals a deeper
     // problem we don't want to silently translate to a diagnostic.
@@ -1376,8 +1388,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             // Parse defaultToken into a local; the mode entry is then
             // rebuilt via the factory rather than mutated in place.
-            std::optional<SchemaTokenId> defaultToken;
-            NodeFlags                    defaultTokenFlags = NodeFlags::None;
+            std::optional<DefaultTokenSpec> defaultToken;
             if (modeObj.contains("defaultToken")) {
                 json const& dt = modeObj.at("defaultToken");
                 if (!dt.is_object() || !dt.contains("kind") ||
@@ -1386,7 +1397,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               std::format("{}/defaultToken", modePath),
                               "'defaultToken' must be an object with a string 'kind'");
                 } else {
-                    defaultToken = data.schemaTokens->intern(
+                    DefaultTokenSpec spec;
+                    spec.kind = data.schemaTokens->intern(
                         dt.at("kind").get<std::string>());
                     // Optional `flags` field — propagates onto every
                     // per-codepoint emission the tokenizer makes in
@@ -1394,11 +1406,39 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // chars as EmptySpace so the AST cursor skips them
                     // wholesale (closes v2-gap-catalog row 3 cleanly).
                     if (dt.contains("flags")) {
-                        defaultTokenFlags = parseFlagList(dt.at("flags"));
+                        spec.flags = parseFlagList(dt.at("flags"));
+                    }
+                    defaultToken = spec;
+                }
+            }
+
+            // Optional `unterminatedAs` field — declares the
+            // diagnostic flavor when this mode is still open at EOF.
+            // Replaces the previous tokenizer-side substring heuristic
+            // ("mode name contains 'comment'") with an explicit
+            // schema-declared value. Defaults to `String` for
+            // backward compat with existing tsql-subset configs.
+            UnterminatedFlavor flavor = UnterminatedFlavor::String;
+            if (modeObj.contains("unterminatedAs")) {
+                json const& ua = modeObj.at("unterminatedAs");
+                if (!ua.is_string()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/unterminatedAs", modePath),
+                              "'unterminatedAs' must be a string");
+                } else {
+                    const auto v = ua.get<std::string>();
+                    if      (v == "string")  flavor = UnterminatedFlavor::String;
+                    else if (v == "comment") flavor = UnterminatedFlavor::Comment;
+                    else if (v == "generic") flavor = UnterminatedFlavor::Generic;
+                    else {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/unterminatedAs", modePath),
+                                  std::format("unknown 'unterminatedAs' value '{}' — "
+                                              "expected one of \"string\", \"comment\", \"generic\"", v));
                     }
                 }
             }
-            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken, defaultTokenFlags);
+            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken, flavor);
 
             // tokens field: "default" inherits top-level lexemeTable;
             // an inline object IS the per-mode table (parsing deferred).

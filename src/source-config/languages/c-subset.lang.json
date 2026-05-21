@@ -9,8 +9,14 @@
 
   "lexerModes": {
     "main":          { "tokens": "default" },
-    "line-comment":  { "defaultToken": { "kind": "CommentChar", "flags": ["EmptySpace"] } },
-    "block-comment": { "defaultToken": { "kind": "CommentChar", "flags": ["EmptySpace"] } }
+    "line-comment":  {
+      "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
+      "unterminatedAs":  "comment"
+    },
+    "block-comment": {
+      "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
+      "unterminatedAs":  "comment"
+    }
   },
 
   "tokens": {
