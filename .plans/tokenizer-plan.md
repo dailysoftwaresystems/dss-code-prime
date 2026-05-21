@@ -2,6 +2,24 @@
 
 > Opens parent plan #5 (`tokenizer`). The first real consumer of v2's `lexerModes` + `stringStyle` machinery. Three PRs (TZ1–TZ3); bounded scope; the per-PR cadence from v2 / SH applies.
 
+> ## 🔖 Session resumption note (set 2026-05-21)
+>
+> **Next action: review TZ3** before opening the parser phase (#7).
+>
+> TZ3 shipped as commit `fa0df8d` on branch `feature/tokenizer-plan` without going through the per-PR 5-agent review cadence the v2 / SH / TZ1 / TZ2 discipline calls for. That was a deliberate trade — TZ3 was test-flip plumbing and every body-mode failure surfaced and was fixed inline — but the review still needs running before merging or moving on to phase #7.
+>
+> **Cadence to follow** (same as TZ2 round 2):
+> 1. Run `/pr-review-toolkit:review-pr` covering `code`, `simplify`, `tests`, `errors`, `types` reviewers in parallel against the TZ3 diff (`git diff main..feature/tokenizer-plan -- src/ tests/`).
+> 2. Triage findings (Critical / High / Medium / Low).
+> 3. If non-trivial, address with a "Fix everything" commit appended to this branch (same shape as `8612486`).
+> 4. Update this row's hash list + close `v2-gap-catalog.md` row 3's status if any review-driven changes touch it.
+>
+> **Specific things to keep an eye on:**
+> - The new `resolveMeaning` fast-path B trusting `tok.schemaKind` when candidates are empty — single most semantically loaded change. Confirm `Error`-kind exclusion is the right line.
+> - `bodyDefaultTokenKinds_` set populated from `schema_->lexerModes()` at ctor time — verify this stays correct under schema-with-no-modes (toy).
+> - Tokenizer's id-start vs longest-match preference — confirm `if` / `if_foo` / `Nxyz` regression coverage is in place (currently implicit; TZ2's `loy.lang.json` tests cover `if`, `Nxyz` isn't a real schema entry but the logic gates on `length > identLen` so the existing toy-keyword tests prove the not-prefer case).
+> - 3 new body-mode E2E pins in `test_tsql_subset.cpp` — token-count + key-leaf assertions. The strictness level matches the user-chosen "pin full token stream count + key leaves" option.
+
 ## 0. Status (snapshot)
 
 | | |
