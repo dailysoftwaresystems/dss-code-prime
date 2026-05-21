@@ -123,7 +123,7 @@ struct LookupHit {
 // ── UTF-8 codepoint length ────────────────────────────────────────────────
 //
 // In a body mode (where the user chose per-codepoint defaultToken
-// emission — see `.plans/tokenizer-plan.md` §2.3), the tokenizer needs
+// emission — see `.plans/04-tokenizer-plan - ok.md` §2.3), the tokenizer needs
 // to advance one codepoint at a time, not one byte. UTF-8 lead-byte
 // ranges:
 //   0x00-0x7F   single-byte ASCII (1)
@@ -189,7 +189,7 @@ struct LookupHit {
 
 // ── numeric scan ──────────────────────────────────────────────────────────
 //
-// Hand-coded per `.plans/tokenizer-plan.md` §2.4. The grammar:
+// Hand-coded per `.plans/04-tokenizer-plan - ok.md` §2.4. The grammar:
 //
 //   prefix-int := 0 (x|X) [0-9a-fA-F_]+ suffix?   // hex
 //              |  0 (b|B) [01_]+ suffix?           // binary

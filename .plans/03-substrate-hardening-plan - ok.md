@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Status        | ✅ **done.** SH1–SH4 all shipped. Parent plan #5 (`tokenizer`) is now unblocked. |
-| Predecessors  | ✅ v1 T0–T12 (`tree-node-model-plan.md`); ✅ v2 PR0–PR8 (`schema-expressiveness-v2-plan.md`). |
+| Predecessors  | ✅ v1 T0–T12 (`01-tree-node-model-plan - ok.md`); ✅ v2 PR0–PR8 (`02-schema-expressiveness-v2-plan - ok.md`). |
 | Successors    | Parent plan phase #5 (tokenizer). Cleanly verifying the schema against real tokens is what makes phase #7 (parser) tractable and what surfaces v3 schema gaps in time to act on them. |
 | Scope         | Originally bounded to SH1–SH3 (de-risking). SH4 extends the plan by **explicit user direction** to bundle three small v2-era follow-ups — close-out tightening rather than new substrate work. Anything beyond SH4 still becomes a separate sub-plan. |
 
@@ -142,7 +142,7 @@ Why `NodeId` carries the tag rather than just the `Node` (as the plan's Option A
 
 **Goal.** Close three small v2-era loose ends before the tokenizer phase opens. Each item is independent; bundled into one PR because individually they're not worth a round-trip.
 
-**Why now (deviation from the "bounded" §0 promise).** The original SH plan declared "no other items will be added — anything new becomes a separate sub-plan." SH4 is added by **explicit user direction** after surveying `.plans/v2-gap-catalog.md` against the now-shipped substrate. All three items are close-out cleanup of mechanisms that already exist; none is new substrate work and none warrants a standalone sub-plan.
+**Why now (deviation from the "bounded" §0 promise).** The original SH plan declared "no other items will be added — anything new becomes a separate sub-plan." SH4 is added by **explicit user direction** after surveying `.plans/v2-gap-catalog - tbd.md` against the now-shipped substrate. All three items are close-out cleanup of mechanisms that already exist; none is new substrate work and none warrants a standalone sub-plan.
 
 #### SH4a — `landing-log-check` CI job
 
@@ -169,7 +169,7 @@ The cleaner fix is **shape-based positioning**: declare a dedicated `switchStmt`
   - Add shapes: `switchStmt`, `switchBody`, `caseLabel`, `breakStmt`.
   - Add `switchStmt` and `breakStmt` to the `statement` alt.
 - `tests/core/test_c_subset.cpp`: one happy-path test (`SwitchStmtParsesAllArmKinds`) driving a switch with a case arm, a default arm, and a `break` statement; asserts via full pretty-print equality.
-- Update `.plans/v2-gap-catalog.md` row 11 to record the design call (shape-based, not `scopeRequire`).
+- Update `.plans/v2-gap-catalog - tbd.md` row 11 to record the design call (shape-based, not `scopeRequire`).
 
 **Acceptance.** Happy-path tree shape matches the inline expected literal; existing c-subset and toy tests stay green; the loader still loads c-subset cleanly under `loadShipped`.
 
@@ -213,6 +213,6 @@ Per-PR cadence reuses the v2 discipline: implement → 5-agent review → compre
 ## 4. What comes after
 
 Once SH1–SH4 all land:
-- `compiler-implementation-plan.md` §0 status table: SH row flips to ✅ done.
+- `00-compiler-implementation-plan - tbd.md` §0 status table: SH row flips to ✅ done.
 - Parent plan phase #5 (tokenizer) opens. The lexer can now be the *first* consumer of the schema with confidence that the substrate beneath it is verified across two platforms with no cross-tree footguns AND that nested-alt routing is robust under stress AND that the existing PR3 scope-require mechanism is exercised end-to-end by a real grammar.
 - v2 schema gaps that the tokenizer surfaces (lookahead variants, custom literal patterns, float-literal styling, ternary operator) become candidates for a future `schema-expressiveness-v3-plan.md`.

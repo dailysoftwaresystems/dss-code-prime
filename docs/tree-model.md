@@ -2,7 +2,7 @@
 
 > **For new contributors.** Read this if you want to walk a parsed tree, add a typed view for a new rule, or attach semantic data to nodes. About 30 minutes end-to-end.
 >
-> Internal design rationale (decision records, deviations, history) lives in [`.plans/tree-node-model-plan.md`](../.plans/tree-node-model-plan.md) — you don't need it to use the model.
+> Internal design rationale (decision records, deviations, history) lives in [`.plans/01-tree-node-model-plan - ok.md`](../.plans/01-tree-node-model-plan - ok.md) — you don't need it to use the model.
 
 ---
 
