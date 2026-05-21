@@ -384,6 +384,8 @@ Tokenizers for interpolated strings, here-strings, and multi-language embeddings
 | `tokens` | no | `"default"` inherits the top-level `tokens` map. Inline `{ ... }` object is parsed-deferred (warning emitted; lookup table stays empty until per-mode-inline-tokens lands). |
 | `defaultToken` | no | `{ "kind": "X" }`. Emitted by the tokenizer when nothing else matches the input. Common for `string-body` modes whose body is mostly free text. |
 
+**`defaultToken.kind` is off-grammar.** A kind declared here is implicitly off-grammar — it represents per-codepoint body content that the schema cursor never expects. The builder skips the cursor-advance for those tokens (string/comment bodies stay visible in the AST but don't drive shape matching). Referencing the same kind from any `shapes/*` rule emits `C_BodyDefaultKindInShape` at load time, because the shape's slot would silently never match. Either pick a distinct kind for the shape slot, or stop using the kind as a `defaultToken`.
+
 **Backward compat.** If `lexerModes` is absent the loader synthesizes a `"main"` mode pointing at the top-level `tokens` map. v1 configs continue to load unchanged.
 
 **Keywords cannot carry `modeOp`** — soft-keyword demotion (contextual resolution) and lexer-mode switching are distinct mechanisms. Mixing them on a `keywords[]` entry emits `C_ConflictingField`. Move the entry to `tokens` to switch modes.
@@ -450,6 +452,7 @@ Delimited string literals — `"hello"`, `@"verbatim ""quotes"""`, `R"DELIM(raw)
 | `C_UnknownScopeName` | The scope name doesn't match any built-in (`None`, `Root`, `Block`, `Paren`, `Bracket`, `Generic`, `String`, `Comment`). |
 | `C_UnknownLexerMode` | A `modeArg` references a mode that wasn't declared in `lexerModes`. |
 | `C_InvalidStringStyle` | A `stringStyle` block is malformed — see §9.7 (missing/empty `endsAt`; `escapeChar` without `escapeKind: "char"`; `tagPattern` without `delimiterTag: "matched"`; invalid `tagPattern` regex; unknown `escapeKind`; non-`"matched"` `delimiterTag` value; wrong-typed sub-field). |
+| `C_BodyDefaultKindInShape` | A `lexerModes.<m>.defaultToken.kind` is also referenced from a `shapes/*` rule. Body-default kinds are off-grammar (the cursor never expects them); a shape reference would silently never match. Pick a distinct kind for the shape slot or stop using the kind as a `defaultToken`. |
 | `C_RedundantScopeRequire` (warning) | Your `scopeRequire` has a contradiction or redundancy. The rule still loads. |
 | `C_RedundantField` (warning) | `lookahead` without `speculative: true`; `modeArg` with `popMode`; case-folded duplicate mode name; mode with only `defaultToken` and no `tokens` field; inline per-mode `tokens` object (not yet parsed). The rule still loads. |
 | `P_ContextualKeywordResolution` (info, at parse) | A soft keyword demoted to `Identifier`. Expected behavior when the cursor's expected set excludes the keyword. |
