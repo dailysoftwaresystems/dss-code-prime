@@ -29,6 +29,7 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 | G-003 | **No IR.** `src/gen/intermediate/` is empty. No IR design, no SSA decision, no lowering pass.  | The hinge between frontend and backend. Wrong design here forces frontend OR backend rework. |
 | G-004 | **Codegen is one Windows PE demo.** No ELF, no Mach-O, no ARM64, no IR-driven path. | v1's hardest single chunk of work. Three object formats × two arches × three runtimes (CRT / glibc / libSystem). |
 | G-005 | **No project-config format.** Driver layer is unspecified; users can't actually invoke the compiler against a real project. | Without this, every other artifact has no entry point. |
+| G-006 | **No compilation-unit model.** Parser produces one Tree per file; nothing bundles them. Semantic / IR / codegen would each invent their own answer. | See [`08-compilation-unit-plan - tbd.md`](./08-compilation-unit-plan - tbd.md) — phase #7.5 between parser and semantic. |
 
 ---
 
@@ -36,7 +37,7 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 
 | ID    | Gap | Where it surfaces | Resolves via |
 |-------|-----|-------------------|--------------|
-| G-101 | Parser unborn (G-001 detail). | `src/analysis/syntactic/` | [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md) PA1–PA4 |
+| G-101 | Parser unborn (G-001 detail). | `src/analysis/syntactic/` | [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md) PA0–PA5b (7 PRs total) |
 | G-102 | Operator precedence in the AST. Data shipped PR1; tree-shape flip ⏳. | `tests/core/test_c_subset.cpp::ExpressionWithMixedOpsIsLeftFolded` | parser-plan PA2 (closes v2-gap-catalog row 1) |
 | G-103 | Function calls `f(x, y)` — no postfix-call shape. | c-subset.lang.json `operand` | parser-plan PA4 + operator-table postfix arity (v2-gap-catalog row 7) |
 | G-104 | Array indexing `a[0]`. | c-subset.lang.json `operand` | parser-plan PA4 + postfix arity (v2-gap-catalog row 12) |
@@ -45,8 +46,8 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 | G-107 | Compound assignment `+= -= *= /=`. | c-subset.lang.json `tokens` | Add to tokens + binary slot in `binaryOp` (v2-gap-catalog row 16) |
 | G-108 | Ternary `? :` — mixfix. | not-yet-tokens | **v3 candidate** — current `Prefix/Infix/Postfix` enum doesn't model mixfix (v2-gap-catalog row 17) |
 | G-109 | Float literal lexing (`3.14`, `1e10`, `1.0f` with suffix rules). | tokenizer | Hand-coded today in c-subset's tokenizer path; full numeric-style descriptor is v3 (v2-gap-catalog row 14) |
-| G-110 | Multi-file translation units. The current model is one file → one tree. | n/a — undesigned | **New phase concept** required: "compilation unit" as a list-of-trees + cross-tree symbol references. Affects parser, semantic, IR. |
-| G-111 | `#include` / module imports. Both c-subset and tsql-subset (`USE database;`) need cross-file references. | n/a — undesigned | Schema field on language config declaring its import syntax + driver-layer resolution pass. v3 candidate or a new sub-plan. |
+| G-110 | Multi-file translation units. The current model is one file → one tree. | [`08-compilation-unit-plan - tbd.md`](./08-compilation-unit-plan - tbd.md) CU1 + CU2 | **Phase #7.5** (new) — `CompilationUnit` type + `UnitBuilder` aggregator. Semantic / IR / codegen all consume CUs instead of bare Trees. |
+| G-111 | `#include` / module imports. Both c-subset and tsql-subset (`USE database;`) need cross-file references. | [`08-compilation-unit-plan - tbd.md`](./08-compilation-unit-plan - tbd.md) CU4 | **Phase #7.5** — per-language `ImportResolver` populates `CrossTreeRef` edges before semantic consumes the CU. Schema-driven import syntax stays a v3 candidate; v1 dispatches resolver on language name. |
 | G-112 | Preprocessor for full C (not c-subset). | n/a | **Explicitly out of v1.** c-subset omits the preprocessor by design. Full C99 is post-v1. |
 | G-113 | T-SQL `GO` batch separator, `BEGIN ... END` blocks, cursors, `TRY/CATCH`. | tsql-subset.lang.json | Out of v1 if PA4 corpus doesn't need them; otherwise extend tsql-subset (mechanism exists — pure shape work per v2-gap-catalog §6 "Residual T-SQL gaps"). |
 | G-114 | Error recovery quality benchmark. | parser-plan PA3 | Decide the bar (clang-level? tsc-level?) — open question parser-plan §4 Q4. |
@@ -58,7 +59,7 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 
 | ID    | Gap | Notes |
 |-------|-----|-------|
-| G-201 | Symbol table design. Linear chain of scopes? Hash-of-hashes? Persistent immutable? | Decide before any consumer ships. Defaults to a stack-of-hashmaps + a flat `SymbolId` interner; revisit if cross-tree references demand otherwise. |
+| G-201 | Symbol table design. Linear chain of scopes? Hash-of-hashes? Persistent immutable? **CU-scoped** post phase 7.5. | Decide before phase #8 PR1. Default: stack-of-hashmaps owned by `CompilationUnit`; `SymbolId` interner is CU-scoped; cross-tree refs come pre-resolved from `CompilationUnit.crossRefs()`. |
 | G-202 | Scope resolution pass — walk the CST, populate `NodeAttribute<SymbolId>` on every identifier reference. | Reuses the existing `NodeAttribute<T>` machinery (T8). |
 | G-203 | Type representation. Nominal? Structural? Trait-based? | C-subset wants nominal + pointer types; tsql-subset wants nominal + SQL row types. Decide on a sum type that covers both — `TypeKind` enum + `TypeId` interner on a per-tree side table. |
 | G-204 | Type inference / checking. C-subset is mostly type-annotated; tsql-subset wants column type inference from `CREATE TABLE` declarations + cross-statement flow. | C-side: minimal — verify expression types match LHS at assignment + arg-list match at calls. T-SQL side: needs the symbol table for table/column resolution. |
@@ -253,26 +254,29 @@ This is the **largest single chunk of work** in v1.
 [done] tokenizer ✅
     │
     ▼
-[next] parser-plan PA1 ─────► PA2 ────► PA3 ────► PA4
-                                                    │
-                                                    ▼
-                              semantic (G-201..212) ─► artifactProfile AP3 ─► IR (G-301..308)
-                                                            │                       │
-                                                            ▼                       ▼
-                                                    project-config + driver ────► optimizer (G-401..410)
-                                                            │                       │
-                                                            ▼                       ▼
-                                                    artifactProfile AP1+AP2+AP4 ► codegen ────► linker
-                                                                                  (G-501..524)  (G-540..543)
-                                                                                                    │
-                                                                                                    ▼
-                                                                                            CI matrix + corpus + perf
-                                                                                                    │
-                                                                                                    ▼
-                                                                                                  v1 ship
+[next] parser PA0 ─► PA1 ─► PA2 ─► PA3 ─► PA4 ─┬─► PA5a ─► PA5b   (LSP, per-file)
+                                                │
+                                                ▼
+                                        CU1 ─► CU2 ─► CU3 ─► CU4   (phase 7.5)
+                                                                │
+                                                                ▼
+                                                semantic (G-201..212) ─► artifactProfile AP3 ─► IR (G-301..308)
+                                                                                │                     │
+                                                                                ▼                     ▼
+                                                                project-config + driver ──────► optimizer (G-401..410)
+                                                                                │                     │
+                                                                                ▼                     ▼
+                                                            artifactProfile AP1+AP2+AP4 ────► codegen ─► linker
+                                                                                              (G-501..524) (G-540..543)
+                                                                                                          │
+                                                                                                          ▼
+                                                                                                  CI + corpus + perf
+                                                                                                          │
+                                                                                                          ▼
+                                                                                                       v1 ship
 ```
 
-The critical path runs through: **parser → semantic → IR → codegen × 3 OS × 2 arch**. The artifactProfile mechanism plugs in alongside semantic (driver enforcement) and again at IR/codegen (lowering knobs). Optimizer can develop in parallel with codegen once IR is stable.
+The critical path runs through: **parser → compilation-unit → semantic → IR → codegen × 3 OS × 2 arch**. PA5 (LSP) and CU1..CU4 are **siblings** branching off PA4 — LSP doesn't depend on the CU layer (operates per-file). The artifactProfile mechanism plugs in alongside semantic (driver enforcement) and again at IR/codegen (lowering knobs). Optimizer can develop in parallel with codegen once IR is stable.
 
 ---
 
@@ -280,8 +284,8 @@ The critical path runs through: **parser → semantic → IR → codegen × 3 OS
 
 These are intentionally NOT v1 deliverables. Tracking them here so v1 work doesn't make decisions that close them off.
 
-- LSP server / IDE integration (G-720 memory budget feeds in)
-- Incremental parsing + build caching (G-605)
+- ~~LSP server / IDE integration~~ — **moved to v1** as parser-plan PA5 (diagnostics-only scaffolding); semantic-powered LSP methods (hover/completion/goto-def/references/rename) remain post-v1 in a dedicated LSP follow-up plan after phase #8.
+- Incremental parsing + build caching (G-605) — LSP currently re-parses on every `didChange`; build caching is the perf play that follows.
 - Inlining + CSE + loop-invariant motion (G-404, G-405, G-406)
 - Graph-coloring register allocation (G-512)
 - WASM target
@@ -302,6 +306,8 @@ These are intentionally NOT v1 deliverables. Tracking them here so v1 work doesn
 A PR titled "v1 — production-ready" is accepted when **every** item below is checked:
 
 - [ ] All three shipped languages (`toy`, `c-subset`, `tsql-subset`) parse `tests/corpus/` programs end-to-end via the real parser (no hand-driven `TreeBuilder`).
+- [ ] **Multi-file integration test** per language: c-subset two-file (`main.c` + `helper.h` with cross-file call), tsql-subset two-file (`schema.sql` + `data.sql` with concat ordering), toy degenerate single-file. Phase 7.5 `CompilationUnit` aggregates correctly.
+- [ ] **LSP server** starts via `dss-code-prime --lsp`, completes the `initialize` handshake, and publishes diagnostics in a real editor session (golden-file replay). Semantic-powered methods return empty results (lit up post-phase #8).
 - [ ] `artifactProfile` is enforced: a project asking for an unsupported profile gets `D_ArtifactProfileNotSupported` at config-load.
 - [ ] Codegen produces working binaries for `cli` and `lib` profiles on **{Linux, Windows, macOS} × {x86_64, ARM64}** (3 × 2 = 6 targets).
 - [ ] `script` and `sproc` profiles produce valid output for tsql-subset on every host.
