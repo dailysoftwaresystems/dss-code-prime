@@ -133,6 +133,26 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     , schema_(std::move(schema))
     , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig)))
     , treeId_(nextTreeId())
+    // walker_ embeds the SchemaWalker state machine. The `[this]`-
+    // capturing lambda is the desync emission callback — it stays
+    // valid because (a) TreeBuilder is non-movable (static_assert in
+    // the header pins this), and (b) walker_ is destroyed before
+    // earlier members during ~TreeBuilder, so the callback can't
+    // fire after `this` becomes unsafe to dereference.
+    , walker_(schema_,
+              [this](SourceSpan span, std::optional<RuleId> rule) {
+                  ParseDiagnostic d;
+                  d.code        = DiagnosticCode::P_SchemaCursorDesync;
+                  d.severity    = DiagnosticSeverity::Info;
+                  d.buffer      = source_ ? source_->id() : InvalidBuffer;
+                  d.span        = span;
+                  d.ruleContext = rule;
+                  d.actual      = "schema cursor went off-track; "
+                                  "contextual keyword resolution will "
+                                  "stay strict for the remainder of "
+                                  "the build";
+                  emitDiagnostic_(std::move(d));
+              })
     , builderConfig_(builderConfig) {
     // Constructor preconditions: source_ and schema_ must be non-null.
     // We accept a null source in tests of degenerate paths (the diagnostic
@@ -146,10 +166,6 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // starts at 1. This matches the convention DSS_STRONG_ID enforces:
     // default-constructed = invalid sentinel.
     nodes_.emplace_back();
-    // Initial cursor is invalid — only becomes meaningful on the first
-    // open(rule). Until then there's no expected set for pushToken to
-    // consult, and contextual-keyword resolution stays strict.
-    cursor_ = SchemaCursor{};
 
     // Snapshot body-mode defaultToken kinds + the error sentinel. Both
     // are needed on the per-token resolveMeaning hot path; the set is
@@ -197,25 +213,6 @@ void TreeBuilder::emitDiagnostic_(ParseDiagnostic d) {
 void TreeBuilder::forceReport_(ParseDiagnostic d) {
     d.scopeStack.assign(scopes_.begin(), scopes_.end());
     reporter_->forceReport(std::move(d));
-}
-
-void TreeBuilder::noteCursorDesync_(bool wasValid,
-                                    bool nowValid,
-                                    SourceSpan span,
-                                    std::optional<RuleId> rule) {
-    if (cursorDesynced_) return;
-    if (!(wasValid && !nowValid)) return;
-    cursorDesynced_ = true;
-
-    ParseDiagnostic d;
-    d.code     = DiagnosticCode::P_SchemaCursorDesync;
-    d.severity = DiagnosticSeverity::Info;
-    d.buffer   = source_ ? source_->id() : InvalidBuffer;
-    d.span     = span;
-    d.ruleContext = rule;
-    d.actual   = "schema cursor went off-track; contextual keyword "
-                 "resolution will stay strict for the remainder of the build";
-    emitDiagnostic_(std::move(d));
 }
 
 void TreeBuilder::addBuilderInvariant_(std::string actual, SourceSpan span) {
@@ -295,19 +292,11 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
         .cookie       = cookie,
     });
 
-    // Walk the schema cursor in parallel with the open frame. Saving the
-    // parent's cursor lets closeFrame_ resume the parent via leaveRule
-    // when this rule completes. `leaveRule` requires the saved cursor be
-    // at a RuleLeaf slot — if the parent cursor is at an AltChoice (the
-    // body of a `repeat`/`optional`/`alt`), route it to the RuleLeaf
-    // branch for `rule` first so close() can resume cleanly.
-    SchemaCursor savedParent = cursor_;
-    if (savedParent.valid()) {
-        auto routed = schema_->routeToRuleLeaf(savedParent, rule);
-        if (routed.valid()) savedParent = routed;
-    }
-    cursorStack_.push_back(savedParent);
-    cursor_ = schema_->enterRule(rule);
+    // Walk the schema-cursor state machine in parallel with the open
+    // frame. The walker handles the AltChoice → RuleLeaf routing
+    // (`routeToRuleLeaf`) internally so closeFrame_'s `leaveRule`
+    // resumes cleanly when this rule completes.
+    walker_.enterRule(rule);
 
     return OpenScope{this, cookie};
 }
@@ -390,20 +379,12 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             closedCookies_.insert(fr.cookie);
         }
         open_.pop_back();
-        // Invariant: cursorStack_.size() == open_.size() at every
-        // open/close boundary. leaveRule on a non-RuleLeaf saved cursor
-        // returns invalid and trips noteCursorDesync_ — strict-only
-        // contextual resolution for the remainder of the build.
-        if (!cursorStack_.empty()) {
-            SchemaCursor savedParent = cursorStack_.back();
-            cursorStack_.pop_back();
-            const bool wasValid = savedParent.valid();
-            cursor_ = schema_->leaveRule(savedParent);
-            noteCursorDesync_(wasValid, cursor_.valid(), fr.openerSpan,
-                              std::optional<RuleId>{fr.rule});
-        } else {
-            cursor_ = SchemaCursor{};
-        }
+        // Invariant: walker_.depth() == open_.size() at every
+        // open/close boundary. leaveRule on a non-RuleLeaf saved
+        // cursor returns invalid and trips the walker's desync
+        // callback — strict-only contextual resolution for the
+        // remainder of the build.
+        walker_.leaveRule(fr.openerSpan, std::optional<RuleId>{fr.rule});
         if (isTarget) break;
         if (open_.empty()) break;
     }
@@ -724,8 +705,8 @@ void TreeBuilder::pushToken(Token const& tok) {
             std::abort();
         }
     }
-    if (resolved.meaning.contextual && cursor_.valid()) {
-        const auto expected = schema_->expectedSet(cursor_);
+    if (resolved.meaning.contextual && walker_.cursor().valid()) {
+        const auto expected = walker_.expectedSet();
         bool inExpected = false;
         for (auto const& t : expected) {
             if (t.v == resolved.meaning.id.v) { inExpected = true; break; }
@@ -800,12 +781,10 @@ void TreeBuilder::pushToken(Token const& tok) {
         isEmptySpace(effectiveFlags)
         || bodyDefaultTokenKinds_.contains(resolved.meaning.id);
     if (!isOffGrammar) {
-        const bool wasValid = cursor_.valid();
-        cursor_ = schema_->advance(cursor_, resolved.meaning.id);
-        noteCursorDesync_(wasValid, cursor_.valid(), tok.span,
-                          open_.empty()
-                              ? std::optional<RuleId>{}
-                              : std::optional<RuleId>{open_.back().rule});
+        walker_.advance(resolved.meaning.id, tok.span,
+                        open_.empty()
+                            ? std::optional<RuleId>{}
+                            : std::optional<RuleId>{open_.back().rule});
     }
 }
 
@@ -1036,11 +1015,9 @@ TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
     snap.pendingChildrenSize        = pendingChildren_.size();
     snap.openFrames                 = open_;
     snap.scopes                     = scopes_;
-    snap.cursor                     = cursor_;
-    snap.cursorStack                = cursorStack_;
+    snap.walker                     = walker_.snapshot();
     snap.nextCookie                 = nextCookie_;
     snap.closedCookies              = closedCookies_;
-    snap.cursorDesynced             = cursorDesynced_;
     snap.maxSpeculationDepthReached = maxSpeculationDepthReached_;
     snap.reporterSnap               = reporter_->snapshotForRollback();
 
@@ -1118,11 +1095,9 @@ void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
     pendingChildren_.resize(snap.pendingChildrenSize);
     open_                       = std::move(snap.openFrames);
     scopes_                     = std::move(snap.scopes);
-    cursor_                     = snap.cursor;
-    cursorStack_                = std::move(snap.cursorStack);
+    walker_.restore(std::move(*snap.walker));
     nextCookie_                 = snap.nextCookie;
     closedCookies_              = std::move(snap.closedCookies);
-    cursorDesynced_             = snap.cursorDesynced;
     maxSpeculationDepthReached_ = snap.maxSpeculationDepthReached;
     reporter_->truncateTo(snap.reporterSnap);
 }

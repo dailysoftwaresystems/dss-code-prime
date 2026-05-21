@@ -42,6 +42,7 @@
 
 # Build directory
 build/
+!scripts/build/
 
 # Python bytecode cache (e.g. tools/refresh_landing_log.py)
 __pycache__/

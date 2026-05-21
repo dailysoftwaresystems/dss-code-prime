@@ -11,6 +11,7 @@ add_library(core OBJECT
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/lexer_mode.cpp
+    types/schema_walker.cpp
     types/string_style.cpp
     types/tree.cpp
     types/tree_builder.cpp

@@ -20,6 +20,7 @@ dss_add_test(NAME core/test_tree_end_to_end     SOURCES test_tree_end_to_end.cpp
 dss_add_test(NAME core/test_c_subset            SOURCES test_c_subset.cpp)
 dss_add_test(NAME core/test_operator_table      SOURCES test_operator_table.cpp)
 dss_add_test(NAME core/test_schema_cursor       SOURCES test_schema_cursor.cpp)
+dss_add_test(NAME core/test_schema_walker       SOURCES test_schema_walker.cpp)
 dss_add_test(NAME core/test_contextual_keywords SOURCES test_contextual_keywords.cpp)
 dss_add_test(NAME core/test_scope_require       SOURCES test_scope_require.cpp)
 dss_add_test(NAME core/test_checkpoint          SOURCES test_checkpoint.cpp)

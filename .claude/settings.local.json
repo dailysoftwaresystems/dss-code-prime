@@ -128,7 +128,22 @@
       "Bash(./build/bin/dss/dss_core_test_tree_builder.exe)",
       "Bash(echo \"EXIT=$?\")",
       "Bash(awk '/^### PR landing log/,/^##[^#]/' \".plans/03-substrate-hardening-plan - ok.md\")",
-      "Bash(grep *)"
+      "Bash(grep *)",
+      "Bash(findstr /n /c:\"cursorDesynced\" /c:\"noteCursorDesync\" /c:\"routeToRuleLeaf\" /c:\"cursorStack_\" /c:\"cursor_ =\")",
+      "Bash(git show *)",
+      "Read(//tmp/**)",
+      "Bash(cmake --build . --target test_schema_walker tree_builder)",
+      "Bash(cmake .. -G Ninja)",
+      "Bash(where cmake *)",
+      "Bash(\"/c/Program Files/CMake/bin/cmake.exe\" --version)",
+      "Bash(\"/c/Program Files/CMake/bin/cmake.exe\" .. -G Ninja)",
+      "Bash(\"/c/Program Files/CMake/bin/cmake.exe\" --build .)",
+      "Bash(\"/c/Program Files/CMake/bin/ctest.exe\" --output-on-failure2)",
+      "Bash(chmod +x scripts/build/local-build.sh)",
+      "Bash(scripts/build/local-build.sh --test)",
+      "PowerShell(& 'C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\scripts\\\\build\\\\local-build.ps1' -Test 2>&1 | Select-Object -Last 6)",
+      "PowerShell(& 'C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\scripts\\\\build\\\\local-build.ps1' -Test 2>&1 | Select-Object -Last 30)",
+      "PowerShell(& 'C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\scripts\\\\build\\\\local-build.ps1' -Test 2>&1 | Select-Object -Last 8)"
     ]
   }
 }

@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/schema_walker.hpp"
 #include "core/types/scope_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -18,6 +19,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -233,11 +235,13 @@ private:
         std::size_t                       pendingChildrenSize;
         std::vector<Frame>                openFrames;          // snapshot copy
         std::vector<ScopeKind>            scopes;
-        SchemaCursor                      cursor;
-        std::vector<SchemaCursor>         cursorStack;
+        // SchemaWalker::Snapshot is non-default-constructible by
+        // design (every instance must originate from `snapshot()`).
+        // Wrap in std::optional so CheckpointSnapshot can be built
+        // field-by-field; populated immediately by `checkpoint()`.
+        std::optional<SchemaWalker::Snapshot> walker;
         std::uint32_t                     nextCookie;
         std::unordered_set<std::uint32_t> closedCookies;
-        bool                              cursorDesynced;
         bool                              maxSpeculationDepthReached;
         DiagnosticReporter::Snapshot      reporterSnap;
     };
@@ -252,15 +256,6 @@ private:
     // Checkpoint dtor) aren't silently swallowed by an at-cap reporter.
     void                    forceReport_(ParseDiagnostic d);
     void                    addBuilderInvariant_(std::string actual, SourceSpan span);
-
-    // Emit P_SchemaCursorDesync exactly once per build the first time the
-    // schema cursor goes from valid to invalid. `wasValid` is the state
-    // before the most recent walk step (advance or leaveRule); `nowValid`
-    // is the result. `span` and `rule` populate the diagnostic location.
-    void                    noteCursorDesync_(bool wasValid,
-                                              bool nowValid,
-                                              SourceSpan span,
-                                              std::optional<RuleId> rule);
 
     // Attach a node id to the current frame's children list. Returns false
     // when there's no open frame (caller must have already emitted a
@@ -299,19 +294,14 @@ private:
     std::vector<Frame>                     open_;        // LIFO open-frame stack
     std::vector<ScopeKind>                 scopes_;      // current scope stack
 
-    // Schema cursor mirroring `open_`. Walked through enterRule on open(),
-    // leaveRule on close, and advance on pushToken. Invariant:
-    // `cursorStack_.size() == open_.size()` before/after every open/close
-    // operation. Goes invalid when the caller drives the builder against
-    // the schema's shape; the contextual demotion path treats an invalid
-    // cursor as "no expectations known; keep the keyword."
-    SchemaCursor                           cursor_;
-    std::vector<SchemaCursor>              cursorStack_;
-    // One-shot — true after the first valid → invalid cursor transition.
-    // Bounds the P_SchemaCursorDesync diagnostic to one emission per
-    // build so a long parse that goes off-track doesn't flood the
-    // diagnostic stream.
-    bool                                   cursorDesynced_ = false;
+    // Schema-cursor state machine mirroring `open_`. Walked through
+    // enterRule on open(), leaveRule on close, and advance on
+    // pushToken. Invariant: `walker_.depth() == open_.size()` before
+    // and after every open/close operation. The walker owns the
+    // one-shot P_SchemaCursorDesync latch + emits via the callback
+    // wired in our ctor (so the parser, when it embeds its own
+    // walker, gets the same latched behavior).
+    SchemaWalker                           walker_;
 
     // Body-mode `defaultToken.kind` SchemaTokenIds collected from
     // `schema_->lexerModes()` at construction time. Tokens with one of
@@ -361,5 +351,18 @@ private:
     // events).
     bool                                   maxSpeculationDepthReached_ = false;
 };
+
+// TreeBuilder's ctor wires a `[this]`-capturing lambda into the
+// embedded `SchemaWalker walker_` as the desync emission callback.
+// If TreeBuilder becomes movable, the destination's `walker_` (moved
+// from the source) keeps a lambda whose `this` still points at the
+// source — silently dangling once the source is destructed. Keep it
+// non-movable until the capture is restructured (e.g. take a `this`
+// pointer at every callback invocation rather than at construction).
+static_assert(!std::is_move_constructible_v<TreeBuilder>,
+              "TreeBuilder must stay non-movable while walker_'s "
+              "desync callback captures `this` by reference");
+static_assert(!std::is_copy_constructible_v<TreeBuilder>,
+              "TreeBuilder must stay non-copyable — single-use by design");
 
 } // namespace dss
