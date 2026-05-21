@@ -636,9 +636,28 @@ TokenizeResult Tokenizer::tokenize() && {
         // schema lookup decides if the resulting lexeme is a keyword
         // (schemaKind valid) or a plain identifier (schemaKind invalid;
         // builder's pushToken fallback promotes to Identifier).
+        //
+        // Multi-char lexemes that START with an id-start byte but
+        // EXTEND past the id-run (T-SQL `N'`, MySQL `B'…'`, Python
+        // `b"…"`/`r"…"`) need the global longestMatch to win against
+        // the identifier scan. Compute the id-run length non-destruct-
+        // ively first, then prefer the global lookup only when it
+        // actually beats it. This way `if` / `if_foo` / `Nxyz` all
+        // still tokenize correctly.
         if (isIdStart(c)) {
-            r.advance(1);
-            while (isIdContinue(r.peek())) r.advance(1);
+            std::size_t identLen = 1;
+            while (isIdContinue(r.peek(identLen))) ++identLen;
+
+            const auto globalHit = longestMatch(*schema_, r.remaining(), lexemeProbeMax);
+            if (globalHit.length > identLen) {
+                // e.g. `N'`: the 2-byte lexeme beats the 1-byte id-run.
+                r.advance(globalHit.length);
+                emit(coreKindForByte(c), globalHit.meaning.id);
+                applyMeaningSideEffects(globalHit.meaning);
+                continue;
+            }
+
+            r.advance(identLen);
             const auto lexeme = r.slice(start, r.position());
             const auto hit = longestMatch(*schema_, lexeme, lexemeProbeMax);
             // Only honor the lookup when it covers the entire run; a

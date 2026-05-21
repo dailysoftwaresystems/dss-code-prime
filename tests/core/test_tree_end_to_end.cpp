@@ -13,6 +13,7 @@
 #include "core/types/tree_views.hpp"
 #include "core/types/tree_visitor.hpp"
 #include "core/types/well_known_names.hpp"
+#include "e2e_harness.hpp"
 #include "test_pretty_print.hpp"
 #include "tokenizer/tokenizer.hpp"
 #include "tokenizer/token_stream.hpp"
@@ -42,51 +43,19 @@
 // tokenize → resolve → build pipeline.
 
 using namespace dss;
+using dss::tests::E2EHarness;
+using dss::tests::prettyPrint;
 using dss::tests::ToyHarness;
 
 namespace {
 
-// Bundle of the harness + a live tokenized stream. Built once per test via
-// `tokenizeShipped()`; the test consumes tokens sequentially through
-// `b.pushToken(stream.advance())`. Pre-TZ1 the equivalent class was
-// `TokenSeq`, which fabricated tokens by lexeme lookup — see this
-// file's header comment for context.
-struct E2EHarness {
-    std::shared_ptr<SourceBuffer>        src;
-    std::shared_ptr<GrammarSchema const> schema;
-    TokenStream                          stream;
-    std::unique_ptr<DiagnosticReporter>  lexerDiags;
-};
-
-[[nodiscard]] ToyHarness loadShippedHarness(std::string sourceText) {
-    auto loaded = GrammarSchema::loadShipped("toy");
-    if (!loaded) {
-        ADD_FAILURE() << "loadShipped(\"toy\") failed — config missing or malformed";
-        return ToyHarness{
-            .src    = SourceBuffer::fromString(std::move(sourceText), "<e2e>"),
-            .schema = nullptr,
-        };
-    }
-    return ToyHarness{
-        .src    = SourceBuffer::fromString(std::move(sourceText), "<e2e>"),
-        .schema = *loaded,
-    };
-}
-
+// Shim that adapts the shared-harness `tokenizeShipped("toy", text)`
+// to the parameterless signature this file's existing tests use. The
+// `E2EHarness` struct itself is now `dss::tests::E2EHarness` from
+// `e2e_harness.hpp` — the same shape c-subset and tsql-subset tests use.
 [[nodiscard]] E2EHarness tokenizeShipped(std::string sourceText) {
-    auto h = loadShippedHarness(std::move(sourceText));
-    if (!h.schema) return E2EHarness{.src = h.src, .schema = nullptr};
-    Tokenizer tk{h.src, h.schema};
-    auto [stream, reporter] = std::move(tk).tokenize();
-    return E2EHarness{
-        .src        = h.src,
-        .schema     = h.schema,
-        .stream     = std::move(stream),
-        .lexerDiags = std::move(reporter),
-    };
+    return dss::tests::tokenizeShipped("toy", std::move(sourceText));
 }
-
-using dss::tests::prettyPrint;
 
 std::size_t countCode(std::span<ParseDiagnostic const> diags, DiagnosticCode code) {
     std::size_t n = 0;

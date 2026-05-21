@@ -313,6 +313,15 @@ private:
     // diagnostic stream.
     bool                                   cursorDesynced_ = false;
 
+    // Body-mode `defaultToken.kind` SchemaTokenIds collected from
+    // `schema_->lexerModes()` at construction time. Tokens with one of
+    // these kinds are off-grammar (the kind never appears in any
+    // `shapes/*` position by construction — it's only declared on a
+    // lexer mode), so the cursor advance is silently skipped to avoid
+    // a spurious P_SchemaCursorDesync per body codepoint. Populated
+    // once in the ctor; queried in pushToken's cursor-advance gate.
+    std::unordered_set<std::uint32_t>      bodyDefaultTokenKinds_;
+
     // Cookies that have been "closed" by cascade or by finish() but whose
     // OpenScope guards are still alive (and will eventually call close()
     // when destroyed). A subsequent close() for these is a clean no-op

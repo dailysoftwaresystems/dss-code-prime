@@ -150,6 +150,17 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // open(rule). Until then there's no expected set for pushToken to
     // consult, and contextual-keyword resolution stays strict.
     cursor_ = SchemaCursor{};
+
+    // Snapshot the schema's body-mode defaultToken kinds. These appear
+    // only inside string / comment / bracket-id bodies (never in any
+    // shape) — advancing the schema cursor with them always desyncs.
+    // Pre-compute the lookup set so the pushToken cursor-advance gate
+    // can skip them in O(1).
+    for (auto const& mode : schema_->lexerModes()) {
+        if (mode.defaultToken) {
+            bodyDefaultTokenKinds_.insert(mode.defaultToken->kind.v);
+        }
+    }
 }
 
 NodeId TreeBuilder::emit_(detail::Node n) {
@@ -462,6 +473,22 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
                                SchemaTokenId preResolved = InvalidSchemaToken) {
     ResolvedMeaning out;
     const auto candidates = schema.lookupLexeme(lexeme);
+
+    // Pre-resolved built-in kind when the per-lexeme table has no
+    // entry at all (numeric/string literals, body-mode defaultToken
+    // emissions). Handled before the empty-candidates early return so
+    // the tokenizer's resolution survives. Excludes Error — recovery
+    // must still go through P_UnknownToken.
+    if (candidates.empty() && preResolved.valid()) {
+        const auto errorKind = schema.schemaTokens().find("Error");
+        if (preResolved.v != errorKind.v) {
+            LexemeMeaning synthetic{};
+            synthetic.id   = preResolved;
+            out.meaning    = synthetic;
+            out.matchCount = 1;
+        }
+        return out;
+    }
     if (candidates.empty()) return out;
 
     // A candidate survives iff BOTH the schema's per-scope forbid rules
@@ -511,8 +538,38 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
             }
             return out;
         }
-        // preResolved missing-or-rejected — fall through to the full
-        // scan so scope-driven multi-meaning resolution still works.
+        // preResolved isn't in `candidates` at all — the tokenizer pre-
+        // resolved a built-in kind that the schema declares globally
+        // (literals like IntLiteral, body-mode defaultToken kinds like
+        // StringChar emitted while the next byte at the close ALSO
+        // matches a global lexeme like `'`). Trust the tokenizer's
+        // pre-resolution unconditionally; the schema's per-lexeme
+        // table never had this kind so the slow path would pick a
+        // different meaning. The tokenizer is authoritative for body-
+        // mode and built-in kinds.
+        //
+        // Exclude `Error` — its semantic is "tokenizer couldn't
+        // resolve this byte", and the builder must fall through to
+        // the P_UnknownToken / Error-leaf recovery path.
+        //
+        // Distinct from the scope-rejected case: if preResolved IS in
+        // candidates but scope-rejected, fall through so a sibling
+        // candidate that IS scope-allowed can win (toy `<` in Generic).
+        bool preResolvedInCandidates = false;
+        for (auto const& m : candidates) {
+            if (m.id == preResolved) { preResolvedInCandidates = true; break; }
+        }
+        const auto errorKind = schema.schemaTokens().find("Error");
+        if (!preResolvedInCandidates && preResolved.v != errorKind.v) {
+            LexemeMeaning synthetic{};
+            synthetic.id = preResolved;
+            out.meaning   = synthetic;
+            out.matchCount = 1;
+            return out;
+        }
+        // preResolved IS in candidates but scope-rejected — fall through
+        // to the full scan so scope-driven multi-meaning resolution
+        // still works (toy `<` outside-vs-inside-Generic).
     }
 
     // Candidates arrive pre-sorted by priority (lowest first, stable on
@@ -576,7 +633,10 @@ void TreeBuilder::pushToken(Token const& tok) {
     if (resolved.matchCount == 0 && tok.coreKind == CoreTokenKind::Word) {
         // Fallback: alphanumeric word that isn't a keyword → Identifier.
         // "Identifier" is pre-interned at schema load time, so a const
-        // lookup against the frozen interner always succeeds.
+        // lookup against the frozen interner always succeeds. The
+        // built-in-kind fallback (e.g. IntLiteral whose lexeme isn't in
+        // the table) is handled in `resolveMeaning`'s fast-path B —
+        // matchCount==0 here means the lexeme wasn't even pre-resolved.
         LexemeMeaning ident{};
         ident.id = schema_->schemaTokens().find("Identifier");
         resolved.meaning   = ident;
@@ -704,13 +764,25 @@ void TreeBuilder::pushToken(Token const& tok) {
     // tokens never appear in the schema's expected sets — whitespace is
     // off-grammar by design — so don't advance through them; doing so
     // would invalidate the cursor on every space and trip the desync
-    // diagnostic on every otherwise-clean parse. For non-EmptySpace
-    // tokens, if `advance` returns invalid (token not expected at this
-    // position) the cursor becomes invalid for the remainder of the
-    // build, future contextual resolutions stay strict per the fallback
-    // above, and the first valid → invalid transition surfaces one
-    // P_SchemaCursorDesync.
-    if (!isEmptySpace(effectiveFlags)) {
+    // diagnostic on every otherwise-clean parse.
+    //
+    // Body-mode defaultToken kinds (StringChar, CommentChar,
+    // BracketIdChar — whatever a `lexerModes.<name>.defaultToken.kind`
+    // declares) are off-grammar by construction: the schema never
+    // references them in any shape. Skipping the cursor advance for
+    // them avoids one spurious desync per body codepoint without
+    // requiring the schema author to flag them as EmptySpace (which
+    // would also remove them from the AST — wrong for string contents).
+    //
+    // For non-EmptySpace, non-body-mode tokens, if `advance` returns
+    // invalid (token not expected at this position) the cursor becomes
+    // invalid for the remainder of the build, future contextual
+    // resolutions stay strict per the fallback above, and the first
+    // valid → invalid transition surfaces one P_SchemaCursorDesync.
+    const bool isOffGrammar =
+        isEmptySpace(effectiveFlags)
+        || bodyDefaultTokenKinds_.contains(resolved.meaning.id.v);
+    if (!isOffGrammar) {
         const bool wasValid = cursor_.valid();
         cursor_ = schema_->advance(cursor_, resolved.meaning.id);
         noteCursorDesync_(wasValid, cursor_.valid(), tok.span,
