@@ -150,6 +150,17 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // open(rule). Until then there's no expected set for pushToken to
     // consult, and contextual-keyword resolution stays strict.
     cursor_ = SchemaCursor{};
+
+    // Snapshot body-mode defaultToken kinds + the error sentinel. Both
+    // are needed on the per-token resolveMeaning hot path; the set is
+    // a function of the (immutable) schema, so the ctor is the right
+    // place to compute it once.
+    for (auto const& mode : schema_->lexerModes()) {
+        if (mode.defaultToken) {
+            bodyDefaultTokenKinds_.insert(mode.defaultToken->kind);
+        }
+    }
+    errorKind_ = schema_->schemaTokens().find("Error");
 }
 
 NodeId TreeBuilder::emit_(detail::Node n) {
@@ -456,11 +467,66 @@ struct ResolvedMeaning {
     return true;
 }
 
+// Built-in literal kinds the tokenizer is allowed to pre-resolve. These
+// names are predeclared at schema load (see kBuiltinTokenKindNames in
+// grammar_schema_json.cpp) so the interner always has them. The list is
+// the synthesis-allowlist's "non-body-mode" half — body kinds come from
+// the caller's `bodyKinds` set.
+[[nodiscard]] bool isBuiltinLiteralKind(GrammarSchema const& schema,
+                                        SchemaTokenId id) noexcept {
+    static constexpr std::string_view kLiterals[] = {
+        "IntLiteral", "FloatLiteral", "StringLiteral",
+        "CharLiteral", "BoolLiteral", "NullLiteral",
+    };
+    const auto name = schema.schemaTokens().name(id);
+    for (auto lit : kLiterals) {
+        if (name == lit) return true;
+    }
+    return false;
+}
+
+// Build the ResolvedMeaning for a synthesis path (paths A and B in
+// resolveMeaning). Asserts the synthesized kind is either a body-mode
+// defaultToken kind or a known literal — the only cases the tokenizer
+// is licensed to pre-resolve without a per-lexeme schema entry.
+[[nodiscard]] ResolvedMeaning makeSyntheticMeaning(
+    GrammarSchema const& schema,
+    SchemaTokenId preResolved,
+    std::unordered_set<SchemaTokenId> const& bodyKinds) noexcept {
+    assert((bodyKinds.contains(preResolved)
+            || isBuiltinLiteralKind(schema, preResolved))
+           && "resolveMeaning synthesizing for a kind that is neither a "
+              "body-mode defaultToken nor a built-in literal — likely a "
+              "tokenizer/schema drift bug");
+    (void)schema; // referenced only in the assertion above
+    ResolvedMeaning out;
+    LexemeMeaning synthetic{};
+    synthetic.id   = preResolved;
+    out.meaning    = synthetic;
+    out.matchCount = 1;
+    return out;
+}
+
 ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
                                std::string_view lexeme,
-                               std::span<ScopeKind const> scopes) {
+                               std::span<ScopeKind const> scopes,
+                               std::unordered_set<SchemaTokenId> const& bodyKinds,
+                               SchemaTokenId errorKind,
+                               SchemaTokenId preResolved = InvalidSchemaToken) {
     ResolvedMeaning out;
     const auto candidates = schema.lookupLexeme(lexeme);
+
+    // Path A: tokenizer pre-resolved a built-in/body kind and the per-
+    // lexeme table has nothing for this lexeme at all (numeric literals
+    // like `5`, body-mode chars). Trust the tokenizer; the slow path
+    // has no candidate to consider. Error stays excluded so recovery
+    // continues through P_UnknownToken.
+    if (candidates.empty() && preResolved.valid()) {
+        if (preResolved != errorKind) {
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds);
+        }
+        return out;
+    }
     if (candidates.empty()) return out;
 
     // A candidate survives iff BOTH the schema's per-scope forbid rules
@@ -469,6 +535,62 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
         return schema.isTokenValidInScope(m.id, scopes)
             && meaningAllowedByScopeRequire(m, scopes);
     };
+
+    // Fast path: tokenizer pre-resolved a `schemaKind`. Find the named
+    // meaning, confirm it survives the scope filter, then still run the
+    // same-priority ambiguity scan the slow path runs — bypassing the
+    // priority scan must NOT bypass the P_AmbiguousToken warning the
+    // builder would otherwise emit.
+    //
+    // Falls through to the full scan when the fast-path can't satisfy
+    // its winner (preResolved missing from candidates OR scope-
+    // rejected) — that keeps multi-meaning-with-scope cases like toy's
+    // `<` outside-vs-inside-Generic working correctly.
+    if (preResolved.valid()) {
+        std::optional<std::size_t> winnerIdx;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (candidates[i].id == preResolved && candidateAllowed(candidates[i])) {
+                winnerIdx = i;
+                break;
+            }
+        }
+        if (winnerIdx) {
+            out.meaning = candidates[*winnerIdx];
+            // matchCount mirrors the slow path: count every scope-
+            // allowed candidate, not just the winner. Downstream code
+            // only checks `matchCount == 0` today, but keeping the
+            // value parity-equivalent across fast/slow paths avoids
+            // future divergence if a consumer starts using it.
+            for (auto const& m : candidates) {
+                if (candidateAllowed(m)) ++out.matchCount;
+            }
+            // Same-priority ambiguity check — first declared still
+            // wins (consistent with the slow path), but the warning
+            // surfaces so the config author can disambiguate.
+            for (std::size_t i = *winnerIdx + 1; i < candidates.size(); ++i) {
+                if (candidates[i].priority != out.meaning.priority) break;
+                if (candidateAllowed(candidates[i])) {
+                    out.ambiguous = true;
+                    break;
+                }
+            }
+            return out;
+        }
+        // Path B: preResolved is a built-in/body kind that the schema's
+        // per-lexeme table doesn't list at all. Trust the tokenizer —
+        // the slow path would pick a different meaning. Excludes Error
+        // (recovery via P_UnknownToken). Distinct from the scope-
+        // rejected case below: if preResolved IS in candidates but
+        // scope-rejected, fall through so a sibling candidate that IS
+        // scope-allowed can win (toy `<` outside-vs-inside-Generic).
+        bool preResolvedInCandidates = false;
+        for (auto const& m : candidates) {
+            if (m.id == preResolved) { preResolvedInCandidates = true; break; }
+        }
+        if (!preResolvedInCandidates && preResolved != errorKind) {
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds);
+        }
+    }
 
     // Candidates arrive pre-sorted by priority (lowest first, stable on
     // ties). Find the first that survives.
@@ -519,16 +641,19 @@ void TreeBuilder::pushToken(Token const& tok) {
     const std::string_view lexeme = source_->slice(tok.span);
 
     // Resolve the schema meaning. Three paths:
-    //  1. Direct lexeme match (operator / punctuation / keyword).
+    //  1. Direct lexeme match (operator / punctuation / keyword). When
+    //     `tok.schemaKind` is valid (tokenizer pre-resolved) the
+    //     resolveMeaning fast-path short-circuits the priority scan.
     //  2. Word fallback to Identifier when the lexeme isn't a keyword.
     //  3. No match at all → Error leaf + P_UnknownToken.
     ResolvedMeaning resolved = resolveMeaning(
-        *schema_, lexeme, std::span<ScopeKind const>{scopes_});
+        *schema_, lexeme, std::span<ScopeKind const>{scopes_},
+        bodyDefaultTokenKinds_, errorKind_, tok.schemaKind);
 
     if (resolved.matchCount == 0 && tok.coreKind == CoreTokenKind::Word) {
         // Fallback: alphanumeric word that isn't a keyword → Identifier.
-        // "Identifier" is pre-interned at schema load time, so a const
-        // lookup against the frozen interner always succeeds.
+        // Identifier is pre-interned at load (kBuiltinTokenKindNames),
+        // so the lookup against the frozen interner always succeeds.
         LexemeMeaning ident{};
         ident.id = schema_->schemaTokens().find("Identifier");
         resolved.meaning   = ident;
@@ -637,11 +762,17 @@ void TreeBuilder::pushToken(Token const& tok) {
         popScope();    // emits P_BuilderInvariant on underflow
     }
 
-    // Emit the leaf.
+    // Emit the leaf. The effective flag set is the OR of the schema
+    // meaning's `flagsApplied` (set declaratively on the lexeme entry)
+    // and the tokenizer-supplied `tok.flags` (e.g. `EmptySpace` on
+    // body-mode emissions where the LexerMode declared
+    // `defaultToken.flags`). Both sources of flag intent reach the
+    // AST; closes the v2-gap-catalog row 3 path end-to-end.
+    const NodeFlags effectiveFlags = resolved.meaning.flagsApplied | tok.flags;
     detail::Node leaf{};
     leaf.kind      = NodeKind::Token;
     leaf.tokenKind = resolved.meaning.id;
-    leaf.flags     = resolved.meaning.flagsApplied;
+    leaf.flags     = effectiveFlags;
     leaf.span      = tok.span;
     const NodeId id = emit_(leaf);
     attachToCurrentFrame_(id);
@@ -650,13 +781,25 @@ void TreeBuilder::pushToken(Token const& tok) {
     // tokens never appear in the schema's expected sets — whitespace is
     // off-grammar by design — so don't advance through them; doing so
     // would invalidate the cursor on every space and trip the desync
-    // diagnostic on every otherwise-clean parse. For non-EmptySpace
-    // tokens, if `advance` returns invalid (token not expected at this
-    // position) the cursor becomes invalid for the remainder of the
-    // build, future contextual resolutions stay strict per the fallback
-    // above, and the first valid → invalid transition surfaces one
-    // P_SchemaCursorDesync.
-    if (!isEmptySpace(resolved.meaning.flagsApplied)) {
+    // diagnostic on every otherwise-clean parse.
+    //
+    // Body-mode defaultToken kinds (StringChar, CommentChar,
+    // BracketIdChar — whatever a `lexerModes.<name>.defaultToken.kind`
+    // declares) are off-grammar by construction: the schema never
+    // references them in any shape. Skipping the cursor advance for
+    // them avoids one spurious desync per body codepoint without
+    // requiring the schema author to flag them as EmptySpace (which
+    // would also remove them from the AST — wrong for string contents).
+    //
+    // For non-EmptySpace, non-body-mode tokens, if `advance` returns
+    // invalid (token not expected at this position) the cursor becomes
+    // invalid for the remainder of the build, future contextual
+    // resolutions stay strict per the fallback above, and the first
+    // valid → invalid transition surfaces one P_SchemaCursorDesync.
+    const bool isOffGrammar =
+        isEmptySpace(effectiveFlags)
+        || bodyDefaultTokenKinds_.contains(resolved.meaning.id);
+    if (!isOffGrammar) {
         const bool wasValid = cursor_.valid();
         cursor_ = schema_->advance(cursor_, resolved.meaning.id);
         noteCursorDesync_(wasValid, cursor_.valid(), tok.span,

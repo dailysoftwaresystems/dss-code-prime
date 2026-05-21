@@ -7,10 +7,33 @@
     "fileExtensions": [".c", ".h"]
   },
 
+  "lexerModes": {
+    "main":          { "tokens": "default" },
+    "line-comment":  {
+      "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
+      "unterminatedAs":  "comment"
+    },
+    "block-comment": {
+      "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
+      "unterminatedAs":  "comment"
+    }
+  },
+
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
     "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
     "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+
+    "//": [{
+      "kind": "LineCommentStart", "flags": ["EmptySpace"],
+      "modeOp": "pushMode", "modeArg": "line-comment",
+      "stringStyle": { "escapeKind": "none", "endsAt": "\n" }
+    }],
+    "/*": [{
+      "kind": "BlockCommentStart", "flags": ["EmptySpace"],
+      "modeOp": "pushMode", "modeArg": "block-comment",
+      "stringStyle": { "escapeKind": "none", "endsAt": "*/" }
+    }],
 
     "(":  [{ "kind": "ParenOpen",     "opensScope": "Paren"   }],
     ")":  [{ "kind": "ParenClose",    "closesScope": true     }],

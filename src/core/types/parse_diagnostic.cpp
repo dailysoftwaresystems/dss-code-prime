@@ -32,6 +32,11 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "P_ContextualKeywordResolution";
         case DiagnosticCode::P_SchemaCursorDesync:
             return "P_SchemaCursorDesync";
+        case DiagnosticCode::P_IllegalChar:              return "P_IllegalChar";
+        case DiagnosticCode::P_MalformedNumber:          return "P_MalformedNumber";
+        case DiagnosticCode::P_UnterminatedString:       return "P_UnterminatedString";
+        case DiagnosticCode::P_UnterminatedComment:      return "P_UnterminatedComment";
+        case DiagnosticCode::P_InvalidEscape:            return "P_InvalidEscape";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
         case DiagnosticCode::P_UnfinishedTree:           return "P_UnfinishedTree";
@@ -55,6 +60,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_RedundantField:           return "C_RedundantField";
         case DiagnosticCode::C_UnknownLexerMode:         return "C_UnknownLexerMode";
         case DiagnosticCode::C_InvalidStringStyle:       return "C_InvalidStringStyle";
+        case DiagnosticCode::C_BodyDefaultKindInShape:   return "C_BodyDefaultKindInShape";
     }
     return "Unknown";
 }

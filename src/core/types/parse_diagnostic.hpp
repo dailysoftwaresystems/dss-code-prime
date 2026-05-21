@@ -50,6 +50,11 @@ enum class DiagnosticCode : std::uint16_t {
     P_UnmatchedClose              = 0x000B,
     P_ContextualKeywordResolution = 0x000C,
     P_SchemaCursorDesync          = 0x000D,
+    P_IllegalChar                 = 0x000E,
+    P_MalformedNumber             = 0x000F,
+    P_UnterminatedString          = 0x0010,
+    P_UnterminatedComment         = 0x0011,
+    P_InvalidEscape               = 0x0012,
 
     // ── P9xxx — builder internal-invariant violations (release-mode rescues) ──
     P_BuilderInvariant            = 0x9000,
@@ -77,6 +82,11 @@ enum class DiagnosticCode : std::uint16_t {
     C_RedundantField              = 0xC026,
     C_UnknownLexerMode            = 0xC027,
     C_InvalidStringStyle          = 0xC028,
+    // A `lexerModes.<m>.defaultToken.kind` was also referenced from a
+    // `shapes/*` rule. The builder treats body-default kinds as off-
+    // grammar (cursor-skip), so a shape reference would silently never
+    // match — surface it at load time instead.
+    C_BodyDefaultKindInShape      = 0xC029,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

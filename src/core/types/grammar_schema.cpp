@@ -2,6 +2,7 @@
 
 #include "core/types/grammar_schema_json.hpp"
 
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -10,7 +11,29 @@
 
 namespace dss {
 
-GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::move(d)) {}
+GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::move(d)) {
+#ifndef NDEBUG
+    // Cross-check the loader-computed `maxLexemeLength` against a fresh
+    // recomputation. Catches a loader-side bug that would otherwise
+    // silently truncate the tokenizer's longest-match window. Debug-
+    // only — the production builds trust the loader (single call site
+    // for the field).
+    std::size_t recomputed = 0;
+    for (auto const& [lex, meanings] : d_.lexemeTable) {
+        (void)meanings;
+        if (lex.size() > recomputed) recomputed = lex.size();
+    }
+    for (auto const& [modeId, table] : d_.lexerModeTokens) {
+        (void)modeId;
+        for (auto const& [lex, meanings] : table) {
+            (void)meanings;
+            if (lex.size() > recomputed) recomputed = lex.size();
+        }
+    }
+    assert(recomputed == d_.maxLexemeLength
+           && "GrammarSchemaData::maxLexemeLength out of sync with lexemeTable");
+#endif
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Loaders — thin shims over the JSON-aware loader.

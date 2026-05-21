@@ -227,7 +227,7 @@ TEST(LexerModesLoader, DefaultTokenPopulated) {
     ASSERT_TRUE(modeId.valid());
     auto const& mode = s.lexerMode(modeId);
     ASSERT_TRUE(mode.defaultToken.has_value());
-    EXPECT_EQ(s.schemaTokens().name(*mode.defaultToken), "StringChar");
+    EXPECT_EQ(s.schemaTokens().name(mode.defaultToken->kind), "StringChar");
 }
 
 // ── Loader: modeOp / modeArg parsing on token meanings ──────────────────

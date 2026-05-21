@@ -306,6 +306,18 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         s.tagPattern = kDefaultTagPattern;
     }
 
+    // Cross-field validation: longest-match terminator does not
+    // compose with dynamic-tag matching. The tokenizer's tag-aware
+    // close (regex+endsAt) doesn't honor longest-match, so the two
+    // flags silently disagree if both are set. Reject at load.
+    if (s.endsAtLongestMatch && !s.tagPattern.empty()) {
+        c.emit(DiagnosticCode::C_ConflictingField,
+               std::format("{}/endsAtLongestMatch", path),
+               "'endsAtLongestMatch' is incompatible with 'delimiterTag: \"matched\"' "
+               "(longest-match close is not honored for dynamic tags)");
+        return std::nullopt;
+    }
+
     // Validate regex at load. Catch std::regex_error specifically; any
     // other exception (std::bad_alloc, system errors) signals a deeper
     // problem we don't want to silently translate to a diagnostic.
@@ -887,6 +899,34 @@ void computeNullableTails(GrammarSchemaData& data) {
     }
 }
 
+// Reject any rule shape that references a SchemaTokenId declared as a
+// lexer mode's `defaultToken.kind`. Body-default kinds are off-grammar
+// by construction (see `TreeBuilder::bodyDefaultTokenKinds_`): the
+// cursor-advance gate silently skips them, so a shape reference would
+// never match. Surface the bug at load time instead.
+void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll) {
+    std::unordered_set<SchemaTokenId> bodyKinds;
+    for (auto const& mode : data.lexerModes) {
+        if (mode.defaultToken) bodyKinds.insert(mode.defaultToken->kind);
+    }
+    if (bodyKinds.empty()) return;
+
+    for (auto const& [ruleIdV, rule] : data.compiledRules) {
+        const auto ruleName = data.rules->name(RuleId{ruleIdV});
+        for (auto const& p : rule.positions) {
+            if (p.slotKind() != SlotKind::TokenLeaf) continue;
+            if (!bodyKinds.contains(p.tokenId())) continue;
+            coll.emit(DiagnosticCode::C_BodyDefaultKindInShape,
+                      std::format("/shapes/{}", ruleName),
+                      std::format("token '{}' is declared as a lexer mode's "
+                                  "defaultToken.kind and is therefore off-"
+                                  "grammar — referencing it from a shape "
+                                  "would silently never match",
+                                  data.schemaTokens->name(p.tokenId())));
+        }
+    }
+}
+
 } // anonymous namespace
 
 LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
@@ -1376,7 +1416,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             // Parse defaultToken into a local; the mode entry is then
             // rebuilt via the factory rather than mutated in place.
-            std::optional<SchemaTokenId> defaultToken;
+            std::optional<DefaultTokenSpec> defaultToken;
             if (modeObj.contains("defaultToken")) {
                 json const& dt = modeObj.at("defaultToken");
                 if (!dt.is_object() || !dt.contains("kind") ||
@@ -1385,11 +1425,48 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               std::format("{}/defaultToken", modePath),
                               "'defaultToken' must be an object with a string 'kind'");
                 } else {
-                    defaultToken = data.schemaTokens->intern(
+                    DefaultTokenSpec spec;
+                    spec.kind = data.schemaTokens->intern(
                         dt.at("kind").get<std::string>());
+                    // Optional `flags` field — propagates onto every
+                    // per-codepoint emission the tokenizer makes in
+                    // this mode. Lets a comment-body mode flag its
+                    // chars as EmptySpace so the AST cursor skips them
+                    // wholesale (closes v2-gap-catalog row 3 cleanly).
+                    if (dt.contains("flags")) {
+                        spec.flags = parseFlagList(dt.at("flags"));
+                    }
+                    defaultToken = spec;
                 }
             }
-            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken);
+
+            // Optional `unterminatedAs` field — declares the
+            // diagnostic flavor when this mode is still open at EOF.
+            // Replaces the previous tokenizer-side substring heuristic
+            // ("mode name contains 'comment'") with an explicit
+            // schema-declared value. Defaults to `String` for
+            // backward compat with existing tsql-subset configs.
+            UnterminatedFlavor flavor = UnterminatedFlavor::String;
+            if (modeObj.contains("unterminatedAs")) {
+                json const& ua = modeObj.at("unterminatedAs");
+                if (!ua.is_string()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/unterminatedAs", modePath),
+                              "'unterminatedAs' must be a string");
+                } else {
+                    const auto v = ua.get<std::string>();
+                    if      (v == "string")  flavor = UnterminatedFlavor::String;
+                    else if (v == "comment") flavor = UnterminatedFlavor::Comment;
+                    else if (v == "generic") flavor = UnterminatedFlavor::Generic;
+                    else {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/unterminatedAs", modePath),
+                                  std::format("unknown 'unterminatedAs' value '{}' — "
+                                              "expected one of \"string\", \"comment\", \"generic\"", v));
+                    }
+                }
+            }
+            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken, flavor);
 
             // tokens field: "default" inherits top-level lexemeTable;
             // an inline object IS the per-mode table (parsing deferred).
@@ -1669,6 +1746,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 buildPositionTables        (data, doc.at("shapes"), coll);
                 detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
                 computeNullableTails       (data);
+                validateBodyDefaultKindsOffGrammar(data, coll);
             }
         }
     }
@@ -1689,6 +1767,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         for (auto& [lex, meanings] : table) {
             (void)lex;
             for (auto& m : meanings) m.schemaId = data.id;
+        }
+    }
+
+    // Longest declared lexeme key — consumed by the tokenizer (TZ1+)
+    // to cap its longest-match probe length. Iterate every per-mode
+    // table too in case a mode-only token exceeds the main table's max.
+    data.maxLexemeLength = 0;
+    for (auto const& [lex, meanings] : data.lexemeTable) {
+        (void)meanings;
+        if (lex.size() > data.maxLexemeLength) data.maxLexemeLength = lex.size();
+    }
+    for (auto const& [modeId, table] : data.lexerModeTokens) {
+        (void)modeId;
+        for (auto const& [lex, meanings] : table) {
+            (void)meanings;
+            if (lex.size() > data.maxLexemeLength) data.maxLexemeLength = lex.size();
         }
     }
 

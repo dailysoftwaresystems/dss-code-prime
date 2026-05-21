@@ -7,85 +7,28 @@
 #include "core/types/tree.hpp"
 #include "core/types/tree_builder.hpp"
 #include "core/types/tree_node.hpp"
+#include "e2e_harness.hpp"
 #include "test_pretty_print.hpp"
 
 #include <gtest/gtest.h>
 
-#include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
 
-// Hand-tokenized end-to-end tests driving the shipped c-subset.lang.json
-// through TreeBuilder. The tokenizer doesn't exist yet, so each test
-// synthesizes Token objects pointing into the SourceBuffer — the same
-// pattern test_tree_end_to_end.cpp uses for toy.lang.json.
-//
-// These tests pin structural shapes, not parser semantics. Operator
-// precedence is NOT modeled by the schema today — see
-// `ExpressionWithMixedOpsIsLeftFolded` for the empirical record of that
-// limitation. When precedence lands in the schema, that test's expected
-// literal flips from a flat sequence to a nested grouping.
+// End-to-end tests driving the shipped c-subset.lang.json through the
+// live tokenize → resolve → build pipeline. These pin structural
+// shapes, not parser semantics. Operator precedence is NOT modeled by
+// the schema today — see `ExpressionWithMixedOpsIsLeftFolded` for the
+// empirical record of that limitation. When precedence lands in the
+// schema, that test's expected literal flips from a flat sequence to
+// a nested grouping.
 
 using namespace dss;
+using dss::tests::drainWhitespace;
+using dss::tests::E2EHarness;
 using dss::tests::prettyPrint;
-
-namespace {
-
-struct CSubsetHarness {
-    std::shared_ptr<SourceBuffer>        src;
-    std::shared_ptr<GrammarSchema const> schema;
-};
-
-CSubsetHarness loadShippedCSubset(std::string sourceText) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
-    if (!loaded) {
-        ADD_FAILURE() << "loadShipped(\"c-subset\") failed: "
-                      << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message)
-                      << " (cwd=" << std::filesystem::current_path().string() << ")";
-        return {SourceBuffer::fromString(std::move(sourceText), "<c-subset>"), nullptr};
-    }
-    return {SourceBuffer::fromString(std::move(sourceText), "<c-subset>"), *loaded};
-}
-
-// Synthesize a Token at the first occurrence of `text` in `src`. Caller
-// must ensure `text` is unique in the source — use the offset overload
-// otherwise. On lookup failure, raises ADD_FAILURE and returns a Token
-// with an empty (zero-width at offset 0) span so downstream pushToken
-// won't produce span-overflow garbage that buries the original failure
-// signal.
-Token at(SourceBuffer const& src, std::string_view text,
-         CoreTokenKind kind = CoreTokenKind::Operator) {
-    const auto sv = src.text();
-    const auto first = sv.find(text);
-    if (first == std::string_view::npos) {
-        ADD_FAILURE() << "lexeme '" << text << "' not in source — test bug";
-        return Token{
-            .coreKind   = kind,
-            .schemaKind = InvalidSchemaToken,
-            .span       = SourceSpan::empty(0),
-        };
-    }
-    return Token{
-        .coreKind   = kind,
-        .schemaKind = InvalidSchemaToken,
-        .span       = SourceSpan::of(static_cast<ByteOffset>(first),
-                                      static_cast<ByteOffset>(first + text.size())),
-    };
-}
-
-Token at(SourceBuffer const& src, std::string_view text, std::size_t startHint,
-         CoreTokenKind kind = CoreTokenKind::Operator) {
-    EXPECT_EQ(src.text().substr(startHint, text.size()), text);
-    return Token{
-        .coreKind   = kind,
-        .schemaKind = InvalidSchemaToken,
-        .span       = SourceSpan::of(static_cast<ByteOffset>(startHint),
-                                      static_cast<ByteOffset>(startHint + text.size())),
-    };
-}
-
-} // namespace
+using dss::tests::tokenizeShipped;
 
 // Drives `int x = 5;` through the disambiguated topLevel shape:
 // typeRef → Identifier → topLevelTail → varDeclTail. The shape graph
@@ -93,7 +36,7 @@ Token at(SourceBuffer const& src, std::string_view text, std::size_t startHint,
 // AssignOp/EndStatement); both branches share a single typeRef + Identifier
 // prefix so the loader's alt-FIRST ambiguity check stays happy.
 TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
-    auto h = loadShippedCSubset("int x = 5;");
+    auto h = tokenizeShipped("c-subset", "int x = 5;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
@@ -103,19 +46,22 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
-            b.pushToken(at(*h.src, "int", CoreTokenKind::Word));
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(at(*h.src, "x", CoreTokenKind::Word));
+        drainWhitespace(b, h.stream);
+        b.pushToken(h.stream.advance());
         {
             auto tail   = b.open(h.schema->rules().find("topLevelTail"));
             auto vdTail = b.open(h.schema->rules().find("varDeclTail"));
-            b.pushToken(at(*h.src, "="));
+            drainWhitespace(b, h.stream);
+            b.pushToken(h.stream.advance());
+            drainWhitespace(b, h.stream);
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
-                b.pushToken(at(*h.src, "5", CoreTokenKind::Word));
+                b.pushToken(h.stream.advance());
             }
-            b.pushToken(at(*h.src, ";"));
+            b.pushToken(h.stream.advance());
         }
     }
     Tree t = std::move(b).finish();
@@ -123,6 +69,8 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     EXPECT_TRUE(t.diagnostics().all().empty());
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
+    EXPECT_TRUE(h.lexerDiags->all().empty())
+        << "tokenizer should produce no diagnostics on clean source";
 
     const std::string_view expected =
         "rule:root\n"
@@ -147,19 +95,8 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
 // A typo in any of `topLevelTail` / `funcTail` / `paramList` / `param` /
 // `block` / `ifStmt` / `returnStmt` would fail this test.
 TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
-    auto h = loadShippedCSubset("int main(void) { if (x) { return x; } }");
+    auto h = tokenizeShipped("c-subset", "int main(void) { if (x) { return x; } }");
     ASSERT_NE(h.schema, nullptr);
-    const auto src = h.src->text();
-    const auto x1 = src.find("x");
-    const auto x2 = src.find("x", x1 + 1);
-    const auto firstParen   = src.find("(");
-    const auto firstParenC  = src.find(")");
-    const auto secondParen  = src.find("(", firstParen + 1);
-    const auto secondParenC = src.find(")", firstParenC + 1);
-    const auto outerBlockO  = src.find("{");
-    const auto innerBlockO  = src.find("{", outerBlockO + 1);
-    const auto innerBlockC  = src.find("}");
-    const auto outerBlockC  = src.find("}", innerBlockC + 1);
 
     TreeBuilder b{h.src, h.schema};
     {
@@ -168,54 +105,63 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
-            b.pushToken(at(*h.src, "int", CoreTokenKind::Word));
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(at(*h.src, "main", CoreTokenKind::Word));
+        drainWhitespace(b, h.stream);
+        b.pushToken(h.stream.advance());
         {
             auto tail = b.open(h.schema->rules().find("topLevelTail"));
             auto fn   = b.open(h.schema->rules().find("funcTail"));
-            b.pushToken(at(*h.src, "(", firstParen));
+            b.pushToken(h.stream.advance());
             {
                 auto pl = b.open(h.schema->rules().find("paramList"));
                 auto p  = b.open(h.schema->rules().find("param"));
                 auto ty = b.open(h.schema->rules().find("typeRef"));
                 auto tb = b.open(h.schema->rules().find("typeBase"));
-                b.pushToken(at(*h.src, "void", CoreTokenKind::Word));
+                b.pushToken(h.stream.advance());
             }
-            b.pushToken(at(*h.src, ")", firstParenC));
+            b.pushToken(h.stream.advance());
+            drainWhitespace(b, h.stream);
             {
                 auto blk = b.open(h.schema->rules().find("block"));
-                b.pushToken(at(*h.src, "{", outerBlockO));
+                b.pushToken(h.stream.advance());
+                drainWhitespace(b, h.stream);
                 {
                     auto stmt = b.open(h.schema->rules().find("statement"));
                     auto ifs  = b.open(h.schema->rules().find("ifStmt"));
-                    b.pushToken(at(*h.src, "if", CoreTokenKind::Word));
-                    b.pushToken(at(*h.src, "(", secondParen));
+                    b.pushToken(h.stream.advance());
+                    drainWhitespace(b, h.stream);
+                    b.pushToken(h.stream.advance());
                     {
                         auto expr = b.open(h.schema->rules().find("expression"));
                         auto opr  = b.open(h.schema->rules().find("operand"));
-                        b.pushToken(at(*h.src, "x", x1, CoreTokenKind::Word));
+                        b.pushToken(h.stream.advance());
                     }
-                    b.pushToken(at(*h.src, ")", secondParenC));
+                    b.pushToken(h.stream.advance());
+                    drainWhitespace(b, h.stream);
                     {
                         auto innerStmt = b.open(h.schema->rules().find("statement"));
                         auto innerBlk  = b.open(h.schema->rules().find("block"));
-                        b.pushToken(at(*h.src, "{", innerBlockO));
+                        b.pushToken(h.stream.advance());
+                        drainWhitespace(b, h.stream);
                         {
                             auto retStmt = b.open(h.schema->rules().find("statement"));
                             auto rs      = b.open(h.schema->rules().find("returnStmt"));
-                            b.pushToken(at(*h.src, "return", CoreTokenKind::Word));
+                            b.pushToken(h.stream.advance());
+                            drainWhitespace(b, h.stream);
                             {
                                 auto retExpr = b.open(h.schema->rules().find("expression"));
                                 auto retOpr  = b.open(h.schema->rules().find("operand"));
-                                b.pushToken(at(*h.src, "x", x2, CoreTokenKind::Word));
+                                b.pushToken(h.stream.advance());
                             }
-                            b.pushToken(at(*h.src, ";"));
+                            b.pushToken(h.stream.advance());
                         }
-                        b.pushToken(at(*h.src, "}", innerBlockC));
+                        drainWhitespace(b, h.stream);
+                        b.pushToken(h.stream.advance());
                     }
                 }
-                b.pushToken(at(*h.src, "}", outerBlockC));
+                drainWhitespace(b, h.stream);
+                b.pushToken(h.stream.advance());
             }
         }
     }
@@ -227,6 +173,7 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
             : diagnosticCodeName(t.diagnostics().all()[0].code));
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
+    EXPECT_TRUE(h.lexerDiags->all().empty());
 
     const std::string_view expected =
         "rule:root\n"
@@ -275,7 +222,7 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
 // parser will translate this table into nested tree shapes; today it's
 // data sitting on the schema, queryable by the eventual Pratt walker.
 TEST(CSubsetEndToEnd, OperatorTableMatchesCPrecedence) {
-    auto h = loadShippedCSubset("");
+    auto h = tokenizeShipped("c-subset", "");
     ASSERT_NE(h.schema, nullptr);
     auto const& table  = h.schema->operatorTable();
     auto const& tokens = h.schema->schemaTokens();
@@ -318,7 +265,7 @@ TEST(CSubsetEndToEnd, OperatorTableMatchesCPrecedence) {
 // sequence to a nested binaryExpr grouping — that flip is the visible
 // signal the limitation has been removed.
 TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
-    auto h = loadShippedCSubset("a + b * c;");
+    auto h = tokenizeShipped("c-subset", "a + b * c;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
@@ -330,26 +277,30 @@ TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
             auto expr = b.open(h.schema->rules().find("expression"));
             {
                 auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(at(*h.src, "a", CoreTokenKind::Word));
+                b.pushToken(h.stream.advance());
             }
+            drainWhitespace(b, h.stream);
             {
                 auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(at(*h.src, "+"));
+                b.pushToken(h.stream.advance());
             }
+            drainWhitespace(b, h.stream);
             {
                 auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(at(*h.src, "b", CoreTokenKind::Word));
+                b.pushToken(h.stream.advance());
             }
+            drainWhitespace(b, h.stream);
             {
                 auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(at(*h.src, "*"));
+                b.pushToken(h.stream.advance());
             }
+            drainWhitespace(b, h.stream);
             {
                 auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(at(*h.src, "c", CoreTokenKind::Word));
+                b.pushToken(h.stream.advance());
             }
         }
-        b.pushToken(at(*h.src, ";"));
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
 
@@ -366,6 +317,7 @@ TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
     }
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
+    EXPECT_TRUE(h.lexerDiags->all().empty());
 
     const std::string_view expected =
         "rule:root\n"
@@ -394,46 +346,41 @@ TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
 // switch body, not Switch). See `.plans/substrate-hardening-plan.md` SH4b
 // for the design call.
 TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
-    auto h = loadShippedCSubset("switch (x) { case 1: break; default: break; }");
+    auto h = tokenizeShipped("c-subset",
+                             "switch (x) { case 1: break; default: break; }");
     ASSERT_NE(h.schema, nullptr);
-    const auto src = h.src->text();
-    const auto firstParen   = src.find("(");
-    const auto firstParenC  = src.find(")");
-    const auto bodyOpen     = src.find("{");
-    const auto bodyClose    = src.find("}");
-    const auto firstBreak   = src.find("break");
-    const auto secondBreak  = src.find("break", firstBreak + 1);
-    const auto firstSemi    = src.find(";");
-    const auto secondSemi   = src.find(";", firstSemi + 1);
-    const auto firstColon   = src.find(":");
-    const auto secondColon  = src.find(":", firstColon + 1);
 
     TreeBuilder b{h.src, h.schema};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sw   = b.open(h.schema->rules().find("switchStmt"));
-        b.pushToken(at(*h.src, "switch", CoreTokenKind::Word));
-        b.pushToken(at(*h.src, "(", firstParen));
+        b.pushToken(h.stream.advance());
+        drainWhitespace(b, h.stream);
+        b.pushToken(h.stream.advance());
         {
             auto expr = b.open(h.schema->rules().find("expression"));
             auto opr  = b.open(h.schema->rules().find("operand"));
-            b.pushToken(at(*h.src, "x", CoreTokenKind::Word));
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(at(*h.src, ")", firstParenC));
-        b.pushToken(at(*h.src, "{", bodyOpen));
+        b.pushToken(h.stream.advance());
+        drainWhitespace(b, h.stream);
+        b.pushToken(h.stream.advance());
+        drainWhitespace(b, h.stream);
         // ── case arm
         {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto lbl  = b.open(h.schema->rules().find("caseLabel"));
-            b.pushToken(at(*h.src, "case", CoreTokenKind::Word));
+            b.pushToken(h.stream.advance());
+            drainWhitespace(b, h.stream);
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
-                b.pushToken(at(*h.src, "1", CoreTokenKind::Word));
+                b.pushToken(h.stream.advance());
             }
-            b.pushToken(at(*h.src, ":", firstColon));
+            b.pushToken(h.stream.advance());
         }
+        drainWhitespace(b, h.stream);
         // ── break inside the case arm (parses as a sibling switchBodyItem
         //    statement, not a child of caseLabel — C's case fall-through
         //    structure is "label then statements", not "label containing
@@ -442,24 +389,27 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto inner = b.open(h.schema->rules().find("statement"));
             auto br    = b.open(h.schema->rules().find("breakStmt"));
-            b.pushToken(at(*h.src, "break", firstBreak, CoreTokenKind::Word));
-            b.pushToken(at(*h.src, ";", firstSemi));
+            b.pushToken(h.stream.advance());
+            b.pushToken(h.stream.advance());
         }
+        drainWhitespace(b, h.stream);
         // ── default arm
         {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto lbl  = b.open(h.schema->rules().find("caseLabel"));
-            b.pushToken(at(*h.src, "default", CoreTokenKind::Word));
-            b.pushToken(at(*h.src, ":", secondColon));
+            b.pushToken(h.stream.advance());
+            b.pushToken(h.stream.advance());
         }
+        drainWhitespace(b, h.stream);
         {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto inner = b.open(h.schema->rules().find("statement"));
             auto br    = b.open(h.schema->rules().find("breakStmt"));
-            b.pushToken(at(*h.src, "break", secondBreak, CoreTokenKind::Word));
-            b.pushToken(at(*h.src, ";", secondSemi));
+            b.pushToken(h.stream.advance());
+            b.pushToken(h.stream.advance());
         }
-        b.pushToken(at(*h.src, "}", bodyClose));
+        drainWhitespace(b, h.stream);
+        b.pushToken(h.stream.advance());
     }
     Tree t = std::move(b).finish();
 
@@ -475,6 +425,7 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
     }
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
+    EXPECT_TRUE(h.lexerDiags->all().empty());
 
     const std::string_view expected =
         "rule:root\n"

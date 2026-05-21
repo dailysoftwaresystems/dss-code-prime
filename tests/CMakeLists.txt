@@ -18,3 +18,4 @@ function(dss_add_test)
 endfunction()
 
 add_subdirectory(core)
+add_subdirectory(tokenizer)
