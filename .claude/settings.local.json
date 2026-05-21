@@ -126,7 +126,9 @@
       "Bash(./dss_core_test_tree_builder.exe --gtest_list_tests)",
       "Bash(./build/bin/dss/dss_core_test_tree_builder.exe --gtest_list_tests)",
       "Bash(./build/bin/dss/dss_core_test_tree_builder.exe)",
-      "Bash(echo \"EXIT=$?\")"
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(awk '/^### PR landing log/,/^##[^#]/' \".plans/03-substrate-hardening-plan - ok.md\")",
+      "Bash(grep *)"
     ]
   }
 }
