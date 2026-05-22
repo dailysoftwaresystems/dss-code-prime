@@ -186,7 +186,15 @@
       "Bash(cmd.exe //c \".\\\\\\\\dss_analysis_syntactic_test_parser_toy.exe --gtest_brief=1\")",
       "Bash(MSYS2_ARG_CONV_EXCL='*' cmd /c \".\\\\\\\\dss_analysis_syntactic_test_parser_toy.exe\" \"--gtest_brief=1\")",
       "PowerShell(Out-File *)",
-      "PowerShell(Set-Location C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss; @\\('ParserToy.HappyPath_SingleVarDecl','ParserToy.HappyPath_SingleExprStmt','ParserToy.HappyPath_MultipleStatements','ParserToy.HappyPath_EmptySource','ParserToy.BrokenPath_UnknownTokenInExpressionPosition','ParserToy.BrokenPath_PrematureEofMidRule','ParserToy.BrokenPath_TokenNotInAnyFirstSet','ParserToy.RuleLeafSkipNullable_DoesNotConsumeTokens','ParserToy.NullableBranchNegativePin_DoesNotFireOnFirstMatch'\\) | ForEach-Object { $name=$_; $r = & .\\\\dss_analysis_syntactic_test_parser_toy.exe --gtest_filter=$name --gtest_brief=1 2>&1 | Select-Object -Last 1; \"$name -> $r\" })"
+      "PowerShell(Set-Location C:\\\\Source\\\\DailySoftware\\\\dss-code-prime\\\\build\\\\bin\\\\dss; @\\('ParserToy.HappyPath_SingleVarDecl','ParserToy.HappyPath_SingleExprStmt','ParserToy.HappyPath_MultipleStatements','ParserToy.HappyPath_EmptySource','ParserToy.BrokenPath_UnknownTokenInExpressionPosition','ParserToy.BrokenPath_PrematureEofMidRule','ParserToy.BrokenPath_TokenNotInAnyFirstSet','ParserToy.RuleLeafSkipNullable_DoesNotConsumeTokens','ParserToy.NullableBranchNegativePin_DoesNotFireOnFirstMatch'\\) | ForEach-Object { $name=$_; $r = & .\\\\dss_analysis_syntactic_test_parser_toy.exe --gtest_filter=$name --gtest_brief=1 2>&1 | Select-Object -Last 1; \"$name -> $r\" })",
+      "Bash(cmake --build C:/Source/DailySoftware/dss-code-prime/build --target dss-code-prime)",
+      "Bash(cmake --build C:/Source/DailySoftware/dss-code-prime/build --target dss_analysis_syntactic_test_parser_toy dss_analysis_syntactic_test_parser_speculation dss_analysis_syntactic_test_parser_c_subset_smoke)",
+      "Bash(ctest --test-dir C:/Source/DailySoftware/dss-code-prime/build --output-on-failure -R \"test_parser\")",
+      "Bash(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_parser_toy.exe)",
+      "Bash(./dss_analysis_syntactic_test_parser_toy.exe)",
+      "PowerShell(cd C:/Source/DailySoftware/dss-code-prime/build/bin/dss; .\\\\dss_analysis_syntactic_test_parser_toy.exe --gtest_list_tests 2>&1 | Select-Object -First 30; \"exit=$LASTEXITCODE\")",
+      "PowerShell(cd C:/Source/DailySoftware/dss-code-prime/build/bin/dss; .\\\\dss_analysis_syntactic_test_parser_toy.exe 2>&1 | Select-Object -Last 10; \"exit=$LASTEXITCODE\")",
+      "PowerShell(cd C:/Source/DailySoftware/dss-code-prime/build/bin/dss; .\\\\dss_analysis_syntactic_test_parser_speculation.exe 2>&1 | Select-Object -Last 10; \"spec exit=$LASTEXITCODE\"; .\\\\dss_analysis_syntactic_test_parser_c_subset_smoke.exe 2>&1 | Select-Object -Last 10; \"csub exit=$LASTEXITCODE\")"
     ]
   }
 }

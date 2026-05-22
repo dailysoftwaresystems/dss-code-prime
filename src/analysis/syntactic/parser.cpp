@@ -217,27 +217,149 @@ struct Parser::Impl {
         return out;
     }
 
-    // Try one speculative branch. Snapshots all four state machines
-    // (token stream, builder, walker, parser frames), opens the
-    // branch frame, then runs `stepOnce` repeatedly until either the
-    // branch's frame closes (`frames.size() == targetDepth` →
-    // success) or a failure signal fires:
-    //   - walker.isDesynced()           → grammar mismatch
-    //   - new diagnostic emitted        → branch dispatch raised
-    //                                     P_NoAlternativeMatched /
-    //                                     P_UnexpectedToken /
-    //                                     P_MissingRequiredChild
-    //   - exceeded probe budget         → safety bound (16 ×
-    //                                     `walker.lookahead()`); a
-    //                                     branch that doesn't close
-    //                                     within ~tokens-budget is
-    //                                     unlikely to be the right
-    //                                     choice
-    //   - reached EOF without closing   → branch needs more input
+    // Move-only RAII guard for one speculative-branch probe.
     //
-    // On success: commit checkpoint + return true. Branch frame is
-    // properly populated (open + children + close).
-    // On failure: restore all four state machines + return false.
+    // Mirrors `TreeBuilder::Checkpoint`'s "rollback unless committed"
+    // discipline across all four state machines a speculative probe
+    // touches: token stream, builder, walker, parser frames + the
+    // delta-basis bookkeeping (diag counter, desync latch baseline,
+    // speculation-depth counter, watchdog tuple). The probe owns the
+    // invariant; the caller drives the inner dispatch loop and either
+    // calls `commit()` on success or lets the dtor restore on any
+    // failure path. Returning from the loop without `commit()`
+    // (including via exception, `return false`, or an early `goto`)
+    // structurally guarantees a complete restore — the four-machine
+    // restore is no longer convention.
+    class SpeculationProbe {
+    public:
+        explicit SpeculationProbe(Impl& impl)
+            : impl_(impl)
+            , bookmark_(impl.tokens.mark())
+            , cp_(impl.builder->checkpoint())
+            , walkerSnap_(impl.walker.snapshot())
+            , targetDepth_(impl.frames.size())
+            , diagsBefore_(impl.diagsEmitted)
+            , probeStartPos_(impl.tokens.position())
+            // Capture the desync latch as a delta baseline.
+            // `SchemaWalker`'s latch is one-shot for the walker's
+            // lifetime — once tripped by an earlier dispatch path
+            // (contextual-keyword demotion, prior mismatched
+            // advance), `isDesynced()` returns true permanently.
+            // Comparing the absolute value would auto-fail every
+            // speculation probe after the first parse-wide desync;
+            // the delta `nowDesynced && !desyncedBefore` only fails
+            // when *this branch* tripped the latch.
+            , desyncedBefore_(impl.walker.isDesynced())
+            // Budget: 16× the schema's declared lookahead. The
+            // declared lookahead is the disambiguation distance,
+            // not a total-cost bound, so multiply by a generous
+            // factor to let the branch make legitimate progress
+            // (descents, token consumption) while still aborting
+            // adversarial input.
+            , budget_(static_cast<std::size_t>(
+                  impl.walker.lookahead() > 0
+                      ? impl.walker.lookahead() * 16u
+                      : 64u)) {
+            ++impl_.speculationDepth;
+        }
+
+        SpeculationProbe(SpeculationProbe const&)            = delete;
+        SpeculationProbe& operator=(SpeculationProbe const&) = delete;
+        SpeculationProbe(SpeculationProbe&&)                 = delete;
+        SpeculationProbe& operator=(SpeculationProbe&&)      = delete;
+
+        ~SpeculationProbe() noexcept {
+            if (!committed_) {
+                // Order matters: drop local `OpenScope` guards
+                // BEFORE `builder->rollback`. Rollback restores the
+                // builder's open-frame stack from the checkpoint
+                // snapshot, including its cookie-tracking set; an
+                // `OpenScope` destructor running afterwards would
+                // call `closeFrame_` on a cookie the builder has
+                // discarded, tripping its invariant checker.
+                // Popping first lets each destructor close cleanly
+                // against a still-live cookie, and the subsequent
+                // rollback then overwrites all the close-side
+                // effects with the snapshot.
+                while (impl_.frames.size() > targetDepth_) {
+                    impl_.frames.pop_back();
+                }
+                impl_.walker.restore(std::move(*walkerSnap_));
+                impl_.builder->rollback(std::move(*cp_));
+                impl_.tokens.restore(bookmark_);
+                impl_.diagsEmitted = diagsBefore_;
+            }
+            --impl_.speculationDepth;
+        }
+
+        [[nodiscard]] std::size_t targetDepth() const noexcept {
+            return targetDepth_;
+        }
+
+        [[nodiscard]] bool isDesynced() const noexcept {
+            return impl_.walker.isDesynced() && !desyncedBefore_;
+        }
+
+        [[nodiscard]] bool exceededBudget() const noexcept {
+            return impl_.tokens.position() - probeStartPos_ > budget_;
+        }
+
+        [[nodiscard]] bool emittedDiag() const noexcept {
+            return impl_.diagsEmitted > diagsBefore_;
+        }
+
+        // Commit the probe. After this the dtor is a no-op (beyond
+        // the speculation-depth decrement) and the four-machine
+        // state stays at its post-commit position. Also re-baselines
+        // the outer watchdog tuple — the pre-speculation snapshot is
+        // stale (cursor/tokPos/depth moved across multiple tokens),
+        // and resetting `firstIteration` alone would hide the rare
+        // case where post-commit state happens to equal pre-
+        // speculation state.
+        void commit() noexcept {
+            impl_.builder->commit(std::move(*cp_));
+            impl_.lastCursor = impl_.walker.cursor();
+            impl_.lastTokPos = impl_.tokens.position();
+            impl_.lastDepth  = impl_.frames.size();
+            committed_       = true;
+        }
+
+    private:
+        Impl&                                  impl_;
+        TokenStream::Bookmark                  bookmark_;
+        // `TreeBuilder::Checkpoint` and `SchemaWalker::Snapshot` are
+        // move-only and non-default-constructible by design (every
+        // instance must originate from the producer); wrap in
+        // `std::optional` so the destructor can move-out into
+        // rollback/restore exactly once.
+        std::optional<TreeBuilder::Checkpoint> cp_;
+        std::optional<SchemaWalker::Snapshot>  walkerSnap_;
+        std::size_t                            targetDepth_;
+        std::size_t                            diagsBefore_;
+        std::size_t                            probeStartPos_;
+        bool                                   desyncedBefore_;
+        std::size_t                            budget_;
+        bool                                   committed_ = false;
+    };
+
+    // Try one speculative branch. Opens the branch frame inside a
+    // `SpeculationProbe` and drives `stepOnce` repeatedly until
+    // either the branch's frame closes (`frames.size() ==
+    // probe.targetDepth()` → success → commit + return true) or a
+    // failure signal fires:
+    //   - probe.isDesynced()    → grammar mismatch this branch
+    //   - probe.exceededBudget()→ 16 × `walker.lookahead()` safety
+    //                             bound; a branch that doesn't close
+    //                             within budget is unlikely to be
+    //                             the right choice
+    //   - probe.emittedDiag()   → branch dispatch raised
+    //                             P_NoAlternativeMatched /
+    //                             P_UnexpectedToken /
+    //                             P_MissingRequiredChild
+    //   - stepOnce → Done       → reached EOF mid-branch; needs more
+    //                             input
+    // Any return-without-commit path triggers the probe's RAII
+    // restore (tokens + builder + walker + frames + diag counter).
     [[nodiscard]] bool trySpeculativeBranch(RuleId branch) {
         if (speculationDepth >= config.maxSpeculationDepth) {
             emitParserError(
@@ -248,100 +370,43 @@ struct Parser::Impl {
                     speculationDepth, config.maxSpeculationDepth));
             return false;
         }
-        ++speculationDepth;
-        struct DepthGuard {
-            std::size_t& d;
-            ~DepthGuard() { --d; }
-        } guard{speculationDepth};
 
-        const auto bookmark        = tokens.mark();
-        auto       cp              = builder->checkpoint();
-        auto       walkerSnap      = walker.snapshot();
-        const auto targetDepth     = frames.size();
-        const auto diagsBefore     = diagsEmitted;
-        const auto probeStartPos   = tokens.position();
-        // Capture the desync latch as a delta baseline. `SchemaWalker`'s
-        // latch is one-shot for the walker's lifetime — once tripped by
-        // an earlier dispatch path (contextual-keyword demotion, prior
-        // mismatched advance), `isDesynced()` returns true permanently.
-        // Comparing the absolute value would auto-fail every speculation
-        // probe after the first parse-wide desync; the delta `nowDesynced
-        // && !desyncedBefore` only fails when *this branch* tripped the
-        // latch.
-        const bool desyncedBefore  = walker.isDesynced();
-
-        // Budget: 16× the schema's declared lookahead. The declared
-        // lookahead is the disambiguation distance, not a total-cost
-        // bound, so multiply by a generous factor to let the branch
-        // make legitimate progress (descents, token consumption)
-        // while still aborting adversarial input.
-        const std::uint16_t declared = walker.lookahead();
-        const std::size_t   budget   = static_cast<std::size_t>(
-            declared > 0 ? declared * 16u : 64u);
+        SpeculationProbe probe{*this};
 
         frames.push_back(builder->open(branch));
         walker.enterRule(branch);
 
-        while (frames.size() > targetDepth) {
-            if (walker.isDesynced() && !desyncedBefore) goto fail;
-            if (tokens.position() - probeStartPos > budget) goto fail;
+        while (frames.size() > probe.targetDepth()) {
+            if (probe.isDesynced())     return false;
+            if (probe.exceededBudget()) return false;
             // Note: do NOT bail on `isAtSourceEnd && !walker.canEndSource()`
             // — the branch's last iteration legitimately runs with peek
             // == Eof when the cursor is at End and `closeFrameOnce` is
             // the next action. Premature-EOF mid-branch is caught by
             // stepOnce's own EOF handler, which emits
-            // P_MissingRequiredChild → the post-stepOnce diagsEmitted
-            // recheck below fires.
+            // P_MissingRequiredChild → the post-stepOnce diag recheck
+            // below fires.
 
             const auto outcome = stepOnce();
             if (outcome == StepOutcome::Done) {
-                // Done at the outer parser level only when canEndSource
-                // is true AND tokens drained — but we're inside an
-                // unclosed branch frame here, so this signals the
-                // branch needs more input than is available. Treat as
-                // failure.
-                goto fail;
+                // Done at the outer parser level only when
+                // canEndSource is true AND tokens drained — but
+                // we're inside an unclosed branch frame here, so
+                // this signals the branch needs more input than is
+                // available. Treat as failure.
+                return false;
             }
             // Post-step rechecks: stepOnce may have emitted a
             // diagnostic and closed the branch frame in the same
             // iteration (peek=EOF mid-rule). Without these the loop
             // exits via `frames.size() == targetDepth` and commits a
-            // half-built branch. Mirror the loop-head checks (delta-
-            // basis for the desync latch).
-            if (diagsEmitted > diagsBefore) goto fail;
-            if (walker.isDesynced() && !desyncedBefore) goto fail;
+            // half-built branch. Mirror the loop-head checks.
+            if (probe.emittedDiag()) return false;
+            if (probe.isDesynced())  return false;
         }
 
-        builder->commit(std::move(cp));
-        // Re-baseline the watchdog tuple to the post-commit state.
-        // The pre-speculation snapshot is stale (cursor/tokPos/depth
-        // moved across multiple tokens); the next outer iteration
-        // must measure forward progress relative to the *new*
-        // baseline. Resetting the `firstIteration` latch alone would
-        // hide the rare case where post-commit state happens to
-        // equal pre-speculation state.
-        lastCursor = walker.cursor();
-        lastTokPos = tokens.position();
-        lastDepth  = frames.size();
+        probe.commit();
         return true;
-
-      fail:
-        // Restore all four state machines to the pre-probe state.
-        // Order matters: drop local `OpenScope` guards BEFORE
-        // `builder->rollback`. Rollback restores the builder's
-        // open-frame stack from the checkpoint snapshot, including
-        // its cookie-tracking set; an `OpenScope` destructor running
-        // afterwards would call `closeFrame_` on a cookie the
-        // builder has discarded, tripping its invariant checker.
-        // Popping first lets each destructor close cleanly against a
-        // still-live cookie, and the subsequent rollback then
-        // overwrites all the close-side effects with the snapshot.
-        while (frames.size() > targetDepth) frames.pop_back();
-        walker.restore(std::move(walkerSnap));
-        builder->rollback(std::move(cp));
-        tokens.restore(bookmark);
-        diagsEmitted = diagsBefore;
-        return false;
     }
 
     // ── one dispatch iteration ─────────────────────────────────────
