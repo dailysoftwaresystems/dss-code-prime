@@ -776,3 +776,141 @@ TEST(TreeBuilder, BodyDefaultKindsEmptyWhenSchemaHasNoBodyModes) {
     EXPECT_EQ(countCode(t.diagnostics().all(),
                         DiagnosticCode::P_SchemaCursorDesync), 0u);
 }
+
+// Two body modes declaring distinct default kinds — the
+// bodyDefaultTokenKinds_ set must be the UNION across all modes.
+// Without this pin, a regression that picked up only the FIRST mode's
+// kind would mask a desync diagnostic from the second mode's body.
+TEST(TreeBuilder, BodyDefaultKindsUnionsAcrossLexerModes) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "MultiBody", "version": "0.1.0" },
+      "lexerModes": {
+        "main":   { "tokens": "default" },
+        "modeA":  { "defaultToken": { "kind": "AKind" }, "unterminatedAs": "string" },
+        "modeB":  { "defaultToken": { "kind": "BKind" }, "unterminatedAs": "string" }
+      },
+      "tokens": {
+        "[": [{ "kind": "AOpen", "modeOp": "pushMode", "modeArg": "modeA",
+                "stringStyle": { "escapeKind": "none", "endsAt": "]" } }],
+        "(": [{ "kind": "BOpen", "modeOp": "pushMode", "modeArg": "modeB",
+                "stringStyle": { "escapeKind": "none", "endsAt": ")" } }]
+      },
+      "shapes": { "root": { "sequence": [ "AOpen" ] } }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("", "<multi>");
+    const auto aKind = schema->schemaTokens().find("AKind");
+    const auto bKind = schema->schemaTokens().find("BKind");
+    ASSERT_TRUE(aKind.valid());
+    ASSERT_TRUE(bKind.valid());
+
+    Token aTok{ .coreKind = CoreTokenKind::Punctuation, .schemaKind = aKind,
+                .span = SourceSpan::of(0, 0) };
+    Token bTok{ .coreKind = CoreTokenKind::Punctuation, .schemaKind = bKind,
+                .span = SourceSpan::of(0, 0) };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        // Push BOTH body-default kinds. If only AKind made it into the
+        // skip set, BKind would advance the cursor (which expects AOpen)
+        // and trip `P_SchemaCursorDesync`. If only BKind made it in,
+        // AKind would trip it.
+        b.pushToken(aTok);
+        b.pushToken(bTok);
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_SchemaCursorDesync), 0u)
+        << "both AKind and BKind must be in the body-default skip set";
+}
+
+// Synthesis path consults `isTokenValidInScope`: a schema that
+// forbids a built-in literal inside some scope must reject synthesis
+// of that literal when that scope is active. Without the filter, the
+// tokenizer's pre-resolved kind would smuggle past the scope rule and
+// land as a clean leaf with no diagnostic.
+TEST(TreeBuilder, SynthesisHonorsIsTokenValidInScope) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "ScopeSynth", "version": "0.1.0" },
+      "tokens": {
+        "{": [{ "kind": "BlockOpen",  "opensScope": "Block" }],
+        "}": [{ "kind": "BlockClose", "closesScope": true }]
+      },
+      "scopes": {
+        "validity": [ { "scope": "Block", "forbid": ["IntLiteral"] } ]
+      },
+      "shapes": {
+        "root":  { "sequence": [{ "repeat": "stmt" }] },
+        "stmt":  { "sequence": ["BlockOpen", "IntLiteral", "BlockClose"] }
+      }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("{5}", "<scope-synth>");
+    const auto intLitKind = schema->schemaTokens().find("IntLiteral");
+
+    Token open5  { .coreKind = CoreTokenKind::Punctuation, .schemaKind = {},
+                   .span = SourceSpan::of(0, 1) };
+    Token five   { .coreKind = CoreTokenKind::IntLiteral,  .schemaKind = intLitKind,
+                   .span = SourceSpan::of(1, 2) };
+    Token close5 { .coreKind = CoreTokenKind::Punctuation, .schemaKind = {},
+                   .span = SourceSpan::of(2, 3) };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        auto stmt = b.open(schema->rules().find("stmt"));
+        b.pushToken(open5);
+        b.pushToken(five);       // synthesis target, forbidden inside Block
+        b.pushToken(close5);
+    }
+    Tree t = std::move(b).finish();
+
+    auto const& diags = t.diagnostics().all();
+    // Scope forbid must reject `IntLiteral` inside Block. With synthesis
+    // honoring isTokenValidInScope, the synthesis returns empty match,
+    // the Word fallback can't help (coreKind == IntLiteral, not Word),
+    // and pushToken emits P_UnknownToken + an Error leaf.
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_UnknownToken), 1u);
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+}
+
+// Negative pin: when the scope is NOT active, synthesis succeeds and
+// the IntLiteral lands as a clean leaf. Distinguishes "scope-rejected"
+// from "synthesis-broken-globally."
+TEST(TreeBuilder, SynthesisAcceptsBuiltinLiteralOutsideForbidScope) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "ScopeSynthOk", "version": "0.1.0" },
+      "tokens": {
+        "{": [{ "kind": "BlockOpen",  "opensScope": "Block" }],
+        "}": [{ "kind": "BlockClose", "closesScope": true }]
+      },
+      "scopes": {
+        "validity": [ { "scope": "Block", "forbid": ["IntLiteral"] } ]
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral"] }
+      }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("5", "<scope-synth-ok>");
+    const auto intLitKind = schema->schemaTokens().find("IntLiteral");
+
+    Token five{ .coreKind = CoreTokenKind::IntLiteral, .schemaKind = intLitKind,
+                .span = SourceSpan::of(0, 1) };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        b.pushToken(five);
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_UnknownToken), 0u);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+}

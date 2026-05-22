@@ -1275,3 +1275,74 @@ TEST(Tokenizer, IdStartProbe_KeywordPrefixDoesNotSplitIdentifier) {
     EXPECT_FALSE(first.schemaKind.valid())
         << "if_foo must NOT resolve to IfKeyword — only the exact lexeme `if` should";
 }
+
+// Bare `if` resolves to the keyword, NOT the identifier fallback. Pins
+// the equal-length keyword case — a regression that flipped the
+// comparison would still pass `if_foo` (id-run wins via length) but
+// might mis-handle lone `if` (equal-length → fall-through stamps the
+// keyword schemaKind on the Word token).
+TEST(Tokenizer, IdStartProbe_BareKeywordResolvesToKeywordKind) {
+    auto loaded = GrammarSchema::loadFromText(kIdProbeSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("if", "<idprobe>");
+
+    Tokenizer tk{src, schema};
+    auto res = std::move(tk).tokenize();
+    ASSERT_FALSE(res.stream.isAtEnd());
+    const Token first = res.stream.advance();
+
+    EXPECT_EQ(first.span.length(), 2u);
+    EXPECT_EQ(first.coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(first.schemaKind.v,
+              schema->schemaTokens().find("IfKeyword").v)
+        << "lone `if` must resolve to IfKeyword via the equal-length keyword path";
+}
+
+// Mode-pushing 2-byte id-start opener: `r"..."` style. The 2-byte
+// `r"` lexeme triggers a pushMode, which is a stronger interaction
+// than the `N'` case (no mode change). Pinning this catches a
+// regression where the longer-wins gate accepted the global hit's
+// span but dropped its `modeOp` side effect.
+namespace {
+constexpr std::string_view kRawStringSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "RawStr", "version": "0.1.0" },
+  "lexerModes": {
+    "main":   { "tokens": "default" },
+    "rawStr": { "defaultToken": { "kind": "RawChar" }, "unterminatedAs": "string" }
+  },
+  "tokens": {
+    "r\"": [{ "kind": "RawOpen", "modeOp": "pushMode", "modeArg": "rawStr",
+              "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }],
+    "\"":  [{ "kind": "PlainOpen" }]
+  },
+  "shapes": { "root": { "sequence": [ "RawOpen" ] } }
+})JSON";
+}
+
+TEST(Tokenizer, IdStartProbe_RawStringOpenerPushesMode) {
+    auto loaded = GrammarSchema::loadFromText(kRawStringSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("r\"abc\"", "<rawstr>");
+
+    Tokenizer tk{src, schema};
+    auto res = std::move(tk).tokenize();
+    ASSERT_FALSE(res.stream.isAtEnd());
+    const Token first = res.stream.advance();
+
+    EXPECT_EQ(first.span.length(), 2u);
+    EXPECT_EQ(first.schemaKind.v,
+              schema->schemaTokens().find("RawOpen").v);
+
+    // The next emitted tokens should be RawChar (body-mode default),
+    // proving the modeOp fired during the global-hit path. If a
+    // regression took the id-run path instead, `r` would be a Word
+    // token and `"` would open the PlainOpen mode (no push).
+    const Token rawA = res.stream.advance();
+    EXPECT_EQ(rawA.schemaKind.v,
+              schema->schemaTokens().find("RawChar").v)
+        << "expected RawChar body token after `r\"`; modeOp must have fired";
+}

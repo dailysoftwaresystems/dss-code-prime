@@ -940,11 +940,18 @@ void computeNullableTails(GrammarSchemaData& data) {
     }
 }
 
-// Reject any rule shape that references a SchemaTokenId declared as a
-// lexer mode's `defaultToken.kind`. Body-default kinds are off-grammar
-// by construction (see `TreeBuilder::bodyDefaultTokenKinds_`): the
-// cursor-advance gate silently skips them, so a shape reference would
-// never match. Surface the bug at load time instead.
+// Reject any rule shape OR scope-forbid entry that references a
+// SchemaTokenId declared as a lexer mode's `defaultToken.kind`.
+// Body-default kinds are off-grammar by construction (see
+// `TreeBuilder::bodyDefaultTokenKinds_`): the cursor-advance gate
+// silently skips them, so either reference would silently never fire.
+//
+// Main-mode lexeme meanings DELIBERATELY may map to body-default
+// kinds (this is the OR-merge pattern pinned by
+// `Tokenizer.TokenFlags_PropagateToBuilderLeafFlags`). When a main-
+// mode lexeme resolves to a body-default kind the cursor-skip
+// correctly treats it like trivia — harmless as long as no shape
+// expects the kind, which the shape check below already enforces.
 void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll) {
     std::unordered_set<SchemaTokenId> bodyKinds;
     for (auto const& mode : data.lexerModes) {
@@ -952,6 +959,7 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
     }
     if (bodyKinds.empty()) return;
 
+    // Shape references.
     for (auto const& [ruleIdV, rule] : data.compiledRules) {
         const auto ruleName = data.rules->name(RuleId{ruleIdV});
         for (auto const& p : rule.positions) {
@@ -964,6 +972,25 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
                                   "grammar — referencing it from a shape "
                                   "would silently never match",
                                   data.schemaTokens->name(p.tokenId())));
+        }
+    }
+
+    // scopes.validity[].forbid entries — a forbid on a body-default
+    // kind couldn't fire (the kind only appears inside its body mode,
+    // and synthesis goes through scope filtering which would reject
+    // before the forbid was ever consulted). Author probably meant a
+    // different kind.
+    for (auto const& [scopeV, forbidSet] : data.scopeForbid) {
+        for (auto const tokIdV : forbidSet) {
+            const SchemaTokenId id{tokIdV};
+            if (!bodyKinds.contains(id)) continue;
+            coll.emit(DiagnosticCode::C_BodyDefaultKindInShape,
+                      std::format("/scopes/validity"),
+                      std::format("token '{}' (forbidden inside scope id {}) is "
+                                  "declared as a lexer mode's defaultToken.kind "
+                                  "and is off-grammar; the forbid cannot fire",
+                                  data.schemaTokens->name(id),
+                                  scopeV));
         }
     }
 }

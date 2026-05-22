@@ -20,6 +20,7 @@
 #include "toy_harness.hpp"
 
 #include <gtest/gtest.h>
+#include <gtest/gtest-spi.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -372,6 +373,24 @@ TEST(TreeEndToEnd, BrokenPath_PushErrorRecovered) {
     EXPECT_TRUE(hasError(t.flags(t.root())));
     EXPECT_GE(countCode(diags, DiagnosticCode::P_UnexpectedToken), 1u);
     EXPECT_GE(countErrorDescendants(t, t.root()), 1u);
+}
+
+// Pin the E2EHarness destructor's "unexpected lexer diagnostic"
+// safety-net path. Tokenize an input that the toy lexer cannot
+// recognize (the `@` character isn't a declared lexeme), then let the
+// harness go out of scope WITHOUT calling `dismissLexerDiags`. The
+// destructor must fire `ADD_FAILURE` via `EXPECT_NONFATAL_FAILURE`.
+// Without this pin, a regression that disabled the safety net would
+// silently let every E2E test pass even if the tokenizer started
+// emitting bogus diagnostics.
+TEST(E2EHarnessSelfCheck, DtorReportsUndismissedLexerDiagnostic) {
+    EXPECT_NONFATAL_FAILURE(
+        {
+            auto h = tokenizeShipped("@");
+            // Don't call h.dismissLexerDiags() — the dtor must fail.
+            (void)h;
+        },
+        "E2EHarness");
 }
 
 TEST(TreeEndToEnd, BrokenPath_PopScopeUnderflow) {

@@ -28,6 +28,7 @@ using namespace dss;
 using dss::tests::drainWhitespace;
 using dss::tests::E2EHarness;
 using dss::tests::prettyPrint;
+using dss::tests::pushNext;
 using dss::tests::tokenizeShipped;
 
 // Drives `int x = 5;` through the disambiguated topLevel shape:
@@ -54,8 +55,7 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
             auto tail   = b.open(h.schema->rules().find("topLevelTail"));
             auto vdTail = b.open(h.schema->rules().find("varDeclTail"));
             drainWhitespace(b, h.stream);
-            b.pushToken(h.stream.advance());
-            drainWhitespace(b, h.stream);
+            pushNext(b, h.stream);
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
@@ -69,9 +69,6 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     EXPECT_TRUE(t.diagnostics().all().empty());
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
-    EXPECT_TRUE(h.lexerDiags->all().empty())
-        << "tokenizer should produce no diagnostics on clean source";
-
     const std::string_view expected =
         "rule:root\n"
         "  rule:topLevel\n"
@@ -120,35 +117,29 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
                 auto tb = b.open(h.schema->rules().find("typeBase"));
                 b.pushToken(h.stream.advance());
             }
-            b.pushToken(h.stream.advance());
-            drainWhitespace(b, h.stream);
+            pushNext(b, h.stream);
             {
                 auto blk = b.open(h.schema->rules().find("block"));
-                b.pushToken(h.stream.advance());
-                drainWhitespace(b, h.stream);
+                pushNext(b, h.stream);
                 {
                     auto stmt = b.open(h.schema->rules().find("statement"));
                     auto ifs  = b.open(h.schema->rules().find("ifStmt"));
-                    b.pushToken(h.stream.advance());
-                    drainWhitespace(b, h.stream);
+                    pushNext(b, h.stream);
                     b.pushToken(h.stream.advance());
                     {
                         auto expr = b.open(h.schema->rules().find("expression"));
                         auto opr  = b.open(h.schema->rules().find("operand"));
                         b.pushToken(h.stream.advance());
                     }
-                    b.pushToken(h.stream.advance());
-                    drainWhitespace(b, h.stream);
+                    pushNext(b, h.stream);
                     {
                         auto innerStmt = b.open(h.schema->rules().find("statement"));
                         auto innerBlk  = b.open(h.schema->rules().find("block"));
-                        b.pushToken(h.stream.advance());
-                        drainWhitespace(b, h.stream);
+                        pushNext(b, h.stream);
                         {
                             auto retStmt = b.open(h.schema->rules().find("statement"));
                             auto rs      = b.open(h.schema->rules().find("returnStmt"));
-                            b.pushToken(h.stream.advance());
-                            drainWhitespace(b, h.stream);
+                            pushNext(b, h.stream);
                             {
                                 auto retExpr = b.open(h.schema->rules().find("expression"));
                                 auto retOpr  = b.open(h.schema->rules().find("operand"));
@@ -173,7 +164,6 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
             : diagnosticCodeName(t.diagnostics().all()[0].code));
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
-    EXPECT_TRUE(h.lexerDiags->all().empty());
 
     const std::string_view expected =
         "rule:root\n"
@@ -288,24 +278,20 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sw   = b.open(h.schema->rules().find("switchStmt"));
-        b.pushToken(h.stream.advance());
-        drainWhitespace(b, h.stream);
+        pushNext(b, h.stream);
         b.pushToken(h.stream.advance());
         {
             auto expr = b.open(h.schema->rules().find("expression"));
             auto opr  = b.open(h.schema->rules().find("operand"));
             b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());
-        drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());
-        drainWhitespace(b, h.stream);
+        pushNext(b, h.stream);
+        pushNext(b, h.stream);
         // ── case arm
         {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto lbl  = b.open(h.schema->rules().find("caseLabel"));
-            b.pushToken(h.stream.advance());
-            drainWhitespace(b, h.stream);
+            pushNext(b, h.stream);
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
@@ -358,7 +344,6 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
     }
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
-    EXPECT_TRUE(h.lexerDiags->all().empty());
 
     const std::string_view expected =
         "rule:root\n"

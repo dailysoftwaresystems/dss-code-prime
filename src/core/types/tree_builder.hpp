@@ -321,13 +321,27 @@ private:
     // built-in literals) the tokenizer is allowed to pre-resolve into
     // a synthesized LexemeMeaning. Frozen after ctor; the schema is
     // immutable.
+    //
+    // Flat union across all modes (no per-mode awareness): if mode A's
+    // default is `Foo` and mode B's default is also `Foo`, both skip
+    // correctly; if mode A's `Foo` collides with a Foo declared
+    // outside its body the cursor-skip still fires. Defense-in-depth
+    // for the latter lives at the loader (`C_BodyDefaultKindInShape`)
+    // which rejects shapes / scope-forbid entries naming a body-default
+    // kind. Threading the mode-of-origin through `Token` to enable
+    // mode-conditioned skipping would be a tokenizer surface change;
+    // deferred unless a real schema misuse surfaces.
     std::unordered_set<SchemaTokenId>      bodyDefaultTokenKinds_;
 
-    // Schema's "Error" SchemaTokenId, cached at ctor so the per-token
-    // resolveMeaning path doesn't re-walk the interner. Predeclared by
-    // the loader (see kBuiltinTokenKindNames), so this is always valid
-    // for any well-formed schema.
+    // Schema's "Error" + "Identifier" SchemaTokenIds, cached at ctor so
+    // the per-token resolveMeaning + contextual-keyword paths don't
+    // re-walk the interner. Predeclared by the loader (see
+    // kBuiltinTokenKindNames); the ctor fatal-aborts if either is
+    // missing rather than letting silent drift (e.g. an Error-kind
+    // token would synthesize into a clean leaf instead of triggering
+    // recovery).
     SchemaTokenId                          errorKind_{};
+    SchemaTokenId                          identifierKind_{};
 
     // Cookies that have been "closed" by cascade or by finish() but whose
     // OpenScope guards are still alive (and will eventually call close()

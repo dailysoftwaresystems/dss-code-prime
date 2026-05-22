@@ -4,7 +4,6 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <atomic>
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +14,21 @@
 #include <utility>
 
 namespace dss {
+
+namespace {
+
+// Always-on fatal-abort for TreeBuilder invariants. Matches the
+// project's `*Fatal` pattern (see tree.cpp's `treeFatal`,
+// tree_attrs.hpp's `attrFatal`) so contract violations halt loudly in
+// release builds, not just under NDEBUG-off asserts.
+[[noreturn]] void tbFatal(char const* what) noexcept {
+    std::fputs("dss::TreeBuilder fatal: ", stderr);
+    std::fputs(what, stderr);
+    std::fputc('\n', stderr);
+    std::abort();
+}
+
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────
 // OpenScope — RAII guard returned by TreeBuilder::open()
@@ -72,9 +86,7 @@ TreeBuilder::Checkpoint::Checkpoint(Checkpoint&& other) noexcept
 TreeBuilder::Checkpoint&
 TreeBuilder::Checkpoint::operator=(Checkpoint&& other) noexcept {
     if (this != &other) {
-        // If `this` is still pending, the user assigned over a live
-        // guard — roll it back as a defensive default (same as the
-        // destructor would have done).
+        // Assigning over a live guard rolls back — same as dtor would.
         if (builder_ && disp_ == Disposition::Pending) {
             builder_->rollbackToId_(id_);
         }
@@ -158,25 +170,33 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // We accept a null source in tests of degenerate paths (the diagnostic
     // emit fallback handles it), but a null schema means pushToken has
     // nothing to resolve against — fail fast.
-    if (!schema_) {
-        std::fputs("dss::TreeBuilder fatal: schema is null\n", stderr);
-        std::abort();
-    }
+    if (!schema_) tbFatal("schema is null");
     // Slot 0 of the arena is reserved as InvalidNode — every real NodeId
     // starts at 1. This matches the convention DSS_STRONG_ID enforces:
     // default-constructed = invalid sentinel.
     nodes_.emplace_back();
 
-    // Snapshot body-mode defaultToken kinds + the error sentinel. Both
-    // are needed on the per-token resolveMeaning hot path; the set is
-    // a function of the (immutable) schema, so the ctor is the right
-    // place to compute it once.
+    // Snapshot body-mode defaultToken kinds + the error + identifier
+    // sentinels. All are needed on the per-token resolveMeaning hot
+    // path; the values are a function of the (immutable) schema, so
+    // the ctor is the right place to compute them once.
     for (auto const& mode : schema_->lexerModes()) {
         if (mode.defaultToken) {
             bodyDefaultTokenKinds_.insert(mode.defaultToken->kind);
         }
     }
-    errorKind_ = schema_->schemaTokens().find("Error");
+    errorKind_      = schema_->schemaTokens().find("Error");
+    identifierKind_ = schema_->schemaTokens().find("Identifier");
+
+    // Both are predeclared by the loader's `kBuiltinTokenKindNames` list
+    // — they MUST resolve. A missing "Error" sentinel would silently
+    // turn every Error-kind token into a clean synthesized leaf
+    // (resolveMeaning's Path A/B guard compares `preResolved !=
+    // errorKind` to gate synthesis); a missing "Identifier" would
+    // break the Word fallback + contextual-keyword demotion. Better
+    // to halt at construction than corrupt every parse.
+    if (!errorKind_.valid())      tbFatal("schema missing predeclared 'Error' token kind");
+    if (!identifierKind_.valid()) tbFatal("schema missing predeclared 'Identifier' token kind");
 }
 
 NodeId TreeBuilder::emit_(detail::Node n) {
@@ -288,8 +308,8 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
 
     // Wraparound is theoretical (4B opens in one build), but it would
     // collide with the "invalid" sentinel and cause spurious LIFO
-    // violation diagnostics — assert early if it ever happens.
-    assert(nextCookie_ != 0 && "TreeBuilder::open: cookie wraparound");
+    // violation diagnostics — fatal-halt early if it ever happens.
+    if (nextCookie_ == 0) tbFatal("cookie counter wrapped around");
     const std::uint32_t cookie = nextCookie_++;
     // The new frame owns pendingChildren_ from this point forward.
     const auto pendingStart = static_cast<std::uint32_t>(pendingChildren_.size());
@@ -475,20 +495,39 @@ struct ResolvedMeaning {
     return false;
 }
 
-// Build the ResolvedMeaning for a synthesis path (paths A and B in
-// resolveMeaning). Asserts the synthesized kind is either a body-mode
-// defaultToken kind or a known literal — the only cases the tokenizer
-// is licensed to pre-resolve without a per-lexeme schema entry.
+// Synthesize a `ResolvedMeaning` for a tokenizer-pre-resolved kind that
+// has no entry in the per-lexeme schema table (numeric literals like
+// `5`, body-mode default tokens like `StringChar`). The synthesized
+// meaning carries the pre-resolved kind directly and bypasses the
+// per-lexeme priority scan.
+//
+// Scope filter: synthesis honors the schema's per-scope forbid rules
+// (`isTokenValidInScope`). Skipping this would let a built-in literal
+// forbidden inside a particular scope smuggle past — e.g. a schema
+// that declares `forbid: ["IntLiteral"]` inside a Type-position scope
+// expects the rejection to flow through `P_UnknownToken` recovery,
+// not silently land as a clean leaf. Returns empty `ResolvedMeaning`
+// when rejected so the caller falls back to the Word/Error path.
+//
+// Drift guard: the kind MUST be either a body-mode default OR a known
+// built-in literal — the only two cases the tokenizer is licensed to
+// pre-resolve without a per-lexeme entry. Anything else means
+// tokenizer / schema drift; fatal-abort rather than synthesize a
+// silently-wrong leaf in release builds.
 [[nodiscard]] ResolvedMeaning makeSyntheticMeaning(
     GrammarSchema const& schema,
     SchemaTokenId preResolved,
-    std::unordered_set<SchemaTokenId> const& bodyKinds) noexcept {
-    assert((bodyKinds.contains(preResolved)
-            || isBuiltinLiteralKind(schema, preResolved))
-           && "resolveMeaning synthesizing for a kind that is neither a "
-              "body-mode defaultToken nor a built-in literal — likely a "
-              "tokenizer/schema drift bug");
-    (void)schema; // referenced only in the assertion above
+    std::unordered_set<SchemaTokenId> const& bodyKinds,
+    std::span<ScopeKind const> scopes) noexcept {
+    if (!(bodyKinds.contains(preResolved)
+          || isBuiltinLiteralKind(schema, preResolved))) {
+        tbFatal("resolveMeaning synthesizing for a kind that is neither "
+                "a body-mode defaultToken nor a built-in literal — "
+                "likely a tokenizer/schema drift bug");
+    }
+    if (!schema.isTokenValidInScope(preResolved, scopes)) {
+        return ResolvedMeaning{};
+    }
     ResolvedMeaning out;
     LexemeMeaning synthetic{};
     synthetic.id   = preResolved;
@@ -506,14 +545,14 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     ResolvedMeaning out;
     const auto candidates = schema.lookupLexeme(lexeme);
 
-    // Path A: tokenizer pre-resolved a built-in/body kind and the per-
-    // lexeme table has nothing for this lexeme at all (numeric literals
-    // like `5`, body-mode chars). Trust the tokenizer; the slow path
-    // has no candidate to consider. Error stays excluded so recovery
-    // continues through P_UnknownToken.
+    // Path A: tokenizer pre-resolved AND the per-lexeme table is empty
+    // for this lexeme (numeric literals, body-mode chars whose byte
+    // isn't a declared lexeme). Trust the tokenizer's classification;
+    // the slow path has nothing to consider. Error stays excluded so
+    // recovery flows through P_UnknownToken.
     if (candidates.empty() && preResolved.valid()) {
         if (preResolved != errorKind) {
-            return makeSyntheticMeaning(schema, preResolved, bodyKinds);
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds, scopes);
         }
         return out;
     }
@@ -527,63 +566,50 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     };
 
     // Fast path: tokenizer pre-resolved a `schemaKind`. Find the named
-    // meaning, confirm it survives the scope filter, then still run the
-    // same-priority ambiguity scan the slow path runs — bypassing the
-    // priority scan must NOT bypass the P_AmbiguousToken warning the
-    // builder would otherwise emit.
-    //
-    // Falls through to the full scan when the fast-path can't satisfy
-    // its winner (preResolved missing from candidates OR scope-
-    // rejected) — that keeps multi-meaning-with-scope cases like toy's
-    // `<` outside-vs-inside-Generic working correctly.
+    // meaning, confirm it survives the scope filter, then still run
+    // the same-priority ambiguity scan — bypassing the priority scan
+    // must NOT bypass the P_AmbiguousToken warning the builder would
+    // otherwise emit. Falls through when the fast path's winner
+    // doesn't satisfy (preResolved missing OR scope-rejected) — keeps
+    // multi-meaning-with-scope cases (toy's `<` outside-vs-inside-
+    // Generic) working.
     if (preResolved.valid()) {
-        std::optional<std::size_t> winnerIdx;
         for (std::size_t i = 0; i < candidates.size(); ++i) {
-            if (candidates[i].id == preResolved && candidateAllowed(candidates[i])) {
-                winnerIdx = i;
-                break;
-            }
-        }
-        if (winnerIdx) {
-            out.meaning = candidates[*winnerIdx];
-            // matchCount mirrors the slow path: count every scope-
-            // allowed candidate, not just the winner. Downstream code
-            // only checks `matchCount == 0` today, but keeping the
-            // value parity-equivalent across fast/slow paths avoids
-            // future divergence if a consumer starts using it.
+            if (candidates[i].id != preResolved) continue;
+            if (!candidateAllowed(candidates[i])) continue;
+            out.meaning = candidates[i];
             for (auto const& m : candidates) {
                 if (candidateAllowed(m)) ++out.matchCount;
             }
-            // Same-priority ambiguity check — first declared still
-            // wins (consistent with the slow path), but the warning
-            // surfaces so the config author can disambiguate.
-            for (std::size_t i = *winnerIdx + 1; i < candidates.size(); ++i) {
-                if (candidates[i].priority != out.meaning.priority) break;
-                if (candidateAllowed(candidates[i])) {
+            for (std::size_t j = i + 1; j < candidates.size(); ++j) {
+                if (candidates[j].priority != out.meaning.priority) break;
+                if (candidateAllowed(candidates[j])) {
                     out.ambiguous = true;
                     break;
                 }
             }
             return out;
         }
-        // Path B: preResolved is a built-in/body kind that the schema's
-        // per-lexeme table doesn't list at all. Trust the tokenizer —
-        // the slow path would pick a different meaning. Excludes Error
-        // (recovery via P_UnknownToken). Distinct from the scope-
-        // rejected case below: if preResolved IS in candidates but
-        // scope-rejected, fall through so a sibling candidate that IS
-        // scope-allowed can win (toy `<` outside-vs-inside-Generic).
+        // Path B: preResolved is a built-in/body kind that the per-
+        // lexeme table doesn't list at all. Trust the tokenizer — the
+        // tokenizer knew the mode context, the slow path doesn't.
+        // E.g. closing `'` in string-body mode emits StringChar but
+        // the schema's `'` lexeme lists StringStart; the body-mode
+        // classification must win. Distinct from the scope-rejected
+        // case below: if preResolved IS in candidates but scope-
+        // rejected, fall through so a sibling scope-allowed candidate
+        // can win.
         bool preResolvedInCandidates = false;
         for (auto const& m : candidates) {
             if (m.id == preResolved) { preResolvedInCandidates = true; break; }
         }
         if (!preResolvedInCandidates && preResolved != errorKind) {
-            return makeSyntheticMeaning(schema, preResolved, bodyKinds);
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds, scopes);
         }
     }
 
-    // Candidates arrive pre-sorted by priority (lowest first, stable on
-    // ties). Find the first that survives.
+    // Slow path: priority-ordered survivor scan (candidates arrive
+    // pre-sorted by priority, lowest first, stable on ties).
     std::optional<std::size_t> winnerIdx;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         if (candidateAllowed(candidates[i])) {
@@ -594,10 +620,6 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     if (!winnerIdx) return out;
 
     out.meaning = candidates[*winnerIdx];
-
-    // Ambiguity: another scope-valid candidate exists with the same
-    // priority as the winner. First-declared still wins, but we want to
-    // surface this as P_AmbiguousToken.
     for (std::size_t i = *winnerIdx + 1; i < candidates.size(); ++i) {
         if (candidates[i].priority != out.meaning.priority) break;
         if (candidateAllowed(candidates[i])) {
@@ -642,12 +664,12 @@ void TreeBuilder::pushToken(Token const& tok) {
 
     if (resolved.matchCount == 0 && tok.coreKind == CoreTokenKind::Word) {
         // Fallback: alphanumeric word that isn't a keyword → Identifier.
-        // Identifier is pre-interned at load (kBuiltinTokenKindNames),
-        // so the lookup against the frozen interner always succeeds.
+        // Identifier is validated at ctor (see identifierKind_); the
+        // lookup against the frozen interner always succeeds.
         LexemeMeaning ident{};
-        ident.id = schema_->schemaTokens().find("Identifier");
-        resolved.meaning   = ident;
-        resolved.matchCount = ident.id.valid() ? 1 : 0;
+        ident.id            = identifierKind_;
+        resolved.meaning    = ident;
+        resolved.matchCount = 1;
     }
 
     if (resolved.matchCount == 0) {
@@ -655,12 +677,12 @@ void TreeBuilder::pushToken(Token const& tok) {
         // text. Insert an Error leaf so the resulting tree still spans
         // every input byte.
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::P_UnknownToken;
-        d.severity = DiagnosticSeverity::Error;
-        d.buffer   = source_->id();
-        d.span     = tok.span;
-        d.actual   = std::format("'{}'", lexeme);
-        if (!open_.empty()) d.ruleContext = open_.back().rule;
+        d.code        = DiagnosticCode::P_UnknownToken;
+        d.severity    = DiagnosticSeverity::Error;
+        d.buffer      = source_->id();
+        d.span        = tok.span;
+        d.actual      = std::format("'{}'", lexeme);
+        d.ruleContext = open_.back().rule;
         emitDiagnostic_(std::move(d));
 
         detail::Node errNode{};
@@ -678,12 +700,12 @@ void TreeBuilder::pushToken(Token const& tok) {
         // (deterministic), but we report so the user can disambiguate
         // the config (or the source itself).
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::P_AmbiguousToken;
-        d.severity = DiagnosticSeverity::Warning;
-        d.buffer   = source_->id();
-        d.span     = tok.span;
-        d.actual   = std::format("'{}'", lexeme);
-        if (!open_.empty()) d.ruleContext = open_.back().rule;
+        d.code        = DiagnosticCode::P_AmbiguousToken;
+        d.severity    = DiagnosticSeverity::Warning;
+        d.buffer      = source_->id();
+        d.span        = tok.span;
+        d.actual      = std::format("'{}'", lexeme);
+        d.ruleContext = open_.back().rule;
         emitDiagnostic_(std::move(d));
     }
 
@@ -706,12 +728,10 @@ void TreeBuilder::pushToken(Token const& tok) {
         // fabricating a LexemeMeaning by hand would skip that check.
         // The demotion target equals the source → infinite no-op
         // identity; abort early with a clear message.
-        const auto identId = schema_->schemaTokens().find("Identifier");
-        if (resolved.meaning.id.v == identId.v) {
-            std::fputs("dss::TreeBuilder fatal: contextual meaning resolved to "
-                       "Identifier (the demotion target); config bypassed the "
-                       "loader's C_MissingField check\n", stderr);
-            std::abort();
+        if (resolved.meaning.id.v == identifierKind_.v) {
+            tbFatal("contextual meaning resolved to Identifier (the "
+                    "demotion target); config bypassed the loader's "
+                    "C_MissingField check");
         }
     }
     if (resolved.meaning.contextual && walker_.cursor().valid()) {
@@ -722,20 +742,19 @@ void TreeBuilder::pushToken(Token const& tok) {
         }
         if (!inExpected) {
             const auto demotedFrom = resolved.meaning.id;
-            const auto identId     = schema_->schemaTokens().find("Identifier");
             LexemeMeaning ident{};
-            ident.id = identId;
+            ident.id         = identifierKind_;
             resolved.meaning = ident;
 
             ParseDiagnostic d;
-            d.code     = DiagnosticCode::P_ContextualKeywordResolution;
-            d.severity = DiagnosticSeverity::Info;
-            d.buffer   = source_->id();
-            d.span     = tok.span;
-            d.actual   = std::format("'{}' as Identifier (demoted from {})",
-                                     lexeme,
-                                     schema_->schemaTokens().name(demotedFrom));
-            if (!open_.empty()) d.ruleContext = open_.back().rule;
+            d.code        = DiagnosticCode::P_ContextualKeywordResolution;
+            d.severity    = DiagnosticSeverity::Info;
+            d.buffer      = source_->id();
+            d.span        = tok.span;
+            d.actual      = std::format("'{}' as Identifier (demoted from {})",
+                                        lexeme,
+                                        schema_->schemaTokens().name(demotedFrom));
+            d.ruleContext = open_.back().rule;
             emitDiagnostic_(std::move(d));
         }
     }
@@ -791,9 +810,7 @@ void TreeBuilder::pushToken(Token const& tok) {
         || bodyDefaultTokenKinds_.contains(resolved.meaning.id);
     if (!isOffGrammar) {
         walker_.advance(resolved.meaning.id, tok.span,
-                        open_.empty()
-                            ? std::optional<RuleId>{}
-                            : std::optional<RuleId>{open_.back().rule});
+                        std::optional<RuleId>{open_.back().rule});
     }
 }
 

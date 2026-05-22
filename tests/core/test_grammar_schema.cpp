@@ -388,6 +388,79 @@ TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
     EXPECT_TRUE(sawReservedDiag);
 }
 
+// Body-default kinds are off-grammar. The loader rejects shape
+// references AND scope-forbid entries naming them — both surfaces
+// would silently never fire at runtime (the cursor-advance gate
+// skips body-default kinds), so surface the misuse at load time.
+TEST(GrammarSchema, RejectsBodyDefaultKindInShape) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "BadShape", "version": "0.1.0" },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "BodyChar" }, "unterminatedAs": "string" }
+      },
+      "tokens": {
+        "(": [{ "kind": "Open", "modeOp": "pushMode", "modeArg": "body",
+                "stringStyle": { "escapeKind": "none", "endsAt": ")" } }]
+      },
+      "shapes": {
+        "root": { "sequence": ["Open", "BodyChar"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(result.has_value());
+
+    bool saw = false;
+    for (auto const& d : result.error()) {
+        if (d.code == DiagnosticCode::C_BodyDefaultKindInShape
+            && d.message.find("BodyChar") != std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw)
+        << "C_BodyDefaultKindInShape must fire for a shape referencing "
+           "a body-default token kind";
+}
+
+TEST(GrammarSchema, RejectsBodyDefaultKindInScopeForbid) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "BadForbid", "version": "0.1.0" },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "BodyChar" }, "unterminatedAs": "string" }
+      },
+      "tokens": {
+        "{": [{ "kind": "BlockOpen", "opensScope": "Block" }],
+        "(": [{ "kind": "Open", "modeOp": "pushMode", "modeArg": "body",
+                "stringStyle": { "escapeKind": "none", "endsAt": ")" } }]
+      },
+      "scopes": {
+        "validity": [ { "scope": "Block", "forbid": ["BodyChar"] } ]
+      },
+      "shapes": {
+        "root": { "sequence": ["Open"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(result.has_value());
+
+    bool saw = false;
+    for (auto const& d : result.error()) {
+        if (d.code == DiagnosticCode::C_BodyDefaultKindInShape
+            && d.message.find("BodyChar") != std::string::npos
+            && d.message.find("forbidden") != std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw)
+        << "C_BodyDefaultKindInShape must fire for scope-forbid "
+           "entries referencing a body-default kind";
+}
+
 // Pin the FIRST-set augmentation: `expr`-shape rules see prefix
 // operator tokens added to their FIRST set so the dispatch loop's
 // `tokInFirst` check accepts bare-prefix expressions (`-a;` etc.)
