@@ -299,6 +299,18 @@ TEST(ParserToyDeath, ZeroSpeculationDepthAborts) {
     ParserConfig cfg;
     cfg.maxSpeculationDepth = 0;
     EXPECT_DEATH(
-        Parser(src, *loaded, std::move(empty), cfg),
+        Parser(src, *loaded, std::move(empty), std::move(cfg)),
         "maxSpeculationDepth must be >= 1");
+}
+
+TEST(ParserToyDeath, ZeroExpressionDepthAborts) {
+    auto loaded = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(loaded.has_value());
+    auto src = SourceBuffer::fromString("", "<x>");
+    TokenStream empty;
+    ParserConfig cfg;
+    cfg.maxExpressionDepth = 0;
+    EXPECT_DEATH(
+        Parser(src, *loaded, std::move(empty), std::move(cfg)),
+        "maxExpressionDepth must be >= 1");
 }

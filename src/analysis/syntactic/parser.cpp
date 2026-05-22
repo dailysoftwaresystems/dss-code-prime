@@ -1,17 +1,21 @@
 #include "analysis/syntactic/parser.hpp"
 
+#include "analysis/syntactic/pratt_walker.hpp"
 #include "core/types/compiled_shape.hpp"
+#include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/schema_walker.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/token.hpp"
 #include "core/types/tree_builder.hpp"
 #include "core/types/tree_node.hpp"
+#include "core/types/well_known_names.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -127,6 +131,28 @@ struct Parser::Impl {
     // indefinitely would otherwise stack-loop the call stack.
     std::size_t speculationDepth = 0;
 
+    // Pratt-walker recursion depth. Incremented on every recursive
+    // call into `DefaultPrattWalker`'s climb routine; fatal-aborts
+    // when it would exceed `config.maxExpressionDepth`. Bounds C++
+    // stack growth for adversarial right-recursion (deeply nested
+    // parens, long right-assoc chains). Same posture as the
+    // forward-progress watchdog — better to halt loudly than risk a
+    // silent stack overflow.
+    std::size_t expressionDepth = 0;
+
+    // Operator-precedence walker, looked up once per `expr`-rule
+    // dispatch. Owned by Impl — either moved out of
+    // `ParserConfig::prattWalker` (caller-provided override) or
+    // default-constructed by `parse()` on first use.
+    std::unique_ptr<PrattWalker> prattWalker;
+
+    // Back-pointer to the owning `Parser`. The Pratt-walker dispatch
+    // path needs to pass a `Parser&` to `walkExpression` (the
+    // public virtual takes `Parser&`, not `Impl&`); using a stable
+    // pointer set at ctor time avoids threading the outer reference
+    // through every dispatch site.
+    Parser* outer = nullptr;
+
     Impl(std::shared_ptr<SourceBuffer>        s,
          std::shared_ptr<GrammarSchema const> sc,
          TokenStream                          ts,
@@ -134,10 +160,19 @@ struct Parser::Impl {
         : src(std::move(s))
         , schema(std::move(sc))
         , tokens(std::move(ts))
-        , config(cfg)
+        , config{cfg.maxSpeculationDepth, cfg.maxExpressionDepth, nullptr}
         , identifierKind(schema->schemaTokens().find("Identifier"))
         , errorKind(schema->schemaTokens().find("Error"))
-        , walker(schema) {}
+        , walker(schema)
+        , prattWalker(std::move(cfg.prattWalker)) {}
+
+    // Default Pratt walker has friend access to drive the parser's
+    // token stream, builder, schema walker, and frame stack
+    // surgically. User-supplied walkers (passed via
+    // `ParserConfig::prattWalker`) can only access the public
+    // `Parser` API — none today; the API is YAGNI until a real
+    // consumer asks for it.
+    friend class DefaultPrattWalker;
 
     // ── helpers ──────────────────────────────────────────────────────
 
@@ -341,6 +376,107 @@ struct Parser::Impl {
         std::size_t                            budget_;
         bool                                   committed_ = false;
     };
+
+    // Drive the dispatch loop until the parser-frame stack drops back
+    // to `targetDepth`. Used by `DefaultPrattWalker` to delegate atom
+    // parsing to the schema-driven recursive-descent machinery — the
+    // walker opens an atom rule frame and then hands off until that
+    // frame closes. Mirrors the inner-loop pattern in
+    // `trySpeculativeBranch` minus the failure-mode bookkeeping.
+    //
+    // On `stepOnce → Done` mid-atom (EOF before the atom frame closed),
+    // emits `P_PrematureEndOfInput` and forcibly closes remaining
+    // frames down to `targetDepth`. Silent return would leave the
+    // walker with an unbalanced frame stack and the caller would close
+    // the wrong rule on its own teardown.
+    void parseUntilFrameDepth(std::size_t targetDepth) {
+        while (frames.size() > targetDepth) {
+            if (stepOnce() == StepOutcome::Done) {
+                if (frames.size() > targetDepth) {
+                    emitParserError(
+                        DiagnosticCode::P_PrematureEndOfInput,
+                        tokens.peek().span,
+                        "premature end of input inside Pratt-walker atom");
+                    while (frames.size() > targetDepth) closeFrameOnce();
+                }
+                return;
+            }
+        }
+    }
+
+    // Open a frame for `rule` (parser side + builder side + parser
+    // walker entry), mirroring the inline pattern previously repeated
+    // at every walker open site.
+    void openExprFrame(RuleId rule) {
+        frames.push_back(builder->open(rule));
+        walker.enterRule(rule);
+    }
+
+    // Advance over `peek` as an operator token: push to builder, step
+    // the parser walker. Returns false when peek is EOF (caller
+    // should treat that as a structural error — see H4 in the PA2
+    // review notes); true on a successful push.
+    [[nodiscard]] bool pushOperatorToken() {
+        Token const& peek = tokens.peek();
+        if (peek.coreKind == CoreTokenKind::Eof) return false;
+        const SchemaTokenId kind =
+            effectiveKind(peek, identifierKind, errorKind);
+        const Token opTok = tokens.advance();
+        builder->pushToken(opTok);
+        walker.advance(kind, opTok.span,
+                       std::optional<RuleId>{builder->currentRule()});
+        return true;
+    }
+
+    // Four-machine snapshot used by `DefaultPrattWalker` to roll back
+    // a tentatively-built primary so it can be rebuilt inside a wrap
+    // (binaryExpr / postfixExpr). Distinct from `SpeculationProbe` —
+    // the walker's rollback is always intentional (no commit-vs-fail
+    // discipline) and the budget / watchdog re-baseline aren't
+    // applicable. Token bookmark + builder checkpoint + schema-walker
+    // snapshot + frame depth + diag counter, restored in dtor order.
+    struct WalkerSnapshot {
+        TokenStream::Bookmark                  tokenBookmark;
+        std::optional<TreeBuilder::Checkpoint> builderCp;
+        std::optional<SchemaWalker::Snapshot>  walkerSnap;
+        std::size_t                            frameDepth;
+        std::size_t                            diagsBefore;
+    };
+
+    [[nodiscard]] WalkerSnapshot snapForWalker() {
+        return WalkerSnapshot{
+            tokens.mark(),
+            builder->checkpoint(),
+            walker.snapshot(),
+            frames.size(),
+            diagsEmitted,
+        };
+    }
+
+    // Rolls back the four-machine state to the snapshot. Consumes
+    // `s.builderCp` / `s.walkerSnap` (move-only). Callers that want
+    // to rollback AGAIN must re-snap before each rollback. Callers
+    // that DON'T rollback must call `commitWalkerSnap` before the
+    // snapshot goes out of scope — otherwise the embedded
+    // `TreeBuilder::Checkpoint` dtor silently rolls back everything
+    // built since the snap (the "uncommitted Checkpoint" RAII rule).
+    void rollbackForWalker(WalkerSnapshot& s) noexcept {
+        while (frames.size() > s.frameDepth) {
+            frames.pop_back();
+        }
+        walker.restore(std::move(*s.walkerSnap));
+        builder->rollback(std::move(*s.builderCp));
+        tokens.restore(s.tokenBookmark);
+        diagsEmitted = s.diagsBefore;
+    }
+
+    // Commit the snapshot's builder Checkpoint so its dtor doesn't
+    // auto-rollback the post-snap work. Used when the walker decides
+    // the tentatively-built primary stands on its own (no op at >=
+    // minPrec) and the snap should be discarded.
+    void commitWalkerSnap(WalkerSnapshot& s) noexcept {
+        if (s.builderCp) builder->commit(std::move(*s.builderCp));
+    }
 
     // Try one speculative branch. Opens the branch frame inside a
     // `SpeculationProbe` and drives `stepOnce` repeatedly until
@@ -559,6 +695,21 @@ struct Parser::Impl {
                 && std::ranges::find(firstSet, tokKind) != firstSet.end();
 
             if (tokInFirst) {
+                // `expr`-shape rules hand off to the Pratt walker
+                // instead of the schema-driven RuleLeaf descent. The
+                // walker opens its own `exprRule` frame plus any
+                // wrapper frames (binaryExpr / unaryExpr /
+                // postfixExpr); on return the frame stack is balanced
+                // with entry. The walker is responsible for advancing
+                // tokens — the watchdog's next iteration will observe
+                // the post-walker (cursor, tokPos, depth) tuple and
+                // not trip since at least the cursor moved.
+                if (schema->isExprRule(nextRule)) {
+                    prattWalker->walkExpression(
+                        *outer, nextRule,
+                        schema->exprMinPrecedence(nextRule));
+                    return StepOutcome::Continue;
+                }
                 frames.push_back(builder->open(nextRule));
                 walker.enterRule(nextRule);
                 return StepOutcome::Continue;
@@ -744,10 +895,14 @@ Parser::Parser(std::shared_ptr<SourceBuffer>        src,
     if (config.maxSpeculationDepth == 0) {
         fatal("dss::Parser::Parser: maxSpeculationDepth must be >= 1");
     }
+    if (config.maxExpressionDepth == 0) {
+        fatal("dss::Parser::Parser: maxExpressionDepth must be >= 1");
+    }
     impl_ = std::make_unique<Impl>(std::move(src),
                                    std::move(schema),
                                    std::move(tokens),
-                                   config);
+                                   std::move(config));
+    impl_->outer = this;
 }
 
 Parser::~Parser() = default;
@@ -758,6 +913,14 @@ ParseResult Parser::parse() && {
     auto& I = *impl_;
 
     I.builder = std::make_unique<TreeBuilder>(I.src, I.schema);
+
+    // Default-construct the Pratt walker if the caller didn't inject
+    // one through `ParserConfig::prattWalker`. Always-present so the
+    // `isExprRule` dispatch path in `stepOnce` can unconditionally
+    // invoke `prattWalker->walkExpression`.
+    if (!I.prattWalker) {
+        I.prattWalker = std::make_unique<DefaultPrattWalker>();
+    }
 
     const RuleId rootRule = I.schema->rootCursor().rule();
     if (!rootRule.valid()) {
@@ -790,6 +953,214 @@ ParseResult Parser::parse() && {
     }
 
     return ParseResult{std::move(*I.builder).finish()};
+}
+
+// ── DefaultPrattWalker ──────────────────────────────────────────────────
+//
+// Schema-driven operator-precedence climber. Produces a right-recursive
+// tree wrapping operator results in the auto-interned `binaryExpr` /
+// `unaryExpr` / `postfixExpr` rules (loader registers these when any
+// schema declares an `expr`-kind shape). Left- vs. right-associativity
+// is encoded in the operator table, not in the tree's structural
+// nesting — a downstream semantic pass reads associativity from
+// `operatorTable().lookup(kind, Infix)->associativity`.
+//
+// Each `parseExpressionAt(minPrec)` call:
+//   1. Takes a four-machine snapshot (tokens, builder, walker, frames,
+//      diag counter).
+//   2. Parses a primary (prefix-op + nested expression OR the atom).
+//   3. Loops: while peek is an op at >= minPrec, rolls back to the
+//      snapshot, opens a wrapper, rebuilds LHS via recursion with
+//      minPrec = op.prec + 1 (so LHS doesn't gobble this same op),
+//      pushes the op, recurses RHS at op.prec (right-recursive).
+//      Each iteration strictly extends the consumed range — no loop.
+namespace {
+
+// Bundles the wrapper rule ids resolved once per `walkExpression`
+// entry. Threading these through avoids re-doing the same `rules()
+// .find(...)` lookup at every climb level + makes the dependency on
+// the loader's auto-intern explicit.
+struct PrattRules {
+    RuleId atom;
+    RuleId binaryExpr;
+    RuleId unaryExpr;
+    RuleId postfixExpr;
+};
+
+// Push trivia tokens through the builder until peek is meaningful.
+// Mirrors the main dispatch loop's TokenLeaf-trivia passthrough so
+// whitespace lands inside the wrapper frame that's currently open.
+void pumpTrivia(Parser::Impl& I) {
+    while (!I.tokens.isAtEnd() && isSkippableTrivia(I.tokens.peek())) {
+        I.builder->pushToken(I.tokens.advance());
+    }
+}
+
+void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
+                       std::int32_t minPrec);
+
+// Emit one primary as a child of the current frame: either a
+// prefix-op + nested expression, or the schema's atom rule.
+void parsePrimary(Parser::Impl& I, PrattRules const& rules,
+                  std::int32_t minPrec) {
+    pumpTrivia(I);
+    Token const& peek = I.tokens.peek();
+    const SchemaTokenId kind =
+        effectiveKind(peek, I.identifierKind, I.errorKind);
+
+    const auto prefix = I.schema->operatorTable().lookup(
+        kind, OperatorArity::Prefix);
+    if (prefix && prefix->precedence >= minPrec) {
+        I.openExprFrame(rules.unaryExpr);
+        // pushOperatorToken returns false only on EOF, which can't
+        // happen here — we already inspected peek via effectiveKind
+        // and got a real Prefix entry from the operator table.
+        (void)I.pushOperatorToken();
+        // Recurse at the prefix's own precedence so tighter ops bind
+        // inside the operand (e.g. `-a * b` parses as
+        // `unaryExpr[-, binaryExpr[a, *, b]]` when `*` is tighter).
+        parseExpressionAt(I, rules, prefix->precedence);
+        I.closeFrameOnce();
+        return;
+    }
+
+    const std::size_t depthBeforeAtom = I.frames.size();
+    I.openExprFrame(rules.atom);
+    I.parseUntilFrameDepth(depthBeforeAtom);
+}
+
+void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
+                       std::int32_t minPrec) {
+    if (I.expressionDepth >= I.config.maxExpressionDepth) {
+        fatal("dss::DefaultPrattWalker: expression recursion depth "
+              "exceeded ParserConfig::maxExpressionDepth — deeply "
+              "nested parens or right-associative chains would have "
+              "blown the C++ call stack");
+    }
+    ++I.expressionDepth;
+    struct DepthGuard {
+        std::size_t& depth;
+        ~DepthGuard() { --depth; }
+    } guard{I.expressionDepth};
+
+    auto snap = I.snapForWalker();
+    parsePrimary(I, rules, minPrec);
+
+    while (true) {
+        pumpTrivia(I);
+        Token const& peek = I.tokens.peek();
+        if (peek.coreKind == CoreTokenKind::Eof) {
+            I.commitWalkerSnap(snap);
+            return;
+        }
+        const SchemaTokenId kind =
+            effectiveKind(peek, I.identifierKind, I.errorKind);
+
+        const auto infix = I.schema->operatorTable().lookup(
+            kind, OperatorArity::Infix);
+        const auto postfix = I.schema->operatorTable().lookup(
+            kind, OperatorArity::Postfix);
+
+        const bool postfixInClimb =
+            postfix && postfix->precedence >= minPrec;
+        const bool infixInClimb =
+            infix && infix->precedence >= minPrec;
+
+        if (!postfixInClimb && !infixInClimb) {
+            I.commitWalkerSnap(snap);
+            return;
+        }
+
+        // Roll back before opening the wrapper. Re-snap IMMEDIATELY
+        // (still pointing at the pre-primary state) so a subsequent
+        // iteration can wipe this wrap in turn — re-snapping AFTER
+        // the wrap was emitted would let only the wrap's children be
+        // undone, not the wrap itself.
+        I.rollbackForWalker(snap);
+        snap = I.snapForWalker();
+
+        // Postfix wins ties with infix at the same precedence — it
+        // binds the lhs alone (no further operand to gather), so
+        // structurally it's the more local binding.
+        if (postfixInClimb) {
+            I.openExprFrame(rules.postfixExpr);
+            parseExpressionAt(I, rules, postfix->precedence + 1);
+            pumpTrivia(I);
+            if (!I.pushOperatorToken()) {
+                // Pathological: inner recursion consumed the postfix
+                // op too (shouldn't, given the prec+1 floor) and we
+                // landed at EOF here. Diagnose + abort the wrap so we
+                // don't push a synthesized EOF as the operator token.
+                I.emitParserError(
+                    DiagnosticCode::P_PrematureEndOfInput,
+                    peek.span,
+                    "expression ended before postfix operator");
+                I.closeFrameOnce();
+                I.commitWalkerSnap(snap);
+                return;
+            }
+            I.closeFrameOnce();
+            continue;
+        }
+
+        I.openExprFrame(rules.binaryExpr);
+        // LHS: strictly tighter (op.prec + 1) so it doesn't gobble
+        // this same-prec op (which would loop forever).
+        parseExpressionAt(I, rules, infix->precedence + 1);
+        pumpTrivia(I);
+        if (!I.pushOperatorToken()) {
+            I.emitParserError(
+                DiagnosticCode::P_PrematureEndOfInput,
+                peek.span,
+                "expression ended before infix operator");
+            I.closeFrameOnce();
+            I.commitWalkerSnap(snap);
+            return;
+        }
+        // RHS uses op.prec, so same-prec ops fold into a nested
+        // binaryExpr (right-recursive shape; left-assoc is conveyed
+        // only via the operator table).
+        parseExpressionAt(I, rules, infix->precedence);
+        I.closeFrameOnce();
+    }
+}
+
+} // namespace
+
+void DefaultPrattWalker::walkExpression(Parser& parser,
+                                        RuleId        exprRule,
+                                        std::int32_t  minPrec) {
+    auto& I = *parser.impl_;
+
+    // Resolve atom + wrapper rules ONCE. Mid-climb the builder's
+    // current rule is whichever wrapper we're inside, so
+    // `exprAtom(currentRule())` would return InvalidRule.
+    PrattRules const rules{
+        .atom        = I.schema->exprAtom(exprRule),
+        .binaryExpr  = I.schema->rules().find(dss::rules::kBinaryExpr),
+        .unaryExpr   = I.schema->rules().find(dss::rules::kUnaryExpr),
+        .postfixExpr = I.schema->rules().find(dss::rules::kPostfixExpr),
+    };
+    if (!rules.atom.valid()) {
+        fatal("dss::DefaultPrattWalker::walkExpression: exprRule's "
+              "atom is InvalidRule — schema didn't compile this rule "
+              "as `expr`-kind");
+    }
+    // The loader is contractually obligated to intern these when any
+    // schema declares an `expr` shape — if any is missing, the loader
+    // and walker disagree on the schema's shape kind. Loud halt
+    // beats silent corruption.
+    if (!rules.binaryExpr.valid() || !rules.unaryExpr.valid()
+        || !rules.postfixExpr.valid()) {
+        fatal("dss::DefaultPrattWalker::walkExpression: wrapper rule "
+              "(binaryExpr/unaryExpr/postfixExpr) not interned — "
+              "loader's auto-intern path failed to register the "
+              "well-known wrapper names");
+    }
+
+    I.openExprFrame(exprRule);
+    parseExpressionAt(I, rules, minPrec);
+    I.closeFrameOnce();
 }
 
 } // namespace dss

@@ -334,6 +334,24 @@ bool GrammarSchema::isNullable(RuleId rule) const noexcept {
     return it->second.nullable;
 }
 
+bool GrammarSchema::isExprRule(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return false;
+    return it->second.isExpr;
+}
+
+RuleId GrammarSchema::exprAtom(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return RuleId{};
+    return it->second.exprAtom;
+}
+
+std::int32_t GrammarSchema::exprMinPrecedence(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return 0;
+    return it->second.exprMinPrecedence;
+}
+
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
                                        std::span<ScopeKind const> stack) const noexcept {
     // Walk the scope stack top-down so the innermost scope's rules win —

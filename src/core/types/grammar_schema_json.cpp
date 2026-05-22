@@ -623,7 +623,24 @@ std::vector<SchemaTokenId> firstOfBody(json const& body,
         return firstOfBody(body.at("repeat"), data);
     }
     if (body.contains("expr")) {
-        return firstOfBody(body.at("expr").at("atom"), data);
+        // FIRST(expr-rule) = FIRST(atom) ∪ {tokens registered as Prefix
+        // operators}. The Pratt walker dispatches on prefix tokens
+        // before descending into the atom rule, so the parser's
+        // dispatch loop must accept a prefix token as a legitimate
+        // entry into the expression rule. Without this union, the
+        // `tokInFirst` check in `RuleLeaf` dispatch rejects bare
+        // prefix expressions like `-a;` even though the walker would
+        // happily consume them.
+        auto result = firstOfBody(body.at("expr").at("atom"), data);
+        for (auto const& [lex, meanings] : data.lexemeTable) {
+            (void)lex;
+            for (auto const& m : meanings) {
+                if (data.operators.lookup(m.id, OperatorArity::Prefix)) {
+                    insertSorted(result, m.id);
+                }
+            }
+        }
+        return result;
     }
     return {};
 }
@@ -797,6 +814,30 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
         const auto endId   = builder.emplace(detail::Position::makeEnd());
         const auto entryId = builder.build(body, endId);
         rule.entryPos = entryId;
+
+        // Record `expr`-shape metadata so the parser can hand off to a
+        // Pratt walker. The cursor side already compiles the body as a
+        // transparent ref to atom (see `PositionBuilder::build`); this
+        // is the parser-side signal that operator-precedence climbing
+        // applies to this rule. The `expr` body was schema-validated
+        // upstream in `collectRuleRefs` — both `atom` (required) and
+        // `minPrecedence` (optional) are well-formed if we reach here.
+        if (body.is_object() && body.contains("expr")) {
+            json const& exprBody = body.at("expr");
+            if (exprBody.is_object() && exprBody.contains("atom")
+                && exprBody.at("atom").is_string()) {
+                const auto& atomName = exprBody.at("atom").get<std::string>();
+                if (data.rules->contains(atomName)) {
+                    rule.isExpr   = true;
+                    rule.exprAtom = data.rules->find(atomName);
+                    if (exprBody.contains("minPrecedence")
+                        && exprBody.at("minPrecedence").is_number_integer()) {
+                        rule.exprMinPrecedence =
+                            exprBody.at("minPrecedence").get<std::int32_t>();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1708,6 +1749,74 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // regardless of definition order.
             for (auto const& [shapeName, _] : doc.at("shapes").items()) {
                 (void)data.rules->intern(shapeName);
+            }
+
+            // Auto-intern the Pratt-walker wrapper rules. The parser
+            // synthesizes `binaryExpr`/`unaryExpr`/`postfixExpr` frames
+            // around operator-precedence results; those frames need
+            // valid RuleIds. We auto-intern only when the schema
+            // actually uses `expr` shapes (i.e. opts into Pratt
+            // dispatch); other schemas keep their lean rule interner.
+            // The wrapper rules have no compiled body — they're
+            // parser-managed and the schema cursor walks transparently
+            // past them (silently invalid through the wrapper frame,
+            // recovering on close; no P_SchemaCursorDesync since the
+            // transitions skip the wasValid→!nowValid check).
+            //
+            // Reject user-declared shapes named `binaryExpr` /
+            // `unaryExpr` / `postfixExpr` — they're walker-synthesized
+            // and a user redeclaration would let the schema cursor see
+            // a body for them, breaking the "transparent wrapper"
+            // invariant. Surface as C_UnknownShape at the named path.
+            for (auto const& reserved
+                 : {"binaryExpr", "unaryExpr", "postfixExpr"}) {
+                if (doc.at("shapes").contains(reserved)) {
+                    coll.emit(
+                        DiagnosticCode::C_UnknownShape,
+                        std::format("/shapes/{}", reserved),
+                        std::format(
+                            "shape name '{}' is reserved for the "
+                            "Pratt-walker wrapper rule (auto-interned "
+                            "when the schema declares any `expr` shape); "
+                            "rename the user shape", reserved));
+                }
+            }
+
+            // Recursive scan: `expr` may be nested inside any
+            // sequence/alt/optional/repeat body, not only top-level.
+            // A flat scan would miss `{ "sequence": [ { "expr": {...} } ] }`
+            // and the walker would later fatal-abort on a missing
+            // wrapper-rule lookup.
+            auto containsExprBody = [](auto const& self,
+                                       json const& body) -> bool {
+                if (!body.is_object()) return false;
+                if (body.contains("expr")) return true;
+                for (auto const& key : {"sequence", "alt"}) {
+                    if (body.contains(key) && body.at(key).is_array()) {
+                        for (auto const& child : body.at(key)) {
+                            if (self(self, child)) return true;
+                        }
+                    }
+                }
+                for (auto const& key : {"optional", "repeat"}) {
+                    if (body.contains(key)) {
+                        if (self(self, body.at(key))) return true;
+                    }
+                }
+                return false;
+            };
+            bool schemaUsesExpr = false;
+            for (auto const& [shapeName, body] : doc.at("shapes").items()) {
+                (void)shapeName;
+                if (containsExprBody(containsExprBody, body)) {
+                    schemaUsesExpr = true;
+                    break;
+                }
+            }
+            if (schemaUsesExpr) {
+                for (auto const& name : {"binaryExpr", "unaryExpr", "postfixExpr"}) {
+                    (void)data.rules->intern(name);
+                }
             }
 
             // Pass B: validate references — every string atom must resolve

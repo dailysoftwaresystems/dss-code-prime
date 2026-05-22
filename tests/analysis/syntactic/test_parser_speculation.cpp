@@ -156,7 +156,7 @@ TEST(ParserSpeculation, MaxDepthCapEmitsAndStopsRecursion) {
     auto h = loadAndTokenize("A B ;");
     ParserConfig cfg;
     cfg.maxSpeculationDepth = 1;
-    Parser p{h.src, h.schema, std::move(h.stream), cfg};
+    Parser p{h.src, h.schema, std::move(h.stream), std::move(cfg)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 

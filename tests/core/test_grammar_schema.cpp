@@ -289,7 +289,13 @@ TEST(GrammarSchema, LoadShippedCSubset) {
                                   "paramList", "param", "block", "statement",
                                   "ifStmt", "whileStmt", "doStmt", "forStmt",
                                   "returnStmt", "exprStmt", "expression",
-                                  "binaryOp", "operand"}) {
+                                  "operand",
+                                  // Pratt-walker wrapper rules auto-interned
+                                  // by the loader when the schema declares
+                                  // any `expr` shape. c-subset's `expression`
+                                  // rule is `expr`-kind, so these must be
+                                  // present in the rule interner.
+                                  "binaryExpr", "unaryExpr", "postfixExpr"}) {
         EXPECT_TRUE(schema.rules().find(rule).valid()) << rule;
     }
 
@@ -309,6 +315,125 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     // v2-gap-catalog row 2). Confirm the lexeme has no meaning so a
     // future regression that silently adds it gets caught.
     EXPECT_TRUE(schema.lookupLexeme("typedef").empty());
+}
+
+// Pin the `expr`-shape accessors on c-subset. `expression` is the
+// only `expr`-kind rule in the shipped grammar; `operand` is its atom.
+// Other rules return false / Invalid / 0.
+TEST(GrammarSchema, ExprShapeAccessorsOnCSubset) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    if (!result.has_value()) {
+        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
+    }
+    auto const& schema = **result;
+
+    const auto expression = schema.rules().find("expression");
+    const auto operand    = schema.rules().find("operand");
+    const auto statement  = schema.rules().find("statement");
+    ASSERT_TRUE(expression.valid());
+    ASSERT_TRUE(operand.valid());
+    ASSERT_TRUE(statement.valid());
+
+    EXPECT_TRUE (schema.isExprRule(expression));
+    EXPECT_EQ   (schema.exprAtom(expression).v, operand.v);
+    EXPECT_EQ   (schema.exprMinPrecedence(expression), 0);
+
+    EXPECT_FALSE(schema.isExprRule(operand));
+    EXPECT_FALSE(schema.exprAtom(operand).valid());
+    EXPECT_EQ   (schema.exprMinPrecedence(operand), 0);
+
+    EXPECT_FALSE(schema.isExprRule(statement));
+}
+
+// Wrapper rules `binaryExpr` / `unaryExpr` / `postfixExpr` MUST NOT be
+// auto-interned in schemas that don't use any `expr` shape. The toy
+// grammar's `expression` rule is `sequence`-shaped (not `expr`); a
+// regression that unconditionally interns the wrappers would inflate
+// every shipped grammar's RuleInterner and silently change RuleId
+// numbering.
+TEST(GrammarSchema, WrapperRulesAbsentInNonExprSchema) {
+    auto result = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(result.has_value());
+    auto const& schema = **result;
+
+    EXPECT_FALSE(schema.rules().find("binaryExpr").valid());
+    EXPECT_FALSE(schema.rules().find("unaryExpr").valid());
+    EXPECT_FALSE(schema.rules().find("postfixExpr").valid());
+}
+
+// Loader rejects user-declared shapes named `binaryExpr` /
+// `unaryExpr` / `postfixExpr` — they're walker-synthesized; a user
+// redeclaration would let the schema cursor see a body for them,
+// breaking the "transparent wrapper" invariant.
+TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
+    constexpr std::string_view kReservedShape = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "Bad", "version": "0.1.0" },
+      "tokens": { "x": [{ "kind": "X" }] },
+      "shapes": {
+        "root":       { "sequence": ["X"] },
+        "binaryExpr": { "sequence": ["X"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kReservedShape);
+    ASSERT_FALSE(result.has_value());
+    bool sawReservedDiag = false;
+    for (auto const& d : result.error()) {
+        if (d.message.find("binaryExpr") != std::string::npos
+            && d.message.find("reserved") != std::string::npos) {
+            sawReservedDiag = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawReservedDiag);
+}
+
+// Pin the FIRST-set augmentation: `expr`-shape rules see prefix
+// operator tokens added to their FIRST set so the dispatch loop's
+// `tokInFirst` check accepts bare-prefix expressions (`-a;` etc.)
+// without the walker. Without this, the dispatch would emit
+// `P_NoAlternativeMatched` before the walker ever ran.
+TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
+    constexpr std::string_view kPrefixSchema = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "PrefixFirst", "version": "0.1.0" },
+      "tokens": {
+        "-":  [{ "kind": "MinusOp" }]
+      },
+      "operators": {
+        "groups": [
+          { "precedence": 90, "associativity": "right", "arity": "prefix", "operators": ["-"] }
+        ]
+      },
+      "shapes": {
+        "root":       { "sequence": ["expression"] },
+        "expression": { "expr": { "atom": "operand" } },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kPrefixSchema);
+    ASSERT_TRUE(result.has_value())
+        << (result.has_value() ? "" : result.error()[0].message);
+    auto const& schema = **result;
+
+    const auto expression = schema.rules().find("expression");
+    const auto minusOp    = schema.schemaTokens().find("MinusOp");
+    const auto identifier = schema.schemaTokens().find("Identifier");
+    ASSERT_TRUE(expression.valid());
+    ASSERT_TRUE(minusOp.valid());
+    ASSERT_TRUE(identifier.valid());
+
+    const auto firstSet = schema.firstSetOf(expression);
+    const auto hasMinus = std::ranges::find_if(firstSet,
+        [minusOp](SchemaTokenId id) { return id.v == minusOp.v; })
+        != firstSet.end();
+    const auto hasIdent = std::ranges::find_if(firstSet,
+        [identifier](SchemaTokenId id) { return id.v == identifier.v; })
+        != firstSet.end();
+    EXPECT_TRUE(hasMinus)
+        << "FIRST(expression) must include MinusOp (Prefix op union)";
+    EXPECT_TRUE(hasIdent)
+        << "FIRST(expression) must include Identifier (atom FIRST)";
 }
 
 // `typeRef` admits `const int const x` (double-const). Real C allows

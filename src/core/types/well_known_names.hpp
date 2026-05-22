@@ -16,6 +16,8 @@ namespace dss::rules {
 inline constexpr std::string_view kIdentifier   = "identifier";
 inline constexpr std::string_view kLiteral      = "literal";
 inline constexpr std::string_view kBinaryExpr   = "binaryExpr";
+inline constexpr std::string_view kUnaryExpr    = "unaryExpr";
+inline constexpr std::string_view kPostfixExpr  = "postfixExpr";
 inline constexpr std::string_view kBlock        = "block";
 inline constexpr std::string_view kFunctionDecl = "functionDecl";
 inline constexpr std::string_view kVarDecl      = "varDecl";

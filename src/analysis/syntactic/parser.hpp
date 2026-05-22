@@ -1,5 +1,6 @@
 #pragma once
 
+#include "analysis/syntactic/pratt_walker.hpp"
 #include "core/export.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
@@ -26,6 +27,22 @@ struct DSS_EXPORT ParserConfig {
     // grammar's plausible lookahead; bounds the parser's own probe
     // nesting independently of the builder's checkpoint cap.
     std::size_t maxSpeculationDepth = 8;
+
+    // Recursion-depth cap for the Pratt walker's C++-stack recursion
+    // on the right-hand side of infix operators. Pathological input
+    // (deeply nested parens or right-assoc chains) would otherwise
+    // blow the call stack. The walker fatal-aborts when this cap is
+    // exceeded — same posture as the dispatch loop's forward-progress
+    // watchdog. 256 fits both real C-style code and the test corpus
+    // with plenty of headroom.
+    std::size_t maxExpressionDepth = 256;
+
+    // Optional override for the operator-precedence walker. Null
+    // (the default) means the parser constructs and owns a
+    // `DefaultPrattWalker`. Callers can inject their own walker for
+    // tests or for languages whose expression dispatch needs
+    // bespoke logic. Move-only ownership.
+    std::unique_ptr<PrattWalker> prattWalker;
 };
 
 // Schema-driven recursive-descent parser.
@@ -60,9 +77,23 @@ public:
     // via the forward-progress watchdog.
     [[nodiscard]] ParseResult parse() &&;
 
-private:
+    // Forward-declared so file-scope helpers in `parser.cpp` (where
+    // `Impl`'s definition lives) can name the type without being
+    // friends. The struct's full definition is private to `parser.cpp`;
+    // external callers can hold a `Parser::Impl*` but can't see its
+    // members. `DefaultPrattWalker` accesses internals via the friend
+    // declaration on `Parser` (below).
     struct Impl;
+
+private:
     std::unique_ptr<Impl> impl_;
+
+    // `DefaultPrattWalker` drives the parser's token stream, builder,
+    // schema walker, and frame stack via friend access to `Impl`.
+    // User-supplied walkers (passed via `ParserConfig::prattWalker`)
+    // don't get this access — the API for them is YAGNI until a
+    // real consumer asks.
+    friend class DefaultPrattWalker;
 };
 
 // Parser must stay non-movable + non-copyable: it's a single-use

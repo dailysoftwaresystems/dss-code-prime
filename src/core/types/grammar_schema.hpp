@@ -353,6 +353,15 @@ public:
     [[nodiscard]] std::span<SchemaTokenId const> firstSetOf(RuleId rule) const noexcept;
     [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;
 
+    // `expr`-shape introspection. `isExprRule` is true when the rule's
+    // body was declared as `{ "expr": { "atom": ..., "minPrecedence": ... } }`.
+    // For such rules `exprAtom` returns the operand rule and
+    // `exprMinPrecedence` returns the floor precedence for the outermost
+    // operator climb. Non-expr rules return false / InvalidRule / 0.
+    [[nodiscard]] bool         isExprRule(RuleId rule)        const noexcept;
+    [[nodiscard]] RuleId       exprAtom(RuleId rule)          const noexcept;
+    [[nodiscard]] std::int32_t exprMinPrecedence(RuleId rule) const noexcept;
+
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,
                                            std::span<ScopeKind const> stack) const noexcept;

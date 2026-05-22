@@ -255,22 +255,7 @@
 
     "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
 
-    "expression": {
-      "sequence": [
-        "operand",
-        { "repeat": { "sequence": [ "binaryOp", "operand" ] } }
-      ]
-    },
-
-    "binaryOp": {
-      "alt": [
-        "AssignOp",
-        "PlusOp", "MinusOp", "StarOp", "SlashOp",
-        "EqEqOp", "NotEqOp", "LtOp", "GtOp", "LtEqOp", "GtEqOp",
-        "AndAndOp", "OrOrOp",
-        "BitAndOp", "BitOrOp", "BitXorOp", "ShlOp", "ShrOp"
-      ]
-    },
+    "expression": { "expr": { "atom": "operand" } },
 
     "operand": {
       "alt": [

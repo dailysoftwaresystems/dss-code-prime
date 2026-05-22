@@ -194,7 +194,9 @@
       "Bash(./dss_analysis_syntactic_test_parser_toy.exe)",
       "PowerShell(cd C:/Source/DailySoftware/dss-code-prime/build/bin/dss; .\\\\dss_analysis_syntactic_test_parser_toy.exe --gtest_list_tests 2>&1 | Select-Object -First 30; \"exit=$LASTEXITCODE\")",
       "PowerShell(cd C:/Source/DailySoftware/dss-code-prime/build/bin/dss; .\\\\dss_analysis_syntactic_test_parser_toy.exe 2>&1 | Select-Object -Last 10; \"exit=$LASTEXITCODE\")",
-      "PowerShell(cd C:/Source/DailySoftware/dss-code-prime/build/bin/dss; .\\\\dss_analysis_syntactic_test_parser_speculation.exe 2>&1 | Select-Object -Last 10; \"spec exit=$LASTEXITCODE\"; .\\\\dss_analysis_syntactic_test_parser_c_subset_smoke.exe 2>&1 | Select-Object -Last 10; \"csub exit=$LASTEXITCODE\")"
+      "PowerShell(cd C:/Source/DailySoftware/dss-code-prime/build/bin/dss; .\\\\dss_analysis_syntactic_test_parser_speculation.exe 2>&1 | Select-Object -Last 10; \"spec exit=$LASTEXITCODE\"; .\\\\dss_analysis_syntactic_test_parser_c_subset_smoke.exe 2>&1 | Select-Object -Last 10; \"csub exit=$LASTEXITCODE\")",
+      "PowerShell(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_pratt_walker.exe --gtest_filter=PrattWalker.TightLhsThenLooseOperatorWrapsLhsInBinaryExpr 2>&1 | Select-Object -Last 50)",
+      "PowerShell(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_parser_c_subset_smoke.exe --gtest_filter=ParserCSubsetSmoke.FunctionBodyExpressionIsPrecedenceCorrect 2>&1 | Select-Object -Last 40)"
     ]
   }
 }
