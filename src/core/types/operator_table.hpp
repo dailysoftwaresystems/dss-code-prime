@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"
 
 #include <cstdint>
@@ -74,6 +75,15 @@ public:
     struct Entry {
         std::int32_t  precedence    = 0;
         OperatorAssoc associativity = OperatorAssoc::None;
+        // Grouped-postfix delimiter (e.g. `(` ends at `)`, `[` ends
+        // at `]`). When `endsAt` is valid, the Pratt walker treats
+        // the postfix operator as a delimited group: after the
+        // opener it parses `bodyRule` (or, when `bodyRule` is
+        // InvalidRule, a single `expression` via the active expr
+        // shape) until the closer. When `endsAt` is invalid, the
+        // postfix is single-token (`++`, `--`).
+        SchemaTokenId endsAt{};
+        RuleId        bodyRule{};
     };
 
     OperatorTable()                                = default;

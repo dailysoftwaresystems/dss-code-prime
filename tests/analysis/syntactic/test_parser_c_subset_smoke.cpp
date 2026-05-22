@@ -1,5 +1,6 @@
 #include "analysis/syntactic/parser.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
@@ -143,6 +144,102 @@ TEST(ParserCSubsetSmoke, FunctionBodyExpressionIsPrecedenceCorrect) {
         "      rule:operand\n"
         "        tok:\"c\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+TEST(ParserCSubsetSmoke, FunctionCallParsesAsPostfix) {
+    auto h = loadAndTokenize("int main() { f(a, b); }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "postfixExpr"));
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "argList"));
+}
+
+TEST(ParserCSubsetSmoke, EmptyArgumentCallParsesAsPostfix) {
+    auto h = loadAndTokenize("int main() { f(); }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "zero-arg calls must parse cleanly (argList nullable)";
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "postfixExpr"));
+}
+
+TEST(ParserCSubsetSmoke, ArrayIndexParsesAsPostfix) {
+    auto h = loadAndTokenize("int main() { a[0]; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "postfixExpr"));
+}
+
+// The `[`-postfix declares `bodyRule: "expression"`. `expression` is
+// itself an expr-rule, so the walker must route the body through
+// `prattWalker->walkExpression` to engage operator climbing. Without
+// that routing, `i + j * k` would parse as a flat sequence and there
+// would be no `binaryExpr` for the nested `j * k`.
+TEST(ParserCSubsetSmoke, ArrayIndexBodyClimbsPrecedence) {
+    auto h = loadAndTokenize("int main() { a[i + j * k]; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "binaryExpr"))
+        << "the index expression must engage operator climbing for `j*k` "
+           "to bind tighter than `+`";
+}
+
+// `f(a;` — opener consumed, body parses, closer missing. Walker emits
+// `P_MissingRequiredChild`, closes the wrap, and returns control to
+// the parent dispatch so the `;` can still terminate the statement.
+TEST(ParserCSubsetSmoke, MissingCloserEmitsRecoveryDiag) {
+    auto h = loadAndTokenize("int main() { f(a; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+    std::size_t missing = 0;
+    for (auto const& d : t.diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_MissingRequiredChild) ++missing;
+    }
+    EXPECT_GE(missing, 1u);
+    EXPECT_TRUE(hasError(t.flags(t.root())));
+}
+
+TEST(ParserCSubsetSmoke, PostfixIncParsesAsPostfix) {
+    auto h = loadAndTokenize("int main() { i++; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "postfixExpr"));
+}
+
+// Prefix `*` — dereference. Walker disambiguates from infix `*` by
+// position (operator-table arity).
+TEST(ParserCSubsetSmoke, PrefixDerefParsesAsUnary) {
+    auto h = loadAndTokenize("int main() { *p; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "unaryExpr"));
 }
 
 // Parenthesized sub-expressions delegate through `operand`'s `( expression )`

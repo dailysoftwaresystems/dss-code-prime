@@ -1,3 +1,4 @@
+#include "analysis/syntactic/parser.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/lexer_mode.hpp"
 #include "core/types/operator_table.hpp"
@@ -7,6 +8,8 @@
 #include "core/types/token.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_builder.hpp"
+#include "tokenizer/tokenizer.hpp"
+#include "tokenizer/token_stream.hpp"
 #include "e2e_harness.hpp"
 #include "test_pretty_print.hpp"
 
@@ -197,38 +200,15 @@ TEST(TsqlSubset, SimpleSelectStar) {
 }
 
 TEST(TsqlSubset, SelectFromQualifiedThreePartName) {
-    auto h = tokenizeShipped("tsql-subset", "SELECT a FROM db.schema.t;");
-    ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        pushNext(b, h.stream);
-        {
-            auto list = b.open(h.schema->rules().find("selectList"));
-            auto items = b.open(h.schema->rules().find("selectItemList"));
-            auto item  = b.open(h.schema->rules().find("selectItem"));
-            auto expr  = b.open(h.schema->rules().find("expression"));
-            auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());
-        }
-        drainWhitespace(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            { auto na = b.open(h.schema->rules().find("nameAtom"));
-              b.pushToken(h.stream.advance()); }
-            b.pushToken(h.stream.advance());
-            { auto na = b.open(h.schema->rules().find("nameAtom"));
-              b.pushToken(h.stream.advance()); }
-            b.pushToken(h.stream.advance());
-            { auto na = b.open(h.schema->rules().find("nameAtom"));
-              b.pushToken(h.stream.advance()); }
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
+    auto loaded = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const std::string sql = "SELECT a FROM db.schema.t;";
+    auto src = SourceBuffer::fromString(sql, "test.sql");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
     const std::string_view expected =
@@ -241,17 +221,20 @@ TEST(TsqlSubset, SelectFromQualifiedThreePartName) {
         "          rule:selectItem\n"
         "            rule:expression\n"
         "              rule:operand\n"
-        "                tok:\"a\"\n"
+        "                rule:qualifiedName\n"
+        "                  rule:nameAtom\n"
+        "                    tok:\"a\"\n"
         "      tok:\"FROM\"\n"
-        "      rule:qualifiedName\n"
-        "        rule:nameAtom\n"
-        "          tok:\"db\"\n"
-        "        tok:\".\"\n"
-        "        rule:nameAtom\n"
-        "          tok:\"schema\"\n"
-        "        tok:\".\"\n"
-        "        rule:nameAtom\n"
-        "          tok:\"t\"\n"
+        "      rule:tableRef\n"
+        "        rule:qualifiedName\n"
+        "          rule:nameAtom\n"
+        "            tok:\"db\"\n"
+        "          tok:\".\"\n"
+        "          rule:nameAtom\n"
+        "            tok:\"schema\"\n"
+        "          tok:\".\"\n"
+        "          rule:nameAtom\n"
+        "            tok:\"t\"\n"
         "      tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
@@ -310,46 +293,24 @@ TEST(TsqlSubset, SelectWithUnicodeLiteralOpener) {
 }
 
 TEST(TsqlSubset, SelectWithBracketIdentifier) {
-    // Live tokenization: both `[` openers push bracket-id mode and the
-    // body emits BracketIdChar per codepoint. The body-mode flip means
-    // the test pins token-kind structure (opener resolves at the
-    // `nameAtom` alt's BracketIdStart arm, body chars are siblings)
-    // rather than a hard-coded prettyPrint, which would now include
-    // every bracketed codepoint.
-    auto h = tokenizeShipped("tsql-subset", "SELECT [Order Date] FROM [My Table];");
-    ASSERT_NE(h.schema, nullptr);
-    const auto bracketStartKind = h.schema->schemaTokens().find("BracketIdStart");
-    const auto bracketCharKind  = h.schema->schemaTokens().find("BracketIdChar");
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        pushNext(b, h.stream);
-        {
-            auto list  = b.open(h.schema->rules().find("selectList"));
-            auto items = b.open(h.schema->rules().find("selectItemList"));
-            auto item  = b.open(h.schema->rules().find("selectItem"));
-            auto expr  = b.open(h.schema->rules().find("expression"));
-            auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());
-            drainBody(b, h.stream, bracketCharKind);
-        }
-        drainWhitespace(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());
-            drainBody(b, h.stream, bracketCharKind);
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
+    // Live parse: both `[` openers push bracket-id mode and the body
+    // emits BracketIdChar per codepoint. The parser absorbs body chars
+    // as off-grammar siblings of the opener (no schema reference to
+    // body-mode default-token kinds is allowed).
+    auto loaded = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const std::string sql = "SELECT [Order Date] FROM [My Table];";
+    auto src = SourceBuffer::fromString(sql, "test.sql");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
-    // Pin the alt-resolution: both `[` openers must land as BracketIdStart
-    // leaves (not Identifier).
+    const auto bracketStartKind = schema->schemaTokens().find("BracketIdStart");
+    const auto bracketCharKind  = schema->schemaTokens().find("BracketIdChar");
+
     std::size_t bracketOpeners = 0;
     std::size_t bracketChars   = 0;
     for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
@@ -442,51 +403,15 @@ TEST(TsqlSubset, InsertIntoValues) {
 }
 
 TEST(TsqlSubset, UpdateSetWhere) {
-    auto h = tokenizeShipped("tsql-subset", "UPDATE t SET a = 1 WHERE id = 5;");
-    ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto upd  = b.open(h.schema->rules().find("updateStmt"));
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());
-        }
-        drainWhitespace(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto al = b.open(h.schema->rules().find("assignList"));
-            auto a  = b.open(h.schema->rules().find("assignment"));
-            { auto na = b.open(h.schema->rules().find("nameAtom"));
-              b.pushToken(h.stream.advance()); }
-            drainWhitespace(b, h.stream);
-            pushNext(b, h.stream);
-            { auto e = b.open(h.schema->rules().find("expression"));
-              auto o = b.open(h.schema->rules().find("operand"));
-              b.pushToken(h.stream.advance()); }
-        }
-        drainWhitespace(b, h.stream);
-        {
-            auto w = b.open(h.schema->rules().find("whereClause"));
-            pushNext(b, h.stream);
-            auto e = b.open(h.schema->rules().find("expression"));
-            { auto o = b.open(h.schema->rules().find("operand"));
-              b.pushToken(h.stream.advance()); }
-            drainWhitespace(b, h.stream);
-            {
-                auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(h.stream.advance());
-            }
-            drainWhitespace(b, h.stream);
-            { auto o = b.open(h.schema->rules().find("operand"));
-              b.pushToken(h.stream.advance()); }
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
+    auto loaded = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const std::string sql = "UPDATE t SET a = 1 WHERE id = 5;";
+    auto src = SourceBuffer::fromString(sql, "test.sql");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
     const std::string_view expected =
@@ -510,7 +435,9 @@ TEST(TsqlSubset, UpdateSetWhere) {
         "        tok:\"WHERE\"\n"
         "        rule:expression\n"
         "          rule:operand\n"
-        "            tok:\"id\"\n"
+        "            rule:qualifiedName\n"
+        "              rule:nameAtom\n"
+        "                tok:\"id\"\n"
         "          rule:binaryOp\n"
         "            tok:\"=\"\n"
         "          rule:operand\n"
@@ -520,37 +447,15 @@ TEST(TsqlSubset, UpdateSetWhere) {
 }
 
 TEST(TsqlSubset, DeleteFromWhere) {
-    auto h = tokenizeShipped("tsql-subset", "DELETE FROM t WHERE id = 5;");
-    ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto del  = b.open(h.schema->rules().find("deleteStmt"));
-        pushNext(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());
-        }
-        drainWhitespace(b, h.stream);
-        {
-            auto w = b.open(h.schema->rules().find("whereClause"));
-            pushNext(b, h.stream);
-            auto e = b.open(h.schema->rules().find("expression"));
-            { auto o = b.open(h.schema->rules().find("operand"));
-              b.pushToken(h.stream.advance()); }
-            drainWhitespace(b, h.stream);
-            { auto bop = b.open(h.schema->rules().find("binaryOp"));
-              b.pushToken(h.stream.advance()); }
-            drainWhitespace(b, h.stream);
-            { auto o = b.open(h.schema->rules().find("operand"));
-              b.pushToken(h.stream.advance()); }
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
+    auto loaded = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const std::string sql = "DELETE FROM t WHERE id = 5;";
+    auto src = SourceBuffer::fromString(sql, "test.sql");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
     const std::string_view expected =
@@ -566,7 +471,9 @@ TEST(TsqlSubset, DeleteFromWhere) {
         "        tok:\"WHERE\"\n"
         "        rule:expression\n"
         "          rule:operand\n"
-        "            tok:\"id\"\n"
+        "            rule:qualifiedName\n"
+        "              rule:nameAtom\n"
+        "                tok:\"id\"\n"
         "          rule:binaryOp\n"
         "            tok:\"=\"\n"
         "          rule:operand\n"
@@ -743,59 +650,23 @@ TEST(TsqlSubset, ParsesMultipleStatements) {
 }
 
 TEST(TsqlSubset, OperatorPrecedenceConsumedInExpression) {
-    // `expression` is flat-fold `operand (binaryOp operand)*`. The
-    // parser would consult OperatorTable for precedence; here we just
-    // exercise that the schema produces the flat form expected.
-    auto h = tokenizeShipped("tsql-subset", "UPDATE t SET a = b + c * d;");
-    ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto upd  = b.open(h.schema->rules().find("updateStmt"));
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());
-        }
-        drainWhitespace(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto al = b.open(h.schema->rules().find("assignList"));
-            auto a  = b.open(h.schema->rules().find("assignment"));
-            { auto na = b.open(h.schema->rules().find("nameAtom"));
-              b.pushToken(h.stream.advance()); }
-            drainWhitespace(b, h.stream);
-            pushNext(b, h.stream);
-            { auto e = b.open(h.schema->rules().find("expression"));
-              { auto o = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance()); }
-              drainWhitespace(b, h.stream);
-              { auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(h.stream.advance()); }
-              drainWhitespace(b, h.stream);
-              { auto o = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance()); }
-              drainWhitespace(b, h.stream);
-              { auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(h.stream.advance()); }
-              drainWhitespace(b, h.stream);
-              { auto o = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance()); }
-            }
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
+    // `expression` is flat-fold `operand (binaryOp operand)*` —
+    // the sequence-shaped `expression` rule. Pin the schema-side
+    // data that drives operator climbing (`*` binds tighter than
+    // `+`); the parser drives this through assignment's expression.
+    auto loaded = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const std::string sql = "UPDATE t SET a = b + c * d;";
+    auto src = SourceBuffer::fromString(sql, "test.sql");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream)};
+    Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
-    // Pin the flat-fold shape: 3 operands + 2 binaryOps under
-    // `expression`. When the parser's Pratt walker lands, this test
-    // flips to a nested grouping (b + (c * d)) — the visible signal
-    // that operator precedence climbing is consuming the OperatorTable.
-    auto const& tokens = h.schema->schemaTokens();
-    auto const* table  = &h.schema->operatorTable();
+    auto const& tokens = schema->schemaTokens();
+    auto const* table  = &schema->operatorTable();
     auto plus = table->lookup(tokens.find("PlusOp"), OperatorArity::Infix);
     auto star = table->lookup(tokens.find("StarOp"), OperatorArity::Infix);
     ASSERT_TRUE(plus.has_value());

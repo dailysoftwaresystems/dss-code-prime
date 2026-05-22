@@ -648,7 +648,8 @@ TokenizeResult Tokenizer::tokenize() && {
                 // coreKindForByte returns Operator for an id-start byte;
                 // intentional — these matches are delimited-string openers
                 // (`N'`) etc., never Word.
-                emit(coreKindForByte(c), globalHit.meaning.id);
+                emit(coreKindForByte(c), globalHit.meaning.id,
+                     globalHit.meaning.flagsApplied);
                 applyMeaningSideEffects(globalHit.meaning);
                 continue;
             }
@@ -660,7 +661,9 @@ TokenizeResult Tokenizer::tokenize() && {
             // schema entry like `int` shouldn't claim part of `integer`.
             const bool fullMatch = (hit.length == lexeme.size());
             const auto sk = fullMatch ? hit.meaning.id : InvalidSchemaToken;
-            emit(CoreTokenKind::Word, sk);
+            const auto wordFlags = fullMatch ? hit.meaning.flagsApplied
+                                             : NodeFlags::None;
+            emit(CoreTokenKind::Word, sk, wordFlags);
             if (fullMatch) applyMeaningSideEffects(hit.meaning);
             continue;
         }
@@ -692,7 +695,7 @@ TokenizeResult Tokenizer::tokenize() && {
         const auto hit = longestMatch(*schema_, r.remaining(), lexemeProbeMax);
         if (hit.length > 0) {
             r.advance(hit.length);
-            emit(coreKindForByte(c), hit.meaning.id);
+            emit(coreKindForByte(c), hit.meaning.id, hit.meaning.flagsApplied);
             applyMeaningSideEffects(hit.meaning);
             continue;
         }

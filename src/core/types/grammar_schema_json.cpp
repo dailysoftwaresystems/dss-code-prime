@@ -6,6 +6,7 @@
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
+#include "core/types/well_known_names.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -1012,6 +1013,48 @@ void computeFollowSets(GrammarSchemaData& data, Collector& coll) {
     }
 }
 
+// Validate that every operator-table `bodyRule` resolves to an
+// actually-declared shape (has a compiled body). The operators block
+// runs before shape interning so the loader can only intern the name
+// at that point; the real check happens here, post-shapes-compile.
+void validateOperatorBodyRules(GrammarSchemaData& data, Collector& coll) {
+    // For each interned rule lacking a compiled body, check whether
+    // any postfix operator entry's `bodyRule` references it. The
+    // operators block runs before shape interning, so the loader
+    // could only intern the name at operator-load time; the real
+    // "shape exists" check happens here, post-shapes-compile.
+    auto const& interner = *data.rules;
+    for (std::uint32_t r = 1; r < interner.size(); ++r) {
+        const RuleId rule{r};
+        if (data.compiledRules.contains(rule.v)) continue;
+        // Pratt walker synthesizes `binaryExpr`/`unaryExpr`/`postfixExpr`
+        // frames without a schema shape; any new walker-only wrapper
+        // must be added to this skip list (and to `well_known_names.hpp`).
+        const auto name = interner.name(rule);
+        if (name == rules::kBinaryExpr
+            || name == rules::kUnaryExpr
+            || name == rules::kPostfixExpr) {
+            continue;
+        }
+        // Postfix is the only arity that carries `bodyRule`, so iterate
+        // just that slice — O(N) in the declared-token count, trivial
+        // at load time.
+        bool referenced = false;
+        for (std::uint32_t t = 1; t < data.schemaTokens->size() && !referenced; ++t) {
+            const SchemaTokenId tid{t};
+            const auto entry = data.operators.lookup(tid, OperatorArity::Postfix);
+            if (entry && entry->bodyRule.v == rule.v) referenced = true;
+        }
+        if (referenced) {
+            coll.emit(DiagnosticCode::C_UnknownShape,
+                      "/operators/groups",
+                      std::format("postfix operator group references "
+                                  "'bodyRule' = '{}' but no shape with "
+                                  "that name is declared", name));
+        }
+    }
+}
+
 // Reject any rule shape OR scope-forbid entry that references a
 // SchemaTokenId declared as a lexer mode's `defaultToken.kind`.
 // Body-default kinds are off-grammar by construction (see
@@ -1740,7 +1783,70 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
 
-                const OperatorTable::Entry entry{precedence, assoc};
+                // Grouped-postfix delimiter + body rule. Optional;
+                // only meaningful for postfix arity. The walker reads
+                // `endsAt` to know "this postfix has a closing token"
+                // and `bodyRule` to know "what to parse between
+                // opener and closer". Both fields validated below
+                // BEFORE we stamp the entry into the table.
+                SchemaTokenId endsAtId{};
+                RuleId        bodyRuleId{};
+                if (g.contains("endsAt")) {
+                    if (arity != OperatorArity::Postfix) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'endsAt' is only valid on a postfix group");
+                        continue;
+                    }
+                    if (!g.at("endsAt").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'endsAt' must be a string lexeme");
+                        continue;
+                    }
+                    const auto closer = g.at("endsAt").get<std::string>();
+                    auto closerIt = data.lexemeTable.find(closer);
+                    if (closerIt == data.lexemeTable.end()
+                        || closerIt->second.empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("'endsAt' lexeme '{}' is not declared in 'tokens'",
+                                              closer));
+                        continue;
+                    }
+                    if (closerIt->second.size() != 1) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("'endsAt' lexeme '{}' has multiple meanings; "
+                                              "ambiguous closers are unsupported",
+                                              closer));
+                        continue;
+                    }
+                    endsAtId = closerIt->second[0].id;
+                }
+                if (g.contains("bodyRule")) {
+                    if (arity != OperatorArity::Postfix) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'bodyRule' is only valid on a postfix group");
+                        continue;
+                    }
+                    if (!endsAtId.valid()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'bodyRule' requires a paired 'endsAt' delimiter");
+                        continue;
+                    }
+                    if (!g.at("bodyRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'bodyRule' must be a string rule name");
+                        continue;
+                    }
+                    // The operators block runs BEFORE shapes are
+                    // interned in Pass A, so `data.rules->contains`
+                    // would falsely report unknown for every entry.
+                    // Intern the name now (creates the RuleId if
+                    // absent, returns existing one if a later shape
+                    // shares the name); validate-against-declared-
+                    // shapes happens in a post-shapes pass below.
+                    const auto rname = g.at("bodyRule").get<std::string>();
+                    bodyRuleId = data.rules->intern(rname);
+                }
+                const OperatorTable::Entry entry{precedence, assoc, endsAtId, bodyRuleId};
 
                 for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
                     json const& op = g.at("operators")[j];
@@ -2012,6 +2118,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 computeNullableTails       (data);
                 computeFollowSets          (data, coll);
                 validateBodyDefaultKindsOffGrammar(data, coll);
+                validateOperatorBodyRules  (data, coll);
             }
         }
     }

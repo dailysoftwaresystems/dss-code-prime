@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -91,6 +92,14 @@ struct Parser::Impl {
     // per token. Mirrors `TreeBuilder::errorKind_`'s pattern.
     SchemaTokenId identifierKind;
     SchemaTokenId errorKind;
+
+    // Off-grammar token kinds — every `lexerModes.<name>.defaultToken.kind`
+    // declared in the schema. These tokens are emitted by the tokenizer
+    // (StringChar, BracketIdChar, CommentChar bodies) but the schema by
+    // construction never references them in any shape; they're absorbed
+    // into the current frame as leaves without advancing the parser's
+    // schema walker. Mirrors `TreeBuilder::bodyDefaultTokenKinds_`.
+    std::unordered_set<SchemaTokenId> bodyDefaultTokenKinds;
 
     // Builder lives in Impl (heap) since `TreeBuilder` is non-movable
     // (static_assert) and Impl is constructed in-place.
@@ -180,7 +189,13 @@ struct Parser::Impl {
         , identifierKind(schema->schemaTokens().find("Identifier"))
         , errorKind(schema->schemaTokens().find("Error"))
         , walker(schema)
-        , prattWalker(std::move(cfg.prattWalker)) {}
+        , prattWalker(std::move(cfg.prattWalker)) {
+        for (auto const& mode : schema->lexerModes()) {
+            if (mode.defaultToken) {
+                bodyDefaultTokenKinds.insert(mode.defaultToken->kind);
+            }
+        }
+    }
 
     // Default Pratt walker has friend access to drive the parser's
     // token stream, builder, schema walker, and frame stack
@@ -755,6 +770,40 @@ struct Parser::Impl {
         lastDepth  = curDepth;
         firstIteration = false;
 
+        // Off-grammar body-token drain. The tokenizer emits leaves
+        // for every codepoint of a string body / bracket-id body /
+        // comment body (`StringChar`, `BracketIdChar`, `CommentChar`,
+        // …). The schema by construction never references those
+        // kinds in any shape — the loader rejects shapes that do.
+        // They reach the AST as leaves under the current frame but
+        // never advance the parser's schema walker. Without this
+        // drain, the per-slot dispatch would see a body token,
+        // fail the expected-set match, and route to `recoverAt` —
+        // turning every string contents into a diagnostic storm.
+        // Mirrors `TreeBuilder::pushToken`'s body-mode cursor skip.
+        //
+        // Positioned AFTER the watchdog snap so a runaway drain
+        // can't mask a dispatch stall: the next iteration's snap
+        // sees the post-drain (cursor, tokPos, depth) and the
+        // watchdog still trips when dispatch fails to advance.
+        while (!tokens.isAtEnd()) {
+            Token const& bodyPeek = tokens.peek();
+            if (bodyPeek.coreKind == CoreTokenKind::Eof) break;
+            const SchemaTokenId k =
+                effectiveKind(bodyPeek, identifierKind, errorKind);
+            if (!bodyDefaultTokenKinds.contains(k)) break;
+            const std::size_t before = tokens.position();
+            builder->pushToken(tokens.advance());
+            if (tokens.position() == before) {
+                // Defensive: a non-EOF body token must advance the
+                // stream. If the tokenizer ever regressed to emit a
+                // zero-width body token (e.g. an unterminatedAs
+                // backfill at EOF), looping here would spin until
+                // OOM. Abort loudly instead.
+                fatal("dss::Parser: body-token drain failed to advance");
+            }
+        }
+
         // ── per-slot dispatch ──
         const SlotKind slot = walker.slotKind();
         const Token&   peek = tokens.peek();
@@ -947,6 +996,19 @@ struct Parser::Impl {
                 const auto routed = schema->routeToRuleLeaf(
                     walker.cursor(), candidate);
                 if (!routed.valid()) continue;
+                // `expr`-shape rules MUST go through the Pratt walker
+                // even when discovered via the AltChoice→RuleLeaf
+                // scan. Without this, an `expression` reachable from
+                // an optional/repeat slot would be parsed as a plain
+                // atom and the operator climb never runs (e.g.
+                // `return f(x)` where the optional[expression] under
+                // returnStmt was hit via this path).
+                if (schema->isExprRule(candidate)) {
+                    prattWalker->walkExpression(
+                        *outer, candidate,
+                        schema->exprMinPrecedence(candidate));
+                    return StepOutcome::Continue;
+                }
                 openExprFrame(candidate);
                 return StepOutcome::Continue;
             }
@@ -1173,7 +1235,9 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
 
         // Postfix wins ties with infix at the same precedence — it
         // binds the lhs alone (no further operand to gather), so
-        // structurally it's the more local binding.
+        // structurally it's the more local binding. Grouped postfix
+        // (`endsAt.valid()`) extends the simple `++` case with a
+        // body-rule frame parsed between opener and closer.
         if (postfixInClimb) {
             I.openExprFrame(rules.postfixExpr);
             parseExpressionAt(I, rules, postfix->precedence + 1);
@@ -1190,6 +1254,48 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                 I.closeFrameOnce();
                 I.commitWalkerSnap(snap);
                 return;
+            }
+            if (postfix->endsAt.valid()) {
+                // Grouped postfix: drive the body until the closer.
+                // An expr-rule body (e.g. `[expression]` for indexing)
+                // must run through the Pratt walker so operator climb
+                // applies inside the brackets; calling `openExprFrame`
+                // directly would skip precedence and produce a flat
+                // tree. Same routing rule as `stepOnce`'s AltChoice→
+                // RuleLeaf path for expr-rules.
+                if (postfix->bodyRule.valid()) {
+                    if (I.schema->isExprRule(postfix->bodyRule)) {
+                        I.prattWalker->walkExpression(
+                            *I.outer, postfix->bodyRule,
+                            I.schema->exprMinPrecedence(postfix->bodyRule));
+                    } else {
+                        const std::size_t bodyDepth = I.frames.size();
+                        I.openExprFrame(postfix->bodyRule);
+                        I.parseUntilFrameDepth(bodyDepth);
+                    }
+                }
+                pumpTrivia(I);
+                Token const& closerPeek = I.tokens.peek();
+                const SchemaTokenId closerKind = effectiveKind(
+                    closerPeek, I.identifierKind, I.errorKind);
+                if (closerKind.v != postfix->endsAt.v) {
+                    // Closer missing. Emit the diagnostic AND drop an
+                    // Error leaf at the missing-closer position so the
+                    // HasError flag propagates up through the
+                    // postfixExpr wrap and the tree carries the
+                    // structural signal (not just a sidecar diagnostic).
+                    // We do NOT consume `closerPeek` — the parent
+                    // dispatch resumes from it (typically `recoverAt`
+                    // scans to the next sync token).
+                    I.emitParserError(
+                        DiagnosticCode::P_MissingRequiredChild,
+                        closerPeek.span,
+                        I.renderActual(closerPeek),
+                        std::span<SchemaTokenId const>{&postfix->endsAt, 1});
+                    I.builder->pushErrorNode(closerPeek.span);
+                } else {
+                    (void)I.pushOperatorToken();
+                }
             }
             I.closeFrameOnce();
             continue;

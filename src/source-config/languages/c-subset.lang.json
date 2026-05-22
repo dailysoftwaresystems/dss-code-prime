@@ -67,7 +67,10 @@
     "^":  [{ "kind": "BitXorOp" }],
     "~":  [{ "kind": "TildeOp"  }],
     "<<": [{ "kind": "ShlOp"    }],
-    ">>": [{ "kind": "ShrOp"    }]
+    ">>": [{ "kind": "ShrOp"    }],
+
+    "++": [{ "kind": "PlusPlusOp" }],
+    "--": [{ "kind": "MinusMinusOp" }]
   },
 
   "operators": {
@@ -83,7 +86,10 @@
       { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
       { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
       { "precedence": 70, "associativity": "left",                       "operators": ["*", "/"]                               },
-      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-"]                          }
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*"]                     },
+      { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" }
     ]
   },
 
@@ -265,11 +271,17 @@
         "IntLiteral",
         "CharLiteral",
         "StringLiteral",
-        { "sequence": [ "BangOp",   "operand" ] },
-        { "sequence": [ "MinusOp",  "operand" ] },
-        { "sequence": [ "TildeOp",  "operand" ] },
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
+    },
+
+    "argList": {
+      "optional": {
+        "sequence": [
+          "expression",
+          { "repeat": { "sequence": [ "Comma", "expression" ] } }
+        ]
+      }
     }
   }
 }
