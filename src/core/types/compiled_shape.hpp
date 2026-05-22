@@ -116,6 +116,7 @@ struct CompiledRule {
     std::uint32_t              entryPos = 0;
     std::vector<Position>      positions;
     std::vector<SchemaTokenId> firstSet;
+    std::vector<SchemaTokenId> followSet;
     bool                       nullable = false;
 
     // `expr`-shape metadata. `isExpr` true iff the rule's body is

@@ -168,6 +168,12 @@ public:
                    std::optional<SchemaTokenId> expectedToken = std::nullopt,
                    std::string_view             note          = {});
 
+    // Insert an Error leaf at `span` WITHOUT emitting a diagnostic — the
+    // caller has already emitted a richer one through `reportDiagnostic`
+    // (e.g. a panic-mode P_UnexpectedToken carrying the full
+    // `expectedSet` rendered by the parser). Propagates HasError to root.
+    void pushErrorNode(SourceSpan span);
+
     // Public gateway for diagnostics the parser layer needs to emit that
     // don't fit `pushError`'s "unexpected token + Error leaf" shape —
     // notably `P_MissingRequiredChild`, `P_NoAlternativeMatched`, and

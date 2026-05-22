@@ -100,6 +100,16 @@ struct Parser::Impl {
     // innermost open frame.
     std::vector<TreeBuilder::OpenScope> frames;
 
+    // Parallel rule chain — `frameRules[i]` is the RuleId of the
+    // frame at the same index in `frames`. Maintained in lock-step
+    // with frame push/pop so recovery code can walk the rule chain
+    // without going through builder-internal state. Notably, this
+    // lets `panicRecover` find the nearest compiled-body ancestor's
+    // FOLLOW set when the immediate `currentRule()` is an auto-
+    // interned Pratt wrapper (`binaryExpr`/`unaryExpr`/`postfixExpr`,
+    // none of which have compiled bodies).
+    std::vector<RuleId>                 frameRules;
+
     // Parser-side walker. The builder embeds its own; the two are
     // driven lock-step by the dispatch loop. Divergence is a load-
     // bearing bug-catcher — surfaces as the builder's
@@ -160,7 +170,13 @@ struct Parser::Impl {
         : src(std::move(s))
         , schema(std::move(sc))
         , tokens(std::move(ts))
-        , config{cfg.maxSpeculationDepth, cfg.maxExpressionDepth, nullptr}
+        , config{
+            cfg.maxSpeculationDepth,
+            cfg.maxExpressionDepth,
+            cfg.recoveryStrategy,
+            cfg.maxSyncScanTokens,
+            nullptr,
+          }
         , identifierKind(schema->schemaTokens().find("Identifier"))
         , errorKind(schema->schemaTokens().find("Error"))
         , walker(schema)
@@ -181,12 +197,50 @@ struct Parser::Impl {
         ++diagsEmitted;
     }
 
+    // Render `actual` for a diagnostic. Three branches:
+    //   - Eof core kind → `'<eof>'` (quoted consistently with other
+    //     actuals so the renderer's `got 'X'` prose holds).
+    //   - non-empty span → the source lexeme bytes.
+    //   - zero-width non-Eof token (rare; synthesized recovery) →
+    //     the schema token-kind name when known, else `'<unknown>'`.
+    [[nodiscard]] std::string renderActual(Token const& tok) const {
+        if (tok.coreKind == CoreTokenKind::Eof) return "'<eof>'";
+        if (tok.span.start() < tok.span.end()) {
+            return std::format("'{}'", src->slice(tok.span));
+        }
+        const SchemaTokenId kind =
+            effectiveKind(tok, identifierKind, errorKind);
+        if (kind.valid()) {
+            return std::format("'{}'", schema->schemaTokens().name(kind));
+        }
+        return "'<unknown>'";
+    }
+
+    // Render the parser's `expected` list from a schema-token-id
+    // set. Skips InvalidSchemaToken sentinels (a malformed
+    // compiled rule with a stale id would otherwise render as the
+    // misleading empty-quotes string `''`).
+    [[nodiscard]] std::vector<std::string>
+    renderExpectedNames(std::span<SchemaTokenId const> set) const {
+        std::vector<std::string> out;
+        out.reserve(set.size());
+        for (auto tok : set) {
+            if (!tok.valid()) continue;
+            out.push_back(std::format("'{}'",
+                                      schema->schemaTokens().name(tok)));
+        }
+        return out;
+    }
+
     // Build + emit a parser-side diagnostic with severity Error,
     // `buffer = src->id()`, and `ruleContext = builder->currentRule()`
     // populated. Centralises the seven-field scaffold previously
-    // repeated at each emission site.
+    // repeated at each emission site. Optional `expected` argument
+    // carries the schema-token-id set the cursor would accept — the
+    // renderer prints "expected 'X' or 'Y' — got 'Z'".
     void emitParserError(DiagnosticCode code, SourceSpan span,
-                         std::string actual) {
+                         std::string actual,
+                         std::span<SchemaTokenId const> expected = {}) {
         ParseDiagnostic d;
         d.code        = code;
         d.severity    = DiagnosticSeverity::Error;
@@ -196,7 +250,85 @@ struct Parser::Impl {
                             ? std::optional<RuleId>{}
                             : std::optional<RuleId>{builder->currentRule()};
         d.actual      = std::move(actual);
+        if (!expected.empty()) {
+            d.expected = renderExpectedNames(expected);
+        }
         emitDiag(std::move(d));
+    }
+
+    // Lookup helper: returns true when `kind` is in the FOLLOW set
+    // of the nearest enclosing rule that has a non-empty followSet.
+    // Walking frames lets recovery succeed inside Pratt wrappers
+    // (`binaryExpr`/`unaryExpr`/`postfixExpr` — auto-interned, no
+    // compiled body, empty followSet) by consulting the surrounding
+    // compiled rule. Stops at the first non-empty followSet rather
+    // than unioning all ancestors — the innermost compiled context
+    // is the precise resync horizon.
+    [[nodiscard]] bool followContains(SchemaTokenId kind) const noexcept {
+        for (auto it = frameRules.rbegin(); it != frameRules.rend(); ++it) {
+            const auto follow = schema->followSetOf(*it);
+            if (follow.empty()) continue;
+            return std::ranges::find(follow, kind) != follow.end();
+        }
+        return false;
+    }
+
+    // Panic-mode recovery: insert an Error leaf at the bad token,
+    // then scan forward until peek is a stopping point:
+    //   - EOF — always stops
+    //   - lexer Error coreKind — already noisy, don't merge into recovery
+    //   - schema-declared `syncTokens` (e.g. `;`, `}`)
+    //   - FOLLOW of the nearest compiled enclosing rule
+    //   - `maxSyncScanTokens` adversarial-input cap
+    //
+    // Returns the count consumed (always ≥ 1 so the forward-progress
+    // watchdog is satisfied). `SingleToken` mode short-circuits.
+    //
+    // Tokens consumed beyond the first are not driven through the
+    // builder's `pushToken` (would advance the schema walker through
+    // off-grammar positions and emit `P_SchemaCursorDesync` per byte)
+    // — but TRIVIA is preserved by pushing it through (whitespace +
+    // comment nodes survive recovery so editor selections covering
+    // the recovered range still see something structurally meaningful).
+    std::size_t panicRecover() {
+        builder->pushErrorNode(tokens.peek().span);
+        (void)tokens.advance();
+        if (config.recoveryStrategy == RecoveryStrategy::SingleToken) {
+            return 1;
+        }
+
+        const auto sync = schema->syncTokens();
+        std::size_t consumed = 1;
+        while (consumed < config.maxSyncScanTokens) {
+            Token const& peek = tokens.peek();
+            if (peek.coreKind == CoreTokenKind::Eof)   break;
+            if (peek.coreKind == CoreTokenKind::Error) break;
+            if (isSkippableTrivia(peek)) {
+                builder->pushToken(tokens.advance());
+                ++consumed;
+                continue;
+            }
+            const SchemaTokenId kind =
+                effectiveKind(peek, identifierKind, errorKind);
+            if (std::ranges::find(sync, kind) != sync.end()) break;
+            if (followContains(kind)) break;
+            (void)tokens.advance();
+            ++consumed;
+        }
+        return consumed;
+    }
+
+    // Emit a recovery diagnostic + run panic-mode. The shape is
+    // identical at all six dispatch-loop recovery sites, so the
+    // helper documents what a "recovery emission" actually is:
+    // rich diag (with `expected` from the schema cursor) + Error
+    // leaf at the bad token + scan to the next sync/follow point.
+    StepOutcome recoverAt(DiagnosticCode code,
+                          Token const& peek,
+                          std::span<SchemaTokenId const> expected) {
+        emitParserError(code, peek.span, renderActual(peek), expected);
+        (void)panicRecover();
+        return StepOutcome::Continue;
     }
 
     void closeFrameOnce() noexcept {
@@ -205,6 +337,7 @@ struct Parser::Impl {
         walker.leaveRule(SourceSpan::empty(0), rule);
         frames.back().close();
         frames.pop_back();
+        if (!frameRules.empty()) frameRules.pop_back();
     }
 
     [[nodiscard]] bool isAtSourceEnd() const noexcept {
@@ -318,6 +451,9 @@ struct Parser::Impl {
                 // effects with the snapshot.
                 while (impl_.frames.size() > targetDepth_) {
                     impl_.frames.pop_back();
+                    if (!impl_.frameRules.empty()) {
+                        impl_.frameRules.pop_back();
+                    }
                 }
                 impl_.walker.restore(std::move(*walkerSnap_));
                 impl_.builder->rollback(std::move(*cp_));
@@ -406,9 +542,11 @@ struct Parser::Impl {
 
     // Open a frame for `rule` (parser side + builder side + parser
     // walker entry), mirroring the inline pattern previously repeated
-    // at every walker open site.
+    // at every walker open site. Pushes to the parallel `frameRules`
+    // stack so recovery code can walk the rule chain.
     void openExprFrame(RuleId rule) {
         frames.push_back(builder->open(rule));
+        frameRules.push_back(rule);
         walker.enterRule(rule);
     }
 
@@ -463,6 +601,7 @@ struct Parser::Impl {
     void rollbackForWalker(WalkerSnapshot& s) noexcept {
         while (frames.size() > s.frameDepth) {
             frames.pop_back();
+            if (!frameRules.empty()) frameRules.pop_back();
         }
         walker.restore(std::move(*s.walkerSnap));
         builder->rollback(std::move(*s.builderCp));
@@ -509,8 +648,7 @@ struct Parser::Impl {
 
         SpeculationProbe probe{*this};
 
-        frames.push_back(builder->open(branch));
-        walker.enterRule(branch);
+        openExprFrame(branch);
 
         while (frames.size() > probe.targetDepth()) {
             if (probe.isDesynced())     return false;
@@ -584,10 +722,10 @@ struct Parser::Impl {
         if (tokens.peek().coreKind == CoreTokenKind::Eof
             && !walker.canEndSource()) {
             if (frames.empty()) return StepOutcome::Done;
-            emitParserError(
-                DiagnosticCode::P_MissingRequiredChild,
-                tokens.peek().span,
-                "premature end of input — schema cursor expected more");
+            emitParserError(DiagnosticCode::P_MissingRequiredChild,
+                            tokens.peek().span,
+                            "'<eof>'",
+                            walker.expectedSet());
             closeFrameOnce();
             return StepOutcome::Continue;
         }
@@ -656,29 +794,8 @@ struct Parser::Impl {
                 return StepOutcome::Continue;
             }
 
-            const SchemaTokenId expectedTok =
-                expected.empty() ? InvalidSchemaToken : expected.front();
-            builder->pushError(peek.span,
-                               std::nullopt,
-                               expectedTok.valid()
-                                   ? std::optional<SchemaTokenId>{expectedTok}
-                                   : std::nullopt,
-                               "token does not match expected schema slot");
-            // `pushError` routes its diagnostic directly through the
-            // builder's reporter, bypassing `emitDiag`, so the
-            // parser's `diagsEmitted` counter — which gates
-            // speculative-branch rollback detection — must be
-            // incremented by hand to preserve that contract. Note
-            // this only mirrors the parser's deliberate-emission
-            // sites; trivia `pushToken` paths that emit builder-side
-            // diagnostics (P_UnknownToken / P_SchemaCursorDesync /
-            // P_AmbiguousToken / P_ContextualKeywordResolution) do
-            // NOT flow through this counter — known gap, accepted
-            // because those codes signal informational drift rather
-            // than commit-blocking errors.
-            ++diagsEmitted;
-            (void)tokens.advance();
-            return StepOutcome::Continue;
+            return recoverAt(DiagnosticCode::P_UnexpectedToken,
+                             peek, expected);
         }
 
         case SlotKind::RuleLeaf: {
@@ -710,8 +827,7 @@ struct Parser::Impl {
                         schema->exprMinPrecedence(nextRule));
                     return StepOutcome::Continue;
                 }
-                frames.push_back(builder->open(nextRule));
-                walker.enterRule(nextRule);
+                openExprFrame(nextRule);
                 return StepOutcome::Continue;
             }
 
@@ -726,22 +842,13 @@ struct Parser::Impl {
                 // nullable RuleLeaf references, so this path is rare
                 // in practice; the guard exists for grammar-author
                 // safety.
-                frames.push_back(builder->open(nextRule));
-                walker.enterRule(nextRule);
+                openExprFrame(nextRule);
                 closeFrameOnce();
                 return StepOutcome::Continue;
             }
 
-            emitParserError(
-                DiagnosticCode::P_NoAlternativeMatched,
-                peek.span,
-                std::format(
-                    "token kind {} is not in FIRST({}) and the rule is "
-                    "not nullable",
-                    static_cast<int>(tokKind.v),
-                    static_cast<int>(nextRule.v)));
-            (void)tokens.advance();
-            return StepOutcome::Continue;
+            return recoverAt(DiagnosticCode::P_NoAlternativeMatched,
+                             peek, firstSet);
         }
 
         case SlotKind::AltChoice: {
@@ -769,12 +876,8 @@ struct Parser::Impl {
                         && walker.takeNullableBranch()) {
                         return StepOutcome::Continue;
                     }
-                    emitParserError(
-                        DiagnosticCode::P_BacktrackFailed,
-                        peek.span,
-                        "token not in any speculative branch's FIRST set");
-                    (void)tokens.advance();
-                    return StepOutcome::Continue;
+                    return recoverAt(DiagnosticCode::P_BacktrackFailed,
+                                     peek, expected);
                 }
 
                 // Try each candidate branch in declaration order.
@@ -788,12 +891,8 @@ struct Parser::Impl {
                     }
                 }
 
-                emitParserError(
-                    DiagnosticCode::P_BacktrackFailed,
-                    peek.span,
-                    "every speculative branch failed to commit");
-                (void)tokens.advance();
-                return StepOutcome::Continue;
+                return recoverAt(DiagnosticCode::P_BacktrackFailed,
+                                 peek, expected);
             }
 
             // Non-speculative AltChoice.
@@ -815,12 +914,8 @@ struct Parser::Impl {
                     return StepOutcome::Continue;
                 }
 
-                emitParserError(
-                    DiagnosticCode::P_NoAlternativeMatched,
-                    peek.span,
-                    "no AltChoice branch FIRST-set contains the next token");
-                (void)tokens.advance();
-                return StepOutcome::Continue;
+                return recoverAt(DiagnosticCode::P_NoAlternativeMatched,
+                                 peek, expected);
             }
 
             // Try TokenLeaf-branch route first via the schema's
@@ -852,8 +947,7 @@ struct Parser::Impl {
                 const auto routed = schema->routeToRuleLeaf(
                     walker.cursor(), candidate);
                 if (!routed.valid()) continue;
-                frames.push_back(builder->open(candidate));
-                walker.enterRule(candidate);
+                openExprFrame(candidate);
                 return StepOutcome::Continue;
             }
 
@@ -865,12 +959,8 @@ struct Parser::Impl {
             // is broken; the P_NoAlternativeMatched here is a
             // fail-safe surfacing the invariant violation, not a
             // recovery path.
-            emitParserError(
-                DiagnosticCode::P_NoAlternativeMatched,
-                peek.span,
-                "AltChoice routing failed for a token in the union — schema invariant violation");
-            (void)tokens.advance();
-            return StepOutcome::Continue;
+            return recoverAt(DiagnosticCode::P_NoAlternativeMatched,
+                             peek, expected);
         }
 
         }   // switch slotKind
@@ -897,6 +987,9 @@ Parser::Parser(std::shared_ptr<SourceBuffer>        src,
     }
     if (config.maxExpressionDepth == 0) {
         fatal("dss::Parser::Parser: maxExpressionDepth must be >= 1");
+    }
+    if (config.maxSyncScanTokens == 0) {
+        fatal("dss::Parser::Parser: maxSyncScanTokens must be >= 1");
     }
     impl_ = std::make_unique<Impl>(std::move(src),
                                    std::move(schema),
@@ -927,8 +1020,7 @@ ParseResult Parser::parse() && {
         fatal("dss::Parser::parse: schema has no root rule");
     }
 
-    I.frames.push_back(I.builder->open(rootRule));
-    I.walker.enterRule(rootRule);
+    I.openExprFrame(rootRule);
 
     I.lastCursor = I.walker.cursor();
     I.lastTokPos = I.tokens.position();

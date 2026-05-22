@@ -8,6 +8,7 @@
 #include "tokenizer/token_stream.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <type_traits>
 
@@ -17,6 +18,17 @@ namespace dss {
 // tree's diagnostic stream is reachable via `tree.diagnostics()`.
 struct DSS_EXPORT ParseResult {
     Tree tree;
+};
+
+// How the dispatch loop's recovery sites behave when they see an
+// unrecognized token. `SingleToken` consumes exactly one token and
+// continues (legacy single-step behavior, kept for regression-bisect
+// parity). `PanicMode` scans forward until peek hits
+// `schema->syncTokens()` ∪ `followSetOf(nearest compiled ancestor)`
+// ∪ EOF ∪ lexer Error, capped at `maxSyncScanTokens`.
+enum class RecoveryStrategy : std::uint8_t {
+    SingleToken,
+    PanicMode,
 };
 
 // Per-instance knobs for the parser.
@@ -36,6 +48,20 @@ struct DSS_EXPORT ParserConfig {
     // watchdog. 256 fits both real C-style code and the test corpus
     // with plenty of headroom.
     std::size_t maxExpressionDepth = 256;
+
+    // Recovery strategy for unrecognized tokens. Default scans to
+    // the next sync/follow point; `SingleToken` is the legacy single-
+    // step behavior, kept for regression-bisect parity and for tests
+    // that pin the old shape.
+    RecoveryStrategy recoveryStrategy = RecoveryStrategy::PanicMode;
+
+    // Upper bound on how many tokens panic-mode may scan past a
+    // recovery site before giving up and accepting whatever peek
+    // currently is. Caps adversarial input (very long stretches with
+    // no sync/follow token) and pathological misuses. 64 covers
+    // every recovery scenario shipped grammars exercise; raise per-
+    // grammar via this config if a corpus shows otherwise.
+    std::size_t maxSyncScanTokens = 64;
 
     // Optional override for the operator-precedence walker. Null
     // (the default) means the parser constructs and owns a

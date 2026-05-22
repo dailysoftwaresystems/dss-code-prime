@@ -328,6 +328,16 @@ std::span<SchemaTokenId const> GrammarSchema::firstSetOf(RuleId rule) const noex
     return it->second.firstSet;
 }
 
+std::span<SchemaTokenId const> GrammarSchema::followSetOf(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return {};
+    return it->second.followSet;
+}
+
+std::span<SchemaTokenId const> GrammarSchema::syncTokens() const noexcept {
+    return d_.syncTokens;
+}
+
 bool GrammarSchema::isNullable(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return false;

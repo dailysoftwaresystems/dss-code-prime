@@ -940,6 +940,78 @@ void computeNullableTails(GrammarSchemaData& data) {
     }
 }
 
+// FOLLOW(R) = the set of token kinds that can legitimately follow a
+// successful parse of rule R, anywhere it's referenced. Used by the
+// parser's panic-mode recovery to decide "have I reached a resync
+// point for the currently-failing rule".
+//
+// Algorithm (textbook fixed-point):
+//   For each parent rule, for each RuleLeaf(R) position p:
+//     - Add `expectedSet(positions[p.nextPos()])` to FOLLOW(R).
+//     - If `positions[p.nextPos()].nullableTail()`, also add
+//       FOLLOW(parentRule) to FOLLOW(R) (the path continues past
+//       parentRule's end, picking up the grandparent's follow).
+// Iterate until no follow set grows.
+//
+// Root rule's FOLLOW stays empty — nothing in the grammar references
+// it. EOF is handled separately by the parser's `canEndSource` check.
+void computeFollowSets(GrammarSchemaData& data, Collector& coll) {
+    // Bound is far above the O(rules × positions) convergence the
+    // monotone lattice guarantees — functions as a runaway guard
+    // against a future refactor that breaks monotonicity. If we hit
+    // it with `changed == true` we emit a loader diagnostic rather
+    // than silently shipping a truncated FOLLOW set.
+    constexpr int kMaxIters = 10000;
+    auto addToFollow = [](std::vector<SchemaTokenId>& follow,
+                          SchemaTokenId tok) -> bool {
+        auto it = std::lower_bound(follow.begin(), follow.end(), tok,
+            [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; });
+        if (it != follow.end() && it->v == tok.v) return false;
+        follow.insert(it, tok);
+        return true;
+    };
+
+    bool changed = true;
+    int iters = 0;
+    while (changed && iters++ < kMaxIters) {
+        changed = false;
+        for (auto& [parentIdV, parentRule] : data.compiledRules) {
+            auto const& positions = parentRule.positions;
+            // Snapshot parent's follow set up-front so a same-rule
+            // self-reference can't read a follow set we just mutated
+            // in this iteration. Reads stay stable within one pass;
+            // changes propagate on the next iteration.
+            const auto parentFollowSnapshot = parentRule.followSet;
+            for (auto const& p : positions) {
+                if (p.slotKind() != SlotKind::RuleLeaf) continue;
+                const RuleId childRule = p.ruleId();
+                auto childIt = data.compiledRules.find(childRule.v);
+                if (childIt == data.compiledRules.end()) continue;
+                auto& childFollow = childIt->second.followSet;
+                if (p.nextPos() >= positions.size()) continue;
+                auto const& next = positions[p.nextPos()];
+                for (auto tok : next.expectedSet()) {
+                    if (addToFollow(childFollow, tok)) changed = true;
+                }
+                if (next.nullableTail()) {
+                    for (auto tok : parentFollowSnapshot) {
+                        if (addToFollow(childFollow, tok)) changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if (changed) {
+        coll.emit(DiagnosticCode::C_CircularShape,
+                  "/shapes",
+                  std::format("FOLLOW-set fixed-point did not converge in "
+                              "{} iterations — the grammar likely violates "
+                              "monotonicity (a loader bug); FOLLOW data is "
+                              "truncated and recovery quality degraded",
+                              kMaxIters));
+    }
+}
+
 // Reject any rule shape OR scope-forbid entry that references a
 // SchemaTokenId declared as a lexer mode's `defaultToken.kind`.
 // Body-default kinds are off-grammar by construction (see
@@ -1766,6 +1838,62 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // syncTokens ──
+    // Optional array of token-kind names treated as panic-mode resync
+    // points by the parser. Loader validates: each entry must be a
+    // string naming a declared / built-in token kind, and Eof/Error are
+    // rejected (Eof is always an implicit sync; Error would short-
+    // circuit recovery before it ever reached a real syntactic site).
+    // Stored sorted ascending by id.v for fast contains-probes in the
+    // parser's hot recovery loop.
+    if (doc.contains("syncTokens")) {
+        json const& sv = doc.at("syncTokens");
+        if (!sv.is_array()) {
+            coll.emit(DiagnosticCode::C_MissingField, "/syncTokens",
+                      "'syncTokens' must be an array of token-kind names");
+        } else {
+            std::vector<SchemaTokenId> collected;
+            for (std::size_t i = 0; i < sv.size(); ++i) {
+                json const& entry = sv[i];
+                const auto path = std::format("/syncTokens/{}", i);
+                if (!entry.is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path,
+                              "syncToken entry must be a string token-kind name");
+                    continue;
+                }
+                const auto name = entry.get<std::string>();
+                if (!data.schemaTokens->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownToken, path,
+                              std::format("syncToken '{}' is not a declared "
+                                          "or built-in token kind", name));
+                    continue;
+                }
+                const auto id = data.schemaTokens->find(name);
+                if (name == "Eof" || name == "Error") {
+                    coll.emit(DiagnosticCode::C_ConflictingField, path,
+                              std::format("syncToken '{}' is reserved — Eof is "
+                                          "an implicit sync, Error would short-"
+                                          "circuit recovery", name));
+                    continue;
+                }
+                if (data.emptySpaceTokens.contains(id.v)) {
+                    coll.emit(DiagnosticCode::C_ConflictingField, path,
+                              std::format("syncToken '{}' is flagged "
+                                          "`EmptySpace`; using trivia as a "
+                                          "panic-mode break would stop "
+                                          "recovery at every whitespace", name));
+                    continue;
+                }
+                auto it = std::lower_bound(collected.begin(), collected.end(), id,
+                    [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; });
+                if (it == collected.end() || it->v != id.v) {
+                    collected.insert(it, id);
+                }
+            }
+            data.syncTokens = std::move(collected);
+        }
+    }
+
     // shapes ──
     if (doc.contains("shapes")) {
         if (!doc.at("shapes").is_object()) {
@@ -1882,6 +2010,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 buildPositionTables        (data, doc.at("shapes"), coll);
                 detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
                 computeNullableTails       (data);
+                computeFollowSets          (data, coll);
                 validateBodyDefaultKindsOffGrammar(data, coll);
             }
         }

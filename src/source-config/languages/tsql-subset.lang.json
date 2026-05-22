@@ -9,6 +9,8 @@
 
   "reservedWordPolicy": "contextual",
 
+  "syncTokens": ["EndStatement"],
+
   "lexerModes": {
     "main":            { "tokens": "default" },
     "bracket-id":      { "defaultToken": { "kind": "BracketIdChar" } },

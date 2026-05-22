@@ -208,6 +208,43 @@ TEST(ReporterFormat, IncludesPrefixSeverityAndCaret) {
     EXPECT_NE(out.find("hint:  insert ';' before this token"), std::string::npos);
 }
 
+// Multi-byte span underlines with `^^^…` matching the span length, so
+// a regression that drops the loop and prints a single `^` would not
+// silently pass.
+TEST(ReporterFormat, MultiCharSpanProducesMultiCaretUnderline) {
+    DiagnosticReporter r;
+    BufferRegistry bufs;
+    auto buf = SourceBuffer::fromString("let foo = 1;\n", "<inline>");
+    bufs.add(buf);
+
+    auto d = makeDiag(DiagnosticCode::P_UnexpectedToken,
+                      DiagnosticSeverity::Error,
+                      buf->id(),
+                      4, 7, "'foo'");
+    r.report(d);
+    auto out = r.format(r.all()[0], bufs);
+    EXPECT_NE(out.find("^^^"), std::string::npos)
+        << "3-byte span must render `^^^` not a lone `^`";
+}
+
+// Empty-span (start == end) renders a single caret rather than zero.
+TEST(ReporterFormat, EmptySpanRendersSingleCaret) {
+    DiagnosticReporter r;
+    BufferRegistry bufs;
+    auto buf = SourceBuffer::fromString("x\n", "<inline>");
+    bufs.add(buf);
+
+    auto d = makeDiag(DiagnosticCode::P_MissingRequiredChild,
+                      DiagnosticSeverity::Error,
+                      buf->id(),
+                      1, 1, "'<eof>'");
+    r.report(d);
+    auto out = r.format(r.all()[0], bufs);
+    EXPECT_NE(out.find("^"), std::string::npos);
+    EXPECT_EQ(out.find("^^"), std::string::npos)
+        << "zero-width span must render exactly one `^`";
+}
+
 TEST(ReporterFormat, FormatsRelatedLocations) {
     DiagnosticReporter r;
     BufferRegistry bufs;

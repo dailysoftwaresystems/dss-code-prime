@@ -202,6 +202,14 @@ struct DSS_EXPORT GrammarSchemaData {
     // cap its longest-match probe length. Zero only for a schema with
     // no declared `tokens` entries.
     std::size_t                                       maxLexemeLength = 0;
+
+    // Panic-mode sync tokens declared at the schema level — token
+    // kinds the parser treats as "safe resync points" when the input
+    // is broken. Sorted ascending by `id.v` so callers can use
+    // binary-search probes. Loader-validated: every entry must be a
+    // declared token kind, and Eof/Error are rejected (Eof is always
+    // an implicit sync; Error would short-circuit recovery).
+    std::vector<SchemaTokenId>                        syncTokens;
 };
 
 } // namespace detail
@@ -351,7 +359,14 @@ public:
 
     // Direct per-rule queries that don't require a cursor instance.
     [[nodiscard]] std::span<SchemaTokenId const> firstSetOf(RuleId rule) const noexcept;
+    [[nodiscard]] std::span<SchemaTokenId const> followSetOf(RuleId rule) const noexcept;
     [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;
+
+    // Schema-declared panic-mode sync tokens. Sorted ascending by
+    // `id.v`. Empty when the config omits the `syncTokens` field.
+    // Parser's panic-mode recovery consumes until peek is in this set
+    // OR in `followSetOf(currentRule)`.
+    [[nodiscard]] std::span<SchemaTokenId const> syncTokens() const noexcept;
 
     // `expr`-shape introspection. `isExprRule` is true when the rule's
     // body was declared as `{ "expr": { "atom": ..., "minPrecedence": ... } }`.

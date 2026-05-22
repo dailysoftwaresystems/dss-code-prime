@@ -855,6 +855,26 @@ void TreeBuilder::pushError(SourceSpan                   span,
     propagateHasError_(id);
 }
 
+void TreeBuilder::pushErrorNode(SourceSpan span) {
+    if (finished_) {
+        addBuilderInvariant_("pushErrorNode after finish()", span);
+        return;
+    }
+    if (open_.empty()) {
+        addBuilderInvariant_(
+            "pushErrorNode called with no open frame; node dropped",
+            span);
+        return;
+    }
+    detail::Node errNode{};
+    errNode.kind  = NodeKind::Error;
+    errNode.flags = NodeFlags::HasError;
+    errNode.span  = span;
+    const NodeId id = emit_(errNode);
+    attachToCurrentFrame_(id);
+    propagateHasError_(id);
+}
+
 // ── scope stack ──────────────────────────────────────────────────────────
 
 void TreeBuilder::pushScope(ScopeKind kind) {

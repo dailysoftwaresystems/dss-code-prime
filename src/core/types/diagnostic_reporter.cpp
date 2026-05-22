@@ -249,13 +249,20 @@ void appendLineWithCaret(std::string& out,
     std::format_to(std::back_inserter(out),
                    "{:>2} | {}\n", lv.line, lv.text);
 
-    // Caret line. Column is 1-based; the `|` gutter prints "<space> | "
-    // (5 chars) so the caret column inside the line text starts after
-    // those 5 chars. column-1 leading spaces, then ^.
+    // Underline: column-1 leading spaces, then `^` repeated for the
+    // span's byte length (clamped to whatever's left on the line — a
+    // multi-line span underlines only the portion on the first line).
+    // Empty spans render a single `^` (the smallest sensible cursor).
     const std::size_t pad = (lv.column == 0 ? 0u : lv.column - 1u);
+    const std::size_t lineRemainder =
+        (pad >= lv.text.size()) ? 0u : (lv.text.size() - pad);
+    const std::size_t requestedLen =
+        (span.end() > span.start()) ? (span.end() - span.start()) : 1u;
+    const std::size_t caretLen = std::max<std::size_t>(
+        1u, std::min(requestedLen, lineRemainder));
     std::format_to(std::back_inserter(out),
-                   "   | {:>{}}^",
-                   "", pad);
+                   "   | {:>{}}{:^>{}}",
+                   "", pad, "", caretLen);
     if (!caretNote.empty()) {
         std::format_to(std::back_inserter(out), " {}", caretNote);
     }

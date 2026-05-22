@@ -197,7 +197,9 @@
       "PowerShell(cd C:/Source/DailySoftware/dss-code-prime/build/bin/dss; .\\\\dss_analysis_syntactic_test_parser_speculation.exe 2>&1 | Select-Object -Last 10; \"spec exit=$LASTEXITCODE\"; .\\\\dss_analysis_syntactic_test_parser_c_subset_smoke.exe 2>&1 | Select-Object -Last 10; \"csub exit=$LASTEXITCODE\")",
       "PowerShell(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_pratt_walker.exe --gtest_filter=PrattWalker.TightLhsThenLooseOperatorWrapsLhsInBinaryExpr 2>&1 | Select-Object -Last 50)",
       "PowerShell(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_parser_c_subset_smoke.exe --gtest_filter=ParserCSubsetSmoke.FunctionBodyExpressionIsPrecedenceCorrect 2>&1 | Select-Object -Last 40)",
-      "PowerShell(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_tokenizer_test_tokenizer.exe --gtest_filter=Tokenizer.TokenFlags_PropagateToBuilderLeafFlags 2>&1 | Select-Object -Last 25)"
+      "PowerShell(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_tokenizer_test_tokenizer.exe --gtest_filter=Tokenizer.TokenFlags_PropagateToBuilderLeafFlags 2>&1 | Select-Object -Last 25)",
+      "PowerShell(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_parser_toy.exe --gtest_filter=ParserToy.BrokenPath_TokenNotInAnyFirstSet 2>&1 | Select-Object -Last 40)",
+      "PowerShell(C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_parser_recovery.exe 2>&1 | Select-Object -Last 30)"
     ]
   }
 }

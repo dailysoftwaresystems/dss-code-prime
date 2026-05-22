@@ -392,6 +392,190 @@ TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
 // references AND scope-forbid entries naming them — both surfaces
 // would silently never fire at runtime (the cursor-advance gate
 // skips body-default kinds), so surface the misuse at load time.
+// PA3: `followSetOf(rule)` walks the position graph at load time.
+// Verify the textbook FOLLOW computation: for c-subset's `expression`
+// rule, FOLLOW must include the tokens that can legitimately appear
+// AFTER an expression — `;` (EndStatement) at statement boundary, `)`
+// (ParenClose) at paren-wrapped sub-expression boundary, `,` (Comma)
+// in argument-list-like positions if any. These are the resync points
+// the parser's panic-mode uses for `expr`-kind rules.
+TEST(GrammarSchema, FollowSetOfExpressionIncludesStatementEnders) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(result.has_value());
+    auto const& schema = **result;
+
+    const auto expression = schema.rules().find("expression");
+    ASSERT_TRUE(expression.valid());
+
+    const auto follow = schema.followSetOf(expression);
+    auto containsName = [&](std::string_view name) {
+        const auto id = schema.schemaTokens().find(name);
+        return id.valid()
+            && std::ranges::find_if(follow,
+                   [id](SchemaTokenId s) { return s.v == id.v; })
+                != follow.end();
+    };
+    EXPECT_TRUE(containsName("EndStatement"))
+        << "FOLLOW(expression) must include `;` — expression can end a statement";
+    EXPECT_TRUE(containsName("ParenClose"))
+        << "FOLLOW(expression) must include `)` — expression in `(expr)`";
+    EXPECT_TRUE(containsName("Colon"))
+        << "FOLLOW(expression) must include `:` — `case expr:` label";
+}
+
+// FOLLOW propagation across nullable-tail positions: when a RuleLeaf
+// reference is followed by an `optional` body that nullable-skips
+// to End, the child's FOLLOW must inherit the parent's FOLLOW. This
+// is the textbook case for "FOLLOW transitively includes the
+// FOLLOW of every rule whose continuation is nullable".
+TEST(GrammarSchema, FollowSetPropagatesAcrossNullableTail) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "NullableFollow", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        ";": [{ "kind": "Semi" }],
+        ",": [{ "kind": "Comma" }]
+      },
+      "shapes": {
+        "root":   { "sequence": [ "A", "Semi" ] },
+        "A":      { "sequence": [ "B", { "optional": "Comma" } ] },
+        "B":      { "sequence": [ "Identifier" ] }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    auto const& schema = **loaded;
+
+    const auto b    = schema.rules().find("B");
+    const auto semi = schema.schemaTokens().find("Semi");
+    const auto comma = schema.schemaTokens().find("Comma");
+    ASSERT_TRUE(b.valid());
+    ASSERT_TRUE(semi.valid());
+    ASSERT_TRUE(comma.valid());
+
+    const auto follow = schema.followSetOf(b);
+    auto contains = [&](SchemaTokenId id) {
+        return std::ranges::find_if(follow,
+            [id](SchemaTokenId s) { return s.v == id.v; }) != follow.end();
+    };
+    EXPECT_TRUE(contains(comma))
+        << "B is directly followed by `optional Comma` — Comma in FOLLOW(B)";
+    EXPECT_TRUE(contains(semi))
+        << "FOLLOW(A) (which is {Semi}) must propagate to FOLLOW(B) "
+           "because the optional after B is nullable-tail";
+}
+
+// Self-recursive rule (`list = Identifier (Comma list)?`): the
+// snapshot-per-pass guard in `computeFollowSets` ensures the fixed-
+// point converges to a stable FOLLOW set rather than diverging or
+// producing iteration-order-dependent results. FOLLOW(list) must
+// include Semi (from the parent root sequence).
+TEST(GrammarSchema, FollowSetConvergesOnSelfRecursiveRule) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "SelfRec", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        ";": [{ "kind": "Semi" }],
+        ",": [{ "kind": "Comma" }]
+      },
+      "shapes": {
+        "root":   { "sequence": [ "list", "Semi" ] },
+        "list":   { "sequence": [ "Identifier", { "optional": { "sequence": [ "Comma", "list" ] } } ] }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    auto const& schema = **loaded;
+
+    const auto list = schema.rules().find("list");
+    const auto semi = schema.schemaTokens().find("Semi");
+    ASSERT_TRUE(list.valid());
+    const auto follow = schema.followSetOf(list);
+    auto contains = [&](SchemaTokenId id) {
+        return std::ranges::find_if(follow,
+            [id](SchemaTokenId s) { return s.v == id.v; }) != follow.end();
+    };
+    EXPECT_TRUE(contains(semi))
+        << "FOLLOW(list) must include Semi via the root sequence";
+}
+
+// Root rule has no parent reference; its FOLLOW must be empty. The
+// parser's `canEndSource` check is what authorizes EOF — no implicit
+// EOF in FOLLOW(root).
+TEST(GrammarSchema, FollowSetOfRootIsEmpty) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(result.has_value());
+    auto const& schema = **result;
+    const auto root = schema.rules().find("root");
+    ASSERT_TRUE(root.valid());
+    EXPECT_TRUE(schema.followSetOf(root).empty());
+}
+
+// PA3: `syncTokens` field round-trips. Loader rejects unknown kind
+// names, Eof, and Error (each with its own loader diagnostic shape).
+TEST(GrammarSchema, SyncTokensRoundTrip) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(result.has_value());
+    auto const& schema = **result;
+    const auto sync = schema.syncTokens();
+
+    auto containsName = [&](std::string_view name) {
+        const auto id = schema.schemaTokens().find(name);
+        return id.valid()
+            && std::ranges::find_if(sync,
+                   [id](SchemaTokenId s) { return s.v == id.v; })
+                != sync.end();
+    };
+    EXPECT_TRUE(containsName("EndStatement"));
+    EXPECT_TRUE(containsName("BlockClose"));
+}
+
+TEST(GrammarSchema, SyncTokensRejectsUnknownKind) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "Bad", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "syncTokens": ["NotAKind"],
+      "shapes": { "root": { "sequence": ["Semi"] } }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(result.has_value());
+    bool saw = false;
+    for (auto const& d : result.error()) {
+        if (d.code == DiagnosticCode::C_UnknownToken
+            && d.message.find("NotAKind") != std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw);
+}
+
+TEST(GrammarSchema, SyncTokensRejectsReservedEof) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "Bad", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "syncTokens": ["Eof"],
+      "shapes": { "root": { "sequence": ["Semi"] } }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(result.has_value());
+    bool saw = false;
+    for (auto const& d : result.error()) {
+        if (d.code == DiagnosticCode::C_ConflictingField
+            && d.message.find("reserved") != std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw);
+}
+
 TEST(GrammarSchema, RejectsBodyDefaultKindInShape) {
     constexpr std::string_view cfg = R"JSON({
       "dssSchemaVersion": 2,

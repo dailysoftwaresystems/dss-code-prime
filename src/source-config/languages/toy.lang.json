@@ -28,6 +28,8 @@
     "=":  [{ "kind": "AssignmentOperator" }]
   },
 
+  "syncTokens": ["EndCommand", "BlockClose"],
+
   "keywords": [
     { "word": "var", "kind": "VarKeyword" },
     { "word": "if",  "kind": "IfKeyword" }

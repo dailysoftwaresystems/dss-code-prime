@@ -461,6 +461,43 @@ TEST(TreeBuilder, PushErrorWithoutOpenFrameEmitsInvariant) {
                        DiagnosticCode::P_UnexpectedToken), 0u);
 }
 
+// `pushErrorNode` inserts the Error leaf WITHOUT emitting any
+// diagnostic — the parser layer's panic-mode uses this after it has
+// already emitted a rich `P_UnexpectedToken` itself, so re-emitting
+// would double-count. The Error leaf, HasError propagation, and the
+// failure-mode invariants mirror `pushError`.
+TEST(TreeBuilder, PushErrorNodeInsertsLeafWithoutDiagnostic) {
+    auto h = Harness::make("x");
+    TreeBuilder b{h.src, h.schema};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        b.pushErrorNode(SourceSpan::of(0, 1));
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_UnexpectedToken), 0u);
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BuilderInvariant), 0u);
+    EXPECT_TRUE(hasError(t.flags(t.root())));
+
+    std::size_t errorLeaves = 0;
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Error) ++errorLeaves;
+    }
+    EXPECT_EQ(errorLeaves, 1u);
+}
+
+TEST(TreeBuilder, PushErrorNodeWithoutOpenFrameEmitsInvariant) {
+    auto h = Harness::make("x");
+    TreeBuilder b{h.src, h.schema};
+    b.pushErrorNode(SourceSpan::of(0, 1));
+    Tree t = std::move(b).finish();
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                       DiagnosticCode::P_BuilderInvariant), 1u);
+}
+
 // ── LIFO violation cascade close ───────────────────────────────────────
 
 TEST(TreeBuilder, OutOfOrderCloseCascadesAndDoesNotDoubleDiagnose) {

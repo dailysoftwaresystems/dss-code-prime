@@ -87,6 +87,8 @@
     ]
   },
 
+  "syncTokens": ["EndStatement", "BlockClose"],
+
   "keywords": [
     { "word": "void",   "kind": "VoidKeyword"   },
     { "word": "int",    "kind": "IntKeyword"    },
