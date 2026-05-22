@@ -97,7 +97,17 @@ public:
     [[nodiscard]] std::uint16_t                 lookahead()      const noexcept;
     [[nodiscard]] bool                          isAtEndOfRule()  const noexcept;
     [[nodiscard]] bool                          canEndSource()   const noexcept;
+    [[nodiscard]] bool                          nullableTail()   const noexcept;
     [[nodiscard]] RuleId                        slotRuleRef()    const noexcept;
+
+    // Step past a nullable AltChoice without consuming a token. The
+    // parser calls this when an optional/repeat AltChoice doesn't
+    // match the next token but the cursor's `nullableTail` is true —
+    // taking the AltChoice's nullable branch lets the cursor advance
+    // to whatever follows the optional. No-op if the cursor isn't at
+    // a nullable AltChoice (the parser should emit
+    // `P_NoAlternativeMatched` and consume in that case).
+    bool takeNullableBranch() noexcept;
     [[nodiscard]] std::size_t                   depth()          const noexcept { return cursorStack_.size(); }
     [[nodiscard]] bool                          isDesynced()     const noexcept { return cursorDesynced_; }
 

@@ -168,6 +168,17 @@ public:
                    std::optional<SchemaTokenId> expectedToken = std::nullopt,
                    std::string_view             note          = {});
 
+    // Public gateway for diagnostics the parser layer needs to emit that
+    // don't fit `pushError`'s "unexpected token + Error leaf" shape —
+    // notably `P_MissingRequiredChild`, `P_NoAlternativeMatched`, and
+    // `P_BacktrackFailed`. The diagnostic flows through the same
+    // reporter that handles every other tree-side diagnostic, so the
+    // dedup, ordering, and severity rules apply consistently. The
+    // builder stamps the active scope stack onto the diagnostic; the
+    // caller fills `code`, `severity`, `buffer`, `span`, `expected`,
+    // `actual`, `ruleContext`, and `related`.
+    void reportDiagnostic(ParseDiagnostic d);
+
     // ── scope stack (validated against schema in pushToken) ──
     void pushScope(ScopeKind kind);
     void popScope();    // emits P_BuilderInvariant on underflow

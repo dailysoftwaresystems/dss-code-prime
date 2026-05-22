@@ -98,6 +98,21 @@ bool SchemaWalker::canEndSource() const noexcept {
     return schema_->canEndSource(cursor_);
 }
 
+bool SchemaWalker::nullableTail() const noexcept {
+    return schema_->nullableTail(cursor_);
+}
+
+bool SchemaWalker::takeNullableBranch() noexcept {
+    const auto next = schema_->nullableBranch(cursor_);
+    if (!next.valid()) return false;
+    // No `noteDesync_` call here: "skipping" via a nullable branch
+    // is a deliberate cursor mutation that, by construction, lands
+    // on a valid position (we rejected invalid above). It is not a
+    // valid→invalid transition, so no desync diagnostic is owed.
+    cursor_ = next;
+    return true;
+}
+
 RuleId SchemaWalker::slotRuleRef() const noexcept {
     return schema_->slotRuleRef(cursor_);
 }

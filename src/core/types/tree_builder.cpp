@@ -215,6 +215,15 @@ void TreeBuilder::forceReport_(ParseDiagnostic d) {
     reporter_->forceReport(std::move(d));
 }
 
+void TreeBuilder::reportDiagnostic(ParseDiagnostic d) {
+    if (finished_) {
+        addBuilderInvariant_(
+            "reportDiagnostic() after finish()", d.span);
+        return;
+    }
+    emitDiagnostic_(std::move(d));
+}
+
 void TreeBuilder::addBuilderInvariant_(std::string actual, SourceSpan span) {
     ParseDiagnostic d;
     d.code     = DiagnosticCode::P_BuilderInvariant;

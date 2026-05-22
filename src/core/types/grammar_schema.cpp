@@ -302,6 +302,26 @@ std::uint16_t GrammarSchema::lookahead(SchemaCursor cur) const noexcept {
     return (p != nullptr && p->slotKind() == SlotKind::AltChoice) ? p->lookahead() : 0;
 }
 
+bool GrammarSchema::nullableTail(SchemaCursor cur) const noexcept {
+    auto const* p = lookupPos(d_, cur);
+    return p != nullptr && p->nullableTail();
+}
+
+SchemaCursor GrammarSchema::nullableBranch(SchemaCursor cur) const noexcept {
+    auto const* p = lookupPos(d_, cur);
+    if (p == nullptr || p->slotKind() != SlotKind::AltChoice) return SchemaCursor{};
+    auto it = d_.compiledRules.find(cur.rule().v);
+    if (it == d_.compiledRules.end()) return SchemaCursor{};
+    auto const& positions = it->second.positions;
+    for (auto bid : p->branches()) {
+        if (bid >= positions.size()) continue;
+        if (positions[bid].nullableTail()) {
+            return SchemaCursor{cur.rule(), bid};
+        }
+    }
+    return SchemaCursor{};
+}
+
 std::span<SchemaTokenId const> GrammarSchema::firstSetOf(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return {};

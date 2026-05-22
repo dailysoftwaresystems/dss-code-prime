@@ -330,6 +330,25 @@ public:
     [[nodiscard]] bool         isSpeculativeAlt(SchemaCursor cur) const noexcept;
     [[nodiscard]] std::uint16_t lookahead(SchemaCursor cur) const noexcept;
 
+    // Nullable-tail introspection used by the parser to detect and
+    // step past skippable `optional`/`repeat` shapes.
+    //
+    // `nullableTail(cur)`: true when the position can complete to
+    // end-of-rule without consuming a token.
+    //
+    // `nullableBranch(cur)`: at an AltChoice cursor, returns the
+    // first branch whose `nullableTail` is true; invalid otherwise.
+    // "First wins" is deliberate: the only AltChoice shapes the
+    // loader produces with multiple nullable branches are
+    // `optional` (two branches, second is the skip) and `repeat`
+    // (two branches, second is the loop exit) — both unambiguous
+    // by construction. A hand-rolled `alt` with multiple nullable
+    // arms is loader-rejected via `C_AmbiguousAlternatives` on
+    // overlapping FIRST sets, which empirically covers every
+    // multi-nullable case the loader can emit.
+    [[nodiscard]] bool         nullableTail(SchemaCursor cur)   const noexcept;
+    [[nodiscard]] SchemaCursor nullableBranch(SchemaCursor cur) const noexcept;
+
     // Direct per-rule queries that don't require a cursor instance.
     [[nodiscard]] std::span<SchemaTokenId const> firstSetOf(RuleId rule) const noexcept;
     [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;

@@ -6,8 +6,9 @@
 #   scripts\build\local-build.ps1 -Configure    # cmake configure + build
 #   scripts\build\local-build.ps1 -Clean        # wipe build dir + reconfigure + build
 #
-# Designed to be safe to invoke without approval prompts in agentic
-# workflows — read-only on src/, writes only inside build/.
+# Safe to invoke without approval prompts in agentic workflows —
+# read-only on src/, writes only inside build/. Requires `cmake` on
+# PATH at version >= 4.0 (project's CMakeLists.txt floor).
 
 [CmdletBinding()]
 param(
@@ -17,6 +18,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Refresh PATH from the system + user env vars. PowerShell sessions
+# inherit their parent's PATH and don't pick up post-launch system
+# updates (Windows broadcasts WM_SETTINGCHANGE but PowerShell doesn't
+# listen). This refresh costs nothing and makes the script robust
+# against the "PATH was updated but my shell is stale" case.
+$env:PATH = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ';' + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $root

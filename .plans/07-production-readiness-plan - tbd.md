@@ -24,7 +24,7 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 
 | ID    | Gap                                                                 | Why it matters |
 |-------|---------------------------------------------------------------------|----------------|
-| G-001 | **Parser unborn.** `src/analysis/syntactic/` is still a `.gitkeep` stub *for the driver itself* — but the substrate is now in place (PA0 ✅, `c764c2a`). PA1 lands the actual driver. | Single biggest "does this work" risk. See [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md). |
+| G-001 | **Parser driver shipped (PA1 ✅).** Schema-driven iterative RD driver with try-each-branch speculation + depth cap + abandon-token guard + lock-step builder. 22 tests green. Pratt walker (PA2), error recovery + diagnostic UX (PA3), and corpus stress (PA4) remain. | Largest "does this work at all" risk now retired. See [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md). |
 | G-002 | **Semantic phase undesigned.** `src/analysis/semantic/` is a stub; no symbol table, no type checker, no scope resolver. | Required for any non-trivial codegen. Type errors are the most common real-world diagnostic. |
 | G-003 | **No IR.** `src/gen/intermediate/` is empty. No IR design, no SSA decision, no lowering pass.  | The hinge between frontend and backend. Wrong design here forces frontend OR backend rework. |
 | G-004 | **Codegen is one Windows PE demo.** No ELF, no Mach-O, no ARM64, no IR-driven path. | v1's hardest single chunk of work. Three object formats × two arches × three runtimes (CRT / glibc / libSystem). |
@@ -37,7 +37,7 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 
 | ID    | Gap | Where it surfaces | Resolves via |
 |-------|-----|-------------------|--------------|
-| G-101 | Parser driver unborn (G-001 detail). PA0 substrate ✅; PA1–PA5b remain. | `src/analysis/syntactic/` (still stub except for tests yet-to-land) | [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md) PA0 ✅, PA1–PA5b ⏳ |
+| G-101 | Parser driver shipped (PA1 ✅, G-001 detail). PA0 substrate + PA1 iterative driver done; PA2–PA5b remain. | `src/analysis/syntactic/parser.{hpp,cpp}` + 22 tests | [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md) PA0 + PA1 ✅, PA2–PA5b ⏳ |
 | G-102 | Operator precedence in the AST. Data shipped PR1; tree-shape flip ⏳. | `tests/core/test_c_subset.cpp::ExpressionWithMixedOpsIsLeftFolded` | parser-plan PA2 (closes v2-gap-catalog row 1) |
 | G-103 | Function calls `f(x, y)` — no postfix-call shape. | c-subset.lang.json `operand` | parser-plan PA4 + operator-table postfix arity (v2-gap-catalog row 7) |
 | G-104 | Array indexing `a[0]`. | c-subset.lang.json `operand` | parser-plan PA4 + postfix arity (v2-gap-catalog row 12) |
