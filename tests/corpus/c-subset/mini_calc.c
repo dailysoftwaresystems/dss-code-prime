@@ -5,7 +5,11 @@
 //
 // Features exercised:
 //   - Top-level function declarations with parameter lists
+//   - extern function prototype (no body)
+//   - Top-level array variable declaration
 //   - Local variable declarations with initializers
+//   - Local array variable declarations
+//   - Compound assignment operators (+=)
 //   - if/else statements (nested), while loops, do/while
 //   - Function calls (postfix `(args)`)
 //   - Array indexing (postfix `[i]`)
@@ -13,10 +17,13 @@
 //   - Prefix unary operators (!, -, ~, *)
 //   - Bitwise operators (& | ^ << >>)
 //   - Comparison operators
-//   - String / char / int / bool / null literals
 //   - Block statements
 
+extern int printf(int fmt);
+
 int g_iter_count = 0;
+int g_buffer[256];
+int g_pending[];
 
 int square(int x) {
     return x * x;
@@ -118,7 +125,9 @@ int compose_calc(int a, int b, int c) {
 
 int main() {
     int arr;
+    int local_buf[16];
     int sum = sum_array(arr, 10);
+    sum += local_buf[0];
     int m   = max3(sum, fact(5), fib(8));
     int c   = clamp(m, 0, 100);
     int s   = saturating_add(c, 50, 200);

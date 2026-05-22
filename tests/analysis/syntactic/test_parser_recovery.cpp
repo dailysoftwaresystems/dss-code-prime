@@ -356,6 +356,29 @@ TEST(ParserRecovery, BodyCodepointsAbsorbedCleanlyOnHappyPath) {
     EXPECT_NE(t.root(), InvalidNode);
 }
 
+// ── externTail broken-path ─────────────────────────────────────────────
+//
+// `externDecl`'s tail is an alt of `funcParamsOnly` (starts with `(`)
+// and `varDeclTail` (starts with `[`, `=`, or `;`). A malformed extern
+// like `extern int foo bar;` matches neither arm at the position after
+// `foo` (`bar` is a stray Identifier). The parser must emit a
+// diagnostic at the offending token and recover to the next sync
+// point. Without this pin, a regression that silently accepts the
+// stray token or routes the diagnostic to the wrong span would slip
+// through every happy-path corpus test.
+TEST(ParserRecovery, ExternTailUnexpectedTokenIsDiagnosed) {
+    auto h = loadShipped("c-subset", "extern int foo bar;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    EXPECT_TRUE(t.diagnostics().hasErrors())
+        << "stray identifier in externTail position must produce a diagnostic";
+    EXPECT_NE(t.root(), InvalidNode);
+    EXPECT_TRUE(hasError(t.flags(t.root())))
+        << "HasError must propagate to the root frame";
+}
+
 // ── ctor preconditions ─────────────────────────────────────────────────
 
 TEST(ParserRecoveryDeath, ZeroSyncScanCapAborts) {

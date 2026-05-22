@@ -1,5 +1,22 @@
 rule:root
   rule:topLevel
+    rule:externDecl
+      tok:"extern"
+      rule:typeRef
+        rule:typeBase
+          tok:"int"
+      tok:"printf"
+      rule:externTail
+        tok:"("
+        rule:paramList
+          rule:param
+            rule:typeRef
+              rule:typeBase
+                tok:"int"
+            tok:"fmt"
+        tok:")"
+        tok:";"
+  rule:topLevel
     rule:typeRef
       rule:typeBase
         tok:"int"
@@ -10,6 +27,31 @@ rule:root
         rule:expression
           rule:operand
             tok:"0"
+        tok:";"
+  rule:topLevel
+    rule:typeRef
+      rule:typeBase
+        tok:"int"
+    tok:"g_buffer"
+    rule:topLevelTail
+      rule:varDeclTail
+        rule:arrayDeclSuffix
+          tok:"["
+          rule:expression
+            rule:operand
+              tok:"256"
+          tok:"]"
+        tok:";"
+  rule:topLevel
+    rule:typeRef
+      rule:typeBase
+        tok:"int"
+    tok:"g_pending"
+    rule:topLevelTail
+      rule:varDeclTail
+        rule:arrayDeclSuffix
+          tok:"["
+          tok:"]"
         tok:";"
   rule:topLevel
     rule:typeRef
@@ -980,6 +1022,20 @@ rule:root
                 rule:typeRef
                   rule:typeBase
                     tok:"int"
+                tok:"local_buf"
+                rule:arrayDeclSuffix
+                  tok:"["
+                  rule:expression
+                    rule:operand
+                      tok:"16"
+                  tok:"]"
+              tok:";"
+          rule:statement
+            rule:varDecl
+              rule:varDeclHead
+                rule:typeRef
+                  rule:typeBase
+                    tok:"int"
                 tok:"sum"
                 tok:"="
                 rule:expression
@@ -996,6 +1052,22 @@ rule:root
                         rule:operand
                           tok:"10"
                     tok:")"
+              tok:";"
+          rule:statement
+            rule:exprStmt
+              rule:expression
+                rule:binaryExpr
+                  rule:operand
+                    tok:"sum"
+                  tok:"+="
+                  rule:postfixExpr
+                    rule:operand
+                      tok:"local_buf"
+                    tok:"["
+                    rule:expression
+                      rule:operand
+                        tok:"0"
+                    tok:"]"
               tok:";"
           rule:statement
             rule:varDecl

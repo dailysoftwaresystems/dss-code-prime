@@ -70,12 +70,23 @@
     ">>": [{ "kind": "ShrOp"    }],
 
     "++": [{ "kind": "PlusPlusOp" }],
-    "--": [{ "kind": "MinusMinusOp" }]
+    "--": [{ "kind": "MinusMinusOp" }],
+
+    "+=":  [{ "kind": "PlusAssignOp"   }],
+    "-=":  [{ "kind": "MinusAssignOp"  }],
+    "*=":  [{ "kind": "StarAssignOp"   }],
+    "/=":  [{ "kind": "SlashAssignOp"  }],
+    "%=":  [{ "kind": "ModAssignOp"    }],
+    "&=":  [{ "kind": "BitAndAssignOp" }],
+    "|=":  [{ "kind": "BitOrAssignOp"  }],
+    "^=":  [{ "kind": "BitXorAssignOp" }],
+    "<<=": [{ "kind": "ShlAssignOp"    }],
+    ">>=": [{ "kind": "ShrAssignOp"    }]
   },
 
   "operators": {
     "groups": [
-      { "precedence": 15, "associativity": "right",                      "operators": ["="]                                    },
+      { "precedence": 15, "associativity": "right",                      "operators": ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] },
       { "precedence": 20, "associativity": "left",                       "operators": ["||"]                                   },
       { "precedence": 25, "associativity": "left",                       "operators": ["&&"]                                   },
       { "precedence": 30, "associativity": "left",                       "operators": ["|"]                                    },
@@ -110,14 +121,40 @@
     { "word": "switch",  "kind": "SwitchKeyword"  },
     { "word": "case",    "kind": "CaseKeyword"    },
     { "word": "default", "kind": "DefaultKeyword" },
-    { "word": "break",   "kind": "BreakKeyword"   }
+    { "word": "break",   "kind": "BreakKeyword"   },
+
+    { "word": "extern",  "kind": "ExternKeyword"  }
   ],
 
   "shapes": {
     "root": { "sequence": [ { "repeat": "topLevel" } ] },
 
     "topLevel": {
-      "sequence": [ "typeRef", "Identifier", "topLevelTail" ]
+      "alt": [
+        { "sequence": [ "typeRef", "Identifier", "topLevelTail" ] },
+        "externDecl"
+      ]
+    },
+
+    "externDecl": {
+      "sequence": [
+        "ExternKeyword",
+        "typeRef",
+        "Identifier",
+        "externTail"
+      ]
+    },
+
+    "externTail": {
+      "alt": [
+        { "sequence": [
+            "ParenOpen",
+            { "optional": "paramList" },
+            "ParenClose",
+            "EndStatement"
+        ] },
+        "varDeclTail"
+      ]
     },
 
     "topLevelTail": { "alt": [ "funcTail", "varDeclTail" ] },
@@ -133,8 +170,17 @@
 
     "varDeclTail": {
       "sequence": [
+        { "optional": "arrayDeclSuffix" },
         { "optional": { "sequence": [ "AssignOp", "expression" ] } },
         "EndStatement"
+      ]
+    },
+
+    "arrayDeclSuffix": {
+      "sequence": [
+        "BracketOpen",
+        { "optional": "expression" },
+        "BracketClose"
       ]
     },
 
@@ -152,6 +198,7 @@
       "sequence": [
         "typeRef",
         "Identifier",
+        { "optional": "arrayDeclSuffix" },
         { "optional": { "sequence": [ "AssignOp", "expression" ] } }
       ]
     },

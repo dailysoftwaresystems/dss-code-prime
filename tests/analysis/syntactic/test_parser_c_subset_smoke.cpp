@@ -324,6 +324,252 @@ TEST(ParserCSubsetSmoke, PrefixDerefParsesAsUnary) {
     EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
 }
 
+// Compound assignment: `+=` and the other compound-assign operators
+// are right-associative at precedence 15 alongside `=`. This test pins
+// the common case (`+=`); `ShlCompoundAssignmentRespectsLongestMatch`
+// below covers the longest-match boundary (`<<=` must NOT lex as
+// `<< =`); `CompoundAssignmentIsRightAssociative` pins the right-assoc
+// nested-binaryExpr shape that distinguishes right from left assoc.
+TEST(ParserCSubsetSmoke, CompoundAssignmentParsesAsBinaryExpr) {
+    auto h = loadAndTokenize("int main() { x += 1; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:operand\n"
+        "      tok:\"x\"\n"
+        "    tok:\"+=\"\n"
+        "    rule:operand\n"
+        "      tok:\"1\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
+}
+
+// `<<=` is the most longest-match-pressured compound-assign — the
+// tokenizer must prefer it over `<<` followed by `=`. A regression in
+// longest-match would silently lex `x <<= 1` as `x << = 1` (parses
+// with an error). Pin the 3-char op as a single binaryExpr.
+TEST(ParserCSubsetSmoke, ShlCompoundAssignmentRespectsLongestMatch) {
+    auto h = loadAndTokenize("int main() { x <<= 1; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "longest-match must prefer <<= over << followed by =";
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:operand\n"
+        "      tok:\"x\"\n"
+        "    tok:\"<<=\"\n"
+        "    rule:operand\n"
+        "      tok:\"1\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
+}
+
+// Right-associativity pin: `x += y += z` must parse as
+// `x += (y += z)`, NOT `(x += y) += z`. The right-assoc declaration in
+// the operator group is the only thing distinguishing the shape; a
+// regression that flips the JSON to `"left"` would parse `x += 1`
+// identically but produce a different nested shape here.
+TEST(ParserCSubsetSmoke, CompoundAssignmentIsRightAssociative) {
+    auto h = loadAndTokenize("int main() { x += y += z; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:binaryExpr\n"
+        "    rule:operand\n"
+        "      tok:\"x\"\n"
+        "    tok:\"+=\"\n"
+        "    rule:binaryExpr\n"
+        "      rule:operand\n"
+        "        tok:\"y\"\n"
+        "      tok:\"+=\"\n"
+        "      rule:operand\n"
+        "        tok:\"z\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
+}
+
+// `extern` declares a function prototype or variable without a body.
+// Two forms: function (paren-paramlist + `;`) and variable
+// (optional-init + `;`). Function form is pinned via full
+// `prettyPrintSubtree`; variable form is pinned via shape presence
+// (the externTail's tail-only difference is what matters for that
+// arm; the externDecl frame shape is already covered by the function
+// form). Broken-path coverage in `test_parser_recovery.cpp`.
+TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
+    auto h = loadAndTokenize("extern int printf(char x);");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
+
+    const NodeId ext = findFirstNodeWithRule(t, "externDecl");
+    ASSERT_NE(ext, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:externDecl\n"
+        "  tok:\"extern\"\n"
+        "  rule:typeRef\n"
+        "    rule:typeBase\n"
+        "      tok:\"int\"\n"
+        "  tok:\"printf\"\n"
+        "  rule:externTail\n"
+        "    tok:\"(\"\n"
+        "    rule:paramList\n"
+        "      rule:param\n"
+        "        rule:typeRef\n"
+        "          rule:typeBase\n"
+        "            tok:\"char\"\n"
+        "        tok:\"x\"\n"
+        "    tok:\")\"\n"
+        "    tok:\";\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, ext), kExpected);
+}
+
+TEST(ParserCSubsetSmoke, ExternVariableDeclParses) {
+    auto h = loadAndTokenize("extern int errno;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
+}
+
+// Array declarator: expression-side `a[0]` is pinned by
+// `ArrayIndexParsesAsPostfix`; this trio is the declarator-side
+// complement (v2-gap-catalog row 12). The trio together exercises
+// both `varDeclTail` (top-level) and `varDeclHead` (local) array-
+// suffix attachment points, plus the empty-suffix path `int x[];`.
+TEST(ParserCSubsetSmoke, TopLevelArrayDeclParses) {
+    auto h = loadAndTokenize("int a[10];");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId tl = findFirstNodeWithRule(t, "topLevel");
+    ASSERT_NE(tl, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:topLevel\n"
+        "  rule:typeRef\n"
+        "    rule:typeBase\n"
+        "      tok:\"int\"\n"
+        "  tok:\"a\"\n"
+        "  rule:topLevelTail\n"
+        "    rule:varDeclTail\n"
+        "      rule:arrayDeclSuffix\n"
+        "        tok:\"[\"\n"
+        "        rule:expression\n"
+        "          rule:operand\n"
+        "            tok:\"10\"\n"
+        "        tok:\"]\"\n"
+        "      tok:\";\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, tl), kExpected);
+}
+
+TEST(ParserCSubsetSmoke, EmptyArrayDeclSuffixParses) {
+    // `int x[];` — empty bracket pair. The size expression in
+    // `arrayDeclSuffix` is `optional`, so the brackets can be empty.
+    auto h = loadAndTokenize("int x[];");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId suffix = findFirstNodeWithRule(t, "arrayDeclSuffix");
+    ASSERT_NE(suffix, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:arrayDeclSuffix\n"
+        "  tok:\"[\"\n"
+        "  tok:\"]\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, suffix), kExpected);
+}
+
+TEST(ParserCSubsetSmoke, InnerArrayDeclParses) {
+    auto h = loadAndTokenize("int main() { int buf[64]; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId head = findFirstNodeWithRule(t, "varDeclHead");
+    ASSERT_NE(head, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:varDeclHead\n"
+        "  rule:typeRef\n"
+        "    rule:typeBase\n"
+        "      tok:\"int\"\n"
+        "  tok:\"buf\"\n"
+        "  rule:arrayDeclSuffix\n"
+        "    tok:\"[\"\n"
+        "    rule:expression\n"
+        "      rule:operand\n"
+        "        tok:\"64\"\n"
+        "    tok:\"]\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, head), kExpected);
+}
+
+TEST(ParserCSubsetSmoke, ArrayDeclWithInitializerExpressionParses) {
+    // Size expression can use earlier-declared constants. The pin
+    // here captures the nested `binaryExpr` for `n * 2` inside the
+    // arrayDeclSuffix — proving operator climb engages inside the
+    // size expression (and that the binaryExpr is positioned
+    // INSIDE arrayDeclSuffix, not somewhere else in the tree).
+    auto h = loadAndTokenize("int main() { int buf[n * 2]; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId suffix = findFirstNodeWithRule(t, "arrayDeclSuffix");
+    ASSERT_NE(suffix, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:arrayDeclSuffix\n"
+        "  tok:\"[\"\n"
+        "  rule:expression\n"
+        "    rule:binaryExpr\n"
+        "      rule:operand\n"
+        "        tok:\"n\"\n"
+        "      tok:\"*\"\n"
+        "      rule:operand\n"
+        "        tok:\"2\"\n"
+        "  tok:\"]\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, suffix), kExpected);
+}
+
 // Postfix chains are left-recursive: `f(a)[i]` should bind as
 // `(f(a))[i]` — the `[i]` postfix wraps the result of `f(a)`. The
 // walker's rollback-replay strategy assumes right-recursive
