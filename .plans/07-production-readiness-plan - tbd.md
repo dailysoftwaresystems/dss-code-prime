@@ -24,7 +24,7 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 
 | ID    | Gap                                                                 | Why it matters |
 |-------|---------------------------------------------------------------------|----------------|
-| G-001 | **Parser driver shipped (PA1 ✅).** Schema-driven iterative RD driver with try-each-branch speculation + depth cap + abandon-token guard + lock-step builder. 22 tests green. PA1 follow-up `SpeculationProbe` RAII guard landed (closes parser-plan open question #5; four-machine snapshot/restore is now structurally local, mirrors `TreeBuilder::Checkpoint`; zero behavior change). Pratt walker (PA2), error recovery + diagnostic UX (PA3), and corpus stress (PA4) remain. | Largest "does this work at all" risk now retired. See [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md). |
+| G-001 | **Parser driver shipped (PA1–PA3 ✅).** Schema-driven iterative RD driver (PA1) + Pratt walker for operators (PA2) + panic-mode recovery with schema-declared `syncTokens` and load-time `followSetOf` + clang-style diagnostic rendering (PA3). 715 tests / 35 suites green. Corpus stress (PA4) and LSP scaffolding (PA5a/PA5b) remain. | Largest "does this work at all" risk fully retired. See [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md). |
 | G-002 | **Semantic phase undesigned.** `src/analysis/semantic/` is a stub; no symbol table, no type checker, no scope resolver. | Required for any non-trivial codegen. Type errors are the most common real-world diagnostic. |
 | G-003 | **No IR.** `src/gen/intermediate/` is empty. No IR design, no SSA decision, no lowering pass.  | The hinge between frontend and backend. Wrong design here forces frontend OR backend rework. |
 | G-004 | **Codegen is one Windows PE demo.** No ELF, no Mach-O, no ARM64, no IR-driven path. | v1's hardest single chunk of work. Three object formats × two arches × three runtimes (CRT / glibc / libSystem). |
@@ -37,8 +37,8 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 
 | ID    | Gap | Where it surfaces | Resolves via |
 |-------|-----|-------------------|--------------|
-| G-101 | Parser driver shipped (PA1 ✅, G-001 detail). PA0 substrate + PA1 iterative driver done (incl. PA1 follow-up `SpeculationProbe` RAII guard); PA2–PA5b remain. | `src/analysis/syntactic/parser.{hpp,cpp}` + 22 tests | [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md) PA0 + PA1 ✅, PA2–PA5b ⏳ |
-| G-102 | Operator precedence in the AST. Data shipped PR1; tree-shape flip ⏳. | `tests/core/test_c_subset.cpp::ExpressionWithMixedOpsIsLeftFolded` | parser-plan PA2 (closes v2-gap-catalog row 1) |
+| G-101 | Parser driver shipped (PA0–PA3 ✅, G-001 detail). Substrate, iterative RD driver, Pratt walker, and recovery + diagnostic UX all landed; PA4 corpus stress + PA5a/PA5b LSP remain. | `src/analysis/syntactic/parser.{hpp,cpp}` + 715 tests across 35 suites | [`05-parser-plan - tbd.md`](./05-parser-plan - tbd.md) PA0–PA3 ✅, PA4–PA5b ⏳ |
+| G-102 | ✅ Operator precedence in the AST. Closed end-to-end in PA2 (v2-gap-catalog row 1). | `ParserCSubsetSmoke.FunctionBodyExpressionIsPrecedenceCorrect` | parser-plan PA2 ✅ |
 | G-103 | Function calls `f(x, y)` — no postfix-call shape. | c-subset.lang.json `operand` | parser-plan PA4 + operator-table postfix arity (v2-gap-catalog row 7) |
 | G-104 | Array indexing `a[0]`. | c-subset.lang.json `operand` | parser-plan PA4 + postfix arity (v2-gap-catalog row 12) |
 | G-105 | Pointer ops `*p`, `&x`. | c-subset.lang.json `operand` | parser-plan PA4 + prefix arity + typeRef-side change (v2-gap-catalog row 6) |
@@ -50,8 +50,8 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 | G-111 | `#include` / module imports. Both c-subset and tsql-subset (`USE database;`) need cross-file references. | [`08-compilation-unit-plan - tbd.md`](./08-compilation-unit-plan - tbd.md) CU4 | **Phase #7.5** — per-language `ImportResolver` populates `CrossTreeRef` edges before semantic consumes the CU. Schema-driven import syntax stays a v3 candidate; v1 dispatches resolver on language name. |
 | G-112 | Preprocessor for full C (not c-subset). | n/a | **Explicitly out of v1.** c-subset omits the preprocessor by design. Full C99 is post-v1. |
 | G-113 | T-SQL `GO` batch separator, `BEGIN ... END` blocks, cursors, `TRY/CATCH`. | tsql-subset.lang.json | Out of v1 if PA4 corpus doesn't need them; otherwise extend tsql-subset (mechanism exists — pure shape work per v2-gap-catalog §6 "Residual T-SQL gaps"). |
-| G-114 | Error recovery quality benchmark. | parser-plan PA3 | Decide the bar (clang-level? tsc-level?) — open question parser-plan §4 Q4. |
-| G-115 | Diagnostic UX — source-rendered context (line + col + caret + fix-it hints). | program/driver | Render layer in the driver, consuming `tree.diagnostics()`. parser-plan PA3 has the substrate; needs its own PR. |
+| G-114 | ✅ Error recovery quality benchmark. PA3 ✅ — bar set to "every error produces an actionable message; recovery continues without cascading beyond 3× the original error count" (pinned by `ParserRecovery.SingleErrorCascadeBoundedAtThreeX`). Real-world stress is PA4's job to validate. | `tests/analysis/syntactic/test_parser_recovery.cpp` | parser-plan PA3 ✅ |
+| G-115 | ✅ Diagnostic UX — clang-style line/column/caret rendering. `DiagnosticReporter::format()` produces the display end-to-end; PA3 populated parser-side `expected`/`actual`/`ruleContext` so every parser-emitted code surfaces correctly. Multi-char `^^^` underline matches span length. CLI wiring + future LSP (PA5a) both consume the same renderer. | `tests/core/test_diagnostic_reporter.cpp` | parser-plan PA3 ✅; driver-side CLI wiring still pending |
 
 ---
 
