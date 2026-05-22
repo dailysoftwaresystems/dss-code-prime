@@ -72,15 +72,13 @@ namespace detail {
 // (it has no JSON pointer to attach), so this header trusts the caller.
 class DSS_EXPORT OperatorTable {
 public:
-    // Grouped-postfix payload: the operator consumes a delimiter and
-    // (optionally) a body rule between opener and closer. Present only
-    // on postfix entries declared with `endsAt` in the schema. The
-    // wrapping `std::optional<GroupedPostfix>` makes "grouped without
-    // delimiter" unrepresentable — previously the two flag-fields
-    // admitted that invalid state and the walker had to re-check.
+    // Grouped-postfix payload: operator consumes a delimiter and
+    // (optionally) a body rule between opener and closer. Wrapping
+    // `std::optional<GroupedPostfix>` makes "grouped without
+    // delimiter" unrepresentable.
     struct GroupedPostfix {
-        SchemaTokenId endsAt;        // always valid when this payload is present
-        RuleId        bodyRule{};    // optional within the variant — invalid ⇒ no body
+        SchemaTokenId endsAt;
+        RuleId        bodyRule{};    // invalid ⇒ grouped operator with no body shape
     };
 
     struct Entry {

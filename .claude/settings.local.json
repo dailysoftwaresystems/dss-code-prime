@@ -223,7 +223,8 @@
       "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/tsql-subset/schema_and_dml.sql'\\); Write-Output \\(\"total bytes: \" + $b.Length\\); $s = [System.Text.Encoding]::UTF8.GetString\\($b, 2300, [Math]::Min\\(180, $b.Length - 2300\\)\\); Write-Output \\('---' + $s + '---'\\))",
       "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/tsql-subset/schema_and_dml.sql'\\); $s = [System.Text.Encoding]::UTF8.GetString\\($b, 2340, 100\\); Write-Output \\('---' + $s + '---'\\))",
       "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/tsql-subset/schema_and_dml.sql'\\); $s = [System.Text.Encoding]::UTF8.GetString\\($b, 1660, 100\\); Write-Output \\('---' + $s + '---'\\))",
-      "PowerShell(Remove-Item *)"
+      "PowerShell(Remove-Item *)",
+      "PowerShell($env:DSS_REFRESH_GOLDENS = '1'; C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_corpus.exe 2>&1 | Select-String -Pattern 'PASSED|FAILED|Refreshed' | Select-Object -First 5)"
     ]
   }
 }

@@ -326,7 +326,7 @@ TEST(ParserCSubsetSmoke, PrefixDerefParsesAsUnary) {
 
 // Postfix chains are left-recursive: `f(a)[i]` should bind as
 // `(f(a))[i]` — the `[i]` postfix wraps the result of `f(a)`. The
-// PA2 walker's rollback-replay strategy assumes right-recursive
+// walker's rollback-replay strategy assumes right-recursive
 // structure: on the 2nd iteration of the climb loop it rolls back to
 // the state BEFORE the primary atom was built, then re-parses the
 // LHS at `precedence + 1` to exclude same-prec ops. For postfix
@@ -337,24 +337,42 @@ TEST(ParserCSubsetSmoke, PrefixDerefParsesAsUnary) {
 //
 // Fix requires reworking the walker so postfix chains preserve the
 // prior wrap as the new primary, rather than re-parsing from
-// scratch. Tracked as PA4-F3 in `.plans/05-parser-plan` §2.3.1 —
-// keep this disabled test as a tombstone so the fix re-enables it
-// rather than re-rediscovering the bug.
+// scratch. Keep this disabled test as a tombstone so the fix
+// re-enables it rather than re-rediscovering the bug.
 TEST(ParserCSubsetSmoke, DISABLED_PostfixChainNestsLeftToRight) {
     auto h = loadAndTokenize("int main() { f(a)[i]; }");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
-    std::size_t postfixCount = 0;
-    walkPreOrder(t, [&](TreeCursor const& c) {
-        if (t.kind(c.current()) == NodeKind::Internal
-            && t.rules().name(t.rule(c.current())) == "postfixExpr") {
-            ++postfixCount;
-        }
-    });
-    EXPECT_EQ(postfixCount, 2u)
-        << "chained postfix must produce two nested postfixExpr frames";
+
+    // Count alone (==2) would pass a partial fix that emits the two
+    // wraps as siblings instead of nested. The full shape pin is the
+    // only way to guarantee left-recursive nesting: the outer
+    // postfixExpr for `[i]` wraps the inner postfixExpr for `f(a)` as
+    // its operand. Re-enabling this test must produce exactly this
+    // tree — anything else means the fix is incomplete.
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:postfixExpr\n"
+        "    rule:operand\n"
+        "      rule:postfixExpr\n"
+        "        rule:operand\n"
+        "          tok:\"f\"\n"
+        "        tok:\"(\"\n"
+        "        rule:argList\n"
+        "          rule:expression\n"
+        "            rule:operand\n"
+        "              tok:\"a\"\n"
+        "        tok:\")\"\n"
+        "    tok:\"[\"\n"
+        "    rule:expression\n"
+        "      rule:operand\n"
+        "        tok:\"i\"\n"
+        "    tok:\"]\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
 }
 
 // Parenthesized sub-expressions delegate through `operand`'s `( expression )`

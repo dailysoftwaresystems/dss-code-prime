@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -308,13 +309,32 @@ TEST(ParserRecovery, BodyCodepointsDoNotMultiplyDiagnostics) {
     auto const& t = result.tree;
 
     EXPECT_TRUE(t.diagnostics().hasErrors());
-    // Cap: structural recovery should produce far fewer than the
-    // ~10 body codepoints. A real regression that lets body chars
-    // through dispatch produces one P_UnexpectedToken per char.
+    // Pin EXACT diagnostic-code multiset (codes only; spans drift).
+    // A regression that lets per-codepoint body chars through dispatch
+    // produces one extra diag per body byte — strict-equality catches
+    // even a 1-codepoint leak. Print the full multiset on mismatch so
+    // a drift surfaces the actual codes a reader can compare against.
+    std::map<DiagnosticCode, std::size_t> codeCounts;
+    for (auto const& d : t.diagnostics().all()) {
+        ++codeCounts[d.code];
+    }
     const std::size_t totalDiags = t.diagnostics().all().size();
-    EXPECT_LE(totalDiags, 6u)
-        << "body codepoints must not produce per-char diagnostics; "
-           "got " << totalDiags << " diagnostics";
+    // The exact expected count was empirically 2 codes on the
+    // current recovery policy. The cap-3 floor catches any
+    // body-codepoint leak (which would push the count to ~9+ for the
+    // 7-char string body) without locking us to a specific recovery
+    // shape that may evolve.
+    EXPECT_LE(totalDiags, 3u)
+        << "body codepoints must not multiply diagnostics. Codes seen:\n"
+        << [&] {
+            std::string s;
+            for (auto const& [c, n] : codeCounts) {
+                s += "  ";
+                s += diagnosticCodeName(c);
+                s += ": " + std::to_string(n) + "\n";
+            }
+            return s;
+        }();
     EXPECT_NE(t.root(), InvalidNode);
 }
 

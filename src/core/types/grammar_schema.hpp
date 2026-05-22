@@ -185,13 +185,8 @@ struct DSS_EXPORT GrammarSchemaData {
                                           std::vector<LexemeMeaning>>>
                                                       lexerModeTokens;
 
-    // Union of every `lexerModes.<name>.defaultToken.kind` declared in
-    // the schema (`StringChar`, `BracketIdChar`, `CommentChar`, …).
-    // These are the "off-grammar" tokens — emitted by the tokenizer as
-    // leaves but never referenced by any shape (loader-enforced). Both
-    // the parser dispatch loop and `TreeBuilder::pushToken` consult
-    // this set to skip schema-walker advance for body tokens. Computed
-    // once by the loader after `lexerModes` is populated.
+    // Off-grammar body-token kinds — see
+    // `GrammarSchema::bodyDefaultTokenKinds()` for the contract.
     std::unordered_set<SchemaTokenId>                 bodyDefaultTokenKinds;
 
     // Pool indexed by `LexemeMeaning::stringStyleId`. Slot 0 is the
@@ -286,13 +281,24 @@ public:
     [[nodiscard]] std::span<LexemeMeaning const>
         lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept;
 
-    // The union of every `lexerModes.<name>.defaultToken.kind` declared
-    // in the schema. These token kinds are "off-grammar" by construction
-    // (the loader rejects any shape that references them): the tokenizer
-    // emits them as leaves while a body mode is active, and both
-    // `TreeBuilder::pushToken` and the parser dispatch loop skip the
-    // schema-walker advance for them. Single source of truth for both
-    // consumers — built once at schema-build time.
+    // Off-grammar body-token kinds. Every
+    // `lexerModes.<name>.defaultToken.kind` declared in the schema
+    // (`StringChar`, `BracketIdChar`, `CommentChar`, …) is a body
+    // token: emitted by the tokenizer as a leaf while a body mode is
+    // active, never referenced by any shape (loader-enforced via
+    // `C_BodyDefaultKindInShape`). Both `TreeBuilder::pushToken` and
+    // the parser dispatch loop consult this to skip schema-walker
+    // advance for body tokens. Single source of truth, computed once
+    // at schema-build time.
+    //
+    // `isBodyDefaultKind` is the preferred predicate — it hides the
+    // container choice. `bodyDefaultTokenKinds` returns the set
+    // directly for the hot-path consumers (parser + builder) that
+    // already cache a pointer to it and would otherwise pay an
+    // accessor call per token.
+    [[nodiscard]] bool isBodyDefaultKind(SchemaTokenId id) const noexcept {
+        return d_.bodyDefaultTokenKinds.contains(id);
+    }
     [[nodiscard]] std::unordered_set<SchemaTokenId> const&
         bodyDefaultTokenKinds() const noexcept { return d_.bodyDefaultTokenKinds; }
 

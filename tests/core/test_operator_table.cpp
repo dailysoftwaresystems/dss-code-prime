@@ -596,6 +596,24 @@ namespace {
                               : loaded.error();
 }
 
+// Each loader error path emits a specific `DiagnosticCode`; the
+// message text is informative but free to evolve. Tests pin the
+// CODE primarily and the message substring secondarily (so a typo
+// or rewording doesn't false-positive a regression, while still
+// catching messages that lose meaning entirely).
+[[nodiscard]] bool hasDiag(std::vector<ConfigDiagnostic> const& diags,
+                           DiagnosticCode code,
+                           std::string_view messageNeedle) {
+    for (auto const& d : diags) {
+        if (d.code == code
+            && d.message.find(messageNeedle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[maybe_unused]]
 [[nodiscard]] bool hasMessage(std::vector<ConfigDiagnostic> const& diags,
                               std::string_view needle) {
     for (auto const& d : diags) {
@@ -629,7 +647,8 @@ TEST(OperatorTableEndsAtBodyRule, EndsAtOnNonPostfixIsRejected) {
           "shapes": { "root": { "sequence": [ "Identifier" ] } }
         })JSON";
     const auto diags = loadShouldFail(cfg);
-    EXPECT_TRUE(hasMessage(diags, "'endsAt' is only valid on a postfix group"))
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'endsAt' is only valid on a postfix group"))
         << "actual: " << (diags.empty() ? "<none>" : diags[0].message);
 }
 
@@ -645,7 +664,8 @@ TEST(OperatorTableEndsAtBodyRule, EndsAtMustBeAString) {
           "shapes": { "root": { "sequence": [ "Identifier" ] } }
         })JSON";
     const auto diags = loadShouldFail(cfg);
-    EXPECT_TRUE(hasMessage(diags, "'endsAt' must be a string"));
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'endsAt' must be a string"));
 }
 
 TEST(OperatorTableEndsAtBodyRule, EndsAtLexemeMustBeDeclared) {
@@ -660,7 +680,8 @@ TEST(OperatorTableEndsAtBodyRule, EndsAtLexemeMustBeDeclared) {
           "shapes": { "root": { "sequence": [ "Identifier" ] } }
         })JSON";
     const auto diags = loadShouldFail(cfg);
-    EXPECT_TRUE(hasMessage(diags, "is not declared in 'tokens'"));
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "is not declared in 'tokens'"));
 }
 
 TEST(OperatorTableEndsAtBodyRule, EndsAtLexemeMustHaveSingleMeaning) {
@@ -687,7 +708,8 @@ TEST(OperatorTableEndsAtBodyRule, EndsAtLexemeMustHaveSingleMeaning) {
       "shapes": { "root": { "sequence": [ "Identifier" ] } }
     })JSON";
     const auto diags = loadShouldFail(cfg);
-    EXPECT_TRUE(hasMessage(diags, "ambiguous closers are unsupported"));
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "ambiguous closers are unsupported"));
 }
 
 TEST(OperatorTableEndsAtBodyRule, BodyRuleOnNonPostfixIsRejected) {
@@ -701,7 +723,8 @@ TEST(OperatorTableEndsAtBodyRule, BodyRuleOnNonPostfixIsRejected) {
           "shapes": { "root": { "sequence": [ "Identifier" ] } }
         })JSON";
     const auto diags = loadShouldFail(cfg);
-    EXPECT_TRUE(hasMessage(diags, "'bodyRule' is only valid on a postfix group"));
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'bodyRule' is only valid on a postfix group"));
 }
 
 TEST(OperatorTableEndsAtBodyRule, BodyRuleWithoutEndsAtIsRejected) {
@@ -719,7 +742,8 @@ TEST(OperatorTableEndsAtBodyRule, BodyRuleWithoutEndsAtIsRejected) {
           }
         })JSON";
     const auto diags = loadShouldFail(cfg);
-    EXPECT_TRUE(hasMessage(diags, "'bodyRule' requires a paired 'endsAt'"));
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'bodyRule' requires a paired 'endsAt'"));
 }
 
 TEST(OperatorTableEndsAtBodyRule, BodyRuleMustBeAString) {
@@ -734,7 +758,8 @@ TEST(OperatorTableEndsAtBodyRule, BodyRuleMustBeAString) {
           "shapes": { "root": { "sequence": [ "Identifier" ] } }
         })JSON";
     const auto diags = loadShouldFail(cfg);
-    EXPECT_TRUE(hasMessage(diags, "'bodyRule' must be a string"));
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'bodyRule' must be a string"));
 }
 
 TEST(OperatorTableEndsAtBodyRule, BodyRuleReferencesUndefinedShape) {
@@ -750,7 +775,8 @@ TEST(OperatorTableEndsAtBodyRule, BodyRuleReferencesUndefinedShape) {
           "shapes": { "root": { "sequence": [ "Identifier" ] } }
         })JSON";
     const auto diags = loadShouldFail(cfg);
-    EXPECT_TRUE(hasMessage(diags, "no shape with that name is declared"));
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_UnknownShape,
+                        "no shape with that name is declared"));
 }
 
 // Walker-wrapper rules (`binaryExpr`/`unaryExpr`/`postfixExpr`) have

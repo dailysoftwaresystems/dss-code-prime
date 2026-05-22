@@ -1071,10 +1071,7 @@ void validateOperatorBodyRules(GrammarSchemaData& data, Collector& coll) {
 // correctly treats it like trivia — harmless as long as no shape
 // expects the kind, which the shape check below already enforces.
 void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll) {
-    std::unordered_set<SchemaTokenId> bodyKinds;
-    for (auto const& mode : data.lexerModes) {
-        if (mode.defaultToken) bodyKinds.insert(mode.defaultToken->kind);
-    }
+    auto const& bodyKinds = data.bodyDefaultTokenKinds;
     if (bodyKinds.empty()) return;
 
     // Shape references.
@@ -2119,6 +2116,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // Ambiguity detection runs last: it reads the position tables
             // to surface alt branches whose FIRST sets overlap.
             if (!coll.hasErrors()) {
+                // Compute the body-mode kind union BEFORE the
+                // validators run so they can consume the schema-
+                // owned set (single source of truth shared with
+                // `Parser::Impl` and `TreeBuilder`).
+                for (auto const& mode : data.lexerModes) {
+                    if (mode.defaultToken) {
+                        data.bodyDefaultTokenKinds.insert(
+                            mode.defaultToken->kind);
+                    }
+                }
                 computeFirstAndNullable    (data, doc.at("shapes"));
                 buildPositionTables        (data, doc.at("shapes"), coll);
                 detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
@@ -2149,15 +2156,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
-    // Body-mode `defaultToken.kind` union — read by `TreeBuilder` and
-    // the parser's dispatch loop to skip schema-walker advance for
-    // off-grammar body tokens. Computed once here; both consumers
-    // share the same set.
-    for (auto const& mode : data.lexerModes) {
-        if (mode.defaultToken) {
-            data.bodyDefaultTokenKinds.insert(mode.defaultToken->kind);
-        }
-    }
+    // (`bodyDefaultTokenKinds` was populated above before the
+    // validators ran — see the shapes block.)
 
     // Longest declared lexeme key — consumed by the tokenizer (TZ1+)
     // to cap its longest-match probe length. Iterate every per-mode

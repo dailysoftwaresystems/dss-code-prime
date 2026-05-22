@@ -86,6 +86,27 @@ namespace {
     return out;
 }
 
+// Parse the `DSS_REFRESH_GOLDENS` env var. The intent is "set to `1`
+// to refresh"; we explicitly REJECT other values (including `0` and
+// `false`) rather than treat them as truthy. Loose `getenv != nullptr`
+// semantics would let a stale or accidentally-exported `=0` silently
+// overwrite goldens and skip the byte-compare across every corpus
+// test — a CI footgun this guard exists to prevent.
+[[nodiscard]] bool goldenRefreshRequested() {
+    const char* raw = std::getenv("DSS_REFRESH_GOLDENS");
+    if (raw == nullptr) return false;
+    const std::string_view v{raw};
+    if (v == "1" || v == "true" || v == "TRUE" || v == "yes") return true;
+    if (v.empty() || v == "0" || v == "false" || v == "FALSE" || v == "no") {
+        return false;
+    }
+    ADD_FAILURE() << "DSS_REFRESH_GOLDENS has unexpected value '" << v
+                  << "' — use '1' to refresh, unset (or '0') otherwise. "
+                     "Refusing to interpret to avoid silently masking "
+                     "drift.";
+    std::abort();
+}
+
 // Golden-file comparison. Each corpus file gets a sibling `.tree`
 // capturing the expected `prettyPrintTree(tree)`. To regenerate after
 // an intentional grammar change, set the env var
@@ -95,15 +116,27 @@ namespace {
 // addition that forgot the companion file).
 void checkGoldenTree(Tree const& t, fs::path const& goldenPath) {
     const std::string actual = prettyPrintTree(t);
-    if (std::getenv("DSS_REFRESH_GOLDENS") != nullptr) {
+    if (goldenRefreshRequested()) {
         std::ofstream out{goldenPath, std::ios::binary};
-        if (!out) {
-            ADD_FAILURE() << "cannot write golden file "
+        if (!out.is_open()) {
+            ADD_FAILURE() << "cannot open golden file for write: "
                           << goldenPath.string();
             return;
         }
         out << actual;
-        std::cout << "Refreshed " << goldenPath.string() << "\n";
+        out.flush();
+        if (!out.good()) {
+            ADD_FAILURE() << "write to golden file failed (disk full / "
+                          << "quota?): " << goldenPath.string();
+            return;
+        }
+        // Refreshing always emits a loud test failure so a CI run that
+        // accidentally has the env var set can never be a passing
+        // build — refresh is a developer action, not a CI mode.
+        ADD_FAILURE() << "Refreshed " << goldenPath.string()
+                      << " — this is a developer-only operation; the "
+                         "test fails by design when refreshed so CI "
+                         "with DSS_REFRESH_GOLDENS=1 cannot mask drift.";
         return;
     }
     if (!fs::exists(goldenPath)) {
@@ -113,6 +146,12 @@ void checkGoldenTree(Tree const& t, fs::path const& goldenPath) {
         return;
     }
     std::ifstream in{goldenPath, std::ios::binary};
+    if (!in.is_open()) {
+        ADD_FAILURE() << "cannot open golden file for read "
+                         "(permission / sharing violation?): "
+                      << goldenPath.string();
+        return;
+    }
     std::ostringstream buf;
     buf << in.rdbuf();
     const std::string expected = std::move(buf).str();

@@ -516,19 +516,26 @@ TEST(PrattWalker, AltChoiceScanRoutesExprRuleThroughWalker) {
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
 
-    // `binaryExpr` present ⇒ walker was invoked. Absent ⇒ regression.
-    bool sawBinaryExpr = false;
-    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
-        const NodeId id{i};
-        if (t.kind(id) == NodeKind::Internal
-            && t.rules().name(t.rule(id)) == "binaryExpr") {
-            sawBinaryExpr = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(sawBinaryExpr)
-        << "AltChoice→RuleLeaf path must route expr-rules through walkExpression — "
-           "without it, operator climbing is skipped and `a + b` flattens";
+    // Full structural pin: `body` must contain `expression` as its
+    // sole rule child, and `expression` must contain `binaryExpr`
+    // (i.e. the walker climbed `+` rather than building `a + b` as a
+    // flat operand sequence). A pure "sawBinaryExpr" check could pass
+    // accidentally if the routing picked the wrong rule that happened
+    // to also produce a binaryExpr; pinning the body→expression edge
+    // closes that loophole.
+    constexpr std::string_view kExpected =
+        "rule:root\n"
+        "  rule:stmt\n"
+        "    rule:body\n"
+        "      rule:expression\n"
+        "        rule:binaryExpr\n"
+        "          rule:operand\n"
+        "            tok:\"a\"\n"
+        "          tok:\"+\"\n"
+        "          rule:operand\n"
+        "            tok:\"b\"\n"
+        "    tok:\";\"\n";
+    EXPECT_EQ(prettyPrint(t), kExpected);
 }
 
 // ── recursion-depth death ───────────────────────────────────────────────

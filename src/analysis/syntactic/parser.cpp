@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -83,6 +84,18 @@ enum class StepOutcome {
 // ── Impl ────────────────────────────────────────────────────────────────
 
 struct Parser::Impl {
+    // Non-copyable and non-movable: `bodyDefaultTokenKinds` below is a
+    // raw pointer into the schema's owned set. The pointer is bound at
+    // ctor time and is stable for the lifetime of this object — moving
+    // `Impl` would silently rebind to dangling memory. The current
+    // `Parser` holds `Impl` via `unique_ptr` and never moves it, but
+    // mirroring `TreeBuilder`'s explicit pin makes that invariant a
+    // compile-time contract instead of an unintentional one.
+    Impl(Impl const&)            = delete;
+    Impl(Impl&&)                 = delete;
+    Impl& operator=(Impl const&) = delete;
+    Impl& operator=(Impl&&)      = delete;
+
     std::shared_ptr<SourceBuffer>        src;
     std::shared_ptr<GrammarSchema const> schema;
     TokenStream                          tokens;
@@ -1029,6 +1042,15 @@ struct Parser::Impl {
     }
 };
 
+// Mirror the `TreeBuilder` pin so a future refactor that tries to
+// store `Impl` by value (rather than via `unique_ptr`) fails at compile
+// time instead of silently breaking the `bodyDefaultTokenKinds` raw
+// pointer's lifetime contract.
+static_assert(!std::is_move_constructible_v<Parser::Impl>,
+              "Parser::Impl must remain non-movable — its "
+              "bodyDefaultTokenKinds pointer is bound at ctor time and a "
+              "move would silently rebind to dangling state");
+
 Parser::Parser(std::shared_ptr<SourceBuffer>        src,
                std::shared_ptr<GrammarSchema const> schema,
                TokenStream                          tokens,
@@ -1233,7 +1255,7 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
         // Postfix wins ties with infix at the same precedence — it
         // binds the lhs alone (no further operand to gather), so
         // structurally it's the more local binding. Grouped postfix
-        // (`endsAt.valid()`) extends the simple `++` case with a
+        // (`grouped.has_value()`) extends the simple `++` case with a
         // body-rule frame parsed between opener and closer.
         if (postfixInClimb) {
             I.openExprFrame(rules.postfixExpr);
@@ -1254,6 +1276,16 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             }
             if (postfix->grouped) {
                 auto const& gp = *postfix->grouped;
+                // Type-level invariant pinned at the deref site: the
+                // loader (`grammar_schema_json.cpp`) only constructs
+                // `grouped` when `endsAtId.valid()`, but the struct
+                // shape doesn't enforce that on aggregate init. Catch
+                // any future producer that bypasses the loader.
+                if (!gp.endsAt.valid()) {
+                    fatal("dss::DefaultPrattWalker: grouped postfix "
+                          "entry has invalid endsAt — loader contract "
+                          "violated");
+                }
                 // Grouped postfix: drive the body until the closer.
                 // An expr-rule body (e.g. `[expression]` for indexing)
                 // must run through the Pratt walker so operator climb

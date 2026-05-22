@@ -112,11 +112,15 @@ bool GrammarSchema::isEmptySpace(SchemaTokenId id) const noexcept {
     return d_.emptySpaceTokens.contains(id.v);
 }
 
-NodeFlags GrammarSchema::flagsForKind(SchemaTokenId) const noexcept {
-    // No schema field populates per-kind flags today. The accessor is
-    // the structural channel the numeric-literal emit site reads so
-    // a future `literalFlags` schema field doesn't need a tokenizer
-    // change. See header comment.
+NodeFlags GrammarSchema::flagsForKind(SchemaTokenId id) const noexcept {
+    // No schema field populates per-kind flags today, so every kind
+    // returns None. The accessor is the structural channel the
+    // numeric-literal emit site reads — a future `literalFlags`
+    // schema field plugs in here without a tokenizer change. The
+    // valid-id check bakes the contract NOW, while there are zero
+    // data-bearing callers: future schemas wiring real data in must
+    // not silently accept an invalid id.
+    if (!id.valid()) return NodeFlags::None;
     return NodeFlags::None;
 }
 
