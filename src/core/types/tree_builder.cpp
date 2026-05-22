@@ -176,15 +176,10 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // default-constructed = invalid sentinel.
     nodes_.emplace_back();
 
-    // Snapshot body-mode defaultToken kinds + the error + identifier
-    // sentinels. All are needed on the per-token resolveMeaning hot
-    // path; the values are a function of the (immutable) schema, so
-    // the ctor is the right place to compute them once.
-    for (auto const& mode : schema_->lexerModes()) {
-        if (mode.defaultToken) {
-            bodyDefaultTokenKinds_.insert(mode.defaultToken->kind);
-        }
-    }
+    // Body-mode defaultToken kinds come from the schema (computed once
+    // at load time; shared with the parser). The error + identifier
+    // sentinels are cached for the per-token resolveMeaning hot path.
+    bodyDefaultTokenKinds_ = &schema_->bodyDefaultTokenKinds();
     errorKind_      = schema_->schemaTokens().find("Error");
     identifierKind_ = schema_->schemaTokens().find("Identifier");
 
@@ -660,7 +655,7 @@ void TreeBuilder::pushToken(Token const& tok) {
     //  3. No match at all → Error leaf + P_UnknownToken.
     ResolvedMeaning resolved = resolveMeaning(
         *schema_, lexeme, std::span<ScopeKind const>{scopes_},
-        bodyDefaultTokenKinds_, errorKind_, tok.schemaKind);
+        *bodyDefaultTokenKinds_, errorKind_, tok.schemaKind);
 
     if (resolved.matchCount == 0 && tok.coreKind == CoreTokenKind::Word) {
         // Fallback: alphanumeric word that isn't a keyword → Identifier.
@@ -807,7 +802,7 @@ void TreeBuilder::pushToken(Token const& tok) {
     // valid → invalid transition surfaces one P_SchemaCursorDesync.
     const bool isOffGrammar =
         isEmptySpace(effectiveFlags)
-        || bodyDefaultTokenKinds_.contains(resolved.meaning.id);
+        || bodyDefaultTokenKinds_->contains(resolved.meaning.id);
     if (!isOffGrammar) {
         walker_.advance(resolved.meaning.id, tok.span,
                         std::optional<RuleId>{open_.back().rule});

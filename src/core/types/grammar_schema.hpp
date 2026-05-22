@@ -185,6 +185,15 @@ struct DSS_EXPORT GrammarSchemaData {
                                           std::vector<LexemeMeaning>>>
                                                       lexerModeTokens;
 
+    // Union of every `lexerModes.<name>.defaultToken.kind` declared in
+    // the schema (`StringChar`, `BracketIdChar`, `CommentChar`, …).
+    // These are the "off-grammar" tokens — emitted by the tokenizer as
+    // leaves but never referenced by any shape (loader-enforced). Both
+    // the parser dispatch loop and `TreeBuilder::pushToken` consult
+    // this set to skip schema-walker advance for body tokens. Computed
+    // once by the loader after `lexerModes` is populated.
+    std::unordered_set<SchemaTokenId>                 bodyDefaultTokenKinds;
+
     // Pool indexed by `LexemeMeaning::stringStyleId`. Slot 0 is the
     // InvalidStringStyle sentinel; real ids 1..N. Each StringStyle
     // owns its `endsAt`/`tagPattern` strings; the vector may reallocate
@@ -276,6 +285,28 @@ public:
     // always means "no meanings for this lexeme," never "wrong id."
     [[nodiscard]] std::span<LexemeMeaning const>
         lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept;
+
+    // The union of every `lexerModes.<name>.defaultToken.kind` declared
+    // in the schema. These token kinds are "off-grammar" by construction
+    // (the loader rejects any shape that references them): the tokenizer
+    // emits them as leaves while a body mode is active, and both
+    // `TreeBuilder::pushToken` and the parser dispatch loop skip the
+    // schema-walker advance for them. Single source of truth for both
+    // consumers — built once at schema-build time.
+    [[nodiscard]] std::unordered_set<SchemaTokenId> const&
+        bodyDefaultTokenKinds() const noexcept { return d_.bodyDefaultTokenKinds; }
+
+    // Per-`SchemaTokenId` flags channel used by tokenizer emit sites
+    // that don't pass through the lexeme-meaning lookup (e.g. numeric
+    // literals, where the tokenizer hand-codes the scan and the kind
+    // is the built-in `IntLiteral`/`FloatLiteral` rather than a
+    // schema-declared lexeme). Today every kind returns
+    // `NodeFlags::None`; this is the structural channel a future
+    // schema field (e.g. `literalFlags: { IntLiteral: [...] }`) would
+    // populate. The accessor exists so the numeric emit site uses the
+    // same `flagsApplied`-aware shape as the other emit sites and
+    // doesn't drift if a use case lands.
+    [[nodiscard]] NodeFlags flagsForKind(SchemaTokenId id) const noexcept;
 
     // Per-instance schema id stamped onto every owned `LexemeMeaning`.
     // Used by accessors like `stringStyle(m)` to assert that `m`

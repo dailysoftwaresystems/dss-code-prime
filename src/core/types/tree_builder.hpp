@@ -320,13 +320,11 @@ private:
     // walker, gets the same latched behavior).
     SchemaWalker                           walker_;
 
-    // Body-mode `defaultToken.kind` SchemaTokenIds collected from
-    // `schema_->lexerModes()` at construction time. Tokens with one of
-    // these kinds are off-grammar — advancing the schema cursor with
-    // them always desyncs — and they are the only kinds (alongside
-    // built-in literals) the tokenizer is allowed to pre-resolve into
-    // a synthesized LexemeMeaning. Frozen after ctor; the schema is
-    // immutable.
+    // Body-mode `defaultToken.kind` set — consulted on the per-token
+    // resolveMeaning path to skip the schema cursor advance for
+    // off-grammar body tokens. Sourced from `schema_->bodyDefaultTokenKinds()`
+    // (single source of truth shared with the parser); we hold a pointer
+    // so the per-token hot path doesn't re-fetch the reference.
     //
     // Flat union across all modes (no per-mode awareness): if mode A's
     // default is `Foo` and mode B's default is also `Foo`, both skip
@@ -334,10 +332,8 @@ private:
     // outside its body the cursor-skip still fires. Defense-in-depth
     // for the latter lives at the loader (`C_BodyDefaultKindInShape`)
     // which rejects shapes / scope-forbid entries naming a body-default
-    // kind. Threading the mode-of-origin through `Token` to enable
-    // mode-conditioned skipping would be a tokenizer surface change;
-    // deferred unless a real schema misuse surfaces.
-    std::unordered_set<SchemaTokenId>      bodyDefaultTokenKinds_;
+    // kind.
+    std::unordered_set<SchemaTokenId> const* bodyDefaultTokenKinds_ = nullptr;
 
     // Schema's "Error" + "Identifier" SchemaTokenIds, cached at ctor so
     // the per-token resolveMeaning + contextual-keyword paths don't

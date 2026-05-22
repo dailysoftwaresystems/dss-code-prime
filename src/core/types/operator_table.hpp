@@ -72,18 +72,25 @@ namespace detail {
 // (it has no JSON pointer to attach), so this header trusts the caller.
 class DSS_EXPORT OperatorTable {
 public:
+    // Grouped-postfix payload: the operator consumes a delimiter and
+    // (optionally) a body rule between opener and closer. Present only
+    // on postfix entries declared with `endsAt` in the schema. The
+    // wrapping `std::optional<GroupedPostfix>` makes "grouped without
+    // delimiter" unrepresentable — previously the two flag-fields
+    // admitted that invalid state and the walker had to re-check.
+    struct GroupedPostfix {
+        SchemaTokenId endsAt;        // always valid when this payload is present
+        RuleId        bodyRule{};    // optional within the variant — invalid ⇒ no body
+    };
+
     struct Entry {
-        std::int32_t  precedence    = 0;
-        OperatorAssoc associativity = OperatorAssoc::None;
-        // Grouped-postfix delimiter (e.g. `(` ends at `)`, `[` ends
-        // at `]`). When `endsAt` is valid, the Pratt walker treats
-        // the postfix operator as a delimited group: after the
-        // opener it parses `bodyRule` (or, when `bodyRule` is
-        // InvalidRule, a single `expression` via the active expr
-        // shape) until the closer. When `endsAt` is invalid, the
-        // postfix is single-token (`++`, `--`).
-        SchemaTokenId endsAt{};
-        RuleId        bodyRule{};
+        std::int32_t                   precedence    = 0;
+        OperatorAssoc                  associativity = OperatorAssoc::None;
+        // Absent ⇒ simple operator (infix, prefix, or single-token
+        // postfix like `++`). Present ⇒ grouped postfix like
+        // `f(args)` or `a[i]`; the walker parses `bodyRule` (when
+        // valid) until the `endsAt` closer.
+        std::optional<GroupedPostfix>  grouped{};
     };
 
     OperatorTable()                                = default;

@@ -675,8 +675,11 @@ TokenizeResult Tokenizer::tokenize() && {
         // still get a token emitted but also produce P_MalformedNumber.
         if (isDigit(c)) {
             const auto scan = scanNumber(r);
-            emit(scan.isFloat ? CoreTokenKind::FloatLiteral : CoreTokenKind::IntLiteral,
-                 scan.isFloat ? floatLitKind : intLitKind);
+            const auto litKind = scan.isFloat ? floatLitKind : intLitKind;
+            emit(scan.isFloat ? CoreTokenKind::FloatLiteral
+                              : CoreTokenKind::IntLiteral,
+                 litKind,
+                 schema_->flagsForKind(litKind));
             if (scan.malformed) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::P_MalformedNumber;

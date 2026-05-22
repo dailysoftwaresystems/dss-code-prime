@@ -1043,7 +1043,10 @@ void validateOperatorBodyRules(GrammarSchemaData& data, Collector& coll) {
         for (std::uint32_t t = 1; t < data.schemaTokens->size() && !referenced; ++t) {
             const SchemaTokenId tid{t};
             const auto entry = data.operators.lookup(tid, OperatorArity::Postfix);
-            if (entry && entry->bodyRule.v == rule.v) referenced = true;
+            if (entry && entry->grouped
+                && entry->grouped->bodyRule.v == rule.v) {
+                referenced = true;
+            }
         }
         if (referenced) {
             coll.emit(DiagnosticCode::C_UnknownShape,
@@ -1846,7 +1849,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     const auto rname = g.at("bodyRule").get<std::string>();
                     bodyRuleId = data.rules->intern(rname);
                 }
-                const OperatorTable::Entry entry{precedence, assoc, endsAtId, bodyRuleId};
+                OperatorTable::Entry entry{precedence, assoc, std::nullopt};
+                if (endsAtId.valid()) {
+                    entry.grouped = OperatorTable::GroupedPostfix{
+                        endsAtId, bodyRuleId};
+                }
 
                 for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
                     json const& op = g.at("operators")[j];
@@ -2139,6 +2146,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         for (auto& [lex, meanings] : table) {
             (void)lex;
             for (auto& m : meanings) m.schemaId = data.id;
+        }
+    }
+
+    // Body-mode `defaultToken.kind` union — read by `TreeBuilder` and
+    // the parser's dispatch loop to skip schema-walker advance for
+    // off-grammar body tokens. Computed once here; both consumers
+    // share the same set.
+    for (auto const& mode : data.lexerModes) {
+        if (mode.defaultToken) {
+            data.bodyDefaultTokenKinds.insert(mode.defaultToken->kind);
         }
     }
 

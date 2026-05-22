@@ -154,8 +154,25 @@ TEST(ParserCSubsetSmoke, FunctionCallParsesAsPostfix) {
 
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
-    EXPECT_TRUE(hasInternalNodeWithRule(t, "postfixExpr"));
-    EXPECT_TRUE(hasInternalNodeWithRule(t, "argList"));
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:postfixExpr\n"
+        "    rule:operand\n"
+        "      tok:\"f\"\n"
+        "    tok:\"(\"\n"
+        "    rule:argList\n"
+        "      rule:expression\n"
+        "        rule:operand\n"
+        "          tok:\"a\"\n"
+        "      tok:\",\"\n"
+        "      rule:expression\n"
+        "        rule:operand\n"
+        "          tok:\"b\"\n"
+        "    tok:\")\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
 }
 
 TEST(ParserCSubsetSmoke, EmptyArgumentCallParsesAsPostfix) {
@@ -167,7 +184,18 @@ TEST(ParserCSubsetSmoke, EmptyArgumentCallParsesAsPostfix) {
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors())
         << "zero-arg calls must parse cleanly (argList nullable)";
-    EXPECT_TRUE(hasInternalNodeWithRule(t, "postfixExpr"));
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:postfixExpr\n"
+        "    rule:operand\n"
+        "      tok:\"f\"\n"
+        "    tok:\"(\"\n"
+        "    rule:argList\n"
+        "    tok:\")\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
 }
 
 TEST(ParserCSubsetSmoke, ArrayIndexParsesAsPostfix) {
@@ -178,7 +206,20 @@ TEST(ParserCSubsetSmoke, ArrayIndexParsesAsPostfix) {
 
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
-    EXPECT_TRUE(hasInternalNodeWithRule(t, "postfixExpr"));
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:postfixExpr\n"
+        "    rule:operand\n"
+        "      tok:\"a\"\n"
+        "    tok:\"[\"\n"
+        "    rule:expression\n"
+        "      rule:operand\n"
+        "        tok:\"0\"\n"
+        "    tok:\"]\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
 }
 
 // The `[`-postfix declares `bodyRule: "expression"`. `expression` is
@@ -194,9 +235,32 @@ TEST(ParserCSubsetSmoke, ArrayIndexBodyClimbsPrecedence) {
 
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
-    EXPECT_TRUE(hasInternalNodeWithRule(t, "binaryExpr"))
-        << "the index expression must engage operator climbing for `j*k` "
-           "to bind tighter than `+`";
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    // The right-recursive `binaryExpr[i, +, binaryExpr[j, *, k]]`
+    // shape is the visible signal that operator climb ran inside the
+    // brackets — `*` (prec 70) binds tighter than `+` (prec 65), so
+    // `j * k` nests under the `+` RHS.
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:postfixExpr\n"
+        "    rule:operand\n"
+        "      tok:\"a\"\n"
+        "    tok:\"[\"\n"
+        "    rule:expression\n"
+        "      rule:binaryExpr\n"
+        "        rule:operand\n"
+        "          tok:\"i\"\n"
+        "        tok:\"+\"\n"
+        "        rule:binaryExpr\n"
+        "          rule:operand\n"
+        "            tok:\"j\"\n"
+        "          tok:\"*\"\n"
+        "          rule:operand\n"
+        "            tok:\"k\"\n"
+        "    tok:\"]\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
 }
 
 // `f(a;` — opener consumed, body parses, closer missing. Walker emits
@@ -226,7 +290,16 @@ TEST(ParserCSubsetSmoke, PostfixIncParsesAsPostfix) {
 
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
-    EXPECT_TRUE(hasInternalNodeWithRule(t, "postfixExpr"));
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:postfixExpr\n"
+        "    rule:operand\n"
+        "      tok:\"i\"\n"
+        "    tok:\"++\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
 }
 
 // Prefix `*` — dereference. Walker disambiguates from infix `*` by
@@ -239,7 +312,49 @@ TEST(ParserCSubsetSmoke, PrefixDerefParsesAsUnary) {
 
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors());
-    EXPECT_TRUE(hasInternalNodeWithRule(t, "unaryExpr"));
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    constexpr std::string_view kExpected =
+        "rule:expression\n"
+        "  rule:unaryExpr\n"
+        "    tok:\"*\"\n"
+        "    rule:operand\n"
+        "      tok:\"p\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), kExpected);
+}
+
+// Postfix chains are left-recursive: `f(a)[i]` should bind as
+// `(f(a))[i]` — the `[i]` postfix wraps the result of `f(a)`. The
+// PA2 walker's rollback-replay strategy assumes right-recursive
+// structure: on the 2nd iteration of the climb loop it rolls back to
+// the state BEFORE the primary atom was built, then re-parses the
+// LHS at `precedence + 1` to exclude same-prec ops. For postfix
+// chains, that exclusion drops the first postfix (e.g. `(` at 100
+// is excluded at minPrec 101), so the inner re-parse stops at the
+// first opener instead of consuming the full first wrap. The outer
+// loop then pushes the wrong token as the 2nd wrap's operator.
+//
+// Fix requires reworking the walker so postfix chains preserve the
+// prior wrap as the new primary, rather than re-parsing from
+// scratch. Tracked as PA4-F3 in `.plans/05-parser-plan` §2.3.1 —
+// keep this disabled test as a tombstone so the fix re-enables it
+// rather than re-rediscovering the bug.
+TEST(ParserCSubsetSmoke, DISABLED_PostfixChainNestsLeftToRight) {
+    auto h = loadAndTokenize("int main() { f(a)[i]; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    std::size_t postfixCount = 0;
+    walkPreOrder(t, [&](TreeCursor const& c) {
+        if (t.kind(c.current()) == NodeKind::Internal
+            && t.rules().name(t.rule(c.current())) == "postfixExpr") {
+            ++postfixCount;
+        }
+    });
+    EXPECT_EQ(postfixCount, 2u)
+        << "chained postfix must produce two nested postfixExpr frames";
 }
 
 // Parenthesized sub-expressions delegate through `operand`'s `( expression )`

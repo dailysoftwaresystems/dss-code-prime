@@ -281,6 +281,61 @@ TEST(ParserRecovery, PanicModeTerminatesAtEofWithNoSyncToken) {
     EXPECT_NE(t.root(), InvalidNode);
 }
 
+// ── off-grammar body-token drain × recovery ────────────────────────────
+//
+// String / bracket-id / comment bodies emit one off-grammar leaf per
+// codepoint. The parser's per-iteration drain skips them when dispatch
+// proceeds normally, and `panicRecover`'s sync-scan loop silently
+// consumes them as "not-in-sync, not-in-follow" bytes. Either way,
+// body codepoints inside a broken region must NOT generate a
+// per-codepoint diagnostic storm.
+//
+// Broken tsql `SELECT 'oops' x FROM t;` — `SELECT 'oops'` matches the
+// selectItem path (operand → stringLit body), then `x` is an extra
+// unexpected token before `FROM`. Recovery scans to the next sync
+// (`;`). The trip through the string body before the structural
+// error AND any body chars in the sync-scan range must not multiply
+// diagnostics.
+TEST(ParserRecovery, BodyCodepointsDoNotMultiplyDiagnostics) {
+    // Build a broken statement whose recovery span crosses a string
+    // body. `'abcdefg'` is 9 codepoints (7 body + opener + closer);
+    // if any of them produced its own diagnostic the count would
+    // explode.
+    auto h = loadShipped("tsql-subset",
+        "SELECT @bad 'abcdefg' garbage FROM t;");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+    // Cap: structural recovery should produce far fewer than the
+    // ~10 body codepoints. A real regression that lets body chars
+    // through dispatch produces one P_UnexpectedToken per char.
+    const std::size_t totalDiags = t.diagnostics().all().size();
+    EXPECT_LE(totalDiags, 6u)
+        << "body codepoints must not produce per-char diagnostics; "
+           "got " << totalDiags << " diagnostics";
+    EXPECT_NE(t.root(), InvalidNode);
+}
+
+// Clean-parse counterpart: a SELECT whose string literal sits in a
+// well-formed position. Body codepoints are absorbed silently by the
+// drain — zero diagnostics, tree still walks. This pins the
+// "happy-path drain" half of the body-token machinery while the
+// recovery test above pins the broken-path half.
+TEST(ParserRecovery, BodyCodepointsAbsorbedCleanlyOnHappyPath) {
+    auto h = loadShipped("tsql-subset",
+        "SELECT * FROM t WHERE name = 'a long string value';");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "string body codepoints must be absorbed silently by the "
+           "parser's body-token drain";
+    EXPECT_NE(t.root(), InvalidNode);
+}
+
 // ── ctor preconditions ─────────────────────────────────────────────────
 
 TEST(ParserRecoveryDeath, ZeroSyncScanCapAborts) {

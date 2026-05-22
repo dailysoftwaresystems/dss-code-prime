@@ -98,8 +98,10 @@ struct Parser::Impl {
     // (StringChar, BracketIdChar, CommentChar bodies) but the schema by
     // construction never references them in any shape; they're absorbed
     // into the current frame as leaves without advancing the parser's
-    // schema walker. Mirrors `TreeBuilder::bodyDefaultTokenKinds_`.
-    std::unordered_set<SchemaTokenId> bodyDefaultTokenKinds;
+    // schema walker. Sourced from `schema->bodyDefaultTokenKinds()`
+    // (computed once by the loader; shared with `TreeBuilder`); held as
+    // a pointer so the per-iteration drain loop doesn't re-fetch.
+    std::unordered_set<SchemaTokenId> const* bodyDefaultTokenKinds = nullptr;
 
     // Builder lives in Impl (heap) since `TreeBuilder` is non-movable
     // (static_assert) and Impl is constructed in-place.
@@ -188,14 +190,9 @@ struct Parser::Impl {
           }
         , identifierKind(schema->schemaTokens().find("Identifier"))
         , errorKind(schema->schemaTokens().find("Error"))
+        , bodyDefaultTokenKinds(&schema->bodyDefaultTokenKinds())
         , walker(schema)
-        , prattWalker(std::move(cfg.prattWalker)) {
-        for (auto const& mode : schema->lexerModes()) {
-            if (mode.defaultToken) {
-                bodyDefaultTokenKinds.insert(mode.defaultToken->kind);
-            }
-        }
-    }
+        , prattWalker(std::move(cfg.prattWalker)) {}
 
     // Default Pratt walker has friend access to drive the parser's
     // token stream, builder, schema walker, and frame stack
@@ -791,7 +788,7 @@ struct Parser::Impl {
             if (bodyPeek.coreKind == CoreTokenKind::Eof) break;
             const SchemaTokenId k =
                 effectiveKind(bodyPeek, identifierKind, errorKind);
-            if (!bodyDefaultTokenKinds.contains(k)) break;
+            if (!bodyDefaultTokenKinds->contains(k)) break;
             const std::size_t before = tokens.position();
             builder->pushToken(tokens.advance());
             if (tokens.position() == before) {
@@ -1255,7 +1252,8 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                 I.commitWalkerSnap(snap);
                 return;
             }
-            if (postfix->endsAt.valid()) {
+            if (postfix->grouped) {
+                auto const& gp = *postfix->grouped;
                 // Grouped postfix: drive the body until the closer.
                 // An expr-rule body (e.g. `[expression]` for indexing)
                 // must run through the Pratt walker so operator climb
@@ -1263,14 +1261,14 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                 // directly would skip precedence and produce a flat
                 // tree. Same routing rule as `stepOnce`'s AltChoice→
                 // RuleLeaf path for expr-rules.
-                if (postfix->bodyRule.valid()) {
-                    if (I.schema->isExprRule(postfix->bodyRule)) {
+                if (gp.bodyRule.valid()) {
+                    if (I.schema->isExprRule(gp.bodyRule)) {
                         I.prattWalker->walkExpression(
-                            *I.outer, postfix->bodyRule,
-                            I.schema->exprMinPrecedence(postfix->bodyRule));
+                            *I.outer, gp.bodyRule,
+                            I.schema->exprMinPrecedence(gp.bodyRule));
                     } else {
                         const std::size_t bodyDepth = I.frames.size();
-                        I.openExprFrame(postfix->bodyRule);
+                        I.openExprFrame(gp.bodyRule);
                         I.parseUntilFrameDepth(bodyDepth);
                     }
                 }
@@ -1278,7 +1276,7 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                 Token const& closerPeek = I.tokens.peek();
                 const SchemaTokenId closerKind = effectiveKind(
                     closerPeek, I.identifierKind, I.errorKind);
-                if (closerKind.v != postfix->endsAt.v) {
+                if (closerKind.v != gp.endsAt.v) {
                     // Closer missing. Emit the diagnostic AND drop an
                     // Error leaf at the missing-closer position so the
                     // HasError flag propagates up through the
@@ -1291,7 +1289,7 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                         DiagnosticCode::P_MissingRequiredChild,
                         closerPeek.span,
                         I.renderActual(closerPeek),
-                        std::span<SchemaTokenId const>{&postfix->endsAt, 1});
+                        std::span<SchemaTokenId const>{&gp.endsAt, 1});
                     I.builder->pushErrorNode(closerPeek.span);
                 } else {
                     (void)I.pushOperatorToken();

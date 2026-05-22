@@ -112,6 +112,14 @@ bool GrammarSchema::isEmptySpace(SchemaTokenId id) const noexcept {
     return d_.emptySpaceTokens.contains(id.v);
 }
 
+NodeFlags GrammarSchema::flagsForKind(SchemaTokenId) const noexcept {
+    // No schema field populates per-kind flags today. The accessor is
+    // the structural channel the numeric-literal emit site reads so
+    // a future `literalFlags` schema field doesn't need a tokenizer
+    // change. See header comment.
+    return NodeFlags::None;
+}
+
 std::span<LexerMode const> GrammarSchema::lexerModes() const noexcept {
     // Slot 0 is the InvalidLexerMode sentinel — internal indexing
     // detail. Real modes start at index 1; subspan(1) hides the

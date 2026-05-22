@@ -468,6 +468,69 @@ TEST(PrattWalker, MinPrecedenceFloorLeavesLowerOpsUnconsumed) {
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
+// ── AltChoice → RuleLeaf expr-rule routing ──────────────────────────────
+//
+// PA4 fixed a regression where the parser's AltChoice scan path
+// (which picks one branch from an `alt` shape) would call
+// `openExprFrame(expression)` directly instead of routing through
+// `prattWalker->walkExpression`. The direct call skipped operator
+// climbing — `return f(x);` parsed as a flat operand sequence with
+// the `(` and `x)` as siblings of `f` instead of `f(x)` as a
+// postfixExpr. This test isolates the AltChoice→RuleLeaf scan path
+// (rather than going through `returnStmt` which carries surrounding
+// machinery) so a regression reverting the `isExprRule` check at
+// `parser.cpp:992` surfaces with a single failing pin.
+TEST(PrattWalker, AltChoiceScanRoutesExprRuleThroughWalker) {
+    // Tiny synthetic grammar with an `alt` whose ONLY branch is
+    // RuleLeaf(expression). The dispatch's AltChoice path scans
+    // that branch's FIRST set, finds Identifier matches, and routes
+    // to RuleLeaf(expression). If the routing dispatches through
+    // `prattWalker->walkExpression`, `a + b` produces a `binaryExpr`.
+    // If it falls back to `openExprFrame(expression)` directly, the
+    // expression rule's `expr:` content is opened without operator
+    // climbing — `binaryExpr` is absent and the tree has the
+    // operator + operand as flat siblings.
+    constexpr std::string_view kAltSchema = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "PrattAlt", "version": "0.1.0" },
+      "tokens": {
+        " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "+":  [{ "kind": "PlusOp"  }],
+        ";":  [{ "kind": "Semi" }]
+      },
+      "operators": {
+        "groups": [
+          { "precedence": 65, "associativity": "left", "operators": ["+"] }
+        ]
+      },
+      "shapes": {
+        "root":       { "sequence": [{ "repeat": "stmt" }] },
+        "stmt":       { "sequence": ["body", "Semi"] },
+        "body":       { "alt": ["expression"] },
+        "expression": { "expr": { "atom": "operand" } },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+
+    Tree t = parse(kAltSchema, "a + b;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    // `binaryExpr` present ⇒ walker was invoked. Absent ⇒ regression.
+    bool sawBinaryExpr = false;
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Internal
+            && t.rules().name(t.rule(id)) == "binaryExpr") {
+            sawBinaryExpr = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawBinaryExpr)
+        << "AltChoice→RuleLeaf path must route expr-rules through walkExpression — "
+           "without it, operator climbing is skipped and `a + b` flattens";
+}
+
 // ── recursion-depth death ───────────────────────────────────────────────
 
 // Adversarial right-associative input — chain of `=` ops longer than
