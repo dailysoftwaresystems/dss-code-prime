@@ -1,8 +1,7 @@
 // Pins for `JsonRpc` parse/serialize and the streaming framing
-// helper `tryParseFramedMessage`. The JSON-RPC layer is one of the
-// "files warranting most careful attention" per the architecture
-// review — split-chunk reads, Content-Length variants, and id
-// type-handling are the regression risk.
+// helper `tryParseFramedMessage`. Regression risk lives in
+// split-chunk reads, Content-Length variants, and LspId type
+// handling.
 
 #include "lsp/json_rpc.hpp"
 #include "lsp/protocol.hpp"

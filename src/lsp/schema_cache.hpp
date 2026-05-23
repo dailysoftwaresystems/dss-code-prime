@@ -41,6 +41,10 @@ struct DSS_EXPORT SchemaResolveError {
     std::string            detail;
 };
 
+// Alias: every public resolver returns this shape.
+using SchemaResult = std::expected<std::shared_ptr<dss::GrammarSchema const>,
+                                    SchemaResolveError>;
+
 class DSS_EXPORT SchemaCache {
 public:
     // `schemaDir` empty ⇒ shipped-only mode.
@@ -51,36 +55,24 @@ public:
     SchemaCache(SchemaCache&&)                 = delete;
     SchemaCache& operator=(SchemaCache&&)      = delete;
 
-    // Resolve by language name (e.g. "c-subset"). Returns the cached
-    // schema on hit, loads + caches on miss.
-    [[nodiscard]] std::expected<std::shared_ptr<dss::GrammarSchema const>,
-                                 SchemaResolveError>
-        resolveByName(std::string_view languageName);
+    [[nodiscard]] SchemaResult resolveByName(std::string_view languageName);
 
-    // Resolve by file extension (e.g. ".c"). Iterates each known
-    // language's `fileExtensions()` and returns the first match.
-    // Triggers `resolveByName` on miss when running in shipped mode
-    // to discover languages lazily. Case-insensitive comparison on
-    // Windows; case-sensitive elsewhere (matches the filesystem).
-    [[nodiscard]] std::expected<std::shared_ptr<dss::GrammarSchema const>,
-                                 SchemaResolveError>
-        resolveByExtension(std::string_view fileExtension);
+    // Iterates known languages' `fileExtensions()` and returns the
+    // first case-insensitive match. In shipped mode, probes each
+    // shipped candidate on cache miss.
+    [[nodiscard]] SchemaResult resolveByExtension(std::string_view fileExtension);
 
     [[nodiscard]] bool hasSchemaDir() const noexcept {
         return schemaDir_.has_value();
     }
 
 private:
-    // Helper called under the lock: tries the cache first, returns
-    // null shared_ptr on miss.
     [[nodiscard]] std::shared_ptr<dss::GrammarSchema const>
         lookupCachedLocked(std::string_view name) const;
 
-    // Loads a schema (NOT under the lock). Returns the loaded
-    // schema or an unexpected with diagnostic detail.
-    [[nodiscard]] std::expected<std::shared_ptr<dss::GrammarSchema const>,
-                                 SchemaResolveError>
-        loadFresh(std::string_view name);
+    // Loads a schema OUTSIDE the cache lock (file I/O too slow to
+    // serialize). Returns unexpected with diagnostic detail on miss.
+    [[nodiscard]] SchemaResult loadFresh(std::string_view name);
 
     std::optional<std::filesystem::path>                                schemaDir_;
     mutable std::mutex                                                  mutex_;

@@ -6,9 +6,9 @@ namespace dss::lsp {
 
 namespace {
 
-// Wire-protocol method name → enum. Linear scan over a constexpr
-// table: 8 entries, branch-predictable, zero allocations. Kept in
-// sync with `methodName()` below — adding a method requires both.
+// Wire-protocol method name → enum. Linear scan over a small
+// constexpr table — branch-predictable, zero allocations. Kept in
+// sync with `methodName()` below: adding a method requires both.
 struct MethodEntry {
     std::string_view name;
     Method           id;

@@ -1,12 +1,8 @@
 // Replay harness: each `*.in.jsonl` under sessions/ is driven
-// against a fresh LspServer. Server outputs are normalized
-// (one JSON object per line, sorted keys removed via nlohmann's
-// stable dump, request-specific noise like timestamps stripped)
-// and compared to the matching `*.out.jsonl` golden file.
-//
-// Goldens are written on first run if missing, OR refreshed when
-// the env-var `DSS_REFRESH_GOLDENS=1` is set. Matches the PA4
-// corpus harness's pattern — see tests/corpus/...
+// against a fresh LspServer; server outputs are normalized
+// (nlohmann round-trip preserves insertion order) and compared to
+// the matching `*.out.jsonl` golden. `DSS_REFRESH_GOLDENS=1`
+// writes goldens; otherwise a missing golden fails loudly.
 
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"

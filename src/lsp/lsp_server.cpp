@@ -23,7 +23,6 @@ using json = nlohmann::json;
 // Extract a file extension (with leading dot, lowercased) from a
 // `file://` URI. Returns empty string if the URI has no extension.
 [[nodiscard]] std::string extensionFromUri(std::string_view uri) {
-    // Best-effort: look for the last '.' after the last '/'.
     auto lastSlash = uri.find_last_of('/');
     auto search = (lastSlash == std::string_view::npos)
         ? uri : uri.substr(lastSlash + 1);
@@ -102,6 +101,15 @@ struct DidChangeParams {
     return {};
 }
 
+// Common prelude for notification handlers: bail on empty or
+// malformed params. Returns std::nullopt to signal "drop the
+// notification silently"; caller returns to the dispatch loop.
+[[nodiscard]] std::optional<json> tryParseParams(Notification const& n) {
+    if (n.params.empty()) return std::nullopt;
+    try { return json::parse(n.params); }
+    catch (...) { return std::nullopt; }
+}
+
 } // namespace
 
 LspServer::LspServer(std::unique_ptr<LspTransport> transport,
@@ -116,8 +124,11 @@ LspServer::LspServer(std::unique_ptr<LspTransport> transport,
 }
 
 LspServer::~LspServer() noexcept {
-    if (transport_) transport_->close();
+    // Drain workers before closing transport so any in-flight
+    // writeMessage completes against the open stream (matches
+    // handleExit_'s ordering).
     if (executor_)  executor_->shutdown();
+    if (transport_) transport_->close();
 }
 
 void LspServer::registerHandlers_() {
@@ -185,9 +196,10 @@ int LspServer::run() {
             (void)transport_->writeMessage(*response);
         }
     }
-    // Clean exit: drain workers before returning.
-    executor_->shutdown();
-    return 0;
+    // LSP §3.6: `exit` without prior `shutdown` is an error (exit 1);
+    // with prior `shutdown` it's a clean teardown (exit 0). The
+    // executor was already drained by handleExit_; no second call.
+    return shutdownReceived_.load(std::memory_order_acquire) ? 0 : 1;
 }
 
 std::optional<std::string> LspServer::handleInitialize_(Request const& /*req*/) {
@@ -197,6 +209,10 @@ std::optional<std::string> LspServer::handleInitialize_(Request const& /*req*/) 
     caps["positionEncoding"] = "utf-16";
     caps["diagnosticProvider"]["interFileDependencies"] = false;
     caps["diagnosticProvider"]["workspaceDiagnostics"]  = false;
+    // hover/definition/references/rename accept `bool | <T>Options`
+    // per LSP §10. completion + signatureHelp REQUIRE the options
+    // object form (§10.18, §10.20) — `true` would be invalid. The
+    // shape asymmetry is the spec's, not ours.
     caps["hoverProvider"]          = true;
     caps["completionProvider"]     = json::object();
     caps["definitionProvider"]     = true;
@@ -227,11 +243,9 @@ void LspServer::handleExit_(Notification const& /*n*/) {
 }
 
 void LspServer::handleDidOpen_(Notification const& n) {
-    if (n.params.empty()) return;
-    json params;
-    try { params = json::parse(n.params); }
-    catch (...) { return; }
-    const auto item = parseTextDocumentItem(params);
+    auto params = tryParseParams(n);
+    if (!params) return;
+    const auto item = parseTextDocumentItem(*params);
     if (item.uri.empty()) return;
 
     // Resolve schema by file extension.
@@ -246,22 +260,18 @@ void LspServer::handleDidOpen_(Notification const& n) {
 }
 
 void LspServer::handleDidChange_(Notification const& n) {
-    if (n.params.empty()) return;
-    json params;
-    try { params = json::parse(n.params); }
-    catch (...) { return; }
-    const auto change = parseDidChange(params);
+    auto params = tryParseParams(n);
+    if (!params) return;
+    const auto change = parseDidChange(*params);
     if (change.uri.empty() || !change.hasFullContent) return;
     (void)documents_.update(change.uri, change.version, change.text);
     enqueueParse_(change.uri);
 }
 
 void LspServer::handleDidClose_(Notification const& n) {
-    if (n.params.empty()) return;
-    json params;
-    try { params = json::parse(n.params); }
-    catch (...) { return; }
-    const auto uri = parseUriOnly(params);
+    auto params = tryParseParams(n);
+    if (!params) return;
+    const auto uri = parseUriOnly(*params);
     if (uri.empty()) return;
     documents_.close(uri);
 

@@ -1,13 +1,19 @@
 #pragma once
 
 #include "lsp/json_rpc.hpp"
+#include "lsp/lsp_server.hpp"
+#include "lsp/schema_cache.hpp"
+#include "lsp/thread_pool.hpp"
 #include "lsp/transport.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -80,5 +86,74 @@ private:
     std::vector<std::string>    serverMessages_;
     std::atomic<bool>           closed_{false};
 };
+
+// LspTestHarness: spin up an LspServer on a background thread
+// against a fresh InMemoryTransport + SchemaCache +
+// SynchronousExecutor. The harness lets tests focus on
+// "messages → assertions" without repeating ~5 lines of setup.
+//
+// Lifetime: the future is kicked off in the ctor; the test pushes
+// client messages, then calls `runUntilExit()` to await server
+// teardown and return the exit code. Move-only; one harness per
+// test.
+class LspTestHarness {
+public:
+    LspTestHarness()
+        : transport_(new InMemoryTransport{})
+        , server_(std::unique_ptr<LspTransport>{transport_},
+                  std::make_unique<SynchronousExecutor>(),
+                  cache_)
+        , exitFuture_(std::async(std::launch::async, [this] {
+              return server_.run();
+          })) {}
+
+    LspTestHarness(LspTestHarness const&)            = delete;
+    LspTestHarness& operator=(LspTestHarness const&) = delete;
+    LspTestHarness(LspTestHarness&&)                 = delete;
+    LspTestHarness& operator=(LspTestHarness&&)      = delete;
+
+    void push(std::string body) {
+        transport_->pushClientMessage(std::move(body));
+    }
+
+    // Block until the server's `run()` returns, OR the timeout
+    // elapses. Caller is expected to have queued an `exit` notif
+    // before calling this. Returns the exit code.
+    [[nodiscard]] int runUntilExit(std::chrono::seconds timeout =
+                                       std::chrono::seconds(2)) {
+        if (exitFuture_.wait_for(timeout) != std::future_status::ready) {
+            return -1; // timed out — caller should ASSERT_NE(-1, ...)
+        }
+        return exitFuture_.get();
+    }
+
+    [[nodiscard]] std::vector<std::string> takeServerMessages() {
+        return transport_->takeServerMessages();
+    }
+
+    [[nodiscard]] InMemoryTransport& transport() noexcept { return *transport_; }
+    [[nodiscard]] SchemaCache&       schemaCache()    noexcept { return cache_; }
+
+private:
+    InMemoryTransport* transport_; // owned by server_'s unique_ptr<LspTransport>
+    SchemaCache        cache_;
+    LspServer          server_;
+    std::future<int>   exitFuture_;
+};
+
+// Canonical wire-message builders. These are used so heavily across
+// the e2e + replay tests that inlining them would be pure noise.
+[[nodiscard]] inline std::string lspInitialize(int id) {
+    return R"({"jsonrpc":"2.0","id":)" + std::to_string(id)
+         + R"(,"method":"initialize","params":{}})";
+}
+
+[[nodiscard]] inline std::string lspShutdown(int id) {
+    return R"({"jsonrpc":"2.0","id":)" + std::to_string(id)
+         + R"(,"method":"shutdown","params":null})";
+}
+
+inline constexpr std::string_view lspExit =
+    R"({"jsonrpc":"2.0","method":"exit","params":null})";
 
 } // namespace dss::lsp::testing

@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -19,13 +20,12 @@ namespace dss {
 
 namespace {
 
-// Parse `--lsp` + optional `--schema-dir=<path>` out of argv. The
 // LSP mode is invoked by `dss-code-prime --lsp [--schema-dir=PATH]`.
-// Order-independent; unknown flags are silently ignored at this
-// layer (the LSP server itself rejects unknown JSON-RPC methods).
+// Order-independent.
 struct LspFlags {
     bool                                 lspMode = false;
     std::optional<std::filesystem::path> schemaDir;
+    std::vector<std::string>             unknown;
 };
 
 [[nodiscard]] LspFlags parseLspFlags(int argc, char* argv[]) {
@@ -37,6 +37,10 @@ struct LspFlags {
         } else if (a.starts_with("--schema-dir=")) {
             out.schemaDir = std::filesystem::path{
                 std::string{a.substr(std::string_view{"--schema-dir="}.size())}};
+        } else if (a.starts_with("--")) {
+            // Track unknown long-flags so a typo (`--Lsp`) doesn't
+            // silently fall through into a different code path.
+            out.unknown.emplace_back(a);
         }
     }
     return out;
@@ -61,6 +65,17 @@ int Program::run(int argc, char* argv[]) {
     const auto flags = parseLspFlags(argc, argv);
     if (flags.lspMode) {
         return runLspMode(flags);
+    }
+    // Reject unknown long-flags loudly when no positional/legacy
+    // mode is taking over (--demo-gui consumes argv[1] directly).
+    const bool legacyMode = argc >= 2 && std::string(argv[1]) == "--demo-gui";
+    if (!flags.unknown.empty() && !legacyMode) {
+        for (auto const& u : flags.unknown) {
+            std::cerr << "unrecognized flag: " << u << std::endl;
+        }
+        std::cerr << "usage: dss-code-prime [--lsp [--schema-dir=PATH]]"
+                     " | [--demo-gui [OUTDIR]]" << std::endl;
+        return 2;
     }
 
     // Temporary: if called with "--demo-gui [output-dir]", generate a demo Windows exe

@@ -10,8 +10,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using dss::ByteOffset;
@@ -100,6 +102,41 @@ TEST(DocumentStore, CloseRemovesDocument) {
     s.close("u");
     EXPECT_FALSE(s.snapshot("u").has_value());
     EXPECT_TRUE(s.diagnosticsFor("u").empty());
+}
+
+TEST(DocumentStore, ConcurrentUpdatesAndStaleWritebackPreserveLatest) {
+    // Worker thread storms `setDiagnostics(staleGen, …)` while the
+    // main thread storms `update(...)`. The mutex + generation
+    // token must guarantee: (a) the stale writeback is dropped or
+    // applied only against its matching generation, and (b) the
+    // latest update's text + version wins.
+    DocumentStore s;
+    s.open("u", 0, "v0", nullptr);
+
+    constexpr int kUpdates = 200;
+    std::atomic<bool> stop{false};
+    std::thread worker([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            std::vector<ParseDiagnostic> diags;
+            diags.push_back(makeDiag("worker"));
+            // Always target gen 0 — every update bumps past it, so
+            // these writes should be dropped after the first update.
+            (void)s.setDiagnostics("u", 0u, std::move(diags));
+        }
+    });
+
+    for (int i = 1; i <= kUpdates; ++i) {
+        auto gen = s.update("u", i, "v" + std::to_string(i));
+        ASSERT_TRUE(gen.has_value());
+    }
+    stop.store(true, std::memory_order_release);
+    worker.join();
+
+    auto snap = s.snapshot("u");
+    ASSERT_TRUE(snap.has_value());
+    EXPECT_EQ(snap->clientVersion, kUpdates);
+    EXPECT_EQ(snap->text, "v" + std::to_string(kUpdates));
+    EXPECT_EQ(snap->parseGeneration, static_cast<std::uint32_t>(kUpdates));
 }
 
 TEST(DocumentStore, ReopenResetsState) {

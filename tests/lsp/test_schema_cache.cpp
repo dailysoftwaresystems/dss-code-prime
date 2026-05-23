@@ -7,7 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <memory>
+#include <thread>
+#include <vector>
 
 using dss::lsp::SchemaCache;
 using dss::lsp::SchemaResolveErrorKind;
@@ -52,6 +55,40 @@ TEST(SchemaCache, UnknownExtensionReturnsNoMatch) {
 TEST(SchemaCache, HasSchemaDirReflectsConstructionMode) {
     SchemaCache shipped;
     EXPECT_FALSE(shipped.hasSchemaDir());
-    SchemaCache dirMode{std::filesystem::path{"/tmp"}};
+    // Use a portable non-existent path — the ctor only stores the
+    // optional; it does not stat the directory.
+    SchemaCache dirMode{std::filesystem::path{"does-not-exist"}};
     EXPECT_TRUE(dirMode.hasSchemaDir());
+}
+
+TEST(SchemaCache, ConcurrentResolveYieldsSingleSharedPointer) {
+    // The cache's whole reason to hold a mutex is to ensure that N
+    // threads asking for the same language all converge on ONE
+    // shared_ptr — no torn loads, no duplicate parses.
+    SchemaCache c;
+    constexpr int kThreads = 16;
+    std::vector<std::shared_ptr<dss::GrammarSchema const>> results(kThreads);
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+
+    std::vector<std::thread> ts;
+    ts.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        ts.emplace_back([&, i] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) { /* spin */ }
+            auto r = c.resolveByName("toy");
+            ASSERT_TRUE(r.has_value());
+            results[i] = *r;
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreads) { /* spin */ }
+    go.store(true, std::memory_order_release);
+    for (auto& t : ts) t.join();
+
+    // All threads must observe the same shared_ptr value (identity).
+    for (int i = 1; i < kThreads; ++i) {
+        EXPECT_EQ(results[0].get(), results[i].get())
+            << "thread " << i << " saw a different schema instance";
+    }
 }

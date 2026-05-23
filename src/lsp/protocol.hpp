@@ -77,8 +77,8 @@ struct DSS_EXPORT Notification {
 using IncomingMessage = std::variant<Request, Notification>;
 
 // LSP `Position` — 0-based line + character. `character` is encoded
-// in UTF-16 code units per the encoding negotiated during
-// `initialize` (PA5a advertises `positionEncoding: "utf-16"`).
+// in the position encoding negotiated during `initialize`; this
+// server advertises `positionEncoding: "utf-16"`.
 struct DSS_EXPORT Position {
     std::uint32_t line      = 0;
     std::uint32_t character = 0;

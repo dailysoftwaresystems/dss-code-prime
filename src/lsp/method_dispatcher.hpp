@@ -35,12 +35,14 @@ public:
 
     MethodDispatcher() = default;
 
-    // Register a handler for a request method. Replaces any prior
-    // handler for the same method.
+    // Register a handler for a request method. Duplicate registration
+    // for the same method is a wiring bug and fatal-aborts — silent
+    // overwrite would let a real handler be masked by a stub (or
+    // vice versa) at server-construction time.
     void registerRequest(Method m, RequestHandler h);
 
-    // Register a handler for a notification method. Replaces any
-    // prior handler.
+    // Register a handler for a notification method. Duplicate
+    // registration fatal-aborts, same rationale as registerRequest.
     void registerNotification(Method m, NotificationHandler h);
 
     // Dispatch an incoming message.

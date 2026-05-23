@@ -35,10 +35,9 @@ struct DSS_EXPORT LspServerOptions {
 
 class DSS_EXPORT LspServer {
 public:
-    // Inject all collaborators. The server takes ownership of
-    // transport + executor (both move-only). `schemaCache` is held
-    // by reference because the caller may want to share it across
-    // server lifetimes (rare; future-proof).
+    // Inject all collaborators. The server owns transport + executor
+    // (both move-only); `schemaCache` is held by reference so callers
+    // can share it across server lifetimes.
     LspServer(std::unique_ptr<LspTransport> transport,
               std::unique_ptr<IExecutor>    executor,
               SchemaCache&                  schemaCache,

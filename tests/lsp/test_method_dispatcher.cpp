@@ -5,11 +5,15 @@
 #include "lsp/method_dispatcher.hpp"
 #include "lsp/protocol.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <gtest/gtest.h>
 
 #include <optional>
 #include <string>
 #include <variant>
+
+using json = nlohmann::json;
 
 using dss::lsp::IncomingMessage;
 using dss::lsp::LspId;
@@ -29,9 +33,11 @@ TEST(MethodDispatcher, DispatchesRegisteredRequest) {
     auto out = d.dispatch(IncomingMessage{req});
     EXPECT_EQ(hits, 1);
     ASSERT_TRUE(out.has_value());
-    // Response must include the id and the handler's result body.
-    EXPECT_NE(out->find("\"id\":42"), std::string::npos);
-    EXPECT_NE(out->find(R"("result":{"ok":true})"), std::string::npos);
+    auto reply = json::parse(*out);
+    EXPECT_EQ(reply.at("jsonrpc"), "2.0");
+    EXPECT_EQ(reply.at("id"), 42);
+    EXPECT_EQ(reply.at("result"), json::parse(R"({"ok":true})"));
+    EXPECT_FALSE(reply.contains("error"));
 }
 
 TEST(MethodDispatcher, UnknownRequestReturnsMethodNotFound) {
@@ -39,17 +45,19 @@ TEST(MethodDispatcher, UnknownRequestReturnsMethodNotFound) {
     Request req{Method::Unknown, LspId{std::int64_t{7}}, "{}"};
     auto out = d.dispatch(IncomingMessage{req});
     ASSERT_TRUE(out.has_value());
-    EXPECT_NE(out->find("\"code\":-32601"), std::string::npos);
-    EXPECT_NE(out->find("\"id\":7"), std::string::npos);
+    auto reply = json::parse(*out);
+    EXPECT_EQ(reply.at("id"), 7);
+    EXPECT_EQ(reply.at("error").at("code"), -32601);
 }
 
 TEST(MethodDispatcher, UnregisteredRequestReturnsMethodNotFound) {
     MethodDispatcher d;
-    // Initialize is known to the enum but has no handler.
     Request req{Method::Initialize, LspId{std::int64_t{1}}, "{}"};
     auto out = d.dispatch(IncomingMessage{req});
     ASSERT_TRUE(out.has_value());
-    EXPECT_NE(out->find("\"code\":-32601"), std::string::npos);
+    auto reply = json::parse(*out);
+    EXPECT_EQ(reply.at("id"), 1);
+    EXPECT_EQ(reply.at("error").at("code"), -32601);
 }
 
 TEST(MethodDispatcher, DispatchesRegisteredNotification) {
@@ -70,19 +78,20 @@ TEST(MethodDispatcher, UnknownNotificationSilentlyDropped) {
     EXPECT_FALSE(out.has_value());
 }
 
-TEST(MethodDispatcher, ReplacesPriorHandler) {
-    MethodDispatcher d;
-    int first = 0, second = 0;
-    d.registerRequest(Method::Shutdown, [&](Request const&) {
-        ++first;
-        return std::optional<std::string>{"null"};
-    });
-    d.registerRequest(Method::Shutdown, [&](Request const&) {
-        ++second;
-        return std::optional<std::string>{"null"};
-    });
-    Request req{Method::Shutdown, LspId{std::int64_t{1}}, "{}"};
-    (void)d.dispatch(IncomingMessage{req});
-    EXPECT_EQ(first, 0);
-    EXPECT_EQ(second, 1);
+TEST(MethodDispatcherDeathTest, DuplicateRequestRegistrationAborts) {
+    EXPECT_DEATH({
+        MethodDispatcher d;
+        d.registerRequest(Method::Shutdown,
+            [](Request const&) { return std::optional<std::string>{"null"}; });
+        d.registerRequest(Method::Shutdown,
+            [](Request const&) { return std::optional<std::string>{"null"}; });
+    }, "duplicate request handler registration");
+}
+
+TEST(MethodDispatcherDeathTest, DuplicateNotificationRegistrationAborts) {
+    EXPECT_DEATH({
+        MethodDispatcher d;
+        d.registerNotification(Method::Exit, [](Notification const&) {});
+        d.registerNotification(Method::Exit, [](Notification const&) {});
+    }, "duplicate notification handler registration");
 }

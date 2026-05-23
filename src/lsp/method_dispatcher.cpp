@@ -2,16 +2,35 @@
 
 #include "lsp/json_rpc.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <variant>
 
 namespace dss::lsp {
 
+namespace {
+
+[[noreturn]] void dispatcherFatal(char const* what) {
+    std::fprintf(stderr, "[lsp/method_dispatcher] fatal: %s\n", what);
+    std::abort();
+}
+
+} // namespace
+
 void MethodDispatcher::registerRequest(Method m, RequestHandler h) {
+    if (requestHandlers_.contains(m)) {
+        // Silent overwrite would mask a real handler with a stub
+        // (or vice versa) at startup — surface the wiring bug now.
+        dispatcherFatal("duplicate request handler registration");
+    }
     requestHandlers_[m] = std::move(h);
 }
 
 void MethodDispatcher::registerNotification(Method m, NotificationHandler h) {
+    if (notificationHandlers_.contains(m)) {
+        dispatcherFatal("duplicate notification handler registration");
+    }
     notificationHandlers_[m] = std::move(h);
 }
 

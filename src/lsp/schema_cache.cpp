@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace dss::lsp {
 
@@ -28,6 +30,19 @@ constexpr std::string_view kShippedLanguages[] = {
     return out;
 }
 
+// Build a `SchemaResolveError` with `<verb> failed[: <first loader
+// diagnostic>]`. Used by both schema-dir and shipped load paths.
+[[nodiscard]] SchemaResolveError makeLoadError(
+    SchemaResolveErrorKind kind,
+    std::string            prefix,
+    std::vector<dss::ConfigDiagnostic> const& diags) {
+    if (!diags.empty()) {
+        prefix += ": ";
+        prefix += diags[0].message;
+    }
+    return SchemaResolveError{kind, std::move(prefix)};
+}
+
 } // namespace
 
 SchemaCache::SchemaCache(std::optional<std::filesystem::path> schemaDir)
@@ -49,40 +64,29 @@ SchemaCache::lookupCachedLocked(std::string_view name) const {
     return nullptr;
 }
 
-std::expected<std::shared_ptr<dss::GrammarSchema const>, SchemaResolveError>
-SchemaCache::loadFresh(std::string_view name) {
+SchemaResult SchemaCache::loadFresh(std::string_view name) {
     if (schemaDir_.has_value()) {
         const auto path = *schemaDir_ / (std::string{name} + ".lang.json");
         auto loaded = dss::GrammarSchema::loadFromFile(path);
         if (!loaded.has_value()) {
-            std::string detail = "loadFromFile failed for ";
-            detail += path.string();
-            if (!loaded.error().empty()) {
-                detail += ": ";
-                detail += loaded.error()[0].message;
-            }
-            return std::unexpected(SchemaResolveError{
-                SchemaResolveErrorKind::LoadFailed, std::move(detail)});
+            return std::unexpected(makeLoadError(
+                SchemaResolveErrorKind::LoadFailed,
+                "loadFromFile failed for " + path.string(),
+                loaded.error()));
         }
         return *loaded;
     }
     auto loaded = dss::GrammarSchema::loadShipped(name);
     if (!loaded.has_value()) {
-        std::string detail{"loadShipped(\""};
-        detail += name;
-        detail += "\") failed";
-        if (!loaded.error().empty()) {
-            detail += ": ";
-            detail += loaded.error()[0].message;
-        }
-        return std::unexpected(SchemaResolveError{
-            SchemaResolveErrorKind::NotFound, std::move(detail)});
+        return std::unexpected(makeLoadError(
+            SchemaResolveErrorKind::NotFound,
+            "loadShipped(\"" + std::string{name} + "\") failed",
+            loaded.error()));
     }
     return *loaded;
 }
 
-std::expected<std::shared_ptr<dss::GrammarSchema const>, SchemaResolveError>
-SchemaCache::resolveByName(std::string_view languageName) {
+SchemaResult SchemaCache::resolveByName(std::string_view languageName) {
     {
         std::lock_guard lk{mutex_};
         if (auto cached = lookupCachedLocked(languageName)) return cached;
@@ -104,8 +108,7 @@ SchemaCache::resolveByName(std::string_view languageName) {
     return it->second;
 }
 
-std::expected<std::shared_ptr<dss::GrammarSchema const>, SchemaResolveError>
-SchemaCache::resolveByExtension(std::string_view fileExtension) {
+SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
     const auto lower = lowercase(fileExtension);
     {
         std::lock_guard lk{mutex_};
