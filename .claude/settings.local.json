@@ -224,7 +224,11 @@
       "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/tsql-subset/schema_and_dml.sql'\\); $s = [System.Text.Encoding]::UTF8.GetString\\($b, 2340, 100\\); Write-Output \\('---' + $s + '---'\\))",
       "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/tsql-subset/schema_and_dml.sql'\\); $s = [System.Text.Encoding]::UTF8.GetString\\($b, 1660, 100\\); Write-Output \\('---' + $s + '---'\\))",
       "PowerShell(Remove-Item *)",
-      "PowerShell($env:DSS_REFRESH_GOLDENS = '1'; C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_corpus.exe 2>&1 | Select-String -Pattern 'PASSED|FAILED|Refreshed' | Select-Object -First 5)"
+      "PowerShell($env:DSS_REFRESH_GOLDENS = '1'; C:/Source/DailySoftware/dss-code-prime/build/bin/dss/dss_analysis_syntactic_test_corpus.exe 2>&1 | Select-String -Pattern 'PASSED|FAILED|Refreshed' | Select-Object -First 5)",
+      "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/c-subset/mini_calc.c'\\); Write-Output \\(\"Total: \" + $b.Length\\); $s = [System.Text.Encoding]::UTF8.GetString\\($b, 1300, 100\\); Write-Output \\('---' + $s + '---'\\))",
+      "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/c-subset/mini_calc.c'\\); $s = [System.Text.Encoding]::UTF8.GetString\\($b, 0, 1400\\); Write-Output \\('---' + $s.Substring\\($s.Length - 500\\) + '---'\\))",
+      "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/c-subset/mini_calc.c'\\); Write-Output \\(\"Byte 1355 char: '\" + [char]$b[1355] + \"'\"\\); Write-Output \\(\"Around 1340-1370: '\" + [System.Text.Encoding]::UTF8.GetString\\($b, 1340, 30\\) + \"'\"\\))",
+      "PowerShell($b = [System.IO.File]::ReadAllBytes\\('C:/Source/DailySoftware/dss-code-prime/tests/corpus/c-subset/mini_calc.c'\\); Write-Output \\(\"Byte 1558: '\" + [char]$b[1558] + \"'\"\\); Write-Output \\(\"1530-1580: '\" + [System.Text.Encoding]::UTF8.GetString\\($b, 1530, 50\\) + \"'\"\\))"
     ]
   }
 }

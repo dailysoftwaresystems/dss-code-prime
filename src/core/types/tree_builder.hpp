@@ -154,6 +154,23 @@ public:
     // raw back-pointer into a temporary, so we refuse it at compile time.
     [[nodiscard]] OpenScope open(RuleId rule) &;
 
+    // Left-recursive wrap: pop the current frame's most-recent pending
+    // child, open a new frame with `rule`, and re-attach the popped
+    // subtree as the new frame's first child. The new frame replaces
+    // the popped subtree's position in the parent's child list.
+    //
+    // Used by the Pratt walker to handle left-associative postfix
+    // chains (`f(a)[i]`, `a[i][j]`, `f()()`) where each postfix wraps
+    // the result of the previous one. The classical rollback-replay
+    // strategy can't express this — rolling back to before the prior
+    // wrap loses it, and re-parsing at `prec+1` excludes the same-prec
+    // postfix that the wrap was built around.
+    //
+    // Contract: requires an open frame containing at least one pending
+    // child. Emits `P_BuilderInvariant` and returns a no-op guard if
+    // either invariant is violated.
+    [[nodiscard]] OpenScope wrapLastChildInFrame(RuleId rule) &;
+
     // Resolve + attach a token leaf to the current frame. EmptySpace tokens
     // are flagged via NodeFlags::EmptySpace; opensScope/closesScope tokens
     // mutate the scope stack here. With no open frame, emits

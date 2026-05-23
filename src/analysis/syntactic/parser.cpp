@@ -575,6 +575,17 @@ struct Parser::Impl {
         walker.enterRule(rule);
     }
 
+    // Left-recursive wrap: open `rule` as a new frame that adopts the
+    // current frame's most-recent pending child as its first child.
+    // Pratt-walker shim around `TreeBuilder::wrapLastChildInFrame` —
+    // mirrors `openExprFrame`'s pattern (push frame guard + frameRules
+    // entry + enter the rule on the parser-side schema walker).
+    void wrapLastChildExprFrame(RuleId rule) {
+        frames.push_back(builder->wrapLastChildInFrame(rule));
+        frameRules.push_back(rule);
+        walker.enterRule(rule);
+    }
+
     // Advance over `peek` as an operator token: push to builder, step
     // the parser walker. Returns false when peek is EOF (caller
     // should treat that as a structural error — see H4 in the PA2
@@ -1244,28 +1255,35 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             return;
         }
 
-        // Roll back before opening the wrapper. Re-snap IMMEDIATELY
-        // (still pointing at the pre-primary state) so a subsequent
-        // iteration can wipe this wrap in turn — re-snapping AFTER
-        // the wrap was emitted would let only the wrap's children be
-        // undone, not the wrap itself.
-        I.rollbackForWalker(snap);
-        snap = I.snapForWalker();
-
         // Postfix wins ties with infix at the same precedence — it
         // binds the lhs alone (no further operand to gather), so
         // structurally it's the more local binding. Grouped postfix
         // (`grouped.has_value()`) extends the simple `++` case with a
         // body-rule frame parsed between opener and closer.
+        //
+        // Postfix is LEFT-associative and uses iterative wrapping via
+        // `wrapLastChildExprFrame` — the just-built primary (or
+        // previously-built wrap in a chain like `f(a)[i]`) becomes the
+        // first child of the new `postfixExpr` frame. NO rollback,
+        // NO recursive `parseExpressionAt` — the rollback-replay used
+        // by infix would lose iter-1's wrap on iter-2 and the
+        // `prec + 1` re-parse would exclude the same-prec postfix
+        // already consumed. The classical Pratt left-recursion shape.
+        //
+        // The pre-primary `snap` stays valid across postfix iterations:
+        // a later same-level infix iter (`f(a) + g(b)`) needs to roll
+        // back ALL the postfix wraps and the primary atom, then open
+        // a `binaryExpr` whose recursive LHS parse rebuilds the chain
+        // inside the new wrap.
         if (postfixInClimb) {
-            I.openExprFrame(rules.postfixExpr);
-            parseExpressionAt(I, rules, postfix->precedence + 1);
-            pumpTrivia(I);
+            I.wrapLastChildExprFrame(rules.postfixExpr);
             if (!I.pushOperatorToken()) {
-                // Pathological: inner recursion consumed the postfix
-                // op too (shouldn't, given the prec+1 floor) and we
-                // landed at EOF here. Diagnose + abort the wrap so we
-                // don't push a synthesized EOF as the operator token.
+                // Truly defensive: peek was non-Eof when we entered
+                // this iteration, so pushOperatorToken should have
+                // succeeded. If it fails here something has corrupted
+                // the token stream — emit a diagnostic so the failure
+                // is observable rather than producing a silently
+                // half-built wrap.
                 I.emitParserError(
                     DiagnosticCode::P_PrematureEndOfInput,
                     peek.span,
@@ -1328,8 +1346,21 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                 }
             }
             I.closeFrameOnce();
+            // Snap intentionally NOT advanced — see header comment
+            // above the postfix branch. A subsequent infix iteration
+            // at the same level needs the original pre-primary snap
+            // so its rollback-replay can wipe this postfix wrap and
+            // rebuild the chain inside the binaryExpr frame.
             continue;
         }
+
+        // Infix path keeps the right-recursive rollback-replay: roll
+        // back to before the primary was built, open the binaryExpr
+        // wrap, and rebuild the primary inside it. Re-snap to the
+        // post-rollback state so a chained infix at lower precedence
+        // can do the same dance.
+        I.rollbackForWalker(snap);
+        snap = I.snapForWalker();
 
         I.openExprFrame(rules.binaryExpr);
         // LHS: strictly tighter (op.prec + 1) so it doesn't gobble

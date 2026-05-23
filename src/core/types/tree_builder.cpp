@@ -325,6 +325,64 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
     return OpenScope{this, cookie};
 }
 
+TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
+    if (finished_) {
+        addBuilderInvariant_("wrapLastChildInFrame() after finish()",
+                             SourceSpan::empty(0));
+        return OpenScope{nullptr, 0};
+    }
+    if (open_.empty()) {
+        addBuilderInvariant_(
+            "wrapLastChildInFrame() with no open parent frame",
+            SourceSpan::empty(0));
+        return OpenScope{nullptr, 0};
+    }
+    // The parent must have at least one child to wrap.
+    auto const parentPendingStart = open_.back().pendingStart;
+    if (pendingChildren_.size()
+        == static_cast<std::size_t>(parentPendingStart)) {
+        addBuilderInvariant_(
+            "wrapLastChildInFrame() requires at least one pending child",
+            SourceSpan::empty(0));
+        return OpenScope{nullptr, 0};
+    }
+
+    // Pop the subtree we're going to wrap. The pop only removes the
+    // parent's pointer to it; the arena node and all its descendants
+    // stay put.
+    const NodeId childToWrap = pendingChildren_.back();
+    pendingChildren_.pop_back();
+
+    // Open the new wrapper frame the normal way. `open()` allocates
+    // the wrapper's Internal node, attaches it as a pending child of
+    // the parent (taking the slot vacated by the pop above), and
+    // pushes the new Frame whose `pendingStart` points at the
+    // post-attach size of `pendingChildren_`.
+    OpenScope guard = open(rule);
+    if (open_.empty()) {
+        // `open()` errored — we already emitted a diagnostic; restore
+        // the pre-pop state so the caller's subtree isn't lost.
+        pendingChildren_.push_back(childToWrap);
+        return guard;
+    }
+
+    // Re-attach the popped subtree as the wrapper's FIRST pending
+    // child. After this push, the wrapper's children region is
+    // `[wrapper.pendingStart, pendingChildren_.size())` = `[childToWrap]`.
+    pendingChildren_.push_back(childToWrap);
+
+    // Fix up the wrapped child's parent pointer and the wrapper's
+    // span so subsequent span rollup is sensible. The wrapper now
+    // starts where the wrapped subtree starts.
+    nodes_[childToWrap.v].parent = open_.back().id;
+    const auto childSpan = nodes_[childToWrap.v].span;
+    open_.back().openerSpan = SourceSpan::empty(childSpan.start());
+    nodes_[open_.back().id.v].span =
+        SourceSpan::empty(childSpan.start());
+
+    return guard;
+}
+
 void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept {
     // Fast path: this cookie has already been finalized by an earlier
     // cascade-close or by finish(). The OpenScope guard is calling
