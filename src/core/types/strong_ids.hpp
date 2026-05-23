@@ -37,6 +37,8 @@ DSS_STRONG_ID(DiagnosticIndex);
 DSS_STRONG_ID(LexerModeId);
 DSS_STRONG_ID(StringStyleId);
 DSS_STRONG_ID(SchemaId);
+DSS_STRONG_ID(DocumentVersion);
+DSS_STRONG_ID(RequestId);
 
 #undef DSS_STRONG_ID
 
@@ -76,6 +78,8 @@ inline constexpr DiagnosticIndex InvalidDiagnostic{};
 inline constexpr LexerModeId     InvalidLexerMode{};
 inline constexpr StringStyleId   InvalidStringStyle{};
 inline constexpr SchemaId        InvalidSchemaId{};
+inline constexpr DocumentVersion InvalidDocumentVersion{};
+inline constexpr RequestId       InvalidRequestId{};
 
 } // namespace dss
 
@@ -96,5 +100,7 @@ DSS_HASH_ID(DiagnosticIndex);
 DSS_HASH_ID(LexerModeId);
 DSS_HASH_ID(StringStyleId);
 DSS_HASH_ID(SchemaId);
+DSS_HASH_ID(DocumentVersion);
+DSS_HASH_ID(RequestId);
 
 #undef DSS_HASH_ID

@@ -1,6 +1,7 @@
 add_subdirectory(core)
 add_subdirectory(tokenizer)
 add_subdirectory(analysis/syntactic)
+add_subdirectory(lsp)
 add_subdirectory(gen)
 add_subdirectory(program)
 
@@ -10,6 +11,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:core>
     $<TARGET_OBJECTS:tokenizer>
     $<TARGET_OBJECTS:analysis_syntactic>
+    $<TARGET_OBJECTS:lsp>
     $<TARGET_OBJECTS:gen>
     $<TARGET_OBJECTS:program>)
 target_include_directories(dss-code-prime-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
