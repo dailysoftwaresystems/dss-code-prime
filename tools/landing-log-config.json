@@ -13,6 +13,11 @@
       "_comment": "TZ1/TZ2/TZ3 + optional letter sub-deliverables (TZ1a, etc).",
       "path": ".plans/04-tokenizer-plan - ok.md",
       "subjectPattern": "^Tokenizer (TZ[0-9]+)[a-z]?(?:\\s+(review)(?:\\s+round-([0-9]+))?)?:"
+    },
+    {
+      "_comment": "CU1..CU6 + optional letter sub-deliverables (CU1a, etc) + optional review/round suffix.",
+      "path": ".plans/08-compilation-unit-plan - tbd.md",
+      "subjectPattern": "^Compilation unit (CU[0-9]+)[a-z]?(?:\\s+(review)(?:\\s+round-([0-9]+))?)?:"
     }
   ]
 }

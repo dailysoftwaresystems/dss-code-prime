@@ -97,3 +97,30 @@ TEST(StrongIds, NodeIdTwoArgCtorStoresTag) {
     EXPECT_EQ(untagged.v, 7u);
     EXPECT_EQ(untagged.treeTag, 0u);
 }
+
+// ── CompilationUnitId (CU1) ───────────────────────────────────────────────
+
+TEST(StrongIds, CompilationUnitIdDefaultIsInvalid) {
+    EXPECT_FALSE(CompilationUnitId{}.valid());
+    EXPECT_FALSE(InvalidCompilationUnit.valid());
+    EXPECT_EQ(InvalidCompilationUnit.v, 0u);
+}
+
+TEST(StrongIds, CompilationUnitIdDistinctType) {
+    // Same DSS_STRONG_ID macro, distinct type. Mixing with TreeId/RuleId
+    // must be a compile error, not a silent uint32_t conversion.
+    static_assert(!std::is_same_v<CompilationUnitId, TreeId>);
+    static_assert(!std::is_same_v<CompilationUnitId, RuleId>);
+    static_assert(!std::is_convertible_v<std::uint32_t, CompilationUnitId>);
+    static_assert(sizeof(CompilationUnitId) == sizeof(std::uint32_t));
+}
+
+TEST(StrongIds, CompilationUnitIdHashable) {
+    std::unordered_set<CompilationUnitId> seen;
+    seen.insert(CompilationUnitId{1});
+    seen.insert(CompilationUnitId{2});
+    seen.insert(CompilationUnitId{1});  // dup
+    EXPECT_EQ(seen.size(), 2u);
+    EXPECT_TRUE(seen.contains(CompilationUnitId{1}));
+    EXPECT_FALSE(seen.contains(CompilationUnitId{3}));
+}

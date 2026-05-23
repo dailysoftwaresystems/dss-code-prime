@@ -6,7 +6,7 @@
 
 | | |
 |---|---|
-| Status        | ⏳ **planned.** v1 production-critical; gates phase #8 (`analysis-semantic`). Production-readiness G-110 + G-111. |
+| Status        | 🟢 **CU1 shipped** (`CompilationUnit` + `UnitBuilder` + `CrossTreeRef` + `CompilationUnitId`; 13 tests, full suite 48/48 green; substrate-tier 5-agent review + fix pass landed). CU2–CU4 ⏳ planned; CU5/CU6 v1.x. v1 production-critical; gates phase #8 (`analysis-semantic`). Production-readiness G-110 + G-111. |
 | Predecessors  | ✅ Parser phase #7 closed ([`05-parser-plan - ok.md`](./05-parser-plan%20-%20ok.md)) — PA0–PA5b all shipped. CU1 unblocked. LSP (PA5a/PA5b) ships per-file as designed; cross-file LSP features wait for a dedicated LSP follow-up plan post-phase #8. |
 | Successors    | Phase #8 (`analysis-semantic`) consumes `CompilationUnit` instead of bare `Tree`. Phase #9 (IR) lowers per-CU. Phase #11 (codegen) emits one artifact per CU. |
 | Scope         | **Bounded.** CU1: `CompilationUnit` type + driver-level aggregation. CU2: multi-file parser invocation + per-file diagnostic merging. CU3: cross-tree symbol-shape hook (the contract semantic phase consumes). CU4: per-language import-resolution shim (heuristic for v1; schema-driven in v3). |
@@ -108,7 +108,7 @@ public:
 
 | PR  | Title                                           | Scope                                                                                                                                                                                                       |
 |-----|-------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| CU1 | `CompilationUnit` type + arena                  | The bare type: strong id (`CompilationUnitId`), owned tree vector, owned driver `DiagnosticReporter`, owned `CrossTreeRef` vector (empty until CU4), schema handle (artifact-profile-agnostic per §2.2). Single mutator: `UnitBuilder::addTree(Tree&&)` — no `addFile`/`addInMemory` yet (CU2). A single-tree CU is the smallest valid CU. Death tests pin **lifecycle invariants** (operating on a moved-from CU; double-`finish()`); the SH3-analog cross-CU NodeId guard is **deferred to CU3** — see §2.5. |
+| CU1 | `CompilationUnit` type + arena                  | The bare type: strong id (`CompilationUnitId`), owned tree vector, owned driver `DiagnosticReporter`, owned `CrossTreeRef` vector (empty until CU4), schema handle (artifact-profile-agnostic per §2.2). Single mutator: `UnitBuilder::addTree(Tree&&)` — no `addFile`/`addInMemory` yet (CU2). A single-tree CU is the smallest *non-trivial* CU; the **empty (zero-tree) CU is also valid** (degenerate case — the driver decides whether empty input is an error, not the type). Death tests pin **lifecycle invariants** (reading `schema()` on a moved-from CU aborts; double-`finish()`; `addTree` after `finish()`; null schema); the SH3-analog cross-CU NodeId guard is **deferred to CU3** — see §2.5. |
 | CU2 | Multi-file `UnitBuilder` + driver wiring        | `UnitBuilder::addFile` → tokenize → parse → push `Tree` into the CU. Driver diagnostics carry per-file `SourceBuffer` reference so the renderer can show the right file/line. CompilationUnit hands a `std::span<Tree const>` to consumers. Per-file order preserved (matters for some languages' include semantics). |
 | CU3 | Cross-tree `SymbolId` shape + `CrossTreeRef`    | The contract semantic-phase consumes. `SymbolId` becomes CU-scoped (not tree-scoped). `NodeAttribute<SymbolId>` keys against the owning Tree's id; the symbol table's storage moves to the CU. Ships **the SH3-analog cross-CU `NodeId` guard** (deferred from CU1 per §2.5) — death tests for `NodeAttribute<SymbolId>` mismatches against other CUs (cross-CU NodeId leaks). |
 | CU4 | Per-language import-resolution shim             | `ImportResolver` interface; built-in implementations per shipped language: **toy** = identity (no imports); **c-subset** = `#include "x.h"` resolves against the project's include-paths (v1 = same directory + project-config-declared include dirs; full system-header resolution post-v1); **tsql-subset** = either (a) concat-order (sqlcmd `:r`) or (b) cross-statement DB.schema reference (driver-injected from project config). Resolution populates the CU's `crossRefs` vector before semantic gets it. |
@@ -161,9 +161,9 @@ public:
 - [ ] `UnitBuilder` aggregates ≥3 files into one `CompilationUnit`; each `Tree` keeps its `BufferId` linkage so diagnostics render correct file paths.
 - [ ] c-subset two-file integration test: `main.c` calls `helper()` declared in `helper.h`; `CompilationUnit.crossRefs()` contains the resolved edge.
 - [ ] tsql-subset two-file integration test: `schema.sql` + `data.sql` concatenate cleanly into one CU; sequential cross-statement references resolve.
-- [ ] toy single-file CU still works (degenerate case shouldn't regress).
-- [ ] `CompilationUnit` is move-only, single-use (built by `UnitBuilder::finish()`, consumed by phase #8). Death tests pin the contract.
-- [ ] Per-PR 5-agent review cadence (substrate tier) for CU1 + CU3 (touch attribute-table contracts); feature tier for CU2 + CU4.
+- [x] **(CU1)** toy single-file CU works; empty (zero-tree) CU is valid too. *Multi-file aggregation (≥3 files) lands in CU2 via `addFile`.*
+- [x] **(CU1)** `CompilationUnit` is move-only, single-use (built by `UnitBuilder::finish()`, consumed by phase #8). Death tests pin the contract: reading `schema()` on a moved-from CU, double-`finish()`, `addTree` after `finish()`, null schema.
+- [x] **(CU1)** Per-PR 5-agent review cadence (substrate tier) executed for CU1 (correctness / type-design / silent-failure / test-coverage / simplicity) + fix-everything pass. CU3 also substrate tier; feature tier for CU2 + CU4.
 - [ ] [`07-production-readiness-plan - tbd.md`](./07-production-readiness-plan%20-%20tbd.md) gaps G-110 + G-111 flipped to ✅ resolved when this phase ships.
 
 ---
@@ -207,3 +207,11 @@ parser PA0 ─► PA1 ─► PA2 ─► PA3 ─► PA4 ─┬─► PA5a ─► 
 ```
 
 PA5 (LSP) and CU1..CU4 are **siblings**, not sequential — LSP doesn't need CompilationUnit (it operates per-file). Both consume parser output independently. They reconverge when the LSP gains cross-file features post-phase #8.
+
+---
+
+## 7. PR landing log
+
+| PR | Status | Commit / notes |
+|---|---|---|
+| CU1 | ✅ done | `CompilationUnit` + `UnitBuilder` + `CrossTreeRef` + `CompilationUnitId` — the bare type (`src/analysis/compilation_unit/`). CU is move-only / single-use; `UnitBuilder` is non-copyable + non-movable with `addTree(Tree&&)` as its only mutator (`addFile`/`addInMemory` = CU2). Trees stored `vector<Tree>` by value, frozen post-`finish()` (L1); `DiagnosticReporter` by value (L3); `crossRefs()` empty until CU4 (L5, with a `LANDMARK(CU4)` tripwire test); process-global `nextId()` atomic counter mirroring `TreeBuilder::nextTreeId` (L2). Empty + single-tree CUs both valid. Out-of-line `~UnitBuilder()` / `~CompilationUnit()` are load-bearing under `-fno-keep-inline-dllexport` (an implicit dtor of a dllexport class isn't emitted into the DLL → `STATUS_ENTRYPOINT_NOT_FOUND` for dllimport consumers). 13 tests (9 contract + 4 death: moved-from `schema()`, double-`finish()`, `addTree`-after-`finish()`, null schema) + 3 `CompilationUnitId` strong-id tests; full suite **48/48** green. Substrate-tier 5-agent review + fix-everything pass (moved-from `schema()` null-guard mirroring `Tree::schema`, move-assignment test, CU4 tripwire marker, plan-wording reconcile). `_pending_` (initial; hash filled post-merge per housekeeping convention). |
