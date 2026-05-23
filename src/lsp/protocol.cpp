@@ -23,6 +23,12 @@ constexpr MethodEntry kMethodTable[] = {
     {"textDocument/didChange",      Method::TextDocumentDidChange},
     {"textDocument/didClose",       Method::TextDocumentDidClose},
     {"textDocument/didSave",        Method::TextDocumentDidSave},
+    {"textDocument/hover",          Method::TextDocumentHover},
+    {"textDocument/completion",     Method::TextDocumentCompletion},
+    {"textDocument/definition",     Method::TextDocumentDefinition},
+    {"textDocument/references",     Method::TextDocumentReferences},
+    {"textDocument/rename",         Method::TextDocumentRename},
+    {"textDocument/signatureHelp",  Method::TextDocumentSignatureHelp},
 };
 
 } // namespace

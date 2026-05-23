@@ -14,18 +14,24 @@ using dss::lsp::methodName;
 using dss::lsp::parseMethod;
 
 TEST(LspProtocol, ParseMethodKnownStrings) {
-    EXPECT_EQ(parseMethod("initialize"),              Method::Initialize);
-    EXPECT_EQ(parseMethod("initialized"),             Method::Initialized);
-    EXPECT_EQ(parseMethod("shutdown"),                Method::Shutdown);
-    EXPECT_EQ(parseMethod("exit"),                    Method::Exit);
-    EXPECT_EQ(parseMethod("textDocument/didOpen"),    Method::TextDocumentDidOpen);
-    EXPECT_EQ(parseMethod("textDocument/didChange"),  Method::TextDocumentDidChange);
-    EXPECT_EQ(parseMethod("textDocument/didClose"),   Method::TextDocumentDidClose);
-    EXPECT_EQ(parseMethod("textDocument/didSave"),    Method::TextDocumentDidSave);
+    EXPECT_EQ(parseMethod("initialize"),                  Method::Initialize);
+    EXPECT_EQ(parseMethod("initialized"),                 Method::Initialized);
+    EXPECT_EQ(parseMethod("shutdown"),                    Method::Shutdown);
+    EXPECT_EQ(parseMethod("exit"),                        Method::Exit);
+    EXPECT_EQ(parseMethod("textDocument/didOpen"),        Method::TextDocumentDidOpen);
+    EXPECT_EQ(parseMethod("textDocument/didChange"),      Method::TextDocumentDidChange);
+    EXPECT_EQ(parseMethod("textDocument/didClose"),       Method::TextDocumentDidClose);
+    EXPECT_EQ(parseMethod("textDocument/didSave"),        Method::TextDocumentDidSave);
+    EXPECT_EQ(parseMethod("textDocument/hover"),          Method::TextDocumentHover);
+    EXPECT_EQ(parseMethod("textDocument/completion"),     Method::TextDocumentCompletion);
+    EXPECT_EQ(parseMethod("textDocument/definition"),     Method::TextDocumentDefinition);
+    EXPECT_EQ(parseMethod("textDocument/references"),     Method::TextDocumentReferences);
+    EXPECT_EQ(parseMethod("textDocument/rename"),         Method::TextDocumentRename);
+    EXPECT_EQ(parseMethod("textDocument/signatureHelp"),  Method::TextDocumentSignatureHelp);
 }
 
 TEST(LspProtocol, ParseMethodUnknownStringMapsToUnknown) {
-    EXPECT_EQ(parseMethod("textDocument/hover"),       Method::Unknown);
+    EXPECT_EQ(parseMethod("textDocument/madeup"),       Method::Unknown);
     EXPECT_EQ(parseMethod(""),                          Method::Unknown);
     EXPECT_EQ(parseMethod("initialize\n"),              Method::Unknown);
     EXPECT_EQ(parseMethod("INITIALIZE"),                Method::Unknown);
@@ -41,6 +47,12 @@ TEST(LspProtocol, MethodNameRoundTripsForKnownMethods) {
         Method::TextDocumentDidChange,
         Method::TextDocumentDidClose,
         Method::TextDocumentDidSave,
+        Method::TextDocumentHover,
+        Method::TextDocumentCompletion,
+        Method::TextDocumentDefinition,
+        Method::TextDocumentReferences,
+        Method::TextDocumentRename,
+        Method::TextDocumentSignatureHelp,
     };
     for (auto m : known) {
         const auto name = methodName(m);

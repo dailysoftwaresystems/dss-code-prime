@@ -122,13 +122,18 @@ void runOneSession(fs::path const& inputPath) {
     goldenPath += ".out.jsonl";
 
     const bool refresh = std::getenv("DSS_REFRESH_GOLDENS") != nullptr;
-    if (!fs::exists(goldenPath) || refresh) {
+    if (refresh) {
         std::ofstream out{goldenPath};
         for (auto const& m : normalized) out << m << '\n';
         out.close();
         SUCCEED() << "wrote golden " << goldenPath;
         return;
     }
+    // Missing goldens must fail loudly — silent generation would let
+    // a reviewer who deleted a golden see a green run.
+    ASSERT_TRUE(fs::exists(goldenPath))
+        << "golden missing: " << goldenPath
+        << " — run with DSS_REFRESH_GOLDENS=1 to create it";
 
     auto expected = readJsonLines(goldenPath);
     EXPECT_EQ(normalized.size(), expected.size())
@@ -151,3 +156,10 @@ TEST(LspReplay, InitializeBasic) {
 TEST(LspReplay, ToyDidOpenAndClose) {
     runOneSession(findSessionsDir() / "toy_didopen_close.in.jsonl");
 }
+
+TEST(LspReplay, HoverStub)         { runOneSession(findSessionsDir() / "hover_stub.in.jsonl"); }
+TEST(LspReplay, CompletionStub)    { runOneSession(findSessionsDir() / "completion_stub.in.jsonl"); }
+TEST(LspReplay, DefinitionStub)    { runOneSession(findSessionsDir() / "definition_stub.in.jsonl"); }
+TEST(LspReplay, ReferencesStub)    { runOneSession(findSessionsDir() / "references_stub.in.jsonl"); }
+TEST(LspReplay, RenameStub)        { runOneSession(findSessionsDir() / "rename_stub.in.jsonl"); }
+TEST(LspReplay, SignatureHelpStub) { runOneSession(findSessionsDir() / "signature_help_stub.in.jsonl"); }

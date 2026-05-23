@@ -138,6 +138,26 @@ void LspServer::registerHandlers_() {
         [this](Notification const& n) { handleDidClose_(n); });
     dispatcher_.registerNotification(Method::TextDocumentDidSave,
         [this](Notification const& n) { handleDidSave_(n); });
+
+    // Stub handlers return their LSP-spec default result.
+    struct StubMethod {
+        Method            method;
+        std::string_view  defaultResult;
+    };
+    constexpr StubMethod kStubs[] = {
+        {Method::TextDocumentHover,         "null"},
+        {Method::TextDocumentCompletion,    "null"},
+        {Method::TextDocumentDefinition,    "null"},
+        {Method::TextDocumentReferences,    "[]"},
+        {Method::TextDocumentRename,        "null"},
+        {Method::TextDocumentSignatureHelp, "null"},
+    };
+    for (auto const& s : kStubs) {
+        dispatcher_.registerRequest(s.method,
+            [r = std::string{s.defaultResult}](Request const&) {
+                return std::optional<std::string>{r};
+            });
+    }
 }
 
 int LspServer::run() {
@@ -172,10 +192,17 @@ int LspServer::run() {
 
 std::optional<std::string> LspServer::handleInitialize_(Request const& /*req*/) {
     json result;
-    result["capabilities"]["textDocumentSync"]      = 1; // 1 == Full per LSP §13.7
-    result["capabilities"]["positionEncoding"]      = "utf-16";
-    result["capabilities"]["diagnosticProvider"]["interFileDependencies"] = false;
-    result["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"]  = false;
+    auto& caps = result["capabilities"];
+    caps["textDocumentSync"] = 1; // 1 == Full per LSP §13.7
+    caps["positionEncoding"] = "utf-16";
+    caps["diagnosticProvider"]["interFileDependencies"] = false;
+    caps["diagnosticProvider"]["workspaceDiagnostics"]  = false;
+    caps["hoverProvider"]          = true;
+    caps["completionProvider"]     = json::object();
+    caps["definitionProvider"]     = true;
+    caps["referencesProvider"]     = true;
+    caps["renameProvider"]         = true;
+    caps["signatureHelpProvider"]  = json::object();
     result["serverInfo"]["name"]    = options_.diagnosticSource;
     result["serverInfo"]["version"] = "0.1.0";
     return result.dump();

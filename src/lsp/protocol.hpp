@@ -44,6 +44,13 @@ enum class Method : std::uint8_t {
     TextDocumentDidChange,
     TextDocumentDidClose,
     TextDocumentDidSave,
+    // Semantic request methods — handlers live in `LspServer`.
+    TextDocumentHover,
+    TextDocumentCompletion,
+    TextDocumentDefinition,
+    TextDocumentReferences,
+    TextDocumentRename,
+    TextDocumentSignatureHelp,
 };
 
 // LSP `id` can be a number, a string, or absent (notifications).
