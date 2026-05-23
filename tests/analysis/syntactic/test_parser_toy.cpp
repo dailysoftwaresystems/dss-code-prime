@@ -94,6 +94,43 @@ void expectExactCodes(std::span<ParseDiagnostic const> diags,
 
 } // namespace
 
+// ── lexer-diagnostic folding (08-compilation-unit-plan §2.6 C2-L1) ────────
+
+TEST(ParserToy, LexerDiagnosticsFoldedIntoTree) {
+    // The optional 5th Parser ctor arg folds the tokenizer's lexer
+    // diagnostics into the produced Tree. `@` is an illegal char →
+    // P_IllegalChar from the lexer, which must appear in the Tree.
+    auto loaded = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src = SourceBuffer::fromString("var x = @;", "<toy>");
+    Tokenizer tk{src, schema};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema, std::move(stream), {}, std::move(lexDiags)};
+    auto result = std::move(p).parse();
+
+    EXPECT_GE(countCode(result.tree.diagnostics().all(),
+                        DiagnosticCode::P_IllegalChar), 1u)
+        << "lexer P_IllegalChar must be folded into the Tree when "
+           "lexerDiagnostics is passed";
+}
+
+TEST(ParserToy, NullLexerDiagsDoesNotFoldLexerErrors) {
+    // The default 4-arg ctor (lexerDiagnostics = nullptr) leaves lexer
+    // diagnostics in the discarded tokenizer reporter — they do NOT appear
+    // in the Tree. Backward-compat for existing callers (LSP, tests). The
+    // parser still emits its own P_NoAlternativeMatched at the `@`.
+    auto h = loadAndTokenize("var x = @;");   // discards lexer diags
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+
+    EXPECT_EQ(countCode(result.tree.diagnostics().all(),
+                        DiagnosticCode::P_IllegalChar), 0u)
+        << "without lexerDiagnostics, lexer diags must NOT appear in the Tree";
+    EXPECT_GE(countCode(result.tree.diagnostics().all(),
+                        DiagnosticCode::P_NoAlternativeMatched), 1u);
+}
+
 // ── happy paths ─────────────────────────────────────────────────────────
 
 TEST(ParserToy, HappyPath_SingleVarDecl) {

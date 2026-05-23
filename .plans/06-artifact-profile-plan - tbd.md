@@ -81,6 +81,7 @@ At project-load time, the driver:
 2. Loads the project config; reads `artifactProfile`.
 3. Asserts `project.artifactProfile ∈ language.artifactProfiles`. Mismatch → fatal `D_ArtifactProfileNotSupported` (driver-phase diagnostic, new `D_*` code namespace alongside `P_*` and `C_*`).
 4. Stamps the resolved profile onto the `CompilationContext` (or equivalent) so every downstream phase can read it without re-walking configs.
+5. Stamps the **entry-point selection** (which source file is the artifact's entry, read from the project config) onto the same `CompilationContext`, beside the profile. This is the home for the entry-point decision — the `CompilationUnit` stays entry-agnostic ([`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) §2.6 C2-D2 re-routes it here from the CU layer). Codegen (§2.4) reads the entry source + the profile-derived entry-point *symbol* name together.
 
 ### 2.4 Codegen consumption
 

@@ -87,6 +87,14 @@ enum class DiagnosticCode : std::uint16_t {
     // grammar (cursor-skip), so a shape reference would silently never
     // match — surface it at load time instead.
     C_BodyDefaultKindInShape      = 0xC029,
+
+    // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
+    // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
+    // The 0xD block is shared with future driver codes (e.g. the artifact-
+    // profile plan's D_ArtifactProfileNotSupported); append, never renumber.
+    D_FileNotFound                = 0xD001,
+    D_EmptyInput                  = 0xD002,
+    D_DuplicateFile               = 0xD003,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

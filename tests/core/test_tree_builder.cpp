@@ -1064,3 +1064,57 @@ TEST(TreeBuilder, WrapLastChildInFrameSpanStartsAtWrappedChild) {
     EXPECT_EQ(t.span(wrapper).start(), 0u);   // wrapped child starts here
     EXPECT_EQ(t.span(wrapper).end(),   2u);   // last appended token ends here
 }
+
+// ── ingestDiagnostics (08-compilation-unit-plan §2.6 C2-L1) ───────────────
+
+TEST(TreeBuilderIngest, PreservesScopeStackVerbatim) {
+    // The load-bearing contract: ingested diagnostics keep their OWN scope
+    // stack and are NOT re-stamped with the builder's (which is what
+    // emitDiagnostic_ does). A lexer diagnostic has no builder-scope context,
+    // so routing it through emitDiagnostic_ would wrongly clobber it.
+    auto h = Harness::make("var x = y;");
+    TreeBuilder b{h.src, h.schema};
+
+    ParseDiagnostic ext;
+    ext.code       = DiagnosticCode::P_DeprecatedSyntax;
+    ext.severity   = DiagnosticSeverity::Warning;
+    ext.scopeStack = {ScopeKind::Generic};   // its own, distinct scope
+    std::vector<ParseDiagnostic> diags{ext};
+
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        auto stmt = b.open(h.schema->rules().find("statement"));
+        auto vd   = b.open(h.schema->rules().find("varDecl"));
+        b.pushToken(h.tok("var", CoreTokenKind::Word));
+        b.pushToken(h.tok("x",   CoreTokenKind::Word));
+        b.pushToken(h.tok("=",   CoreTokenKind::Operator));
+        b.pushToken(h.tok("y",   CoreTokenKind::Word));
+        b.pushToken(h.tok(";"));
+        b.ingestDiagnostics(diags);   // builder scope stack is empty here
+    }
+    Tree t = std::move(b).finish();
+
+    auto all = t.diagnostics().all();
+    auto it = std::ranges::find_if(all, [](ParseDiagnostic const& d) {
+        return d.code == DiagnosticCode::P_DeprecatedSyntax; });
+    ASSERT_NE(it, all.end()) << "ingested diagnostic missing from the Tree";
+    ASSERT_EQ(it->scopeStack.size(), 1u)
+        << "scope stack was clobbered (likely routed through emitDiagnostic_)";
+    EXPECT_EQ(it->scopeStack[0], ScopeKind::Generic);
+}
+
+TEST(TreeBuilderIngest, EmptySpanDiagnosticReachesTheTree) {
+    auto h = Harness::make("var x = y;");
+    TreeBuilder b{h.src, h.schema};
+
+    ParseDiagnostic ext;
+    ext.code     = DiagnosticCode::P_IllegalChar;
+    ext.severity = DiagnosticSeverity::Error;
+    ext.span     = SourceSpan::empty(0);
+    std::vector<ParseDiagnostic> diags{ext};
+    b.ingestDiagnostics(diags);
+
+    Tree t = std::move(b).finish();
+    EXPECT_EQ(countCode(t.diagnostics().all(), DiagnosticCode::P_IllegalChar), 1u)
+        << "ingested diagnostic must reach the Tree's reporter";
+}

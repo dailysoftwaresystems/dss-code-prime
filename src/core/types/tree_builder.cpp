@@ -239,6 +239,21 @@ void TreeBuilder::reportDiagnostic(ParseDiagnostic d) {
     emitDiagnostic_(std::move(d));
 }
 
+void TreeBuilder::ingestDiagnostics(std::span<ParseDiagnostic const> diags) {
+    if (finished_) {
+        addBuilderInvariant_("ingestDiagnostics() after finish()",
+                             SourceSpan::empty(0));
+        return;
+    }
+    // Report verbatim: external diagnostics already carry their own buffer,
+    // span, and scope. Do NOT route through emitDiagnostic_ — that would
+    // overwrite scopeStack with the builder's (empty/irrelevant for lexer
+    // diags). Goes through report() so the cap/dedup window still applies.
+    for (auto const& d : diags) {
+        reporter_->report(d);
+    }
+}
+
 void TreeBuilder::addBuilderInvariant_(std::string actual, SourceSpan span) {
     ParseDiagnostic d;
     d.code     = DiagnosticCode::P_BuilderInvariant;

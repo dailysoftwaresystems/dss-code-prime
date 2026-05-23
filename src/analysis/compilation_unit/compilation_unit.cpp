@@ -1,8 +1,16 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 
+#include "analysis/syntactic/parser.hpp"
+#include "core/types/parse_diagnostic.hpp"
+#include "core/types/source_buffer.hpp"
+#include "tokenizer/tokenizer.hpp"
+
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <system_error>
 #include <utility>
 
 namespace dss {
@@ -16,6 +24,23 @@ namespace {
     std::fputs(what, stderr);
     std::fputc('\n', stderr);
     std::abort();
+}
+
+// Build + report a driver-level diagnostic (no source span — driver errors
+// reference a path/label, not a byte range). The renderer handles an
+// invalid/absent buffer gracefully.
+void reportDriver(DiagnosticReporter& rep,
+                  DiagnosticCode      code,
+                  DiagnosticSeverity  severity,
+                  BufferId            buffer,
+                  std::string         actual) {
+    ParseDiagnostic d;
+    d.code     = code;
+    d.severity = severity;
+    d.buffer   = buffer;
+    d.span     = SourceSpan::empty(0);
+    d.actual   = std::move(actual);
+    rep.report(std::move(d));
 }
 
 } // namespace
@@ -65,7 +90,14 @@ GrammarSchema const& CompilationUnit::schema() const noexcept {
 // ── UnitBuilder ───────────────────────────────────────────────────────────
 UnitBuilder::UnitBuilder(std::shared_ptr<GrammarSchema const> schema)
     : id_(CompilationUnit::nextId())
-    , schema_(std::move(schema)) {
+    , schema_(std::move(schema))
+    // Driver diagnostics are keyed by PATH, not by source span — every
+    // D_FileNotFound / D_DuplicateFile shares (code, InvalidBuffer, empty
+    // span), so the reporter's span-based dedup window would silently
+    // collapse N distinct missing files into one message. Disable dedup on
+    // this reporter so each bad path surfaces. (Per-tree reporters keep
+    // their dedup; this disables it only for the CU's driver-level stream.)
+    , driverDiagnostics_(DiagnosticReporter::Config{.dedupWindow = 0}) {
     if (!schema_) {
         cuFatal("UnitBuilder: schema is null");
     }
@@ -80,6 +112,68 @@ void UnitBuilder::addTree(Tree&& tree) {
         cuFatal("UnitBuilder::addTree called after finish()");
     }
     trees_.push_back(std::move(tree));
+}
+
+void UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src) {
+    // Empty translation unit is valid (consistent with "empty CU is valid"):
+    // note it as Info but still parse + add the (empty) tree. Lives here so
+    // both addFile and addInMemory get the check from one place; the buffer
+    // name (path for files, label for in-memory) identifies it.
+    if (src->size() == 0) {
+        reportDriver(driverDiagnostics_, DiagnosticCode::D_EmptyInput,
+                     DiagnosticSeverity::Info, src->id(),
+                     std::string{src->name()});
+    }
+    // Canonical tokenize → parse → ingest sequence (mirrors the LSP parse
+    // path). The tokenizer's lexer diagnostics are handed to the Parser,
+    // which folds them into the produced Tree's reporter (§2.6 C2-L1), so
+    // the finished Tree owns lexer + parser diagnostics in one stream.
+    Tokenizer tk{src, schema_};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{src, schema_, std::move(stream), {}, std::move(lexDiags)};
+    addTree(std::move(p).parse().tree);
+}
+
+void UnitBuilder::addInMemory(std::string source, std::string label) {
+    if (finished_) {
+        cuFatal("UnitBuilder::addInMemory called after finish()");
+    }
+    parseAndAdd_(SourceBuffer::fromString(std::move(source), std::move(label)));
+}
+
+void UnitBuilder::addFile(std::filesystem::path path) {
+    if (finished_) {
+        cuFatal("UnitBuilder::addFile called after finish()");
+    }
+
+    // Dedup by weakly-canonical path (handles `.`/`..`/symlinks without
+    // requiring the file to exist). On canonicalization failure fall back
+    // to the lexically-normal form so a bad path is still keyed stably.
+    std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(path, ec);
+    std::string const key =
+        (ec ? path.lexically_normal() : canonical).string();
+    if (!seenPaths_.insert(key).second) {
+        reportDriver(driverDiagnostics_, DiagnosticCode::D_DuplicateFile,
+                     DiagnosticSeverity::Warning, InvalidBuffer, path.string());
+        return;  // already added — skip the re-parse.
+    }
+
+    std::shared_ptr<SourceBuffer> src;
+    try {
+        src = SourceBuffer::fromFile(path);
+    } catch (std::exception const& e) {
+        // Missing/unreadable file, mid-read IO error, or a read-time
+        // allocation failure (bad_alloc/length_error) — all *expected*
+        // runtime failures at this boundary. Continue-on-failure (§2.6
+        // C2-L2): record + return, never propagate (a throw would abort the
+        // whole CU build). The 4-GiB cap is a deliberate hard abort inside
+        // fromFile and is intentionally not catchable here.
+        reportDriver(driverDiagnostics_, DiagnosticCode::D_FileNotFound,
+                     DiagnosticSeverity::Error, InvalidBuffer, e.what());
+        return;
+    }
+    parseAndAdd_(std::move(src));
 }
 
 CompilationUnit UnitBuilder::finish() && {

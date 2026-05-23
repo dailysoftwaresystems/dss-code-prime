@@ -20,9 +20,12 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree.hpp"
 
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace dss {
@@ -125,8 +128,23 @@ public:
     // Mirrors `TreeBuilder::treeId()`.
     [[nodiscard]] CompilationUnitId id() const noexcept;
 
-    // CU1's only mutator (L4). Aborts if called after finish().
+    // Low-level mutator: push an already-built Tree. Aborts if called
+    // after finish(). CU2's addFile/addInMemory compose on top of it.
     void addTree(Tree&& tree);
+
+    // Read `path`, tokenize, parse, and add the resulting Tree (CU2).
+    // Continue-on-failure (§2.6 C2-L2): a missing/unreadable file emits
+    // `D_FileNotFound` into the driver diagnostics and returns without
+    // adding a tree. A path already added (by weakly-canonical comparison)
+    // emits `D_DuplicateFile` and is skipped. The tokenizer's lexer
+    // diagnostics are folded into the produced Tree (one stream per file,
+    // §2.6 C2-L1). Aborts if called after finish().
+    void addFile(std::filesystem::path path);
+
+    // In-memory variant of addFile: `label` names the buffer for
+    // diagnostics (e.g. a URI or synthetic name). No deduplication —
+    // in-memory sources are explicit. Aborts if called after finish().
+    void addInMemory(std::string source, std::string label);
 
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
@@ -135,10 +153,15 @@ public:
     [[nodiscard]] CompilationUnit finish() &&;
 
 private:
+    // Shared tail of addFile/addInMemory: tokenize → parse (folding lexer
+    // diagnostics into the Tree) → addTree. `src` must be non-null.
+    void parseAndAdd_(std::shared_ptr<SourceBuffer> src);
+
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
     std::vector<Tree>                    trees_;
     DiagnosticReporter                   driverDiagnostics_;
+    std::unordered_set<std::string>      seenPaths_;   // weakly-canonical, for addFile dedup
     bool                                 finished_ = false;
 };
 
