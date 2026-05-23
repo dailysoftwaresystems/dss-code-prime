@@ -164,6 +164,6 @@ These are the gaps in §1/§8 that **parser-plan PA4** (real-world corpus stress
 | 5     | ~~Row 8 (postfix `x++` `x--`)~~             | **Closed by parser-plan PA4** (simple-postfix `++`/`--`).                                    |
 | 6     | ~~Row 16 (compound assignment `+= -= *= /=`)~~ | **Closed by PA5a-prep.**                       |
 | 7     | ~~Row 29 (extern decl in c-subset)~~        | **Closed by PA5a-prep.**                         |
-| 8     | Row 25 (struct/union/enum in c-subset)      | Deferred to a focused c-subset shape PR (post-PA5a). Bigger scope than PA5a-prep wants. |
+| 8     | Row 25 (struct/union/enum in c-subset)      | Deferred to a focused c-subset shape PR (post parser-phase). Bigger scope than PA5a-prep wants. |
 | 9     | Row 28 (multi-file translation units)       | **Decide before semantic phase #8 starts** — design new "compilation unit" concept |
 | 10    | Row 17 (ternary `? :`)                      | **Defer to v3** — mixfix not modeled in v1+v2 operator-arity enum |

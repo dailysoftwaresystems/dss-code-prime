@@ -9,7 +9,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 production-critical; gates phase #8 (`analysis-semantic`). Production-readiness G-110 + G-111. |
-| Predecessors  | Parser phase #7 ([`05-parser-plan - tbd.md`](./05-parser-plan%20-%20tbd.md)) — PA1 must ship before CU1; PA5 LSP must NOT block on this (LSP operates per-file). |
+| Predecessors  | ✅ Parser phase #7 closed ([`05-parser-plan - ok.md`](./05-parser-plan%20-%20tbd.md)) — PA0–PA5b all shipped. CU1 unblocked. LSP (PA5a/PA5b) ships per-file as designed; cross-file LSP features wait for a dedicated LSP follow-up plan post-phase #8. |
 | Successors    | Phase #8 (`analysis-semantic`) consumes `CompilationUnit` instead of bare `Tree`. Phase #9 (IR) lowers per-CU. Phase #11 (codegen) emits one artifact per CU. |
 | Scope         | **Bounded.** CU1: `CompilationUnit` type + driver-level aggregation. CU2: multi-file parser invocation + per-file diagnostic merging. CU3: cross-tree symbol-shape hook (the contract semantic phase consumes). CU4: per-language import-resolution shim (heuristic for v1; schema-driven in v3). |
 
