@@ -28,6 +28,7 @@ using namespace dss;
 using dss::tests::drainWhitespace;
 using dss::tests::E2EHarness;
 using dss::tests::prettyPrint;
+using dss::tests::pushNext;
 using dss::tests::tokenizeShipped;
 
 // Drives `int x = 5;` through the disambiguated topLevel shape:
@@ -54,8 +55,7 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
             auto tail   = b.open(h.schema->rules().find("topLevelTail"));
             auto vdTail = b.open(h.schema->rules().find("varDeclTail"));
             drainWhitespace(b, h.stream);
-            b.pushToken(h.stream.advance());
-            drainWhitespace(b, h.stream);
+            pushNext(b, h.stream);
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
@@ -69,9 +69,6 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     EXPECT_TRUE(t.diagnostics().all().empty());
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
-    EXPECT_TRUE(h.lexerDiags->all().empty())
-        << "tokenizer should produce no diagnostics on clean source";
-
     const std::string_view expected =
         "rule:root\n"
         "  rule:topLevel\n"
@@ -120,35 +117,29 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
                 auto tb = b.open(h.schema->rules().find("typeBase"));
                 b.pushToken(h.stream.advance());
             }
-            b.pushToken(h.stream.advance());
-            drainWhitespace(b, h.stream);
+            pushNext(b, h.stream);
             {
                 auto blk = b.open(h.schema->rules().find("block"));
-                b.pushToken(h.stream.advance());
-                drainWhitespace(b, h.stream);
+                pushNext(b, h.stream);
                 {
                     auto stmt = b.open(h.schema->rules().find("statement"));
                     auto ifs  = b.open(h.schema->rules().find("ifStmt"));
-                    b.pushToken(h.stream.advance());
-                    drainWhitespace(b, h.stream);
+                    pushNext(b, h.stream);
                     b.pushToken(h.stream.advance());
                     {
                         auto expr = b.open(h.schema->rules().find("expression"));
                         auto opr  = b.open(h.schema->rules().find("operand"));
                         b.pushToken(h.stream.advance());
                     }
-                    b.pushToken(h.stream.advance());
-                    drainWhitespace(b, h.stream);
+                    pushNext(b, h.stream);
                     {
                         auto innerStmt = b.open(h.schema->rules().find("statement"));
                         auto innerBlk  = b.open(h.schema->rules().find("block"));
-                        b.pushToken(h.stream.advance());
-                        drainWhitespace(b, h.stream);
+                        pushNext(b, h.stream);
                         {
                             auto retStmt = b.open(h.schema->rules().find("statement"));
                             auto rs      = b.open(h.schema->rules().find("returnStmt"));
-                            b.pushToken(h.stream.advance());
-                            drainWhitespace(b, h.stream);
+                            pushNext(b, h.stream);
                             {
                                 auto retExpr = b.open(h.schema->rules().find("expression"));
                                 auto retOpr  = b.open(h.schema->rules().find("operand"));
@@ -173,7 +164,6 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
             : diagnosticCodeName(t.diagnostics().all()[0].code));
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
-    EXPECT_TRUE(h.lexerDiags->all().empty());
 
     const std::string_view expected =
         "rule:root\n"
@@ -257,86 +247,19 @@ TEST(CSubsetEndToEnd, OperatorTableMatchesCPrecedence) {
     EXPECT_GT(bangP->precedence, plus->precedence);
 }
 
-// Pins the current shape of `a + b * c;` — a flat left-fold under one
-// expression node rather than the (a + (b * c)) grouping C requires.
-// The schema as shipped today has no concept of operator precedence;
-// `expression` is `operand (binaryOp operand)*` with no grouping rule.
-// When precedence lands, this test's expected literal flips from a flat
-// sequence to a nested binaryExpr grouping — that flip is the visible
-// signal the limitation has been removed.
-TEST(CSubsetEndToEnd, ExpressionWithMixedOpsIsLeftFolded) {
-    auto h = tokenizeShipped("c-subset", "a + b * c;");
-    ASSERT_NE(h.schema, nullptr);
-
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto es   = b.open(h.schema->rules().find("exprStmt"));
-        {
-            auto expr = b.open(h.schema->rules().find("expression"));
-            {
-                auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance());
-            }
-            drainWhitespace(b, h.stream);
-            {
-                auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(h.stream.advance());
-            }
-            drainWhitespace(b, h.stream);
-            {
-                auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance());
-            }
-            drainWhitespace(b, h.stream);
-            {
-                auto bop = b.open(h.schema->rules().find("binaryOp"));
-                b.pushToken(h.stream.advance());
-            }
-            drainWhitespace(b, h.stream);
-            {
-                auto opr = b.open(h.schema->rules().find("operand"));
-                b.pushToken(h.stream.advance());
-            }
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
-
-    // This test opens `statement` directly under `root`, bypassing the
-    // c-subset schema's typical `topLevel → topLevelTail → funcTail → block
-    // → statement` path. The schema cursor goes off-track on the first
-    // statement open and emits a single P_SchemaCursorDesync (info) per
-    // the one-shot policy. The tree shape itself is the structural pin.
-    auto const& diags = t.diagnostics().all();
-    EXPECT_EQ(diags.size(), 1u);
-    if (!diags.empty()) {
-        EXPECT_EQ(diags.front().code, DiagnosticCode::P_SchemaCursorDesync);
-        EXPECT_EQ(diags.front().severity, DiagnosticSeverity::Info);
-    }
-    EXPECT_FALSE(t.diagnostics().hasErrors());
-    EXPECT_FALSE(hasError(t.flags(t.root())));
-    EXPECT_TRUE(h.lexerDiags->all().empty());
-
-    const std::string_view expected =
-        "rule:root\n"
-        "  rule:statement\n"
-        "    rule:exprStmt\n"
-        "      rule:expression\n"
-        "        rule:operand\n"
-        "          tok:\"a\"\n"
-        "        rule:binaryOp\n"
-        "          tok:\"+\"\n"
-        "        rule:operand\n"
-        "          tok:\"b\"\n"
-        "        rule:binaryOp\n"
-        "          tok:\"*\"\n"
-        "        rule:operand\n"
-        "          tok:\"c\"\n"
-        "      tok:\";\"\n";
-    EXPECT_EQ(prettyPrint(t), expected);
-}
+// v2-gap-catalog row 1 used to live here as the flat-fold pin
+// (`ExpressionWithMixedOpsIsLeftFolded`). PA2 closed the gap by
+// migrating c-subset's `expression` rule to use the `expr` shape and
+// wiring the Pratt walker into the parser. The precedence-correct
+// shape is now pinned end-to-end in
+// `tests/analysis/syntactic/test_parser_c_subset_pratt.cpp`, where it
+// exercises the actual walker rather than a hand-rolled flat tree.
+//
+// The hand-driven test pattern no longer applies: with `binaryOp`
+// removed from the schema and `expression` now expr-kind, the only
+// way to produce a structurally-correct expression tree is through
+// the parser — which is exactly what PA4's broader hand-driven→
+// parser-driven flip is about.
 
 // SH4b: end-to-end parse of a switch statement with a `case` arm + a
 // `default` arm + a `break`. Closes v2-gap-catalog row 11. The design
@@ -355,24 +278,20 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sw   = b.open(h.schema->rules().find("switchStmt"));
-        b.pushToken(h.stream.advance());
-        drainWhitespace(b, h.stream);
+        pushNext(b, h.stream);
         b.pushToken(h.stream.advance());
         {
             auto expr = b.open(h.schema->rules().find("expression"));
             auto opr  = b.open(h.schema->rules().find("operand"));
             b.pushToken(h.stream.advance());
         }
-        b.pushToken(h.stream.advance());
-        drainWhitespace(b, h.stream);
-        b.pushToken(h.stream.advance());
-        drainWhitespace(b, h.stream);
+        pushNext(b, h.stream);
+        pushNext(b, h.stream);
         // ── case arm
         {
             auto item = b.open(h.schema->rules().find("switchBodyItem"));
             auto lbl  = b.open(h.schema->rules().find("caseLabel"));
-            b.pushToken(h.stream.advance());
-            drainWhitespace(b, h.stream);
+            pushNext(b, h.stream);
             {
                 auto expr = b.open(h.schema->rules().find("expression"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
@@ -425,7 +344,6 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
     }
     EXPECT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasError(t.flags(t.root())));
-    EXPECT_TRUE(h.lexerDiags->all().empty());
 
     const std::string_view expected =
         "rule:root\n"

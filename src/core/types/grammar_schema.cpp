@@ -112,6 +112,18 @@ bool GrammarSchema::isEmptySpace(SchemaTokenId id) const noexcept {
     return d_.emptySpaceTokens.contains(id.v);
 }
 
+NodeFlags GrammarSchema::flagsForKind(SchemaTokenId id) const noexcept {
+    // No schema field populates per-kind flags today, so every kind
+    // returns None. The accessor is the structural channel the
+    // numeric-literal emit site reads — a future `literalFlags`
+    // schema field plugs in here without a tokenizer change. The
+    // valid-id check bakes the contract NOW, while there are zero
+    // data-bearing callers: future schemas wiring real data in must
+    // not silently accept an invalid id.
+    if (!id.valid()) return NodeFlags::None;
+    return NodeFlags::None;
+}
+
 std::span<LexerMode const> GrammarSchema::lexerModes() const noexcept {
     // Slot 0 is the InvalidLexerMode sentinel — internal indexing
     // detail. Real modes start at index 1; subspan(1) hides the
@@ -302,16 +314,64 @@ std::uint16_t GrammarSchema::lookahead(SchemaCursor cur) const noexcept {
     return (p != nullptr && p->slotKind() == SlotKind::AltChoice) ? p->lookahead() : 0;
 }
 
+bool GrammarSchema::nullableTail(SchemaCursor cur) const noexcept {
+    auto const* p = lookupPos(d_, cur);
+    return p != nullptr && p->nullableTail();
+}
+
+SchemaCursor GrammarSchema::nullableBranch(SchemaCursor cur) const noexcept {
+    auto const* p = lookupPos(d_, cur);
+    if (p == nullptr || p->slotKind() != SlotKind::AltChoice) return SchemaCursor{};
+    auto it = d_.compiledRules.find(cur.rule().v);
+    if (it == d_.compiledRules.end()) return SchemaCursor{};
+    auto const& positions = it->second.positions;
+    for (auto bid : p->branches()) {
+        if (bid >= positions.size()) continue;
+        if (positions[bid].nullableTail()) {
+            return SchemaCursor{cur.rule(), bid};
+        }
+    }
+    return SchemaCursor{};
+}
+
 std::span<SchemaTokenId const> GrammarSchema::firstSetOf(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return {};
     return it->second.firstSet;
 }
 
+std::span<SchemaTokenId const> GrammarSchema::followSetOf(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return {};
+    return it->second.followSet;
+}
+
+std::span<SchemaTokenId const> GrammarSchema::syncTokens() const noexcept {
+    return d_.syncTokens;
+}
+
 bool GrammarSchema::isNullable(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return false;
     return it->second.nullable;
+}
+
+bool GrammarSchema::isExprRule(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return false;
+    return it->second.isExpr;
+}
+
+RuleId GrammarSchema::exprAtom(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return RuleId{};
+    return it->second.exprAtom;
+}
+
+std::int32_t GrammarSchema::exprMinPrecedence(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return 0;
+    return it->second.exprMinPrecedence;
 }
 
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,

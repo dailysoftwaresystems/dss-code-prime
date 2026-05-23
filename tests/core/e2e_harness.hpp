@@ -36,7 +36,6 @@ public:
     TokenStream                          stream;
     std::unique_ptr<DiagnosticReporter>  lexerDiags;
 
-    E2EHarness() = default;
     E2EHarness(std::shared_ptr<SourceBuffer>        s,
                std::shared_ptr<GrammarSchema const> sch,
                TokenStream                          stm,
@@ -48,8 +47,8 @@ public:
 
     E2EHarness(E2EHarness const&)            = delete;
     E2EHarness& operator=(E2EHarness const&) = delete;
-    E2EHarness(E2EHarness&&) noexcept            = default;
-    E2EHarness& operator=(E2EHarness&&) noexcept = default;
+    E2EHarness(E2EHarness&&)                 = default;
+    E2EHarness& operator=(E2EHarness&&)      = default;
 
     // Opt out of the destructor's clean-diags assertion. Use for tests
     // that exercise tokenizer error paths and want to inspect diags
@@ -102,6 +101,16 @@ inline void drainWhitespace(TreeBuilder& b, TokenStream& s) {
          || s.peek().coreKind == CoreTokenKind::Newline)) {
         b.pushToken(s.advance());
     }
+}
+
+// Advance one token from `s` into `b`, then drain any trailing
+// whitespace/newline tokens. Collapses the
+// `b.pushToken(s.advance()); drainWhitespace(b, s);` pattern that
+// dominates the hand-driven test bodies (40+ sites in
+// `tests/core/test_tsql_subset.cpp` alone).
+inline void pushNext(TreeBuilder& b, TokenStream& s) {
+    b.pushToken(s.advance());
+    drainWhitespace(b, s);
 }
 
 } // namespace dss::tests

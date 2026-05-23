@@ -116,7 +116,18 @@ struct CompiledRule {
     std::uint32_t              entryPos = 0;
     std::vector<Position>      positions;
     std::vector<SchemaTokenId> firstSet;
+    std::vector<SchemaTokenId> followSet;
     bool                       nullable = false;
+
+    // `expr`-shape metadata. `isExpr` true iff the rule's body is
+    // `{ "expr": { "atom": ... } }`. The cursor still compiles `expr`
+    // as a transparent reference to the atom rule (see
+    // `PositionBuilder::build`); these fields tell the parser to
+    // hand off to a Pratt walker instead of recursing through the
+    // cursor's atom RuleLeaf.
+    bool                       isExpr = false;
+    RuleId                     exprAtom{};
+    std::int32_t               exprMinPrecedence = 0;
 };
 
 } // namespace dss::detail

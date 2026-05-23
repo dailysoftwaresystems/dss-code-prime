@@ -23,6 +23,7 @@
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
     "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
     "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "\r": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
 
     "//": [{
       "kind": "LineCommentStart", "flags": ["EmptySpace"],
@@ -67,12 +68,26 @@
     "^":  [{ "kind": "BitXorOp" }],
     "~":  [{ "kind": "TildeOp"  }],
     "<<": [{ "kind": "ShlOp"    }],
-    ">>": [{ "kind": "ShrOp"    }]
+    ">>": [{ "kind": "ShrOp"    }],
+
+    "++": [{ "kind": "PlusPlusOp" }],
+    "--": [{ "kind": "MinusMinusOp" }],
+
+    "+=":  [{ "kind": "PlusAssignOp"   }],
+    "-=":  [{ "kind": "MinusAssignOp"  }],
+    "*=":  [{ "kind": "StarAssignOp"   }],
+    "/=":  [{ "kind": "SlashAssignOp"  }],
+    "%=":  [{ "kind": "ModAssignOp"    }],
+    "&=":  [{ "kind": "BitAndAssignOp" }],
+    "|=":  [{ "kind": "BitOrAssignOp"  }],
+    "^=":  [{ "kind": "BitXorAssignOp" }],
+    "<<=": [{ "kind": "ShlAssignOp"    }],
+    ">>=": [{ "kind": "ShrAssignOp"    }]
   },
 
   "operators": {
     "groups": [
-      { "precedence": 15, "associativity": "right",                      "operators": ["="]                                    },
+      { "precedence": 15, "associativity": "right",                      "operators": ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] },
       { "precedence": 20, "associativity": "left",                       "operators": ["||"]                                   },
       { "precedence": 25, "associativity": "left",                       "operators": ["&&"]                                   },
       { "precedence": 30, "associativity": "left",                       "operators": ["|"]                                    },
@@ -83,9 +98,14 @@
       { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
       { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
       { "precedence": 70, "associativity": "left",                       "operators": ["*", "/"]                               },
-      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-"]                          }
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*"]                     },
+      { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" }
     ]
   },
+
+  "syncTokens": ["EndStatement", "BlockClose"],
 
   "keywords": [
     { "word": "void",   "kind": "VoidKeyword"   },
@@ -102,14 +122,40 @@
     { "word": "switch",  "kind": "SwitchKeyword"  },
     { "word": "case",    "kind": "CaseKeyword"    },
     { "word": "default", "kind": "DefaultKeyword" },
-    { "word": "break",   "kind": "BreakKeyword"   }
+    { "word": "break",   "kind": "BreakKeyword"   },
+
+    { "word": "extern",  "kind": "ExternKeyword"  }
   ],
 
   "shapes": {
     "root": { "sequence": [ { "repeat": "topLevel" } ] },
 
     "topLevel": {
-      "sequence": [ "typeRef", "Identifier", "topLevelTail" ]
+      "alt": [
+        { "sequence": [ "typeRef", "Identifier", "topLevelTail" ] },
+        "externDecl"
+      ]
+    },
+
+    "externDecl": {
+      "sequence": [
+        "ExternKeyword",
+        "typeRef",
+        "Identifier",
+        "externTail"
+      ]
+    },
+
+    "externTail": {
+      "alt": [
+        { "sequence": [
+            "ParenOpen",
+            { "optional": "paramList" },
+            "ParenClose",
+            "EndStatement"
+        ] },
+        "varDeclTail"
+      ]
     },
 
     "topLevelTail": { "alt": [ "funcTail", "varDeclTail" ] },
@@ -125,8 +171,17 @@
 
     "varDeclTail": {
       "sequence": [
+        { "optional": "arrayDeclSuffix" },
         { "optional": { "sequence": [ "AssignOp", "expression" ] } },
         "EndStatement"
+      ]
+    },
+
+    "arrayDeclSuffix": {
+      "sequence": [
+        "BracketOpen",
+        { "optional": "expression" },
+        "BracketClose"
       ]
     },
 
@@ -144,6 +199,7 @@
       "sequence": [
         "typeRef",
         "Identifier",
+        { "optional": "arrayDeclSuffix" },
         { "optional": { "sequence": [ "AssignOp", "expression" ] } }
       ]
     },
@@ -255,22 +311,7 @@
 
     "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
 
-    "expression": {
-      "sequence": [
-        "operand",
-        { "repeat": { "sequence": [ "binaryOp", "operand" ] } }
-      ]
-    },
-
-    "binaryOp": {
-      "alt": [
-        "AssignOp",
-        "PlusOp", "MinusOp", "StarOp", "SlashOp",
-        "EqEqOp", "NotEqOp", "LtOp", "GtOp", "LtEqOp", "GtEqOp",
-        "AndAndOp", "OrOrOp",
-        "BitAndOp", "BitOrOp", "BitXorOp", "ShlOp", "ShrOp"
-      ]
-    },
+    "expression": { "expr": { "atom": "operand" } },
 
     "operand": {
       "alt": [
@@ -278,11 +319,17 @@
         "IntLiteral",
         "CharLiteral",
         "StringLiteral",
-        { "sequence": [ "BangOp",   "operand" ] },
-        { "sequence": [ "MinusOp",  "operand" ] },
-        { "sequence": [ "TildeOp",  "operand" ] },
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
+    },
+
+    "argList": {
+      "optional": {
+        "sequence": [
+          "expression",
+          { "repeat": { "sequence": [ "Comma", "expression" ] } }
+        ]
+      }
     }
   }
 }

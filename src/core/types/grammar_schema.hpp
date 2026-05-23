@@ -185,6 +185,10 @@ struct DSS_EXPORT GrammarSchemaData {
                                           std::vector<LexemeMeaning>>>
                                                       lexerModeTokens;
 
+    // Off-grammar body-token kinds — see
+    // `GrammarSchema::bodyDefaultTokenKinds()` for the contract.
+    std::unordered_set<SchemaTokenId>                 bodyDefaultTokenKinds;
+
     // Pool indexed by `LexemeMeaning::stringStyleId`. Slot 0 is the
     // InvalidStringStyle sentinel; real ids 1..N. Each StringStyle
     // owns its `endsAt`/`tagPattern` strings; the vector may reallocate
@@ -202,6 +206,14 @@ struct DSS_EXPORT GrammarSchemaData {
     // cap its longest-match probe length. Zero only for a schema with
     // no declared `tokens` entries.
     std::size_t                                       maxLexemeLength = 0;
+
+    // Panic-mode sync tokens declared at the schema level — token
+    // kinds the parser treats as "safe resync points" when the input
+    // is broken. Sorted ascending by `id.v` so callers can use
+    // binary-search probes. Loader-validated: every entry must be a
+    // declared token kind, and Eof/Error are rejected (Eof is always
+    // an implicit sync; Error would short-circuit recovery).
+    std::vector<SchemaTokenId>                        syncTokens;
 };
 
 } // namespace detail
@@ -269,6 +281,39 @@ public:
     [[nodiscard]] std::span<LexemeMeaning const>
         lookupLexemeInMode(LexerModeId mode, std::string_view lexeme) const noexcept;
 
+    // Off-grammar body-token kinds. Every
+    // `lexerModes.<name>.defaultToken.kind` declared in the schema
+    // (`StringChar`, `BracketIdChar`, `CommentChar`, …) is a body
+    // token: emitted by the tokenizer as a leaf while a body mode is
+    // active, never referenced by any shape (loader-enforced via
+    // `C_BodyDefaultKindInShape`). Both `TreeBuilder::pushToken` and
+    // the parser dispatch loop consult this to skip schema-walker
+    // advance for body tokens. Single source of truth, computed once
+    // at schema-build time.
+    //
+    // `isBodyDefaultKind` is the preferred predicate — it hides the
+    // container choice. `bodyDefaultTokenKinds` returns the set
+    // directly for the hot-path consumers (parser + builder) that
+    // already cache a pointer to it and would otherwise pay an
+    // accessor call per token.
+    [[nodiscard]] bool isBodyDefaultKind(SchemaTokenId id) const noexcept {
+        return d_.bodyDefaultTokenKinds.contains(id);
+    }
+    [[nodiscard]] std::unordered_set<SchemaTokenId> const&
+        bodyDefaultTokenKinds() const noexcept { return d_.bodyDefaultTokenKinds; }
+
+    // Per-`SchemaTokenId` flags channel used by tokenizer emit sites
+    // that don't pass through the lexeme-meaning lookup (e.g. numeric
+    // literals, where the tokenizer hand-codes the scan and the kind
+    // is the built-in `IntLiteral`/`FloatLiteral` rather than a
+    // schema-declared lexeme). Today every kind returns
+    // `NodeFlags::None`; this is the structural channel a future
+    // schema field (e.g. `literalFlags: { IntLiteral: [...] }`) would
+    // populate. The accessor exists so the numeric emit site uses the
+    // same `flagsApplied`-aware shape as the other emit sites and
+    // doesn't drift if a use case lands.
+    [[nodiscard]] NodeFlags flagsForKind(SchemaTokenId id) const noexcept;
+
     // Per-instance schema id stamped onto every owned `LexemeMeaning`.
     // Used by accessors like `stringStyle(m)` to assert that `m`
     // actually came from this schema rather than a copy from another.
@@ -330,9 +375,44 @@ public:
     [[nodiscard]] bool         isSpeculativeAlt(SchemaCursor cur) const noexcept;
     [[nodiscard]] std::uint16_t lookahead(SchemaCursor cur) const noexcept;
 
+    // Nullable-tail introspection used by the parser to detect and
+    // step past skippable `optional`/`repeat` shapes.
+    //
+    // `nullableTail(cur)`: true when the position can complete to
+    // end-of-rule without consuming a token.
+    //
+    // `nullableBranch(cur)`: at an AltChoice cursor, returns the
+    // first branch whose `nullableTail` is true; invalid otherwise.
+    // "First wins" is deliberate: the only AltChoice shapes the
+    // loader produces with multiple nullable branches are
+    // `optional` (two branches, second is the skip) and `repeat`
+    // (two branches, second is the loop exit) — both unambiguous
+    // by construction. A hand-rolled `alt` with multiple nullable
+    // arms is loader-rejected via `C_AmbiguousAlternatives` on
+    // overlapping FIRST sets, which empirically covers every
+    // multi-nullable case the loader can emit.
+    [[nodiscard]] bool         nullableTail(SchemaCursor cur)   const noexcept;
+    [[nodiscard]] SchemaCursor nullableBranch(SchemaCursor cur) const noexcept;
+
     // Direct per-rule queries that don't require a cursor instance.
     [[nodiscard]] std::span<SchemaTokenId const> firstSetOf(RuleId rule) const noexcept;
+    [[nodiscard]] std::span<SchemaTokenId const> followSetOf(RuleId rule) const noexcept;
     [[nodiscard]] bool                           isNullable(RuleId rule) const noexcept;
+
+    // Schema-declared panic-mode sync tokens. Sorted ascending by
+    // `id.v`. Empty when the config omits the `syncTokens` field.
+    // Parser's panic-mode recovery consumes until peek is in this set
+    // OR in `followSetOf(currentRule)`.
+    [[nodiscard]] std::span<SchemaTokenId const> syncTokens() const noexcept;
+
+    // `expr`-shape introspection. `isExprRule` is true when the rule's
+    // body was declared as `{ "expr": { "atom": ..., "minPrecedence": ... } }`.
+    // For such rules `exprAtom` returns the operand rule and
+    // `exprMinPrecedence` returns the floor precedence for the outermost
+    // operator climb. Non-expr rules return false / InvalidRule / 0.
+    [[nodiscard]] bool         isExprRule(RuleId rule)        const noexcept;
+    [[nodiscard]] RuleId       exprAtom(RuleId rule)          const noexcept;
+    [[nodiscard]] std::int32_t exprMinPrecedence(RuleId rule) const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

@@ -6,6 +6,7 @@
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
+#include "core/types/well_known_names.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -623,7 +624,24 @@ std::vector<SchemaTokenId> firstOfBody(json const& body,
         return firstOfBody(body.at("repeat"), data);
     }
     if (body.contains("expr")) {
-        return firstOfBody(body.at("expr").at("atom"), data);
+        // FIRST(expr-rule) = FIRST(atom) ∪ {tokens registered as Prefix
+        // operators}. The Pratt walker dispatches on prefix tokens
+        // before descending into the atom rule, so the parser's
+        // dispatch loop must accept a prefix token as a legitimate
+        // entry into the expression rule. Without this union, the
+        // `tokInFirst` check in `RuleLeaf` dispatch rejects bare
+        // prefix expressions like `-a;` even though the walker would
+        // happily consume them.
+        auto result = firstOfBody(body.at("expr").at("atom"), data);
+        for (auto const& [lex, meanings] : data.lexemeTable) {
+            (void)lex;
+            for (auto const& m : meanings) {
+                if (data.operators.lookup(m.id, OperatorArity::Prefix)) {
+                    insertSorted(result, m.id);
+                }
+            }
+        }
+        return result;
     }
     return {};
 }
@@ -797,6 +815,30 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
         const auto endId   = builder.emplace(detail::Position::makeEnd());
         const auto entryId = builder.build(body, endId);
         rule.entryPos = entryId;
+
+        // Record `expr`-shape metadata so the parser can hand off to a
+        // Pratt walker. The cursor side already compiles the body as a
+        // transparent ref to atom (see `PositionBuilder::build`); this
+        // is the parser-side signal that operator-precedence climbing
+        // applies to this rule. The `expr` body was schema-validated
+        // upstream in `collectRuleRefs` — both `atom` (required) and
+        // `minPrecedence` (optional) are well-formed if we reach here.
+        if (body.is_object() && body.contains("expr")) {
+            json const& exprBody = body.at("expr");
+            if (exprBody.is_object() && exprBody.contains("atom")
+                && exprBody.at("atom").is_string()) {
+                const auto& atomName = exprBody.at("atom").get<std::string>();
+                if (data.rules->contains(atomName)) {
+                    rule.isExpr   = true;
+                    rule.exprAtom = data.rules->find(atomName);
+                    if (exprBody.contains("minPrecedence")
+                        && exprBody.at("minPrecedence").is_number_integer()) {
+                        rule.exprMinPrecedence =
+                            exprBody.at("minPrecedence").get<std::int32_t>();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -899,18 +941,140 @@ void computeNullableTails(GrammarSchemaData& data) {
     }
 }
 
-// Reject any rule shape that references a SchemaTokenId declared as a
-// lexer mode's `defaultToken.kind`. Body-default kinds are off-grammar
-// by construction (see `TreeBuilder::bodyDefaultTokenKinds_`): the
-// cursor-advance gate silently skips them, so a shape reference would
-// never match. Surface the bug at load time instead.
-void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll) {
-    std::unordered_set<SchemaTokenId> bodyKinds;
-    for (auto const& mode : data.lexerModes) {
-        if (mode.defaultToken) bodyKinds.insert(mode.defaultToken->kind);
+// FOLLOW(R) = the set of token kinds that can legitimately follow a
+// successful parse of rule R, anywhere it's referenced. Used by the
+// parser's panic-mode recovery to decide "have I reached a resync
+// point for the currently-failing rule".
+//
+// Algorithm (textbook fixed-point):
+//   For each parent rule, for each RuleLeaf(R) position p:
+//     - Add `expectedSet(positions[p.nextPos()])` to FOLLOW(R).
+//     - If `positions[p.nextPos()].nullableTail()`, also add
+//       FOLLOW(parentRule) to FOLLOW(R) (the path continues past
+//       parentRule's end, picking up the grandparent's follow).
+// Iterate until no follow set grows.
+//
+// Root rule's FOLLOW stays empty — nothing in the grammar references
+// it. EOF is handled separately by the parser's `canEndSource` check.
+void computeFollowSets(GrammarSchemaData& data, Collector& coll) {
+    // Bound is far above the O(rules × positions) convergence the
+    // monotone lattice guarantees — functions as a runaway guard
+    // against a future refactor that breaks monotonicity. If we hit
+    // it with `changed == true` we emit a loader diagnostic rather
+    // than silently shipping a truncated FOLLOW set.
+    constexpr int kMaxIters = 10000;
+    auto addToFollow = [](std::vector<SchemaTokenId>& follow,
+                          SchemaTokenId tok) -> bool {
+        auto it = std::lower_bound(follow.begin(), follow.end(), tok,
+            [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; });
+        if (it != follow.end() && it->v == tok.v) return false;
+        follow.insert(it, tok);
+        return true;
+    };
+
+    bool changed = true;
+    int iters = 0;
+    while (changed && iters++ < kMaxIters) {
+        changed = false;
+        for (auto& [parentIdV, parentRule] : data.compiledRules) {
+            auto const& positions = parentRule.positions;
+            // Snapshot parent's follow set up-front so a same-rule
+            // self-reference can't read a follow set we just mutated
+            // in this iteration. Reads stay stable within one pass;
+            // changes propagate on the next iteration.
+            const auto parentFollowSnapshot = parentRule.followSet;
+            for (auto const& p : positions) {
+                if (p.slotKind() != SlotKind::RuleLeaf) continue;
+                const RuleId childRule = p.ruleId();
+                auto childIt = data.compiledRules.find(childRule.v);
+                if (childIt == data.compiledRules.end()) continue;
+                auto& childFollow = childIt->second.followSet;
+                if (p.nextPos() >= positions.size()) continue;
+                auto const& next = positions[p.nextPos()];
+                for (auto tok : next.expectedSet()) {
+                    if (addToFollow(childFollow, tok)) changed = true;
+                }
+                if (next.nullableTail()) {
+                    for (auto tok : parentFollowSnapshot) {
+                        if (addToFollow(childFollow, tok)) changed = true;
+                    }
+                }
+            }
+        }
     }
+    if (changed) {
+        coll.emit(DiagnosticCode::C_CircularShape,
+                  "/shapes",
+                  std::format("FOLLOW-set fixed-point did not converge in "
+                              "{} iterations — the grammar likely violates "
+                              "monotonicity (a loader bug); FOLLOW data is "
+                              "truncated and recovery quality degraded",
+                              kMaxIters));
+    }
+}
+
+// Validate that every operator-table `bodyRule` resolves to an
+// actually-declared shape (has a compiled body). The operators block
+// runs before shape interning so the loader can only intern the name
+// at that point; the real check happens here, post-shapes-compile.
+void validateOperatorBodyRules(GrammarSchemaData& data, Collector& coll) {
+    // For each interned rule lacking a compiled body, check whether
+    // any postfix operator entry's `bodyRule` references it. The
+    // operators block runs before shape interning, so the loader
+    // could only intern the name at operator-load time; the real
+    // "shape exists" check happens here, post-shapes-compile.
+    auto const& interner = *data.rules;
+    for (std::uint32_t r = 1; r < interner.size(); ++r) {
+        const RuleId rule{r};
+        if (data.compiledRules.contains(rule.v)) continue;
+        // Pratt walker synthesizes `binaryExpr`/`unaryExpr`/`postfixExpr`
+        // frames without a schema shape; any new walker-only wrapper
+        // must be added to this skip list (and to `well_known_names.hpp`).
+        const auto name = interner.name(rule);
+        if (name == rules::kBinaryExpr
+            || name == rules::kUnaryExpr
+            || name == rules::kPostfixExpr) {
+            continue;
+        }
+        // Postfix is the only arity that carries `bodyRule`, so iterate
+        // just that slice — O(N) in the declared-token count, trivial
+        // at load time.
+        bool referenced = false;
+        for (std::uint32_t t = 1; t < data.schemaTokens->size() && !referenced; ++t) {
+            const SchemaTokenId tid{t};
+            const auto entry = data.operators.lookup(tid, OperatorArity::Postfix);
+            if (entry && entry->grouped
+                && entry->grouped->bodyRule.v == rule.v) {
+                referenced = true;
+            }
+        }
+        if (referenced) {
+            coll.emit(DiagnosticCode::C_UnknownShape,
+                      "/operators/groups",
+                      std::format("postfix operator group references "
+                                  "'bodyRule' = '{}' but no shape with "
+                                  "that name is declared", name));
+        }
+    }
+}
+
+// Reject any rule shape OR scope-forbid entry that references a
+// SchemaTokenId declared as a lexer mode's `defaultToken.kind`.
+// Body-default kinds are off-grammar by construction (see
+// `TreeBuilder::bodyDefaultTokenKinds_`): the cursor-advance gate
+// silently skips them, so either reference would silently never fire.
+//
+// Main-mode lexeme meanings DELIBERATELY may map to body-default
+// kinds (this is the OR-merge pattern pinned by
+// `Tokenizer.TokenFlags_PropagateToBuilderLeafFlags`). When a main-
+// mode lexeme resolves to a body-default kind the cursor-skip
+// correctly treats it like trivia — harmless as long as no shape
+// expects the kind, which the shape check below already enforces.
+void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll) {
+    auto const& bodyKinds = data.bodyDefaultTokenKinds;
     if (bodyKinds.empty()) return;
 
+    // Shape references.
     for (auto const& [ruleIdV, rule] : data.compiledRules) {
         const auto ruleName = data.rules->name(RuleId{ruleIdV});
         for (auto const& p : rule.positions) {
@@ -923,6 +1087,25 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
                                   "grammar — referencing it from a shape "
                                   "would silently never match",
                                   data.schemaTokens->name(p.tokenId())));
+        }
+    }
+
+    // scopes.validity[].forbid entries — a forbid on a body-default
+    // kind couldn't fire (the kind only appears inside its body mode,
+    // and synthesis goes through scope filtering which would reject
+    // before the forbid was ever consulted). Author probably meant a
+    // different kind.
+    for (auto const& [scopeV, forbidSet] : data.scopeForbid) {
+        for (auto const tokIdV : forbidSet) {
+            const SchemaTokenId id{tokIdV};
+            if (!bodyKinds.contains(id)) continue;
+            coll.emit(DiagnosticCode::C_BodyDefaultKindInShape,
+                      std::format("/scopes/validity"),
+                      std::format("token '{}' (forbidden inside scope id {}) is "
+                                  "declared as a lexer mode's defaultToken.kind "
+                                  "and is off-grammar; the forbid cannot fire",
+                                  data.schemaTokens->name(id),
+                                  scopeV));
         }
     }
 }
@@ -1600,7 +1783,74 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
 
-                const OperatorTable::Entry entry{precedence, assoc};
+                // Grouped-postfix delimiter + body rule. Optional;
+                // only meaningful for postfix arity. The walker reads
+                // `endsAt` to know "this postfix has a closing token"
+                // and `bodyRule` to know "what to parse between
+                // opener and closer". Both fields validated below
+                // BEFORE we stamp the entry into the table.
+                SchemaTokenId endsAtId{};
+                RuleId        bodyRuleId{};
+                if (g.contains("endsAt")) {
+                    if (arity != OperatorArity::Postfix) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'endsAt' is only valid on a postfix group");
+                        continue;
+                    }
+                    if (!g.at("endsAt").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'endsAt' must be a string lexeme");
+                        continue;
+                    }
+                    const auto closer = g.at("endsAt").get<std::string>();
+                    auto closerIt = data.lexemeTable.find(closer);
+                    if (closerIt == data.lexemeTable.end()
+                        || closerIt->second.empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("'endsAt' lexeme '{}' is not declared in 'tokens'",
+                                              closer));
+                        continue;
+                    }
+                    if (closerIt->second.size() != 1) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("'endsAt' lexeme '{}' has multiple meanings; "
+                                              "ambiguous closers are unsupported",
+                                              closer));
+                        continue;
+                    }
+                    endsAtId = closerIt->second[0].id;
+                }
+                if (g.contains("bodyRule")) {
+                    if (arity != OperatorArity::Postfix) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'bodyRule' is only valid on a postfix group");
+                        continue;
+                    }
+                    if (!endsAtId.valid()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'bodyRule' requires a paired 'endsAt' delimiter");
+                        continue;
+                    }
+                    if (!g.at("bodyRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'bodyRule' must be a string rule name");
+                        continue;
+                    }
+                    // The operators block runs BEFORE shapes are
+                    // interned in Pass A, so `data.rules->contains`
+                    // would falsely report unknown for every entry.
+                    // Intern the name now (creates the RuleId if
+                    // absent, returns existing one if a later shape
+                    // shares the name); validate-against-declared-
+                    // shapes happens in a post-shapes pass below.
+                    const auto rname = g.at("bodyRule").get<std::string>();
+                    bodyRuleId = data.rules->intern(rname);
+                }
+                OperatorTable::Entry entry{precedence, assoc, std::nullopt};
+                if (endsAtId.valid()) {
+                    entry.grouped = OperatorTable::GroupedPostfix{
+                        endsAtId, bodyRuleId};
+                }
 
                 for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
                     json const& op = g.at("operators")[j];
@@ -1698,6 +1948,62 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // syncTokens ──
+    // Optional array of token-kind names treated as panic-mode resync
+    // points by the parser. Loader validates: each entry must be a
+    // string naming a declared / built-in token kind, and Eof/Error are
+    // rejected (Eof is always an implicit sync; Error would short-
+    // circuit recovery before it ever reached a real syntactic site).
+    // Stored sorted ascending by id.v for fast contains-probes in the
+    // parser's hot recovery loop.
+    if (doc.contains("syncTokens")) {
+        json const& sv = doc.at("syncTokens");
+        if (!sv.is_array()) {
+            coll.emit(DiagnosticCode::C_MissingField, "/syncTokens",
+                      "'syncTokens' must be an array of token-kind names");
+        } else {
+            std::vector<SchemaTokenId> collected;
+            for (std::size_t i = 0; i < sv.size(); ++i) {
+                json const& entry = sv[i];
+                const auto path = std::format("/syncTokens/{}", i);
+                if (!entry.is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path,
+                              "syncToken entry must be a string token-kind name");
+                    continue;
+                }
+                const auto name = entry.get<std::string>();
+                if (!data.schemaTokens->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownToken, path,
+                              std::format("syncToken '{}' is not a declared "
+                                          "or built-in token kind", name));
+                    continue;
+                }
+                const auto id = data.schemaTokens->find(name);
+                if (name == "Eof" || name == "Error") {
+                    coll.emit(DiagnosticCode::C_ConflictingField, path,
+                              std::format("syncToken '{}' is reserved — Eof is "
+                                          "an implicit sync, Error would short-"
+                                          "circuit recovery", name));
+                    continue;
+                }
+                if (data.emptySpaceTokens.contains(id.v)) {
+                    coll.emit(DiagnosticCode::C_ConflictingField, path,
+                              std::format("syncToken '{}' is flagged "
+                                          "`EmptySpace`; using trivia as a "
+                                          "panic-mode break would stop "
+                                          "recovery at every whitespace", name));
+                    continue;
+                }
+                auto it = std::lower_bound(collected.begin(), collected.end(), id,
+                    [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; });
+                if (it == collected.end() || it->v != id.v) {
+                    collected.insert(it, id);
+                }
+            }
+            data.syncTokens = std::move(collected);
+        }
+    }
+
     // shapes ──
     if (doc.contains("shapes")) {
         if (!doc.at("shapes").is_object()) {
@@ -1708,6 +2014,74 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // regardless of definition order.
             for (auto const& [shapeName, _] : doc.at("shapes").items()) {
                 (void)data.rules->intern(shapeName);
+            }
+
+            // Auto-intern the Pratt-walker wrapper rules. The parser
+            // synthesizes `binaryExpr`/`unaryExpr`/`postfixExpr` frames
+            // around operator-precedence results; those frames need
+            // valid RuleIds. We auto-intern only when the schema
+            // actually uses `expr` shapes (i.e. opts into Pratt
+            // dispatch); other schemas keep their lean rule interner.
+            // The wrapper rules have no compiled body — they're
+            // parser-managed and the schema cursor walks transparently
+            // past them (silently invalid through the wrapper frame,
+            // recovering on close; no P_SchemaCursorDesync since the
+            // transitions skip the wasValid→!nowValid check).
+            //
+            // Reject user-declared shapes named `binaryExpr` /
+            // `unaryExpr` / `postfixExpr` — they're walker-synthesized
+            // and a user redeclaration would let the schema cursor see
+            // a body for them, breaking the "transparent wrapper"
+            // invariant. Surface as C_UnknownShape at the named path.
+            for (auto const& reserved
+                 : {"binaryExpr", "unaryExpr", "postfixExpr"}) {
+                if (doc.at("shapes").contains(reserved)) {
+                    coll.emit(
+                        DiagnosticCode::C_UnknownShape,
+                        std::format("/shapes/{}", reserved),
+                        std::format(
+                            "shape name '{}' is reserved for the "
+                            "Pratt-walker wrapper rule (auto-interned "
+                            "when the schema declares any `expr` shape); "
+                            "rename the user shape", reserved));
+                }
+            }
+
+            // Recursive scan: `expr` may be nested inside any
+            // sequence/alt/optional/repeat body, not only top-level.
+            // A flat scan would miss `{ "sequence": [ { "expr": {...} } ] }`
+            // and the walker would later fatal-abort on a missing
+            // wrapper-rule lookup.
+            auto containsExprBody = [](auto const& self,
+                                       json const& body) -> bool {
+                if (!body.is_object()) return false;
+                if (body.contains("expr")) return true;
+                for (auto const& key : {"sequence", "alt"}) {
+                    if (body.contains(key) && body.at(key).is_array()) {
+                        for (auto const& child : body.at(key)) {
+                            if (self(self, child)) return true;
+                        }
+                    }
+                }
+                for (auto const& key : {"optional", "repeat"}) {
+                    if (body.contains(key)) {
+                        if (self(self, body.at(key))) return true;
+                    }
+                }
+                return false;
+            };
+            bool schemaUsesExpr = false;
+            for (auto const& [shapeName, body] : doc.at("shapes").items()) {
+                (void)shapeName;
+                if (containsExprBody(containsExprBody, body)) {
+                    schemaUsesExpr = true;
+                    break;
+                }
+            }
+            if (schemaUsesExpr) {
+                for (auto const& name : {"binaryExpr", "unaryExpr", "postfixExpr"}) {
+                    (void)data.rules->intern(name);
+                }
             }
 
             // Pass B: validate references — every string atom must resolve
@@ -1742,11 +2116,23 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // Ambiguity detection runs last: it reads the position tables
             // to surface alt branches whose FIRST sets overlap.
             if (!coll.hasErrors()) {
+                // Compute the body-mode kind union BEFORE the
+                // validators run so they can consume the schema-
+                // owned set (single source of truth shared with
+                // `Parser::Impl` and `TreeBuilder`).
+                for (auto const& mode : data.lexerModes) {
+                    if (mode.defaultToken) {
+                        data.bodyDefaultTokenKinds.insert(
+                            mode.defaultToken->kind);
+                    }
+                }
                 computeFirstAndNullable    (data, doc.at("shapes"));
                 buildPositionTables        (data, doc.at("shapes"), coll);
                 detectAmbiguousAlternatives(data, coll, doc.at("shapes"));
                 computeNullableTails       (data);
+                computeFollowSets          (data, coll);
                 validateBodyDefaultKindsOffGrammar(data, coll);
+                validateOperatorBodyRules  (data, coll);
             }
         }
     }
@@ -1769,6 +2155,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             for (auto& m : meanings) m.schemaId = data.id;
         }
     }
+
+    // (`bodyDefaultTokenKinds` was populated above before the
+    // validators ran — see the shapes block.)
 
     // Longest declared lexeme key — consumed by the tokenizer (TZ1+)
     // to cap its longest-match probe length. Iterate every per-mode

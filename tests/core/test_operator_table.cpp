@@ -579,3 +579,245 @@ TEST(OperatorTableDeath, KeyPackingAbortsOnCeilingOverflow) {
                  OperatorArity::Infix, {0, OperatorAssoc::None});
     }, "exceeds 30-bit key budget");
 }
+
+// ── endsAt / bodyRule loader validation ──────────────────────────────
+//
+// Eight distinct error paths in `grammar_schema_json.cpp` for the
+// PA4 grouped-postfix fields. Each test isolates one path so a
+// regression surfaces with a single failing case.
+
+namespace {
+
+[[nodiscard]] std::vector<ConfigDiagnostic> loadShouldFail(std::string_view json) {
+    auto loaded = GrammarSchema::loadFromText(json);
+    EXPECT_FALSE(loaded.has_value())
+        << "expected load failure but the config loaded cleanly";
+    return loaded.has_value() ? std::vector<ConfigDiagnostic>{}
+                              : loaded.error();
+}
+
+// Each loader error path emits a specific `DiagnosticCode`; the
+// message text is informative but free to evolve. Tests pin the
+// CODE primarily and the message substring secondarily (so a typo
+// or rewording doesn't false-positive a regression, while still
+// catching messages that lose meaning entirely).
+[[nodiscard]] bool hasDiag(std::vector<ConfigDiagnostic> const& diags,
+                           DiagnosticCode code,
+                           std::string_view messageNeedle) {
+    for (auto const& d : diags) {
+        if (d.code == code
+            && d.message.find(messageNeedle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[maybe_unused]]
+[[nodiscard]] bool hasMessage(std::vector<ConfigDiagnostic> const& diags,
+                              std::string_view needle) {
+    for (auto const& d : diags) {
+        if (d.message.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+constexpr std::string_view kGroupedHeader = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "GroupedTest", "version": "0.1.0" },
+  "tokens": {
+    "(":  [{ "kind": "ParenOpen",  "opensScope": "Paren" }],
+    ")":  [{ "kind": "ParenClose", "closesScope": true   }],
+    "[":  [{ "kind": "BracketOpen",  "opensScope": "Bracket" }],
+    "]":  [{ "kind": "BracketClose", "closesScope": true     }],
+    "+":  [{ "kind": "PlusOp"   }]
+  },
+)JSON";
+
+} // namespace
+
+TEST(OperatorTableEndsAtBodyRule, EndsAtOnNonPostfixIsRejected) {
+    const auto cfg = std::string{kGroupedHeader}
+        + R"JSON(
+          "operators": {
+            "groups": [
+              { "precedence": 50, "operators": ["+"], "endsAt": ")" }
+            ]
+          },
+          "shapes": { "root": { "sequence": [ "Identifier" ] } }
+        })JSON";
+    const auto diags = loadShouldFail(cfg);
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'endsAt' is only valid on a postfix group"))
+        << "actual: " << (diags.empty() ? "<none>" : diags[0].message);
+}
+
+TEST(OperatorTableEndsAtBodyRule, EndsAtMustBeAString) {
+    const auto cfg = std::string{kGroupedHeader}
+        + R"JSON(
+          "operators": {
+            "groups": [
+              { "precedence": 100, "arity": "postfix",
+                "operators": ["("], "endsAt": 42 }
+            ]
+          },
+          "shapes": { "root": { "sequence": [ "Identifier" ] } }
+        })JSON";
+    const auto diags = loadShouldFail(cfg);
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'endsAt' must be a string"));
+}
+
+TEST(OperatorTableEndsAtBodyRule, EndsAtLexemeMustBeDeclared) {
+    const auto cfg = std::string{kGroupedHeader}
+        + R"JSON(
+          "operators": {
+            "groups": [
+              { "precedence": 100, "arity": "postfix",
+                "operators": ["("], "endsAt": "}" }
+            ]
+          },
+          "shapes": { "root": { "sequence": [ "Identifier" ] } }
+        })JSON";
+    const auto diags = loadShouldFail(cfg);
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "is not declared in 'tokens'"));
+}
+
+TEST(OperatorTableEndsAtBodyRule, EndsAtLexemeMustHaveSingleMeaning) {
+    // `(` declared with two meanings: ambiguous closer.
+    const std::string cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "AmbigTest", "version": "0.1.0" },
+      "tokens": {
+        "(":  [
+          { "kind": "ParenOpen",  "opensScope": "Paren", "priority": 1 },
+          { "kind": "TupleOpen",  "opensScope": "Paren", "priority": 2 }
+        ],
+        ")":  [
+          { "kind": "ParenClose", "closesScope": true, "priority": 1 },
+          { "kind": "TupleClose", "closesScope": true, "priority": 2 }
+        ]
+      },
+      "operators": {
+        "groups": [
+          { "precedence": 100, "arity": "postfix",
+            "operators": ["("], "endsAt": ")" }
+        ]
+      },
+      "shapes": { "root": { "sequence": [ "Identifier" ] } }
+    })JSON";
+    const auto diags = loadShouldFail(cfg);
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "ambiguous closers are unsupported"));
+}
+
+TEST(OperatorTableEndsAtBodyRule, BodyRuleOnNonPostfixIsRejected) {
+    const auto cfg = std::string{kGroupedHeader}
+        + R"JSON(
+          "operators": {
+            "groups": [
+              { "precedence": 50, "operators": ["+"], "bodyRule": "anything" }
+            ]
+          },
+          "shapes": { "root": { "sequence": [ "Identifier" ] } }
+        })JSON";
+    const auto diags = loadShouldFail(cfg);
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'bodyRule' is only valid on a postfix group"));
+}
+
+TEST(OperatorTableEndsAtBodyRule, BodyRuleWithoutEndsAtIsRejected) {
+    const auto cfg = std::string{kGroupedHeader}
+        + R"JSON(
+          "operators": {
+            "groups": [
+              { "precedence": 100, "arity": "postfix",
+                "operators": ["("], "bodyRule": "args" }
+            ]
+          },
+          "shapes": {
+            "root": { "sequence": [ "Identifier" ] },
+            "args": { "sequence": [ "Identifier" ] }
+          }
+        })JSON";
+    const auto diags = loadShouldFail(cfg);
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'bodyRule' requires a paired 'endsAt'"));
+}
+
+TEST(OperatorTableEndsAtBodyRule, BodyRuleMustBeAString) {
+    const auto cfg = std::string{kGroupedHeader}
+        + R"JSON(
+          "operators": {
+            "groups": [
+              { "precedence": 100, "arity": "postfix",
+                "operators": ["("], "endsAt": ")", "bodyRule": 42 }
+            ]
+          },
+          "shapes": { "root": { "sequence": [ "Identifier" ] } }
+        })JSON";
+    const auto diags = loadShouldFail(cfg);
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_InvalidPrecedenceTable,
+                        "'bodyRule' must be a string"));
+}
+
+TEST(OperatorTableEndsAtBodyRule, BodyRuleReferencesUndefinedShape) {
+    const auto cfg = std::string{kGroupedHeader}
+        + R"JSON(
+          "operators": {
+            "groups": [
+              { "precedence": 100, "arity": "postfix",
+                "operators": ["("], "endsAt": ")",
+                "bodyRule": "doesNotExist" }
+            ]
+          },
+          "shapes": { "root": { "sequence": [ "Identifier" ] } }
+        })JSON";
+    const auto diags = loadShouldFail(cfg);
+    EXPECT_TRUE(hasDiag(diags, DiagnosticCode::C_UnknownShape,
+                        "no shape with that name is declared"));
+}
+
+// Walker-wrapper rules (`binaryExpr`/`unaryExpr`/`postfixExpr`) have
+// no compiled body — they're synthesized by the Pratt walker. The
+// `validateOperatorBodyRules` post-shapes pass must NOT flag them as
+// missing shapes. Regression guard for the skip list living in
+// `well_known_names.hpp`: a future renaming or new wrapper without
+// updating the skip would break every shipped grammar at load time.
+TEST(OperatorTableEndsAtBodyRule, WalkerWrapperNamesDoNotTripValidation) {
+    // Loading c-subset exercises the wrappers (the c-subset operator
+    // table declares prefix/infix/postfix groups, the loader interns
+    // `binaryExpr`/`unaryExpr`/`postfixExpr` as wrapper rules but
+    // doesn't declare them as shapes). Clean load = walker wrappers
+    // correctly skipped.
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+}
+
+// Grouped-postfix `Entry` invariant: when `grouped` is present its
+// `endsAt` MUST be valid; conversely if `grouped` is absent the
+// operator is a simple (non-delimited) postfix or infix/prefix.
+// Pinned at the type level via `std::optional` — this test pins
+// the runtime invariant on a real loaded config.
+TEST(OperatorTableEndsAtBodyRule, GroupedPostfixInvariantHoldsOnCSubset) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+
+    const auto paren = schema->schemaTokens().find("ParenOpen");
+    ASSERT_TRUE(paren.valid());
+    const auto e = schema->operatorTable().lookup(paren, OperatorArity::Postfix);
+    ASSERT_TRUE(e.has_value());
+    ASSERT_TRUE(e->grouped.has_value()) << "`(` postfix must be grouped";
+    EXPECT_TRUE(e->grouped->endsAt.valid());
+    EXPECT_TRUE(e->grouped->bodyRule.valid()) << "argList bodyRule";
+
+    const auto plusPlus = schema->schemaTokens().find("PlusPlusOp");
+    ASSERT_TRUE(plusPlus.valid());
+    const auto incE = schema->operatorTable().lookup(plusPlus, OperatorArity::Postfix);
+    ASSERT_TRUE(incE.has_value());
+    EXPECT_FALSE(incE->grouped.has_value())
+        << "simple postfix `++` must NOT carry a grouped payload";
+}

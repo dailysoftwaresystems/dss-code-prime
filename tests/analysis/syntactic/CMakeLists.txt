@@ -1,0 +1,6 @@
+dss_add_test(NAME analysis/syntactic/test_parser_toy            SOURCES test_parser_toy.cpp)
+dss_add_test(NAME analysis/syntactic/test_parser_speculation    SOURCES test_parser_speculation.cpp)
+dss_add_test(NAME analysis/syntactic/test_parser_c_subset_smoke SOURCES test_parser_c_subset_smoke.cpp)
+dss_add_test(NAME analysis/syntactic/test_pratt_walker          SOURCES test_pratt_walker.cpp)
+dss_add_test(NAME analysis/syntactic/test_parser_recovery       SOURCES test_parser_recovery.cpp)
+dss_add_test(NAME analysis/syntactic/test_corpus                SOURCES test_corpus.cpp)

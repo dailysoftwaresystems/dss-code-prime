@@ -461,6 +461,43 @@ TEST(TreeBuilder, PushErrorWithoutOpenFrameEmitsInvariant) {
                        DiagnosticCode::P_UnexpectedToken), 0u);
 }
 
+// `pushErrorNode` inserts the Error leaf WITHOUT emitting any
+// diagnostic — the parser layer's panic-mode uses this after it has
+// already emitted a rich `P_UnexpectedToken` itself, so re-emitting
+// would double-count. The Error leaf, HasError propagation, and the
+// failure-mode invariants mirror `pushError`.
+TEST(TreeBuilder, PushErrorNodeInsertsLeafWithoutDiagnostic) {
+    auto h = Harness::make("x");
+    TreeBuilder b{h.src, h.schema};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        b.pushErrorNode(SourceSpan::of(0, 1));
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_UnexpectedToken), 0u);
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BuilderInvariant), 0u);
+    EXPECT_TRUE(hasError(t.flags(t.root())));
+
+    std::size_t errorLeaves = 0;
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (t.kind(id) == NodeKind::Error) ++errorLeaves;
+    }
+    EXPECT_EQ(errorLeaves, 1u);
+}
+
+TEST(TreeBuilder, PushErrorNodeWithoutOpenFrameEmitsInvariant) {
+    auto h = Harness::make("x");
+    TreeBuilder b{h.src, h.schema};
+    b.pushErrorNode(SourceSpan::of(0, 1));
+    Tree t = std::move(b).finish();
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                       DiagnosticCode::P_BuilderInvariant), 1u);
+}
+
 // ── LIFO violation cascade close ───────────────────────────────────────
 
 TEST(TreeBuilder, OutOfOrderCloseCascadesAndDoesNotDoubleDiagnose) {
@@ -775,4 +812,255 @@ TEST(TreeBuilder, BodyDefaultKindsEmptyWhenSchemaHasNoBodyModes) {
     // would surface as `P_SchemaCursorDesync` here.
     EXPECT_EQ(countCode(t.diagnostics().all(),
                         DiagnosticCode::P_SchemaCursorDesync), 0u);
+}
+
+// Two body modes declaring distinct default kinds — the
+// bodyDefaultTokenKinds_ set must be the UNION across all modes.
+// Without this pin, a regression that picked up only the FIRST mode's
+// kind would mask a desync diagnostic from the second mode's body.
+TEST(TreeBuilder, BodyDefaultKindsUnionsAcrossLexerModes) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "MultiBody", "version": "0.1.0" },
+      "lexerModes": {
+        "main":   { "tokens": "default" },
+        "modeA":  { "defaultToken": { "kind": "AKind" }, "unterminatedAs": "string" },
+        "modeB":  { "defaultToken": { "kind": "BKind" }, "unterminatedAs": "string" }
+      },
+      "tokens": {
+        "[": [{ "kind": "AOpen", "modeOp": "pushMode", "modeArg": "modeA",
+                "stringStyle": { "escapeKind": "none", "endsAt": "]" } }],
+        "(": [{ "kind": "BOpen", "modeOp": "pushMode", "modeArg": "modeB",
+                "stringStyle": { "escapeKind": "none", "endsAt": ")" } }]
+      },
+      "shapes": { "root": { "sequence": [ "AOpen" ] } }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("", "<multi>");
+    const auto aKind = schema->schemaTokens().find("AKind");
+    const auto bKind = schema->schemaTokens().find("BKind");
+    ASSERT_TRUE(aKind.valid());
+    ASSERT_TRUE(bKind.valid());
+
+    Token aTok{ .coreKind = CoreTokenKind::Punctuation, .schemaKind = aKind,
+                .span = SourceSpan::of(0, 0) };
+    Token bTok{ .coreKind = CoreTokenKind::Punctuation, .schemaKind = bKind,
+                .span = SourceSpan::of(0, 0) };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        // Push BOTH body-default kinds. If only AKind made it into the
+        // skip set, BKind would advance the cursor (which expects AOpen)
+        // and trip `P_SchemaCursorDesync`. If only BKind made it in,
+        // AKind would trip it.
+        b.pushToken(aTok);
+        b.pushToken(bTok);
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_SchemaCursorDesync), 0u)
+        << "both AKind and BKind must be in the body-default skip set";
+}
+
+// Synthesis path consults `isTokenValidInScope`: a schema that
+// forbids a built-in literal inside some scope must reject synthesis
+// of that literal when that scope is active. Without the filter, the
+// tokenizer's pre-resolved kind would smuggle past the scope rule and
+// land as a clean leaf with no diagnostic.
+TEST(TreeBuilder, SynthesisHonorsIsTokenValidInScope) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "ScopeSynth", "version": "0.1.0" },
+      "tokens": {
+        "{": [{ "kind": "BlockOpen",  "opensScope": "Block" }],
+        "}": [{ "kind": "BlockClose", "closesScope": true }]
+      },
+      "scopes": {
+        "validity": [ { "scope": "Block", "forbid": ["IntLiteral"] } ]
+      },
+      "shapes": {
+        "root":  { "sequence": [{ "repeat": "stmt" }] },
+        "stmt":  { "sequence": ["BlockOpen", "IntLiteral", "BlockClose"] }
+      }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("{5}", "<scope-synth>");
+    const auto intLitKind = schema->schemaTokens().find("IntLiteral");
+
+    Token open5  { .coreKind = CoreTokenKind::Punctuation, .schemaKind = {},
+                   .span = SourceSpan::of(0, 1) };
+    Token five   { .coreKind = CoreTokenKind::IntLiteral,  .schemaKind = intLitKind,
+                   .span = SourceSpan::of(1, 2) };
+    Token close5 { .coreKind = CoreTokenKind::Punctuation, .schemaKind = {},
+                   .span = SourceSpan::of(2, 3) };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        auto stmt = b.open(schema->rules().find("stmt"));
+        b.pushToken(open5);
+        b.pushToken(five);       // synthesis target, forbidden inside Block
+        b.pushToken(close5);
+    }
+    Tree t = std::move(b).finish();
+
+    auto const& diags = t.diagnostics().all();
+    // Scope forbid must reject `IntLiteral` inside Block. With synthesis
+    // honoring isTokenValidInScope, the synthesis returns empty match,
+    // the Word fallback can't help (coreKind == IntLiteral, not Word),
+    // and pushToken emits P_UnknownToken + an Error leaf.
+    EXPECT_EQ(countCode(diags, DiagnosticCode::P_UnknownToken), 1u);
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+}
+
+// Negative pin: when the scope is NOT active, synthesis succeeds and
+// the IntLiteral lands as a clean leaf. Distinguishes "scope-rejected"
+// from "synthesis-broken-globally."
+TEST(TreeBuilder, SynthesisAcceptsBuiltinLiteralOutsideForbidScope) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "ScopeSynthOk", "version": "0.1.0" },
+      "tokens": {
+        "{": [{ "kind": "BlockOpen",  "opensScope": "Block" }],
+        "}": [{ "kind": "BlockClose", "closesScope": true }]
+      },
+      "scopes": {
+        "validity": [ { "scope": "Block", "forbid": ["IntLiteral"] } ]
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral"] }
+      }
+    })JSON";
+    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto src    = SourceBuffer::fromString("5", "<scope-synth-ok>");
+    const auto intLitKind = schema->schemaTokens().find("IntLiteral");
+
+    Token five{ .coreKind = CoreTokenKind::IntLiteral, .schemaKind = intLitKind,
+                .span = SourceSpan::of(0, 1) };
+
+    TreeBuilder b{src, schema};
+    {
+        auto root = b.open(schema->rules().find("root"));
+        b.pushToken(five);
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_UnknownToken), 0u);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+}
+
+// ── wrapLastChildInFrame (substrate primitive for left-recursive
+//     postfix chains; see TreeBuilder::wrapLastChildInFrame doc) ──
+
+namespace {
+
+constexpr std::string_view kWrapConfig = R"JSON({
+  "dssSchemaVersion": 1,
+  "language": { "name": "WrapTest", "version": "0.1.0" },
+  "tokens": {
+    "+": [{ "kind": "PlusOp" }]
+  },
+  "shapes": {
+    "root":    { "sequence": ["wrapper", { "optional": "PlusOp" }] },
+    "wrapper": { "sequence": ["Identifier"] }
+  }
+})JSON";
+
+} // namespace
+
+// Positive path: pop a primary, wrap it in a new rule, push a new
+// child, close. The wrapper's children must be [popped, plus_op] in
+// arena traversal order.
+TEST(TreeBuilder, WrapLastChildInFrameReparentsAndReorders) {
+    auto h = dss::tests::ToyHarness::make("x+", kWrapConfig);
+    const auto idKind   = h.schema->schemaTokens().find("Identifier");
+    const auto plusKind = h.schema->schemaTokens().find("PlusOp");
+    const RuleId rootRule    = h.schema->rules().find("root");
+    const RuleId wrapperRule = h.schema->rules().find("wrapper");
+
+    TreeBuilder b{h.src, h.schema};
+    {
+        auto root = b.open(rootRule);
+        b.pushToken(h.tok("x", CoreTokenKind::Word));
+        auto wrap = b.wrapLastChildInFrame(wrapperRule);
+        b.pushToken(h.tok("+", CoreTokenKind::Operator));
+    }
+    Tree t = std::move(b).finish();
+
+    ASSERT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_NE(t.root(), InvalidNode);
+    // Root contains exactly one child: the wrapper.
+    auto rootChildren = t.children(t.root());
+    ASSERT_EQ(rootChildren.size(), 1u);
+    const NodeId wrapper = rootChildren[0];
+    EXPECT_EQ(t.kind(wrapper), NodeKind::Internal);
+    EXPECT_EQ(t.rule(wrapper).v, wrapperRule.v);
+    // Wrapper contains the popped Identifier followed by PlusOp.
+    auto wrapperChildren = t.children(wrapper);
+    ASSERT_EQ(wrapperChildren.size(), 2u);
+    EXPECT_EQ(t.kind(wrapperChildren[0]), NodeKind::Token);
+    EXPECT_EQ(t.tokenKind(wrapperChildren[0]).v, idKind.v);
+    EXPECT_EQ(t.kind(wrapperChildren[1]), NodeKind::Token);
+    EXPECT_EQ(t.tokenKind(wrapperChildren[1]).v, plusKind.v);
+}
+
+// Negative path: no pending children to wrap → `P_BuilderInvariant`
+// + no-op guard.
+TEST(TreeBuilder, WrapLastChildInFrameWithNoChildrenIsInvariantViolation) {
+    auto h = dss::tests::ToyHarness::make("", kWrapConfig);
+    const RuleId rootRule    = h.schema->rules().find("root");
+    const RuleId wrapperRule = h.schema->rules().find("wrapper");
+
+    TreeBuilder b{h.src, h.schema};
+    {
+        auto root = b.open(rootRule);
+        // No pushToken/open before wrap → no pending children.
+        auto wrap = b.wrapLastChildInFrame(wrapperRule);
+        (void)wrap;
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_GE(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BuilderInvariant), 1u);
+}
+
+// Negative path: no parent frame open → `P_BuilderInvariant` + no-op.
+TEST(TreeBuilder, WrapLastChildInFrameWithNoOpenFrameIsInvariantViolation) {
+    auto h = dss::tests::ToyHarness::make("", kWrapConfig);
+    const RuleId wrapperRule = h.schema->rules().find("wrapper");
+
+    TreeBuilder b{h.src, h.schema};
+    // Never open the root frame.
+    {
+        auto wrap = b.wrapLastChildInFrame(wrapperRule);
+        (void)wrap;
+    }
+    Tree t = std::move(b).finish();
+
+    EXPECT_GE(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BuilderInvariant), 1u);
+}
+
+// Span semantics: wrapper's span starts at the wrapped child's start
+// and extends through subsequent children's spans.
+TEST(TreeBuilder, WrapLastChildInFrameSpanStartsAtWrappedChild) {
+    auto h = dss::tests::ToyHarness::make("x+", kWrapConfig);
+    const RuleId rootRule    = h.schema->rules().find("root");
+    const RuleId wrapperRule = h.schema->rules().find("wrapper");
+
+    TreeBuilder b{h.src, h.schema};
+    {
+        auto root = b.open(rootRule);
+        b.pushToken(h.tok("x", CoreTokenKind::Word));
+        auto wrap = b.wrapLastChildInFrame(wrapperRule);
+        b.pushToken(h.tok("+", CoreTokenKind::Operator));
+    }
+    Tree t = std::move(b).finish();
+
+    const NodeId wrapper = t.children(t.root())[0];
+    EXPECT_EQ(t.span(wrapper).start(), 0u);   // wrapped child starts here
+    EXPECT_EQ(t.span(wrapper).end(),   2u);   // last appended token ends here
 }

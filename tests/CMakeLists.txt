@@ -19,3 +19,5 @@ endfunction()
 
 add_subdirectory(core)
 add_subdirectory(tokenizer)
+add_subdirectory(analysis/syntactic)
+add_subdirectory(lsp)

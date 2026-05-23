@@ -289,7 +289,13 @@ TEST(GrammarSchema, LoadShippedCSubset) {
                                   "paramList", "param", "block", "statement",
                                   "ifStmt", "whileStmt", "doStmt", "forStmt",
                                   "returnStmt", "exprStmt", "expression",
-                                  "binaryOp", "operand"}) {
+                                  "operand",
+                                  // Pratt-walker wrapper rules auto-interned
+                                  // by the loader when the schema declares
+                                  // any `expr` shape. c-subset's `expression`
+                                  // rule is `expr`-kind, so these must be
+                                  // present in the rule interner.
+                                  "binaryExpr", "unaryExpr", "postfixExpr"}) {
         EXPECT_TRUE(schema.rules().find(rule).valid()) << rule;
     }
 
@@ -309,6 +315,382 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     // v2-gap-catalog row 2). Confirm the lexeme has no meaning so a
     // future regression that silently adds it gets caught.
     EXPECT_TRUE(schema.lookupLexeme("typedef").empty());
+}
+
+// Pin the `expr`-shape accessors on c-subset. `expression` is the
+// only `expr`-kind rule in the shipped grammar; `operand` is its atom.
+// Other rules return false / Invalid / 0.
+TEST(GrammarSchema, ExprShapeAccessorsOnCSubset) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    if (!result.has_value()) {
+        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
+    }
+    auto const& schema = **result;
+
+    const auto expression = schema.rules().find("expression");
+    const auto operand    = schema.rules().find("operand");
+    const auto statement  = schema.rules().find("statement");
+    ASSERT_TRUE(expression.valid());
+    ASSERT_TRUE(operand.valid());
+    ASSERT_TRUE(statement.valid());
+
+    EXPECT_TRUE (schema.isExprRule(expression));
+    EXPECT_EQ   (schema.exprAtom(expression).v, operand.v);
+    EXPECT_EQ   (schema.exprMinPrecedence(expression), 0);
+
+    EXPECT_FALSE(schema.isExprRule(operand));
+    EXPECT_FALSE(schema.exprAtom(operand).valid());
+    EXPECT_EQ   (schema.exprMinPrecedence(operand), 0);
+
+    EXPECT_FALSE(schema.isExprRule(statement));
+}
+
+// Wrapper rules `binaryExpr` / `unaryExpr` / `postfixExpr` MUST NOT be
+// auto-interned in schemas that don't use any `expr` shape. The toy
+// grammar's `expression` rule is `sequence`-shaped (not `expr`); a
+// regression that unconditionally interns the wrappers would inflate
+// every shipped grammar's RuleInterner and silently change RuleId
+// numbering.
+TEST(GrammarSchema, WrapperRulesAbsentInNonExprSchema) {
+    auto result = GrammarSchema::loadShipped("toy");
+    ASSERT_TRUE(result.has_value());
+    auto const& schema = **result;
+
+    EXPECT_FALSE(schema.rules().find("binaryExpr").valid());
+    EXPECT_FALSE(schema.rules().find("unaryExpr").valid());
+    EXPECT_FALSE(schema.rules().find("postfixExpr").valid());
+}
+
+// Loader rejects user-declared shapes named `binaryExpr` /
+// `unaryExpr` / `postfixExpr` — they're walker-synthesized; a user
+// redeclaration would let the schema cursor see a body for them,
+// breaking the "transparent wrapper" invariant.
+TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
+    constexpr std::string_view kReservedShape = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "Bad", "version": "0.1.0" },
+      "tokens": { "x": [{ "kind": "X" }] },
+      "shapes": {
+        "root":       { "sequence": ["X"] },
+        "binaryExpr": { "sequence": ["X"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kReservedShape);
+    ASSERT_FALSE(result.has_value());
+    bool sawReservedDiag = false;
+    for (auto const& d : result.error()) {
+        if (d.message.find("binaryExpr") != std::string::npos
+            && d.message.find("reserved") != std::string::npos) {
+            sawReservedDiag = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawReservedDiag);
+}
+
+// Body-default kinds are off-grammar. The loader rejects shape
+// references AND scope-forbid entries naming them — both surfaces
+// would silently never fire at runtime (the cursor-advance gate
+// skips body-default kinds), so surface the misuse at load time.
+// PA3: `followSetOf(rule)` walks the position graph at load time.
+// Verify the textbook FOLLOW computation: for c-subset's `expression`
+// rule, FOLLOW must include the tokens that can legitimately appear
+// AFTER an expression — `;` (EndStatement) at statement boundary, `)`
+// (ParenClose) at paren-wrapped sub-expression boundary, `,` (Comma)
+// in argument-list-like positions if any. These are the resync points
+// the parser's panic-mode uses for `expr`-kind rules.
+TEST(GrammarSchema, FollowSetOfExpressionIncludesStatementEnders) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(result.has_value());
+    auto const& schema = **result;
+
+    const auto expression = schema.rules().find("expression");
+    ASSERT_TRUE(expression.valid());
+
+    const auto follow = schema.followSetOf(expression);
+    auto containsName = [&](std::string_view name) {
+        const auto id = schema.schemaTokens().find(name);
+        return id.valid()
+            && std::ranges::find_if(follow,
+                   [id](SchemaTokenId s) { return s.v == id.v; })
+                != follow.end();
+    };
+    EXPECT_TRUE(containsName("EndStatement"))
+        << "FOLLOW(expression) must include `;` — expression can end a statement";
+    EXPECT_TRUE(containsName("ParenClose"))
+        << "FOLLOW(expression) must include `)` — expression in `(expr)`";
+    EXPECT_TRUE(containsName("Colon"))
+        << "FOLLOW(expression) must include `:` — `case expr:` label";
+}
+
+// FOLLOW propagation across nullable-tail positions: when a RuleLeaf
+// reference is followed by an `optional` body that nullable-skips
+// to End, the child's FOLLOW must inherit the parent's FOLLOW. This
+// is the textbook case for "FOLLOW transitively includes the
+// FOLLOW of every rule whose continuation is nullable".
+TEST(GrammarSchema, FollowSetPropagatesAcrossNullableTail) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "NullableFollow", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        ";": [{ "kind": "Semi" }],
+        ",": [{ "kind": "Comma" }]
+      },
+      "shapes": {
+        "root":   { "sequence": [ "A", "Semi" ] },
+        "A":      { "sequence": [ "B", { "optional": "Comma" } ] },
+        "B":      { "sequence": [ "Identifier" ] }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    auto const& schema = **loaded;
+
+    const auto b    = schema.rules().find("B");
+    const auto semi = schema.schemaTokens().find("Semi");
+    const auto comma = schema.schemaTokens().find("Comma");
+    ASSERT_TRUE(b.valid());
+    ASSERT_TRUE(semi.valid());
+    ASSERT_TRUE(comma.valid());
+
+    const auto follow = schema.followSetOf(b);
+    auto contains = [&](SchemaTokenId id) {
+        return std::ranges::find_if(follow,
+            [id](SchemaTokenId s) { return s.v == id.v; }) != follow.end();
+    };
+    EXPECT_TRUE(contains(comma))
+        << "B is directly followed by `optional Comma` — Comma in FOLLOW(B)";
+    EXPECT_TRUE(contains(semi))
+        << "FOLLOW(A) (which is {Semi}) must propagate to FOLLOW(B) "
+           "because the optional after B is nullable-tail";
+}
+
+// Self-recursive rule (`list = Identifier (Comma list)?`): the
+// snapshot-per-pass guard in `computeFollowSets` ensures the fixed-
+// point converges to a stable FOLLOW set rather than diverging or
+// producing iteration-order-dependent results. FOLLOW(list) must
+// include Semi (from the parent root sequence).
+TEST(GrammarSchema, FollowSetConvergesOnSelfRecursiveRule) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "SelfRec", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        ";": [{ "kind": "Semi" }],
+        ",": [{ "kind": "Comma" }]
+      },
+      "shapes": {
+        "root":   { "sequence": [ "list", "Semi" ] },
+        "list":   { "sequence": [ "Identifier", { "optional": { "sequence": [ "Comma", "list" ] } } ] }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    auto const& schema = **loaded;
+
+    const auto list = schema.rules().find("list");
+    const auto semi = schema.schemaTokens().find("Semi");
+    ASSERT_TRUE(list.valid());
+    const auto follow = schema.followSetOf(list);
+    auto contains = [&](SchemaTokenId id) {
+        return std::ranges::find_if(follow,
+            [id](SchemaTokenId s) { return s.v == id.v; }) != follow.end();
+    };
+    EXPECT_TRUE(contains(semi))
+        << "FOLLOW(list) must include Semi via the root sequence";
+}
+
+// Root rule has no parent reference; its FOLLOW must be empty. The
+// parser's `canEndSource` check is what authorizes EOF — no implicit
+// EOF in FOLLOW(root).
+TEST(GrammarSchema, FollowSetOfRootIsEmpty) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(result.has_value());
+    auto const& schema = **result;
+    const auto root = schema.rules().find("root");
+    ASSERT_TRUE(root.valid());
+    EXPECT_TRUE(schema.followSetOf(root).empty());
+}
+
+// PA3: `syncTokens` field round-trips. Loader rejects unknown kind
+// names, Eof, and Error (each with its own loader diagnostic shape).
+TEST(GrammarSchema, SyncTokensRoundTrip) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(result.has_value());
+    auto const& schema = **result;
+    const auto sync = schema.syncTokens();
+
+    auto containsName = [&](std::string_view name) {
+        const auto id = schema.schemaTokens().find(name);
+        return id.valid()
+            && std::ranges::find_if(sync,
+                   [id](SchemaTokenId s) { return s.v == id.v; })
+                != sync.end();
+    };
+    EXPECT_TRUE(containsName("EndStatement"));
+    EXPECT_TRUE(containsName("BlockClose"));
+}
+
+TEST(GrammarSchema, SyncTokensRejectsUnknownKind) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "Bad", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "syncTokens": ["NotAKind"],
+      "shapes": { "root": { "sequence": ["Semi"] } }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(result.has_value());
+    bool saw = false;
+    for (auto const& d : result.error()) {
+        if (d.code == DiagnosticCode::C_UnknownToken
+            && d.message.find("NotAKind") != std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw);
+}
+
+TEST(GrammarSchema, SyncTokensRejectsReservedEof) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "Bad", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "syncTokens": ["Eof"],
+      "shapes": { "root": { "sequence": ["Semi"] } }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(result.has_value());
+    bool saw = false;
+    for (auto const& d : result.error()) {
+        if (d.code == DiagnosticCode::C_ConflictingField
+            && d.message.find("reserved") != std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw);
+}
+
+TEST(GrammarSchema, RejectsBodyDefaultKindInShape) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "BadShape", "version": "0.1.0" },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "BodyChar" }, "unterminatedAs": "string" }
+      },
+      "tokens": {
+        "(": [{ "kind": "Open", "modeOp": "pushMode", "modeArg": "body",
+                "stringStyle": { "escapeKind": "none", "endsAt": ")" } }]
+      },
+      "shapes": {
+        "root": { "sequence": ["Open", "BodyChar"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(result.has_value());
+
+    bool saw = false;
+    for (auto const& d : result.error()) {
+        if (d.code == DiagnosticCode::C_BodyDefaultKindInShape
+            && d.message.find("BodyChar") != std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw)
+        << "C_BodyDefaultKindInShape must fire for a shape referencing "
+           "a body-default token kind";
+}
+
+TEST(GrammarSchema, RejectsBodyDefaultKindInScopeForbid) {
+    constexpr std::string_view cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "BadForbid", "version": "0.1.0" },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "BodyChar" }, "unterminatedAs": "string" }
+      },
+      "tokens": {
+        "{": [{ "kind": "BlockOpen", "opensScope": "Block" }],
+        "(": [{ "kind": "Open", "modeOp": "pushMode", "modeArg": "body",
+                "stringStyle": { "escapeKind": "none", "endsAt": ")" } }]
+      },
+      "scopes": {
+        "validity": [ { "scope": "Block", "forbid": ["BodyChar"] } ]
+      },
+      "shapes": {
+        "root": { "sequence": ["Open"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(result.has_value());
+
+    bool saw = false;
+    for (auto const& d : result.error()) {
+        if (d.code == DiagnosticCode::C_BodyDefaultKindInShape
+            && d.message.find("BodyChar") != std::string::npos
+            && d.message.find("forbidden") != std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw)
+        << "C_BodyDefaultKindInShape must fire for scope-forbid "
+           "entries referencing a body-default kind";
+}
+
+// Pin the FIRST-set augmentation: `expr`-shape rules see prefix
+// operator tokens added to their FIRST set so the dispatch loop's
+// `tokInFirst` check accepts bare-prefix expressions (`-a;` etc.)
+// without the walker. Without this, the dispatch would emit
+// `P_NoAlternativeMatched` before the walker ever ran.
+TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
+    constexpr std::string_view kPrefixSchema = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "PrefixFirst", "version": "0.1.0" },
+      "tokens": {
+        "-":  [{ "kind": "MinusOp" }]
+      },
+      "operators": {
+        "groups": [
+          { "precedence": 90, "associativity": "right", "arity": "prefix", "operators": ["-"] }
+        ]
+      },
+      "shapes": {
+        "root":       { "sequence": ["expression"] },
+        "expression": { "expr": { "atom": "operand" } },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kPrefixSchema);
+    ASSERT_TRUE(result.has_value())
+        << (result.has_value() ? "" : result.error()[0].message);
+    auto const& schema = **result;
+
+    const auto expression = schema.rules().find("expression");
+    const auto minusOp    = schema.schemaTokens().find("MinusOp");
+    const auto identifier = schema.schemaTokens().find("Identifier");
+    ASSERT_TRUE(expression.valid());
+    ASSERT_TRUE(minusOp.valid());
+    ASSERT_TRUE(identifier.valid());
+
+    const auto firstSet = schema.firstSetOf(expression);
+    const auto hasMinus = std::ranges::find_if(firstSet,
+        [minusOp](SchemaTokenId id) { return id.v == minusOp.v; })
+        != firstSet.end();
+    const auto hasIdent = std::ranges::find_if(firstSet,
+        [identifier](SchemaTokenId id) { return id.v == identifier.v; })
+        != firstSet.end();
+    EXPECT_TRUE(hasMinus)
+        << "FIRST(expression) must include MinusOp (Prefix op union)";
+    EXPECT_TRUE(hasIdent)
+        << "FIRST(expression) must include Identifier (atom FIRST)";
 }
 
 // `typeRef` admits `const int const x` (double-const). Real C allows

@@ -1,0 +1,10 @@
+# Golden-file tree pretty-prints — written and compared byte-exact by
+# `tests/analysis/syntactic/test_corpus.cpp::checkGoldenTree`. Force LF
+# regardless of `core.autocrlf` so a Windows checkout doesn't introduce
+# CRLF and break the byte-equality compare on first run.
+*.tree text eol=lf
+
+# Test-corpus source inputs parsed end-to-end by `test_corpus.cpp`. Forcing
+# LF prevents `core.autocrlf` from injecting CR bytes the shipped schemas
+# need to declare explicitly as `Whitespace` lexemes (see e.g. c-subset.lang.json).
+tests/corpus/** text eol=lf

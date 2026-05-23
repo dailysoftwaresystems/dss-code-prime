@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"
 
 #include <cstdint>
@@ -71,9 +72,23 @@ namespace detail {
 // (it has no JSON pointer to attach), so this header trusts the caller.
 class DSS_EXPORT OperatorTable {
 public:
+    // Grouped-postfix payload: operator consumes a delimiter and
+    // (optionally) a body rule between opener and closer. Wrapping
+    // `std::optional<GroupedPostfix>` makes "grouped without
+    // delimiter" unrepresentable.
+    struct GroupedPostfix {
+        SchemaTokenId endsAt;
+        RuleId        bodyRule{};    // invalid ⇒ grouped operator with no body shape
+    };
+
     struct Entry {
-        std::int32_t  precedence    = 0;
-        OperatorAssoc associativity = OperatorAssoc::None;
+        std::int32_t                   precedence    = 0;
+        OperatorAssoc                  associativity = OperatorAssoc::None;
+        // Absent ⇒ simple operator (infix, prefix, or single-token
+        // postfix like `++`). Present ⇒ grouped postfix like
+        // `f(args)` or `a[i]`; the walker parses `bodyRule` (when
+        // valid) until the `endsAt` closer.
+        std::optional<GroupedPostfix>  grouped{};
     };
 
     OperatorTable()                                = default;
