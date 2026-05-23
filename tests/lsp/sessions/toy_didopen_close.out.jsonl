@@ -1,0 +1,4 @@
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"diagnosticProvider":{"interFileDependencies":false,"workspaceDiagnostics":false},"positionEncoding":"utf-16","textDocumentSync":1},"serverInfo":{"name":"dss-code-prime","version":"0.1.0"}}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"diagnostics":[{"code":"P_NoAlternativeMatched","message":"expected 'Identifier' or 'VarKeyword' — got '1'","range":{"end":{"character":1,"line":0},"start":{"character":0,"line":0}},"severity":1,"source":"dss-code-prime"},{"code":"P_NoAlternativeMatched","message":"expected 'Identifier' or 'VarKeyword' — got ';'","range":{"end":{"character":6,"line":0},"start":{"character":5,"line":0}},"severity":1,"source":"dss-code-prime"}],"uri":"file:///clean.toy","version":1}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"diagnostics":[],"uri":"file:///clean.toy"}}
+{"id":2,"jsonrpc":"2.0","result":null}

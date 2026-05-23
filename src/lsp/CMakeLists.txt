@@ -1,6 +1,13 @@
 add_library(lsp OBJECT
+    diagnostic_translator.cpp
+    document_store.cpp
     json_rpc.cpp
+    lsp_server.cpp
+    method_dispatcher.cpp
     protocol.cpp
+    schema_cache.cpp
+    thread_pool.cpp
+    transport.cpp
     utf16_column.cpp
 )
 

@@ -9,4 +9,4 @@ target_include_directories(program PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # dss-code-prime-lib (SHARED).
 target_compile_definitions(program PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
-target_link_libraries(program PUBLIC core gen)
+target_link_libraries(program PUBLIC core gen lsp)
