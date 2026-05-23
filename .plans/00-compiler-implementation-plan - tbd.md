@@ -70,6 +70,46 @@
 
 Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-current-status-snapshot) for tree/node phase detail.
 
+## 0.1. Stepper — next-up by block
+
+> **Definition of "next" used here:** a step is eligible to start the moment **all its dependencies are ✅ shipped** — nothing pending blocks it. Critical-path steps are numbered first; sidewise-but-unblocked work is grouped at the bottom. This is a condensed view of [§8](#8-implementation-phases-todos) — see §8 for full phase metadata, and each sub-plan for PR-level scope.
+>
+> Read top-to-bottom: step **1** is what to start now; the **Blocked by** column tells you why every other step has to wait.
+
+| Step | Plan / PR | What | Blocked by | Status |
+|---|---|---|---|---|
+| **1** | [08](./08-compilation-unit-plan%20-%20tbd.md) **CU1** | `CompilationUnit` type + arena (single-tree CU is the smallest valid CU) | — | ⏭️ **next — fully unblocked** |
+| 2 | [08](./08-compilation-unit-plan%20-%20tbd.md) CU2 | Multi-file `UnitBuilder` + driver wiring | step 1 | ⏳ |
+| 3 | [08](./08-compilation-unit-plan%20-%20tbd.md) CU3 | Cross-tree `SymbolId` shape + `CrossTreeRef` | step 2 | ⏳ |
+| 4 | [08](./08-compilation-unit-plan%20-%20tbd.md) CU4 | Per-language import-resolution shim (toy / c-subset / tsql-subset) | step 3 | ⏳ |
+| 5 | [08.5](./08.5-substrate-prep-plan%20-%20tbd.md) SP1 | Generalize arena + `NodeAttribute<T>` for HIR/MIR/LIR reuse | step 4 | ⏳ |
+| 6 | [08.5](./08.5-substrate-prep-plan%20-%20tbd.md) SP2 | Core type lattice + per-language extension registry | step 5 | ⏳ |
+| 7 | §8 `analysis-semantic` | Symbol table + scope resolution + type checking (consumes CU from step 4, lattice from step 6) | step 6 | ⏳ |
+| 8 | [09](./09-hir-plan%20-%20tbd.md) HR1–HR11 | HIR — language-neutral structured typed pivot; CST→HIR lowering per shipped language | step 7 | ⏳ |
+| 9 | [11](./11-ffi-plan%20-%20tbd.md) FF1–FF6 | FFI — hermetic ELF/PE/Mach-O/ar readers + C-header mode parser + ABI catalog + name mangling | step 8 | ⏳ — parallel with step 10 |
+| 10 | [12](./12-mir-lir-plan%20-%20tbd.md) ML1–ML8 | MIR (SSA over CFG + structured-CF markers) + LIR (per-target ISA) | step 8 | ⏳ — parallel with step 9 |
+| 11 | §8 `gen-optimizer` | v1 mandatory: const fold + DCE + copy prop + dominator-tree + liveness | step 10 | ⏳ — parallel with step 12 |
+| 12 | [13](./13-assembler-plan%20-%20tbd.md) AS1–AS6 | x86_64 + ARM64 hand-encoder + per-(arch×format) relocation taxonomy | step 10 | ⏳ — parallel with step 11 |
+| 13 | [14](./14-linker-plan%20-%20tbd.md) LK1–LK10 | In-tree linker — ELF/PE/Mach-O writers + symbol resolution + relocs + TLS lowering | steps 9, 12, **P1** | ⏳ — largest single chunk of backend work |
+| 14 | [15](./15-debug-info-plan%20-%20tbd.md) DB1–DB12 | DWARF 5 (ELF + Mach-O) + PDB (PE) + CFI / SEH / compact-unwind | steps 10, 13 | ⏳ |
+| 15 | [16](./16-codesign-publish-plan%20-%20tbd.md) CS1–CS9 | Apple codesign + notarization + Authenticode + RFC 3161 + APK v3 (in-tree crypto via vendored BearSSL) | steps 13, 14 | ⏳ |
+| 16 | §8 `program-api` | `dss-code-prime build my-project.dss-project.json` CLI + project loader + clang-quality diag renderer | steps 13, **P1** | 🟦 skeleton; finish blocked |
+| **v1.x — unblock when their deps land** | | | | |
+| 17 | [18](./18-wasm-plan%20-%20tbd.md) WA1–WA10 | WASM backend via structured-CF markers (no Relooper) | steps 8, 10, 13 | ⏳ |
+| 18 | [17](./17-shader-gpu-plan%20-%20tbd.md) SG1–SG10 | SPIR-V codegen + shader HIR + GPU bindings + same-source CPU+GPU dual-lowering | steps 8, 10 | ⏳ |
+| 19 | [10](./10-source-translation-plan%20-%20tbd.md) ST1–ST6 | Source-to-source translation via HIR pivot | step 8 | ⏳ |
+| 20 | [08](./08-compilation-unit-plan%20-%20tbd.md) CU5 | Multi-language CUs (one binary, mixed source languages, HIR convergence) | step 4 + step 8 | ⏳ v1.1 |
+| **Sidewise — unblocked NOW, can run in parallel** | | | | |
+| P1 | [06](./06-artifact-profile-plan%20-%20tbd.md) AP1–AP4 | `artifactProfile` mechanism (registered-set vocab) — **gates steps 13 + 16 acceptance** | — | ⏳ unblocked; parallel-eligible with steps 1–12 |
+| P2 | §8 `docker-setup` (residual) | Dockerfile + cross-compile toolchains | — | ⏳ unblocked; cross-cutting |
+| P3 | §8 `testing` ARM64 + fuzzing | ARM64 CI legs (G-704..G-706) + nightly fuzzing (G-710) + extended sanitizer coverage (G-709) | — | 🟦 partial; rolls continuously |
+| **Reserved — no work until trigger** | | | | |
+| R1 | [19](./19-hir-hw-reserved-plan%20-%20tbd.md) | Hardware HIR sibling (VHDL / Verilog / SystemVerilog) | step 8 + trigger | 🔒 |
+| R2 | [20](./20-custom-language-reserved-plan%20-%20tbd.md) | User's eventual custom language (vocab + stdlib + runtime decisions) | all v1 + step 17 + step 18 + trigger | 🔒 |
+| R3 | [21](./21-runtime-reserved-plan%20-%20tbd.md) | Language runtime (GC / exceptions / coroutines / threading) | step 8 + step 10 + trigger | 🔒 |
+
+> **v1 critical path (first signed binary):** 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → **{9 ‖ 10}** → **{11 ‖ 12}** → 13 → 14 → 15 → 16. **P1 (artifact-profile)** must land before step 13 and step 16 reach acceptance — schedule it anywhere in parallel from step 1 onward.
+
 ## 1. Vision & Overview
 
 **DSS Code Prime** is a universal, configurable compiler written in C++. Its core design principle is that **both the source language and the target platform are configurable**, making it a single compiler engine capable of compiling _any_ defined language to _any_ supported target.
