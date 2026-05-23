@@ -151,6 +151,31 @@ Cross-references the gap-numbering convention in [`07-production-readiness-plan 
 
 ---
 
+## 8b. Gaps now owned by post-v1 sub-plans (added 2026-05-23)
+
+Per the universal-compiler decisions in [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1 (rev 2), several formerly-deferred gaps now have explicit homes in new sub-plans. Listing here so future PA-style empirical surveys don't re-discover them as fresh gaps.
+
+| Capability | Plan owner |
+|---|---|
+| Source-to-source transpilation (language-pair `.map.json`) | [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md) |
+| GPU / shader codegen (SPIR-V) + same-source CPU+GPU functions | [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) |
+| WASM backend | [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) |
+| VHDL / Verilog hardware backend (HIR-HW sibling IR) | [`19-hir-hw-reserved-plan`](./19-hir-hw-reserved-plan%20-%20tbd.md) |
+| FFI binary readers + C-header importer | [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) |
+| Apple codesign + notarization + Authenticode + APK v3 | [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) |
+| DWARF / PDB debug-info emission | [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) |
+| In-tree assembler (x86_64 + ARM64) | [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) |
+| In-tree linker (ELF / PE / Mach-O / WASM / SPIR-V) | [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) |
+| HIR / MIR / LIR layered IR | [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) + [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) |
+| Core type lattice + per-language extension registry | [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) |
+| Multi-language compilation units | [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) CU5 |
+| Custom user-authored language (eventual) | [`20-custom-language-reserved-plan`](./20-custom-language-reserved-plan%20-%20tbd.md) |
+| Language runtime (GC / exceptions / coroutines) | [`21-runtime-reserved-plan`](./21-runtime-reserved-plan%20-%20tbd.md) |
+
+These no longer count as v2 "gap" candidates — they're full architectural commitments tracked in their own plans.
+
+---
+
 ## 9. Sequencing notes for parser phase
 
 These are the gaps in §1/§8 that **parser-plan PA4** (real-world corpus stress) will hit first. Listing here so PA4 doesn't get blocked on each one as a surprise.

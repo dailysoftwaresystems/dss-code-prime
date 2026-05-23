@@ -1,8 +1,13 @@
 # Production Readiness — Master Plan
 
-> **Scope.** dss-code-prime is now committed to be a real production cross-platform compiler. v1 ships **end-to-end binaries for every language in `src/source-config/languages/`** (`toy`, `c-subset`, `tsql-subset`) on **{Windows, Linux, macOS} × {x86_64, ARM64}**, gated by the [`artifactProfile`](./06-artifact-profile-plan - tbd.md) compatibility mechanism. This plan catalogs everything missing between current state and that bar.
+> **Scope.** v1 ships **end-to-end binaries for every language in `src/source-config/languages/`** on **{Windows, Linux, macOS} × {x86_64, ARM64}**, gated by [`artifactProfile`](./06-artifact-profile-plan%20-%20tbd.md). v1.x extends to WASM / shader / transpile / iOS / Android via the new sub-plans (rev 2).
 >
-> **This is the master gap catalog for v1 production.** It supersedes the per-phase rows in `00-compiler-implementation-plan - tbd.md` §8 by reframing them as production deliverables with concrete acceptance criteria, and lists cross-cutting gaps (CI, perf, corpus, tooling) that don't fit any single phase.
+> **Rev 2 (2026-05-23) — hermetic + 3-IR + lattice-extensions.** Three architectural commitments (per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1):
+> 1. **Hermetic compiler.** Own every byte source-to-binary; no external tool invocations.
+> 2. **HIR → MIR → LIR.** Three IR layers, not one. ([`09-hir-plan`](./09-hir-plan%20-%20tbd.md), [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md))
+> 3. **Core lattice + per-language type extensions.** ([`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md))
+>
+> These reframe several gap clusters; see §3 (IR — re-scoped), §5 (codegen — hermetic), §8 (new — FFI), §9 (new — transpile), §10 (new — shader/GPU), §11 (new — WASM).
 
 ---
 
@@ -75,18 +80,24 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 
 ---
 
-## 3. IR phase gaps (§8 phase #9)
+## 3. IR phase gaps — re-scoped rev 2 as three-layer IR
+
+> **Rev 2 (2026-05-23).** G-301's "default SSA over CFG" decision was wrong. A single IR cannot serve binary codegen, transpilation, WASM, and SPIR-V cleanly. Re-scoped as G-301a (HIR), G-301b (MIR), G-301c (LIR) — each with its own sub-plan.
 
 | ID    | Gap | Notes |
 |-------|-----|-------|
-| G-301 | IR design. SSA? CFG-of-basic-blocks? Three-address? Stack? | Default: **SSA over a CFG** — industry-standard, well-understood, plays nicely with the optimizer passes phase #10 lists. |
-| G-302 | IR text format for debugging / caching. | A round-trippable `.dssir` text format + a binary form for build caches. Both are non-trivial; the text form is v1, binary is post-v1. |
-| G-303 | IR verifier. Walk the IR, assert structural invariants (every SSA def dominates its uses, every basic block has a terminator, etc.). | Essential for catching backend bugs early. Same fail-loud discipline as the frontend's strict-assertion testing. |
-| G-304 | Lowering CST → IR. The pass that walks the tree (with semantic attributes attached) and emits IR. | Per-language: each language config implicitly defines its lowering (a `cli` artifactProfile lowers `main` → IR-level `entry` block; a `script` profile lowers differently). |
-| G-305 | IR diagnostic namespace `I_*`. | Same as the others — fail-loud on invariant violations. |
-| G-306 | IR type system — distinct from the source-language type system. Backend types (`i32`, `i64`, `f32`, `f64`, `ptr`, aggregates). | Lower source types into IR types at the start of lowering. Mismatched-arity / wrong-type IR ops abort. |
-| G-307 | Calling convention metadata on IR function definitions. | Needed before codegen. Per-platform: SysV AMD64 / Windows x64 / AArch64 AAPCS64 / Apple ARM64. |
-| G-308 | Profile-driven lowering knobs. `artifactProfile = lib` vs `cli` emit different IR-level entry-block patterns; `script` skips IR entirely. | Tracked in `06-artifact-profile-plan - tbd.md` AP3 — the `CompilationContext` carries the resolved profile. |
+| G-301a | **HIR design.** Language-neutral, structured (if/while/for/switch preserved), typed, attribute side-tables. | Owned by [`09-hir-plan`](./09-hir-plan%20-%20tbd.md). The pivot layer for transpile + native lowering + shader + WASM. |
+| G-301b | **MIR design.** SSA over CFG + structured-CF markers preserved as block annotations. | Owned by [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md). Structured-CF markers let WASM lowering skip Relooper. |
+| G-301c | **LIR design.** Per-target ISA, virtual + physical registers, calling-conv lowered, stack frame materialized. | Owned by `12-mir-lir-plan` (same sub-plan, second half). Consumed by `13-assembler-plan`. |
+| G-302 | IR text formats `.dsshir` / `.dssir` / `.dsslir` for debugging + golden test fixtures. | Three formats, one per layer. All round-trippable. Binary cache forms post-v1. |
+| G-303 | Per-layer verifiers. HIR verifier (typed expr + structured CF + shader restrictions). MIR verifier (SSA dominance + structured-CF markers consistent). LIR verifier (no virtual regs after regalloc + calling-conv shape). | Fail-loud per `H_*` / `I_*` / `L_*` namespaces. |
+| G-304 | CST → HIR lowering — per-language. Each shipped `.lang.json` has a paired lowering in `src/hir/lowering/<lang>_lowering.cpp`. HIR → MIR + MIR → LIR are language-agnostic. | Per `09-hir-plan` HR8/HR9/HR10. |
+| G-305 | Diagnostic namespaces. | `H_*` (HIR), `I_*` (MIR), `L_*` (LIR). |
+| G-306 | MIR + LIR type systems. MIR uses canonical-lowered core lattice (`i1`..`i128`, `f16`..`f128`, `ptr`, `vector<T,N>`, `struct{}`, `array<T,N>`). LIR uses machine-only types. | Per `12-mir-lir-plan`. |
+| G-307 | Calling convention metadata. SysV AMD64 / Microsoft x64 / AAPCS64 / Microsoft ARM64 / Apple ARM64. | Lattice members in core: `CcSysV`, `CcMS64`, `CcAAPCS64`, `CcApple`, `CcFastcall`, `CcThiscall`, `CcVectorcall`, `CcWasm`, `CcSpirv`. Per `08.5-substrate-prep-plan` SP2. |
+| G-308 | Profile-driven lowering knobs. | Unchanged — `artifactProfile` flows through HIR → MIR → LIR → codegen via `CompilationContext`. |
+| G-309 | **(new rev 2)** Structured-CF marker discipline through optimizer passes. Every MIR-level pass must preserve markers or explicitly invalidate them. | Verifier rejects untagged blocks after each optimizer pass in debug builds. Per `12-mir-lir-plan` §2.3. |
+| G-310 | **(new rev 2)** HIR shader-shape restrictions: no recursion, no dynamic alloc, no fn-ptr, no libc, no goto, no host-pointer. | Per `17-shader-gpu-plan` §2.3. `SH_*` codes. |
 
 ---
 
@@ -156,14 +167,37 @@ This is the **largest single chunk of work** in v1.
 | G-532 | Source-position fidelity through CST → IR → codegen. Every instruction needs a `SourceSpan` mapping. | Existing tree carries `SourceSpan`; IR lowering preserves it; codegen emits debug-info entries pointing at it. |
 | G-533 | Variable lifetime tracking for the debugger. | Out of v1 if the v1 bar is "step through and see line numbers" rather than "inspect locals." |
 
-### 5.5 Linker integration
+### 5.5 In-tree linker (re-scoped rev 2: hermetic; no system linker)
+
+> **Rev 2 (2026-05-23).** G-540's "system linker for v1" was wrong. The hermetic-compiler invariant requires owning the entire pipeline. G-540..G-543 dropped; replaced by per-format and per-platform-metadata gaps owned by [`14-linker-plan`](./14-linker-plan%20-%20tbd.md).
 
 | ID    | Gap | Notes |
 |-------|-----|-------|
-| G-540 | Strategy decision: invoke system linker (`ld`/`link.exe`/Apple `ld`) or ship a built-in linker? | **System linker** for v1. Simpler, well-tested, supports all the platform quirks. Built-in linker (à la `mold`/`lld`) is a post-v1 perf play. |
-| G-541 | Linker flag plumbing per `artifactProfile` × platform. | Profile-driven flag tables in `gen/link/`. |
-| G-542 | Driver-level temp-file management for the linker invocation (object files, response files). | Standard temp-dir handling; cross-platform via `std::filesystem`. |
-| G-543 | Linker error capture + repackaging into the diagnostic stream. | A linker failure shouldn't be a raw stderr dump; parse the linker's output and produce structured `D_*` diagnostics. Per-linker (LLD vs ld.bfd vs ld.gold vs Apple ld vs link.exe). |
+| G-560 | **(new)** In-tree ELF writer (Linux x86_64 + ARM64; executables + shared libs; PLT/GOT; GNU_HASH; PT_GNU_RELRO). | `14-linker-plan` LK1. |
+| G-561 | **(new)** In-tree PE/COFF writer (Windows x86_64 + ARM64; exe + DLL; subsystem flag per artifactProfile; base relocations; .idata IAT; .pdata/.xdata). | `14-linker-plan` LK2. |
+| G-562 | **(new)** In-tree Mach-O writer (macOS x86_64 + ARM64; executables + dylibs; chained-fixups for Apple Silicon; LC_DYLD_INFO legacy path; LC_CODE_SIGNATURE placeholder). | `14-linker-plan` LK3. |
+| G-563 | **(new)** Linker engine (symbol resolution + relocation application + section layout + per-format metadata). Format-agnostic; calls per-format writer. | `14-linker-plan` LK4. |
+| G-564 | **(new)** TLS lowering per platform (Linux x86_64 `%fs:`, Linux ARM64 `tpidr_el0`, Windows TEB, macOS `_thread_vars`). | `14-linker-plan` LK5. |
+| G-565 | **(new)** Dynamic linking + imports (PE IAT, ELF GOT/PLT, Mach-O bind opcodes). FFI imports from `11-ffi-plan` land here. | `14-linker-plan` LK6. |
+| G-566 | **(new)** Codesign hook (Mach-O `LC_CODE_SIGNATURE` placeholder + PE attribute-cert reservation). | `14-linker-plan` LK7, filled by `16-codesign-publish-plan`. |
+| G-567 | **(new — v1.x)** WASM module writer (post-v1; skeleton lands in v1). | `14-linker-plan` LK8, full impl `18-wasm-plan`. |
+| G-568 | **(new — v1.x)** SPIR-V module writer (post-v1; skeleton lands in v1). | `14-linker-plan` LK9, full impl `17-shader-gpu-plan`. |
+| G-569 | **(new)** End-to-end hermetic acceptance: build c-subset corpus on CI runner with no system linker installed. | `14-linker-plan` LK10. v1 acceptance gate. |
+| G-570 | **(new)** Deterministic build-id: BLAKE3 of section contents → `.note.gnu.build-id` (ELF) / `LC_UUID` (Mach-O) / `IMAGE_DEBUG_DIRECTORY` (PE). | `14-linker-plan` §2.10. |
+| G-571 | **(new)** In-tree assembler (x86_64 + ARM64 instruction encoding + relocation taxonomy). | Owned by [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md). |
+
+### 5.6 In-tree codesign + publish (new rev 2)
+
+| ID    | Gap | Notes |
+|-------|-----|-------|
+| G-590 | Apple Mach-O codesign (page hashes + Code Directory + SuperBlob + LC_CODE_SIGNATURE fill). | [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) CS2. |
+| G-591 | Apple notarization HTTP client + ticket stapling. | `16-codesign-publish-plan` CS3. |
+| G-592 | iOS provisioning profile embedding + `.app` bundle assembler. | `16-codesign-publish-plan` CS4. |
+| G-593 | Windows Authenticode (PE security directory + PKCS#7 + SpcIndirectDataContent). | `16-codesign-publish-plan` CS5. |
+| G-594 | Windows RFC 3161 TSA timestamping. | `16-codesign-publish-plan` CS6. |
+| G-595 | Android APK v3 signing (skeleton; post-v1 full impl). | `16-codesign-publish-plan` CS7. |
+| G-596 | Vendored crypto substrate (BearSSL): SHA-256/384 + DER + X.509 + PKCS#7 + RSA/ECDSA + HTTPS. | `16-codesign-publish-plan` CS1. |
+| G-597 | Apple-host-free local dev: in-tree Mach-O writer + in-tree codesign means no `xcrun` / `codesign` / `dsymutil` invocations on a non-Apple host. | Hermetic acceptance gate. |
 
 ---
 
@@ -249,7 +283,85 @@ This is the **largest single chunk of work** in v1.
 
 ---
 
-## 8. Sequencing — what unblocks what
+## 8. FFI / precompiled-library ingestion (new rev 2)
+
+> v1-blocking — without it, no libc → no useful binary. Owned by [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md).
+
+| ID    | Gap | Notes |
+|-------|-----|-------|
+| G-801 | In-tree ELF reader (`.dynsym`/`.dynstr`/GNU_HASH/DT_NEEDED). | FF1. |
+| G-802 | In-tree PE reader (IAT/ILT/.edata/.idata + `.lib` static archive). | FF1. |
+| G-803 | In-tree Mach-O reader (LC_SYMTAB/LC_DYSYMTAB/LC_DYLD_INFO_ONLY + LC_DYLD_CHAINED_FIXUPS). | FF1. |
+| G-804 | In-tree `ar` archive reader (BSD-style; libc.a / libm.a). | FF1. |
+| G-805 | C header parser ("header mode" of c-subset frontend; typedef/struct/union/enum/extern + simple `#define`-only-macros). | FF2. Full preprocessor reserved post-v1 (G-810). |
+| G-806 | ABI catalog per (lang × platform). Calling convention + LP64/LLP64 + struct padding + va_arg + small-aggregate-in-regs thresholds. | FF3. |
+| G-807 | C name mangling (per-platform underscoring); Itanium + MSVC demangling reserved post-v1. | FF4. |
+| G-808 | `ingest()` entry point + `HirAttribute<FfiMetadata>` populated on extern decls. | FF5. |
+| G-809 | libc smoke: `extern printf(...)` end-to-end on all 6 (OS × arch). | FF6. |
+| G-810 | (post-v1) C preprocessor for header mode (`#include` + function-like macros). | Reserved. v1 uses pre-reduced headers in `src/source-config/ffi-headers/`. |
+| G-811 | (post-v1) Itanium + MSVC C++ demanglers. | FF7 / FF8. |
+| G-812 | Pre-reduced headers for {libc, libSystem, msvcrt, kernel32} on each platform. | Ships under `src/source-config/ffi-headers/`. |
+| G-813 | Symbol-existence pin: CI reads the actual platform libc binary and asserts every header-declared symbol is present. | Catches drift between pre-reduced headers and reality. |
+
+---
+
+## 9. Source-to-source translation (new rev 2)
+
+> v1.x — first user likely c-subset → JS for a Web target. Owned by [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md).
+
+| ID    | Gap | Notes |
+|-------|-----|-------|
+| G-901 | `.map.json` schema + loader. Hub-and-spoke (HIR↔language, not per-pair grammar mapping). | ST1. |
+| G-902 | HIR(source) → HIR(target) walker. Type-mapping + kind-mapping + idiom hints. | ST2. |
+| G-903 | HIR(target) → CST(target) builder. `emissionTemplates[]` on language schemas. | ST3. |
+| G-904 | Target-schema pretty-printer with lexical conventions. | ST4. |
+| G-905 | First flagship pair: c-subset → JavaScript. End-to-end correctness against host-binary stdout. | ST5. |
+| G-906 | Round-trip discipline: native compile vs transpile + re-parse-target → diff. | ST6. |
+| G-907 | New artifactProfile `transpile`; project config `transpileTarget` + `languagePair` fields. | `06-artifact-profile-plan` §3 already updated. |
+| G-908 | `T_*` diagnostic namespace: `T_MissingKindMapping`, `T_AmbiguousMapping`, `T_KindNotMapped`, `T_ExtensionNotMapped`, `T_IdiomConflict`, `T_TargetSchemaReparse`. | |
+
+---
+
+## 10. Shader / GPU codegen (new rev 2)
+
+> v1.x — lit up for the user's custom language. Owned by [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md).
+
+| ID    | Gap | Notes |
+|-------|-----|-------|
+| G-1001 | HIR shader-shape lattice members in the core lattice: Vector / Matrix / Sampler / Texture / UAV / ConstantBuffer / WorkgroupShared. | SG1. Per `08.5-substrate-prep-plan` §2.2. |
+| G-1002 | HIR shader-shape kinds: WorkgroupBarrier / DerivativeX/Y / TextureSample/Load / ImageStore / AtomicOp / Swizzle. | SG1. Per `09-hir-plan` §2.2 shader extensions. |
+| G-1003 | HIR shader verifier with `SH_*` codes (no recursion / no dynamic alloc / no fn-ptr / no libc / no host-pointer). | SG2. |
+| G-1004 | SPIR-V emitter (module header + memory model + entry points + execution modes + sections). | SG3. |
+| G-1005 | SPIR-V type encoding (core lattice → OpType*). | SG4. |
+| G-1006 | SPIR-V instruction lowering from MIR (with structured-CF marker re-use for OpLoopMerge / OpSelectionMerge). | SG5 + SG6. |
+| G-1007 | SPIR-V decorations (Binding / DescriptorSet / Location / BuiltIn). | SG7. |
+| G-1008 | Entry-point attribute parsing in HIR (`[[shader.vertex]]` / `[[shader.fragment]]` / `[[shader.compute(x,y,z)]]`). | SG8. |
+| G-1009 | Same-source CPU + GPU functions (dual lowering for `[[shader.usable]] [[host.usable]]`). | `17-shader-gpu-plan` §2.4. |
+| G-1010 | Reflection sidecar `.spv.json` with entry-points + bindings + push-constants. | `17-shader-gpu-plan` §2.8. |
+| G-1011 | "Hello triangle" Vulkan validation-layer CI harness. | SG10. |
+
+---
+
+## 11. WASM backend (new rev 2)
+
+> v1.x — web target. Owned by [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md). MUST NOT be foreclosed by IR design (structured-CF marker discipline in MIR is the bridge).
+
+| ID    | Gap | Notes |
+|-------|-----|-------|
+| G-1101 | WASM module encoder (sections 1-12 + custom). | WA1–WA2. |
+| G-1102 | Linear memory + Data section + i32 pointer arithmetic. | WA3. |
+| G-1103 | Structured CF lowering from MIR structured-CF markers (block / loop / if / br / br_if / br_table). | WA4. |
+| G-1104 | Import + export sections (FFI to JS / WASI hosts). | WA5. |
+| G-1105 | Global section + start function. | WA6. |
+| G-1106 | Name custom section (debug names). | WA7. |
+| G-1107 | `wasm-validate`-clean output + round-trip via `wasm2wat` (oracles only). | WA8. |
+| G-1108 | End-to-end "hello world" under wasmtime + Chromium V8 (oracles only). | WA9. |
+| G-1109 | Deterministic byte output. | WA10. |
+| G-1110 | Hermetic acceptance: no `wasm-ld` / `emscripten` invocation. | WA9. |
+
+---
+
+## 12. Sequencing — what unblocks what
 
 ```
 [done] tokenizer ✅
@@ -268,7 +380,7 @@ This is the **largest single chunk of work** in v1.
                                                                                 │                     │
                                                                                 ▼                     ▼
                                                             artifactProfile AP1+AP2+AP4 ────► codegen ─► linker
-                                                                                              (G-501..524) (G-540..543)
+                                                                                              (G-501..524) (G-560..571 in-tree)
                                                                                                           │
                                                                                                           ▼
                                                                                                   CI + corpus + perf
@@ -281,28 +393,33 @@ The critical path runs through: **parser → compilation-unit → semantic → I
 
 ---
 
-## 9. Post-v1 (deferred but tracked)
+## 13. Post-v1 (deferred but tracked)
 
-These are intentionally NOT v1 deliverables. Tracking them here so v1 work doesn't make decisions that close them off.
+These are intentionally NOT v1 deliverables. Several formerly-post-v1 items moved to v1.x with rev 2; see the corresponding sub-plan for status.
 
-- ~~LSP server / IDE integration~~ — **moved to v1** as parser-plan PA5 (diagnostics-only scaffolding); semantic-powered LSP methods (hover/completion/goto-def/references/rename) remain post-v1 in a dedicated LSP follow-up plan after phase #8.
-- Incremental parsing + build caching (G-605) — LSP currently re-parses on every `didChange`; build caching is the perf play that follows.
-- Inlining + CSE + loop-invariant motion (G-404, G-405, G-406)
-- Graph-coloring register allocation (G-512)
-- WASM target
-- Built-in linker (à la `lld`/`mold`)
-- PGO / LTO
-- Full C99 (preprocessor + everything c-subset omits) as a separate language config
-- Stored-procedure deployment automation for tsql-subset's `sproc` artifactProfile
-- Differential testing (G-734)
-- Cross-compilation (G-707)
-- Static musl on Linux (G-521 alt)
-- Exception handling (G-525)
-- TLS (G-516) + atomics (G-517) if a language needs them
+- ~~LSP server / IDE integration~~ — **moved to v1** as parser-plan PA5 (diagnostics-only scaffolding); semantic-powered LSP methods post-phase-#8 in a dedicated LSP follow-up plan.
+- Incremental parsing + build caching (G-605).
+- Inlining + CSE + loop-invariant motion (G-404, G-405, G-406).
+- Graph-coloring register allocation (G-512).
+- ~~WASM target~~ — **moved to v1.x** as [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) per rev 2.
+- ~~Built-in linker~~ — **moved to v1 mandatory** as [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) per rev 2 (hermetic invariant).
+- PGO / LTO.
+- Full C99 (preprocessor + everything c-subset omits) as a separate language config.
+- Stored-procedure deployment automation for tsql-subset's `sproc` artifactProfile.
+- Differential testing (G-734).
+- Cross-compilation (G-707) — partially obviated by the in-tree linker (Apple targets from non-Apple hosts).
+- Static musl on Linux (G-521 alt).
+- Exception handling (G-525) — reserved under [`21-runtime-reserved-plan`](./21-runtime-reserved-plan%20-%20tbd.md) §2.2.
+- ~~TLS (G-516) + atomics (G-517)~~ — **TLS moved to v1** under `14-linker-plan` LK5 (initial-exec model); atomics still post-v1.
+- C++ FFI demangling (Itanium + MSVC) — reserved under [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) FF7/FF8.
+- iOS / Android native targets — v1.x via the in-tree linker + codesign sub-plans.
+- VHDL / Verilog (HIR-HW) — reserved indefinitely; see [`19-hir-hw-reserved-plan`](./19-hir-hw-reserved-plan%20-%20tbd.md).
+- User's custom language — reserved indefinitely; see [`20-custom-language-reserved-plan`](./20-custom-language-reserved-plan%20-%20tbd.md).
+- Language runtime (GC / exceptions / coroutines) — reserved indefinitely; see [`21-runtime-reserved-plan`](./21-runtime-reserved-plan%20-%20tbd.md).
 
 ---
 
-## 10. Acceptance — what "v1 production-ready" means
+## 14. Acceptance — what "v1 production-ready" means
 
 A PR titled "v1 — production-ready" is accepted when **every** item below is checked:
 
@@ -314,11 +431,30 @@ A PR titled "v1 — production-ready" is accepted when **every** item below is c
 - [ ] `script` and `sproc` profiles produce valid output for tsql-subset on every host.
 - [ ] CI matrix runs on all 6 target combos + ASan/UBSan on Linux Clang.
 - [ ] Compile-then-run integration tests pass on every CI runner.
-- [ ] Diagnostic UX renders clang-quality output (line + col + caret + actionable message) for every `P_*`/`S_*` diagnostic class.
+- [ ] Diagnostic UX renders clang-quality output for every `P_*`/`S_*`/`H_*`/`I_*`/`L_*`/`K_*`/`F_*`/`A_*`/`B_*`/`G_*` namespace.
 - [ ] Compile time for a 500-LOC c-subset program is < 1 second on a modern laptop.
 - [ ] Generated binary perf is within 2× of `gcc -O0` for the c-subset corpus.
 - [ ] `docs/{language,project,architecture,contributing}.md` are current.
-- [ ] License declared, third-party deps audited, reproducible-build sweep complete.
+- [ ] License declared, third-party deps audited (BearSSL vendored for codesign), reproducible-build sweep complete.
+- [ ] **Hermetic acceptance (rev 2):** building the c-subset corpus on a CI runner with **no `ld` / `link.exe` / `ld64` / `lld` / `wasm-ld` / `clang` / `gcc` / `as` / `xcrun` / `codesign` / `signtool` / `dxc` / `dsymutil` / `mspdb` / `emscripten` / `wasm-ld` installed** produces a working signed binary on every target.
 - [ ] Second engineer can onboard and ship a substrate PR within their first week (G-761 closure).
 
 When all boxes are checked, this plan is closed and the project's first stable release lands.
+
+---
+
+## 15. Rev 2 quick index (added 2026-05-23)
+
+New gap clusters from the universal-compiler decisions:
+
+| Cluster | Section | Owning sub-plan |
+|---|---|---|
+| HIR + MIR + LIR (replaces single-SSA G-301) | §3 G-301a/b/c, G-309, G-310 | [`09-hir-plan`](./09-hir-plan%20-%20tbd.md), [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) |
+| Core type lattice + extensions | §3 G-307 | [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) |
+| In-tree linker (replaces system-linker G-540..G-543) | §5.5 G-560..G-571 | [`14-linker-plan`](./14-linker-plan%20-%20tbd.md), [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) |
+| In-tree codesign + publish | §5.6 G-590..G-597 | [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) |
+| FFI ingestion | §8 G-801..G-813 | [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) |
+| Source translation | §9 G-901..G-908 | [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md) |
+| Shader / GPU | §10 G-1001..G-1011 | [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) |
+| WASM | §11 G-1101..G-1110 | [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) |
+| Debug info (in-tree DWARF + PDB) | (existing §5.4 + new sub-plan) | [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) |

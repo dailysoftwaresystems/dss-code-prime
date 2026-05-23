@@ -94,20 +94,27 @@ For T-SQL-style languages (`script`, `sproc`), "codegen" is a text-emission phas
 
 ---
 
-## 3. Built-in profile vocabulary
+## 3. Profile vocabulary — registered set
 
-The schema interner predeclares these profile names so the loader can validate `artifactProfiles` entries:
+> **Updated 2026-05-23** per the universal-compiler decisions in [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1 (rev 2). The vocabulary is no longer a compile-time enum; it's a **registered set** owned by the loader and contributable by each shipped backend plan. New profiles arrive via the schema-version bump that introduces their backend, not via config-level name invention.
 
-| Profile  | Meaning                                                        | Codegen path                                       |
-|----------|----------------------------------------------------------------|----------------------------------------------------|
-| `cli`    | Console executable. Entry: `main`.                             | Native binary, console subsystem.                  |
-| `gui`    | Windowed application. Entry: `WinMain`/`wWinMain` (Win), `main` + Cocoa bootstrap (macOS), `main` + WM-toolkit bootstrap (Linux). | Native binary, GUI subsystem on PE; same binary shape on ELF/Mach-O but linked against the platform UI runtime. |
-| `lib`    | Shared library (`.dll` / `.so` / `.dylib`). No entry point; named exports. | Native shared-object format per OS.                |
-| `staticlib` | Static archive (`.lib` / `.a`). Object-file bundle.         | Object emission + archiver.                        |
-| `script` | Text-emission profile for SQL-shaped languages. Output is a `.sql` file or equivalent. No native codegen. | Lowering pass that walks the CST and emits target dialect text. |
-| `sproc`  | Stored-procedure deployment package. Output is a JSON/ZIP bundle the host DB engine consumes. | SQL emission + deployment-manifest assembly.       |
+| Profile     | Meaning                                                        | Codegen path / backend plan |
+|-------------|----------------------------------------------------------------|-----------------------------|
+| `cli`       | Console executable. Entry: `main`.                             | Native binary, console subsystem — [`14-linker-plan`](./14-linker-plan%20-%20tbd.md). |
+| `gui`       | Windowed application. Entry: `WinMain`/`wWinMain` (Win), `main` + Cocoa bootstrap (macOS), `main` + WM-toolkit bootstrap (Linux). | Native binary, GUI subsystem on PE; same binary shape on ELF/Mach-O but linked against the platform UI runtime. |
+| `lib`       | Shared library (`.dll` / `.so` / `.dylib`). No entry point; named exports. | Native shared-object format per OS — `14-linker-plan`. |
+| `staticlib` | Static archive (`.lib` / `.a`). Object-file bundle.            | Object emission + in-tree archiver. |
+| `script`    | Text-emission profile for SQL-shaped languages. Output is a `.sql` file or equivalent. | Lowering pass that walks the CST and emits target dialect text. |
+| `sproc`     | Stored-procedure deployment package. Output is a JSON/ZIP bundle the host DB engine consumes. | SQL emission + deployment-manifest assembly. |
+| `transpile` | **New.** Output is target-language source text. Driven by a language-pair `.map.json`. | [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md). Requires `transpileTarget` + `languagePair` fields in the project config. |
+| `shader`    | **New (reserved for v1.x).** Output is `.spv` (SPIR-V) + sidecar `.spv.json` reflection. | [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md). Source-language schema must declare shader-shape attributes (`[[shader.*]]`) and the shader-shape lattice members (Vector / Matrix / Sampler / Texture / UAV). |
+| `hdl`       | **Reserved.** Output is VHDL / Verilog / SystemVerilog text describing hardware. | [`19-hir-hw-reserved-plan`](./19-hir-hw-reserved-plan%20-%20tbd.md). Reserved namespace; design lands when triggered. |
 
-**Extension points.** A language config that needs a profile not in this list emits `C_UnknownArtifactProfile`. The right response is a follow-up plan (or v3 schema bump) adding the profile name to the built-in set, not config-level name invention — profiles need codegen-backend support to mean anything, so a name without a backend is dead text.
+**Loader behavior.** The loader holds a **registered profile set**, populated at startup by each backend plan's registration call (`ArtifactProfileRegistry::registerProfile`). v1 ships the eight names above. Adding a new profile post-v1 = backend plan + registration call + `dssSchemaVersion` bump. No more compile-time enum; loader iterates the registered set at validation time.
+
+**Diagnostics.**
+- `C_UnknownArtifactProfile` — profile not in the registered set at load time.
+- `C_ProfileBackendMissing` (new) — profile registered but its backend (per the plan table above) isn't compiled into this build. Allows partial builds (e.g. shader-less dev builds) to fail-loud rather than silently strip output.
 
 ---
 
@@ -140,7 +147,7 @@ These ship as part of AP4. The list is per-language data, not a hardcoded driver
 |---|----------|-----------------------|
 | 1 | Should `artifactProfile` participate in the schema's compiled position graph (e.g. `shapes` keyed per profile so a `main` function is required for `cli` but not `lib`)? | **No** for v1 — profile-specific shape requirements are codegen-phase work, not schema-phase. Revisit when the first real grammar needs it. |
 | 2 | Multi-profile compilation in one driver invocation (build both `lib` and `cli` from the same sources)? | **No** for v1 — project config picks exactly one profile. Multi-profile builds run the driver twice. |
-| 3 | Versioning of the profile vocabulary itself — what if a future plan adds `kernelmod` or `wasm`? | Built-in vocab is owned by the loader; adding a profile = schema-version bump. Configs that pin `dssSchemaVersion` get deterministic behavior. |
+| 3 | Versioning of the profile vocabulary itself — what if a future plan adds `kernelmod` or `wasm`? | **Resolved 2026-05-23** — registered set, not compile-time enum (see §3 rewrite). Adding a profile = the corresponding backend plan ships + registers + bumps `dssSchemaVersion`. Configs that pin `dssSchemaVersion` get deterministic behavior. |
 | 4 | Should the field be plural-required on the language side (`artifactProfiles`) and singular on the project side (`artifactProfile`)? | **Yes** — semantic difference: language declares a set, project picks one. Loader rejects scalar on the language side and array on the project side. |
 | 5 | Tooling — should the LSP / IDE plugin (when it lands) consume the profile to constrain code-completion (e.g. don't suggest `WinMain` in a `lib` project)? | **Out of v1 scope.** Logged for the future tooling plan. |
 

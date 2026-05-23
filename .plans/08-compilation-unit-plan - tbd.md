@@ -1,15 +1,13 @@
 # Compilation Unit Phase — Sub-Plan
 
-> Bridges phase #7 (`analysis-syntactic`) and phase #8 (`analysis-semantic`). The parser produces one `Tree` per file; this phase introduces the **`CompilationUnit`** — the bundle of trees + driver-resolved cross-file references that the semantic phase, IR, and codegen all consume. Closes production-readiness gaps **G-110** (multi-file translation units) and **G-111** (imports/modules).
->
-> **Why this isn't bundled into semantic.** The compilation-unit boundary is the cross-cutting decision that ALL downstream phases depend on: semantic walks `CompilationUnit.trees` to build a unified symbol table; IR lowers per-CU (one CU → one IR module); codegen / linker emit one artifact per CU. Bundling this into semantic would force semantic-phase PRs to re-litigate the CU shape every time. Keeping it standalone forces the design decision early, makes the cross-CU contract explicit, and lets the LSP (PA5) operate on per-file `Tree`s without needing the semantic phase to ship first.
+> Bridges phase #7 (`analysis-syntactic`) and phase #8 (`analysis-semantic`). Introduces the **`CompilationUnit`** — the bundle of trees + driver-resolved cross-file references that the semantic phase, IR, and codegen all consume. Closes production-readiness gaps **G-110** + **G-111**.
 
 ## 0. Status (snapshot)
 
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 production-critical; gates phase #8 (`analysis-semantic`). Production-readiness G-110 + G-111. |
-| Predecessors  | ✅ Parser phase #7 closed ([`05-parser-plan - ok.md`](./05-parser-plan%20-%20tbd.md)) — PA0–PA5b all shipped. CU1 unblocked. LSP (PA5a/PA5b) ships per-file as designed; cross-file LSP features wait for a dedicated LSP follow-up plan post-phase #8. |
+| Predecessors  | ✅ Parser phase #7 closed ([`05-parser-plan - ok.md`](./05-parser-plan%20-%20ok.md)) — PA0–PA5b all shipped. CU1 unblocked. LSP (PA5a/PA5b) ships per-file as designed; cross-file LSP features wait for a dedicated LSP follow-up plan post-phase #8. |
 | Successors    | Phase #8 (`analysis-semantic`) consumes `CompilationUnit` instead of bare `Tree`. Phase #9 (IR) lowers per-CU. Phase #11 (codegen) emits one artifact per CU. |
 | Scope         | **Bounded.** CU1: `CompilationUnit` type + driver-level aggregation. CU2: multi-file parser invocation + per-file diagnostic merging. CU3: cross-tree symbol-shape hook (the contract semantic phase consumes). CU4: per-language import-resolution shim (heuristic for v1; schema-driven in v3). |
 
@@ -114,6 +112,7 @@ public:
 | CU2 | Multi-file `UnitBuilder` + driver wiring        | `UnitBuilder::addFile` → tokenize → parse → push `Tree` into the CU. Driver diagnostics carry per-file `SourceBuffer` reference so the renderer can show the right file/line. CompilationUnit hands a `std::span<Tree const>` to consumers. Per-file order preserved (matters for some languages' include semantics). |
 | CU3 | Cross-tree `SymbolId` shape + `CrossTreeRef`    | The contract semantic-phase consumes. `SymbolId` becomes CU-scoped (not tree-scoped). `NodeAttribute<SymbolId>` keys against the owning Tree's id; the symbol table's storage moves to the CU. Adds death tests for `NodeAttribute<SymbolId>` mismatches against other CUs (cross-CU NodeId leaks). |
 | CU4 | Per-language import-resolution shim             | `ImportResolver` interface; built-in implementations per shipped language: **toy** = identity (no imports); **c-subset** = `#include "x.h"` resolves against the project's include-paths (v1 = same directory + project-config-declared include dirs; full system-header resolution post-v1); **tsql-subset** = either (a) concat-order (sqlcmd `:r`) or (b) cross-statement DB.schema reference (driver-injected from project config). Resolution populates the CU's `crossRefs` vector before semantic gets it. |
+| CU5 | **Multi-language CU support** (v1.1)              | Per the universal-compiler decisions in [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1 (rev 2): a single CU can contain files of **different source languages** when all converge on the same artifact via [HIR](./09-hir-plan%20-%20tbd.md). Use case: a project with `.c` (c-subset) files calling FFI exports of `.sql` (tsql-subset) sprocs, compiled to one CLI binary. Per-file schema attached to each `Tree`; HIR lowering dispatches on each file's source language; HIR-level cross-references resolve uniformly. **v1.1 deliverable** — not blocking v1. Open question: when the source languages disagree on artifactProfile, which wins? Default: per-file profiles aggregated by an artifact-policy attached to the project config. |
 
 ### 2.4 What's NOT in this phase
 
