@@ -11,6 +11,7 @@
     " ":  [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
     "\t": [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
     "\n": [{ "kind": "Newline",      "flags": ["EmptySpace"] }],
+    "\r": [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
 
     "+":  [
       { "kind": "SumOperator",          "priority": 10 },
