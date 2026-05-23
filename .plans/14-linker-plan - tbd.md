@@ -11,7 +11,7 @@
 | Status        | ⏳ **planned.** v1 production-critical. Largest single chunk of backend work. |
 | Predecessors  | ⏳ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) (bytes + relocations). ⏳ [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) (extern symbol declarations from precompiled libs). |
 | Successors    | ⏳ [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) (LC_CODE_SIGNATURE / PE security directory placeholders filled post-link). ⏳ [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) (debug sections placed alongside code). |
-| Scope         | **Bounded.** LK1–LK10. v1 acceptance: link c-subset corpus → ELF / PE / Mach-O on every {OS × arch}. WASM (LK8) + SPIR-V (LK9) post-v1 skeletons. |
+| Scope         | **Bounded.** v1: LK1–LK10. v1 acceptance: link c-subset corpus → ELF / PE / Mach-O on every {OS × arch}. WASM (LK8) + SPIR-V (LK9) post-v1 skeletons. **v1.x: LK11** — cross-CU linking (couples with [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) CU6). |
 
 ---
 
@@ -66,7 +66,7 @@ Output per CU:
 
 Engine flow:
 
-1. **Merge symbol tables** across all input CUs (when v1 evolves to multi-object linking — for v1 we link single-CU images per `08-compilation-unit-plan`).
+1. **Merge symbol tables** across all input CUs. **v1 is single-CU per image** (per [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) §2.4); the merge logic stubs to identity. Multi-CU input lands in **LK11** (v1.x), coupled with CU6 — see §2.12.
 2. **Resolve symbols.** Each undefined ref resolves to either a defined symbol in the same image (intra-module) or to an FFI import (entry in the image's import table).
 3. **Lay out sections.** Apply per-format conventions (ELF: page-aligned segments per PT_LOAD; PE: section table with file/virtual alignment; Mach-O: segments with file/virtual alignment).
 4. **Apply relocations.** Per (arch × format) mutator from `13-assembler-plan` §2.5 taxonomy.
@@ -131,6 +131,25 @@ v1: implement initial-exec model for static binaries; general-dynamic reserved p
 
 `K_*` (K for "linK") — `K_SymbolUndefined`, `K_SymbolRedefined`, `K_RelocationOverflow`, `K_RelocationKindMismatch`, `K_SectionOverlap`, `K_ImportUnresolved`, `K_InvalidLoadCommand` (Mach-O), `K_InvalidPeHeader`, `K_InvalidElfHeader`, `K_TlsModelUnsupported`. Per-format writers also emit `K_*` codes scoped to their format.
 
+### 2.12 Cross-CU linking (v1.x — coupled with `08-compilation-unit-plan` CU6)
+
+v1 ships **one `CompilationUnit` per output image**. The engine's "merge symbol tables across all input CUs" step (§2.2 flow item 1) is therefore an identity operation in v1 — there is only one CU to merge.
+
+**LK11** (v1.x) lifts that assumption to enable:
+
+- **Shared libraries / DLLs consumed by a separate `cli`** — each lib is a CU; the executable's CU resolves symbols against the libs' CUs at link time (not at FFI ingestion time, which is LK6 territory).
+- **Incremental compilation** — each translation unit becomes a separate CU; LK11 combines them.
+
+Substrate already in place by the time LK11 ships:
+
+- `CompilationUnitId` provenance ([CU1](./08-compilation-unit-plan%20-%20tbd.md) L2) — every symbol's defining CU is identifiable.
+- Cross-CU `NodeId` guard ([CU3](./08-compilation-unit-plan%20-%20tbd.md) D3) — wrong-CU `NodeAttribute<SymbolId>` access is fatal at substrate level.
+- CU's `crossRefs` table ([CU3/CU4](./08-compilation-unit-plan%20-%20tbd.md)) — pre-resolved inter-tree edges; LK11 extends the same data model to inter-CU edges.
+
+**Trigger** (when LK11 unblocks): the first artifact profile that requires multiple CUs in one image — typically when [`06-artifact-profile-plan`](./06-artifact-profile-plan%20-%20tbd.md) `lib`/`staticlib` outputs need to be consumed by a separate `cli` project, OR when incremental rebuild enters scope. Until then LK11 is reserved scope, and the v1 single-CU contract holds end-to-end.
+
+**Out of scope for LK11**: shared symbol-table semantics across **different processes** (process-boundary IPC / DLL hot-reload). Those are runtime concerns owned by [`21-runtime-reserved-plan`](./21-runtime-reserved-plan%20-%20tbd.md).
+
 ### 2.11 Build-id
 
 BLAKE3-256 hash of (section contents excluding the build-id field itself, in canonical order). Emitted to:
@@ -154,6 +173,7 @@ BLAKE3-256 hash of (section contents excluding the build-id field itself, in can
 | LK8 | WASM writer (skeleton)                           | Module header + section framework; full impl in `18-wasm-plan`. |
 | LK9 | SPIR-V writer (skeleton)                         | Module header + section framework; full impl in `17-shader-gpu-plan`. |
 | LK10| End-to-end "hello world" integration on all 6 (OS × arch) | The hermetic-acceptance gate: build c-subset corpus on a CI runner with NO system linker installed; produced binary runs + prints expected output. |
+| LK11| **Cross-CU linking** (v1.x)                       | Lifts the v1 single-CU-per-image assumption. Engine's symbol-table merge (§2.2 flow item 1) becomes real; cross-CU symbol resolution + relocation application; CU-boundary diagnostics under `K_CrossCu*`. **Couples with** [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) **CU6**. v1.x — triggers per §2.12. |
 
 Substrate tier (5-agent review) for LK4 (engine) + LK7 (codesign-hook contract). Feature tier for writers.
 
@@ -219,4 +239,4 @@ Substrate tier (5-agent review) for LK4 (engine) + LK7 (codesign-hook contract).
                         (WASM)    (SPIR-V)
 ```
 
-LK1/LK2/LK3 are parallel. LK4 ties them together. LK5 + LK6 finish the substrate. LK10 is the hermetic acceptance gate. LK8/LK9 are skeletons unblocking 17/18.
+LK1/LK2/LK3 are parallel. LK4 ties them together. LK5 + LK6 finish the substrate. LK10 is the hermetic acceptance gate. LK8/LK9 are skeletons unblocking 17/18. **LK11** (v1.x) ships post-LK10 — couples with [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) CU6 to lift the single-CU-per-image assumption (see §2.12); trigger-gated, not on the v1 critical path.
