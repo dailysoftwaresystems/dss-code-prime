@@ -347,9 +347,9 @@ TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
         return OpenScope{nullptr, 0};
     }
 
-    // Pop the subtree we're going to wrap. The pop only removes the
-    // parent's pointer to it; the arena node and all its descendants
-    // stay put.
+    // Detach the subtree from its current parent slot. The arena
+    // node and its descendants stay put — we're only moving the
+    // parent's pointer.
     const NodeId childToWrap = pendingChildren_.back();
     pendingChildren_.pop_back();
 
@@ -357,18 +357,31 @@ TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
     // the wrapper's Internal node, attaches it as a pending child of
     // the parent (taking the slot vacated by the pop above), and
     // pushes the new Frame whose `pendingStart` points at the
-    // post-attach size of `pendingChildren_`.
-    OpenScope guard = open(rule);
+    // post-attach size of `pendingChildren_`. Wrapped in try/catch so
+    // a `std::bad_alloc` on `nodes_` grow doesn't leak `childToWrap`
+    // from the parent's pending list (the strong-exception-safety
+    // contract `OpenScope` callers expect — "either the wrap landed
+    // or the builder state is byte-identical").
+    OpenScope guard{nullptr, 0};
+    try {
+        guard = open(rule);
+    } catch (...) {
+        pendingChildren_.push_back(childToWrap);
+        throw;
+    }
     if (open_.empty()) {
-        // `open()` errored — we already emitted a diagnostic; restore
-        // the pre-pop state so the caller's subtree isn't lost.
+        // Defensive: `open()` returned a no-op guard. This is
+        // unreachable from here because `finished_` is gated at the
+        // top of this method and `open()`'s only no-op path is the
+        // `finished_` check. Kept for symmetry with the catch above.
         pendingChildren_.push_back(childToWrap);
         return guard;
     }
 
-    // Re-attach the popped subtree as the wrapper's FIRST pending
-    // child. After this push, the wrapper's children region is
-    // `[wrapper.pendingStart, pendingChildren_.size())` = `[childToWrap]`.
+    // Re-attach the popped subtree under the wrapper. The wrapper's
+    // children region is now `[wrapper.pendingStart, current size)` =
+    // `[childToWrap]` — the load-bearing post-condition the rest of
+    // this function (parent fixup + span anchor) depends on.
     pendingChildren_.push_back(childToWrap);
 
     // Fix up the wrapped child's parent pointer and the wrapper's

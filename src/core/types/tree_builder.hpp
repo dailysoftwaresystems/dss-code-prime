@@ -167,8 +167,11 @@ public:
     // postfix that the wrap was built around.
     //
     // Contract: requires an open frame containing at least one pending
-    // child. Emits `P_BuilderInvariant` and returns a no-op guard if
-    // either invariant is violated.
+    // child. Operates on the TOP frame (`open_.back()`) — callers must
+    // ensure no inner frame is open at call time; wrapping a pending
+    // child of an outer frame is not supported (would silently affect
+    // the wrong frame). Emits `P_BuilderInvariant` and returns a
+    // no-op guard if any invariant is violated.
     [[nodiscard]] OpenScope wrapLastChildInFrame(RuleId rule) &;
 
     // Resolve + attach a token leaf to the current frame. EmptySpace tokens

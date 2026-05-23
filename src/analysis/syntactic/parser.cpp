@@ -570,18 +570,27 @@ struct Parser::Impl {
     // at every walker open site. Pushes to the parallel `frameRules`
     // stack so recovery code can walk the rule chain.
     void openExprFrame(RuleId rule) {
-        frames.push_back(builder->open(rule));
-        frameRules.push_back(rule);
-        walker.enterRule(rule);
+        pushFrameBookkeeping_(builder->open(rule), rule);
     }
 
     // Left-recursive wrap: open `rule` as a new frame that adopts the
     // current frame's most-recent pending child as its first child.
     // Pratt-walker shim around `TreeBuilder::wrapLastChildInFrame` —
-    // mirrors `openExprFrame`'s pattern (push frame guard + frameRules
-    // entry + enter the rule on the parser-side schema walker).
+    // identical bookkeeping tail to `openExprFrame`; differs only in
+    // the builder call.
     void wrapLastChildExprFrame(RuleId rule) {
-        frames.push_back(builder->wrapLastChildInFrame(rule));
+        pushFrameBookkeeping_(builder->wrapLastChildInFrame(rule), rule);
+    }
+
+    // Frame bookkeeping common to both `openExprFrame` and
+    // `wrapLastChildExprFrame`: take ownership of the builder-side
+    // OpenScope guard, register the parallel `frameRules` entry the
+    // recovery code uses for FOLLOW-set walking, and step the
+    // parser-side schema walker into the rule. Same enterRule
+    // semantics regardless of which builder operation produced the
+    // guard (the cleanup `closeFrameOnce()` is symmetric).
+    void pushFrameBookkeeping_(TreeBuilder::OpenScope&& guard, RuleId rule) {
+        frames.push_back(std::move(guard));
         frameRules.push_back(rule);
         walker.enterRule(rule);
     }
@@ -1261,20 +1270,15 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
         // (`grouped.has_value()`) extends the simple `++` case with a
         // body-rule frame parsed between opener and closer.
         //
-        // Postfix is LEFT-associative and uses iterative wrapping via
-        // `wrapLastChildExprFrame` — the just-built primary (or
-        // previously-built wrap in a chain like `f(a)[i]`) becomes the
-        // first child of the new `postfixExpr` frame. NO rollback,
-        // NO recursive `parseExpressionAt` — the rollback-replay used
-        // by infix would lose iter-1's wrap on iter-2 and the
-        // `prec + 1` re-parse would exclude the same-prec postfix
-        // already consumed. The classical Pratt left-recursion shape.
-        //
-        // The pre-primary `snap` stays valid across postfix iterations:
-        // a later same-level infix iter (`f(a) + g(b)`) needs to roll
-        // back ALL the postfix wraps and the primary atom, then open
-        // a `binaryExpr` whose recursive LHS parse rebuilds the chain
-        // inside the new wrap.
+        // Postfix is LEFT-associative: iterative wrapping via
+        // `wrapLastChildExprFrame` wraps the previously-built primary
+        // (or a prior chain wrap) as the new `postfixExpr`'s first
+        // child. The pre-primary `snap` is INTENTIONALLY NOT advanced
+        // across postfix iterations — a later same-level infix iter
+        // (`f(a) + g(b)`) needs that snap to roll the entire chain
+        // back and rebuild it inside the binaryExpr via the recursive
+        // LHS parse at `prec + 1`. Using rollback-replay (infix's
+        // strategy) for postfix would lose iter-1's wrap on iter-2.
         if (postfixInClimb) {
             I.wrapLastChildExprFrame(rules.postfixExpr);
             if (!I.pushOperatorToken()) {
