@@ -22,7 +22,7 @@ Updated as work progresses. Detailed phase status lives in §7.
 | **T6**  | `TreeCursor` (CST + AST modes)                              | ✅ done (review-fix sweep applied + loose-ends closed) |
 | **T7**  | `tree_visitor.hpp` walk helpers                             | ✅ done |
 | **T8**  | `NodeAttribute<T>` side-tables                              | ✅ done |
-| **T9**  | initial typed views                                         | ✅ done |
+| **T9**  | initial typed views                                         | ⚠️ **retired in 08.55** (per thesis decision #4: toy-shaped views replaced by config-driven structure reading) |
 | **T10** | toy-parser end-to-end (happy + broken)                      | ✅ done |
 | **T11** | CMake wireup for any remaining core sources                 | ✅ done (rolling — folded into every checkpoint; audit pass at end of T10 confirmed zero orphans) |
 | **T12** | `docs/tree-model.md` + `docs/language-config-spec.md`       | ✅ done |
@@ -63,6 +63,8 @@ tree_attrs.hpp               ← header-only NodeAttribute<T> side-table; sparse
 well_known_names.hpp         ← inline constexpr string_view constants for standard rule names + built-in token-kind names
 tree_views.hpp               ← header-only typed views (Identifier/Literal/BinaryExpr/Block/FunctionDecl/VarDecl/ExprStmt); ::from() factory + unchecked ctor; EmptySpace-skipping structural accessors
 ```
+
+**Note (post-08.55):** `well_known_names.hpp`, `tree_views.hpp`, and the typed Views (`FunctionDeclView`/`VarDeclView`/`BlockView`/`BinaryExprView`/`IdentifierView`/`LiteralView`/`ExprStmtView`) were retired per thesis decision #4. Engine code now reads structure exclusively from per-language config blocks (`semantics`, `hirLowering`); tests use direct rule lookups + a tiny `tests/core/tree_helpers.hpp::nthVisibleChild` helper. The file-tree entries above are kept for historical context.
 
 **Test-only helpers (`tests/core/`):**
 - `toy_harness.hpp` — shared `ToyHarness` for builder/cursor tests (loads a JSON config, synthesizes tokens; replaces ~60 lines of duplication across two test files).
@@ -116,7 +118,7 @@ Design and implement a **single, language-agnostic tree data structure** that:
 | # | Decision | Rationale |
 |---|---|---|
 | D1 | **CST with an AST view** | Lossless parse tree preserves whitespace, comments, exact token positions. AST view is a *cursor mode* that hides trivia. Enables formatters, refactoring tools, error messages with original spacing, and incremental re-parsing later. |
-| D2 | **Universal `Node` + typed views** | One `Node` struct stores every tree element. The "kind" of node is a `RuleId` — an interned grammar rule name from the language config (`"functionDecl"`, `"ifStmt"`, etc.). Hand-written *views* (`FunctionDeclView`, `BinaryExprView`) wrap `(Tree&, NodeId)` and provide named accessors with zero overhead. Adding a language = writing a config, not new C++ classes. **Caveat (thesis decision #4):** the shipped views are **toy-shaped convenience helpers** keyed to the `well_known_names` rule/child layout — they are NOT a cross-language mechanism. Language-agnostic phases (semantic phase #8, HIR lowering) must read structure from per-language **config blocks** (`semantics` / `hirLowering`), never assume an arbitrary language matches a built-in view's child positions. The views serve toy + as a quick path for configs that adopt the well-known shapes; they must never become the place per-language structure is encoded. |
+| D2 | **Universal `Node` + typed views** | One `Node` struct stores every tree element. The "kind" of node is a `RuleId` — an interned grammar rule name from the language config (`"functionDecl"`, `"ifStmt"`, etc.). Hand-written *views* (`FunctionDeclView`, `BinaryExprView`) wrap `(Tree&, NodeId)` and provide named accessors with zero overhead. Adding a language = writing a config, not new C++ classes. **UPDATE (post-08.55):** The typed Views (`FunctionDeclView`, `VarDeclView`, etc.) were retired per thesis decision #4. The Universal-Node + RuleId-string-name design is unchanged and still correct; what changed is the API for *reading* the tree — language-agnostic engine phases (semantic / HIR lowering) now consult per-language config blocks (`semantics`, `hirLowering`) and use direct `tree.rule(id)` / visible-child lookups, never a built-in toy-shaped view. |
 | D3 | **Arena + `NodeId` indices** | All nodes live in a flat `std::vector<Node>` owned by `Tree`. Children are `uint32_t` indices. Cache-friendly, cheap to serialize, no per-node heap allocations, parent pointers free. Same approach as tree-sitter, Roslyn, rustc. |
 | D4 | **Tree → IR → Target** | Tree describes *shape of source*; IR describes *shape of computation*. Optimizations live on IR (target-independent). Tree is immutable after build; IR is mutable. This keeps the parent plan's pipeline intact. |
 | D5 | **Tree is immutable after build** | TreeBuilder mutates during parsing; once `finalize()` is called, only read APIs are exposed. Semantic info attaches via *attribute side-tables* keyed by `NodeId`, not by mutating nodes. Eliminates cursor-invalidation bugs. |

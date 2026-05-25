@@ -114,6 +114,8 @@ What's in `src/core/types/` today, what v2 PRs will extend, and what v2 design a
 | `tree_attrs.hpp` (`NodeAttribute<T>`) | header-only | T8 — sparse↔dense auto-promotion, custom move ops. Untouched by v2. |
 | `tree_views.hpp` (7 views) | header-only | T9 — `IdentifierView`, `LiteralView`, `BinaryExprView`, `BlockView`, `FunctionDeclView`, `VarDeclView`, `ExprStmtView`. **PR1 introduces operator precedence; the parser-side Pratt walker may eventually want a typed `OperatorExprView` to wrap `BinaryExprView` + operand resolution — flag for v2 retrospective.** |
 | `well_known_names.hpp` | header-only | T9 — `dss::rules::*` + `dss::tokens::*` constants. **Every new v2 well-known rule/token should be added here for single-source-of-truth.** |
+
+**Post-v2 update (08.55):** `well_known_names.hpp` and `tree_views.hpp` were retired per thesis decision #4 (no engine-side per-source-language C++); structure reading is now config-driven via the `semantics` / `hirLowering` schema v4 blocks. The v2 shape/operator/scope work in this plan is unaffected.
 | `detail::views::nthVisibleChild` / `visibleChildCount` / `ruleIdFor` / `tokenKindFor` | `tree_views.hpp` | Helpers; reusable by v2 parser scaffolding. |
 | Shipped grammar | `src/source-config/languages/toy.lang.json` | **Must continue to load unchanged through every v2 PR** — smoke test pin. |
 | Onboarding docs | `docs/tree-model.md`, `docs/language-config-spec.md` | T12 — pinned by `GrammarSchema.DocsCookbookCalcExampleLoadsCleanly`. Each v2 PR appends a "v2 additions" section to `language-config-spec.md` (per PR8). |
@@ -500,6 +502,8 @@ This split is deliberate:
 **Deferred to v3.**
 - Ternary `?:` (mixfix; the `Prefix|Infix|Postfix` enum can't express it).
 - Fine-grained per-context operator exclusion (`allowAssignment` evolved away).
+
+**Post-v2 schema additions** (for orientation): **v3** added `typeExtensions[]` (SP2). **v4** added `imports`, `expr.wrapperRules`, `numberStyle`; `semantics` and `hirLowering` blocks are planned v4 additions (08.6 / 09).
 
 ---
 

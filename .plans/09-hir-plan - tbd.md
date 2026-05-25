@@ -71,6 +71,8 @@ tests/hir/
 
 **Extension kinds (`≥ 256` — registered per language/domain, NOT core):** shader (`WorkgroupBarrier`, `DerivativeX`/`Y`, `TextureSample`, `TextureLoad`, `ImageStore`, `AtomicOp`), SQL (`Query`, `DmlInsert`, `DmlUpdate`, `DmlDelete`, `DdlCreate`, `Cte`, `QueryBlock`), and any future domain. Each is registered by the language/domain that needs it (carrying its operand/attribute shape + which backends consume it); a backend that doesn't recognize an extension kind emits `H_UnsupportedKindForBackend` — never a silent miscompile. The core engine, verifier, and every backend are written against the core + the registry, never against a hardcoded shader/SQL kind.
 
+Extension HIR kinds are **declared per-language** in the schema (the `hirLowering` block, schema v4 — additive sibling of `semantics`/`imports`/`numberStyle`/`typeExtensions[]`), mirroring how shader/SQL extension *types* are declared via `typeExtensions[]` per [08.5 SP2](./08.5-substrate-prep-plan%20-%20tbd.md). Both follow the open core + per-language registered-extensions pattern.
+
 **Generic enough to "support everything":** paradigms beyond the structured-imperative core — OOP dispatch (vtables/interfaces), closures + captures, algebraic data types + pattern matching, exceptions (`TryStmt` reserved), async/coroutines, GC reference types — are representable as **core compositions + registered extension kinds + attribute side-tables**, so a new language onboards by registering kinds, not by editing the core. The single deliberate boundary: a **fundamentally non-imperative paradigm** (concurrent + signal-typed hardware) does NOT force into this HIR — it gets the reserved sibling IR [`19-hir-hw-reserved-plan`](./19-hir-hw-reserved-plan%20-%20tbd.md). One IR cannot honestly model both software and hardware; "support everything" = core + extensions for the software family, + a sibling IR where the paradigm genuinely differs.
 
 Each `HirNode` POD carries:
@@ -178,7 +180,7 @@ Substrate tier (5-agent review) for HR1, HR2, HR3, HR5, HR6 (touch substrate con
 | 5 | Does HIR have generics / templates as first-class? | **First-class generic placeholders** (`TypeRef` to a `Param<name>` lattice node); instantiation is the lowering's responsibility (lower a generic function once per concrete arg list). Recursive instantiation is verifier-bounded. |
 | 6 | Does HIR carry phi nodes? | **No** — phi belongs to MIR (SSA). HIR is pre-SSA, expression-tree-shaped. |
 | 7 | What about exception handling? | **HIR-level `TryStmt` reserved**; v1 shipped languages don't use it. Lowering to MIR is via two-color edges (normal + unwind). Defer to plan 12 if a v1 language needs it. |
-| 8 | Diagnostic namespace? | `H_*` codes. `H_TypeUnresolved`, `H_InvalidBreak`, `H_UnknownIntrinsic`, `H_ShaderViolation`, `H_VerifierFailure`. |
+| 8 | Diagnostic namespace? | `H_*` codes. `H_TypeUnresolved`, `H_InvalidBreak`, `H_UnknownIntrinsic`, `H_ShaderViolation`, `H_VerifierFailure`. Config-load errors in `hirLowering` use the standard `C_*` band (mirror of `imports` / `numberStyle` / `wrapperRules` loader codes) — `H_*` is reserved for verifier / lowering-time failures only. |
 
 ---
 
