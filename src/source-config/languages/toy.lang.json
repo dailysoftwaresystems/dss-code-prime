@@ -48,5 +48,15 @@
     "varDecl":    { "sequence": ["VarKeyword", "Identifier", "AssignmentOperator", "expression", "EndCommand"] },
     "exprStmt":   { "sequence": ["expression", "EndCommand"] },
     "expression": { "sequence": ["Identifier"] }
+  },
+
+  "semantics": {
+    "identifierToken": "Identifier",
+    "declarations": [
+      { "rule": "varDecl", "name": 1, "init": 3, "kind": "variable" }
+    ],
+    "references": [
+      { "rule": "expression" }
+    ]
   }
 }

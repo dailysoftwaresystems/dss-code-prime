@@ -386,5 +386,26 @@
         ]
       }
     }
+  },
+
+  "semantics": {
+    "identifierToken": "Identifier",
+    "declarations": [
+      { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable" },
+      { "rule": "param",       "name": 1, "type": 0, "kind": "variable" }
+    ],
+    "references": [
+      { "rule": "operand" }
+    ],
+    "scopes": [ "block" ],
+    "builtinTypes": [
+      { "name": "int",  "core": "I32"  },
+      { "name": "char", "core": "Char" },
+      { "name": "void", "core": "Void" }
+    ],
+    "literalTypes": [
+      { "literal": "IntLiteral",   "core": "I32" },
+      { "literal": "FloatLiteral", "core": "F64" }
+    ]
   }
 }

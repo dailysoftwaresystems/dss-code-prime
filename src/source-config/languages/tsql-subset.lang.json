@@ -277,5 +277,19 @@
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
     }
+  },
+
+  "semantics": {
+    "identifierToken": "Identifier",
+    "declarations": [
+      { "rule": "createTableStmt", "name": 2, "kind": "table",
+        "nameMatch": "lastIdentifier" }
+    ],
+    "references": [
+      { "rule": "qualifiedName", "nameMatch": "lastIdentifier" }
+    ],
+    "literalTypes": [
+      { "literal": "IntLiteral", "core": "I32" }
+    ]
   }
 }

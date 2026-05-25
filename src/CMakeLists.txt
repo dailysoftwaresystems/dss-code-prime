@@ -2,6 +2,7 @@ add_subdirectory(core)
 add_subdirectory(tokenizer)
 add_subdirectory(analysis/syntactic)
 add_subdirectory(analysis/compilation_unit)
+add_subdirectory(analysis/semantic)
 add_subdirectory(lsp)
 add_subdirectory(gen)
 add_subdirectory(program)
@@ -13,6 +14,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:tokenizer>
     $<TARGET_OBJECTS:analysis_syntactic>
     $<TARGET_OBJECTS:analysis_compilation_unit>
+    $<TARGET_OBJECTS:analysis_semantic>
     $<TARGET_OBJECTS:lsp>
     $<TARGET_OBJECTS:gen>
     $<TARGET_OBJECTS:program>)

@@ -392,6 +392,10 @@ NumberStyle const* GrammarSchema::numberStyle() const noexcept {
     return d_.numberStyle.has_value() ? &(*d_.numberStyle) : nullptr;
 }
 
+SemanticConfig const& GrammarSchema::semantics() const noexcept {
+    return d_.semantics;
+}
+
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
                                        std::span<ScopeKind const> stack) const noexcept {
     // Walk the scope stack top-down so the innermost scope's rules win —

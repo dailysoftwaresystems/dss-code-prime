@@ -126,6 +126,24 @@ enum class DiagnosticCode : std::uint16_t {
     // class of failure: the three Pratt-walker frames MUST be distinct or the
     // walker's tree-building corrupts silently.
     C_DuplicateWrapperRules       = 0xC030,
+    // The `semantics` block (schema v4) is present but malformed: wrong JSON
+    // shape, unknown `kind`/`core`/`constructor`/`nameMatch` enum string, an
+    // out-of-range child index, or a typeShape `operandChild` that doesn't
+    // point to a valid visible child slot. (Missing required sub-fields stay
+    // `C_MissingField`; dangling rule/token names stay `C_UnknownShape`/
+    // `C_UnknownToken`.)
+    C_InvalidSemantics            = 0xC031,
+
+    // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
+    // Emitted by the language-agnostic semantic analyzer
+    // (`src/analysis/semantic/`). The 0xE high nibble renders as the letter
+    // `S` (see `diagnosticCodePrefix`). Append, never renumber.
+    S_UndeclaredIdentifier        = 0xE001,
+    S_RedeclaredSymbol            = 0xE002,
+    S_TypeMismatch                = 0xE003,
+    S_NotCallable                 = 0xE004,
+    S_ArgCountMismatch            = 0xE005,
+    S_UnknownType                 = 0xE006,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

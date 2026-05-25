@@ -8,6 +8,7 @@
 #include "core/types/number_style.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/semantic_config.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/schema_cursor.hpp"
 #include "core/types/schema_token_interner.hpp"
@@ -282,6 +283,13 @@ struct DSS_EXPORT GrammarSchemaData {
     // literals; required (loader emits `C_MissingNumberStyle`)
     // when the language declares `IntLiteral`/`FloatLiteral` tokens.
     std::optional<NumberStyle>                        numberStyle;
+
+    // Per-language semantic config (plan 08.6; schema v4 `semantics`
+    // block). Empty / default-constructed when the language omits the
+    // block — the analyzer then performs no semantic analysis for that
+    // language. Read-only after construction; the loader is the only
+    // writer.
+    SemanticConfig                                    semantics;
 };
 
 } // namespace detail
@@ -509,6 +517,13 @@ public:
     // (`C_MissingNumberStyle`), so any reachable scanNumber call
     // sees a non-null pointer.
     [[nodiscard]] NumberStyle const* numberStyle() const noexcept;
+
+    // Per-language semantic config (plan 08.6; schema v4 `semantics`).
+    // Default-constructed (every facet empty) when the language omits
+    // the block — the analyzer then performs zero semantic analysis
+    // for that language and the model produces no symbols/types/
+    // diagnostics. Read-only; the loader is the only writer.
+    [[nodiscard]] SemanticConfig const& semantics() const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

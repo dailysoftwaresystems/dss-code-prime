@@ -2744,6 +2744,451 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // semantics ── per-language semantic config (plan 08.6; schema v4).
+    // Optional; absent ⇒ analyzer performs no semantic analysis. Parsed
+    // LATE, after `shapes`/`tokens` populated the interners, so referenced
+    // rule/token names resolve here (`C_UnknownShape`/`C_UnknownToken`) and
+    // a loaded schema is guaranteed analyzable.
+    if (doc.contains("semantics")) {
+        json const& sem = doc.at("semantics");
+        if (!sem.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics",
+                      "'semantics' must be an object");
+        } else {
+            SemanticConfig cfg;
+
+            // Core-kind name → TypeKind (only the subset that makes sense as
+            // a source-language built-in type or literal type). Extension
+            // kinds are NEVER named here — they live in the registry, not on
+            // the core lattice.
+            auto const parseCore = [](std::string_view name) -> std::optional<TypeKind> {
+                if (name == "Bool")    return TypeKind::Bool;
+                if (name == "I8")      return TypeKind::I8;
+                if (name == "I16")     return TypeKind::I16;
+                if (name == "I32")     return TypeKind::I32;
+                if (name == "I64")     return TypeKind::I64;
+                if (name == "I128")    return TypeKind::I128;
+                if (name == "U8")      return TypeKind::U8;
+                if (name == "U16")     return TypeKind::U16;
+                if (name == "U32")     return TypeKind::U32;
+                if (name == "U64")     return TypeKind::U64;
+                if (name == "U128")    return TypeKind::U128;
+                if (name == "F16")     return TypeKind::F16;
+                if (name == "F32")     return TypeKind::F32;
+                if (name == "F64")     return TypeKind::F64;
+                if (name == "F128")    return TypeKind::F128;
+                if (name == "Char")    return TypeKind::Char;
+                if (name == "Byte")    return TypeKind::Byte;
+                if (name == "Void")    return TypeKind::Void;
+                return std::nullopt;
+            };
+
+            auto const parseKind = [](std::string_view name) -> std::optional<DeclarationKind> {
+                if (name == "variable") return DeclarationKind::Variable;
+                if (name == "function") return DeclarationKind::Function;
+                if (name == "table")    return DeclarationKind::Table;
+                if (name == "type")     return DeclarationKind::Type;
+                return std::nullopt;
+            };
+
+            auto const parseConstructor = [](std::string_view name) -> std::optional<TypeConstructor> {
+                if (name == "pointer")   return TypeConstructor::Pointer;
+                if (name == "reference") return TypeConstructor::Reference;
+                if (name == "nullable")  return TypeConstructor::Nullable;
+                if (name == "optional")  return TypeConstructor::Optional;
+                if (name == "slice")     return TypeConstructor::Slice;
+                return std::nullopt;
+            };
+
+            auto const parseNameMatch = [](std::string_view name) -> std::optional<NameMatchMode> {
+                if (name == "self")           return NameMatchMode::Self;
+                if (name == "lastIdentifier") return NameMatchMode::LastIdentifier;
+                return std::nullopt;
+            };
+
+            // ── declarations ──
+            if (sem.contains("declarations")) {
+                json const& arr = sem.at("declarations");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/declarations",
+                              "'semantics.declarations' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/declarations/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'declarations' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        DeclarationRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'declarations[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+
+                        auto readIndex = [&](char const* key,
+                                             std::optional<std::uint32_t>& out) {
+                            if (!entry.contains(key)) return;
+                            if (!entry.at(key).is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/" + key,
+                                          std::format("'{}' must be a non-negative integer", key));
+                                return;
+                            }
+                            auto v = entry.at(key).get<std::int64_t>();
+                            if (v < 0 || v > std::numeric_limits<std::int32_t>::max()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/" + key,
+                                          std::format("'{}' visible-child index out of range", key));
+                                return;
+                            }
+                            out = static_cast<std::uint32_t>(v);
+                        };
+                        readIndex("name",   rule.nameChild);
+                        readIndex("type",   rule.typeChild);
+                        readIndex("init",   rule.initChild);
+
+                        if (entry.contains("kind")) {
+                            if (!entry.at("kind").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/kind",
+                                          "'kind' must be a string");
+                            } else {
+                                auto k = parseKind(entry.at("kind").get<std::string>());
+                                if (!k) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/kind",
+                                              std::format("unknown declaration kind '{}' "
+                                                          "(expected 'variable', 'function', "
+                                                          "'table', or 'type')",
+                                                          entry.at("kind").get<std::string>()));
+                                } else {
+                                    rule.kind = *k;
+                                }
+                            }
+                        }
+                        if (entry.contains("nameMatch")) {
+                            if (!entry.at("nameMatch").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/nameMatch",
+                                          "'nameMatch' must be a string");
+                            } else {
+                                auto m = parseNameMatch(entry.at("nameMatch").get<std::string>());
+                                if (!m) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/nameMatch",
+                                              std::format("unknown nameMatch '{}' (expected "
+                                                          "'self' or 'lastIdentifier')",
+                                                          entry.at("nameMatch").get<std::string>()));
+                                } else {
+                                    rule.nameMatch = *m;
+                                }
+                            }
+                        }
+                        cfg.declarations.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── references ──
+            if (sem.contains("references")) {
+                json const& arr = sem.at("references");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/references",
+                              "'semantics.references' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/references/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'references' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        ReferenceRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'references[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+                        if (entry.contains("nameMatch")) {
+                            if (!entry.at("nameMatch").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/nameMatch",
+                                          "'nameMatch' must be a string");
+                            } else {
+                                auto m = parseNameMatch(entry.at("nameMatch").get<std::string>());
+                                if (!m) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/nameMatch",
+                                              std::format("unknown nameMatch '{}' (expected "
+                                                          "'self' or 'lastIdentifier')",
+                                                          entry.at("nameMatch").get<std::string>()));
+                                } else {
+                                    rule.nameMatch = *m;
+                                }
+                            }
+                        }
+                        cfg.references.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── scopes ──
+            if (sem.contains("scopes")) {
+                json const& arr = sem.at("scopes");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/scopes",
+                              "'semantics.scopes' must be an array of rule names");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/scopes/{}", i);
+                        if (!arr[i].is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'scopes' entry must be a string");
+                            continue;
+                        }
+                        auto const name = arr[i].get<std::string>();
+                        if (!data.rules->contains(name)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'scopes[{}]' references unknown shape '{}'",
+                                                  i, name));
+                            continue;
+                        }
+                        ScopeRule scopeRule;
+                        scopeRule.rule     = data.rules->find(name);
+                        scopeRule.ruleName = name;
+                        cfg.scopes.push_back(std::move(scopeRule));
+                    }
+                }
+            }
+
+            // ── builtinTypes ──
+            if (sem.contains("builtinTypes")) {
+                json const& arr = sem.at("builtinTypes");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/builtinTypes",
+                              "'semantics.builtinTypes' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/builtinTypes/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'builtinTypes' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("name") || !entry.at("name").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/name",
+                                      "'name' is required and must be a string");
+                            continue;
+                        }
+                        if (!entry.contains("core") || !entry.at("core").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/core",
+                                      "'core' is required and must be a string");
+                            continue;
+                        }
+                        BuiltinTypeMapping m;
+                        m.name = entry.at("name").get<std::string>();
+                        auto k = parseCore(entry.at("core").get<std::string>());
+                        if (!k) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path + "/core",
+                                      std::format("unknown core TypeKind '{}' (expected one "
+                                                  "of Bool/I*/U*/F*/Char/Byte/Void)",
+                                                  entry.at("core").get<std::string>()));
+                            continue;
+                        }
+                        m.core = *k;
+                        cfg.builtinTypes.push_back(std::move(m));
+                    }
+                }
+            }
+
+            // ── typeShapes ──
+            if (sem.contains("typeShapes")) {
+                json const& arr = sem.at("typeShapes");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/typeShapes",
+                              "'semantics.typeShapes' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/typeShapes/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'typeShapes' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        if (!entry.contains("constructor") || !entry.at("constructor").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/constructor",
+                                      "'constructor' is required and must be a string");
+                            continue;
+                        }
+                        TypeShapeRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'typeShapes[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+                        auto c = parseConstructor(entry.at("constructor").get<std::string>());
+                        if (!c) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path + "/constructor",
+                                      std::format("unknown type constructor '{}' (expected "
+                                                  "'pointer', 'reference', 'nullable', "
+                                                  "'optional', or 'slice')",
+                                                  entry.at("constructor").get<std::string>()));
+                            continue;
+                        }
+                        rule.constructor = *c;
+                        if (entry.contains("operandChild")) {
+                            if (!entry.at("operandChild").is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/operandChild",
+                                          "'operandChild' must be a non-negative integer");
+                                continue;
+                            }
+                            auto v = entry.at("operandChild").get<std::int64_t>();
+                            if (v < 0 || v > std::numeric_limits<std::int32_t>::max()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/operandChild",
+                                          "'operandChild' visible-child index out of range");
+                                continue;
+                            }
+                            rule.operandChild = static_cast<std::int32_t>(v);
+                        }
+                        cfg.typeShapes.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── literalTypes ──
+            if (sem.contains("literalTypes")) {
+                json const& arr = sem.at("literalTypes");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/literalTypes",
+                              "'semantics.literalTypes' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/literalTypes/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'literalTypes' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("literal") || !entry.at("literal").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/literal",
+                                      "'literal' is required and must be a string");
+                            continue;
+                        }
+                        if (!entry.contains("core") || !entry.at("core").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/core",
+                                      "'core' is required and must be a string");
+                            continue;
+                        }
+                        LiteralTypeMapping m;
+                        m.literalName = entry.at("literal").get<std::string>();
+                        if (!data.schemaTokens->contains(m.literalName)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken, path + "/literal",
+                                      std::format("'literalTypes[{}].literal' references "
+                                                  "unknown token kind '{}'", i, m.literalName));
+                            continue;
+                        }
+                        m.literal = data.schemaTokens->find(m.literalName);
+                        auto k = parseCore(entry.at("core").get<std::string>());
+                        if (!k) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path + "/core",
+                                      std::format("unknown core TypeKind '{}'",
+                                                  entry.at("core").get<std::string>()));
+                            continue;
+                        }
+                        m.core = *k;
+                        cfg.literalTypes.push_back(std::move(m));
+                    }
+                }
+            }
+
+            // ── identifierToken ──
+            // Names the token kind whose text is a language identifier. The
+            // engine reads the resolved SchemaTokenId instead of hardcoding
+            // a token name, so the analyzer is name-independent (a language
+            // whose identifier token is "Word" works unchanged).
+            if (sem.contains("identifierToken")) {
+                json const& tok = sem.at("identifierToken");
+                if (!tok.is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/identifierToken",
+                              "'identifierToken' must be a string");
+                } else {
+                    auto const name = tok.get<std::string>();
+                    if (!data.schemaTokens->contains(name)) {
+                        coll.emit(DiagnosticCode::C_UnknownToken,
+                                  "/semantics/identifierToken",
+                                  std::format("'identifierToken' references unknown "
+                                              "token kind '{}'", name));
+                    } else {
+                        cfg.identifierToken = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
+            // A `nameMatch: "lastIdentifier"` rule (declaration or
+            // reference) descends a subtree for its LAST identifier token —
+            // which requires the engine to know which token kind IS the
+            // identifier. Declaring lastIdentifier without an
+            // identifierToken is a config gap (C_MissingField).
+            if (!cfg.identifierToken.valid()) {
+                bool usesLastIdentifier = false;
+                for (auto const& d : cfg.declarations) {
+                    if (d.nameMatch == NameMatchMode::LastIdentifier) usesLastIdentifier = true;
+                }
+                for (auto const& r : cfg.references) {
+                    if (r.nameMatch == NameMatchMode::LastIdentifier) usesLastIdentifier = true;
+                }
+                if (usesLastIdentifier) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              "/semantics/identifierToken",
+                              "a 'lastIdentifier' nameMatch rule requires "
+                              "'semantics.identifierToken' to be declared");
+                }
+            }
+
+            data.semantics = std::move(cfg);
+        }
+    }
+
     // Freeze interners — post-load, no further internment allowed.
     data.rules->freeze();
     data.schemaTokens->freeze();

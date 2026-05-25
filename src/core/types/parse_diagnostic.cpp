@@ -68,6 +68,13 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_MissingNumberStyle:       return "C_MissingNumberStyle";
         case DiagnosticCode::C_InvalidNumberStyle:       return "C_InvalidNumberStyle";
         case DiagnosticCode::C_DuplicateWrapperRules:    return "C_DuplicateWrapperRules";
+        case DiagnosticCode::C_InvalidSemantics:         return "C_InvalidSemantics";
+        case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
+        case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
+        case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";
+        case DiagnosticCode::S_NotCallable:              return "S_NotCallable";
+        case DiagnosticCode::S_ArgCountMismatch:         return "S_ArgCountMismatch";
+        case DiagnosticCode::S_UnknownType:              return "S_UnknownType";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -83,6 +90,7 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0x9xxx → P9xxx     (parse, internal-invariant range)
     //   0xCxxx → C0xxx     (config)
     //   0xDxxx → D0xxx     (driver / compilation-unit)
+    //   0xExxx → S0xxx     (semantic analysis, plan 08.6)
     // Render as the 4-digit hex grouping the user actually sees.
     const auto v          = static_cast<std::uint16_t>(c);
     const std::uint16_t nibble = v & 0xF000u;
@@ -91,11 +99,13 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'C';
     } else if (nibble == 0xD000u) {
         letter = 'D';
+    } else if (nibble == 0xE000u) {
+        letter = 'S';
     }
     // Strip the high nibble for the numeric portion when it's a phase
-    // marker (C/D). The 9xxx range stays 9xxx so P_BuilderInvariant prints
+    // marker (C/D/S). The 9xxx range stays 9xxx so P_BuilderInvariant prints
     // as "P9000".
-    const bool hasNibbleMarker = (nibble == 0xC000u || nibble == 0xD000u);
+    const bool hasNibbleMarker = (nibble == 0xC000u || nibble == 0xD000u || nibble == 0xE000u);
     const std::uint16_t lo = hasNibbleMarker ? (v & 0x0FFFu) : v;
     return std::format("{}{:04X}", letter, lo);
 }
