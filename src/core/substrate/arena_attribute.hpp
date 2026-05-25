@@ -20,11 +20,10 @@
 // (vector<optional<T>> indexed by id.v) once a coverage threshold is crossed.
 // The choice is internal; the public API is identical in either mode.
 //
-// `ArenaT` requirements (duck-typed): a nested `IdType` (the element id, with
-// `.v` / `.arenaTag` / `.valid()` and a two-arg `(v, tag)` ctor + std::hash) and
-// `TagType` (the arena's identity tag, with `.v`); plus `id() -> TagType` and
-// `nodeCount() -> std::size_t`. Fatal-message wording comes from
-// `ArenaNames<IdType, TagType>`.
+// `ArenaT` must satisfy the `Arena` concept (arena_tag.hpp): nested `IdType` /
+// `TagType`, `id() -> TagType`, `nodeCount()`, and a hashable id (the sparse
+// map keys on it). `Tree` and a raw `ArenaContainer` both qualify.
+// Fatal-message wording comes from `ArenaNames<IdType, TagType>`.
 //
 // Lifetime: an ArenaAttribute holds a raw `ArenaT const*` for nodeCount-based
 // bounds checks, so the caller MUST NOT let the bound arena outlive the
@@ -46,6 +45,10 @@ inline constexpr std::size_t kPromoteFloor         = 16;
 template <class ArenaT, class T>
 class ArenaAttribute {
 public:
+    // A body static_assert rather than a template-head constraint: the class has
+    // many out-of-line member / nested-iterator definitions, and a head constraint
+    // would have to be repeated on every one. ArenaT is never overloaded/SFINAE'd,
+    // so gating the whole instantiation here is equivalent and far less churn.
     static_assert(Arena<ArenaT>,
                   "ArenaAttribute<ArenaT, T>: ArenaT must satisfy the Arena concept "
                   "(nested IdType/TagType + id()/nodeCount() + a hashable id)");

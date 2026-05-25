@@ -21,9 +21,9 @@
 //     emplaces it at construction.
 //   - Every emitted `Id` carries the arena's `Tag.v` in `Id.arenaTag`; access
 //     validates it (untagged `Id{N}` literals pass — test ergonomics).
-//   - `Id` must expose `.v` (uint32 index), `.arenaTag` (uint32 provenance,
-//     0 == untagged), `.valid()`, and a two-arg `(v, tag)` ctor.
-//   - `Tag` must expose `.v` (uint32).
+//   - `Id` satisfies `ArenaId` and `Tag` satisfies `ArenaTag` (the shape
+//     contracts in arena_tag.hpp — the single source of truth, enforced here
+//     by the template-head constraints below).
 // Fatal-message wording comes from `ArenaNames<Id, Tag>`.
 
 namespace dss::substrate {

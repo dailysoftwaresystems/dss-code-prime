@@ -42,9 +42,7 @@ struct ArenaNames {
 // rather than deep inside a template.
 template <class Id>
 concept ArenaId =
-    std::default_initializable<Id> &&
-    std::copyable<Id> &&
-    std::equality_comparable<Id> &&
+    std::regular<Id> &&   // default-constructible + copyable + ==  (the value-type basics)
     requires(Id id, std::uint32_t value) {
         { id.v }        -> std::convertible_to<std::uint32_t>;
         { id.arenaTag } -> std::convertible_to<std::uint32_t>;

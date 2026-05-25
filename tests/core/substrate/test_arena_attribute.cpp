@@ -97,7 +97,7 @@ TEST(ArenaAttributeDeathTest, SentinelAndBoundsAbort) {
     auto arena = buildArena(3, 1);
     ArenaAttribute<ShapeArena, int> attr{arena};
     EXPECT_DEATH({ attr.set(ShapeId{}, 1); }, "invalid ShapeId");
-    EXPECT_DEATH({ attr.set(ShapeId{999, 1}, 1); }, "out of bounds");
+    EXPECT_DEATH({ attr.set(ShapeId{999, 1}, 1); }, "ShapeId out of bounds");
 }
 
 TEST(ArenaAttribute, TypeAliasesAndConstOverloads) {
@@ -221,6 +221,6 @@ TEST(ArenaAttributeDeathTest, EmptyArenaAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     ShapeArena emptyArena;                 // default ctor: zero nodes
     ArenaAttribute<ShapeArena, int> attr{emptyArena};
-    EXPECT_DEATH({ attr.set(ShapeId{1}, 1); }, "out of bounds");
+    EXPECT_DEATH({ attr.set(ShapeId{1}, 1); }, "ShapeId out of bounds");
     EXPECT_DEATH({ attr.set(ShapeId{}, 1); }, "invalid ShapeId");
 }

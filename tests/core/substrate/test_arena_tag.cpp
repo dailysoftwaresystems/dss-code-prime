@@ -19,9 +19,14 @@ using namespace dss::substrate;
 using dss::substrate_test::ShapeId;
 using dss::substrate_test::ShapePod;
 using dss::substrate_test::ShapeTag;
+using dss::substrate_test::ValueId;
+using dss::substrate_test::ValuePod;
+using dss::substrate_test::ValueTag;
 
 using ShapeArena   = ArenaContainer<ShapePod, ShapeId, ShapeTag>;
 using ShapeBuilder = ArenaBuilder<ShapePod, ShapeId, ShapeTag>;
+using ValueArena   = ArenaContainer<ValuePod, ValueId, ValueTag>;
+using ValueBuilder = ArenaBuilder<ValuePod, ValueId, ValueTag>;
 
 [[nodiscard]] ShapeArena oneNodeArena(std::uint32_t tag) {
     ShapeBuilder b{ShapeTag{tag}};
@@ -53,6 +58,20 @@ TEST(ArenaTagDeathTest, AttributeRejectsForeignArenaId) {
     ArenaAttribute<ShapeArena, int> attr{arenaA};
     EXPECT_DEATH({ attr.set(ShapeId{1, 222}, 1); },
                  "ShapeAttr bound to ShapeTag=111 got ShapeId from ShapeTag=222");
+}
+
+TEST(ArenaTagDeathTest, SecondArenaFamilyAlsoGuardsAndUsesItsOwnNames) {
+    // The guard + ArenaNames wording are per-arena: a Value-family attribute must
+    // reject a foreign Value id and surface the <ValueId, ValueTag> diagnostic
+    // names, not the Shape family's. Pins the second ArenaNames specialization
+    // end-to-end (the Shape death tests can't reach it).
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ValueBuilder b{ValueTag{111}};
+    b.addNode(ValuePod{1.0});
+    auto arenaA = std::move(b).finish();
+    ArenaAttribute<ValueArena, int> attr{arenaA};
+    EXPECT_DEATH({ attr.set(ValueId{1, 222}, 1); },
+                 "ValueAttr bound to ValueTag=111 got ValueId from ValueTag=222");
 }
 
 TEST(ArenaTagDeathTest, DenseIteratorIdRejectedByForeignAttribute) {

@@ -105,8 +105,8 @@ TEST(ArenaContainerDeathTest, OutOfRangeAborts) {
     ShapeBuilder b{ShapeTag{1}};
     b.addNode(ShapePod{1, 0});
     ShapeArena arena = std::move(b).finish();
-    EXPECT_DEATH({ (void)arena.at(ShapeId{999, 1}); }, "out of range");
-    EXPECT_DEATH({ (void)arena.at(ShapeId{}); }, "out of range");
+    EXPECT_DEATH({ (void)arena.at(ShapeId{999, 1}); }, "ShapeId out of range");
+    EXPECT_DEATH({ (void)arena.at(ShapeId{}); }, "ShapeId out of range");
 }
 
 TEST(ArenaContainerDeathTest, BuilderAtRejectsForeignArenaId) {
