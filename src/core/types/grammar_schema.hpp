@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/compiled_shape.hpp"
+#include "core/types/import_config.hpp"
 #include "core/types/lexer_mode.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeExtensionDescriptor
 #include "core/types/operator_table.hpp"
@@ -220,6 +221,12 @@ struct DSS_EXPORT GrammarSchemaData {
     // additive in schema v3). Empty for v1/v2 configs. Registered into a CU's
     // TypeRegistry at CU build time via registerSchemaTypeExtensions.
     std::vector<TypeExtensionDescriptor>              typeExtensions;
+
+    // Config-driven import resolution (schema v4 `imports` block). Default
+    // `ImportStrategy::None` (no cross-refs) for v1/v2/v3 configs and any v4
+    // config that omits the block. Consumed by ConfigDrivenImportResolver —
+    // the single language-agnostic import engine.
+    ImportConfig                                      imports;
 };
 
 } // namespace detail
@@ -414,6 +421,12 @@ public:
     // Per-language type-extension declarations (SP2; schema v3 `typeExtensions[]`).
     // Empty for v1/v2 configs. Consumed by registerSchemaTypeExtensions.
     [[nodiscard]] std::span<TypeExtensionDescriptor const> typeExtensions() const noexcept;
+
+    // Config-driven import resolution (schema v4 `imports` block). Default
+    // `ImportStrategy::None` when the config omits the block. Consumed by
+    // chooseResolver/ConfigDrivenImportResolver — the single language-agnostic
+    // import engine; NO engine code branches on the language name.
+    [[nodiscard]] ImportConfig const& imports() const noexcept;
 
     // `expr`-shape introspection. `isExprRule` is true when the rule's
     // body was declared as `{ "expr": { "atom": ..., "minPrecedence": ... } }`.

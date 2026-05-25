@@ -96,6 +96,11 @@ enum class DiagnosticCode : std::uint16_t {
     //   (not "Integer"/"Type") or a malformed parameter spec.
     C_UnknownTypeExtension        = 0xC02A,
     C_TypeExtensionParamMismatch  = 0xC02B,
+    // The `imports` block (schema v4) is malformed: `strategy` missing or not
+    // one of "none"/"include-following"/"name-matching", or a required field
+    // has the wrong JSON type. (Missing-but-required fields use C_MissingField;
+    // unknown rule/token names use C_UnknownShape/C_UnknownToken.)
+    C_InvalidImports              = 0xC02C,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

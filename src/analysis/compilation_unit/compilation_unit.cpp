@@ -223,7 +223,7 @@ CompilationUnit UnitBuilder::finish() && {
     // additional included files (include-following) via the loadFile callback,
     // which routes through addTree — and addTree aborts once finished_ is set.
     std::vector<CrossTreeRef> crossRefs;
-    auto const resolver = chooseResolver(schema_->name());
+    auto const resolver = chooseResolver(*schema_);
     ResolutionContext context{
         trees_,
         *schema_,

@@ -277,7 +277,7 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     auto const& schema = **result;
 
     EXPECT_EQ(schema.name(), "CSubset");
-    EXPECT_EQ(schema.schemaVersion(), 2u);
+    EXPECT_EQ(schema.schemaVersion(), 4u);
 
     // Every shape name declared in the JSON must resolve. A typo would
     // currently load cleanly and only fail when a caller asks for the
@@ -716,9 +716,8 @@ TEST(GrammarSchema, SchemaVersionTwoAccepted) {
     EXPECT_EQ((*result)->schemaVersion(), 2u);
 }
 
-// dssSchemaVersion 3 is the upper bound of the loader's accepted window since
-// SP2 (it adds the optional `typeExtensions[]` field). A v3 doc with no
-// extensions loads cleanly.
+// dssSchemaVersion 3 added the optional `typeExtensions[]` field (SP2). A v3
+// doc with no extensions loads cleanly.
 TEST(GrammarSchema, SchemaVersionThreeAccepted) {
     auto result = GrammarSchema::loadFromText(
         R"({"dssSchemaVersion":3,"language":{"name":"X","version":"0.1.0"}})");
@@ -729,20 +728,33 @@ TEST(GrammarSchema, SchemaVersionThreeAccepted) {
     EXPECT_TRUE((*result)->typeExtensions().empty());
 }
 
+// dssSchemaVersion 4 is the upper bound of the loader's accepted window since
+// the config-driven import refactor (it adds the optional `imports` block). A
+// v4 doc with no `imports` block loads cleanly and defaults to strategy None.
+TEST(GrammarSchema, SchemaVersionFourAccepted) {
+    auto result = GrammarSchema::loadFromText(
+        R"({"dssSchemaVersion":4,"language":{"name":"X","version":"0.1.0"}})");
+    ASSERT_TRUE(result.has_value())
+        << "v4 doc should load: "
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    EXPECT_EQ((*result)->schemaVersion(), 4u);
+    EXPECT_EQ((*result)->imports().strategy, ImportStrategy::None);
+}
+
 // Outside the accepted window, the loader must emit C_VersionMismatch with a
 // message naming the supported range. The range string is the load-bearing
 // fragment — full-message equality would over-pin the surrounding prose, but
 // the range itself MUST be there or the diagnostic is uselessly opaque.
-TEST(GrammarSchema, SchemaVersionFourRejectedWithRangeMessage) {
+TEST(GrammarSchema, SchemaVersionFiveRejectedWithRangeMessage) {
     auto result = GrammarSchema::loadFromText(
-        R"({"dssSchemaVersion":4,"language":{"name":"X","version":"0.1.0"}})");
+        R"({"dssSchemaVersion":5,"language":{"name":"X","version":"0.1.0"}})");
     ASSERT_FALSE(result.has_value());
     auto const& diags = result.error();
     auto it = std::ranges::find_if(diags, [](auto const& d) {
         return d.code == DiagnosticCode::C_VersionMismatch;
     });
     ASSERT_NE(it, diags.end());
-    EXPECT_NE(it->message.find("1..3"), std::string::npos)
+    EXPECT_NE(it->message.find("1..4"), std::string::npos)
         << "version-mismatch message should name the supported range; got: "
         << it->message;
 }
@@ -848,6 +860,212 @@ TEST(GrammarSchema, TypeExtensionParametersNotArrayReportsMismatch) {
     })JSON");
     ASSERT_FALSE(result.has_value());
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_TypeExtensionParamMismatch));
+}
+
+// ── imports block (schema v4) ──────────────────────────────────────────────
+
+// An include-following `imports` block populates every parameterized field —
+// the resolver reads these instead of hardcoding rule/token names.
+TEST(GrammarSchema, ImportsIncludeFollowingLoadsAndPopulates) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "CSubset", "version": "0.1.0" },
+        "tokens": { "#": [ { "kind": "IncludeKeyword" } ],
+                    "\"": [ { "kind": "StringStart" } ] },
+        "shapes": {
+            "root": { "sequence": [ "includeDirective" ] },
+            "includeDirective": { "sequence": [ "IncludeKeyword", "StringStart" ] }
+        }
+    })JSON");
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto const& cfg = (*result)->imports();
+    EXPECT_EQ(cfg.strategy, ImportStrategy::None)  // no block declared yet
+        << "control: a config without an `imports` block stays None";
+}
+
+TEST(GrammarSchema, ImportsIncludeFollowingFieldsParse) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "CSubset", "version": "0.1.0" },
+        "imports": { "strategy": "include-following",
+                     "directiveRule": "includeDirective", "pathToken": "StringStart" },
+        "tokens": { "#": [ { "kind": "IncludeKeyword" } ],
+                    "\"": [ { "kind": "StringStart" } ] },
+        "shapes": {
+            "root": { "sequence": [ "includeDirective" ] },
+            "includeDirective": { "sequence": [ "IncludeKeyword", "StringStart" ] }
+        }
+    })JSON");
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto const& cfg = (*result)->imports();
+    EXPECT_EQ(cfg.strategy, ImportStrategy::IncludeFollowing);
+    EXPECT_EQ(cfg.directiveRule, "includeDirective");
+    EXPECT_EQ(cfg.pathToken, "StringStart");
+    EXPECT_TRUE(cfg.caseSensitive);  // default
+}
+
+TEST(GrammarSchema, ImportsNameMatchingFieldsParse) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "TsqlSubset", "version": "0.1.0" },
+        "imports": { "strategy": "name-matching",
+                     "nameRule": "qualifiedName", "definitionRule": "createTableStmt",
+                     "referenceParents": [ "tableRef" ], "nameToken": "Identifier",
+                     "caseSensitive": false },
+        "shapes": {
+            "root": { "sequence": [ "createTableStmt", "tableRef" ] },
+            "qualifiedName": { "sequence": [ "Identifier" ] },
+            "createTableStmt": { "sequence": [ "qualifiedName" ] },
+            "tableRef": { "sequence": [ "qualifiedName" ] }
+        }
+    })JSON");
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto const& cfg = (*result)->imports();
+    EXPECT_EQ(cfg.strategy, ImportStrategy::NameMatching);
+    EXPECT_EQ(cfg.nameRule, "qualifiedName");
+    EXPECT_EQ(cfg.definitionRule, "createTableStmt");
+    ASSERT_EQ(cfg.referenceParents.size(), 1u);
+    EXPECT_EQ(cfg.referenceParents[0], "tableRef");
+    EXPECT_EQ(cfg.nameToken, "Identifier");
+    EXPECT_FALSE(cfg.caseSensitive);
+}
+
+// An unknown `strategy` is a malformed block — C_InvalidImports.
+TEST(GrammarSchema, ImportsUnknownStrategyReportsInvalid) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "telepathy" }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidImports));
+}
+
+// include-following without `directiveRule` is missing a required field.
+TEST(GrammarSchema, ImportsIncludeFollowingMissingDirectiveRuleReportsMissingField) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "include-following", "pathToken": "StringStart" },
+        "tokens": { "\"": [ { "kind": "StringStart" } ] },
+        "shapes": { "root": { "sequence": [ "StringStart" ] } }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+// A `directiveRule` that names no declared shape is C_UnknownShape (the loader
+// parses `imports` late, after shapes are interned, so it can check existence).
+TEST(GrammarSchema, ImportsUnknownRuleReportsUnknownShape) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "include-following",
+                     "directiveRule": "ghostRule", "pathToken": "StringStart" },
+        "tokens": { "\"": [ { "kind": "StringStart" } ] },
+        "shapes": { "root": { "sequence": [ "StringStart" ] } }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// A `pathToken` that names no declared token kind is C_UnknownToken — the
+// token-side analogue of C_UnknownShape above (loader checks both interners).
+TEST(GrammarSchema, ImportsUnknownTokenReportsUnknownToken) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "include-following",
+                     "directiveRule": "includeDirective", "pathToken": "GhostToken" },
+        "tokens": { "\"": [ { "kind": "StringStart" } ] },
+        "shapes": {
+            "root": { "sequence": [ "includeDirective" ] },
+            "includeDirective": { "sequence": [ "StringStart" ] }
+        }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// A `referenceParents[i]` that names no declared shape is C_UnknownShape —
+// the per-entry analogue of the scalar-field dangling-name check.
+TEST(GrammarSchema, ImportsUnknownReferenceParentReportsUnknownShape) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "name-matching",
+                     "nameRule": "qualifiedName", "definitionRule": "createTableStmt",
+                     "referenceParents": [ "ghostParent" ], "nameToken": "Identifier" },
+        "tokens": { "x": [ { "kind": "Identifier" } ] },
+        "shapes": {
+            "root": { "sequence": [ "qualifiedName" ] },
+            "qualifiedName": { "sequence": [ "Identifier" ] },
+            "createTableStmt": { "sequence": [ "qualifiedName" ] },
+            "tableRef": { "sequence": [ "qualifiedName" ] }
+        }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// name-matching with an empty `referenceParents` array is malformed —
+// without parents there is nowhere to anchor reference recognition.
+TEST(GrammarSchema, ImportsNameMatchingEmptyReferenceParentsReportsInvalid) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "name-matching",
+                     "nameRule": "qualifiedName", "definitionRule": "createTableStmt",
+                     "referenceParents": [], "nameToken": "Identifier" },
+        "tokens": { "x": [ { "kind": "Identifier" } ] },
+        "shapes": {
+            "root": { "sequence": [ "qualifiedName" ] },
+            "qualifiedName": { "sequence": [ "Identifier" ] },
+            "createTableStmt": { "sequence": [ "qualifiedName" ] }
+        }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidImports) ||
+                hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+// `caseSensitive` is documented as an optional bool — any other JSON type is
+// a malformed block (C_InvalidImports), not silently coerced.
+TEST(GrammarSchema, ImportsCaseSensitiveWrongTypeReportsInvalid) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "name-matching",
+                     "nameRule": "qualifiedName", "definitionRule": "createTableStmt",
+                     "referenceParents": [ "tableRef" ], "nameToken": "Identifier",
+                     "caseSensitive": "yes" },
+        "tokens": { "x": [ { "kind": "Identifier" } ] },
+        "shapes": {
+            "root": { "sequence": [ "qualifiedName" ] },
+            "qualifiedName": { "sequence": [ "Identifier" ] },
+            "createTableStmt": { "sequence": [ "qualifiedName" ] },
+            "tableRef": { "sequence": [ "qualifiedName" ] }
+        }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidImports));
+}
+
+// `imports` itself must be a JSON object, not a string/array/number — the
+// shape-level type guard.
+TEST(GrammarSchema, ImportsNotAnObjectReportsInvalid) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": "include-following",
+        "tokens": { "x": [ { "kind": "Identifier" } ] },
+        "shapes": { "root": { "sequence": [ "Identifier" ] } }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidImports));
 }
 
 // Pins the cookbook example in docs/language-config-spec.md §7 against the

@@ -354,6 +354,10 @@ std::span<TypeExtensionDescriptor const> GrammarSchema::typeExtensions() const n
     return d_.typeExtensions;
 }
 
+ImportConfig const& GrammarSchema::imports() const noexcept {
+    return d_.imports;
+}
+
 bool GrammarSchema::isNullable(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return false;

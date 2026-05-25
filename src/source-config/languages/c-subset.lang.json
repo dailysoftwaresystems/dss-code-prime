@@ -1,10 +1,16 @@
 {
-  "dssSchemaVersion": 2,
+  "dssSchemaVersion": 4,
 
   "language": {
     "name":           "CSubset",
     "version":        "0.1.0",
     "fileExtensions": [".c", ".h"]
+  },
+
+  "imports": {
+    "strategy":      "include-following",
+    "directiveRule": "includeDirective",
+    "pathToken":     "StringStart"
   },
 
   "lexerModes": {

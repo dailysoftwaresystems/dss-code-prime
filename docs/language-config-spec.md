@@ -439,7 +439,7 @@ Delimited string literals — `"hello"`, `@"verbatim ""quotes"""`, `R"DELIM(raw)
 
 ### 9.8 Updated version window
 
-`dssSchemaVersion` accepts the range `1..3`. v2 configs that use any of the fields above SHOULD set `"dssSchemaVersion": 2`; v3 configs that use `typeExtensions[]` (§10) SHOULD set `3`. The loader still accepts `1` for any field combination — version bumping is documentation, not enforcement.
+`dssSchemaVersion` accepts the range `1..4`. v2 configs that use any of the fields above SHOULD set `"dssSchemaVersion": 2`; v3 configs that use `typeExtensions[]` (§10) SHOULD set `3`; v4 configs that use the `imports` block (§11) SHOULD set `4`. The loader still accepts `1` for any field combination — version bumping is documentation, not enforcement.
 
 ### 9.9 Troubleshooting (v2 codes)
 
@@ -498,3 +498,62 @@ The lattice is **CU-scoped**: each `CompilationUnit` gets its own interner + reg
 | `C_TypeExtensionParamMismatch` | A `parameters` entry is malformed: not an object, missing string `name`/`kind`, an unknown `kind` (only `Integer`/`Type`), or `parameters` itself isn't an array. |
 | `C_ConflictingField` on `typeExtensions` | The same extension `name` is declared more than once in the file. |
 | `C_MissingField` on `typeExtensions/*/name` | An entry has no string `name`. |
+
+---
+
+## 11. v4 additions
+
+Added by the config-driven import refactor. Opt-in and additive: configs that don't declare an `imports` block keep loading as before (and resolve no cross-file imports). Set `"dssSchemaVersion": 4` once the block appears.
+
+### 11.1 `imports` — config-driven import resolution
+
+Cross-file import resolution (populating a `CompilationUnit`'s `crossRefs`) is handled by **one language-agnostic engine** — no engine code branches on the source language name. Per-language behavior comes entirely from this block: the engine reads `strategy` and the parameter fields and runs the matching generic algorithm. This replaces the old per-language import resolver C++ (which dispatched on the language name).
+
+Two generic strategies ship (plus `none`):
+
+```jsonc
+// include-following — e.g. C-style `#include "x.h"`
+{
+  "dssSchemaVersion": 4,
+  "language": { "name": "CSubset", "version": "0.1.0" },
+
+  "imports": {
+    "strategy":      "include-following",
+    "directiveRule": "includeDirective",   // shape wrapping the directive
+    "pathToken":     "StringStart"          // token whose quoted literal is the path
+  }
+}
+```
+
+```jsonc
+// name-matching — e.g. T-SQL table references resolved to CREATE TABLE
+{
+  "dssSchemaVersion": 4,
+  "language": { "name": "TsqlSubset", "version": "0.1.0" },
+
+  "imports": {
+    "strategy":         "name-matching",
+    "nameRule":         "qualifiedName",                                  // the name shape
+    "definitionRule":   "createTableStmt",                               // shape that DEFINES a name
+    "referenceParents": ["tableRef", "insertStmt", "updateStmt", "deleteStmt"], // reference positions
+    "nameToken":        "Identifier",                                    // token keyed for matching
+    "caseSensitive":    false                                            // SQL folds identifier case
+  }
+}
+```
+
+- `strategy` (required, string) — `"none"`, `"include-following"`, or `"name-matching"`.
+- **include-following** resolves each `directiveRule` node's `pathToken` quoted literal against the including file's directory + declared include dirs, **loads** the target into the CU (recursively, deduplicating by canonical path), and records a `CrossTreeRef` from the directive to the included tree's root. Required: `directiveRule`, `pathToken`.
+- **name-matching** matches a `nameRule` appearing under one of `referenceParents` to a `nameRule` under a `definitionRule` of the same name in **another** tree (keyed on the last `nameToken` text). Required: `nameRule`, `definitionRule`, non-empty `referenceParents[]`, `nameToken`.
+- `caseSensitive` (optional, bool, default `true`) — when `false`, names are case-folded before matching (set by case-insensitive languages like T-SQL).
+
+Unresolved references surface as driver diagnostics (`D_UnresolvedImport` / `D_UnresolvedReference`), never silently dropped. Referenced rule/token names are validated against the schema's interners at load time.
+
+### 11.2 Troubleshooting (v4 codes)
+
+| Symptom | Likely fix |
+|---|---|
+| `C_InvalidImports` | `imports` isn't an object; `strategy` is missing/not a string/not one of `none`/`include-following`/`name-matching`; a parameter field has the wrong JSON type; or `referenceParents` isn't a non-empty array. |
+| `C_MissingField` on `imports/*` | A field required by the chosen `strategy` is absent or empty (e.g. include-following without `directiveRule`/`pathToken`; name-matching without `nameRule`/`definitionRule`/`nameToken`/`referenceParents`). |
+| `C_UnknownShape` on `imports/*` | A `directiveRule`/`nameRule`/`definitionRule`/`referenceParents[]` entry names a shape not declared under `shapes`. |
+| `C_UnknownToken` on `imports/*` | A `pathToken`/`nameToken` names a token kind no `tokens`/`keywords`/built-in declared. |

@@ -6,7 +6,6 @@
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_node.hpp"
 #include "core/types/tree_visitor.hpp"
-#include "core/types/well_known_names.hpp"
 
 #include <cctype>
 #include <cstdio>
@@ -99,38 +98,50 @@ void reportDriver(DiagnosticReporter& reporter,
     return std::nullopt;
 }
 
-// Lowercased text of the last Identifier token under `qualifiedName` — the
-// table name in `db.schema.table` (SQL identifiers are case-insensitive).
-// Returns empty when the name is composed only of bracketed identifiers
-// (`[Name]`), which v1 does not match (documented limitation).
-[[nodiscard]] std::string lastIdentifierLower(Tree const& tree, NodeId qualifiedName,
-                                              SchemaTokenId identifierKind) {
+// Text of the last `nameToken` token under `nameNode` — the table name in
+// `db.schema.table`. Case-folded ONLY when `!caseSensitive` (SQL folds; the
+// config carries the policy). Returns empty when the name is composed only of
+// bracketed identifiers (`[Name]`), which v1 does not match (documented
+// limitation: the matcher keys on the last `nameToken`).
+[[nodiscard]] std::string lastIdentifierText(Tree const& tree, NodeId nameNode,
+                                             SchemaTokenId nameToken, bool caseSensitive) {
     std::string last;
-    walkPreOrder(tree, qualifiedName, [&](TreeCursor const& cursor) {
+    walkPreOrder(tree, nameNode, [&](TreeCursor const& cursor) {
         NodeId const id = cursor.current();
-        if (tree.kind(id) == NodeKind::Token && tree.tokenKind(id) == identifierKind) {
+        if (tree.kind(id) == NodeKind::Token && tree.tokenKind(id) == nameToken) {
             last = std::string(tree.text(id));
         }
     });
-    for (char& ch : last) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (!caseSensitive) {
+        for (char& ch : last) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
     return last;
 }
 
-// ── toy / unknown: identity ────────────────────────────────────────────────
+// ── The single language-agnostic import engine ───────────────────────────────
+//
+// Branches on `config.strategy` — a config value read from the schema's
+// `imports` block — NEVER on the language name. Each strategy is a private
+// member function holding the corresponding generic algorithm.
 
-class IdentityResolver final : public ImportResolver {
+class ConfigDrivenImportResolver final : public ImportResolver {
 public:
-    void resolve(ResolutionContext&) const override {}
-};
+    explicit ConfigDrivenImportResolver(ImportConfig config) : config_(std::move(config)) {}
 
-// ── c-subset: #include following ─────────────────────────────────────────────
-
-class CIncludeResolver final : public ImportResolver {
-public:
     void resolve(ResolutionContext& context) const override {
-        RuleId const includeRule = context.schema.rules().find("includeDirective");
+        switch (config_.strategy) {
+            case ImportStrategy::None:             return;
+            case ImportStrategy::IncludeFollowing: resolveIncludeFollowing(context); return;
+            case ImportStrategy::NameMatching:     resolveNameMatching(context);     return;
+        }
+    }
+
+private:
+    // include-following: follow each `directiveRule` node's `pathToken` literal.
+    void resolveIncludeFollowing(ResolutionContext& context) const {
+        RuleId const includeRule = context.schema.rules().find(config_.directiveRule);
         if (!includeRule.valid()) return;
-        SchemaTokenId const stringKind = context.schema.schemaTokens().find("StringStart");
+        SchemaTokenId const stringKind = context.schema.schemaTokens().find(config_.pathToken);
 
         struct Edge { TreeId source; NodeId node; SourceSpan span; TreeId target; };
         std::vector<Edge> edges;
@@ -187,26 +198,23 @@ public:
                 edge.source, edge.node, edge.target, rootOfTree(context.trees, edge.target), edge.span});
         }
     }
-};
 
-// ── tsql-subset: cross-statement table-name matching ─────────────────────────
-
-class TsqlNameResolver final : public ImportResolver {
-public:
-    void resolve(ResolutionContext& context) const override {
+    // name-matching: a `nameRule` in a `referenceParents` position resolved to a
+    // `nameRule` under a `definitionRule` of the same name in ANOTHER tree.
+    void resolveNameMatching(ResolutionContext& context) const {
         GrammarSchema const& schema = context.schema;
-        RuleId const qualifiedNameRule = schema.rules().find("qualifiedName");
+        RuleId const qualifiedNameRule = schema.rules().find(config_.nameRule);
         if (!qualifiedNameRule.valid()) return;
-        RuleId const createRule    = schema.rules().find("createTableStmt");
-        SchemaTokenId const identifierKind = schema.schemaTokens().find(tokens::kIdentifier);
+        RuleId const createRule    = schema.rules().find(config_.definitionRule);
+        SchemaTokenId const identifierKind = schema.schemaTokens().find(config_.nameToken);
+        bool const caseSensitive = config_.caseSensitive;
 
-        // A table-position qualifiedName is a direct child of one of these.
-        RuleId const tablePositions[] = {
-            schema.rules().find("tableRef"),
-            schema.rules().find("insertStmt"),
-            schema.rules().find("updateStmt"),
-            schema.rules().find("deleteStmt"),
-        };
+        // A reference-position name is a direct child of one of these.
+        std::vector<RuleId> tablePositions;
+        tablePositions.reserve(config_.referenceParents.size());
+        for (std::string const& parent : config_.referenceParents) {
+            tablePositions.push_back(schema.rules().find(parent));
+        }
         auto const isTablePosition = [&](RuleId parentRule) {
             for (RuleId rule : tablePositions) {
                 if (rule.valid() && rule == parentRule) return true;
@@ -214,8 +222,8 @@ public:
             return false;
         };
 
-        // Visit every (qualifiedName node, its Internal parent rule) pair in a
-        // tree — the shared shape of both the definition and reference passes.
+        // Visit every (name node, its Internal parent rule) pair in a tree —
+        // the shared shape of both the definition and reference passes.
         auto const forEachQualifiedName = [&](Tree const& tree, auto&& onMatch) {
             walkPreOrder(tree, [&](TreeCursor const& cursor) {
                 NodeId const node = cursor.current();
@@ -226,24 +234,24 @@ public:
             });
         };
 
-        // Pass 1 — definitions: each CREATE TABLE's table name. First wins.
+        // Pass 1 — definitions: each definition node's name. First wins.
         std::unordered_map<std::string, std::pair<TreeId, NodeId>> definitions;
         for (Tree const& tree : context.trees) {
             forEachQualifiedName(tree, [&](NodeId node, RuleId parentRule) {
                 if (parentRule != createRule) return;
-                std::string name = lastIdentifierLower(tree, node, identifierKind);
+                std::string name = lastIdentifierText(tree, node, identifierKind, caseSensitive);
                 if (!name.empty()) definitions.emplace(std::move(name), std::pair{tree.id(), node});
             });
         }
 
-        // Pass 2 — references: table-position qualifiedNames resolved to a
-        // definition in ANOTHER tree become cross-refs; no definition anywhere
-        // is a D_UnresolvedReference; a same-tree match is intra-file (skip).
+        // Pass 2 — references: reference-position names resolved to a definition
+        // in ANOTHER tree become cross-refs; no definition anywhere is a
+        // D_UnresolvedReference; a same-tree match is intra-file (skip).
         for (Tree const& tree : context.trees) {
             BufferId const buffer = tree.source().id();
             forEachQualifiedName(tree, [&](NodeId node, RuleId parentRule) {
                 if (!isTablePosition(parentRule)) return;
-                std::string name = lastIdentifierLower(tree, node, identifierKind);
+                std::string name = lastIdentifierText(tree, node, identifierKind, caseSensitive);
                 if (name.empty()) return;  // bracket-id-only name — v1 doesn't match.
                 auto const it = definitions.find(name);
                 if (it == definitions.end()) {
@@ -258,14 +266,14 @@ public:
             });
         }
     }
+
+    ImportConfig config_;
 };
 
 } // namespace
 
-std::unique_ptr<ImportResolver> chooseResolver(std::string_view languageName) {
-    if (languageName == "CSubset")    return std::make_unique<CIncludeResolver>();
-    if (languageName == "TsqlSubset") return std::make_unique<TsqlNameResolver>();
-    return std::make_unique<IdentityResolver>();
+std::unique_ptr<ImportResolver> chooseResolver(GrammarSchema const& schema) {
+    return std::make_unique<ConfigDrivenImportResolver>(schema.imports());
 }
 
 } // namespace dss

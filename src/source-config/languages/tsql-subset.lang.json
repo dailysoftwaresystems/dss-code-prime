@@ -1,10 +1,19 @@
 {
-  "dssSchemaVersion": 2,
+  "dssSchemaVersion": 4,
 
   "language": {
     "name":           "TsqlSubset",
     "version":        "0.1.0",
     "fileExtensions": [".sql", ".tsql"]
+  },
+
+  "imports": {
+    "strategy":         "name-matching",
+    "nameRule":         "qualifiedName",
+    "definitionRule":   "createTableStmt",
+    "referenceParents": ["tableRef", "insertStmt", "updateStmt", "deleteStmt"],
+    "nameToken":        "Identifier",
+    "caseSensitive":    false
   },
 
   "reservedWordPolicy": "contextual",

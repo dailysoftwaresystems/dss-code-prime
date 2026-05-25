@@ -14,9 +14,12 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace {
@@ -54,6 +57,29 @@ public:
 private:
     std::filesystem::path dir_;
 };
+
+// Read the shipped `<name>.lang.json` TEXT by walking up from cwd to the repo
+// `src/source-config/languages/` directory — mirrors GrammarSchema::loadShipped's
+// search so the genericity test reads the exact bytes the loader would.
+[[nodiscard]] std::string readShippedConfigText(std::string_view name) {
+    namespace fs = std::filesystem;
+    std::string const leaf = std::string{name} + ".lang.json";
+    std::error_code ec;
+    fs::path here = fs::current_path(ec);
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        fs::path const candidate = here / "src" / "source-config" / "languages" / leaf;
+        if (fs::exists(candidate, ec)) {
+            std::ifstream in(candidate, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+        }
+        fs::path const parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+    ADD_FAILURE() << "could not locate shipped config '" << name << "'";
+    std::abort();
+}
 
 } // namespace
 
@@ -304,4 +330,76 @@ TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
     EXPECT_EQ(cu.trees().size(), 1u);
     EXPECT_TRUE(cu.crossRefs().empty());
     EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 1u);
+}
+
+// ── genericity: resolution is driven by the `imports` block, not the name ─────
+
+// Load the shipped c-subset schema TEXT, rename the language to something the
+// engine has never heard of, and confirm `#include` following STILL happens.
+// If any resolver code branched on the language name, the include would be
+// silently dropped under the made-up name; instead the schema's `imports` block
+// drives resolution, so the cross-ref appears exactly as for "CSubset".
+TEST(ImportResolver, IncludeFollowingIsDrivenByConfigNotLanguageName) {
+    std::string text = readShippedConfigText("c-subset");
+    // Rename the language. The shipped config declares `"name": "CSubset"`.
+    auto const pos = text.find("\"CSubset\"");
+    ASSERT_NE(pos, std::string::npos) << "shipped c-subset config no longer names CSubset";
+    text.replace(pos, std::string_view{"\"CSubset\""}.size(), "\"MadeUpLang\"");
+
+    auto loaded = GrammarSchema::loadFromText(text, "<renamed-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "renamed schema should still load: "
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    EXPECT_EQ(schema->name(), "MadeUpLang");
+    // Sanity: the config-driven block survived the rename intact.
+    EXPECT_EQ(schema->imports().strategy, ImportStrategy::IncludeFollowing);
+
+    TempDir dir;
+    auto main = dir.write("main.c", "#include \"helper.h\"\nint main() { return helper(); }\n");
+    dir.write("helper.h", "int helper() { return 1; }\n");
+
+    UnitBuilder builder{schema};
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    // helper.h was discovered + loaded by following the directive — under a
+    // language name no resolver could possibly special-case.
+    ASSERT_EQ(cu.trees().size(), 2u);
+    ASSERT_EQ(cu.crossRefs().size(), 1u);
+    EXPECT_EQ(cu.crossRefs()[0].sourceTree, cu.trees()[0].id());
+    EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.trees()[1].id());
+    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 0u);
+}
+
+// Symmetric genericity proof for the name-matching strategy: rename the
+// shipped tsql-subset's `name` to an arbitrary string and confirm cross-tree
+// table-name matching STILL fires. Both strategies flow through the same
+// chooseResolver(*schema) -> ConfigDrivenImportResolver(schema.imports())
+// path, but pinning each strategy independently leaves no room for a future
+// regression that special-cased one branch on the language name.
+TEST(ImportResolver, NameMatchingIsDrivenByConfigNotLanguageName) {
+    std::string text = readShippedConfigText("tsql-subset");
+    auto const pos = text.find("\"TsqlSubset\"");
+    ASSERT_NE(pos, std::string::npos) << "shipped tsql-subset config no longer names TsqlSubset";
+    text.replace(pos, std::string_view{"\"TsqlSubset\""}.size(), "\"MadeUpDb\"");
+
+    auto loaded = GrammarSchema::loadFromText(text, "<renamed-tsql-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "renamed schema should still load: "
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    EXPECT_EQ(schema->name(), "MadeUpDb");
+    EXPECT_EQ(schema->imports().strategy, ImportStrategy::NameMatching);
+
+    UnitBuilder builder{schema};
+    builder.addInMemory("CREATE TABLE Users (id INT, name VARCHAR);", "schema.sql");
+    builder.addInMemory("SELECT name FROM Users;", "data.sql");
+    auto cu = std::move(builder).finish();
+
+    // Resolution still fires under a language name nothing could special-case.
+    ASSERT_EQ(cu.crossRefs().size(), 1u);
+    EXPECT_EQ(cu.crossRefs()[0].sourceTree, cu.trees()[1].id());
+    EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.trees()[0].id());
+    EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedReference), 0u);
 }

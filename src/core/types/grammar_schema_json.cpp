@@ -1146,9 +1146,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     // version's exclusive fields — accepting a version implies all
     // documented features for that version round-trip cleanly.
     constexpr std::uint32_t kMinSchemaVersion = 1;
-    // v3 adds the optional `typeExtensions[]` field (SP2); v1/v2 configs remain
-    // valid since the field is optional.
-    constexpr std::uint32_t kMaxSchemaVersion = 3;
+    // v3 adds the optional `typeExtensions[]` field (SP2); v4 adds the optional
+    // `imports` block. Earlier configs remain valid since both are optional.
+    constexpr std::uint32_t kMaxSchemaVersion = 4;
     const auto schemaVer = doc.at("dssSchemaVersion").get<std::uint32_t>();
     if (schemaVer < kMinSchemaVersion || schemaVer > kMaxSchemaVersion) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
@@ -2212,6 +2212,128 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 validateBodyDefaultKindsOffGrammar(data, coll);
                 validateOperatorBodyRules  (data, coll);
             }
+        }
+    }
+
+    // imports ── config-driven import resolution (schema v4). Optional; absent
+    // in v1/v2/v3 configs (strategy stays None → no cross-refs). Parsed LATE,
+    // after `shapes`/`tokens` populated the interners, so referenced rule/token
+    // names can be checked for existence here rather than silently tolerated at
+    // resolve-time. Two generic strategies:
+    //   "include-following" — needs `directiveRule` + `pathToken`.
+    //   "name-matching"     — needs `nameRule` + `definitionRule` +
+    //                         non-empty `referenceParents[]` + `nameToken`;
+    //                         optional `caseSensitive` (default true).
+    if (doc.contains("imports")) {
+        json const& imp = doc.at("imports");
+        if (!imp.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidImports, "/imports",
+                      "'imports' must be an object");
+        } else if (!imp.contains("strategy") || !imp.at("strategy").is_string()) {
+            coll.emit(DiagnosticCode::C_InvalidImports, "/imports/strategy",
+                      "'imports.strategy' is required and must be a string "
+                      "('none', 'include-following', or 'name-matching')");
+        } else {
+            // Read a required-by-strategy string field. Missing → C_MissingField;
+            // present-but-wrong-type → C_InvalidImports; empty string → treated
+            // as missing (an empty rule/token name resolves to nothing).
+            auto const readField = [&](char const* key, std::string& out) {
+                const auto path = std::format("/imports/{}", key);
+                if (!imp.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField, path,
+                              std::format("'imports.{}' is required for this strategy", key));
+                    return;
+                }
+                if (!imp.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidImports, path,
+                              std::format("'imports.{}' must be a string", key));
+                    return;
+                }
+                out = imp.at(key).get<std::string>();
+                if (out.empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path,
+                              std::format("'imports.{}' must be non-empty", key));
+                }
+            };
+            // Validate a declared rule name resolves to a known shape; a token
+            // name to a known token kind. Skip the check for an empty name —
+            // readField already reported it as missing.
+            auto const checkRule = [&](std::string const& name, char const* key) {
+                if (!name.empty() && !data.rules->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownShape,
+                              std::format("/imports/{}", key),
+                              std::format("'imports.{}' references unknown shape '{}'", key, name));
+                }
+            };
+            auto const checkToken = [&](std::string const& name, char const* key) {
+                if (!name.empty() && !data.schemaTokens->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownToken,
+                              std::format("/imports/{}", key),
+                              std::format("'imports.{}' references unknown token '{}'", key, name));
+                }
+            };
+
+            ImportConfig cfg;
+            const auto strategyStr = imp.at("strategy").get<std::string>();
+            if (strategyStr == "none") {
+                cfg.strategy = ImportStrategy::None;
+            } else if (strategyStr == "include-following") {
+                cfg.strategy = ImportStrategy::IncludeFollowing;
+                readField("directiveRule", cfg.directiveRule);
+                readField("pathToken",     cfg.pathToken);
+                checkRule (cfg.directiveRule, "directiveRule");
+                checkToken(cfg.pathToken,     "pathToken");
+            } else if (strategyStr == "name-matching") {
+                cfg.strategy = ImportStrategy::NameMatching;
+                readField("nameRule",       cfg.nameRule);
+                readField("definitionRule", cfg.definitionRule);
+                readField("nameToken",      cfg.nameToken);
+                if (!imp.contains("referenceParents")) {
+                    coll.emit(DiagnosticCode::C_MissingField, "/imports/referenceParents",
+                              "'imports.referenceParents' is required for name-matching");
+                } else if (!imp.at("referenceParents").is_array()
+                           || imp.at("referenceParents").empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidImports, "/imports/referenceParents",
+                              "'imports.referenceParents' must be a non-empty array of shape names");
+                } else {
+                    json const& parents = imp.at("referenceParents");
+                    for (std::size_t i = 0; i < parents.size(); ++i) {
+                        if (!parents[i].is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidImports,
+                                      std::format("/imports/referenceParents/{}", i),
+                                      "each 'referenceParents' entry must be a string");
+                            continue;
+                        }
+                        cfg.referenceParents.push_back(parents[i].get<std::string>());
+                    }
+                }
+                checkRule (cfg.nameRule,       "nameRule");
+                checkRule (cfg.definitionRule, "definitionRule");
+                checkToken(cfg.nameToken,      "nameToken");
+                for (std::size_t i = 0; i < cfg.referenceParents.size(); ++i) {
+                    if (!data.rules->contains(cfg.referenceParents[i])) {
+                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                  std::format("/imports/referenceParents/{}", i),
+                                  std::format("'imports.referenceParents[{}]' references "
+                                              "unknown shape '{}'", i, cfg.referenceParents[i]));
+                    }
+                }
+            } else {
+                coll.emit(DiagnosticCode::C_InvalidImports, "/imports/strategy",
+                          std::format("unknown import strategy '{}' (expected 'none', "
+                                      "'include-following', or 'name-matching')", strategyStr));
+            }
+
+            if (imp.contains("caseSensitive")) {
+                if (!imp.at("caseSensitive").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidImports, "/imports/caseSensitive",
+                              "'imports.caseSensitive' must be a boolean");
+                } else {
+                    cfg.caseSensitive = imp.at("caseSensitive").get<bool>();
+                }
+            }
+
+            data.imports = std::move(cfg);
         }
     }
 

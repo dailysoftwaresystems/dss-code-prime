@@ -85,10 +85,12 @@ At project-load time, the driver:
 
 ### 2.4 Codegen consumption
 
-`gen/link` reads the profile to:
-- Pick the entry-point symbol name (`main` for `cli`, `WinMain`/`wWinMain` for `gui` on Windows, `DllMain` for `lib` on Windows + `_init`/`_fini` on ELF, `__attribute__((constructor))` registration on Mach-O).
-- Set the PE subsystem field (`IMAGE_SUBSYSTEM_WINDOWS_CUI` vs `IMAGE_SUBSYSTEM_WINDOWS_GUI` vs the DLL flag).
-- Choose the output file extension (`.exe` / `.dll` / `.so` / `.dylib` / no-extension).
+> **Config-driven, not hardcoded per profile (thesis decision #4).** The mappings below are **defaults/derivations the codegen computes from config**, not a hardwired `if (profile == "gui")` ladder. The entry-point *symbol convention* is **declared by the language config** (a language may use `main`, or its own `@entry`-style attribute the schema names) with **per-target overrides**; the profile + target supply the subsystem/extension/runtime knobs. Codegen branches on the **target** axis (PE vs ELF vs Mach-O — expected) and reads language/profile **config**, never on `schema.name()`. A new language picks its entry convention in config, not by editing codegen.
+
+`gen/link` resolves, from the language config + selected profile + target:
+- The entry-point symbol — sourced from the language config's declared entry convention (default `main`), with target overrides (e.g. `gui`+PE → `WinMain`/`wWinMain`; `lib`+PE → `DllMain`; ELF `_init`/`_fini`; Mach-O `__attribute__((constructor))` registration).
+- The PE subsystem field (`IMAGE_SUBSYSTEM_WINDOWS_CUI` vs `IMAGE_SUBSYSTEM_WINDOWS_GUI` vs the DLL flag) — from profile × target.
+- The output file extension (`.exe` / `.dll` / `.so` / `.dylib` / no-extension) — from profile × target.
 - Pick the linker default-library set (CRT for CLI/GUI, none for freestanding libraries).
 
 For T-SQL-style languages (`script`, `sproc`), "codegen" is a text-emission phase, not a native-binary phase — the driver picks an entirely different backend variant.

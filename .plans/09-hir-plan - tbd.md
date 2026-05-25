@@ -11,7 +11,7 @@
 | Status        | ⏳ **planned.** v1 production-critical. The single largest substrate addition in v1. |
 | Predecessors  | ⏳ [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) (HIR is CU-scoped). ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (HIR uses the generalized arena substrate + core type lattice). ⏳ Phase #8 semantic (HIR consumes `NodeAttribute<TypeId>` + `NodeAttribute<SymbolId>` from the CST). |
 | Successors    | [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md) walks HIR. [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) lowers HIR→MIR. [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) lowers shader-shaped HIR→SPIR-V. [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) lowers HIR (with structured-CF markers from MIR) to WASM bytecode. [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) emits extern decls as HIR nodes. |
-| Scope         | **Bounded.** HR1 arena + node shapes. HR2 typed expressions. HR3 structured CF. HR4 declarations (functions / globals / types / externs). HR5 attribute system (shader intrinsics, FFI ABI metadata, source-position preservation). HR6 verifier. HR7 text format. HR8 CST→HIR lowering pass (one per shipped language). |
+| Scope         | **Bounded.** HR1 arena + node shapes. HR2 typed expressions. HR3 structured CF. HR4 declarations (functions / globals / types / externs). HR5 attribute system (shader intrinsics, FFI ABI metadata, source-position preservation). HR6 verifier. HR7 text format. HR8 **config-driven** CST→HIR lowering engine (one language-agnostic driver reading each language's `hirLowering` config block — NOT per-language C++; see §2.5 + thesis decision #4). |
 
 ---
 
@@ -42,23 +42,24 @@ src/hir/
 │   ├── transpile_hints.hpp       # Per-node target-language preference hints
 │   └── ...
 └── lowering/
-    ├── cst_to_hir.hpp            # Interface — every language registers a lowering
-    ├── toy_lowering.cpp
-    ├── c_subset_lowering.cpp
-    └── tsql_subset_lowering.cpp
+    ├── cst_to_hir.hpp / .cpp     # The ONE language-agnostic lowering engine (reads `hirLowering` config)
+    └── hir_lowering_config.hpp   # Parsed `hirLowering` schema block (CST-shape → HIR mapping)
 
 tests/hir/
 ├── test_hir_arena.cpp
-├── test_hir_lowering_toy.cpp
-├── test_hir_lowering_c_subset.cpp
-├── test_hir_lowering_tsql.cpp
+├── test_hir_lowering_toy.cpp        # fixture: drive the engine over toy's config
+├── test_hir_lowering_c_subset.cpp   # fixture: drive the engine over c-subset's config
+├── test_hir_lowering_tsql.cpp       # fixture: drive the engine over tsql's config
+├── test_hir_lowering_generic.cpp    # genericity: synthetic schema → proves no language assumptions leaked
 ├── test_hir_verifier.cpp
 └── test_hir_text_format.cpp
 ```
 
 ### 2.2 The HIR shape
 
-`HirKind` is a flat enum, similar in spirit to `NodeKind` but enumerating the full structured-IR vocabulary instead of just Internal/Token. Coarse grouping:
+`HirKind` is an **open enum — mirroring the core type lattice's `TypeKind` model (SP2)**: a fixed **universal core** in `[0, 256)` plus a **registered-extension space** `≥ 256`. The core is the paradigm-neutral, structured-typed-imperative vocabulary that composes to represent the vast majority of language constructs; anything a core kind can't express is a **registered extension kind** (declared per language/domain in a `HirKindRegistry`, mirroring `TypeRegistry`), **never a new hardcoded core member**. This is what makes HIR generic enough to represent **any** source language without growing the core — the same core+extensions discipline that lets the type lattice carry C++ `MemberPtr`, C# `Delegate`, TSQL `RowType`, and VHDL `Std_Logic` without bloating the primitive set.
+
+**Core groups (`[0,256)` — universal, fixed):**
 
 | Group | Kinds |
 |---|---|
@@ -66,9 +67,11 @@ tests/hir/
 | **Structured Statements** | `Block`, `IfStmt`, `WhileStmt`, `DoWhileStmt`, `ForStmt`, `SwitchStmt`, `CaseArm`, `BreakStmt`, `ContinueStmt`, `ReturnStmt`, `ExprStmt`, `VarDecl`, `AssignStmt` |
 | **Expressions** | `Literal`, `Ref` (read symbol), `Call`, `IntrinsicCall`, `BinaryOp`, `UnaryOp`, `Cast`, `MemberAccess`, `Index`, `Swizzle`, `ConstructAggregate`, `Ternary`, `LogicalAnd`, `LogicalOr`, `SizeOf`, `AddressOf`, `Deref` |
 | **Types-as-values** | `TypeRef` (carries a `TypeId` from the lattice) |
-| **Shader extensions** | `WorkgroupBarrier`, `DerivativeX`/`DerivativeY`, `TextureSample`, `TextureLoad`, `ImageStore`, `AtomicOp` |
-| **SQL extensions** | `Query` (SELECT), `DmlInsert`, `DmlUpdate`, `DmlDelete`, `DdlCreate`, `Cte` (WITH), `QueryBlock` |
 | **Special** | `Unreachable`, `Error` (recovery sentinel — analog of CST's Error leaf) |
+
+**Extension kinds (`≥ 256` — registered per language/domain, NOT core):** shader (`WorkgroupBarrier`, `DerivativeX`/`Y`, `TextureSample`, `TextureLoad`, `ImageStore`, `AtomicOp`), SQL (`Query`, `DmlInsert`, `DmlUpdate`, `DmlDelete`, `DdlCreate`, `Cte`, `QueryBlock`), and any future domain. Each is registered by the language/domain that needs it (carrying its operand/attribute shape + which backends consume it); a backend that doesn't recognize an extension kind emits `H_UnsupportedKindForBackend` — never a silent miscompile. The core engine, verifier, and every backend are written against the core + the registry, never against a hardcoded shader/SQL kind.
+
+**Generic enough to "support everything":** paradigms beyond the structured-imperative core — OOP dispatch (vtables/interfaces), closures + captures, algebraic data types + pattern matching, exceptions (`TryStmt` reserved), async/coroutines, GC reference types — are representable as **core compositions + registered extension kinds + attribute side-tables**, so a new language onboards by registering kinds, not by editing the core. The single deliberate boundary: a **fundamentally non-imperative paradigm** (concurrent + signal-typed hardware) does NOT force into this HIR — it gets the reserved sibling IR [`19-hir-hw-reserved-plan`](./19-hir-hw-reserved-plan%20-%20tbd.md). One IR cannot honestly model both software and hardware; "support everything" = core + extensions for the software family, + a sibling IR where the paradigm genuinely differs.
 
 Each `HirNode` POD carries:
 ```cpp
@@ -95,11 +98,13 @@ Languages whose CST permits goto (none yet shipped, but full C99 eventually) get
 
 Every expression node carries a `TypeId` resolved from the core type lattice (per `08.5-substrate-prep-plan` SP2). Untyped HIR is rejected by the verifier — semantic phase #8 is the prerequisite. Lowering populates `typeId` per node during CST→HIR; any failure produces an `H_TypeUnresolved` diagnostic and an `Error` HIR node.
 
-### 2.5 Multi-language lowering
+### 2.5 Config-driven lowering (NOT per-language C++)
 
-CST→HIR is a **per-language** pass. Each shipped `.lang.json` ships a paired lowering in `src/hir/lowering/<lang>_lowering.cpp`. The lowering walks the CST + the semantic-populated `NodeAttribute<TypeId>` / `NodeAttribute<SymbolId>` and emits HIR.
+> **Per master-plan thesis decision #4, CST→HIR lowering is config-driven — there is no per-language lowering C++ and no branch on `schema.name()`.**
 
-For a multi-language CU (per CU5 in `08-compilation-unit-plan`), each file's CST runs through its own language's lowering; the resulting HIR modules merge into one HIR program in the CU. Symbol resolution across files happens at semantic time (CU3); HIR only sees pre-resolved cross-file `Ref` nodes.
+Each shipped `.lang.json` declares a **`hirLowering` block** (additive schema facet, v4 — sibling of the `semantics` block from [`08.6-semantic-plan`](./08.6-semantic-plan%20-%20tbd.md)) mapping CST shapes to HIR: `cstRule`/`tokenKind` → `HirKind`, child-role → HIR operand, type-expression → lattice constructor, symbol → intrinsic. A **single language-agnostic `CstToHirLowering` engine** reads that block + the semantic-populated `UnitAttribute<TypeId>` / `UnitAttribute<SymbolId>` and emits HIR for **any** language. A new language lowers by adding a `hirLowering` block — **no engine edits**. When the vocabulary can't express a construct, extend it additively (as schema v2 did for grammar); never language-branch the engine. An incomplete map fails loud with `H_UnsupportedLoweringForKind` — never a silent skip.
+
+For a multi-language CU (per CU5 in `08-compilation-unit-plan`), each file's CST runs through the same engine reading that file's language's `hirLowering` config; the resulting HIR modules merge into one HIR program in the CU. Symbol resolution across files happens at semantic time (CU3); HIR only sees pre-resolved cross-file `Ref` nodes.
 
 ### 2.6 Attribute system
 
@@ -146,7 +151,7 @@ Structural invariants (fail-loud per `H_*` codes):
 
 | PR  | Title                                    | Scope |
 |-----|------------------------------------------|-------|
-| HR1 | HIR arena + node shapes                  | Instantiate `ArenaContainer` with `HirNode` POD; ship `HirKind` enum + `HirFlags`; basic walker (`HirCursor`); ID strong-typing (`HirNodeId`, `HirModuleId`). |
+| HR1 | HIR arena + node shapes                  | Instantiate `ArenaContainer` with `HirNode` POD; ship the **open `HirKind`** (core `[0,256)` + `HirKindRegistry` for extension kinds `≥256`, mirroring `TypeKind`/`TypeRegistry`) + `HirFlags`; basic walker (`HirCursor`); ID strong-typing (`HirNodeId`, `HirModuleId`, `HirKindId`). |
 | HR2 | Typed expressions                        | Literal / Ref / BinaryOp / UnaryOp / Call / Cast / MemberAccess / Index / IntrinsicCall. Verifier asserts every expr has `typeId.valid()`. |
 | HR3 | Structured CF                            | Block / IfStmt / WhileStmt / DoWhileStmt / ForStmt / SwitchStmt / Break / Continue / Return / ExprStmt / VarDecl / AssignStmt. Verifier asserts every break/continue references a valid enclosing scope. |
 | HR4 | Declarations + extern surface             | Module / Function / Global / TypeDecl / ExternFunction / ExternGlobal / ImportGroup. FFI metadata side-table populated. |
@@ -193,8 +198,8 @@ Substrate tier (5-agent review) for HR1, HR2, HR3, HR5, HR6 (touch substrate con
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
-| HirKind enum bloats as languages onboard | High | Medium | Hold the discipline: any new kind requires a verifier rule + a CST→HIR lowering case + an at-least-one downstream consumer (MIR / SPIR-V / WASM / transpile) that handles it. Reject "wishlist" kinds. |
-| SQL-shaped first-class kinds (Q3) force shader/native lowering to handle SQL nodes they'll never see | Medium | Low | Lowering passes ignore unsupported kinds and emit `H_UnsupportedKindForBackend`; per-backend coverage is a verifier sub-check at lowering entry. |
+| HirKind core bloats as languages onboard | High | Low | **Resolved by the open core+extensions model (§2.2):** new constructs are *registered extension kinds* (`≥256` via `HirKindRegistry`), not core enum members. The core `[0,256)` stays fixed; the registry absorbs all growth, exactly as `TypeKind`/`TypeRegistry` do. Discipline still applies to *core* additions (verifier rule + lowering coverage + a downstream consumer), but domain/language kinds never touch the core. |
+| Extension kinds force backends to handle nodes they'll never emit | Medium | Low | A backend that doesn't recognize an extension kind emits `H_UnsupportedKindForBackend` at lowering entry (verifier sub-check); it never silently miscompiles. Each extension kind declares the backends that consume it, so coverage is checkable. |
 | Structured-CF discipline (§2.3) blocks fast lowering for c-subset's `goto` (post-v1 full C99) | Low | Medium | Synthetic-scaffold pattern documented; goto-rich lowering deferred to v1.x when full C99 lands. |
 | Generic instantiation balloons HIR size | Low | Medium | Instantiation cache keyed on `(generic, concrete-args-tuple)`; instantiation budget per CU (open question §5 default: 1000). |
 

@@ -63,6 +63,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_BodyDefaultKindInShape:   return "C_BodyDefaultKindInShape";
         case DiagnosticCode::C_UnknownTypeExtension:     return "C_UnknownTypeExtension";
         case DiagnosticCode::C_TypeExtensionParamMismatch: return "C_TypeExtensionParamMismatch";
+        case DiagnosticCode::C_InvalidImports:           return "C_InvalidImports";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
