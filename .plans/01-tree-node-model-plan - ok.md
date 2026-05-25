@@ -2,6 +2,8 @@
 
 > Sub-plan of [`00-compiler-implementation-plan - tbd.md`](./00-compiler-implementation-plan - tbd.md).
 > Defines the **core data structure** that every later module (tokenizer, parser, semantic analyzer, IR generator) reads from or writes to.
+>
+> **Post-close amendment (CU2, [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) §2.6 C2-L1):** `TreeBuilder` gains a public `ingestDiagnostics(std::span<ParseDiagnostic const>)` that merges externally-produced diagnostics (the tokenizer's lexer stream) into the tree's reporter before `finish()`, so a finished `Tree` owns **all** of its file's diagnostics. Additive (new method, reported through the normal cap/dedup path); no existing `TreeBuilder` caller changes.
 
 ---
 

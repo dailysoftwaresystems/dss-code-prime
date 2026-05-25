@@ -18,9 +18,9 @@ namespace dss {
 namespace {
 
 // Always-on fatal-abort for TreeBuilder invariants. Matches the
-// project's `*Fatal` pattern (see tree.cpp's `treeFatal`,
-// tree_attrs.hpp's `attrFatal`) so contract violations halt loudly in
-// release builds, not just under NDEBUG-off asserts.
+// project's `*Fatal` pattern (see tree.cpp's `treeFatal` and the
+// substrate `detail::arena` fatal helpers in arena_tag.hpp) so contract
+// violations halt loudly in release builds, not just under NDEBUG-off asserts.
 [[noreturn]] void tbFatal(char const* what) noexcept {
     std::fputs("dss::TreeBuilder fatal: ", stderr);
     std::fputs(what, stderr);
@@ -145,6 +145,7 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     , schema_(std::move(schema))
     , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig)))
     , treeId_(nextTreeId())
+    , arena_(treeId_)   // emplaces the slot-0 sentinel; stamps treeId_ on every id
     // walker_ embeds the SchemaWalker state machine. The `[this]`-
     // capturing lambda is the desync emission callback — it stays
     // valid because (a) TreeBuilder is non-movable (static_assert in
@@ -172,9 +173,7 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
     // nothing to resolve against — fail fast.
     if (!schema_) tbFatal("schema is null");
     // Slot 0 of the arena is reserved as InvalidNode — every real NodeId
-    // starts at 1. This matches the convention DSS_STRONG_ID enforces:
-    // default-constructed = invalid sentinel.
-    nodes_.emplace_back();
+    // starts at 1. The ArenaBuilder emplaces that sentinel at construction.
 
     // Body-mode defaultToken kinds come from the schema (computed once
     // at load time; shared with the parser). The error + identifier
@@ -195,9 +194,7 @@ TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
 }
 
 NodeId TreeBuilder::emit_(detail::Node n) {
-    const auto value = static_cast<std::uint32_t>(nodes_.size());
-    nodes_.push_back(n);
-    return NodeId{value, treeId_.v};
+    return arena_.addNode(n);   // appends + stamps treeId_, returns the tagged id
 }
 
 bool TreeBuilder::attachToCurrentFrame_(NodeId id) {
@@ -206,7 +203,7 @@ bool TreeBuilder::attachToCurrentFrame_(NodeId id) {
     // Backpatch parent on the just-emitted node so HasError propagation
     // can walk via the stored parent link rather than the open-frame stack
     // (frames may have already closed by the time a deep error fires).
-    nodes_[id.v].parent = open_.back().id;
+    arena_.at(id).parent = open_.back().id;
     return true;
 }
 
@@ -239,6 +236,21 @@ void TreeBuilder::reportDiagnostic(ParseDiagnostic d) {
     emitDiagnostic_(std::move(d));
 }
 
+void TreeBuilder::ingestDiagnostics(std::span<ParseDiagnostic const> diags) {
+    if (finished_) {
+        addBuilderInvariant_("ingestDiagnostics() after finish()",
+                             SourceSpan::empty(0));
+        return;
+    }
+    // Report verbatim: external diagnostics already carry their own buffer,
+    // span, and scope. Do NOT route through emitDiagnostic_ — that would
+    // overwrite scopeStack with the builder's (empty/irrelevant for lexer
+    // diags). Goes through report() so the cap/dedup window still applies.
+    for (auto const& d : diags) {
+        reporter_->report(d);
+    }
+}
+
 void TreeBuilder::addBuilderInvariant_(std::string actual, SourceSpan span) {
     ParseDiagnostic d;
     d.code     = DiagnosticCode::P_BuilderInvariant;
@@ -254,10 +266,10 @@ void TreeBuilder::propagateHasError_(NodeId start) noexcept {
     // the error). Walk from its PARENT upward. Stops at the first
     // already-flagged ancestor — the chain is monotone since every
     // prior propagation flagged every ancestor up to root.
-    if (!start.valid() || start.v >= nodes_.size()) return;
-    NodeId cur = nodes_[start.v].parent;
-    while (cur.valid() && cur.v < nodes_.size()) {
-        detail::Node& n = nodes_[cur.v];
+    if (!start.valid() || start.v >= arena_.size()) return;
+    NodeId cur = arena_.at(start).parent;
+    while (cur.valid() && cur.v < arena_.size()) {
+        detail::Node& n = arena_.at(cur);
         if (hasError(n.flags)) break;
         n.flags |= NodeFlags::HasError;
         cur = n.parent;
@@ -286,14 +298,14 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
         const auto parentChildren = topFramePendingChildren_();
         if (!parentChildren.empty()) {
             const NodeId lastChild = parentChildren.back();
-            opener = SourceSpan::empty(nodes_[lastChild.v].span.end());
+            opener = SourceSpan::empty(arena_.at(lastChild).span.end());
         }
     }
     n.span = opener;
 
     const NodeId id = emit_(n);
     if (!open_.empty()) {
-        nodes_[id.v].parent = open_.back().id;
+        arena_.at(id).parent = open_.back().id;
         // Register the new internal node as a child of the parent frame
         // now, while parent is still open. closeFrame_ flushes the
         // parent's pending range into childIndex_; without this push the
@@ -358,7 +370,7 @@ TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
     // the parent (taking the slot vacated by the pop above), and
     // pushes the new Frame whose `pendingStart` points at the
     // post-attach size of `pendingChildren_`. Wrapped in try/catch so
-    // a `std::bad_alloc` on `nodes_` grow doesn't leak `childToWrap`
+    // a `std::bad_alloc` on the arena grow doesn't leak `childToWrap`
     // from the parent's pending list (the strong-exception-safety
     // contract `OpenScope` callers expect — "either the wrap landed
     // or the builder state is byte-identical").
@@ -387,10 +399,10 @@ TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
     // Fix up the wrapped child's parent pointer and the wrapper's
     // span so subsequent span rollup is sensible. The wrapper now
     // starts where the wrapped subtree starts.
-    nodes_[childToWrap.v].parent = open_.back().id;
-    const auto childSpan = nodes_[childToWrap.v].span;
+    arena_.at(childToWrap).parent = open_.back().id;
+    const auto childSpan = arena_.at(childToWrap).span;
     open_.back().openerSpan = SourceSpan::empty(childSpan.start());
-    nodes_[open_.back().id.v].span =
+    arena_.at(open_.back().id).span =
         SourceSpan::empty(childSpan.start());
 
     return guard;
@@ -425,7 +437,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             std::format("close() with unknown cookie {}", cookie),
             topChildren.empty()
                 ? open_.back().openerSpan
-                : nodes_[topChildren.back().v].span);
+                : arena_.at(topChildren.back()).span);
         return;
     }
 
@@ -440,7 +452,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
     // up, HasError percolated from any erroring child.
     while (true) {
         Frame& fr = open_.back();
-        detail::Node& node = nodes_[fr.id.v];
+        detail::Node& node = arena_.at(fr.id);
 
         // Flush this frame's pending range to childIndex_ contiguously.
         // The range is `pendingChildren_[fr.pendingStart..end)`. After
@@ -452,12 +464,12 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             NodeId child = pendingChildren_[i];
             childIndex_.push_back(child);
             // Roll the span up from this child onto our node.
-            node.span = SourceSpan::join(node.span, nodes_[child.v].span);
+            node.span = SourceSpan::join(node.span, arena_.at(child).span);
             // OR-reduce HasError. The attach paths already propagated
             // eagerly, but synthetic Missing inserted directly into
             // pendingChildren_ by finish() bypasses attachToCurrentFrame_;
             // this loop catches it.
-            if (hasError(nodes_[child.v].flags)) {
+            if (hasError(arena_.at(child).flags)) {
                 node.flags |= NodeFlags::HasError;
             }
         }
@@ -965,7 +977,7 @@ void TreeBuilder::popScope() {
             const auto topChildren = topFramePendingChildren_();
             at = topChildren.empty()
                 ? open_.back().openerSpan
-                : nodes_[topChildren.back().v].span;
+                : arena_.at(topChildren.back()).span;
         }
         addBuilderInvariant_("popScope on empty scope stack", at);
         return;
@@ -1071,7 +1083,7 @@ Tree TreeBuilder::finish() && {
     // If open() was never called, the arena holds only the sentinel.
     // Emit an empty Tree with no root rather than claiming NodeId{1} —
     // which doesn't exist and would crash on access.
-    const bool neverOpened = (nodes_.size() <= 1);
+    const bool neverOpened = (arena_.size() <= 1);
 
     detail::TreeData td;
     td.source     = source_;
@@ -1081,17 +1093,17 @@ Tree TreeBuilder::finish() && {
     td.rules      = std::shared_ptr<RuleInterner const>(schema_, &schema_->rules());
     td.schema     = schema_;
     td.diagnostics = std::move(reporter_);
-    td.id          = treeId_;
 
+    using NodeArena = substrate::ArenaContainer<detail::Node, NodeId, TreeId>;
     if (neverOpened) {
         // Drop the lone sentinel: Tree's invariant is "nodes empty XOR
-        // root valid". Empty arena + invalid root is a well-formed
-        // empty Tree.
-        td.nodes.clear();
+        // root valid". Empty arena + invalid root is a well-formed empty
+        // Tree. The arena still carries treeId_ so the empty tree keeps its id.
+        td.arena      = NodeArena{std::vector<detail::Node>{}, treeId_};
         td.childIndex.clear();
-        td.root = InvalidNode;
+        td.root        = InvalidNode;
     } else {
-        td.nodes       = std::move(nodes_);
+        td.arena       = std::move(arena_).finish();  // freeze: ArenaBuilder → ArenaContainer
         td.childIndex  = std::move(childIndex_);
         td.root        = NodeId{1, treeId_.v};  // first real node = the root open()
     }
@@ -1122,7 +1134,7 @@ TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
     }
 
     CheckpointSnapshot snap;
-    snap.nodesSize                  = nodes_.size();
+    snap.nodesSize                  = arena_.size();
     snap.childIndexSize             = childIndex_.size();
     snap.pendingChildrenSize        = pendingChildren_.size();
     snap.openFrames                 = open_;
@@ -1202,7 +1214,7 @@ void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
 
     // Restore in topological order: arena first, then dependent vectors,
     // then the cursor/scope/cookie state, then the reporter.
-    nodes_.resize(snap.nodesSize);
+    arena_.truncateTo(snap.nodesSize);
     childIndex_.resize(snap.childIndexSize);
     pendingChildren_.resize(snap.pendingChildrenSize);
     open_                       = std::move(snap.openFrames);

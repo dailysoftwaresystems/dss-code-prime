@@ -2,6 +2,7 @@
 
 #include "analysis/syntactic/pratt_walker.hpp"
 #include "core/export.hpp"
+#include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
@@ -86,12 +87,18 @@ public:
     // Preconditions (fatal-asserted in the body): `src` and `schema`
     // must both be non-null. Single-use: the parser is constructed,
     // `parse() &&` is called exactly once, then the parser is gone.
-    // Pratt expression dispatch is wired in PA2; until then the
-    // parser handles `expr` shapes via the schema-driven dispatch.
+    //
+    // `lexerDiagnostics` (optional): the tokenizer's diagnostic reporter
+    // from `Tokenizer::tokenize()`. When provided, the parser folds those
+    // lexer diagnostics into the resulting Tree's reporter so the Tree
+    // owns lexer + parser diagnostics in one stream (08-compilation-unit-
+    // plan §2.6 C2-L1). Defaulted to nullptr — existing callers are
+    // unaffected.
     Parser(std::shared_ptr<SourceBuffer>        src,
            std::shared_ptr<GrammarSchema const> schema,
            TokenStream                          tokens,
-           ParserConfig                         config = {});
+           ParserConfig                         config = {},
+           std::unique_ptr<DiagnosticReporter>  lexerDiagnostics = nullptr);
 
     Parser(Parser const&)            = delete;
     Parser& operator=(Parser const&) = delete;

@@ -116,6 +116,13 @@ struct Parser::Impl {
     // a pointer so the per-iteration drain loop doesn't re-fetch.
     std::unordered_set<SchemaTokenId> const* bodyDefaultTokenKinds = nullptr;
 
+    // Lexer diagnostics from the tokenizer, optionally handed to the parser
+    // so the finished Tree owns lexer + parser diagnostics in one stream
+    // (08-compilation-unit-plan §2.6 C2-L1). Null when the caller doesn't
+    // pass them (today: LSP + most tests). Ingested into the builder's
+    // reporter at the start of parse(), before the walk.
+    std::unique_ptr<DiagnosticReporter> lexerDiagnostics;
+
     // Builder lives in Impl (heap) since `TreeBuilder` is non-movable
     // (static_assert) and Impl is constructed in-place.
     std::unique_ptr<TreeBuilder> builder;
@@ -1074,7 +1081,8 @@ static_assert(!std::is_move_constructible_v<Parser::Impl>,
 Parser::Parser(std::shared_ptr<SourceBuffer>        src,
                std::shared_ptr<GrammarSchema const> schema,
                TokenStream                          tokens,
-               ParserConfig                         config) {
+               ParserConfig                         config,
+               std::unique_ptr<DiagnosticReporter>  lexerDiagnostics) {
     // Fail-fast preconditions: a null schema or source means the
     // caller mis-constructed the parser. Asserting in the ctor (not
     // `parse()`) catches the bug at the construction site rather
@@ -1096,6 +1104,7 @@ Parser::Parser(std::shared_ptr<SourceBuffer>        src,
                                    std::move(schema),
                                    std::move(tokens),
                                    std::move(config));
+    impl_->lexerDiagnostics = std::move(lexerDiagnostics);
     impl_->outer = this;
 }
 
@@ -1107,6 +1116,14 @@ ParseResult Parser::parse() && {
     auto& I = *impl_;
 
     I.builder = std::make_unique<TreeBuilder>(I.src, I.schema);
+
+    // Fold the tokenizer's lexer diagnostics into the builder's reporter
+    // before the walk, so the finished Tree owns lexer + parser diagnostics
+    // in one stream (08-compilation-unit-plan §2.6 C2-L1). No-op when the
+    // caller didn't pass them.
+    if (I.lexerDiagnostics) {
+        I.builder->ingestDiagnostics(I.lexerDiagnostics->all());
+    }
 
     // Default-construct the Pratt walker if the caller didn't inject
     // one through `ParserConfig::prattWalker`. Always-present so the

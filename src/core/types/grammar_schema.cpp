@@ -350,6 +350,10 @@ std::span<SchemaTokenId const> GrammarSchema::syncTokens() const noexcept {
     return d_.syncTokens;
 }
 
+std::span<TypeExtensionDescriptor const> GrammarSchema::typeExtensions() const noexcept {
+    return d_.typeExtensions;
+}
+
 bool GrammarSchema::isNullable(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return false;

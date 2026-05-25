@@ -91,8 +91,9 @@ before touching any of it.
 **Key invariants:**
 - Slot 0 is the `InvalidNode` sentinel; real nodes start at index 1.
 - Tree is immutable after `finish()`. All semantic annotation goes through `NodeAttribute<T>` side-tables.
-- `NodeId` is a strong type wrapping `{uint32_t v; uint32_t treeTag}` with `valid()` predicate
-  (`v != 0` == invalid; `treeTag == 0` == untagged literal). Equality and `std::hash` compare `.v` only.
+- `NodeId` is a strong type wrapping `{uint32_t v; uint32_t arenaTag}` with `valid()` predicate
+  (`v != 0` == invalid; `arenaTag == 0` == untagged literal). Equality and `std::hash` compare `.v` only.
+  (`arenaTag` is the generalized arena-provenance field — see SP1's `DSS_ARENA_ID`; for `NodeId` it holds the source `TreeId`.)
 - Cross-tree NodeId usage **is** detectable: `TreeBuilder::emit_` and `RawTreeBuilder` stamp every
   emitted `NodeId` with the source tree's id; `NodeAttribute<T>` and `Tree::node_` validate the tag
   on every access. Tagged-from-foreign-tree aborts with both ids in the fatal message; untagged
@@ -167,7 +168,7 @@ auto const* t = nodeTypes.tryGet(id);       // nullptr on absent
   `vector<optional<T>>` when coverage ≥ 50% AND `tree.nodeCount() ≥ 16`. `clear()` resets to sparse.
 - **Move-only** with custom move ops that reset the source's `denseCount_` + variant so
   moved-from state is observably consistent (rather than std-lib's "valid but unspecified").
-- **Bounds-check + cross-tree-tag-check on every entry**. NodeIds carry a `treeTag` (set by
+- **Bounds-check + cross-tree-tag-check on every entry**. NodeIds carry an `arenaTag` (set by
   `TreeBuilder::emit_` / `RawTreeBuilder::addNode`); foreign-tree usage aborts with both
   TreeIds in the fatal message. Untagged literals (`NodeId{N}` from test code) bypass the
   tag check but are still bounds-checked.
@@ -567,7 +568,7 @@ heap-allocated `std::vector` and reset it AFTER `finish()` (see
   for non-trivial languages). See `.plans/02-schema-expressiveness-v2-plan - ok.md`.
 - **Substrate hardening (SH1–SH4): done.** SH2 confirmed the multi-OS CI matrix (Linux/GCC,
   Linux/Clang+ASan, Windows/MSVC, macOS/AppleClang). SH3 closed the cross-tree `NodeId` caveat
-  (`NodeId.treeTag` + tag validation in `NodeAttribute<T>` and `Tree::node_`). SH1 ships
+  (`NodeId.arenaTag` + tag validation in `NodeAttribute<T>` and `Tree::node_`). SH1 ships
   `tools/refresh_landing_log.py` for plan-doc hygiene; SH4a wires its `--check` into CI. SH4b
   adopted `switch`/`case`/`default`/`break` in c-subset via shape-based positioning. SH4c
   pinned multi-level AltChoice routing.

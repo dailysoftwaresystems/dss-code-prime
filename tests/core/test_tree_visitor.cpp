@@ -379,7 +379,7 @@ TEST(TreeVisitor, AstCursorPropagatesAcrossPostOrderWalk) {
 
 TEST(TreeVisitor, EmptyTreeWalkIsNoOp) {
     detail::TreeData td;
-    td.id = TreeId{42};
+    td.arena = substrate::ArenaContainer<detail::Node, NodeId, TreeId>{std::vector<detail::Node>{}, TreeId{42}};
     Tree t{std::move(td)};
 
     int visits = 0;

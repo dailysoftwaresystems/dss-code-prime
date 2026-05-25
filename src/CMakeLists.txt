@@ -1,6 +1,7 @@
 add_subdirectory(core)
 add_subdirectory(tokenizer)
 add_subdirectory(analysis/syntactic)
+add_subdirectory(analysis/compilation_unit)
 add_subdirectory(lsp)
 add_subdirectory(gen)
 add_subdirectory(program)
@@ -11,6 +12,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:core>
     $<TARGET_OBJECTS:tokenizer>
     $<TARGET_OBJECTS:analysis_syntactic>
+    $<TARGET_OBJECTS:analysis_compilation_unit>
     $<TARGET_OBJECTS:lsp>
     $<TARGET_OBJECTS:gen>
     $<TARGET_OBJECTS:program>)
@@ -30,3 +32,33 @@ set_target_properties(dss-code-prime-lib PROPERTIES
 # Thin wrapper that delegates to Program::run().
 add_executable(dss-code-prime main.cpp)
 target_link_libraries(dss-code-prime PRIVATE dss-code-prime-lib)
+
+# ── MinGW runtime DLLs alongside the binaries (Windows + GCC only) ──
+# Every exe (CLI + test binaries) loads libstdc++-6 / libgcc_s_seh-1 /
+# libwinpthread-1 at process start. Windows resolves those via the DLL
+# search order, where the EXE's own directory is #1 — ahead of PATH. When
+# the build toolchain (e.g. Strawberry MinGW, UCRT) is NOT first on PATH —
+# such as running ctest from an MSYS2 MINGW64 shell that injects its own
+# /mingw64/bin — a *different* libstdc++ loads and the process dies at load
+# with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139). Copying the toolchain's own
+# runtime next to the binaries makes the load PATH-independent and the
+# binaries self-contained. dirname(CMAKE_CXX_COMPILER) is this toolchain's
+# bin dir, so each dev machine ships its own matching runtime. No-op on MSVC
+# (system UCRT) and non-Windows (no DLLs).
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    get_filename_component(_dss_toolchain_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(_dss_runtime_dlls "")
+    foreach(_dll libstdc++-6 libgcc_s_seh-1 libwinpthread-1)
+        if(EXISTS "${_dss_toolchain_bin}/${_dll}.dll")
+            list(APPEND _dss_runtime_dlls "${_dss_toolchain_bin}/${_dll}.dll")
+        endif()
+    endforeach()
+    if(_dss_runtime_dlls)
+        add_custom_command(TARGET dss-code-prime-lib POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${_dss_runtime_dlls} "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+            COMMAND_EXPAND_LISTS
+            VERBATIM
+            COMMENT "Copying MinGW runtime DLLs next to binaries (PATH-independent load)")
+    endif()
+endif()

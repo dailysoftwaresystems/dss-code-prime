@@ -9,6 +9,7 @@
 
   "lexerModes": {
     "main":          { "tokens": "default" },
+    "string":        { "defaultToken": { "kind": "StringChar" } },
     "line-comment":  {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -46,6 +47,13 @@
     ";":  [{ "kind": "EndStatement" }],
     ",":  [{ "kind": "Comma" }],
     ":":  [{ "kind": "Colon" }],
+
+    "#include": [{ "kind": "IncludeKeyword" }],
+    "\"": [{
+      "kind": "StringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
 
     "=":  [{ "kind": "AssignOp" }],
     "+":  [{ "kind": "PlusOp"   }],
@@ -132,9 +140,14 @@
 
     "topLevel": {
       "alt": [
+        "includeDirective",
         { "sequence": [ "typeRef", "Identifier", "topLevelTail" ] },
         "externDecl"
       ]
+    },
+
+    "includeDirective": {
+      "sequence": [ "IncludeKeyword", "StringStart" ]
     },
 
     "externDecl": {

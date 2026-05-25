@@ -9,6 +9,13 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::P_PrematureEndOfInput), "P_PrematureEndOfInput");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_MissingField),        "C_MissingField");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::P_TooManyDiagnostics),  "P_TooManyDiagnostics");
+    // D_* driver / compilation-unit codes (CU2).
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_FileNotFound),        "D_FileNotFound");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_EmptyInput),          "D_EmptyInput");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DuplicateFile),       "D_DuplicateFile");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_UnknownTypeExtension), "C_UnknownTypeExtension");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_TypeExtensionParamMismatch),
+              "C_TypeExtensionParamMismatch");
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
@@ -20,6 +27,11 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
     // C_* prefix and the high nibble is stripped for the numeric portion.
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_MissingField),     "C0001");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_AmbiguousAlternatives), "C0010");
+    // D_* prefix; high nibble stripped like C_*.
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_FileNotFound),     "D0001");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_DuplicateFile),    "D0003");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_UnknownTypeExtension),       "C002A");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_TypeExtensionParamMismatch), "C002B");
 }
 
 TEST(DiagnosticSeverity, NameMapping) {

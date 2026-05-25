@@ -64,7 +64,7 @@ TEST(StrongIds, InvalidSentinelsHaveExpectedValue) {
 TEST(StrongIds, IsTriviallyCopyable) {
     static_assert(std::is_trivially_copyable_v<NodeId>);
     static_assert(std::is_trivially_copyable_v<RuleId>);
-    // NodeId carries an extra `treeTag` field (see strong_ids.hpp comment)
+    // NodeId carries an extra `arenaTag` field (see strong_ids.hpp comment)
     // so cross-tree usage of NodeIds aborts loudly. The other strong ids
     // remain bare-uint32 sized.
     static_assert(sizeof(NodeId) == 2 * sizeof(std::uint32_t));
@@ -72,7 +72,7 @@ TEST(StrongIds, IsTriviallyCopyable) {
 }
 
 TEST(StrongIds, NodeIdEqualityIgnoresTreeTag) {
-    // The treeTag is provenance metadata, NOT identity. Two NodeIds with
+    // The arenaTag is provenance metadata, NOT identity. Two NodeIds with
     // the same `.v` but different tags MUST compare equal so existing
     // tests that mix literal NodeId{N} with tagged-from-tree NodeIds
     // continue to assert structurally. The cross-tree validator is the
@@ -91,9 +91,36 @@ TEST(StrongIds, NodeIdEqualityIgnoresTreeTag) {
 TEST(StrongIds, NodeIdTwoArgCtorStoresTag) {
     NodeId id{7, 42};
     EXPECT_EQ(id.v, 7u);
-    EXPECT_EQ(id.treeTag, 42u);
+    EXPECT_EQ(id.arenaTag, 42u);
 
     NodeId untagged{7};
     EXPECT_EQ(untagged.v, 7u);
-    EXPECT_EQ(untagged.treeTag, 0u);
+    EXPECT_EQ(untagged.arenaTag, 0u);
+}
+
+// ── CompilationUnitId (CU1) ───────────────────────────────────────────────
+
+TEST(StrongIds, CompilationUnitIdDefaultIsInvalid) {
+    EXPECT_FALSE(CompilationUnitId{}.valid());
+    EXPECT_FALSE(InvalidCompilationUnit.valid());
+    EXPECT_EQ(InvalidCompilationUnit.v, 0u);
+}
+
+TEST(StrongIds, CompilationUnitIdDistinctType) {
+    // Same DSS_STRONG_ID macro, distinct type. Mixing with TreeId/RuleId
+    // must be a compile error, not a silent uint32_t conversion.
+    static_assert(!std::is_same_v<CompilationUnitId, TreeId>);
+    static_assert(!std::is_same_v<CompilationUnitId, RuleId>);
+    static_assert(!std::is_convertible_v<std::uint32_t, CompilationUnitId>);
+    static_assert(sizeof(CompilationUnitId) == sizeof(std::uint32_t));
+}
+
+TEST(StrongIds, CompilationUnitIdHashable) {
+    std::unordered_set<CompilationUnitId> seen;
+    seen.insert(CompilationUnitId{1});
+    seen.insert(CompilationUnitId{2});
+    seen.insert(CompilationUnitId{1});  // dup
+    EXPECT_EQ(seen.size(), 2u);
+    EXPECT_TRUE(seen.contains(CompilationUnitId{1}));
+    EXPECT_FALSE(seen.contains(CompilationUnitId{3}));
 }

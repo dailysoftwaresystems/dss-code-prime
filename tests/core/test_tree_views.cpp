@@ -34,7 +34,7 @@ public:
         : src_(SourceBuffer::fromString(std::move(sourceText), "<test>"))
         , schema_(std::move(schema))
         , rules_(std::make_shared<RuleInterner>()) {
-        td_.nodes.emplace_back();   // slot 0 reserved for InvalidNode
+        nodes_.emplace_back();   // slot 0 reserved for InvalidNode
     }
 
     [[nodiscard]] RuleId internRule(std::string_view name) { return rules_->intern(name); }
@@ -44,35 +44,35 @@ public:
 
     NodeId addInternal(RuleId rule, SourceSpan span, NodeFlags flags,
                        NodeId parent, std::vector<NodeId> children = {}) {
-        const auto value = static_cast<std::uint32_t>(td_.nodes.size());
+        const auto value = static_cast<std::uint32_t>(nodes_.size());
         detail::Node n{};
         n.kind = NodeKind::Internal;
         n.flags = flags;
         n.rule = rule;
         n.span = span;
         n.parent = parent;
-        td_.nodes.push_back(n);
+        nodes_.push_back(n);
         pending_.emplace_back(NodeId{value}, std::move(children));
         return NodeId{value};
     }
 
     NodeId addToken(SchemaTokenId kind, SourceSpan span, NodeFlags flags,
                     NodeId parent) {
-        const auto value = static_cast<std::uint32_t>(td_.nodes.size());
+        const auto value = static_cast<std::uint32_t>(nodes_.size());
         detail::Node n{};
         n.kind      = NodeKind::Token;
         n.flags     = flags;
         n.tokenKind = kind;
         n.span      = span;
         n.parent    = parent;
-        td_.nodes.push_back(n);
+        nodes_.push_back(n);
         pending_.emplace_back(NodeId{value}, std::vector<NodeId>{});
         return NodeId{value};
     }
 
     [[nodiscard]] Tree finish(NodeId root, TreeId id = TreeId{1}) && {
         for (auto& [nid, kids] : pending_) {
-            auto& n = td_.nodes[nid.v];
+            auto& n = nodes_[nid.v];
             n.firstChild = static_cast<std::uint32_t>(td_.childIndex.size());
             n.childCount = static_cast<std::uint32_t>(kids.size());
             for (NodeId k : kids) td_.childIndex.push_back(k);
@@ -81,7 +81,7 @@ public:
         td_.source = src_;
         td_.rules  = rules_;
         td_.schema = schema_;
-        td_.id     = id;
+        td_.arena  = substrate::ArenaContainer<detail::Node, NodeId, TreeId>{std::move(nodes_), id};
         td_.root   = root;
         return Tree{std::move(td_)};
     }
@@ -90,6 +90,7 @@ private:
     std::shared_ptr<SourceBuffer>          src_;
     std::shared_ptr<GrammarSchema const>   schema_;
     std::shared_ptr<RuleInterner>          rules_;
+    std::vector<detail::Node>              nodes_;
     detail::TreeData                       td_;
     std::vector<std::pair<NodeId, std::vector<NodeId>>> pending_;
 };

@@ -705,8 +705,7 @@ TEST(GrammarSchema, CSubsetTypeRefAllowsDoubleConst) {
     EXPECT_TRUE((*result)->rules().find("typeRef").valid());
 }
 
-// dssSchemaVersion 2 is the upper bound of the loader's accepted window.
-// A valid v2 document must load AND emit zero diagnostics — a future
+// dssSchemaVersion 2 must load AND emit zero diagnostics — a future
 // warning-on-version-2 regression would silently pass without this.
 TEST(GrammarSchema, SchemaVersionTwoAccepted) {
     auto result = GrammarSchema::loadFromText(
@@ -717,23 +716,138 @@ TEST(GrammarSchema, SchemaVersionTwoAccepted) {
     EXPECT_EQ((*result)->schemaVersion(), 2u);
 }
 
-// Outside the accepted window, the loader must emit C_VersionMismatch
-// with a message naming the supported range. The range string is the
-// load-bearing fragment — full-message equality would over-pin the
-// surrounding prose, but the range itself MUST be there or the
-// diagnostic is uselessly opaque.
-TEST(GrammarSchema, SchemaVersionThreeRejectedWithRangeMessage) {
+// dssSchemaVersion 3 is the upper bound of the loader's accepted window since
+// SP2 (it adds the optional `typeExtensions[]` field). A v3 doc with no
+// extensions loads cleanly.
+TEST(GrammarSchema, SchemaVersionThreeAccepted) {
     auto result = GrammarSchema::loadFromText(
         R"({"dssSchemaVersion":3,"language":{"name":"X","version":"0.1.0"}})");
+    ASSERT_TRUE(result.has_value())
+        << "v3 doc should load: "
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    EXPECT_EQ((*result)->schemaVersion(), 3u);
+    EXPECT_TRUE((*result)->typeExtensions().empty());
+}
+
+// Outside the accepted window, the loader must emit C_VersionMismatch with a
+// message naming the supported range. The range string is the load-bearing
+// fragment — full-message equality would over-pin the surrounding prose, but
+// the range itself MUST be there or the diagnostic is uselessly opaque.
+TEST(GrammarSchema, SchemaVersionFourRejectedWithRangeMessage) {
+    auto result = GrammarSchema::loadFromText(
+        R"({"dssSchemaVersion":4,"language":{"name":"X","version":"0.1.0"}})");
     ASSERT_FALSE(result.has_value());
     auto const& diags = result.error();
     auto it = std::ranges::find_if(diags, [](auto const& d) {
         return d.code == DiagnosticCode::C_VersionMismatch;
     });
     ASSERT_NE(it, diags.end());
-    EXPECT_NE(it->message.find("1..2"), std::string::npos)
+    EXPECT_NE(it->message.find("1..3"), std::string::npos)
         << "version-mismatch message should name the supported range; got: "
         << it->message;
+}
+
+// ── typeExtensions[] (SP2, schema v3) ──────────────────────────────────────
+
+namespace {
+[[nodiscard]] bool hasDiagCode(std::vector<ConfigDiagnostic> const& diags, DiagnosticCode code) {
+    return std::ranges::any_of(diags, [code](auto const& d) { return d.code == code; });
+}
+} // namespace
+
+TEST(GrammarSchema, TypeExtensionsLoadAndPopulate) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 3,
+        "language": { "name": "TsqlSubset", "version": "0.1.0" },
+        "typeExtensions": [
+            { "name": "TSQL::Varchar", "parameters": [ { "name": "N", "kind": "Integer" } ] },
+            { "name": "TSQL::RowType" }
+        ]
+    })JSON");
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto exts = (*result)->typeExtensions();
+    ASSERT_EQ(exts.size(), 2u);
+    EXPECT_EQ(exts[0].name, "TSQL::Varchar");
+    ASSERT_EQ(exts[0].parameters.size(), 1u);
+    EXPECT_EQ(exts[0].parameters[0].name, "N");
+    EXPECT_EQ(exts[0].parameters[0].kind, TypeParamKind::Integer);
+    EXPECT_EQ(exts[1].name, "TSQL::RowType");
+    EXPECT_TRUE(exts[1].parameters.empty());
+}
+
+TEST(GrammarSchema, TypeExtensionBadParamKindReportsMismatch) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 3,
+        "language": { "name": "X", "version": "0.1.0" },
+        "typeExtensions": [ { "name": "X::Foo", "parameters": [ { "name": "N", "kind": "Nope" } ] } ]
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_TypeExtensionParamMismatch));
+}
+
+TEST(GrammarSchema, TypeExtensionsNotArrayReportsUnknown) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 3,
+        "language": { "name": "X", "version": "0.1.0" },
+        "typeExtensions": { "name": "X::Foo" }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownTypeExtension));
+}
+
+TEST(GrammarSchema, TypeExtensionEntryNotObjectReportsUnknown) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 3,
+        "language": { "name": "X", "version": "0.1.0" },
+        "typeExtensions": [ 42 ]
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownTypeExtension));
+}
+
+TEST(GrammarSchema, TypeExtensionDuplicateNameReportsConflict) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 3,
+        "language": { "name": "X", "version": "0.1.0" },
+        "typeExtensions": [ { "name": "X::Foo" }, { "name": "X::Foo" } ]
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_ConflictingField));
+}
+
+TEST(GrammarSchema, TypeExtensionTypeKindParamLoads) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 3,
+        "language": { "name": "X", "version": "0.1.0" },
+        "typeExtensions": [ { "name": "X::Boxed", "parameters": [ { "name": "T", "kind": "Type" } ] } ]
+    })JSON");
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto exts = (*result)->typeExtensions();
+    ASSERT_EQ(exts.size(), 1u);
+    ASSERT_EQ(exts[0].parameters.size(), 1u);
+    EXPECT_EQ(exts[0].parameters[0].kind, TypeParamKind::Type);
+}
+
+TEST(GrammarSchema, TypeExtensionMissingNameReportsMissingField) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 3,
+        "language": { "name": "X", "version": "0.1.0" },
+        "typeExtensions": [ { "parameters": [] } ]
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, TypeExtensionParametersNotArrayReportsMismatch) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 3,
+        "language": { "name": "X", "version": "0.1.0" },
+        "typeExtensions": [ { "name": "X::Foo", "parameters": { "name": "N" } } ]
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_TypeExtensionParamMismatch));
 }
 
 // Pins the cookbook example in docs/language-config-spec.md §7 against the

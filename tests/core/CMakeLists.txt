@@ -27,3 +27,20 @@ dss_add_test(NAME core/test_checkpoint          SOURCES test_checkpoint.cpp)
 dss_add_test(NAME core/test_lexer_modes         SOURCES test_lexer_modes.cpp)
 dss_add_test(NAME core/test_string_style        SOURCES test_string_style.cpp)
 dss_add_test(NAME core/test_tsql_subset         SOURCES test_tsql_subset.cpp)
+
+# Generalized arena substrate (SP1). The test sources live under substrate/
+# and include the shared `substrate/arena_test_types.hpp`, so this directory
+# is on their include path.
+dss_add_test(NAME core/substrate/test_arena_tag       SOURCES substrate/test_arena_tag.cpp)
+dss_add_test(NAME core/substrate/test_arena_container SOURCES substrate/test_arena_container.cpp)
+dss_add_test(NAME core/substrate/test_arena_attribute SOURCES substrate/test_arena_attribute.cpp)
+dss_add_test(NAME core/substrate/test_arena_concepts  SOURCES substrate/test_arena_concepts.cpp)
+target_include_directories(dss_core_substrate_test_arena_tag       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(dss_core_substrate_test_arena_container PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(dss_core_substrate_test_arena_attribute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(dss_core_substrate_test_arena_concepts  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Core type lattice + extension registry (SP2).
+dss_add_test(NAME core/type_lattice/test_core_type     SOURCES type_lattice/test_core_type.cpp)
+dss_add_test(NAME core/type_lattice/test_type_interner SOURCES type_lattice/test_type_interner.cpp)
+dss_add_test(NAME core/type_lattice/test_type_registry SOURCES type_lattice/test_type_registry.cpp)

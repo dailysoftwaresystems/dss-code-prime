@@ -87,6 +87,33 @@ enum class DiagnosticCode : std::uint16_t {
     // grammar (cursor-skip), so a shape reference would silently never
     // match — surface it at load time instead.
     C_BodyDefaultKindInShape      = 0xC029,
+    // Type-extension declarations (SP2; `typeExtensions[]`, schema v3).
+    // C_UnknownTypeExtension: a malformed extension entry at load (not an
+    //   object / not a valid declaration); ALSO the code a consumer (phase #8
+    //   / transpile-map validation) emits when a type references an extension
+    //   name that no registry resolved.
+    // C_TypeExtensionParamMismatch: an extension parameter has an unknown kind
+    //   (not "Integer"/"Type") or a malformed parameter spec.
+    C_UnknownTypeExtension        = 0xC02A,
+    C_TypeExtensionParamMismatch  = 0xC02B,
+
+    // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
+    // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
+    // The 0xD block is shared with future driver codes (e.g. the artifact-
+    // profile plan's D_ArtifactProfileNotSupported); append, never renumber.
+    D_FileNotFound                = 0xD001,
+    D_EmptyInput                  = 0xD002,
+    D_DuplicateFile               = 0xD003,
+    // Import resolution (08-compilation-unit-plan §2.8, CU4). A reference to
+    // another translation unit could not be resolved within the CU:
+    //   D_UnresolvedImport    — a c-subset `#include "x.h"` whose file was not
+    //                           found in the including dir or any include dir.
+    //   D_UnresolvedReference — a tsql table reference (qualifiedName in table
+    //                           position) with no matching CREATE TABLE in the CU.
+    // Both are Warnings: phase #8 / FFI / a system catalog may still provide
+    // the target, so the driver does not treat them as build-fatal here.
+    D_UnresolvedImport            = 0xD004,
+    D_UnresolvedReference         = 0xD005,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

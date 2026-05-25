@@ -1146,7 +1146,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     // version's exclusive fields — accepting a version implies all
     // documented features for that version round-trip cleanly.
     constexpr std::uint32_t kMinSchemaVersion = 1;
-    constexpr std::uint32_t kMaxSchemaVersion = 2;
+    // v3 adds the optional `typeExtensions[]` field (SP2); v1/v2 configs remain
+    // valid since the field is optional.
+    constexpr std::uint32_t kMaxSchemaVersion = 3;
     const auto schemaVer = doc.at("dssSchemaVersion").get<std::uint32_t>();
     if (schemaVer < kMinSchemaVersion || schemaVer > kMaxSchemaVersion) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
@@ -2001,6 +2003,82 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
             data.syncTokens = std::move(collected);
+        }
+    }
+
+    // typeExtensions ── per-language extension type-kinds (SP2; schema v3).
+    // Optional; absent in v1/v2 configs. Each entry:
+    //   { "name": "<Lang>::<Type>",
+    //     "parameters": [ { "name": "N", "kind": "Integer"|"Type" } ] }
+    // The descriptors are registered into a CU's TypeRegistry at CU build time
+    // (registerSchemaTypeExtensions). kindIds are minted there, not here.
+    if (doc.contains("typeExtensions")) {
+        json const& te = doc.at("typeExtensions");
+        if (!te.is_array()) {
+            coll.emit(DiagnosticCode::C_UnknownTypeExtension, "/typeExtensions",
+                      "'typeExtensions' must be an array of extension declarations");
+        } else {
+            std::unordered_set<std::string> seenNames;
+            for (std::size_t i = 0; i < te.size(); ++i) {
+                json const& entry = te[i];
+                const auto path = std::format("/typeExtensions/{}", i);
+                if (!entry.is_object()) {
+                    coll.emit(DiagnosticCode::C_UnknownTypeExtension, path,
+                              "type-extension entry must be an object");
+                    continue;
+                }
+                if (!entry.contains("name") || !entry.at("name").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path + "/name",
+                              "type-extension entry must have a string 'name'");
+                    continue;
+                }
+                auto extName = entry.at("name").get<std::string>();
+                if (!seenNames.insert(extName).second) {
+                    coll.emit(DiagnosticCode::C_ConflictingField, path + "/name",
+                              std::format("type extension '{}' declared more than once", extName));
+                    continue;
+                }
+                TypeExtensionDescriptor desc;
+                desc.name = std::move(extName);
+                bool paramsOk = true;
+                if (entry.contains("parameters")) {
+                    json const& params = entry.at("parameters");
+                    if (!params.is_array()) {
+                        coll.emit(DiagnosticCode::C_TypeExtensionParamMismatch,
+                                  path + "/parameters", "'parameters' must be an array");
+                        paramsOk = false;
+                    } else {
+                        for (std::size_t p = 0; p < params.size(); ++p) {
+                            json const& param = params[p];
+                            const auto ppath = std::format("{}/parameters/{}", path, p);
+                            if (!param.is_object()
+                                || !param.contains("name") || !param.at("name").is_string()
+                                || !param.contains("kind") || !param.at("kind").is_string()) {
+                                coll.emit(DiagnosticCode::C_TypeExtensionParamMismatch, ppath,
+                                          "parameter must be an object with string 'name' and 'kind'");
+                                paramsOk = false;
+                                continue;
+                            }
+                            const auto kindStr = param.at("kind").get<std::string>();
+                            TypeParamKind pk{};
+                            if (kindStr == "Integer") {
+                                pk = TypeParamKind::Integer;
+                            } else if (kindStr == "Type") {
+                                pk = TypeParamKind::Type;
+                            } else {
+                                coll.emit(DiagnosticCode::C_TypeExtensionParamMismatch, ppath,
+                                          std::format("unknown parameter kind '{}' (expected "
+                                                      "'Integer' or 'Type')", kindStr));
+                                paramsOk = false;
+                                continue;
+                            }
+                            desc.parameters.push_back(
+                                TypeParam{param.at("name").get<std::string>(), pk});
+                        }
+                    }
+                }
+                if (paramsOk) data.typeExtensions.push_back(std::move(desc));
+            }
         }
     }
 

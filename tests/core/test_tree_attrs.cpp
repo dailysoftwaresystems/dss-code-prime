@@ -622,7 +622,7 @@ TEST(NodeAttributeDeath, GetOnAbsentNodeIdAbortsDense) {
 namespace {
 Tree makeEmptyTree() {
     detail::TreeData td;
-    td.id = TreeId{4242};
+    td.arena = substrate::ArenaContainer<detail::Node, NodeId, TreeId>{std::vector<detail::Node>{}, TreeId{4242}};
     return Tree{std::move(td)};
 }
 } // namespace
@@ -701,7 +701,7 @@ TEST(NodeAttributeDeath, SetWithForeignTreeNodeIdAborts) {
     Tree b = buildFlatTreeWithId(3, TreeId{222});
     NodeAttribute<int> attrA{a};
     NodeId idFromB = b.root();
-    ASSERT_NE(idFromB.treeTag, 0u);
+    ASSERT_NE(idFromB.arenaTag, 0u);
     EXPECT_DEATH({ attrA.set(idFromB, 1); },
                  "NodeAttribute bound to TreeId=111 got NodeId from TreeId=222");
 }
@@ -741,13 +741,13 @@ TEST(NodeAttributeDeath, EraseWithForeignTreeNodeIdAborts) {
 }
 
 TEST(NodeAttribute, UntaggedLiteralPassesValidator) {
-    // Hand-fabricated NodeId literals (treeTag == 0) MUST pass the cross-
+    // Hand-fabricated NodeId literals (arenaTag == 0) MUST pass the cross-
     // tree validator — existing tests rely on `NodeId{N}` shorthand. The
     // bounds check is still the catch for genuinely-bad ids.
     Tree a = buildFlatTreeWithId(3, TreeId{111});
     NodeAttribute<int> attrA{a};
     NodeId untagged{1};
-    ASSERT_EQ(untagged.treeTag, 0u);
+    ASSERT_EQ(untagged.arenaTag, 0u);
     attrA.set(untagged, 42);
     EXPECT_EQ(attrA.get(untagged), 42);
     EXPECT_EQ(attrA.get(NodeId(1, 111)), 42);  // same .v, tagged equivalent
@@ -786,7 +786,7 @@ TEST(NodeAttributeDeath, IteratorYieldsTaggedIdsAfterPromotion) {
     NodeAttribute<int> attrB{b};
     auto it = attrA.begin();
     NodeId yielded = (*it).first;
-    EXPECT_EQ(yielded.treeTag, 111u);
+    EXPECT_EQ(yielded.arenaTag, 111u);
     EXPECT_DEATH({ attrB.set(yielded, 1); },
                  "NodeAttribute bound to TreeId=222 got NodeId from TreeId=111");
 }
@@ -812,6 +812,6 @@ TEST(Tree, ChildrenOnSameTreeReturnsTaggedIds) {
     auto kids = a.children(a.root());
     ASSERT_EQ(kids.size(), 3u);
     for (NodeId k : kids) {
-        EXPECT_EQ(k.treeTag, 111u);
+        EXPECT_EQ(k.arenaTag, 111u);
     }
 }

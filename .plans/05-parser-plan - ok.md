@@ -1,6 +1,8 @@
 # Parser Phase — Sub-Plan
 
 > Opens parent plan #7 (`analysis-syntactic`). The piece that consumes the live `TokenStream` from the tokenizer and drives `TreeBuilder::open` / `pushToken` / `Checkpoint` from the compiled shape graph. Closes `v2-gap-catalog - tbd.md` row 1 end-to-end (operator-table data ✅, tree shape ⏳ until this phase lands).
+>
+> **Post-close amendment (CU2, [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) §2.6 C2-L1):** the `Parser` constructor gains an optional trailing `std::unique_ptr<DiagnosticReporter> lexerDiagnostics = nullptr`. When non-null, the parser folds the tokenizer's lexer diagnostics into the builder's reporter (via `TreeBuilder::ingestDiagnostics`) before the walk, so the finished `Tree` owns lexer + parser diagnostics in one stream. Additive (defaulted param); existing callers (LSP, tests) are unchanged. Lets the LSP later stop dropping lexer diagnostics by passing its `lexDiags` through.
 
 ## 0. Status (snapshot)
 

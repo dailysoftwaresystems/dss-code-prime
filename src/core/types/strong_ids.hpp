@@ -28,7 +28,32 @@ namespace dss {
         constexpr auto operator<=>(Name const&) const = default;             \
     }
 
-// NodeId is special — see definition below.
+// Arena-element id: an arena index `v` plus a provenance tag `arenaTag` (the
+// owning arena's tag). `arenaTag == 0` is the "untagged" sentinel — a literal
+// `Name{3}` constructed in tests passes the validators, while a tagged id
+// obtained from one arena and handed to another aborts with both tags in the
+// message (the SH3 cross-arena guard, generalized in src/core/substrate/).
+//
+// Equality and ordering compare `.v` ONLY; `arenaTag` is provenance metadata,
+// not identity, so same-slot ids from different arenas compare equal and the
+// validators (not equality) are the enforcement point. This is the shape
+// `substrate::ArenaContainer`/`ArenaBuilder` require of their id parameter.
+//
+// (The field is named `arenaTag` — neutral across arenas: for NodeId it is the
+// source TreeId; for TypeId it is the owning CompilationUnitId.)
+#define DSS_ARENA_ID(Name)                                                   \
+    struct Name {                                                            \
+        constexpr Name() noexcept = default;                                 \
+        constexpr explicit Name(std::uint32_t value) noexcept : v(value) {}  \
+        constexpr Name(std::uint32_t value, std::uint32_t tag) noexcept      \
+            : v(value), arenaTag(tag) {}                                      \
+        std::uint32_t v       = 0;                                           \
+        std::uint32_t arenaTag = 0;                                           \
+        [[nodiscard]] constexpr bool valid() const noexcept { return v != 0; } \
+        constexpr bool operator==(Name const& o) const noexcept { return v == o.v; } \
+        constexpr auto operator<=>(Name const& o) const noexcept { return v <=> o.v; } \
+    }
+
 DSS_STRONG_ID(RuleId);
 DSS_STRONG_ID(SchemaTokenId);
 DSS_STRONG_ID(BufferId);
@@ -37,35 +62,25 @@ DSS_STRONG_ID(DiagnosticIndex);
 DSS_STRONG_ID(LexerModeId);
 DSS_STRONG_ID(StringStyleId);
 DSS_STRONG_ID(SchemaId);
+DSS_STRONG_ID(CompilationUnitId);
+// CU-scoped symbol identity. Minted per-CompilationUnit (not per-Tree), so a
+// SymbolId is meaningful only against the CU that produced it — the semantic
+// phase keys its symbol table by SymbolId, bound through a NodeId via
+// `UnitAttribute<SymbolId>` (see analysis/compilation_unit/unit_attribute.hpp).
+DSS_STRONG_ID(SymbolId);
+// Type-system ids (SP2). `TypeKindId` identifies an extension type-kind
+// (registry-minted, >= 256; core kinds occupy the TypeKind enum's [0,256)).
+// `TypeNameId` interns nominal type/extension names.
+DSS_STRONG_ID(TypeKindId);
+DSS_STRONG_ID(TypeNameId);
+
+// Arena-element ids (carry `arenaTag`): NodeId is the Tree's node index; TypeId
+// is the CU-scoped type lattice's index (its arena tag is the CompilationUnitId).
+DSS_ARENA_ID(NodeId);
+DSS_ARENA_ID(TypeId);
 
 #undef DSS_STRONG_ID
-
-// NodeId carries its source tree's id (`treeTag`) alongside the arena
-// index (`v`). `treeTag == 0` is the "untagged" sentinel — literal
-// `NodeId{3}` constructed in tests passes validators, while a tagged
-// NodeId obtained from one tree and handed to another aborts with both
-// TreeIds in the message. Closes the §5.10 caveat documented in
-// `docs/tree-model.md`.
-//
-// Equality and ordering compare `.v` only; `treeTag` is provenance
-// metadata, not identity. Same-arena-slot NodeIds from different trees
-// compare equal so that existing tests that mix tagged-from-tree and
-// untagged literal NodeIds remain valid. The validators are the
-// enforcement point, not equality.
-struct NodeId {
-    constexpr NodeId() noexcept = default;
-    constexpr explicit NodeId(std::uint32_t value) noexcept : v(value) {}
-    constexpr NodeId(std::uint32_t value, std::uint32_t tag) noexcept
-        : v(value), treeTag(tag) {}
-
-    std::uint32_t v       = 0;
-    std::uint32_t treeTag = 0;
-
-    [[nodiscard]] constexpr bool valid() const noexcept { return v != 0; }
-
-    constexpr bool operator==(NodeId const& o) const noexcept { return v == o.v; }
-    constexpr auto operator<=>(NodeId const& o) const noexcept { return v <=> o.v; }
-};
+#undef DSS_ARENA_ID
 
 inline constexpr NodeId          InvalidNode{};
 inline constexpr RuleId          InvalidRule{};
@@ -76,6 +91,11 @@ inline constexpr DiagnosticIndex InvalidDiagnostic{};
 inline constexpr LexerModeId     InvalidLexerMode{};
 inline constexpr StringStyleId   InvalidStringStyle{};
 inline constexpr SchemaId        InvalidSchemaId{};
+inline constexpr CompilationUnitId InvalidCompilationUnit{};
+inline constexpr SymbolId        InvalidSymbol{};
+inline constexpr TypeId          InvalidType{};
+inline constexpr TypeKindId      InvalidTypeKind{};
+inline constexpr TypeNameId      InvalidTypeName{};
 
 } // namespace dss
 
@@ -96,5 +116,10 @@ DSS_HASH_ID(DiagnosticIndex);
 DSS_HASH_ID(LexerModeId);
 DSS_HASH_ID(StringStyleId);
 DSS_HASH_ID(SchemaId);
+DSS_HASH_ID(CompilationUnitId);
+DSS_HASH_ID(SymbolId);
+DSS_HASH_ID(TypeId);
+DSS_HASH_ID(TypeKindId);
+DSS_HASH_ID(TypeNameId);
 
 #undef DSS_HASH_ID

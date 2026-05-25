@@ -61,6 +61,13 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_UnknownLexerMode:         return "C_UnknownLexerMode";
         case DiagnosticCode::C_InvalidStringStyle:       return "C_InvalidStringStyle";
         case DiagnosticCode::C_BodyDefaultKindInShape:   return "C_BodyDefaultKindInShape";
+        case DiagnosticCode::C_UnknownTypeExtension:     return "C_UnknownTypeExtension";
+        case DiagnosticCode::C_TypeExtensionParamMismatch: return "C_TypeExtensionParamMismatch";
+        case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
+        case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
+        case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
+        case DiagnosticCode::D_UnresolvedImport:         return "D_UnresolvedImport";
+        case DiagnosticCode::D_UnresolvedReference:      return "D_UnresolvedReference";
     }
     return "Unknown";
 }
@@ -70,16 +77,21 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0x0xxx → P0xxx     (parse)
     //   0x9xxx → P9xxx     (parse, internal-invariant range)
     //   0xCxxx → C0xxx     (config)
+    //   0xDxxx → D0xxx     (driver / compilation-unit)
     // Render as the 4-digit hex grouping the user actually sees.
-    const auto v = static_cast<std::uint16_t>(c);
+    const auto v          = static_cast<std::uint16_t>(c);
+    const std::uint16_t nibble = v & 0xF000u;
     char letter = 'P';
-    if ((v & 0xF000u) == 0xC000u) {
+    if (nibble == 0xC000u) {
         letter = 'C';
+    } else if (nibble == 0xD000u) {
+        letter = 'D';
     }
-    // Strip the high nibble for the numeric portion when it's the phase
-    // marker (P/C). The 9xxx range stays 9xxx so P_BuilderInvariant prints
+    // Strip the high nibble for the numeric portion when it's a phase
+    // marker (C/D). The 9xxx range stays 9xxx so P_BuilderInvariant prints
     // as "P9000".
-    const std::uint16_t lo = ((v & 0xF000u) == 0xC000u) ? (v & 0x0FFFu) : v;
+    const bool hasNibbleMarker = (nibble == 0xC000u || nibble == 0xD000u);
+    const std::uint16_t lo = hasNibbleMarker ? (v & 0x0FFFu) : v;
     return std::format("{}{:04X}", letter, lo);
 }
 

@@ -205,6 +205,14 @@ public:
     // `actual`, `ruleContext`, and `related`.
     void reportDiagnostic(ParseDiagnostic d);
 
+    // Merge externally-produced diagnostics (e.g. the tokenizer's lexer
+    // stream) into this tree's reporter, *verbatim* — each keeps its own
+    // buffer/span/scope, unlike reportDiagnostic which stamps the builder's
+    // current scope stack. Call before finish() so the finished Tree owns
+    // lexer + parser diagnostics in one stream. Reported through the normal
+    // cap/dedup path. See 08-compilation-unit-plan §2.6 C2-L1.
+    void ingestDiagnostics(std::span<ParseDiagnostic const> diags);
+
     // ── scope stack (validated against schema in pushToken) ──
     void pushScope(ScopeKind kind);
     void popScope();    // emits P_BuilderInvariant on underflow
@@ -319,7 +327,10 @@ private:
     std::unique_ptr<DiagnosticReporter>    reporter_;
     TreeId                                 treeId_;
 
-    std::vector<detail::Node>              nodes_;       // arena under construction
+    // Node arena under construction — the generalized substrate builder
+    // (SP1). emit_ appends through it; checkpoint/rollback use size()/
+    // truncateTo(); finish() && hands off a frozen ArenaContainer.
+    substrate::ArenaBuilder<detail::Node, NodeId, TreeId> arena_;
     std::vector<NodeId>                    childIndex_;  // flat children table under construction
 
     // Staging vector for children of open frames. Each open Frame owns the
