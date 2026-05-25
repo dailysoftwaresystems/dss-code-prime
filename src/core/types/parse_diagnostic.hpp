@@ -87,6 +87,15 @@ enum class DiagnosticCode : std::uint16_t {
     // grammar (cursor-skip), so a shape reference would silently never
     // match — surface it at load time instead.
     C_BodyDefaultKindInShape      = 0xC029,
+    // Type-extension declarations (SP2; `typeExtensions[]`, schema v3).
+    // C_UnknownTypeExtension: a malformed extension entry at load (not an
+    //   object / not a valid declaration); ALSO the code a consumer (phase #8
+    //   / transpile-map validation) emits when a type references an extension
+    //   name that no registry resolved.
+    // C_TypeExtensionParamMismatch: an extension parameter has an unknown kind
+    //   (not "Integer"/"Type") or a malformed parameter spec.
+    C_UnknownTypeExtension        = 0xC02A,
+    C_TypeExtensionParamMismatch  = 0xC02B,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

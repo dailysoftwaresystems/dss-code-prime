@@ -13,6 +13,9 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_FileNotFound),        "D_FileNotFound");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_EmptyInput),          "D_EmptyInput");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DuplicateFile),       "D_DuplicateFile");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_UnknownTypeExtension), "C_UnknownTypeExtension");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_TypeExtensionParamMismatch),
+              "C_TypeExtensionParamMismatch");
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
@@ -27,6 +30,8 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
     // D_* prefix; high nibble stripped like C_*.
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_FileNotFound),     "D0001");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_DuplicateFile),    "D0003");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_UnknownTypeExtension),       "C002A");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_TypeExtensionParamMismatch), "C002B");
 }
 
 TEST(DiagnosticSeverity, NameMapping) {

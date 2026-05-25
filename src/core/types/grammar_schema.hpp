@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/compiled_shape.hpp"
 #include "core/types/lexer_mode.hpp"
+#include "core/types/type_lattice/core_type.hpp"  // TypeExtensionDescriptor
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/rule_id.hpp"
@@ -214,6 +215,11 @@ struct DSS_EXPORT GrammarSchemaData {
     // declared token kind, and Eof/Error are rejected (Eof is always
     // an implicit sync; Error would short-circuit recovery).
     std::vector<SchemaTokenId>                        syncTokens;
+
+    // Per-language type-extension declarations (SP2; `typeExtensions[]`,
+    // additive in schema v3). Empty for v1/v2 configs. Registered into a CU's
+    // TypeRegistry at CU build time via registerSchemaTypeExtensions.
+    std::vector<TypeExtensionDescriptor>              typeExtensions;
 };
 
 } // namespace detail
@@ -404,6 +410,10 @@ public:
     // Parser's panic-mode recovery consumes until peek is in this set
     // OR in `followSetOf(currentRule)`.
     [[nodiscard]] std::span<SchemaTokenId const> syncTokens() const noexcept;
+
+    // Per-language type-extension declarations (SP2; schema v3 `typeExtensions[]`).
+    // Empty for v1/v2 configs. Consumed by registerSchemaTypeExtensions.
+    [[nodiscard]] std::span<TypeExtensionDescriptor const> typeExtensions() const noexcept;
 
     // `expr`-shape introspection. `isExprRule` is true when the rule's
     // body was declared as `{ "expr": { "atom": ..., "minPrecedence": ... } }`.

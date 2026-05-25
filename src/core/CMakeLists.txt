@@ -16,6 +16,7 @@ add_library(core OBJECT
     types/tree.cpp
     types/tree_builder.cpp
     types/tree_cursor.cpp
+    types/type_lattice/type_lattice.cpp
 )
 
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
