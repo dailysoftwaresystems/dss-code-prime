@@ -673,17 +673,24 @@ TEST(TreeBuilder, PerMeaningValidScopesFiltersResolution) {
 // P_UnknownToken; the resulting leaf carries the IntLiteral kind.
 TEST(TreeBuilder, SynthesizesMeaningForBuiltinLiteralKind) {
     constexpr std::string_view cfg = R"JSON({
-      "dssSchemaVersion": 1,
+      "dssSchemaVersion": 4,
       "language": { "name": "LitSyn", "version": "0.1.0" },
       "tokens": {
         ";": [{ "kind": "EndCommand" }]
+      },
+      "numberStyle": {
+        "decimal":  true,
+        "emitKind": { "integer": "IntLiteral" }
       },
       "shapes": {
         "root": { "sequence": [{ "repeat": "stmt" }] },
         "stmt": { "sequence": ["IntLiteral", "EndCommand"] }
       }
     })JSON";
-    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto loadedSchema = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loadedSchema.has_value())
+        << (loadedSchema.error().empty() ? "<no diagnostics>" : loadedSchema.error()[0].message);
+    auto schema = *loadedSchema;
     auto src    = SourceBuffer::fromString("5;", "<litsyn>");
     const auto intLitKind = schema->schemaTokens().find("IntLiteral");
     ASSERT_TRUE(intLitKind.valid());
@@ -776,17 +783,24 @@ TEST(TreeBuilder, SynthesisExcludesErrorKindAndEmitsUnknownToken) {
 // expected slot. No "off-grammar skip" can shadow real grammar tokens.
 TEST(TreeBuilder, BodyDefaultKindsEmptyWhenSchemaHasNoBodyModes) {
     constexpr std::string_view cfg = R"JSON({
-      "dssSchemaVersion": 1,
+      "dssSchemaVersion": 4,
       "language": { "name": "NoBody", "version": "0.1.0" },
       "tokens": {
         ";": [{ "kind": "EndCommand" }]
+      },
+      "numberStyle": {
+        "decimal":  true,
+        "emitKind": { "integer": "IntLiteral" }
       },
       "shapes": {
         "root": { "sequence": [{ "repeat": "stmt" }] },
         "stmt": { "sequence": ["IntLiteral", "EndCommand"] }
       }
     })JSON";
-    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto loadedSchema = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loadedSchema.has_value())
+        << (loadedSchema.error().empty() ? "<no diagnostics>" : loadedSchema.error()[0].message);
+    auto schema = *loadedSchema;
     auto src    = SourceBuffer::fromString("5", "<nobody>");
     const auto intLitKind = schema->schemaTokens().find("IntLiteral");
 
@@ -871,11 +885,15 @@ TEST(TreeBuilder, BodyDefaultKindsUnionsAcrossLexerModes) {
 // land as a clean leaf with no diagnostic.
 TEST(TreeBuilder, SynthesisHonorsIsTokenValidInScope) {
     constexpr std::string_view cfg = R"JSON({
-      "dssSchemaVersion": 1,
+      "dssSchemaVersion": 4,
       "language": { "name": "ScopeSynth", "version": "0.1.0" },
       "tokens": {
         "{": [{ "kind": "BlockOpen",  "opensScope": "Block" }],
         "}": [{ "kind": "BlockClose", "closesScope": true }]
+      },
+      "numberStyle": {
+        "decimal":  true,
+        "emitKind": { "integer": "IntLiteral" }
       },
       "scopes": {
         "validity": [ { "scope": "Block", "forbid": ["IntLiteral"] } ]
@@ -885,7 +903,10 @@ TEST(TreeBuilder, SynthesisHonorsIsTokenValidInScope) {
         "stmt":  { "sequence": ["BlockOpen", "IntLiteral", "BlockClose"] }
       }
     })JSON";
-    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto loadedSchema = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loadedSchema.has_value())
+        << (loadedSchema.error().empty() ? "<no diagnostics>" : loadedSchema.error()[0].message);
+    auto schema = *loadedSchema;
     auto src    = SourceBuffer::fromString("{5}", "<scope-synth>");
     const auto intLitKind = schema->schemaTokens().find("IntLiteral");
 
@@ -920,11 +941,15 @@ TEST(TreeBuilder, SynthesisHonorsIsTokenValidInScope) {
 // from "synthesis-broken-globally."
 TEST(TreeBuilder, SynthesisAcceptsBuiltinLiteralOutsideForbidScope) {
     constexpr std::string_view cfg = R"JSON({
-      "dssSchemaVersion": 1,
+      "dssSchemaVersion": 4,
       "language": { "name": "ScopeSynthOk", "version": "0.1.0" },
       "tokens": {
         "{": [{ "kind": "BlockOpen",  "opensScope": "Block" }],
         "}": [{ "kind": "BlockClose", "closesScope": true }]
+      },
+      "numberStyle": {
+        "decimal":  true,
+        "emitKind": { "integer": "IntLiteral" }
       },
       "scopes": {
         "validity": [ { "scope": "Block", "forbid": ["IntLiteral"] } ]
@@ -933,7 +958,10 @@ TEST(TreeBuilder, SynthesisAcceptsBuiltinLiteralOutsideForbidScope) {
         "root": { "sequence": ["IntLiteral"] }
       }
     })JSON";
-    auto schema = *GrammarSchema::loadFromText(cfg);
+    auto loadedSchema = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(loadedSchema.has_value())
+        << (loadedSchema.error().empty() ? "<no diagnostics>" : loadedSchema.error()[0].message);
+    auto schema = *loadedSchema;
     auto src    = SourceBuffer::fromString("5", "<scope-synth-ok>");
     const auto intLitKind = schema->schemaTokens().find("IntLiteral");
 

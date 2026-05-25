@@ -101,6 +101,31 @@ enum class DiagnosticCode : std::uint16_t {
     // has the wrong JSON type. (Missing-but-required fields use C_MissingField;
     // unknown rule/token names use C_UnknownShape/C_UnknownToken.)
     C_InvalidImports              = 0xC02C,
+    // An `expr` shape was declared without a complete `wrapperRules` block
+    // (08.55 cleanup; schema v4). Every `expr`-shape rule must name the three
+    // Pratt-walker wrapper rules (binary / unary / postfix); the engine
+    // auto-interns and threads those names — it never hardcodes them.
+    C_MissingWrapperRules         = 0xC02D,
+    // The language declared `IntLiteral`/`FloatLiteral` as multi-char tokens
+    // but no `numberStyle` block (08.55 cleanup; schema v4). The tokenizer's
+    // scanNumber() drives entirely from the schema's NumberStyle; without it
+    // the scanner has no rules to apply. Use ONLY for the "block is required
+    // but absent" case at the end of the numberStyle parse — type/shape/
+    // range errors inside an existing block use C_InvalidNumberStyle.
+    C_MissingNumberStyle          = 0xC02E,
+    // The `numberStyle` block is present but malformed: wrong JSON type,
+    // out-of-range radix, non-single-char fractionPoint/digitSeparator,
+    // unknown emitKind reference, etc. Mirrors the `imports` block's
+    // C_InvalidImports discipline (08.55 cleanup; schema v4). Missing
+    // required sub-fields use C_MissingField; unknown sub-keys use
+    // C_UnknownShape.
+    C_InvalidNumberStyle          = 0xC02F,
+    // Two or more `wrapperRules` roles (binary/unary/postfix) resolved to the
+    // same RuleId — a duplicate-name config error. Distinct from
+    // `C_MissingWrapperRules` (missing field) so the operator sees the actual
+    // class of failure: the three Pratt-walker frames MUST be distinct or the
+    // walker's tree-building corrupts silently.
+    C_DuplicateWrapperRules       = 0xC030,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

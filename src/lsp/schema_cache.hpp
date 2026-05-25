@@ -34,6 +34,18 @@ enum class SchemaResolveErrorKind : std::uint8_t {
     NotFound,           // schema dir / shipped name doesn't exist
     LoadFailed,         // file exists but loader rejected it
     NoExtensionMatch,   // file extension matches no known language
+    // Shipped-mode only: cwd-walk failed to locate the
+    // `src/source-config/languages/` directory within 8 parent levels.
+    // Without it, extension-based resolution has no candidate list. Loud
+    // failure prevents a silent "extension matches nothing" misdiagnosis
+    // when the real problem is "shipped configs not discoverable from
+    // this cwd" (e.g. binary invoked from a deploy location).
+    ShippedDirNotFound,
+    // Shipped-mode only: the shipped-config directory was located but
+    // contains no `*.lang.json` files. Distinct from `ShippedDirNotFound`
+    // so the operator knows whether to set --schema-dir or to populate
+    // the located directory.
+    ShippedDirEmpty,
 };
 
 struct DSS_EXPORT SchemaResolveError {
@@ -45,10 +57,35 @@ struct DSS_EXPORT SchemaResolveError {
 using SchemaResult = std::expected<std::shared_ptr<dss::GrammarSchema const>,
                                     SchemaResolveError>;
 
+// Result of the shipped-config-directory discovery walk: every name
+// found (sorted, without the `.lang.json` suffix) PLUS the directory
+// path that was located (or `nullopt` if the cwd-walk found nothing
+// within its 8-level horizon). The two together let `SchemaCache`
+// distinguish "directory not findable from this cwd" (config error)
+// from "directory found but empty" (deploy error) — both surface as
+// loud errors at the resolve site, not a silent empty list.
+struct DSS_EXPORT ShippedDiscoveryResult {
+    std::vector<std::string>             names;
+    std::optional<std::filesystem::path> directory;
+};
+
 class DSS_EXPORT SchemaCache {
 public:
-    // `schemaDir` empty ⇒ shipped-only mode.
-    explicit SchemaCache(std::optional<std::filesystem::path> schemaDir = std::nullopt);
+    // `schemaDir` empty ⇒ shipped-only mode (the cache auto-discovers
+    // `src/source-config/languages/` via cwd-walk). `discoveryStartPath`
+    // overrides the walk's starting point and exists for tests that need
+    // to pin "no shipped dir found" / "dir found but empty" behaviour
+    // without mutating process cwd; production callers leave it default.
+    explicit SchemaCache(std::optional<std::filesystem::path> schemaDir = std::nullopt,
+                         std::optional<std::filesystem::path> discoveryStartPath = std::nullopt);
+
+    // Walk up from `startPath` (default: `current_path()`) up to 8
+    // parent levels looking for `src/source-config/languages/`. If
+    // found, enumerate `*.lang.json` and return the sorted base names
+    // alongside the located directory. Public + static so tests can
+    // pin behavior without mutating process cwd.
+    [[nodiscard]] static ShippedDiscoveryResult discoverShippedLanguages(
+        std::optional<std::filesystem::path> startPath = std::nullopt);
 
     SchemaCache(SchemaCache const&)            = delete;
     SchemaCache& operator=(SchemaCache const&) = delete;
@@ -84,6 +121,11 @@ private:
     // Empty in --schema-dir mode (we don't enumerate the dir
     // upfront; we load lazily on demand).
     std::vector<std::string>                                            shippedCandidates_;
+    // The shipped-config directory the discovery walk located. Set
+    // alongside `shippedCandidates_` at construction in shipped mode;
+    // `nullopt` when the cwd-walk failed (→ ShippedDirNotFound on
+    // extension lookup) or when in --schema-dir mode (unused).
+    std::optional<std::filesystem::path>                                shippedDir_;
 };
 
 } // namespace dss::lsp

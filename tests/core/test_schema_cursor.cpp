@@ -411,12 +411,21 @@ TEST(SchemaCursor, FirstSetOfInvalidRuleIsEmpty) {
 
 TEST(SchemaCursor, ExprShapeBehavesAsAtomReferenceForCursor) {
     constexpr std::string_view kCfg = R"JSON({
-      "dssSchemaVersion": 2,
+      "dssSchemaVersion": 4,
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { "+": [{ "kind": "PlusOp" }] },
       "shapes": {
         "root":       { "sequence": [ "expression" ] },
-        "expression": { "expr":     { "atom": "primary" } },
+        "expression": {
+          "expr": {
+            "atom": "primary",
+            "wrapperRules": {
+              "binary":  "binaryExpr",
+              "unary":   "unaryExpr",
+              "postfix": "postfixExpr"
+            }
+          }
+        },
         "primary":    { "sequence": [ "Identifier" ] }
       }
     })JSON";

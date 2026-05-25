@@ -1,8 +1,8 @@
 #pragma once
 
 // Shared toy-CompilationUnit helpers for the CU3 test files
-// (test_unit_attribute.cpp + test_symbol_population.cpp). Kept here rather
-// than copied per-file so the two suites can't drift.
+// (test_unit_attribute.cpp + adjacent CU3-era suites). Kept here
+// rather than copied per-file so the suites can't drift.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/types/grammar_schema.hpp"

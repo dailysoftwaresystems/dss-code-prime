@@ -308,7 +308,11 @@ void LspServer::enqueueParse_(std::string uri) {
         auto src = dss::SourceBuffer::fromString(snap.text, uri);
         dss::Tokenizer tk{src, snap.schema};
         auto [stream, lexDiags] = std::move(tk).tokenize();
-        dss::Parser p{src, snap.schema, std::move(stream)};
+        // Thread tokenizer diagnostics (P_IllegalChar, P_MalformedNumber, …)
+        // through to the Parser so they reach the published diagnostics
+        // stream alongside parser-side diagnostics. Mirrors the CU
+        // pipeline (compilation_unit.cpp).
+        dss::Parser p{src, snap.schema, std::move(stream), {}, std::move(lexDiags)};
         auto result = std::move(p).parse();
 
         // Copy out: the span aliases tree storage that dies at scope end.

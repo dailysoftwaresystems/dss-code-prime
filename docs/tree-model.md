@@ -119,81 +119,56 @@ walkPreOrder(t, /*start=*/ someInternalId, [&](TreeCursor const&) { ... });
 
 ---
 
-## 4. Cookbook: add a typed view
+## 4. Cookbook: read a rule's children
 
-A *view* is a tiny POD-like wrapper around `(Tree const*, NodeId)` that gives named accessors for a specific rule's role-positions. Adding one is mostly boilerplate.
+The 08.55 cleanup retired the typed-view + canonical-rule-name layer — its role-position helpers were a footgun (a grammar edit silently shifted indices) and a duplication of what direct schema lookups already express. Reading a node's children is now a two-step idiom:
 
-Suppose your grammar has a `whileStmt: { sequence: ["WhileKeyword", "ParenOpen", "expression", "ParenClose", "block"] }` and you want a view that exposes `condition()` and `body()`.
+1. **Identify the rule by name** — once per consumer, via the schema's rule interner.
+2. **Walk visible children positionally** — when you need role-based access, use the `tests/core/tree_helpers.hpp::nthVisibleChild` helper (test-only) or open-code the filter at the call site.
 
-**Step 1.** Pick a rule-name constant. If `"whileStmt"` is going to be used in more than one place, add it to `well_known_names.hpp`:
+Suppose your grammar has `whileStmt: { sequence: ["WhileKeyword", "ParenOpen", "expression", "ParenClose", "block"] }` and you want to read its condition and body:
 
 ```cpp
-// src/core/types/well_known_names.hpp
-namespace dss::rules {
-inline constexpr std::string_view kWhileStmt = "whileStmt";
+#include "core/types/grammar_schema.hpp"
+#include "core/types/tree.hpp"
+
+// Resolve the rule id once and cache it (per CU, per pass, etc.).
+const auto whileStmtRule = schema.rules().find("whileStmt");
+
+// Type-check a node:
+if (tree.rule(someInternalNode) == whileStmtRule) {
+    // Walk visible children positionally. Visible = non-EmptySpace
+    // (whitespace, comments, etc. are children of the node but
+    // skipped by every consumer that cares about AST role).
+    std::size_t seen = 0;
+    NodeId condition = InvalidNode;
+    NodeId body      = InvalidNode;
+    for (NodeId c : tree.children(someInternalNode)) {
+        if (isEmptySpace(tree.flags(c))) continue;
+        if (seen == 2) condition = c;
+        if (seen == 4) body      = c;
+        ++seen;
+    }
 }
 ```
 
-**Step 2.** Drop this header in `src/core/types/while_stmt_view.hpp`:
+Tests can short-circuit the loop with the helper in `tests/core/tree_helpers.hpp`:
 
 ```cpp
-#pragma once
+#include "tree_helpers.hpp"
+using dss::tests::nthVisibleChild;
 
-#include "core/types/strong_ids.hpp"
-#include "core/types/tree.hpp"
-#include "core/types/tree_views.hpp"      // for detail::views::nthVisibleChild + ruleIdFor
-#include "core/types/well_known_names.hpp"
-
-#include <optional>
-
-namespace dss {
-
-class WhileStmtView {
-public:
-    // Unchecked constructor — caller promises this node IS a whileStmt.
-    WhileStmtView(Tree const& t, NodeId id) noexcept : tree_(&t), id_(id) {}
-
-    // Safe factory — returns nullopt if `id` is the wrong shape.
-    [[nodiscard]] static std::optional<WhileStmtView> from(Tree const& t, NodeId id) {
-        if (!id.valid() || t.kind(id) != NodeKind::Internal) return std::nullopt;
-        const auto want = detail::views::ruleIdFor(t, rules::kWhileStmt);
-        if (!want.valid() || t.rule(id) != want) return std::nullopt;
-        return WhileStmtView{t, id};
-    }
-
-    [[nodiscard]] NodeId      node()      const noexcept { return id_; }
-    [[nodiscard]] SourceSpan  span()      const noexcept { return tree_->span(id_); }
-
-    // Visible (AST-mode) children, indexed by structural position.
-    // Layout: [WhileKeyword, ParenOpen, expression, ParenClose, block]
-    //          0             1           2           3            4
-    [[nodiscard]] NodeId condition() const noexcept {
-        return detail::views::nthVisibleChild(*tree_, id_, /*index=*/ 2);
-    }
-    [[nodiscard]] NodeId body() const noexcept {
-        return detail::views::nthVisibleChild(*tree_, id_, /*index=*/ 4);
-    }
-
-private:
-    Tree const* tree_;
-    NodeId      id_;
-};
-
-} // namespace dss
+NodeId condition = nthVisibleChild(tree, someInternalNode, /*index=*/ 2);
+NodeId body      = nthVisibleChild(tree, someInternalNode, /*index=*/ 4);
 ```
 
-**Step 3.** Add a test in `tests/core/test_while_stmt_view.cpp` that builds a `whileStmt` with `RawTreeBuilder` and verifies `from(...)` + `condition()` + `body()`. Use `tests/core/test_tree_views.cpp` as a template; register the test with `dss_add_test` in `tests/core/CMakeLists.txt`.
+**When to lift this into a typed wrapper:**
 
-**That's the whole add-a-view path.** ~30 lines of header + one test. No CMake changes for the header itself — `tree_views.hpp`'s pattern is header-only and the public include path picks the new file up automatically.
+- The same role-positions are read from 3+ call sites and a grammar edit risks silent index drift — wrap them in a small accessor function that asserts `tree.rule(id) == whileStmtRule` and then returns the visible child by index. Keep it in the consumer's translation unit; don't expose a new public header.
 
-**When to use a view:**
+**When NOT to wrap:**
 
-- You're reading a specific rule and care about role-positions (`condition`, `body`).
-- You want compile-time safety vs typos (`while_stmt.condition()` won't compile if you rename it).
-
-**When NOT to use a view:**
-
-- One-shot lookups. `t.children(id)` + a tiny inline filter is fine.
+- One-shot lookups. The for-loop above is fine.
 - Cross-rule traversals. Use `walkPreOrder` / `walkPostOrder`.
 
 ---
@@ -288,8 +263,8 @@ Recovery is sound: even a broken parse produces a walkable tree with the `HasErr
 | Move through it | `core/types/tree_cursor.hpp` |
 | Walk every node | `core/types/tree_visitor.hpp` |
 | Attach data to nodes | `core/types/tree_attrs.hpp` |
-| Use a typed view | `core/types/tree_views.hpp` |
-| Define / look up a rule name | `core/types/well_known_names.hpp` |
+| Look up a rule by name | `core/types/grammar_schema.hpp` — `schema.rules().find("ruleName")` |
+| Read role-positions of a known rule (tests) | `tests/core/tree_helpers.hpp::nthVisibleChild` |
 | Construct a tree (you're writing a parser) | `core/types/tree_builder.hpp` |
 | Inspect diagnostics from a parse | `core/types/parse_diagnostic.hpp`, `core/types/diagnostic_reporter.hpp` |
 | Author or load a grammar | `core/types/grammar_schema.hpp` (see [language-config-spec.md](./language-config-spec.md)) |

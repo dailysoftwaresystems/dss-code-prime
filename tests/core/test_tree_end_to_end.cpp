@@ -10,14 +10,13 @@
 #include "core/types/tree_builder.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_node.hpp"
-#include "core/types/tree_views.hpp"
 #include "core/types/tree_visitor.hpp"
-#include "core/types/well_known_names.hpp"
 #include "e2e_harness.hpp"
 #include "test_pretty_print.hpp"
 #include "tokenizer/tokenizer.hpp"
 #include "tokenizer/token_stream.hpp"
 #include "toy_harness.hpp"
+#include "tree_helpers.hpp"
 
 #include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
@@ -205,7 +204,10 @@ TEST(TreeEndToEnd, HappyPath_MultipleStatements_PrintsExpectedTree) {
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
-TEST(TreeEndToEnd, HappyPath_ViewsResolveOnRealParse) {
+TEST(TreeEndToEnd, HappyPath_DirectRuleLookupResolvesOnRealParse) {
+    // 08.55 retired the typed-view layer entirely. The same shape can
+    // be expressed via direct rule lookups against the schema — the
+    // engine has zero hardcoded rule names.
     auto h = tokenizeShipped("var x = a; y; var w = b;");
     ASSERT_NE(h.schema, nullptr);
 
@@ -221,26 +223,34 @@ TEST(TreeEndToEnd, HappyPath_ViewsResolveOnRealParse) {
     Tree t = std::move(b).finish();
     ASSERT_FALSE(t.diagnostics().hasErrors());
 
+    const auto kStatement = h.schema->rules().find("statement");
+    const auto kVarDecl   = h.schema->rules().find("varDecl");
+    const auto kExprStmt  = h.schema->rules().find("exprStmt");
+
     std::vector<std::string> seen;
     walkPreOrder(t.astCursor(), [&](TreeCursor const& c) {
         const auto id = c.current();
         if (t.kind(id) != NodeKind::Internal) return WalkAction::Continue;
-        if (t.rules().name(t.rule(id)) != "statement") return WalkAction::Continue;
+        if (t.rule(id).v != kStatement.v) return WalkAction::Continue;
 
         // Statement's first VISIBLE child is the actual decl / expr-stmt
-        // node. nthVisibleChild is robust to any future leading-EmptySpace
-        // refactor; raw children().front() would silently break.
-        const auto inner = detail::views::nthVisibleChild(t, id, 0);
+        // node. nthVisibleChild (test helper) is robust to any future
+        // leading-EmptySpace refactor; raw children().front() would
+        // silently break.
+        const auto inner = dss::tests::nthVisibleChild(t, id, 0);
         if (!inner.valid()) {
             ADD_FAILURE() << "statement has no visible child";
             return WalkAction::Stop;
         }
 
-        if (auto vd = VarDeclView::from(t, inner)) {
-            seen.push_back("varDecl:" + std::string{vd->name().name()});
-        } else if (auto es = ExprStmtView::from(t, inner)) {
-            const auto expr = es->expression();
-            const auto first = detail::views::nthVisibleChild(t, expr, 0);
+        if (t.kind(inner) == NodeKind::Internal && t.rule(inner).v == kVarDecl.v) {
+            // toy varDecl shape: [VarKeyword, Identifier, AssignmentOperator,
+            // expression, EndCommand]. Visible child 1 is the name token.
+            const auto nameNode = dss::tests::nthVisibleChild(t, inner, 1);
+            seen.push_back("varDecl:" + std::string{t.text(nameNode)});
+        } else if (t.kind(inner) == NodeKind::Internal && t.rule(inner).v == kExprStmt.v) {
+            const auto expr  = dss::tests::nthVisibleChild(t, inner, 0);
+            const auto first = dss::tests::nthVisibleChild(t, expr, 0);
             if (!first.valid()) {
                 ADD_FAILURE() << "exprStmt's expression has no visible child";
                 return WalkAction::Stop;
@@ -360,7 +370,7 @@ TEST(TreeEndToEnd, BrokenPath_PushErrorRecovered) {
         // but via the schema-resolves-empty path, not via pushError).
         for (int i = 0; i < 6; ++i) b.pushToken(h.stream.advance());
         b.pushError(SourceSpan::of(8, 9), std::nullopt,
-                    h.schema->schemaTokens().find(tokens::kIdentifier),
+                    h.schema->schemaTokens().find("Identifier"),
                     "expected expression");
         // Skip past the `?` token the tokenizer produced.
         (void)h.stream.advance();

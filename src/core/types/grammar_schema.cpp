@@ -382,6 +382,16 @@ std::int32_t GrammarSchema::exprMinPrecedence(RuleId rule) const noexcept {
     return it->second.exprMinPrecedence;
 }
 
+ExprWrapperRules GrammarSchema::exprWrapperRules(RuleId rule) const noexcept {
+    auto it = d_.exprWrapperRules.find(rule.v);
+    if (it == d_.exprWrapperRules.end()) return ExprWrapperRules{};
+    return it->second;
+}
+
+NumberStyle const* GrammarSchema::numberStyle() const noexcept {
+    return d_.numberStyle.has_value() ? &(*d_.numberStyle) : nullptr;
+}
+
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
                                        std::span<ScopeKind const> stack) const noexcept {
     // Walk the scope stack top-down so the innermost scope's rules win —

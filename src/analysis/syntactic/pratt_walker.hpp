@@ -44,9 +44,10 @@ public:
 
 // Schema-driven Pratt walker. Reads the operator table from the
 // parser's schema and produces precedence-correct trees wrapped in
-// the well-known `binaryExpr` / `unaryExpr` / `postfixExpr` rules
-// (auto-interned by the loader when the schema declares any `expr`
-// shape).
+// the three rules declared by the schema's `expr.wrapperRules.
+// {binary,unary,postfix}` block — names are config-sourced, the
+// engine no longer hardcodes any wrapper rule name (loader auto-
+// interns the names when the schema declares any `expr` shape).
 //
 // Defined in `parser.cpp` so it can access `Parser::Impl` internals
 // via friendship — the walker drives the parser's token stream,

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <format>
+#include <string>
 #include <string_view>
 
 using namespace dss;
@@ -366,12 +368,29 @@ TEST(GrammarSchema, WrapperRulesAbsentInNonExprSchema) {
 // redeclaration would let the schema cursor see a body for them,
 // breaking the "transparent wrapper" invariant.
 TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
+    // 08.55: wrapper-rule names are declared per-language via
+    // `expr.wrapperRules`. The loader rejects a top-level `shapes`
+    // entry whose name collides with any wrapper rule name declared
+    // by this schema (so the schema cursor can't enter through a
+    // user-defined body for what is supposed to be a walker-
+    // synthesized frame).
     constexpr std::string_view kReservedShape = R"JSON({
-      "dssSchemaVersion": 2,
+      "dssSchemaVersion": 4,
       "language": { "name": "Bad", "version": "0.1.0" },
       "tokens": { "x": [{ "kind": "X" }] },
       "shapes": {
-        "root":       { "sequence": ["X"] },
+        "root":       { "sequence": ["expression"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "binaryExpr",
+              "unary":   "unaryExpr",
+              "postfix": "postfixExpr"
+            }
+          }
+        },
+        "operand":    { "sequence": ["X"] },
         "binaryExpr": { "sequence": ["X"] }
       }
     })JSON";
@@ -380,7 +399,7 @@ TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
     bool sawReservedDiag = false;
     for (auto const& d : result.error()) {
         if (d.message.find("binaryExpr") != std::string::npos
-            && d.message.find("reserved") != std::string::npos) {
+            && d.message.find("wrapper") != std::string::npos) {
             sawReservedDiag = true;
             break;
         }
@@ -652,7 +671,7 @@ TEST(GrammarSchema, RejectsBodyDefaultKindInScopeForbid) {
 // `P_NoAlternativeMatched` before the walker ever ran.
 TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
     constexpr std::string_view kPrefixSchema = R"JSON({
-      "dssSchemaVersion": 2,
+      "dssSchemaVersion": 4,
       "language": { "name": "PrefixFirst", "version": "0.1.0" },
       "tokens": {
         "-":  [{ "kind": "MinusOp" }]
@@ -664,7 +683,16 @@ TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
       },
       "shapes": {
         "root":       { "sequence": ["expression"] },
-        "expression": { "expr": { "atom": "operand" } },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "binaryExpr",
+              "unary":   "unaryExpr",
+              "postfix": "postfixExpr"
+            }
+          }
+        },
         "operand":    { "alt": ["Identifier"] }
       }
     })JSON";
@@ -1072,7 +1100,7 @@ TEST(GrammarSchema, ImportsNotAnObjectReportsInvalid) {
 // loader. If this fails, the doc's "Loads cleanly because:" claims are wrong.
 TEST(GrammarSchema, DocsCookbookCalcExampleLoadsCleanly) {
     constexpr std::string_view kCalcCookbook = R"JSON({
-  "dssSchemaVersion": 1,
+  "dssSchemaVersion": 4,
 
   "language": {
     "name":           "Calc",
@@ -1098,6 +1126,11 @@ TEST(GrammarSchema, DocsCookbookCalcExampleLoadsCleanly) {
     { "word": "let", "kind": "LetKeyword" }
   ],
 
+  "numberStyle": {
+    "decimal":  true,
+    "emitKind": { "integer": "IntLiteral" }
+  },
+
   "shapes": {
     "root":     { "sequence": [{ "repeat": "stmt" }] },
     "stmt":     { "alt":      ["letDecl", "exprStmt"] },
@@ -1122,4 +1155,354 @@ TEST(GrammarSchema, LoadShippedRejectsPathLikeNames) {
     EXPECT_FALSE(b.has_value());
     EXPECT_FALSE(c.has_value());
     EXPECT_FALSE(d.has_value());
+}
+
+// ── 08.55 cleanup: wrapperRules + numberStyle strict pins ──────────────
+
+// Missing `wrapperRules` block fails to load with C_MissingWrapperRules.
+TEST(GrammarSchema, ExprShapeWithoutWrapperRulesIsRejected) {
+    constexpr std::string_view kNoWrap = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NoWrap", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root":       { "sequence": ["expression", "Semi"] },
+        "expression": { "expr": { "atom": "operand" } },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kNoWrap);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingWrapperRules));
+}
+
+// Partial `wrapperRules` (missing one of binary/unary/postfix) is rejected.
+TEST(GrammarSchema, ExprShapeWithPartialWrapperRulesIsRejected) {
+    constexpr std::string_view kPartial = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "PartialWrap", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root":       { "sequence": ["expression", "Semi"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": { "binary": "bExpr", "unary": "uExpr" }
+          }
+        },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kPartial);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingWrapperRules));
+}
+
+// Happy-path: distinct (non-c-subset) wrapper-rule names load cleanly,
+// the parser-side schema lookup returns the right RuleIds. Genericity
+// pin: the engine has NO hardcoded `binaryExpr`/`unaryExpr`/`postfixExpr`
+// names — any names work.
+TEST(GrammarSchema, ExprShapeWithCustomWrapperRuleNamesIsAccepted) {
+    constexpr std::string_view kCustom = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "CustomWrap", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root":       { "sequence": ["expression", "Semi"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "bExpr",
+              "unary":   "uExpr",
+              "postfix": "pExpr"
+            }
+          }
+        },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCustom);
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto& schema = **result;
+    const auto exprRule = schema.rules().find("expression");
+    ASSERT_TRUE(exprRule.valid());
+    const auto pack = schema.exprWrapperRules(exprRule);
+    EXPECT_TRUE(pack.valid());
+    EXPECT_EQ(schema.rules().name(pack.binary),  "bExpr");
+    EXPECT_EQ(schema.rules().name(pack.unary),   "uExpr");
+    EXPECT_EQ(schema.rules().name(pack.postfix), "pExpr");
+}
+
+// numberStyle absent + IntLiteral referenced in a shape is rejected.
+TEST(GrammarSchema, IntLiteralInShapeWithoutNumberStyleIsRejected) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NoNum", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingNumberStyle));
+}
+
+// Happy-path: numberStyle parsed cleanly, all fields round-trip.
+TEST(GrammarSchema, NumberStyleHappyPathRoundTrips) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "Nums", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "numberStyle": {
+        "decimal":         true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" }
+        ],
+        "exponent":        { "letters": ["e", "E"], "signOptional": true },
+        "fractionPoint":   ".",
+        "digitSeparator":  "_",
+        "integerSuffixes": ["u", "L"],
+        "floatSuffixes":   ["f"],
+        "emitKind":        { "integer": "IntLiteral", "float": "FloatLiteral" }
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto const* ns = (*result)->numberStyle();
+    ASSERT_NE(ns, nullptr);
+    EXPECT_TRUE(ns->decimal);
+    ASSERT_EQ(ns->integerPrefixes.size(), 1u);
+    EXPECT_EQ(ns->integerPrefixes[0].prefix, "0x");
+    EXPECT_EQ(ns->integerPrefixes[0].radix,  16u);
+    ASSERT_TRUE(ns->exponent.has_value());
+    EXPECT_EQ(ns->exponent->letters.size(), 2u);
+    EXPECT_EQ(ns->exponent->letters[0], 'e');
+    EXPECT_TRUE(ns->exponent->signOptional);
+    ASSERT_TRUE(ns->fractionPoint.has_value());
+    EXPECT_EQ(*ns->fractionPoint, '.');
+    ASSERT_TRUE(ns->digitSeparator.has_value());
+    EXPECT_EQ(*ns->digitSeparator, '_');
+    EXPECT_EQ(ns->integerSuffixes.size(), 2u);
+    EXPECT_EQ(ns->floatSuffixes.size(),   1u);
+}
+
+// emitKind.integer is required.
+TEST(GrammarSchema, NumberStyleMissingEmitKindIntegerIsRejected) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NoEmit", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "numberStyle": {
+        "decimal":  true,
+        "emitKind": { "float": "FloatLiteral" }
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    // F13 (08.55 remediation): C_MissingNumberStyle is reserved for
+    // "block entirely absent". A required sub-field that is missing
+    // or empty inside an existing block uses C_MissingField.
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+// F13: out-of-range radix is now C_InvalidNumberStyle (was overloaded
+// onto C_MissingNumberStyle prior to the 08.55 remediation pass).
+TEST(GrammarSchema, NumberStyleRadixOutOfRangeReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "BadRadix", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "numberStyle": {
+        "decimal": true,
+        "integerPrefixes": [ { "prefix": "0x", "radix": 99, "digits": "0-9a-fA-F" } ],
+        "emitKind": { "integer": "IntLiteral" }
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+// F13: numberStyle that isn't an object is C_InvalidNumberStyle (the
+// block is present but malformed at the top level).
+TEST(GrammarSchema, NumberStyleNotAnObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "BadType", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "numberStyle": "wrong",
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+// F3: tsql-subset declares typeExtensions[] for parameterized types
+// (VARCHAR(N) — Integer parameter). Verify the shipped config carries
+// the registration so a future grammar-level update can wire the
+// shape parser through it.
+TEST(GrammarSchema, TsqlSubsetTypeExtensionsAreDeclared) {
+    auto r = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(r.has_value());
+    auto exts = (*r)->typeExtensions();
+    ASSERT_FALSE(exts.empty());
+    bool sawVarchar = false;
+    for (auto const& e : exts) {
+        if (e.name == "TSQL::Varchar") {
+            sawVarchar = true;
+            ASSERT_EQ(e.parameters.size(), 1u);
+            EXPECT_EQ(e.parameters[0].kind, TypeParamKind::Integer);
+        }
+    }
+    EXPECT_TRUE(sawVarchar);
+}
+
+// F5: pairwise-distinct check on wrapperRules. The walker tags
+// Pratt frames by RuleId; two rules collapsing to the same id
+// would silently miscount nesting depth.
+TEST(GrammarSchema, ExprWrapperRulesDuplicateRuleNamesRejected) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "DupWrap", "version": "0.1.0" },
+      "tokens": {
+        "+": [{ "kind": "PlusOp" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "operators": {
+        "groups": [ { "precedence": 10, "operators": ["+"] } ]
+      },
+      "shapes": {
+        "root":     { "sequence": ["expression", "Semi"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "X",
+              "unary":   "X",
+              "postfix": "Y"
+            }
+          }
+        },
+        "operand": { "sequence": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_DuplicateWrapperRules));
+}
+
+// F17: unknown wrapperRules key is C_UnknownShape (matches the
+// sibling expr-body unknown-key check), NOT C_MissingWrapperRules
+// (reserved for "field absent/empty").
+TEST(GrammarSchema, ExprWrapperRulesUnknownKeyReportsUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "UnkKey", "version": "0.1.0" },
+      "tokens": {
+        "+": [{ "kind": "PlusOp" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "operators": {
+        "groups": [ { "precedence": 10, "operators": ["+"] } ]
+      },
+      "shapes": {
+        "root":     { "sequence": ["expression", "Semi"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "B",
+              "unary":   "U",
+              "postfix": "P",
+              "infix":   "I"
+            }
+          }
+        },
+        "operand": { "sequence": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// F15: built-in token kinds are exactly the eight universal
+// categories. Paradigm-specific kinds (CharLiteral, BoolLiteral,
+// NullLiteral) are NOT pre-interned and must be declared by the
+// language.
+TEST(GrammarSchema, BuiltinTokenKindsAreExactlyUniversal) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "Empty", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": ["Semi"] } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value());
+    auto const& tokens = (*r)->schemaTokens();
+    EXPECT_TRUE(tokens.contains("Identifier"));
+    EXPECT_TRUE(tokens.contains("IntLiteral"));
+    EXPECT_TRUE(tokens.contains("FloatLiteral"));
+    EXPECT_TRUE(tokens.contains("StringLiteral"));
+    EXPECT_TRUE(tokens.contains("Eof"));
+    EXPECT_TRUE(tokens.contains("Error"));
+    EXPECT_TRUE(tokens.contains("Whitespace"));
+    EXPECT_TRUE(tokens.contains("Newline"));
+    EXPECT_FALSE(tokens.contains("CharLiteral"));
+    EXPECT_FALSE(tokens.contains("BoolLiteral"));
+    EXPECT_FALSE(tokens.contains("NullLiteral"));
+}
+
+// F15: a config that references a demoted built-in without
+// declaring it must emit C_UnknownToken.
+TEST(GrammarSchema, DemotedBuiltinReferencedWithoutDeclarationReportsCode) {
+    for (auto const* name : {"BoolLiteral", "CharLiteral", "NullLiteral"}) {
+        const std::string kCfg = std::format(R"JSON({{
+          "dssSchemaVersion": 4,
+          "language": {{ "name": "Demoted", "version": "0.1.0" }},
+          "tokens": {{ ";": [{{ "kind": "Semi" }}] }},
+          "shapes": {{ "root": {{ "sequence": ["{}", "Semi"] }} }}
+        }})JSON", name);
+        auto r = GrammarSchema::loadFromText(kCfg);
+        ASSERT_FALSE(r.has_value()) << "unexpected success for " << name;
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape)
+                    || hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken))
+            << "no diagnostic flagging the demoted built-in '" << name << "'";
+    }
+}
+
+// F15: a config that DECLARES `BoolLiteral` via keywords loads
+// cleanly. The demotion is value-neutral — the kind is just no
+// longer auto-interned at schema-build time.
+TEST(GrammarSchema, DemotedBuiltinDeclaredExplicitlyLoadsCleanly) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "WithBool", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "keywords": [
+        { "word": "true",  "kind": "BoolLiteral" },
+        { "word": "false", "kind": "BoolLiteral" }
+      ],
+      "shapes": { "root": { "sequence": ["BoolLiteral", "Semi"] } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_TRUE((*r)->schemaTokens().contains("BoolLiteral"));
 }

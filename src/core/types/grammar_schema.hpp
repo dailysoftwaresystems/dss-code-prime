@@ -5,6 +5,7 @@
 #include "core/types/import_config.hpp"
 #include "core/types/lexer_mode.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeExtensionDescriptor
+#include "core/types/number_style.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/rule_id.hpp"
@@ -67,6 +68,39 @@ struct DSS_EXPORT ScopeMatch {
 static_assert(std::is_trivially_copyable_v<ScopeMatch>,
               "ScopeMatch must stay trivially copyable — copied through "
               "the candidate-filtering hot path in resolveMeaning.");
+
+// Pratt-walker wrapper rule names per `expr` shape (schema v4
+// `expr.wrapperRules`). Each `expr`-kind rule declares the three
+// names the walker will synthesize around operator-precedence
+// results — the engine no longer hardcodes `binaryExpr`/`unaryExpr`/
+// `postfixExpr`. The loader auto-interns the declared names and
+// stores their RuleIds here; the parser's Pratt walker reads
+// `GrammarSchema::exprWrapperRules(exprRule)` once per
+// walkExpression entry.
+struct DSS_EXPORT ExprWrapperRules {
+    RuleId binary;
+    RuleId unary;
+    RuleId postfix;
+
+    // All three RuleIds are valid AND pairwise-distinct. The walker
+    // tags frames by RuleId; a duplicate id would collide silently
+    // (e.g. both `binary` and `unary` interned to the same name and
+    // RuleId — Pratt frames meant for two different climb shapes
+    // would land in one bucket). The loader rejects duplicates up
+    // front (see `C_MissingWrapperRules` in grammar_schema_json.cpp);
+    // this predicate is the runtime safety net.
+    [[nodiscard]] bool valid() const noexcept {
+        return binary.valid() && unary.valid() && postfix.valid()
+            && binary.v != unary.v
+            && unary.v  != postfix.v
+            && binary.v != postfix.v;
+    }
+};
+
+static_assert(std::is_trivially_copyable_v<ExprWrapperRules>,
+              "ExprWrapperRules must stay trivially copyable — read once "
+              "per walkExpression call and copied by value into the Pratt "
+              "wrapper bundle.");
 
 // One resolved meaning of a lexeme, sourced from a single entry under
 // the config's `tokens` map. A lexeme may have several meanings — the
@@ -227,6 +261,27 @@ struct DSS_EXPORT GrammarSchemaData {
     // config that omits the block. Consumed by ConfigDrivenImportResolver —
     // the single language-agnostic import engine.
     ImportConfig                                      imports;
+
+    // Pratt-walker wrapper rule ids per `expr` shape (08.55 cleanup;
+    // schema v4 `expr.wrapperRules`). Keyed by the expr rule's RuleId
+    // value. The loader populates this BEFORE shape compile so the
+    // shape-existence skip-list and the Pratt walker both read from
+    // the same authoritative table. Empty for languages that declare
+    // no `expr` shapes.
+    std::unordered_map<std::uint32_t, ExprWrapperRules> exprWrapperRules;
+
+    // Set of every wrapper RuleId synthesized by the Pratt walker
+    // (union across `exprWrapperRules`). The shape-existence
+    // validator (`validateOperatorBodyRules`) uses this to skip
+    // interned rule names that have no compiled body BY DESIGN —
+    // walker-managed frames, not user-declared shapes.
+    std::unordered_set<std::uint32_t>                 wrapperRuleIds;
+
+    // Numeric-literal lexical grammar (08.55 cleanup; schema v4
+    // `numberStyle`). nullopt for languages that declare no numeric
+    // literals; required (loader emits `C_MissingNumberStyle`)
+    // when the language declares `IntLiteral`/`FloatLiteral` tokens.
+    std::optional<NumberStyle>                        numberStyle;
 };
 
 } // namespace detail
@@ -436,6 +491,24 @@ public:
     [[nodiscard]] bool         isExprRule(RuleId rule)        const noexcept;
     [[nodiscard]] RuleId       exprAtom(RuleId rule)          const noexcept;
     [[nodiscard]] std::int32_t exprMinPrecedence(RuleId rule) const noexcept;
+
+    // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
+    // for `rule`. The loader auto-interned the declared names and
+    // validated all three were present, so for an `isExprRule(rule)`
+    // the returned struct is `.valid()`. For non-expr rules every
+    // field is `InvalidRule`. Read once per `walkExpression` entry —
+    // the walker bundles the three ids into its `PrattRules` and
+    // threads them through the climb.
+    [[nodiscard]] ExprWrapperRules exprWrapperRules(RuleId rule) const noexcept;
+
+    // Numeric-literal lexical grammar declared by the language's
+    // `numberStyle` block. Returns nullptr when no block was
+    // declared — the tokenizer then knows the language has no
+    // numeric literals (e.g. toy). The loader rejects schemas that
+    // declare `IntLiteral`/`FloatLiteral` tokens without a block
+    // (`C_MissingNumberStyle`), so any reachable scanNumber call
+    // sees a non-null pointer.
+    [[nodiscard]] NumberStyle const* numberStyle() const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

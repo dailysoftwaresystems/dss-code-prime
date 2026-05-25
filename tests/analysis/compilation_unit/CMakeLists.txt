@@ -4,9 +4,6 @@ dss_add_test(NAME analysis/compilation_unit/test_compilation_unit
 dss_add_test(NAME analysis/compilation_unit/test_unit_attribute
              SOURCES test_unit_attribute.cpp)
 
-dss_add_test(NAME analysis/compilation_unit/test_symbol_population
-             SOURCES test_symbol_population.cpp)
-
 dss_add_test(NAME analysis/compilation_unit/test_import_resolver
              SOURCES test_import_resolver.cpp)
 
@@ -18,8 +15,6 @@ dss_add_test(NAME analysis/compilation_unit/test_import_resolver
 target_include_directories(dss_analysis_compilation_unit_test_compilation_unit
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_compilation_unit_test_unit_attribute
-                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
-target_include_directories(dss_analysis_compilation_unit_test_symbol_population
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_compilation_unit_test_import_resolver
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)

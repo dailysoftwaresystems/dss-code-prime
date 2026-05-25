@@ -846,3 +846,32 @@ TEST(ParserCSubsetSmoke, ParenGroupingForcesOuterPrecedence) {
         "      tok:\"c\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
 }
+
+// F2: c-subset reintroduces CharLiteral via a `'`-opened body mode
+// (mirrors the `"`-opened string mode). `'a'` parses cleanly: the
+// `'` opener token, one `CharLiteral` body byte, the `'` closer
+// (same token kind back-popping the body mode). Pin via a tree-
+// presence assertion on the body-mode CharLiteral token kind.
+TEST(ParserCSubsetSmoke, CharLiteralParsesAsOperand) {
+    auto harness = loadAndTokenize("int main() { return 'a'; }");
+    Parser parser{harness.src, harness.schema, std::move(harness.stream)};
+    auto const result = std::move(parser).parse();
+    auto const& tree = result.tree;
+    EXPECT_FALSE(tree.diagnostics().hasErrors())
+        << "c-subset failed to parse CharLiteral cleanly";
+    // The body-mode emits a CharLiteral schema-token inside the
+    // `'a'` span; verify the token kind appears in the leaf stream.
+    const auto charLitId = tree.schema().schemaTokens().find("CharLiteral");
+    ASSERT_TRUE(charLitId.valid());
+    bool sawCharLiteralToken = false;
+    for (std::uint32_t i = 1; i < tree.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (tree.kind(id) == NodeKind::Token
+            && tree.tokenKind(id).v == charLitId.v) {
+            sawCharLiteralToken = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawCharLiteralToken)
+        << "expected at least one CharLiteral body-token in the parse tree";
+}

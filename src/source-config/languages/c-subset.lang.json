@@ -16,6 +16,7 @@
   "lexerModes": {
     "main":          { "tokens": "default" },
     "string":        { "defaultToken": { "kind": "StringChar" } },
+    "charBody":      { "defaultToken": { "kind": "CharLiteral" } },
     "line-comment":  {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -59,6 +60,11 @@
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "string",
       "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
+    "'": [{
+      "kind": "CharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
     }],
 
     "=":  [{ "kind": "AssignOp" }],
@@ -117,6 +123,26 @@
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" }
     ]
+  },
+
+  "numberStyle": {
+    "decimal": true,
+    "integerPrefixes": [
+      { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" },
+      { "prefix": "0X", "radix": 16, "digits": "0-9a-fA-F" },
+      { "prefix": "0b", "radix": 2,  "digits": "01"        },
+      { "prefix": "0B", "radix": 2,  "digits": "01"        },
+      { "prefix": "0o", "radix": 8,  "digits": "0-7"       },
+      { "prefix": "0O", "radix": 8,  "digits": "0-7"       },
+      { "prefix": "0",  "radix": 8,  "digits": "0-7"       }
+    ],
+    "exponent":         { "letters": ["e", "E"], "signOptional": true },
+    "fractionPoint":    ".",
+    "digitSeparator":   "_",
+    "integerSuffixes":  ["u", "U", "l", "L", "ll", "LL", "ul", "UL", "lu", "LU",
+                          "ull", "ULL", "llu", "LLU"],
+    "floatSuffixes":    ["f", "F"],
+    "emitKind":         { "integer": "IntLiteral", "float": "FloatLiteral" }
   },
 
   "syncTokens": ["EndStatement", "BlockClose"],
@@ -330,14 +356,24 @@
 
     "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
 
-    "expression": { "expr": { "atom": "operand" } },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    },
 
     "operand": {
       "alt": [
         "Identifier",
         "IntLiteral",
-        "CharLiteral",
-        "StringLiteral",
+        "FloatLiteral",
+        "StringStart",
+        "CharStart",
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
     },

@@ -25,7 +25,7 @@ A config that loads cleanly produces a `GrammarSchema` you can pass to `TreeBuil
 
 ```jsonc
 {
-  "dssSchemaVersion": 1,         // required — accepted range is 1..3; loader emits C_VersionMismatch on values outside that window
+  "dssSchemaVersion": 1,         // required — accepted range is 1..4; loader emits C_VersionMismatch on values outside that window
 
   "language": {                  // required — identifies the language
     "name":           "Calc",    // required
@@ -45,7 +45,7 @@ The loader's error catalogue (returned in `ConfigDiagnostic.code`):
 | Code | When |
 |---|---|
 | `C_MalformedJson` | JSON parse failed — bad braces, quotes, etc. |
-| `C_VersionMismatch` | `dssSchemaVersion` missing, non-integer, or outside the accepted range (currently `1..3`). |
+| `C_VersionMismatch` | `dssSchemaVersion` missing, non-integer, or outside the accepted range (currently `1..4`). |
 | `C_InvalidLanguageName` | `language.name` missing, empty, or not a string. |
 | `C_MissingField` | Required field absent. |
 | `C_UnknownToken` | A `shapes` entry references a token kind that isn't declared in `tokens`, `keywords`, or built-ins. |
@@ -106,12 +106,14 @@ These names are pre-registered by every schema — you can reference them in `sh
 | Kind | What the lexer produces |
 |---|---|
 | `Identifier` | A bare word that doesn't match any `keywords[].word`. |
-| `IntLiteral`, `FloatLiteral` | Numeric literals. |
-| `StringLiteral`, `CharLiteral` | Quoted literals. |
-| `BoolLiteral`, `NullLiteral` | Boolean / null literals. |
+| `IntLiteral`, `FloatLiteral` | Numeric literals. Driven by [`numberStyle`](#114-numberstyle--numeric-literal-grammar). |
+| `StringLiteral` | Quoted literals from a delimited-string opener (see `stringStyle`). |
+| `Whitespace`, `Newline` | Trivia. |
 | `Eof`, `Error` | End-of-input and recovery markers. |
 
 You can shadow a built-in name in `tokens` if you need different flags or scope behavior — your declaration wins.
+
+**Paradigm-specific kinds are NOT pre-interned.** Languages that have `CharLiteral` / `BoolLiteral` / `NullLiteral` as syntactic categories declare them explicitly in `tokens` (or `keywords` for `true`/`false`/`null`-as-keyword). Not every plausible language has those categories — leaving them out of the built-ins forces every config to spell out what it actually uses.
 
 ---
 
@@ -184,7 +186,7 @@ This is a complete, valid `.lang.json` for a tiny calculator language — copy i
 
 ```jsonc
 {
-  "dssSchemaVersion": 1,
+  "dssSchemaVersion": 4,
 
   "language": {
     "name":           "Calc",
@@ -210,6 +212,11 @@ This is a complete, valid `.lang.json` for a tiny calculator language — copy i
     { "word": "let", "kind": "LetKeyword" }
   ],
 
+  "numberStyle": {
+    "decimal":  true,
+    "emitKind": { "integer": "IntLiteral" }
+  },
+
   "shapes": {
     "root":     { "sequence": [{ "repeat": "stmt" }] },
     "stmt":     { "alt":      ["letDecl", "exprStmt"] },
@@ -221,10 +228,11 @@ This is a complete, valid `.lang.json` for a tiny calculator language — copy i
 
 Loads cleanly because:
 
-- `dssSchemaVersion: 1` is inside the loader's accepted window (`1..3`).
+- `dssSchemaVersion: 4` is inside the loader's accepted window (`1..4`).
 - `language.name`, `version`, `fileExtensions` all present.
 - Every shape reference (`stmt`, `letDecl`, `exprStmt`) resolves to a declared shape.
 - Every token reference (`LetKeyword`, `Identifier`, `EqOp`, `IntLiteral`, `End`) resolves — keywords + tokens + built-in `Identifier`/`IntLiteral`.
+- `numberStyle` is required because the grammar references `IntLiteral`. The minimal block declares `decimal: true` (bare digits) and the emit kind.
 - `letDecl` and `exprStmt` have disjoint FIRST sets (`LetKeyword` vs `IntLiteral`) — no `C_AmbiguousAlternatives`.
 - `ParenOpen` opens a `Paren` scope; `ParenClose` closes — no `C_UnclosableScope`. (Even though `Paren` isn't used by any shape yet, the close-pair is consistent so the loader is happy.)
 
@@ -237,8 +245,8 @@ To verify, run any unit test that calls `GrammarSchema::loadShipped("calc")` and
 | Symptom | Likely fix |
 |---|---|
 | `C_MalformedJson` | Run the file through a JSON validator. Trailing commas, unquoted keys, smart quotes. |
-| `C_VersionMismatch` | `"dssSchemaVersion": 1` — must be an integer inside `1..3`, not a string. |
-| `C_UnknownToken: "X"` referenced from `shapes.Y` | `X` isn't declared in `tokens` or `keywords` and isn't a built-in. Check spelling; built-ins are `Identifier`, `IntLiteral`, `FloatLiteral`, `StringLiteral`, `CharLiteral`, `BoolLiteral`, `NullLiteral`. |
+| `C_VersionMismatch` | `"dssSchemaVersion": 1` — must be an integer inside `1..4`, not a string. |
+| `C_UnknownToken: "X"` referenced from `shapes.Y` | `X` isn't declared in `tokens` or `keywords` and isn't a built-in. Check spelling; built-ins are `Identifier`, `IntLiteral`, `FloatLiteral`, `StringLiteral`, `Eof`, `Error`, `Whitespace`, `Newline`. Paradigm-specific kinds (`CharLiteral`, `BoolLiteral`, `NullLiteral`, …) are no longer pre-interned — a language that uses them must declare them in `tokens`/`keywords` or via a `defaultToken` body mode. |
 | `C_UnknownShape: "X"` referenced from `shapes.Y` | `Y` references a shape name that isn't a key in `shapes`. |
 | `C_CircularShape: "X"` | Your shape references itself as the first element of its sequence. Insert a literal token before the recursive reference, or split into two shapes. |
 | `C_AmbiguousAlternatives` | Two `alt` arms can start with the same token. Pull the common prefix into a parent sequence or pick distinct sentinels. |
@@ -557,3 +565,73 @@ Unresolved references surface as driver diagnostics (`D_UnresolvedImport` / `D_U
 | `C_MissingField` on `imports/*` | A field required by the chosen `strategy` is absent or empty (e.g. include-following without `directiveRule`/`pathToken`; name-matching without `nameRule`/`definitionRule`/`nameToken`/`referenceParents`). |
 | `C_UnknownShape` on `imports/*` | A `directiveRule`/`nameRule`/`definitionRule`/`referenceParents[]` entry names a shape not declared under `shapes`. |
 | `C_UnknownToken` on `imports/*` | A `pathToken`/`nameToken` names a token kind no `tokens`/`keywords`/built-in declared. |
+
+### 11.3 `expr.wrapperRules` — per-language Pratt wrapper names
+
+Every `expr` shape now declares the three Pratt-walker wrapper rule names the engine will synthesize around operator-precedence results. The engine no longer hardcodes any wrapper-rule name; each language picks its own. The walker reads the three RuleIds out of the schema once per `walkExpression` entry.
+
+```jsonc
+"expression": {
+  "expr": {
+    "atom":         "operand",
+    "minPrecedence": 0,
+    "wrapperRules": {
+      "binary":  "binaryExpr",    // each language picks its own names
+      "unary":   "unaryExpr",
+      "postfix": "postfixExpr"
+    }
+  }
+}
+```
+
+- All three (`binary` / `unary` / `postfix`) are required when `wrapperRules` is present; an `expr` shape without a complete `wrapperRules` block fails to load (`C_MissingWrapperRules`).
+- Names declared here cannot also appear under top-level `shapes` — wrapper rules are walker-synthesized and have no compiled body. A redeclaration fails to load (`C_UnknownShape`).
+- A non-`expr` language uses none of this — the block is required only on `expr`-shape rules.
+
+### 11.4 `numberStyle` — numeric-literal grammar
+
+`numberStyle` is the universal config-driven numeric scanner descriptor. The tokenizer's `scanNumber()` walks the active language's `NumberStyle` — no hardcoded letter classes, no C-style assumptions baked into the engine.
+
+```jsonc
+"numberStyle": {
+  "decimal":         true,             // permit bare decimal digits
+  "integerPrefixes": [                 // optional; empty = decimal only
+    { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" },
+    { "prefix": "0b", "radix": 2,  "digits": "01" },
+    { "prefix": "0o", "radix": 8,  "digits": "0-7" }
+  ],
+  "exponent": {                        // optional; absent = integer only
+    "letters":      ["e", "E"],
+    "signOptional": true
+  },
+  "fractionPoint":   ".",              // optional; absent = no float literal
+  "digitSeparator":  "_",              // optional; absent = no separators
+  "integerSuffixes": ["u","U","l","L","ll","LL","ul","UL","ull","ULL"],
+  "floatSuffixes":   ["f","F","d","D"],
+  "emitKind": {                        // which token kinds the scanner emits
+    "integer": "IntLiteral",
+    "float":   "FloatLiteral"
+  }
+}
+```
+
+- `decimal` (bool, default `false`) — permit bare digits at start of a number.
+- `integerPrefixes[*]` — `{ prefix, radix, digits }`. The scanner walks prefixes in declaration order; the first whose `digits` class accepts the byte after the prefix wins. `radix` ∈ [2, 36]. `digits` is a character class string supporting `a-z` ranges (e.g. `"0-9a-fA-F"`).
+- `exponent` — `{ letters, signOptional }`. `letters[*]` are single ASCII characters; the scanner accepts any one of them as the exponent introducer. `signOptional` defaults to `true`. **Semantics**: `signOptional: true` means a `+` or `-` MAY appear between the exponent letter and digits (`1e+3`, `1e-3`, `1e3` all accepted — the C-style default). `signOptional: false` means NO sign is permitted there — `1e+3` tokenizes as `1` + identifier-or-token `e` + `+` + `3`, NOT as one float. The name does NOT mean "sign required"; that mode is intentionally not modeled.
+- `fractionPoint` — single ASCII char (typically `.`). When set AND followed by a digit, the scanner promotes the literal to float.
+- `digitSeparator` — single ASCII char. Accepted (and consumed silently) between digits.
+- `integerSuffixes` / `floatSuffixes` — string arrays; the scanner longest-matches against them after the number body. A float-suffix match promotes the kind.
+- `emitKind.integer` — required; names the token kind the scanner emits for integer literals.
+- `emitKind.float` — required IFF any float-producing facet is declared (`exponent` / `fractionPoint` / non-empty `floatSuffixes`).
+
+Languages with no numeric literals omit the block entirely. Configs that reference `IntLiteral`/`FloatLiteral` in any shape but declare no `numberStyle` fail to load (`C_MissingNumberStyle`).
+
+### 11.5 Troubleshooting (08.55 codes)
+
+| Symptom | Likely fix |
+|---|---|
+| `C_MissingWrapperRules` | An `expr` shape was declared without a complete `wrapperRules` block, or one of `binary`/`unary`/`postfix` is missing/empty/non-string. Names declared here cannot collide with top-level `shapes`. |
+| `C_MissingNumberStyle` | The language declared `IntLiteral`/`FloatLiteral` in any shape but omitted the `numberStyle` block entirely. |
+| `C_MissingField` on `numberStyle/...` | A required sub-field is absent or empty (e.g. `emitKind`, `emitKind.integer`, a prefix's `prefix`/`radix`/`digits`). |
+| `C_InvalidNumberStyle` | The block is present but malformed: wrong JSON type, `radix` outside `[2, 36]`, `fractionPoint`/`digitSeparator` not single-char, non-bool `signOptional`, etc. |
+| `C_UnknownToken` on `numberStyle/emitKind/*` | The named token kind isn't declared anywhere (built-in or `tokens`). |

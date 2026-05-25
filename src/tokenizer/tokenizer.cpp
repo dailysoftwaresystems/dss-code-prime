@@ -1,6 +1,7 @@
 #include "tokenizer/tokenizer.hpp"
 
 #include "core/types/lexer_mode.hpp"
+#include "core/types/number_style.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/string_style.hpp"
 #include "tokenizer/source_reader.hpp"
@@ -189,150 +190,193 @@ struct LookupHit {
 
 // ── numeric scan ──────────────────────────────────────────────────────────
 //
-// Hand-coded per `.plans/04-tokenizer-plan - ok.md` §2.4. The grammar:
+// Universally config-driven (08.55 cleanup; schema v4 `numberStyle`).
+// The tokenizer's numeric scanner reads the active language's
+// `GrammarSchema::numberStyle()` and walks input accordingly — no
+// hardcoded letter classes, no baked C-style assumptions. A language
+// with no numeric literals omits the block entirely; the loader emits
+// `C_MissingNumberStyle` when `IntLiteral`/`FloatLiteral` are
+// referenced from shapes without a block.
 //
-//   prefix-int := 0 (x|X) [0-9a-fA-F_]+ suffix?   // hex
-//              |  0 (b|B) [01_]+ suffix?           // binary
-//              |  0 (o|O) [0-7_]+ suffix?           // octal
-//   int        := [0-9]+ suffix?                   // decimal
-//   float      := ([0-9]+ \. [0-9]*  |  [0-9]+ exponent) suffix?
-//   exponent   := (e|E) [+-]? [0-9]+
-//   suffix     := [uUlL]+ | f | F | d | D | (combinations like ul, ull)
-//
-// Three classes of bug this scan now avoids:
-//
-//   1. `0xff` was previously consumed as `0` + suffix `xff` — the
-//      base-prefix branch below resolves it as a hex IntLiteral.
-//   2. `1ex` (bare exponent + identifier) — the exponent backoff
-//      (`sawEButNoExp`) leaves `e` for the next iteration.
-//   3. `123abc` — the suffix loop now only accepts letters from the
-//      type-marker set (u/U/l/L/f/F/d/D), so `123abc` becomes
-//      `123` + `abc` rather than one bogus IntLiteral.
-//
-// Languages whose numeric grammar deviates from this C-style scheme
-// will eventually need a `numberStyle` schema descriptor (v2-gap-
-// catalog row 14). Until then, every shipped config inherits the
-// rules above as the universal default.
+// Diagnostic preservation:
+//   - `P_MalformedNumber` still fires when a prefix is matched but no
+//     real digit (only separators) follows — `0x_`, `0b__`.
+//   - `P_IllegalChar` is owned by the dispatch loop (unchanged).
 
-[[nodiscard]] constexpr bool isHexDigit(char c) noexcept {
+// Test whether `c` lands in the digit character-class string. The
+// class syntax supports literal chars and `a-z` ranges (the same shape
+// every shipped config uses); unknown forms are interpreted literally.
+[[nodiscard]] bool matchesDigitClass(std::string_view digits, char c) noexcept {
     const auto u = static_cast<unsigned char>(c);
-    return (u >= '0' && u <= '9') || (u >= 'a' && u <= 'f') || (u >= 'A' && u <= 'F');
+    for (std::size_t i = 0; i < digits.size(); ++i) {
+        // `a-z` range form.
+        if (i + 2 < digits.size() && digits[i + 1] == '-') {
+            const auto lo = static_cast<unsigned char>(digits[i]);
+            const auto hi = static_cast<unsigned char>(digits[i + 2]);
+            if (u >= lo && u <= hi) return true;
+            i += 2;
+            continue;
+        }
+        if (static_cast<unsigned char>(digits[i]) == u) return true;
+    }
+    return false;
 }
 
-[[nodiscard]] constexpr bool isBinDigit(char c) noexcept { return c == '0' || c == '1'; }
-
-[[nodiscard]] constexpr bool isOctDigit(char c) noexcept {
-    return c >= '0' && c <= '7';
-}
-
-// Recognised numeric-suffix characters — used both as start- and
-// continue-predicate (`42ull` walks four chars through this). `e`/`E`
-// are excluded (those are exponent introducers handled separately).
-// Other letters terminate the number — `123abc` becomes two tokens.
-[[nodiscard]] constexpr bool isNumberSuffixChar(char c) noexcept {
-    return c == 'u' || c == 'U' || c == 'l' || c == 'L'
-        || c == 'f' || c == 'F' || c == 'd' || c == 'D';
+[[nodiscard]] bool isSeparator(NumberStyle const& s, char c) noexcept {
+    return s.digitSeparator.has_value() && *s.digitSeparator == c;
 }
 
 // Result of `scanNumber`: float vs int + malformed signal. Malformed
-// fires for base-prefixed literals that have a prefix but no actual
-// digits — `0x_`, `0b__`, `0o`. The token is still emitted (so the
-// source span is covered), but the caller emits P_MalformedNumber so
-// the diagnostic surfaces.
+// fires for prefix literals that have a prefix but no actual digits —
+// `0x_`, `0b__`. The token is still emitted (so the source span is
+// covered), but the caller emits P_MalformedNumber.
 struct NumberScan {
     bool isFloat   = false;
     bool malformed = false;
 };
 
-// Helper: consume a base-prefix body (digits + underscores). Returns
-// true if at least one *digit* was seen (not just underscores).
-template <typename DigitPred>
-[[nodiscard]] bool consumeBaseBody(SourceReader& r, DigitPred isBaseDigit) noexcept {
-    bool sawDigit = false;
-    while (isBaseDigit(r.peek()) || r.peek() == '_') {
-        if (isBaseDigit(r.peek())) sawDigit = true;
-        r.advance(1);
+// Longest-match against a list of suffixes at the reader's current
+// position. Returns 0 when nothing matched (the suffix tail is
+// optional in every shipped config). Suffix strings are compared
+// byte-for-byte against the upcoming bytes.
+[[nodiscard]] std::size_t matchLongestSuffix(SourceReader const& r,
+                                             std::vector<std::string> const& suffixes) noexcept {
+    std::size_t best = 0;
+    const auto rem = r.remaining();
+    for (auto const& s : suffixes) {
+        if (s.size() > rem.size()) continue;
+        if (s.size() <= best) continue;
+        if (rem.substr(0, s.size()) == s) best = s.size();
     }
-    return sawDigit;
+    return best;
 }
 
-[[nodiscard]] NumberScan scanNumber(SourceReader& r) noexcept {
+[[nodiscard]] NumberScan scanNumber(SourceReader& r, NumberStyle const& style) noexcept {
     NumberScan out;
 
-    // Base-prefixed integer literals: 0x / 0b / 0o. Consume only when
-    // the *first* digit was `0` AND the next char is one of x/X/b/B/o/O
-    // AND the char after that is a valid digit for the base OR an
-    // underscore. Pure-letter tails like `0xy` stay tokenized as `0`
-    // plus identifier `xy`. Pure-underscore tails like `0x_` consume
-    // the body and set `malformed` so the caller emits a diagnostic.
-    if (r.peek() == '0') {
-        const char p1 = r.peek(1);
-        const char p2 = r.peek(2);
-        auto consumeSuffix = [&] {
-            while (isNumberSuffixChar(r.peek())) r.advance(1);
-        };
-        if ((p1 == 'x' || p1 == 'X') && (isHexDigit(p2) || p2 == '_')) {
-            r.advance(2);
-            const bool sawDigit = consumeBaseBody(r, isHexDigit);
-            consumeSuffix();
-            out.malformed = !sawDigit;
-            return out;
+    // 1. Try integer prefixes in declaration order. The loader's
+    //    ordering is preserved so a config can disambiguate
+    //    overlapping prefixes by listing the longer one first
+    //    (e.g. `0x` before `0`). Per-prefix digit class drives
+    //    body acceptance; separators are accepted as long as the
+    //    schema declares one.
+    for (auto const& p : style.integerPrefixes) {
+        const auto rem = r.remaining();
+        if (rem.size() < p.prefix.size()) continue;
+        if (rem.substr(0, p.prefix.size()) != p.prefix) continue;
+        // Lookahead resolution after a prefix match:
+        //   - EOF after a MULTI-CHAR prefix: the prefix is a designator
+        //     (e.g. `0x`, `0b`, `0o`) and the body is missing. Consume
+        //     the prefix as a malformed IntLiteral so the diagnostic
+        //     surfaces. Splitting `0x` into `0` + `x` would silently
+        //     swallow the user's typo.
+        //   - EOF after a SINGLE-CHAR prefix (e.g. C-style bare `0`
+        //     octal): the prefix byte is ITSELF a valid digit in the
+        //     prefix's own digit class, so `0` at EOF is a valid zero,
+        //     not malformed. Fall through to the bare-decimal arm
+        //     (which consumes the byte and emits IntLiteral cleanly).
+        //   - Non-digit, non-separator follow-up: leave the prefix
+        //     alone so `0xy` keeps parsing as `0` + identifier `xy`
+        //     (a shorter prefix or the bare-decimal arm picks the `0`).
+        const bool atEofAfterPrefix = p.prefix.size() >= rem.size();
+        const char afterPrefix =
+            !atEofAfterPrefix ? rem[p.prefix.size()] : '\0';
+        if (atEofAfterPrefix && p.prefix.size() == 1) {
+            // Single-char prefix at EOF: not malformed; let a later
+            // pass handle it (bare-decimal arm if decimal is enabled,
+            // longest-match otherwise).
+            continue;
         }
-        if ((p1 == 'b' || p1 == 'B') && (isBinDigit(p2) || p2 == '_')) {
-            r.advance(2);
-            const bool sawDigit = consumeBaseBody(r, isBinDigit);
-            consumeSuffix();
-            out.malformed = !sawDigit;
-            return out;
+        if (!atEofAfterPrefix
+            && !matchesDigitClass(p.digits, afterPrefix)
+            && !isSeparator(style, afterPrefix)) {
+            continue;
         }
-        if ((p1 == 'o' || p1 == 'O') && (isOctDigit(p2) || p2 == '_')) {
-            r.advance(2);
-            const bool sawDigit = consumeBaseBody(r, isOctDigit);
-            consumeSuffix();
-            out.malformed = !sawDigit;
-            return out;
+        r.advance(p.prefix.size());
+        bool sawDigit = false;
+        while (true) {
+            const char c = r.peek();
+            if (matchesDigitClass(p.digits, c)) { sawDigit = true; r.advance(1); continue; }
+            if (isSeparator(style, c))         { r.advance(1); continue; }
+            break;
         }
+        // Optional integer suffix.
+        if (const auto n = matchLongestSuffix(r, style.integerSuffixes); n > 0) {
+            r.advance(n);
+        }
+        out.malformed = !sawDigit;
+        return out;
     }
 
-    // Decimal integer run.
-    while (isDigit(r.peek())) r.advance(1);
+    // 2. Decimal body — only when the schema opts into bare decimals.
+    //    The dispatch loop ensures we entered on an isDigit byte; if
+    //    the schema sets `decimal: false`, we still consume the bare
+    //    digit run to make progress (caller treats it as malformed).
+    bool sawDigit = false;
+    auto consumeDecimalRun = [&] {
+        while (true) {
+            const char c = r.peek();
+            if (c >= '0' && c <= '9') { sawDigit = true; r.advance(1); continue; }
+            if (isSeparator(style, c)) { r.advance(1); continue; }
+            break;
+        }
+    };
+    consumeDecimalRun();
 
-    // Fractional part — `.` followed by a digit. Avoids gobbling `a.b`
-    // member access (caller ensures we entered scanNumber on a digit;
-    // the `.` is fractional only when more digits follow).
-    if (r.peek() == '.' && isDigit(r.peek(1))) {
+    // 3. Fractional part — when fractionPoint is set AND followed by a
+    //    digit (`a.b` member access doesn't gobble the dot).
+    if (style.fractionPoint.has_value()
+        && r.peek() == *style.fractionPoint
+        && (r.peek(1) >= '0' && r.peek(1) <= '9')) {
         out.isFloat = true;
-        r.advance(1);                                  // '.'
-        while (isDigit(r.peek())) r.advance(1);
+        r.advance(1);            // fraction point
+        consumeDecimalRun();
     }
 
-    // Exponent. `1e+5` / `1e-5` / `1e5` all valid; bare `1e` (no
-    // digit) is not. When the exponent fails, mark the `e` as off-
-    // limits to the suffix scan so it stays available as a fresh-
-    // start identifier for the next tokenize iteration.
-    bool sawEButNoExp = false;
-    if (r.peek() == 'e' || r.peek() == 'E') {
-        std::size_t look = 1;
-        if (r.peek(1) == '+' || r.peek(1) == '-') look = 2;
-        if (isDigit(r.peek(look))) {
-            out.isFloat = true;
-            r.advance(look + 1);
-            while (isDigit(r.peek())) r.advance(1);
-        } else {
-            sawEButNoExp = true;
+    // 4. Exponent — when declared. A failed exponent (letter without
+    //    digits following) leaves the letter unconsumed so the next
+    //    tokenize iteration sees it as a fresh start.
+    bool sawExpLetterButNoExp = false;
+    if (style.exponent.has_value()) {
+        auto const& exp = *style.exponent;
+        bool letterMatched = false;
+        for (auto l : exp.letters) {
+            if (r.peek() == l) { letterMatched = true; break; }
+        }
+        if (letterMatched) {
+            std::size_t look = 1;
+            if (exp.signOptional && (r.peek(1) == '+' || r.peek(1) == '-')) look = 2;
+            const char afterSign = r.peek(look);
+            if (afterSign >= '0' && afterSign <= '9') {
+                out.isFloat = true;
+                r.advance(look);  // letter (+ optional sign)
+                consumeDecimalRun();
+            } else {
+                sawExpLetterButNoExp = true;
+            }
         }
     }
 
-    // Suffix (restricted set — u/U/l/L promote nothing; f/F/d/D promote
-    // an otherwise-int literal to float). Skipped when we just bailed
-    // on a non-exponent `e`/`E`; the char belongs to the next token.
-    if (!sawEButNoExp && isNumberSuffixChar(r.peek())) {
-        const char first = r.peek();
-        if (first == 'f' || first == 'F' || first == 'd' || first == 'D') {
+    // 5. Suffixes — try float suffixes first (longer typically); a
+    //    float-suffix match promotes to float kind. Skip when we
+    //    bailed on a no-digit exponent letter (it belongs to the
+    //    next token). Two-pass longest-match across both lists keeps
+    //    selection deterministic; integer suffixes apply if no float
+    //    suffix matched.
+    if (!sawExpLetterButNoExp) {
+        if (const auto fn = matchLongestSuffix(r, style.floatSuffixes); fn > 0) {
             out.isFloat = true;
+            r.advance(fn);
+        } else if (const auto in = matchLongestSuffix(r, style.integerSuffixes); in > 0) {
+            r.advance(in);
         }
-        while (isNumberSuffixChar(r.peek())) r.advance(1);
     }
+
+    // Bare decimal with no digit body landed only on a separator —
+    // surface as malformed. Reachable when the dispatch loop entered
+    // on a digit char so we always saw at least one digit; the guard
+    // is here for symmetry with the prefix branch.
+    if (!sawDigit) out.malformed = true;
 
     return out;
 }
@@ -360,12 +404,16 @@ TokenizeResult Tokenizer::tokenize() && {
     // Caching the whitespace kinds is a substantive win — without it,
     // each whitespace byte runs the longest-match loop for a known
     // single-byte lookup.
-    const auto intLitKind   = schema_->schemaTokens().find("IntLiteral");
-    const auto floatLitKind = schema_->schemaTokens().find("FloatLiteral");
     const auto eofKind      = schema_->schemaTokens().find("Eof");
     const auto errorKind    = schema_->schemaTokens().find("Error");
     const auto wsKind       = schema_->schemaTokens().find("Whitespace");
     const auto newlineKind  = schema_->schemaTokens().find("Newline");
+
+    // Numeric-literal grammar (08.55; config-driven). nullptr when the
+    // language declares no `numberStyle`. The digit branch in the
+    // dispatch loop falls back to longest-match when this is null so a
+    // bare digit can still be claimed by a language-specific token.
+    NumberStyle const* const numberStyle = schema_->numberStyle();
 
     // Probe length is bounded by the schema's longest declared lexeme
     // key. Recomputing this per call would re-walk the lexeme table;
@@ -668,18 +716,36 @@ TokenizeResult Tokenizer::tokenize() && {
             continue;
         }
 
-        // Numeric literals — hand-coded; see `scanNumber` for the
-        // grammar. Int vs Float is decided inside `scanNumber` based
-        // on whether `.`/`e`/`E` or a float-marker suffix was consumed.
-        // Malformed base-prefix literals (`0x_` with no actual digit)
-        // still get a token emitted but also produce P_MalformedNumber.
-        if (isDigit(c)) {
-            const auto scan = scanNumber(r);
-            const auto litKind = scan.isFloat ? floatLitKind : intLitKind;
+        // Numeric literals — config-driven via `numberStyle` (08.55).
+        // When the language declares no numeric grammar (no
+        // `numberStyle` block) we fall through to the longest-match
+        // path so a bare digit can still be lexed as part of a
+        // language-specific token (or rejected as illegal).
+        // Malformed prefix literals (`0x_` with no actual digit) still
+        // get a token emitted but also produce P_MalformedNumber.
+        //
+        // Entry guard: the current byte is a decimal digit (when the
+        // schema enables `decimal`) OR matches the first byte of any
+        // declared integer prefix (so Pascal-style `$ff`, Erlang-style
+        // `16#ff`, etc. enter the numeric scanner instead of the
+        // longest-match operator path).
+        auto startsNumberLiteral = [&]() -> bool {
+            if (numberStyle == nullptr) return false;
+            if (numberStyle->decimal && isDigit(c)) return true;
+            for (auto const& p : numberStyle->integerPrefixes) {
+                if (!p.prefix.empty() && p.prefix[0] == c) return true;
+            }
+            return false;
+        };
+        if (startsNumberLiteral()) {
+            const auto scan = scanNumber(r, *numberStyle);
+            const auto emitKind =
+                scan.isFloat ? numberStyle->emitKind.floating
+                             : numberStyle->emitKind.integer;
             emit(scan.isFloat ? CoreTokenKind::FloatLiteral
                               : CoreTokenKind::IntLiteral,
-                 litKind,
-                 schema_->flagsForKind(litKind));
+                 emitKind,
+                 schema_->flagsForKind(emitKind));
             if (scan.malformed) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::P_MalformedNumber;

@@ -18,6 +18,17 @@
 
   "reservedWordPolicy": "contextual",
 
+  "numberStyle": {
+    "decimal":          true,
+    "exponent":         { "letters": ["e", "E"], "signOptional": true },
+    "fractionPoint":    ".",
+    "emitKind":         { "integer": "IntLiteral", "float": "FloatLiteral" }
+  },
+
+  "typeExtensions": [
+    { "name": "TSQL::Varchar", "parameters": [ { "name": "N", "kind": "Integer" } ] }
+  ],
+
   "syncTokens": ["EndStatement"],
 
   "lexerModes": {

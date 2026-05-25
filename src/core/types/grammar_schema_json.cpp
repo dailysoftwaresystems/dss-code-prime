@@ -6,7 +6,6 @@
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
-#include "core/types/well_known_names.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -51,16 +50,29 @@ std::optional<ScopeKind> parseScopeName(std::string_view name) {
 // Built-in token-kind names — predeclared so shape references like
 // "Identifier" resolve regardless of whether the user re-declared them
 // under tokens/keywords. Mirrors CoreTokenKind on the lexer side.
+//
+// Paradigm-specific kinds (`BoolLiteral`/`CharLiteral`/`NullLiteral`)
+// were removed from this list in the 08.55 cleanup — not every plausible
+// programming language has those literal categories. A language that
+// uses them declares them explicitly in its `tokens`/`keywords` block.
+// Universal categories remain pre-interned:
+//   - `Identifier`, `IntLiteral`, `FloatLiteral`, `StringLiteral` are
+//     emitted directly by the tokenizer's lexical layers (identifier
+//     scan + numeric scan + string-literal opener), and the scanner
+//     resolves the kind by name; pre-interning keeps every shipped
+//     schema able to reference them in a `shapes` body without an
+//     explicit token declaration.
+//   - `Whitespace`/`Newline`/`Eof`/`Error` are tokenizer-internal
+//     kinds the engine emits unconditionally.
 constexpr std::string_view kBuiltinTokenKindNames[] = {
     "Identifier",
     "IntLiteral",
     "FloatLiteral",
     "StringLiteral",
-    "CharLiteral",
-    "BoolLiteral",
-    "NullLiteral",
     "Eof",
     "Error",
+    "Whitespace",
+    "Newline",
 };
 
 struct Collector {
@@ -503,13 +515,35 @@ void collectReferences(json const& body,
         collectReferences(body.at("repeat"),
                           std::format("{}/repeat", path), outRefs, c);
     }
-    // `expr` body is `{ atom: <rule>, minPrecedence?: <int> }`. The loader
-    // validates the atom reference resolves and rejects unknown keys so a
-    // typo (e.g. `minPrecdence`) doesn't silently use the default. Operator-
-    // table consumption is the parser's responsibility, not the loader's.
+    // `expr` body is `{ atom: <rule>, minPrecedence?: <int>,
+    // wrapperRules: { binary, unary, postfix } }`. The loader validates
+    // the atom reference resolves and rejects unknown keys so a typo
+    // (e.g. `minPrecdence`) doesn't silently use the default.
+    // `wrapperRules` is REQUIRED — every `expr` shape declares the
+    // three Pratt-walker wrapper rule names the engine will synthesize
+    // around operator-precedence results (08.55 cleanup). Operator-
+    // table consumption is the parser's responsibility, not the
+    // loader's.
     if (body.contains("expr")) {
         json const& exprBody = body.at("expr");
         const auto exprPath = std::format("{}/expr", path);
+        // Nested-expr rejection. Wrapper-rule packs are keyed by the
+        // OWNING top-level shape's RuleId (see `walkExprBodies` Pass A.2
+        // below); an `expr` declared inside a sequence/alt/optional/repeat
+        // body would key on the wrong rule and silently miss at parse
+        // time. Top-level path is `/shapes/<name>`; anything deeper means
+        // we've recursed through a non-expr kind. Reject loudly here
+        // rather than threading per-position keying through the loader.
+        const std::string kShapesPrefix = "/shapes/";
+        const bool topLevel =
+            path.starts_with(kShapesPrefix)
+            && path.find('/', kShapesPrefix.size()) == std::string::npos;
+        if (!topLevel) {
+            c.emit(DiagnosticCode::C_UnknownShape, exprPath,
+                   "'expr' body must be at the top of a shape definition; "
+                   "nested `expr` declarations are not supported");
+            return;
+        }
         if (!exprBody.is_object()) {
             c.emit(DiagnosticCode::C_MissingField, exprPath,
                    "'expr' body must be an object with an 'atom' field");
@@ -518,12 +552,86 @@ void collectReferences(json const& body,
                    "'expr' requires a string 'atom' field naming the operand rule");
         } else {
             outRefs.push_back(exprBody.at("atom").get<std::string>());
-            // Allowlist: anything other than atom/minPrecedence is a typo.
+            // Allowlist: anything other than atom/minPrecedence/wrapperRules
+            // is a typo.
             for (auto const& [k, _] : exprBody.items()) {
-                if (k != "atom" && k != "minPrecedence") {
+                if (k != "atom" && k != "minPrecedence" && k != "wrapperRules") {
                     c.emit(DiagnosticCode::C_UnknownShape,
                            std::format("{}/{}", exprPath, k),
-                           std::format("unknown 'expr' field '{}' — expected 'atom' or 'minPrecedence'", k));
+                           std::format("unknown 'expr' field '{}' — expected 'atom', 'minPrecedence', or 'wrapperRules'", k));
+                }
+            }
+            // `wrapperRules` validation. The actual interning of the
+            // declared names happens later (Pass A on shapes), so here
+            // we only emit the shape diagnostic — missing block or any
+            // missing/empty field is C_MissingWrapperRules. The walker
+            // and the shape-existence validator both read the resulting
+            // RuleIds out of the schema; if validation surfaces an
+            // error here, those downstream stages are skipped.
+            if (!exprBody.contains("wrapperRules")) {
+                c.emit(DiagnosticCode::C_MissingWrapperRules,
+                       std::format("{}/wrapperRules", exprPath),
+                       "'expr' requires a 'wrapperRules' object with "
+                       "'binary', 'unary', and 'postfix' rule names");
+            } else {
+                json const& wr = exprBody.at("wrapperRules");
+                const auto wrPath = std::format("{}/wrapperRules", exprPath);
+                if (!wr.is_object()) {
+                    c.emit(DiagnosticCode::C_MissingWrapperRules, wrPath,
+                           "'wrapperRules' must be an object with 'binary', "
+                           "'unary', and 'postfix' string fields");
+                } else {
+                    for (auto const* key : {"binary", "unary", "postfix"}) {
+                        if (!wr.contains(key) || !wr.at(key).is_string()
+                            || wr.at(key).get<std::string>().empty()) {
+                            c.emit(DiagnosticCode::C_MissingWrapperRules,
+                                   std::format("{}/{}", wrPath, key),
+                                   std::format("'wrapperRules.{}' is required and "
+                                               "must be a non-empty string naming "
+                                               "the Pratt-walker wrapper rule", key));
+                        }
+                    }
+                    // Pairwise-distinct check. The walker tags each Pratt
+                    // frame by the wrapper RuleId; duplicates collapse
+                    // distinct frame classes into one bucket and silently
+                    // miscount nesting depth. A dedicated diagnostic code
+                    // (`C_DuplicateWrapperRules`) keeps "missing" and
+                    // "duplicate" as distinct failure classes for tooling.
+                    auto wrapperName = [&](char const* key) -> std::string {
+                        if (!wr.contains(key) || !wr.at(key).is_string()) return {};
+                        return wr.at(key).get<std::string>();
+                    };
+                    const auto nb = wrapperName("binary");
+                    const auto nu = wrapperName("unary");
+                    const auto np = wrapperName("postfix");
+                    if (!nb.empty() && !nu.empty() && nb == nu) {
+                        c.emit(DiagnosticCode::C_DuplicateWrapperRules, wrPath,
+                               std::format("'wrapperRules.binary' and 'wrapperRules.unary' "
+                                           "must name distinct rules (both are '{}')", nb));
+                    }
+                    if (!nu.empty() && !np.empty() && nu == np) {
+                        c.emit(DiagnosticCode::C_DuplicateWrapperRules, wrPath,
+                               std::format("'wrapperRules.unary' and 'wrapperRules.postfix' "
+                                           "must name distinct rules (both are '{}')", nu));
+                    }
+                    if (!nb.empty() && !np.empty() && nb == np) {
+                        c.emit(DiagnosticCode::C_DuplicateWrapperRules, wrPath,
+                               std::format("'wrapperRules.binary' and 'wrapperRules.postfix' "
+                                           "must name distinct rules (both are '{}')", nb));
+                    }
+                    // Allowlist: anything other than the three known keys
+                    // is a typo. Use C_UnknownShape (matches the expr-body
+                    // unknown-key check a few lines above) — C_MissingWrapperRules
+                    // is reserved for "block/field absent or empty".
+                    for (auto const& [k, _] : wr.items()) {
+                        if (k != "binary" && k != "unary" && k != "postfix") {
+                            c.emit(DiagnosticCode::C_UnknownShape,
+                                   std::format("{}/{}", wrPath, k),
+                                   std::format("unknown 'wrapperRules' field '{}' "
+                                               "— expected 'binary', 'unary', or "
+                                               "'postfix'", k));
+                        }
+                    }
                 }
             }
         }
@@ -1027,15 +1135,14 @@ void validateOperatorBodyRules(GrammarSchemaData& data, Collector& coll) {
     for (std::uint32_t r = 1; r < interner.size(); ++r) {
         const RuleId rule{r};
         if (data.compiledRules.contains(rule.v)) continue;
-        // Pratt walker synthesizes `binaryExpr`/`unaryExpr`/`postfixExpr`
-        // frames without a schema shape; any new walker-only wrapper
-        // must be added to this skip list (and to `well_known_names.hpp`).
+        // Pratt walker synthesizes per-`expr`-shape wrapper-rule
+        // frames without a schema shape — the loader's wrapper-rule
+        // intern pass populates `data.wrapperRuleIds` from each
+        // `expr.wrapperRules` block, and this skip list is keyed on
+        // that set. No hardcoded names anywhere in the engine
+        // (08.55 cleanup).
+        if (data.wrapperRuleIds.contains(rule.v)) continue;
         const auto name = interner.name(rule);
-        if (name == rules::kBinaryExpr
-            || name == rules::kUnaryExpr
-            || name == rules::kPostfixExpr) {
-            continue;
-        }
         // Postfix is the only arity that carries `bodyRule`, so iterate
         // just that slice — O(N) in the declared-token count, trivial
         // at load time.
@@ -2094,72 +2201,123 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 (void)data.rules->intern(shapeName);
             }
 
-            // Auto-intern the Pratt-walker wrapper rules. The parser
-            // synthesizes `binaryExpr`/`unaryExpr`/`postfixExpr` frames
-            // around operator-precedence results; those frames need
-            // valid RuleIds. We auto-intern only when the schema
-            // actually uses `expr` shapes (i.e. opts into Pratt
-            // dispatch); other schemas keep their lean rule interner.
-            // The wrapper rules have no compiled body — they're
-            // parser-managed and the schema cursor walks transparently
-            // past them (silently invalid through the wrapper frame,
-            // recovering on close; no P_SchemaCursorDesync since the
-            // transitions skip the wasValid→!nowValid check).
+            // Auto-intern each `expr` shape's declared wrapper rule
+            // names (08.55 cleanup; schema v4 `expr.wrapperRules`).
+            // Per-`expr`-shape — the engine no longer hardcodes
+            // `binaryExpr`/`unaryExpr`/`postfixExpr` anywhere. The
+            // walker reads the resulting RuleIds out of the schema
+            // (`GrammarSchema::exprWrapperRules(rule)`) and synthesizes
+            // wrapper frames around operator-precedence results.
             //
-            // Reject user-declared shapes named `binaryExpr` /
-            // `unaryExpr` / `postfixExpr` — they're walker-synthesized
-            // and a user redeclaration would let the schema cursor see
-            // a body for them, breaking the "transparent wrapper"
-            // invariant. Surface as C_UnknownShape at the named path.
-            for (auto const& reserved
-                 : {"binaryExpr", "unaryExpr", "postfixExpr"}) {
-                if (doc.at("shapes").contains(reserved)) {
-                    coll.emit(
-                        DiagnosticCode::C_UnknownShape,
-                        std::format("/shapes/{}", reserved),
-                        std::format(
-                            "shape name '{}' is reserved for the "
-                            "Pratt-walker wrapper rule (auto-interned "
-                            "when the schema declares any `expr` shape); "
-                            "rename the user shape", reserved));
-                }
-            }
-
+            // Wrapper rules have no compiled body — they're walker-
+            // managed and the schema cursor walks transparently past
+            // them. To keep the cursor from re-entering through a
+            // user-declared rule of the same name, reject any
+            // `shapes.<name>` redeclaration of a wrapper rule (a
+            // user-defined body for a wrapper name would let the
+            // cursor walk through it instead of the walker).
+            //
             // Recursive scan: `expr` may be nested inside any
             // sequence/alt/optional/repeat body, not only top-level.
-            // A flat scan would miss `{ "sequence": [ { "expr": {...} } ] }`
-            // and the walker would later fatal-abort on a missing
-            // wrapper-rule lookup.
-            auto containsExprBody = [](auto const& self,
-                                       json const& body) -> bool {
-                if (!body.is_object()) return false;
-                if (body.contains("expr")) return true;
+            // A flat scan would miss `{ "sequence": [ { "expr": {...} } ] }`.
+            auto walkExprBodies = [](auto const& self,
+                                     json const& body,
+                                     auto const& sink) -> void {
+                if (!body.is_object()) return;
+                if (body.contains("expr") && body.at("expr").is_object()) {
+                    sink(body.at("expr"));
+                }
                 for (auto const& key : {"sequence", "alt"}) {
                     if (body.contains(key) && body.at(key).is_array()) {
                         for (auto const& child : body.at(key)) {
-                            if (self(self, child)) return true;
+                            self(self, child, sink);
                         }
                     }
                 }
                 for (auto const& key : {"optional", "repeat"}) {
                     if (body.contains(key)) {
-                        if (self(self, body.at(key))) return true;
+                        self(self, body.at(key), sink);
                     }
                 }
-                return false;
             };
-            bool schemaUsesExpr = false;
+
+            // Pass A.1: collect declared wrapper-rule names + reject
+            // shape redeclarations of any of them. Done before the
+            // intern pass so the shape redeclaration check runs
+            // against the union of names actually declared in this
+            // schema (one config might use `bExpr`/`uExpr`/`pExpr`,
+            // another `binaryExpr`/...).
+            std::vector<std::string> wrapperNames;
             for (auto const& [shapeName, body] : doc.at("shapes").items()) {
                 (void)shapeName;
-                if (containsExprBody(containsExprBody, body)) {
-                    schemaUsesExpr = true;
-                    break;
+                walkExprBodies(walkExprBodies, body,
+                               [&](json const& exprBody) {
+                    if (!exprBody.contains("wrapperRules")) return;
+                    json const& wr = exprBody.at("wrapperRules");
+                    if (!wr.is_object()) return;
+                    for (auto const* key : {"binary", "unary", "postfix"}) {
+                        if (wr.contains(key) && wr.at(key).is_string()) {
+                            const auto name = wr.at(key).get<std::string>();
+                            if (!name.empty()) wrapperNames.push_back(name);
+                        }
+                    }
+                });
+            }
+            // Dedup + reject shape redeclarations.
+            std::sort(wrapperNames.begin(), wrapperNames.end());
+            wrapperNames.erase(std::unique(wrapperNames.begin(),
+                                           wrapperNames.end()),
+                               wrapperNames.end());
+            for (auto const& name : wrapperNames) {
+                if (doc.at("shapes").contains(name)) {
+                    coll.emit(
+                        DiagnosticCode::C_UnknownShape,
+                        std::format("/shapes/{}", name),
+                        std::format(
+                            "shape name '{}' is declared as a "
+                            "Pratt-walker wrapper rule by an `expr` "
+                            "shape's `wrapperRules` — wrapper rules "
+                            "are walker-synthesized and cannot have a "
+                            "compiled shape body; rename the user "
+                            "shape", name));
                 }
             }
-            if (schemaUsesExpr) {
-                for (auto const& name : {"binaryExpr", "unaryExpr", "postfixExpr"}) {
-                    (void)data.rules->intern(name);
-                }
+            // Intern every declared wrapper-rule name; record their
+            // RuleIds in `data.wrapperRuleIds` so the shape-existence
+            // skip-list (`validateOperatorBodyRules`) reads them out
+            // of the schema rather than hardcoding names.
+            for (auto const& name : wrapperNames) {
+                const auto rid = data.rules->intern(name);
+                data.wrapperRuleIds.insert(rid.v);
+            }
+            // Per-`expr`-rule wrapper-rule resolution. Keyed by the
+            // owning expr rule's RuleId so the walker can look up the
+            // bundle on entry.
+            for (auto const& [shapeName, body] : doc.at("shapes").items()) {
+                walkExprBodies(walkExprBodies, body,
+                               [&](json const& exprBody) {
+                    // Only record when the owning rule is a top-level
+                    // shape (the walker dispatch happens per rule, and
+                    // every shipped schema declares its `expr` at the
+                    // top level of a rule body). The `walkExprBodies`
+                    // call site iterates shapes so we know `shapeName`
+                    // is the owning rule.
+                    if (!exprBody.contains("wrapperRules")) return;
+                    json const& wr = exprBody.at("wrapperRules");
+                    if (!wr.is_object()) return;
+                    ExprWrapperRules pack{};
+                    for (auto const* key : {"binary", "unary", "postfix"}) {
+                        if (!wr.contains(key) || !wr.at(key).is_string()) return;
+                        const auto n = wr.at(key).get<std::string>();
+                        if (n.empty()) return;
+                        const auto rid = data.rules->intern(n);
+                        if (std::string{key} == "binary")       pack.binary  = rid;
+                        else if (std::string{key} == "unary")   pack.unary   = rid;
+                        else /* postfix */                       pack.postfix = rid;
+                    }
+                    const auto ownerRid = data.rules->intern(shapeName);
+                    data.exprWrapperRules.emplace(ownerRid.v, pack);
+                });
             }
 
             // Pass B: validate references — every string atom must resolve
@@ -2212,6 +2370,255 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 validateBodyDefaultKindsOffGrammar(data, coll);
                 validateOperatorBodyRules  (data, coll);
             }
+        }
+    }
+
+    // numberStyle ── numeric-literal lexical grammar (08.55 cleanup;
+    // schema v4). Optional; absent for languages that don't lex numeric
+    // literals (toy). REQUIRED when any shape references `IntLiteral` or
+    // `FloatLiteral` — the tokenizer's scanNumber() drives entirely from
+    // this block, so omitting it would leave numeric scanning without
+    // rules. Parsed AFTER shapes so the gate ("does any shape reference
+    // IntLiteral/FloatLiteral?") has authoritative data.
+    {
+        // Compute the "language uses numeric literals" gate.
+        // Reaches into the compiled shapes' position tables, which are
+        // already populated by the buildPositionTables() pass above.
+        const auto intLitId   = data.schemaTokens->find("IntLiteral");
+        const auto floatLitId = data.schemaTokens->find("FloatLiteral");
+        bool usesNumericLiteralTokens = false;
+        for (auto const& [ruleIdV, rule] : data.compiledRules) {
+            (void)ruleIdV;
+            for (auto const& p : rule.positions) {
+                if (p.slotKind() != SlotKind::TokenLeaf) continue;
+                if (p.tokenId().v == intLitId.v || p.tokenId().v == floatLitId.v) {
+                    usesNumericLiteralTokens = true;
+                    break;
+                }
+            }
+            if (usesNumericLiteralTokens) break;
+        }
+
+        if (doc.contains("numberStyle")) {
+            json const& ns = doc.at("numberStyle");
+            if (!ns.is_object()) {
+                coll.emit(DiagnosticCode::C_InvalidNumberStyle, "/numberStyle",
+                          "'numberStyle' must be an object");
+            } else {
+                NumberStyle style;
+
+                // decimal — optional bool, default false.
+                if (ns.contains("decimal")) {
+                    if (!ns.at("decimal").is_boolean()) {
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  "/numberStyle/decimal",
+                                  "'numberStyle.decimal' must be a boolean");
+                    } else {
+                        style.decimal = ns.at("decimal").get<bool>();
+                    }
+                }
+
+                // integerPrefixes — optional array of objects.
+                if (ns.contains("integerPrefixes")) {
+                    if (!ns.at("integerPrefixes").is_array()) {
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  "/numberStyle/integerPrefixes",
+                                  "'numberStyle.integerPrefixes' must be an array");
+                    } else {
+                        json const& arr = ns.at("integerPrefixes");
+                        for (std::size_t i = 0; i < arr.size(); ++i) {
+                            const auto ppath = std::format("/numberStyle/integerPrefixes/{}", i);
+                            if (!arr[i].is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidNumberStyle, ppath,
+                                          "each integer prefix must be an object with "
+                                          "'prefix', 'radix', and 'digits' fields");
+                                continue;
+                            }
+                            NumberPrefix np{};
+                            if (!arr[i].contains("prefix") || !arr[i].at("prefix").is_string()
+                                || arr[i].at("prefix").get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          std::format("{}/prefix", ppath),
+                                          "'prefix' must be a non-empty string");
+                                continue;
+                            }
+                            np.prefix = arr[i].at("prefix").get<std::string>();
+                            if (!arr[i].contains("radix") || !arr[i].at("radix").is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          std::format("{}/radix", ppath),
+                                          "'radix' must be an integer in [2,36]");
+                                continue;
+                            }
+                            const auto r = arr[i].at("radix").get<int>();
+                            if (r < 2 || r > 36) {
+                                coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                          std::format("{}/radix", ppath),
+                                          std::format("radix {} is out of range [2,36]", r));
+                                continue;
+                            }
+                            np.radix = static_cast<std::uint8_t>(r);
+                            if (!arr[i].contains("digits") || !arr[i].at("digits").is_string()
+                                || arr[i].at("digits").get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          std::format("{}/digits", ppath),
+                                          "'digits' must be a non-empty character-class "
+                                          "string (e.g. \"0-9a-fA-F\")");
+                                continue;
+                            }
+                            np.digits = arr[i].at("digits").get<std::string>();
+                            style.integerPrefixes.push_back(std::move(np));
+                        }
+                    }
+                }
+
+                // exponent — optional object.
+                if (ns.contains("exponent")) {
+                    json const& e = ns.at("exponent");
+                    if (!e.is_object()) {
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  "/numberStyle/exponent",
+                                  "'numberStyle.exponent' must be an object");
+                    } else {
+                        NumberExponent ne{};
+                        if (!e.contains("letters") || !e.at("letters").is_array()
+                            || e.at("letters").empty()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      "/numberStyle/exponent/letters",
+                                      "'exponent.letters' must be a non-empty "
+                                      "array of single-character strings");
+                        } else {
+                            bool ok = true;
+                            for (std::size_t i = 0; i < e.at("letters").size(); ++i) {
+                                auto const& lj = e.at("letters")[i];
+                                if (!lj.is_string() || lj.get<std::string>().size() != 1) {
+                                    coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                              std::format("/numberStyle/exponent/letters/{}", i),
+                                              "each exponent letter must be a "
+                                              "single-character string");
+                                    ok = false;
+                                    continue;
+                                }
+                                ne.letters.push_back(lj.get<std::string>()[0]);
+                            }
+                            if (ok) {
+                                if (e.contains("signOptional")) {
+                                    if (!e.at("signOptional").is_boolean()) {
+                                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                                  "/numberStyle/exponent/signOptional",
+                                                  "'signOptional' must be a boolean");
+                                    } else {
+                                        ne.signOptional = e.at("signOptional").get<bool>();
+                                    }
+                                }
+                                style.exponent = std::move(ne);
+                            }
+                        }
+                    }
+                }
+
+                // fractionPoint — optional single char.
+                if (ns.contains("fractionPoint")) {
+                    if (!ns.at("fractionPoint").is_string()
+                        || ns.at("fractionPoint").get<std::string>().size() != 1) {
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  "/numberStyle/fractionPoint",
+                                  "'numberStyle.fractionPoint' must be a "
+                                  "single-character string");
+                    } else {
+                        style.fractionPoint = ns.at("fractionPoint").get<std::string>()[0];
+                    }
+                }
+
+                // digitSeparator — optional single char.
+                if (ns.contains("digitSeparator")) {
+                    if (!ns.at("digitSeparator").is_string()
+                        || ns.at("digitSeparator").get<std::string>().size() != 1) {
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  "/numberStyle/digitSeparator",
+                                  "'numberStyle.digitSeparator' must be a "
+                                  "single-character string");
+                    } else {
+                        style.digitSeparator = ns.at("digitSeparator").get<std::string>()[0];
+                    }
+                }
+
+                // integerSuffixes / floatSuffixes — optional string arrays.
+                auto readSuffixes = [&](char const* key,
+                                        std::vector<std::string>& out) {
+                    if (!ns.contains(key)) return;
+                    if (!ns.at(key).is_array()) {
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  std::format("/numberStyle/{}", key),
+                                  std::format("'numberStyle.{}' must be an array of strings",
+                                              key));
+                        return;
+                    }
+                    for (std::size_t i = 0; i < ns.at(key).size(); ++i) {
+                        auto const& sj = ns.at(key)[i];
+                        if (!sj.is_string() || sj.get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                      std::format("/numberStyle/{}/{}", key, i),
+                                      "each suffix must be a non-empty string");
+                            continue;
+                        }
+                        out.push_back(sj.get<std::string>());
+                    }
+                };
+                readSuffixes("integerSuffixes", style.integerSuffixes);
+                readSuffixes("floatSuffixes",   style.floatSuffixes);
+
+                // emitKind — required when the block is present.
+                if (!ns.contains("emitKind") || !ns.at("emitKind").is_object()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              "/numberStyle/emitKind",
+                              "'numberStyle.emitKind' is required and must be an "
+                              "object with 'integer' (and optionally 'float') "
+                              "token-kind names");
+                } else {
+                    json const& ek = ns.at("emitKind");
+                    auto readKind = [&](char const* key, SchemaTokenId& out, bool required) {
+                        if (!ek.contains(key)) {
+                            if (required) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          std::format("/numberStyle/emitKind/{}", key),
+                                          std::format("'emitKind.{}' is required", key));
+                            }
+                            return;
+                        }
+                        if (!ek.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                      std::format("/numberStyle/emitKind/{}", key),
+                                      std::format("'emitKind.{}' must be a string "
+                                                  "naming a token kind", key));
+                            return;
+                        }
+                        const auto n = ek.at(key).get<std::string>();
+                        if (!data.schemaTokens->contains(n)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      std::format("/numberStyle/emitKind/{}", key),
+                                      std::format("'emitKind.{}' references unknown "
+                                                  "token kind '{}'", key, n));
+                            return;
+                        }
+                        out = data.schemaTokens->find(n);
+                    };
+                    readKind("integer", style.emitKind.integer, /*required=*/true);
+                    // `float` is required iff any float-producing facet is declared.
+                    const bool needsFloat =
+                        style.exponent.has_value()
+                        || style.fractionPoint.has_value()
+                        || !style.floatSuffixes.empty();
+                    readKind("float", style.emitKind.floating, needsFloat);
+                }
+
+                data.numberStyle = std::move(style);
+            }
+        } else if (usesNumericLiteralTokens) {
+            coll.emit(DiagnosticCode::C_MissingNumberStyle, "/numberStyle",
+                      "language references 'IntLiteral'/'FloatLiteral' in a "
+                      "shape but declares no 'numberStyle' block — the "
+                      "tokenizer's numeric scanner is config-driven, so the "
+                      "block is required when numeric literal tokens are used");
         }
     }
 
