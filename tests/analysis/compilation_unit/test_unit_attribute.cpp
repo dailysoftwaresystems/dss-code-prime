@@ -29,14 +29,14 @@ namespace {
 using namespace dss;
 using dss::cu_test::makeToyUnit;
 
-// A tagged NodeId whose treeTag (4242) belongs to no tree in any test CU here
+// A tagged NodeId whose arenaTag (4242) belongs to no tree in any test CU here
 // (CUs are built from toy sources, whose trees get small monotonic ids) — i.e.
 // a stand-in for a NodeId leaked from another CompilationUnit's tree. The
 // fixed tag makes the cross-CU death-test regex exact and swap-proof.
 constexpr std::uint32_t kForeignTag = 4242;
 constexpr NodeId        kForeignNode{1, kForeignTag};
 
-// Encodes (treeTag, NodeId.v) so forEach output can be compared exactly
+// Encodes (arenaTag, NodeId.v) so forEach output can be compared exactly
 // without depending on per-tree iteration order.
 [[nodiscard]] std::uint64_t key(TreeId tree, NodeId node) {
     return (static_cast<std::uint64_t>(tree.v) << 32) | node.v;
@@ -166,9 +166,9 @@ TEST(UnitAttribute, UntaggedLiteralRoutesInSingleTreeUnit) {
     // equality is by .v).
     auto cu = makeToyUnit({"var a = x;"});
     NodeId const tagged = cu.trees()[0].root();
-    ASSERT_NE(tagged.treeTag, 0u);
+    ASSERT_NE(tagged.arenaTag, 0u);
     NodeId const untagged{tagged.v};
-    ASSERT_EQ(untagged.treeTag, 0u);
+    ASSERT_EQ(untagged.arenaTag, 0u);
 
     UnitAttribute<int> attr{cu};
     attr.set(untagged, 42);
@@ -220,7 +220,7 @@ TEST(UnitAttribute, MovedFromIsEmpty) {
 //
 // Each NodeId-keyed entry point routes independently through route_, so the
 // foreign-id abort is pinned on every one of them. The regex pins the exact
-// (fixed) source TreeId, so a swapped crossUnitFatal(cuId, treeTag) argument
+// (fixed) source TreeId, so a swapped crossUnitFatal(cuId, arenaTag) argument
 // order would print the CU id there instead and fail the match.
 
 TEST(UnitAttributeDeathTest, CrossUnitNodeIdAbortsOnSet) {

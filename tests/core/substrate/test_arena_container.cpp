@@ -32,7 +32,7 @@ TEST(ArenaContainer, BuilderEmitsTaggedIdsFromSlotOne) {
     const ShapeId a = b.addNode(ShapePod{1, 10});
     const ShapeId c = b.addNode(ShapePod{2, 20});
     EXPECT_EQ(a.v, 1u);
-    EXPECT_EQ(a.treeTag, 7u);
+    EXPECT_EQ(a.arenaTag, 7u);
     EXPECT_EQ(c.v, 2u);
     EXPECT_EQ(b.at(a).kind, 1);
     EXPECT_EQ(b.at(c).aux, 20u);
@@ -95,7 +95,7 @@ TEST(ArenaContainer, TruncateThenReAddResyncsIndexAndConstAt) {
     b.truncateTo(mark);
     const ShapeId re = b.addNode(ShapePod{3, 0});   // must reuse slot `mark`
     EXPECT_EQ(re.v, static_cast<std::uint32_t>(mark));
-    EXPECT_EQ(re.treeTag, 5u);
+    EXPECT_EQ(re.arenaTag, 5u);
     ShapeBuilder const& cb = b;
     EXPECT_EQ(cb.at(re).kind, 3);               // const at() overload
 }

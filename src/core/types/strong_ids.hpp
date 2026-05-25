@@ -28,28 +28,27 @@ namespace dss {
         constexpr auto operator<=>(Name const&) const = default;             \
     }
 
-// Arena-element id: an arena index `v` plus a provenance tag `treeTag` (the
-// owning arena's tag). `treeTag == 0` is the "untagged" sentinel — a literal
+// Arena-element id: an arena index `v` plus a provenance tag `arenaTag` (the
+// owning arena's tag). `arenaTag == 0` is the "untagged" sentinel — a literal
 // `Name{3}` constructed in tests passes the validators, while a tagged id
 // obtained from one arena and handed to another aborts with both tags in the
 // message (the SH3 cross-arena guard, generalized in src/core/substrate/).
 //
-// Equality and ordering compare `.v` ONLY; `treeTag` is provenance metadata,
+// Equality and ordering compare `.v` ONLY; `arenaTag` is provenance metadata,
 // not identity, so same-slot ids from different arenas compare equal and the
 // validators (not equality) are the enforcement point. This is the shape
 // `substrate::ArenaContainer`/`ArenaBuilder` require of their id parameter.
 //
-// (The field is named `treeTag` for its origin on Tree's NodeId; for other
-// arenas it carries that arena's tag — e.g. the owning CompilationUnitId for
-// TypeId. A rename to a neutral name is tracked in 08.5 as an HIR-era cleanup.)
+// (The field is named `arenaTag` — neutral across arenas: for NodeId it is the
+// source TreeId; for TypeId it is the owning CompilationUnitId.)
 #define DSS_ARENA_ID(Name)                                                   \
     struct Name {                                                            \
         constexpr Name() noexcept = default;                                 \
         constexpr explicit Name(std::uint32_t value) noexcept : v(value) {}  \
         constexpr Name(std::uint32_t value, std::uint32_t tag) noexcept      \
-            : v(value), treeTag(tag) {}                                      \
+            : v(value), arenaTag(tag) {}                                      \
         std::uint32_t v       = 0;                                           \
-        std::uint32_t treeTag = 0;                                           \
+        std::uint32_t arenaTag = 0;                                           \
         [[nodiscard]] constexpr bool valid() const noexcept { return v != 0; } \
         constexpr bool operator==(Name const& o) const noexcept { return v == o.v; } \
         constexpr auto operator<=>(Name const& o) const noexcept { return v <=> o.v; } \
@@ -75,7 +74,7 @@ DSS_STRONG_ID(SymbolId);
 DSS_STRONG_ID(TypeKindId);
 DSS_STRONG_ID(TypeNameId);
 
-// Arena-element ids (carry `treeTag`): NodeId is the Tree's node index; TypeId
+// Arena-element ids (carry `arenaTag`): NodeId is the Tree's node index; TypeId
 // is the CU-scoped type lattice's index (its arena tag is the CompilationUnitId).
 DSS_ARENA_ID(NodeId);
 DSS_ARENA_ID(TypeId);

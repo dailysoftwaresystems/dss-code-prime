@@ -19,14 +19,14 @@
 // symbol table: `UnitAttribute<SymbolId>` bound to one CU.
 //
 // Internally it holds one NodeAttribute<T> per tree and routes each NodeId to
-// the right one via NodeId.treeTag (the SH3 per-tree provenance). The extra
+// the right one via NodeId.arenaTag (the SH3 per-tree provenance). The extra
 // guard CU3 adds over NodeAttribute is *membership*: a tagged NodeId whose
-// treeTag belongs to a tree in a DIFFERENT CompilationUnit (a cross-CU leak)
+// arenaTag belongs to a tree in a DIFFERENT CompilationUnit (a cross-CU leak)
 // is not in this CU's routing table and aborts loud — the per-tree guard alone
 // can't catch this because TreeIds are globally unique, so a foreign id never
 // matches any single bound tree but would otherwise just "miss". (The one
 // provenance the guard CANNOT verify is an *untagged* literal NodeId in a
-// single-tree CU: with treeTag==0 there is nothing to check membership
+// single-tree CU: with arenaTag==0 there is nothing to check membership
 // against, so it routes to the sole tree on trust — see route_.)
 //
 // This is the binding layer (NodeId -> T), NOT a reverse index: there is no
@@ -134,20 +134,20 @@ public:
 
 private:
     // Map a NodeId to the index of its owning tree's NodeAttribute, enforcing
-    // CU membership. An untagged literal (treeTag == 0) is only routable when
+    // CU membership. An untagged literal (arenaTag == 0) is only routable when
     // the CU has exactly one tree; it is rejected as ambiguous in a multi-tree
     // CU and (since size() != 1) in a zero-tree CU. The per-tree NodeAttribute
     // still applies its own sentinel / bounds / tag checks once routed.
     [[nodiscard]] std::size_t route_(NodeId id) const {
-        if (id.treeTag == 0) {
+        if (id.arenaTag == 0) {
             if (perTree_.size() == 1) return 0;
             detail::unit_attr::unitAttrFatal(
-                "untagged NodeId (treeTag==0) is ambiguous in a multi-tree "
+                "untagged NodeId (arenaTag==0) is ambiguous in a multi-tree "
                 "(or empty) CompilationUnit");
         }
-        auto const it = tagToIndex_.find(id.treeTag);
+        auto const it = tagToIndex_.find(id.arenaTag);
         if (it == tagToIndex_.end()) {
-            detail::unit_attr::crossUnitFatal(cuId_.v, id.treeTag);
+            detail::unit_attr::crossUnitFatal(cuId_.v, id.arenaTag);
         }
         return it->second;
     }

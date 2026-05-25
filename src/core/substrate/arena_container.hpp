@@ -19,9 +19,9 @@
 // Conventions (preserved from Tree):
 //   - Slot 0 is the reserved sentinel; real ids start at 1. The builder
 //     emplaces it at construction.
-//   - Every emitted `Id` carries the arena's `Tag.v` in `Id.treeTag`; access
+//   - Every emitted `Id` carries the arena's `Tag.v` in `Id.arenaTag`; access
 //     validates it (untagged `Id{N}` literals pass — test ergonomics).
-//   - `Id` must expose `.v` (uint32 index), `.treeTag` (uint32 provenance,
+//   - `Id` must expose `.v` (uint32 index), `.arenaTag` (uint32 provenance,
 //     0 == untagged), `.valid()`, and a two-arg `(v, tag)` ctor.
 //   - `Tag` must expose `.v` (uint32).
 // Fatal-message wording comes from `ArenaNames<Id, Tag>`.
@@ -48,7 +48,7 @@ public:
     ArenaContainer& operator=(ArenaContainer&&) noexcept = default;
 
     // The arena's identity tag (NOT an element id) — what every emitted Id's
-    // `.treeTag` is matched against.
+    // `.arenaTag` is matched against.
     [[nodiscard]] Tag         id()        const noexcept { return tag_; }
     [[nodiscard]] std::size_t nodeCount() const noexcept { return nodes_.size(); }
     [[nodiscard]] bool        empty()     const noexcept { return nodes_.empty(); }

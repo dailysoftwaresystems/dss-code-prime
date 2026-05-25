@@ -121,7 +121,7 @@ private:
     // (e.g. a foreign-tree id deliberately passed in for a cross-tree
     // death test) are returned unchanged.
     [[nodiscard]] NodeId retagIfUntagged_(NodeId id) const noexcept {
-        return id.treeTag == 0 ? NodeId{id.v, id_.v} : id;
+        return id.arenaTag == 0 ? NodeId{id.v, id_.v} : id;
     }
 
     std::shared_ptr<SourceBuffer> src_;

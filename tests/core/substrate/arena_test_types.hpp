@@ -3,7 +3,7 @@
 // Two non-Tree arena type families for the substrate tests, proving
 // ArenaContainer / ArenaBuilder / ArenaAttribute are not coupled to
 // detail::Node / NodeId / TreeId. Each id mirrors NodeId's shape (index `.v`
-// + provenance `.treeTag`, equality on `.v` only) and each tag mirrors a
+// + provenance `.arenaTag`, equality on `.v` only) and each tag mirrors a
 // DSS_STRONG_ID (just `.v`).
 
 #include <cstdint>
@@ -15,10 +15,10 @@ namespace dss::substrate_test {
 // ── "shape" arena ──
 struct ShapeId {
     std::uint32_t v       = 0;
-    std::uint32_t treeTag = 0;
+    std::uint32_t arenaTag = 0;
     constexpr ShapeId() noexcept = default;
     constexpr explicit ShapeId(std::uint32_t value) noexcept : v(value) {}
-    constexpr ShapeId(std::uint32_t value, std::uint32_t tag) noexcept : v(value), treeTag(tag) {}
+    constexpr ShapeId(std::uint32_t value, std::uint32_t tag) noexcept : v(value), arenaTag(tag) {}
     [[nodiscard]] constexpr bool valid() const noexcept { return v != 0; }
     constexpr bool operator==(ShapeId const& o) const noexcept { return v == o.v; }
 };
@@ -36,10 +36,10 @@ struct ShapePod {
 // ── "value" arena (a distinct pod + id family) ──
 struct ValueId {
     std::uint32_t v       = 0;
-    std::uint32_t treeTag = 0;
+    std::uint32_t arenaTag = 0;
     constexpr ValueId() noexcept = default;
     constexpr explicit ValueId(std::uint32_t value) noexcept : v(value) {}
-    constexpr ValueId(std::uint32_t value, std::uint32_t tag) noexcept : v(value), treeTag(tag) {}
+    constexpr ValueId(std::uint32_t value, std::uint32_t tag) noexcept : v(value), arenaTag(tag) {}
     [[nodiscard]] constexpr bool valid() const noexcept { return v != 0; }
     constexpr bool operator==(ValueId const& o) const noexcept { return v == o.v; }
 };

@@ -21,7 +21,7 @@
 // The choice is internal; the public API is identical in either mode.
 //
 // `ArenaT` requirements (duck-typed): a nested `IdType` (the element id, with
-// `.v` / `.treeTag` / `.valid()` and a two-arg `(v, tag)` ctor + std::hash) and
+// `.v` / `.arenaTag` / `.valid()` and a two-arg `(v, tag)` ctor + std::hash) and
 // `TagType` (the arena's identity tag, with `.v`); plus `id() -> TagType` and
 // `nodeCount() -> std::size_t`. Fatal-message wording comes from
 // `ArenaNames<IdType, TagType>`.
@@ -184,13 +184,13 @@ private:
             detail::arena::attrInvalidSentinel(Names::attribute, Names::element);
         if (id.v >= arena_->nodeCount())
             detail::arena::attrOutOfBounds(Names::attribute, Names::element);
-        // Untagged id (treeTag == 0) passes — preserves the existing test
+        // Untagged id (arenaTag == 0) passes — preserves the existing test
         // ergonomics of literal `IdType{N}`. A non-zero tag that differs from
         // the bound arena's tag means the caller pulled this id from a
         // different arena; fail loud with both tags.
-        if (id.treeTag != 0 && id.treeTag != tag_.v)
+        if (id.arenaTag != 0 && id.arenaTag != tag_.v)
             detail::arena::attrCrossArena(Names::attribute, Names::element, Names::tag,
-                                          tag_.v, id.treeTag);
+                                          tag_.v, id.arenaTag);
     }
 
     template <typename Self>

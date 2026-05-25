@@ -7,7 +7,7 @@
 // Cross-arena guard primitive shared by ArenaContainer (element access) and
 // ArenaAttribute (side-table access). Both stamp a per-arena tag onto every id
 // and validate it on every access — an id from arena A used against arena B
-// aborts loudly. This is the generalization of Tree's SH3 `treeTag` discipline.
+// aborts loudly. This is the generalization of Tree's SH3 `arenaTag` discipline.
 //
 // Fatal-message wording is driven by `ArenaNames<Id, Tag>` so each domain
 // reproduces its own diagnostics. The primary template gives generic names;
@@ -72,15 +72,15 @@ namespace detail::arena {
 }
 
 // The element-access guard shared by ArenaContainer::at and ArenaBuilder::at:
-// bounds first, then the cross-arena tag check (untagged ids — treeTag == 0 —
+// bounds first, then the cross-arena tag check (untagged ids — arenaTag == 0 —
 // pass, preserving literal-id test ergonomics). `Names` supplies the wording.
 template <class Names, class Id, class Tag>
 inline void validateElement(Id id, Tag tag, std::size_t count) {
     if (!id.valid() || id.v >= count) {
         outOfRange(Names::access, Names::element);
     }
-    if (id.treeTag != 0 && id.treeTag != tag.v) {
-        crossArenaAccess(Names::access, Names::element, Names::tag, id.treeTag, tag.v);
+    if (id.arenaTag != 0 && id.arenaTag != tag.v) {
+        crossArenaAccess(Names::access, Names::element, Names::tag, id.arenaTag, tag.v);
     }
 }
 

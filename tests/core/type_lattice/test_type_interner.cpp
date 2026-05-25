@@ -28,7 +28,7 @@ TEST(TypeInterner, PrimitivesCanonicalize) {
     EXPECT_NE(f32a.v, i32.v);
     EXPECT_EQ(ti.kind(f32a), TypeKind::F32);
     EXPECT_EQ(ti.size(), 2u);             // f32 + i32 (not 3)
-    EXPECT_EQ(f32a.treeTag, 1u);          // carries owner-CU provenance
+    EXPECT_EQ(f32a.arenaTag, 1u);          // carries owner-CU provenance
 }
 
 TEST(TypeInterner, VectorOfF32x4InternsToOneTypeId) {

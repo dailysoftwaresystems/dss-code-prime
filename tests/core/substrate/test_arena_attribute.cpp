@@ -164,7 +164,7 @@ TEST(ArenaAttribute, DenseModeOperationsAndTaggedIteration) {
     // The dense iterator synthesizes ids tagged with the arena's tag.
     int seen = 0;
     for (auto const& [id, value] : attr) {
-        EXPECT_EQ(id.treeTag, 7u);
+        EXPECT_EQ(id.arenaTag, 7u);
         ++seen;
         (void)value;
     }

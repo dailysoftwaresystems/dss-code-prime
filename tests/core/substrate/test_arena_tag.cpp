@@ -1,6 +1,6 @@
 // SP1: the cross-arena guard — an id minted by one arena instance must abort
 // when used against a different instance (the generalization of SH3's
-// cross-tree treeTag discipline). Untagged literals still pass (test
+// cross-tree arenaTag discipline). Untagged literals still pass (test
 // ergonomics). Distinct arena *types* can't be confused at all — that's a
 // compile-time type mismatch, a strictly stronger guarantee.
 
@@ -34,7 +34,7 @@ using ShapeBuilder = ArenaBuilder<ShapePod, ShapeId, ShapeTag>;
 TEST(ArenaTag, UntaggedLiteralPasses) {
     auto arena = oneNodeArena(111);
     ArenaAttribute<ShapeArena, int> attr{arena};
-    attr.set(ShapeId{1}, 42);                       // treeTag == 0 — must pass
+    attr.set(ShapeId{1}, 42);                       // arenaTag == 0 — must pass
     EXPECT_EQ(attr.get(ShapeId{1, 111}), 42);       // same slot, tagged equivalent
     EXPECT_EQ(arena.at(ShapeId{1}).kind, 1);        // container accepts untagged too
 }
@@ -68,7 +68,7 @@ TEST(ArenaTagDeathTest, DenseIteratorIdRejectedByForeignAttribute) {
     for (std::uint32_t i = 1; i <= 11; ++i) attrA.set(ShapeId{i, 111}, 0);
     ASSERT_TRUE(attrA.isDense());
     const ShapeId yielded = (*attrA.begin()).first;
-    ASSERT_EQ(yielded.treeTag, 111u);
+    ASSERT_EQ(yielded.arenaTag, 111u);
 
     auto b = oneNodeArena(222);
     ArenaAttribute<ShapeArena, int> attrB{b};
