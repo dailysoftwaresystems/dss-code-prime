@@ -6,6 +6,8 @@
 // + provenance `.arenaTag`, equality on `.v` only) and each tag mirrors a
 // DSS_STRONG_ID (just `.v`).
 
+#include "core/substrate/arena_tag.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -67,3 +69,26 @@ struct std::hash<dss::substrate_test::ValueId> {
         return std::hash<std::uint32_t>{}(id.v);
     }
 };
+
+// ArenaNames specializations — required since the primary template is a
+// must-specialize tripwire. These give the test arenas their own diagnostic
+// wording (which the death-test regexes pin).
+namespace dss::substrate {
+
+template <>
+struct ArenaNames<substrate_test::ShapeId, substrate_test::ShapeTag> {
+    static constexpr char const* attribute = "ShapeAttr";
+    static constexpr char const* element   = "ShapeId";
+    static constexpr char const* tag       = "ShapeTag";
+    static constexpr char const* access    = "ShapeArena::at";
+};
+
+template <>
+struct ArenaNames<substrate_test::ValueId, substrate_test::ValueTag> {
+    static constexpr char const* attribute = "ValueAttr";
+    static constexpr char const* element   = "ValueId";
+    static constexpr char const* tag       = "ValueTag";
+    static constexpr char const* access    = "ValueArena::at";
+};
+
+} // namespace dss::substrate

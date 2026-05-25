@@ -44,7 +44,7 @@ TEST(ArenaTagDeathTest, ContainerRejectsForeignArenaId) {
     auto arenaA = oneNodeArena(111);
     // An id tagged with arena B (222) used against arena A (111).
     EXPECT_DEATH({ (void)arenaA.at(ShapeId{1, 222}); },
-                 "id from ArenaTag=222 used on ArenaTag=111");
+                 "ShapeId from ShapeTag=222 used on ShapeTag=111");
 }
 
 TEST(ArenaTagDeathTest, AttributeRejectsForeignArenaId) {
@@ -52,7 +52,7 @@ TEST(ArenaTagDeathTest, AttributeRejectsForeignArenaId) {
     auto arenaA = oneNodeArena(111);
     ArenaAttribute<ShapeArena, int> attr{arenaA};
     EXPECT_DEATH({ attr.set(ShapeId{1, 222}, 1); },
-                 "ArenaAttribute bound to ArenaTag=111 got id from ArenaTag=222");
+                 "ShapeAttr bound to ShapeTag=111 got ShapeId from ShapeTag=222");
 }
 
 TEST(ArenaTagDeathTest, DenseIteratorIdRejectedByForeignAttribute) {
@@ -73,5 +73,5 @@ TEST(ArenaTagDeathTest, DenseIteratorIdRejectedByForeignAttribute) {
     auto b = oneNodeArena(222);
     ArenaAttribute<ShapeArena, int> attrB{b};
     EXPECT_DEATH({ attrB.set(yielded, 1); },
-                 "ArenaAttribute bound to ArenaTag=222 got id from ArenaTag=111");
+                 "ShapeAttr bound to ShapeTag=222 got ShapeId from ShapeTag=111");
 }

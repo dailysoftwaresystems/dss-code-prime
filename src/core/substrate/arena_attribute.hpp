@@ -46,6 +46,9 @@ inline constexpr std::size_t kPromoteFloor         = 16;
 template <class ArenaT, class T>
 class ArenaAttribute {
 public:
+    static_assert(Arena<ArenaT>,
+                  "ArenaAttribute<ArenaT, T>: ArenaT must satisfy the Arena concept "
+                  "(nested IdType/TagType + id()/nodeCount() + a hashable id)");
     static_assert(std::is_move_constructible_v<T>,
                   "ArenaAttribute<ArenaT, T>: T must be move-constructible");
 

@@ -114,7 +114,7 @@ TEST(ArenaContainerDeathTest, BuilderAtRejectsForeignArenaId) {
     ShapeBuilder b{ShapeTag{111}};
     b.addNode(ShapePod{1, 0});
     EXPECT_DEATH({ (void)b.at(ShapeId{1, 222}); },
-                 "id from ArenaTag=222 used on ArenaTag=111");
+                 "ShapeId from ShapeTag=222 used on ShapeTag=111");
 }
 
 TEST(ArenaContainerDeathTest, TruncateBelowSentinelAborts) {

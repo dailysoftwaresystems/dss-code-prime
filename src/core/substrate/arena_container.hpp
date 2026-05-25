@@ -28,7 +28,7 @@
 
 namespace dss::substrate {
 
-template <class Pod, class Id, class Tag>
+template <class Pod, ArenaId Id, ArenaTag Tag>
 class ArenaContainer {
 public:
     using PodType = Pod;
@@ -65,7 +65,7 @@ private:
     Tag              tag_;
 };
 
-template <class Pod, class Id, class Tag>
+template <class Pod, ArenaId Id, ArenaTag Tag>
 class ArenaBuilder {
 public:
     using PodType    = Pod;
