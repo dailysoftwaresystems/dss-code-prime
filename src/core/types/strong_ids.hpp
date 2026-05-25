@@ -38,6 +38,11 @@ DSS_STRONG_ID(LexerModeId);
 DSS_STRONG_ID(StringStyleId);
 DSS_STRONG_ID(SchemaId);
 DSS_STRONG_ID(CompilationUnitId);
+// CU-scoped symbol identity. Minted per-CompilationUnit (not per-Tree), so a
+// SymbolId is meaningful only against the CU that produced it — the semantic
+// phase keys its symbol table by SymbolId, bound through a NodeId via
+// `UnitAttribute<SymbolId>` (see analysis/compilation_unit/unit_attribute.hpp).
+DSS_STRONG_ID(SymbolId);
 
 #undef DSS_STRONG_ID
 
@@ -78,6 +83,7 @@ inline constexpr LexerModeId     InvalidLexerMode{};
 inline constexpr StringStyleId   InvalidStringStyle{};
 inline constexpr SchemaId        InvalidSchemaId{};
 inline constexpr CompilationUnitId InvalidCompilationUnit{};
+inline constexpr SymbolId        InvalidSymbol{};
 
 } // namespace dss
 
@@ -99,5 +105,6 @@ DSS_HASH_ID(LexerModeId);
 DSS_HASH_ID(StringStyleId);
 DSS_HASH_ID(SchemaId);
 DSS_HASH_ID(CompilationUnitId);
+DSS_HASH_ID(SymbolId);
 
 #undef DSS_HASH_ID
