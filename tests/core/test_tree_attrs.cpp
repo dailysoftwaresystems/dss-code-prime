@@ -622,7 +622,7 @@ TEST(NodeAttributeDeath, GetOnAbsentNodeIdAbortsDense) {
 namespace {
 Tree makeEmptyTree() {
     detail::TreeData td;
-    td.id = TreeId{4242};
+    td.arena = substrate::ArenaContainer<detail::Node, NodeId, TreeId>{std::vector<detail::Node>{}, TreeId{4242}};
     return Tree{std::move(td)};
 }
 } // namespace

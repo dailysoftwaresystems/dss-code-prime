@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/arena_container.hpp"    // Tree's node storage is an ArenaContainer
 #include "core/types/diagnostic_reporter.hpp"   // unique_ptr<DiagnosticReporter> needs the complete type
 #include "core/types/grammar_schema.hpp"        // shared_ptr<GrammarSchema const>
 #include "core/types/source_buffer.hpp"
@@ -14,6 +15,23 @@
 #include <span>
 #include <string_view>
 #include <vector>
+
+namespace dss::substrate {
+
+// Reproduce Tree's exact diagnostic wording so the existing death tests
+// (e.g. "NodeAttribute bound to TreeId=… got NodeId from TreeId=…",
+// "Tree::node_: NodeId out of range") match byte-for-byte after the arena
+// substrate generalization. Declared before the ArenaContainer<Node, …> use
+// in TreeData below so the specialization is always the one chosen.
+template <>
+struct ArenaNames<NodeId, TreeId> {
+    static constexpr char const* attribute = "NodeAttribute";
+    static constexpr char const* element   = "NodeId";
+    static constexpr char const* tag       = "TreeId";
+    static constexpr char const* access    = "Tree::node_";
+};
+
+} // namespace dss::substrate
 
 namespace dss {
 
@@ -34,11 +52,13 @@ struct DSS_EXPORT TreeData {
     std::shared_ptr<SourceBuffer>        source;
     std::shared_ptr<RuleInterner const>  rules;
     std::shared_ptr<GrammarSchema const> schema;          // null only in hand-built test trees
-    std::vector<Node>                    nodes;           // arena; index = NodeId.v
+    // Node storage + the tree's identity tag + the cross-tree access guard,
+    // all carried by the generalized arena substrate (SP1). The tree's `id`
+    // is `arena.id()`.
+    substrate::ArenaContainer<Node, NodeId, TreeId> arena;
     std::vector<NodeId>                  childIndex;      // flat child table
     std::unique_ptr<DiagnosticReporter>  diagnostics;     // null only in hand-built test trees
     NodeId                               root = InvalidNode;
-    TreeId                               id   = InvalidTree;
 };
 
 } // namespace detail
@@ -52,6 +72,11 @@ struct DSS_EXPORT TreeData {
 // side-tables — see NodeAttribute<T> — are the only mutable companion state.)
 class DSS_EXPORT Tree {
 public:
+    // Arena interface consumed by substrate::ArenaAttribute<Tree, T> (the type
+    // behind NodeAttribute<T>): the element id type and the arena's tag type.
+    using IdType  = NodeId;
+    using TagType = TreeId;
+
     explicit Tree(detail::TreeData&& data);
     ~Tree();    // out-of-line to permit unique_ptr<incomplete-type>
 

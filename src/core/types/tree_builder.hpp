@@ -327,7 +327,10 @@ private:
     std::unique_ptr<DiagnosticReporter>    reporter_;
     TreeId                                 treeId_;
 
-    std::vector<detail::Node>              nodes_;       // arena under construction
+    // Node arena under construction — the generalized substrate builder
+    // (SP1). emit_ appends through it; checkpoint/rollback use size()/
+    // truncateTo(); finish() && hands off a frozen ArenaContainer.
+    substrate::ArenaBuilder<detail::Node, NodeId, TreeId> arena_;
     std::vector<NodeId>                    childIndex_;  // flat children table under construction
 
     // Staging vector for children of open frames. Each open Frame owns the

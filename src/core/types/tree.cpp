@@ -8,7 +8,6 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
-#include <format>
 #include <utility>
 
 namespace dss {
@@ -29,7 +28,7 @@ namespace {
 
 Tree::Tree(detail::TreeData&& data) : data_(std::move(data)) {
     // Either the tree has nodes (and thus a valid root) or it is the empty tree.
-    if (!data_.nodes.empty() && !data_.root.valid()) {
+    if (data_.arena.nodeCount() != 0 && !data_.root.valid()) {
         treeFatal("Tree constructed with nodes but no valid root");
     }
 }
@@ -40,7 +39,7 @@ Tree& Tree::operator=(Tree&&) noexcept = default;
 
 // ── identity ──
 
-TreeId Tree::id() const noexcept { return data_.id; }
+TreeId Tree::id() const noexcept { return data_.arena.id(); }
 
 SourceBuffer const& Tree::source() const noexcept {
     // Pre-condition: TreeData::source must be non-null. The builder ensures it;
@@ -74,24 +73,16 @@ bool Tree::hasDiagnostics() const noexcept { return static_cast<bool>(data_.diag
 
 NodeId Tree::root() const noexcept { return data_.root; }
 
-std::size_t Tree::nodeCount() const noexcept { return data_.nodes.size(); }
+std::size_t Tree::nodeCount() const noexcept { return data_.arena.nodeCount(); }
 
 // ── universal accessors ──
 
 detail::Node const& Tree::node_(NodeId id) const {
-    if (!id.valid() || id.v >= data_.nodes.size()) {
-        treeFatal("Tree::node_: NodeId out of range");
-    }
-    // Untagged NodeId (treeTag == 0) passes — covers hand-fabricated test
-    // literals like `NodeId{3}`. A non-zero tag MUST match this tree's id
-    // or the access is cross-tree and aborts with both ids in the message.
-    if (id.treeTag != 0 && id.treeTag != data_.id.v) {
-        auto const msg = std::format(
-            "Tree::node_: NodeId from TreeId={} used on TreeId={}",
-            id.treeTag, data_.id.v);
-        treeFatal(msg.c_str());
-    }
-    return data_.nodes[id.v];
+    // Bounds + cross-tree-tag guard now live in the arena substrate
+    // (ArenaContainer::at), which reproduces the exact "Tree::node_: NodeId
+    // out of range" / "NodeId from TreeId=… used on TreeId=…" wording via the
+    // ArenaNames<NodeId, TreeId> specialization.
+    return data_.arena.at(id);
 }
 
 NodeKind   Tree::kind(NodeId id)   const { return node_(id).kind; }

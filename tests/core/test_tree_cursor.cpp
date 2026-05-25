@@ -462,7 +462,7 @@ TEST(TreeCursor, EmptyTreeMovementFailsCleanlyWithoutAbort) {
     // entry points return cursors at InvalidNode; every movement returns
     // false; accessors return sentinel/empty values; depth is 0.
     detail::TreeData td;
-    td.id = TreeId{99};
+    td.arena = substrate::ArenaContainer<detail::Node, NodeId, TreeId>{std::vector<detail::Node>{}, TreeId{99}};
     // No source, no rules, no schema, no diagnostics — empty in every sense.
     Tree t{std::move(td)};
 

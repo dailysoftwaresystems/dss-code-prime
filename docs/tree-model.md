@@ -241,6 +241,14 @@ dss::Tree fatal: Tree::node_: NodeId from TreeId=B used on TreeId=A
 
 Hand-fabricated literal `NodeId{N}` constants (treeTag == 0) bypass the cross-tree check so existing tests that mix literal and tree-emitted ids continue to assert structurally; the bounds check is still the catch for genuinely-bad untagged ids. `NodeId` equality and `std::hash<NodeId>` compare `.v` only — the tag is provenance metadata, not identity.
 
+**Under the hood: the generalized arena substrate.** Since SP1, `Tree` and `NodeAttribute<T>` are thin facades over a reusable substrate in `src/core/substrate/` so the later IR layers (HIR / MIR / LIR) and the CU-scoped symbol table build on the same plumbing instead of copy-pasting it:
+
+- `substrate::ArenaContainer<Pod, Id, Tag>` — the immutable dense arena (slot-0 sentinel, per-arena tag, bounds + cross-arena guard). `Tree` embeds an `ArenaContainer<detail::Node, NodeId, TreeId>`; `Tree::node_` delegates to its `at()`.
+- `substrate::ArenaBuilder<Pod, Id, Tag>` — the mutable counterpart (`addNode` → tagged id, `truncateTo` for speculative rollback, `finish() &&` → frozen container). `TreeBuilder` builds its nodes through one.
+- `substrate::ArenaAttribute<ArenaT, T>` — the side-table; **`NodeAttribute<T>` is exactly `ArenaAttribute<Tree, T>`**. Same API, same dual sparse↔dense storage, same guard.
+
+The cross-tree guard above is the `ArenaT = Tree` case of a general cross-*arena* guard; fatal-message wording per arena comes from a specializable `substrate::ArenaNames<Id, Tag>` (Tree specializes it to the `NodeAttribute`/`NodeId`/`TreeId` strings shown above). Everything in this section's API is unchanged — the generalization is internal.
+
 ---
 
 ## 6. Diagnostics — when something goes wrong
