@@ -7,6 +7,9 @@ dss_add_test(NAME analysis/compilation_unit/test_unit_attribute
 dss_add_test(NAME analysis/compilation_unit/test_symbol_population
              SOURCES test_symbol_population.cpp)
 
+dss_add_test(NAME analysis/compilation_unit/test_import_resolver
+             SOURCES test_import_resolver.cpp)
+
 # Reaches the shared `core/e2e_harness.hpp` (tokenize-a-shipped-config helper)
 # from a sibling test directory. dss_add_test only puts src/ on the include
 # path; add tests/ so `core/...` resolves. (Do NOT add the repo root — its
@@ -17,4 +20,6 @@ target_include_directories(dss_analysis_compilation_unit_test_compilation_unit
 target_include_directories(dss_analysis_compilation_unit_test_unit_attribute
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_compilation_unit_test_symbol_population
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_include_directories(dss_analysis_compilation_unit_test_import_resolver
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)

@@ -95,6 +95,16 @@ enum class DiagnosticCode : std::uint16_t {
     D_FileNotFound                = 0xD001,
     D_EmptyInput                  = 0xD002,
     D_DuplicateFile               = 0xD003,
+    // Import resolution (08-compilation-unit-plan §2.8, CU4). A reference to
+    // another translation unit could not be resolved within the CU:
+    //   D_UnresolvedImport    — a c-subset `#include "x.h"` whose file was not
+    //                           found in the including dir or any include dir.
+    //   D_UnresolvedReference — a tsql table reference (qualifiedName in table
+    //                           position) with no matching CREATE TABLE in the CU.
+    // Both are Warnings: phase #8 / FFI / a system catalog may still provide
+    // the target, so the driver does not treat them as build-fatal here.
+    D_UnresolvedImport            = 0xD004,
+    D_UnresolvedReference         = 0xD005,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

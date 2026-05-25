@@ -1,5 +1,6 @@
 add_library(analysis_compilation_unit OBJECT
     compilation_unit.cpp
+    import_resolver.cpp
     symbol_population.cpp
 )
 

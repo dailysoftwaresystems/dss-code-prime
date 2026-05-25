@@ -6,24 +6,46 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/parse_diagnostic.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace dss::cu_test {
 
-[[nodiscard]] inline std::shared_ptr<GrammarSchema const> loadToySchema() {
-    auto loaded = GrammarSchema::loadShipped("toy");
+[[nodiscard]] inline std::shared_ptr<GrammarSchema const> loadShippedSchema(std::string_view name) {
+    auto loaded = GrammarSchema::loadShipped(name);
     if (!loaded) {
-        ADD_FAILURE() << "loadShipped(\"toy\") failed";
+        ADD_FAILURE() << "loadShipped(\"" << name << "\") failed";
         std::abort();
     }
     return *loaded;
+}
+
+[[nodiscard]] inline std::shared_ptr<GrammarSchema const> loadToySchema() {
+    return loadShippedSchema("toy");
+}
+
+// True if any diagnostic in `reporter` carries `code`.
+[[nodiscard]] inline bool hasCode(DiagnosticReporter const& reporter, DiagnosticCode code) {
+    auto all = reporter.all();
+    return std::any_of(all.begin(), all.end(),
+                       [code](ParseDiagnostic const& d) { return d.code == code; });
+}
+
+[[nodiscard]] inline std::size_t countCode(DiagnosticReporter const& reporter, DiagnosticCode code) {
+    auto all = reporter.all();
+    return static_cast<std::size_t>(
+        std::count_if(all.begin(), all.end(),
+                      [code](ParseDiagnostic const& d) { return d.code == code; }));
 }
 
 // Build a CompilationUnit from one in-memory toy source per entry. Each source

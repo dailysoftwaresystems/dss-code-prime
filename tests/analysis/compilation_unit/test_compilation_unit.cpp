@@ -176,11 +176,12 @@ TEST(CompilationUnit, MoveAssignmentTransfersOwnership) {
     EXPECT_EQ(cu1.trees().size(), 2u);  // 2 trees from cu2, not 1 from cu1
 }
 
-TEST(CompilationUnit, CrossRefsEmptyInCU1) {
-    // LANDMARK(CU4): CU1 ships the CrossTreeRef struct + empty vector; CU4's
-    // ImportResolver is what populates it. When that lands, this empty-span
-    // assertion becomes wrong for multi-file CUs with imports — the CU4
-    // author MUST revisit this test deliberately (don't just delete it).
+TEST(CompilationUnit, CrossRefsEmptyForToy) {
+    // CU4 landed: the ImportResolver now populates crossRefs for c-subset
+    // (#include) and tsql-subset (table refs). toy is the identity resolver
+    // (no import syntax), so a toy CU still has zero cross-refs — this remains
+    // a valid, intentional assertion. Cross-language population is exercised in
+    // test_import_resolver.cpp.
     auto schema = loadToySchema();
     UnitBuilder b{schema};
     b.addTree(parseToyTree("var x = 1;"));

@@ -1,5 +1,6 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 
+#include "analysis/compilation_unit/import_resolver.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -12,6 +13,7 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -114,7 +116,7 @@ void UnitBuilder::addTree(Tree&& tree) {
     trees_.push_back(std::move(tree));
 }
 
-void UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src) {
+TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src) {
     // Empty translation unit is valid (consistent with "empty CU is valid"):
     // note it as Info but still parse + add the (empty) tree. Lives here so
     // both addFile and addInMemory get the check from one place; the buffer
@@ -132,6 +134,39 @@ void UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src) {
     auto [stream, lexDiags] = std::move(tk).tokenize();
     Parser p{src, schema_, std::move(stream), {}, std::move(lexDiags)};
     addTree(std::move(p).parse().tree);
+    return trees_.back().id();
+}
+
+void UnitBuilder::addIncludeDir(std::filesystem::path dir) {
+    if (finished_) {
+        cuFatal("UnitBuilder::addIncludeDir called after finish()");
+    }
+    includeDirs_.push_back(std::move(dir));
+}
+
+TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok) {
+    std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(path, ec);
+    std::string const key = (ec ? path.lexically_normal() : canonical).string();
+
+    // Already loaded (by addFile or a previous include) → reuse, no re-parse.
+    if (auto it = pathToTreeIndex_.find(key); it != pathToTreeIndex_.end()) {
+        ok = true;
+        return trees_[it->second].id();
+    }
+
+    std::shared_ptr<SourceBuffer> src;
+    try {
+        src = SourceBuffer::fromFile(path);
+    } catch (std::exception const&) {
+        ok = false;
+        return InvalidTree;  // caller (resolver) emits D_UnresolvedImport.
+    }
+    seenPaths_.insert(key);
+    TreeId const id = parseAndAdd_(std::move(src));
+    pathToTreeIndex_[key] = trees_.size() - 1;
+    ok = true;
+    return id;
 }
 
 void UnitBuilder::addInMemory(std::string source, std::string label) {
@@ -174,12 +209,31 @@ void UnitBuilder::addFile(std::filesystem::path path) {
         return;
     }
     parseAndAdd_(std::move(src));
+    // Record the path→tree mapping so a later #include resolving to this same
+    // file dedups against it instead of re-parsing.
+    pathToTreeIndex_[key] = trees_.size() - 1;
 }
 
 CompilationUnit UnitBuilder::finish() && {
     if (finished_) {
         cuFatal("UnitBuilder::finish() called twice");
     }
+
+    // Resolve imports BEFORE marking finished: the c-subset resolver may load
+    // additional included files (include-following) via the loadFile callback,
+    // which routes through addTree — and addTree aborts once finished_ is set.
+    std::vector<CrossTreeRef> crossRefs;
+    auto const resolver = chooseResolver(schema_->name());
+    ResolutionContext context{
+        trees_,
+        *schema_,
+        driverDiagnostics_,
+        includeDirs_,
+        [this](std::filesystem::path const& path, bool& ok) { return loadAndAdd_(path, ok); },
+        crossRefs,
+    };
+    resolver->resolve(context);
+
     finished_ = true;
     return CompilationUnit{
         CompilationUnit::PrivateTag{},
@@ -187,7 +241,7 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(schema_),
         std::move(trees_),
         std::move(driverDiagnostics_),
-        {} // crossRefs: empty in CU1 (L5/D4) — CU4 populates.
+        std::move(crossRefs),
     };
 }
 

@@ -64,6 +64,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
+        case DiagnosticCode::D_UnresolvedImport:         return "D_UnresolvedImport";
+        case DiagnosticCode::D_UnresolvedReference:      return "D_UnresolvedReference";
     }
     return "Unknown";
 }

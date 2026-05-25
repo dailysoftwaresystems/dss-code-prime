@@ -25,6 +25,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -146,6 +147,12 @@ public:
     // in-memory sources are explicit. Aborts if called after finish().
     void addInMemory(std::string source, std::string label);
 
+    // Declare a directory the c-subset import resolver searches for
+    // `#include "x.h"` targets (in addition to the including file's own
+    // directory). The full `.dss-project.json` include-path layer is AP2's
+    // job; this is the minimal hook CU4 needs. Aborts if called after finish().
+    void addIncludeDir(std::filesystem::path dir);
+
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
     // does not consume the lvalue, so a second rvalue-qualified call is
@@ -154,14 +161,25 @@ public:
 
 private:
     // Shared tail of addFile/addInMemory: tokenize → parse (folding lexer
-    // diagnostics into the Tree) → addTree. `src` must be non-null.
-    void parseAndAdd_(std::shared_ptr<SourceBuffer> src);
+    // diagnostics into the Tree) → addTree. `src` must be non-null. Returns
+    // the appended Tree's id.
+    TreeId parseAndAdd_(std::shared_ptr<SourceBuffer> src);
+
+    // Load + parse `path`, deduplicating by weakly-canonical path against
+    // files already added (via addFile or a prior include). Returns the
+    // resulting Tree's id; sets `ok` false (InvalidTree) when unreadable. This
+    // backs the import resolver's include-following in finish().
+    TreeId loadAndAdd_(std::filesystem::path const& path, bool& ok);
 
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
     std::vector<Tree>                    trees_;
     DiagnosticReporter                   driverDiagnostics_;
     std::unordered_set<std::string>      seenPaths_;   // weakly-canonical, for addFile dedup
+    // Weakly-canonical path → index into trees_, for include-following dedup
+    // (resolve an #include to an already-loaded tree instead of re-parsing).
+    std::unordered_map<std::string, std::size_t> pathToTreeIndex_;
+    std::vector<std::filesystem::path>   includeDirs_;
     bool                                 finished_ = false;
 };
 
