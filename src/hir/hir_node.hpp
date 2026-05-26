@@ -72,9 +72,12 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
 
 // Does a node of this kind carry a resolved result type — i.e. must its `typeId`
 // be `valid()`? True for the whole Expressions group (every expression has a
-// type, plan §2.4) plus `TypeRef` (which carries the referenced lattice TypeId).
-// False for declarations, statements, and the `Error`/`Unreachable` sentinels.
-// This is the predicate the HR2 verifier's expression-typing rule sweeps with.
+// type, plan §2.4), `TypeRef` (carries the referenced lattice TypeId), and
+// `VarDecl` (carries its DECLARED type: HIR materializes the resolved type onto
+// the node — rather than re-deriving it from a CST or symbol-table lookup at
+// lowering time — so MIR can size the variable's alloca directly; a typeless
+// VarDecl is unlowerable, so it fails loud at verify-time). False for the other
+// declarations/statements and the `Error`/`Unreachable` sentinels.
 //
 // `Extension` is intentionally false here: whether an extension kind produces a
 // value (and so requires a type) lives in its `HirKindDescriptor` operand/
@@ -91,19 +94,126 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::AddressOf: case HirKind::Deref:
         // ── Types-as-values: carries the referenced lattice TypeId ──
         case HirKind::TypeRef:
+        // ── Declaration carrying its own declared type ──
+        case HirKind::VarDecl:
             return true;
-        // ── Modules / Declarations / Statements / sentinels / Extension ──
+        // ── Modules / other declarations / statements / sentinels / Extension ──
         case HirKind::Module: case HirKind::Function: case HirKind::Global:
         case HirKind::TypeDecl: case HirKind::ExternFunction: case HirKind::ExternGlobal:
         case HirKind::ImportGroup: case HirKind::Block: case HirKind::IfStmt:
         case HirKind::WhileStmt: case HirKind::DoWhileStmt: case HirKind::ForStmt:
         case HirKind::SwitchStmt: case HirKind::CaseArm: case HirKind::BreakStmt:
         case HirKind::ContinueStmt: case HirKind::ReturnStmt: case HirKind::ExprStmt:
-        case HirKind::VarDecl: case HirKind::AssignStmt: case HirKind::Unreachable:
+        case HirKind::AssignStmt: case HirKind::Unreachable:
         case HirKind::Error: case HirKind::Extension: case HirKind::Count_:
             return false;
     }
     return false;  // unreachable for a well-formed core kind
+}
+
+// ── Structured-CF kind predicates + payload vocabulary (HR3) ─────────────────
+//
+// A "loop" kind iterates (continue targets one); a "branch target" kind is
+// anything break can leave (loops + switch). Used by the verifier's break/
+// continue scoping rule and by CST→HIR lowering (HR8) to compute branch indices.
+[[nodiscard]] constexpr bool isLoopKind(HirKind kind) noexcept {
+    return kind == HirKind::WhileStmt || kind == HirKind::DoWhileStmt
+        || kind == HirKind::ForStmt;
+}
+[[nodiscard]] constexpr bool isBranchTargetKind(HirKind kind) noexcept {
+    return isLoopKind(kind) || kind == HirKind::SwitchStmt;
+}
+
+// `ForStmt` clause-presence mask (HR3). The three C-style clauses are each
+// independently optional and absent parts cannot be invalid-sentinel children
+// (the builder rejects invalid child ids), so a `ForStmt`'s child list holds
+// only the PRESENT clauses, in Init/Cond/Update order, followed by the always-
+// present body — and the node `payload` records which clauses are present. This
+// is the MLIR "operand-segment" discipline: the child list stays hole-free for
+// generic passes, and the mask is read through the typed `forInit`/
+// `loopCondition`/`forUpdate` accessors so no consumer decodes it by hand.
+enum class ForClause : std::uint32_t {
+    None   = 0,
+    Init   = 1u << 0,
+    Cond   = 1u << 1,
+    Update = 1u << 2,
+};
+inline constexpr std::uint32_t kForClauseMask = 0b111;  // all valid ForClause bits
+
+[[nodiscard]] inline constexpr ForClause operator|(ForClause a, ForClause b) noexcept {
+    return static_cast<ForClause>(static_cast<std::uint32_t>(a) | static_cast<std::uint32_t>(b));
+}
+[[nodiscard]] inline constexpr bool has(ForClause mask, ForClause bit) noexcept {
+    return (static_cast<std::uint32_t>(mask) & static_cast<std::uint32_t>(bit)) != 0;
+}
+[[nodiscard]] inline constexpr std::uint32_t clauseCount(ForClause mask) noexcept {
+    std::uint32_t const m = static_cast<std::uint32_t>(mask) & kForClauseMask;
+    // popcount over 3 bits.
+    return (m & 1u) + ((m >> 1) & 1u) + ((m >> 2) & 1u);
+}
+
+// `CaseArm` payload bit: set iff the arm is the `default:` arm (which has no
+// match-value child). A valued case arm carries its match value as child 0.
+inline constexpr std::uint32_t kCaseArmIsDefault = 1u << 0;
+
+// ── Per-kind child-arity (HR3) — the single source of truth ──────────────────
+//
+// Static child-count bounds the verifier checks against and the `make*` helpers
+// satisfy by construction (a test cross-checks the two never drift). `max ==
+// kUnboundedArity` means variadic. Kinds with no defined shape yet (the HR4
+// declaration kinds, `Extension`) and the `Error` recovery sentinel are
+// unconstrained `{0, kUnboundedArity}`. `ForStmt` and `CaseArm` carry ADDITIONAL
+// payload-coupled constraints the verifier checks beyond these static bounds.
+inline constexpr std::uint32_t kUnboundedArity = 0xFFFFFFFFu;
+
+struct ChildArity {
+    std::uint32_t min;
+    std::uint32_t max;
+};
+
+[[nodiscard]] constexpr ChildArity childArity(HirKind kind) noexcept {
+    switch (kind) {
+        // ── Expressions (HR2) ──
+        case HirKind::Literal: case HirKind::Ref: case HirKind::TypeRef:
+            return {0, 0};
+        case HirKind::Call:               return {1, kUnboundedArity};  // [callee, args...]
+        case HirKind::IntrinsicCall:      return {0, kUnboundedArity};  // [args...]
+        case HirKind::ConstructAggregate: return {0, kUnboundedArity};  // [fields...]
+        case HirKind::UnaryOp: case HirKind::Cast: case HirKind::MemberAccess:
+        case HirKind::Swizzle: case HirKind::SizeOf: case HirKind::AddressOf:
+        case HirKind::Deref:
+            return {1, 1};
+        case HirKind::BinaryOp: case HirKind::Index: case HirKind::LogicalAnd:
+        case HirKind::LogicalOr:
+            return {2, 2};
+        case HirKind::Ternary:            return {3, 3};
+        // ── Statements (HR3) ──
+        case HirKind::Block:              return {0, kUnboundedArity};  // [stmts...]
+        case HirKind::IfStmt:             return {2, 3};                // [cond, then, else?]
+        case HirKind::WhileStmt: case HirKind::DoWhileStmt: case HirKind::AssignStmt:
+            return {2, 2};
+        case HirKind::ForStmt:            return {1, 4};                // body + 0..3 clauses (+ mask check)
+        case HirKind::SwitchStmt:         return {1, kUnboundedArity};  // [discriminant, arms...]
+        case HirKind::CaseArm:            return {0, kUnboundedArity};  // [value?, stmts...] (+ default check)
+        case HirKind::ExprStmt:           return {1, 1};
+        case HirKind::ReturnStmt: case HirKind::VarDecl:
+            return {0, 1};                                             // [value/init?]
+        case HirKind::BreakStmt: case HirKind::ContinueStmt: case HirKind::Unreachable:
+            return {0, 0};
+        // ── No defined shape yet (HR4 declarations) / recovery / extension ──
+        case HirKind::Module: case HirKind::Function: case HirKind::Global:
+        case HirKind::TypeDecl: case HirKind::ExternFunction: case HirKind::ExternGlobal:
+        case HirKind::ImportGroup: case HirKind::Error: case HirKind::Extension:
+        case HirKind::Count_:
+            return {0, kUnboundedArity};
+    }
+    // No core kind reaches here — every enumerator has a case above. A future
+    // kind added without one must NOT silently inherit {0, kUnbounded}
+    // (unconstrained = exempt from the verifier's arity rule); the impossible
+    // {1, 0} range makes the generic arity check fire for every instance of it,
+    // surfacing the omission loudly. (The systemic guard is the tree-wide
+    // -Wswitch-enum latch, G-711.)
+    return {1, 0};
 }
 
 // ── HirFlags: orthogonal per-node markers ────────────────────────────────────

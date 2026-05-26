@@ -23,8 +23,10 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_UnknownTypeExtension), "C_UnknownTypeExtension");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_TypeExtensionParamMismatch),
               "C_TypeExtensionParamMismatch");
-    // H_* HIR verifier / lowering codes (plan 09, HR2).
+    // H_* HIR verifier / lowering codes (plan 09, HR2 + HR3).
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_TypeUnresolved),      "H_TypeUnresolved");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_InvalidBreak),        "H_InvalidBreak");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_VerifierFailure),     "H_VerifierFailure");
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
@@ -44,6 +46,8 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
     // H_* prefix; the 0xF high nibble renders as 'H' and is stripped from the
     // numeric portion (like C/D/S).
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::H_TypeUnresolved),   "H0001");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::H_InvalidBreak),     "H0002");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::H_VerifierFailure),  "H0003");
 }
 
 TEST(DiagnosticSeverity, NameMapping) {

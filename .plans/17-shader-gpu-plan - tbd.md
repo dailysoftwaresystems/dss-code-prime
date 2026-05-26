@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1.x — lit up once the user's custom language begins (`20-custom-language-reserved-plan`). Reserved scope today; design lands now to keep HIR honest. |
-| Predecessors  | 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (shader-shape HIR extensions — HR1 ✅ 2026-05-26 ships the open `HirKindRegistry` shader-shape extensions will register against, HR2 ✅ adds the typed-expression + `HirOpRegistry` substrate; HR3–HR11 pending). ⏳ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) (structured-CF markers carry into SPIR-V `OpLoopMerge` / `OpSelectionMerge`). |
+| Predecessors  | 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (shader-shape HIR extensions — HR1 ✅ 2026-05-26 ships the open `HirKindRegistry` shader-shape extensions will register against, HR2 ✅ adds the typed-expression + `HirOpRegistry` substrate, HR3 ✅ adds structured control flow; HR4–HR11 pending). ⏳ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) (structured-CF markers carry into SPIR-V `OpLoopMerge` / `OpSelectionMerge`). |
 | Successors    | [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md) for SPIR-V→{DXIL, MSL, WGSL} transpile post-v1. |
 | Scope         | **Bounded.** SG1–SG10. v1 deliverable for the custom language is "compute + vertex + fragment shaders compile to spirv-val-clean SPIR-V." |
 

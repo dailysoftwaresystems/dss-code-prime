@@ -14,12 +14,15 @@
 
 #include <array>
 #include <cstddef>
+#include <optional>
+#include <span>
 
 using dss::CompilationUnitId;
 using dss::DiagnosticCode;
 using dss::DiagnosticReporter;
 using dss::DiagnosticSeverity;
 using dss::encodeOp;
+using dss::ForClause;
 using dss::Hir;
 using dss::HirBuilder;
 using dss::HirFlags;
@@ -117,16 +120,29 @@ TEST(HirVerifier, HasErrorNodeIsSkipped) {
 }
 
 TEST(HirVerifier, UntypedStatementDoesNotFire) {
-    // VarDecl / Block are not expression kinds — an InvalidType on them is
+    // Block / ReturnStmt are not type-required — an InvalidType on them is
     // legitimate and must not trip the expression-typing rule.
     HirBuilder b{"toy"};
-    HirNodeId const vd  = b.addLeaf(HirKind::VarDecl);
-    HirNodeId const blk = b.addParent(HirKind::Block, std::array{vd});
+    HirNodeId const ret = b.makeReturn();                 // bare return; (no value)
+    HirNodeId const blk = b.makeBlock(std::array{ret});
     Hir h = std::move(b).finish(blk);
 
     DiagnosticReporter reporter;
     EXPECT_TRUE(HirVerifier{h}.verify(reporter));
     EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, UntypedVarDeclFiresTypeUnresolved) {
+    // VarDecl now carries its declared type (HR3) and is type-required: a
+    // typeless VarDecl can't lower to a sized alloca, so the verifier flags it.
+    HirBuilder b{"toy"};
+    HirNodeId const vd  = b.makeVarDecl(dss::InvalidType, /*symbol=*/1);  // no type
+    HirNodeId const blk = b.makeBlock(std::array{vd});
+    Hir h = std::move(b).finish(blk);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 1u);
 }
 
 TEST(HirVerifier, UntypedExtensionNodeIsSkipped) {
@@ -189,4 +205,230 @@ TEST(HirVerifier, EveryUntypedExpressionIsReportedNotCoalesced) {
     // Distinct span offsets (each node's id) keep the reporter's dedup window
     // from collapsing the two violations into one.
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 2u);
+}
+
+// ── per-kind child-arity rule (H_VerifierFailure) ──
+
+TEST(HirVerifier, WrongFixedArityFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+
+    HirBuilder b{"toy"};
+    // A BinaryOp (arity 2) built — via the raw API — with one child. Typed, so
+    // ONLY the arity rule fires (not H_TypeUnresolved).
+    HirNodeId const a   = b.makeLiteral(i32);
+    HirNodeId const bad = b.addParent(HirKind::BinaryOp, std::array{a}, i32,
+                                      encodeOp(HirOpKind::Add));
+    Hir h = std::move(b).finish(bad);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 0u);
+}
+
+TEST(HirVerifier, ForStmtChildCountMustMatchClauseMask) {
+    HirBuilder b{"toy"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    // Claim Init present (mask bit 0) but supply only the body child — the mask
+    // implies 2 children (init + body), so the count disagrees.
+    HirNodeId const body = b.makeBlock({});
+    HirNodeId const bad  = b.addParent(HirKind::ForStmt, std::array{body}, dss::InvalidType,
+                                       static_cast<std::uint32_t>(ForClause::Init));
+    (void)i32;
+    Hir h = std::move(b).finish(bad);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, ForStmtPayloadBitsOutsideMaskFire) {
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock({});
+    // payload has a stray high bit beyond the 3 clause bits.
+    HirNodeId const bad = b.addParent(HirKind::ForStmt, std::array{body}, dss::InvalidType,
+                                      /*payload=*/0b1000u);
+    Hir h = std::move(b).finish(bad);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, ValuedCaseArmMissingValueFires) {
+    HirBuilder b{"toy"};
+    // A CaseArm with NO default flag (so it's a valued arm) but zero children —
+    // it has no match-value child.
+    HirNodeId const bad = b.addParent(HirKind::CaseArm, {}, dss::InvalidType, /*payload=*/0);
+    Hir h = std::move(b).finish(bad);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, WellFormedControlFlowProducesNoArityFailure) {
+    // False-positive guard: a valid for + switch (valued + default arms) module
+    // built through the typed helpers must produce ZERO H_VerifierFailure — the
+    // dynamic ForStmt/CaseArm checks must not misfire on correct shapes.
+    HirBuilder b{"toy"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+
+    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32),
+                                         std::array{b.makeExprStmt(b.makeLiteral(i32))});
+    HirNodeId const arm1 = b.makeCaseArm(std::nullopt,
+                                         std::array{b.makeExprStmt(b.makeLiteral(i32))});
+    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), std::array{arm0, arm1});
+    HirNodeId const f    = b.makeForStmt(b.makeVarDecl(i32, 2, b.makeLiteral(i32)),
+                                         b.makeLiteral(boolT), std::nullopt,
+                                         b.makeBlock(std::array{sw}));
+    Hir h = std::move(b).finish(f);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 0u);
+}
+
+// ── break/continue scoping rule (H_InvalidBreak) ──
+
+namespace {
+
+// while (true) { <stmts> } as a freestanding module; returns the finished Hir.
+Hir whileWith(HirBuilder& b, std::span<HirNodeId const> stmts) {
+    TypeInterner ti = makeInterner();
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+    HirNodeId const cond = b.makeLiteral(boolT);
+    HirNodeId const body = b.makeBlock(stmts);
+    HirNodeId const wh   = b.makeWhileStmt(cond, body);
+    return std::move(b).finish(wh);
+}
+
+} // namespace
+
+TEST(HirVerifier, BreakInsideLoopIsValid) {
+    HirBuilder b{"toy"};
+    HirNodeId const br = b.makeBreak(0);
+    Hir h = whileWith(b, std::array{br});
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, BreakIndexOutOfRangeFires) {
+    HirBuilder b{"toy"};
+    HirNodeId const br = b.makeBreak(1);     // only one enclosing loop (index 0)
+    Hir h = whileWith(b, std::array{br});
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_InvalidBreak), 1u);
+}
+
+TEST(HirVerifier, BreakWithNoEnclosingTargetFires) {
+    HirBuilder b{"toy"};
+    HirNodeId const br  = b.makeBreak(0);
+    HirNodeId const blk = b.makeBlock(std::array{br});   // no loop/switch at all
+    Hir h = std::move(b).finish(blk);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_InvalidBreak), 1u);
+}
+
+TEST(HirVerifier, BreakTargetingSwitchIsValid) {
+    HirBuilder b{"toy"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    // switch (x) { default: break; } — break CAN target a switch (unlike continue).
+    HirNodeId const br   = b.makeBreak(0);
+    HirNodeId const arm  = b.makeCaseArm(std::nullopt, std::array{br});
+    HirNodeId const disc = b.makeRef(i32, 1);
+    HirNodeId const sw   = b.makeSwitchStmt(disc, std::array{arm});
+    Hir h = std::move(b).finish(sw);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, ContinueAtTopLevelFires) {
+    HirBuilder b{"toy"};
+    HirNodeId const co  = b.makeContinue(0);             // no enclosing loop at all
+    HirNodeId const blk = b.makeBlock(std::array{co});
+    Hir h = std::move(b).finish(blk);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_InvalidBreak), 1u);
+}
+
+TEST(HirVerifier, ContinueInsideLoopIsValid) {
+    HirBuilder b{"toy"};
+    HirNodeId const co = b.makeContinue(0);
+    Hir h = whileWith(b, std::array{co});
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, ContinueTargetingSwitchFires) {
+    HirBuilder b{"toy"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    // switch (x) { default: continue; }  — continue 0 resolves to the switch.
+    HirNodeId const co   = b.makeContinue(0);
+    HirNodeId const arm  = b.makeCaseArm(std::nullopt, std::array{co});
+    HirNodeId const disc = b.makeRef(i32, 1);
+    HirNodeId const sw   = b.makeSwitchStmt(disc, std::array{arm});
+    Hir h = std::move(b).finish(sw);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_InvalidBreak), 1u);
+}
+
+TEST(HirVerifier, ContinueSkippingSwitchToOuterLoopIsValid) {
+    HirBuilder b{"toy"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+    // while (..) { switch (x) { default: continue 1; } } — index 1 skips the
+    // switch (target 0) and resolves to the while (target 1), a loop: valid.
+    HirNodeId const co   = b.makeContinue(1);
+    HirNodeId const arm  = b.makeCaseArm(std::nullopt, std::array{co});
+    HirNodeId const disc = b.makeRef(i32, 1);
+    HirNodeId const sw   = b.makeSwitchStmt(disc, std::array{arm});
+    HirNodeId const body = b.makeBlock(std::array{sw});
+    HirNodeId const cond = b.makeLiteral(boolT);
+    HirNodeId const wh   = b.makeWhileStmt(cond, body);
+    Hir h = std::move(b).finish(wh);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, NestedBreakToOuterLoopIsValid) {
+    HirBuilder b{"toy"};
+    TypeInterner ti = makeInterner();
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+    // outer while { inner while { break 1 } } — break 1 leaves the outer loop.
+    HirNodeId const br    = b.makeBreak(1);
+    HirNodeId const inBody = b.makeBlock(std::array{br});
+    HirNodeId const inCond = b.makeLiteral(boolT);
+    HirNodeId const inner  = b.makeWhileStmt(inCond, inBody);
+    HirNodeId const outBody = b.makeBlock(std::array{inner});
+    HirNodeId const outCond = b.makeLiteral(boolT);
+    HirNodeId const outer   = b.makeWhileStmt(outCond, outBody);
+    Hir h = std::move(b).finish(outer);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
 }

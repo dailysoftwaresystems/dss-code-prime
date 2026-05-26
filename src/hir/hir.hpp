@@ -11,6 +11,7 @@
 #include "hir/hir_op_registry.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -84,7 +85,61 @@ public:
     // `Tree::children`'s fail-loud guard against corrupt POD data.
     [[nodiscard]] std::span<HirNodeId const> children(HirNodeId id) const;
 
+    // ── structured-CF typed accessors (HR3) ──────────────────────────────────
+    //
+    // The read side of the `make*` helpers: they hide each kind's child layout
+    // and payload encoding (optional positions, the ForStmt clause mask, the
+    // CaseArm default flag) so consumers — the verifier, HR8 lowering, HR7 text,
+    // HR12 MIR — index by role, never by raw offset. Each asserts the node's
+    // kind in debug builds; behaviour on a wrong-kind or malformed node is
+    // undefined (well-formedness is the verifier's job). Optional children come
+    // back as `std::optional<HirNodeId>` (nullopt = absent).
+
+    // if: condition, then-branch, optional else-branch.
+    [[nodiscard]] HirNodeId                ifCondition(HirNodeId id) const;
+    [[nodiscard]] HirNodeId                ifThen(HirNodeId id)      const;
+    [[nodiscard]] std::optional<HirNodeId> ifElse(HirNodeId id)     const;
+
+    // Loop-kind-agnostic over While/DoWhile/For: the body (always present) and
+    // the condition (optional — a For may omit it).
+    [[nodiscard]] HirNodeId                loopBody(HirNodeId id)      const;
+    [[nodiscard]] std::optional<HirNodeId> loopCondition(HirNodeId id) const;
+    // For-specific clauses (decode the ForClause mask).
+    [[nodiscard]] std::optional<HirNodeId> forInit(HirNodeId id)   const;
+    [[nodiscard]] std::optional<HirNodeId> forUpdate(HirNodeId id) const;
+    [[nodiscard]] ForClause                forClauses(HirNodeId id) const;
+
+    // switch: discriminant + the case arms.
+    [[nodiscard]] HirNodeId                  switchDiscriminant(HirNodeId id) const;
+    [[nodiscard]] std::span<HirNodeId const> switchArms(HirNodeId id)         const;
+    // case arm: is-default flag, optional match value, the arm's statements.
+    [[nodiscard]] bool                       caseArmIsDefault(HirNodeId id) const;
+    [[nodiscard]] std::optional<HirNodeId>   caseArmValue(HirNodeId id)     const;
+    [[nodiscard]] std::span<HirNodeId const> caseArmBody(HirNodeId id)      const;
+
+    // break/continue nesting index; return value; expr-stmt expression.
+    [[nodiscard]] std::uint32_t            branchDepth(HirNodeId id)  const;
+    [[nodiscard]] std::optional<HirNodeId> returnValue(HirNodeId id)  const;
+    [[nodiscard]] HirNodeId                exprStmtExpr(HirNodeId id) const;
+
+    // var decl: declared type (== typeId), declared SymbolId, optional initializer.
+    [[nodiscard]] TypeId                   varDeclType(HirNodeId id)   const;
+    [[nodiscard]] SymbolId                 varDeclSymbol(HirNodeId id) const;
+    [[nodiscard]] std::optional<HirNodeId> varDeclInit(HirNodeId id)   const;
+
+    // assignment: lvalue target and assigned value.
+    [[nodiscard]] HirNodeId assignTarget(HirNodeId id) const;
+    [[nodiscard]] HirNodeId assignValue(HirNodeId id)  const;
+
 private:
+    // Checked positional child access for the mandatory-child accessors above:
+    // aborts loud (like `children`'s pool-range guard) if `i` is past the node's
+    // child count, rather than letting a compiled-out `assert` + raw span `[]`
+    // become release-build UB on a structurally-malformed node. Optional-child
+    // accessors don't use this — absence is legitimate there, so they return
+    // `std::nullopt` via a size check.
+    [[nodiscard]] HirNodeId childAt(HirNodeId id, std::uint32_t i) const;
+
     Arena                  arena_;
     std::vector<HirNodeId> childPool_;
     // Parent-link parallel array (indexed by node.v; slot 0 is the sentinel —
@@ -106,6 +161,14 @@ static_assert(substrate::Arena<Hir>,
 
 template <class T>
 using HirAttribute = substrate::ArenaAttribute<Hir, T>;
+
+// The enclosing loop/switch nodes of `id`, innermost-first — i.e. the structural
+// branch-target stack a BreakStmt/ContinueStmt at `id` indexes into (`depth 0` =
+// `result[0]`). Walks `parent()` links and collects `isBranchTargetKind` nodes.
+// Shared by the verifier's break/continue rule (validates the index) and CST→HIR
+// lowering (HR8, which COMPUTES the index) so the two agree by construction.
+[[nodiscard]] DSS_EXPORT std::vector<HirNodeId> enclosingBranchTargets(Hir const& hir,
+                                                                       HirNodeId id);
 
 // ── HirBuilder ───────────────────────────────────────────────────────────────
 //
@@ -224,6 +287,71 @@ public:
     HirNodeId makeDeref(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
     // A type used as a value; `type` is the referenced lattice type. Leaf.
     HirNodeId makeTypeRef(TypeId type, HirFlags flags = HirFlags::None);
+
+    // ── typed statement helpers (HR3) ────────────────────────────────────────
+    //
+    // Same discipline as the expression helpers: each fixes its kind's child
+    // layout in one place. Statements are not `requiresValidType` (no `TypeId`
+    // parameter) EXCEPT `VarDecl`, which carries its declared type. Optional
+    // positional children are passed as `std::optional<HirNodeId>` and simply
+    // omitted from the child list when absent (never an invalid-sentinel child,
+    // which the builder rejects); presence is recovered through the matching
+    // read accessor on `Hir` (`ifElse`, `loopCondition`, …), so no consumer
+    // decodes the layout by hand.
+
+    // A block / scope: zero or more statements in order.
+    HirNodeId makeBlock(std::span<HirNodeId const> stmts, HirFlags flags = HirFlags::None);
+
+    // if (cond) then [else elseStmt]. children: [cond, then] or [cond, then, else].
+    HirNodeId makeIfStmt(HirNodeId cond, HirNodeId thenStmt,
+                         std::optional<HirNodeId> elseStmt = std::nullopt,
+                         HirFlags flags = HirFlags::None);
+
+    // while (cond) body — children [cond, body].
+    HirNodeId makeWhileStmt(HirNodeId cond, HirNodeId body, HirFlags flags = HirFlags::None);
+    // do body while (cond) — children [body, cond]: child 0 is what executes
+    // first, so the order is deliberately the reverse of while's [cond, body].
+    // The `loopBody`/`loopCondition` accessors hide the difference from callers.
+    HirNodeId makeDoWhileStmt(HirNodeId body, HirNodeId cond, HirFlags flags = HirFlags::None);
+
+    // C-style for. Each clause is independently optional; `body` is mandatory.
+    // children = [present clauses in init,cond,update order..., body]; the
+    // node payload records which clauses are present (a `ForClause` mask).
+    HirNodeId makeForStmt(std::optional<HirNodeId> init, std::optional<HirNodeId> cond,
+                          std::optional<HirNodeId> update, HirNodeId body,
+                          HirFlags flags = HirFlags::None);
+
+    // switch (discriminant) { arms } — children [discriminant, caseArm...].
+    HirNodeId makeSwitchStmt(HirNodeId discriminant, std::span<HirNodeId const> arms,
+                             HirFlags flags = HirFlags::None);
+    // One switch arm. `value` absent ⇒ the `default:` arm (payload flags it);
+    // otherwise child 0 is the match value. `body` are the arm's statements.
+    // children: [value, body...] for a valued arm, [body...] for default.
+    HirNodeId makeCaseArm(std::optional<HirNodeId> value, std::span<HirNodeId const> body,
+                          HirFlags flags = HirFlags::None);
+
+    // break / continue, by structural nesting index (0 = innermost enclosing
+    // loop/switch). Leaves; the index lives in `payload`.
+    HirNodeId makeBreak(std::uint32_t depth = 0, HirFlags flags = HirFlags::None);
+    HirNodeId makeContinue(std::uint32_t depth = 0, HirFlags flags = HirFlags::None);
+
+    // return [value]; — children [value] or [].
+    HirNodeId makeReturn(std::optional<HirNodeId> value = std::nullopt,
+                         HirFlags flags = HirFlags::None);
+
+    // An expression evaluated for effect — child [expr].
+    HirNodeId makeExprStmt(HirNodeId expr, HirFlags flags = HirFlags::None);
+
+    // A variable declaration. `declaredType` is the variable's type (carried in
+    // the node's `typeId`; the verifier requires it valid). `symbol` is the
+    // declared SymbolId (payload). `init` is the optional initializer (child).
+    HirNodeId makeVarDecl(TypeId declaredType, std::uint32_t symbol,
+                          std::optional<HirNodeId> init = std::nullopt,
+                          HirFlags flags = HirFlags::None);
+
+    // target = value; — children [target, value]. `target` is an lvalue
+    // expression (Ref / Index / MemberAccess / Deref).
+    HirNodeId makeAssignStmt(HirNodeId target, HirNodeId value, HirFlags flags = HirFlags::None);
 
     // Freeze. `root` becomes the module's entry node and must be a node this
     // builder produced. Single-use; the builder is consumed.

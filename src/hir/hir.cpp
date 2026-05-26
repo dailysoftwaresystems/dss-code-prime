@@ -1,11 +1,13 @@
 #include "hir/hir.hpp"
 
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -345,6 +347,263 @@ HirNodeId HirBuilder::makeDeref(HirNodeId operand, TypeId type, HirFlags flags) 
 
 HirNodeId HirBuilder::makeTypeRef(TypeId type, HirFlags flags) {
     return addLeaf(HirKind::TypeRef, type, /*payload=*/0, flags);
+}
+
+// ── typed statement helpers (HR3) ───────────────────────────────────────────
+
+HirNodeId HirBuilder::makeBlock(std::span<HirNodeId const> stmts, HirFlags flags) {
+    return addParent(HirKind::Block, stmts, InvalidType, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeIfStmt(HirNodeId cond, HirNodeId thenStmt,
+                                 std::optional<HirNodeId> elseStmt, HirFlags flags) {
+    if (elseStmt) {
+        HirNodeId const kids[] = {cond, thenStmt, *elseStmt};
+        return addParent(HirKind::IfStmt, kids, InvalidType, /*payload=*/0, flags);
+    }
+    HirNodeId const kids[] = {cond, thenStmt};
+    return addParent(HirKind::IfStmt, kids, InvalidType, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeWhileStmt(HirNodeId cond, HirNodeId body, HirFlags flags) {
+    HirNodeId const kids[] = {cond, body};
+    return addParent(HirKind::WhileStmt, kids, InvalidType, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeDoWhileStmt(HirNodeId body, HirNodeId cond, HirFlags flags) {
+    HirNodeId const kids[] = {body, cond};
+    return addParent(HirKind::DoWhileStmt, kids, InvalidType, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeForStmt(std::optional<HirNodeId> init, std::optional<HirNodeId> cond,
+                                  std::optional<HirNodeId> update, HirNodeId body,
+                                  HirFlags flags) {
+    ForClause mask = ForClause::None;
+    std::vector<HirNodeId> kids;
+    kids.reserve(4);
+    if (init)   { mask = mask | ForClause::Init;   kids.push_back(*init); }
+    if (cond)   { mask = mask | ForClause::Cond;   kids.push_back(*cond); }
+    if (update) { mask = mask | ForClause::Update; kids.push_back(*update); }
+    kids.push_back(body);  // body is always last
+    return addParent(HirKind::ForStmt, kids, InvalidType,
+                     static_cast<std::uint32_t>(mask), flags);
+}
+
+HirNodeId HirBuilder::makeSwitchStmt(HirNodeId discriminant, std::span<HirNodeId const> arms,
+                                     HirFlags flags) {
+    std::vector<HirNodeId> kids;
+    kids.reserve(arms.size() + 1);
+    kids.push_back(discriminant);
+    kids.insert(kids.end(), arms.begin(), arms.end());
+    return addParent(HirKind::SwitchStmt, kids, InvalidType, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeCaseArm(std::optional<HirNodeId> value, std::span<HirNodeId const> body,
+                                  HirFlags flags) {
+    std::vector<HirNodeId> kids;
+    kids.reserve(body.size() + 1);
+    std::uint32_t payload = 0;
+    if (value) {
+        kids.push_back(*value);          // valued arm: match value is child 0
+    } else {
+        payload = kCaseArmIsDefault;     // default arm: no value child
+    }
+    kids.insert(kids.end(), body.begin(), body.end());
+    return addParent(HirKind::CaseArm, kids, InvalidType, payload, flags);
+}
+
+HirNodeId HirBuilder::makeBreak(std::uint32_t depth, HirFlags flags) {
+    return addLeaf(HirKind::BreakStmt, InvalidType, depth, flags);
+}
+
+HirNodeId HirBuilder::makeContinue(std::uint32_t depth, HirFlags flags) {
+    return addLeaf(HirKind::ContinueStmt, InvalidType, depth, flags);
+}
+
+HirNodeId HirBuilder::makeReturn(std::optional<HirNodeId> value, HirFlags flags) {
+    if (value) {
+        HirNodeId const kids[] = {*value};
+        return addParent(HirKind::ReturnStmt, kids, InvalidType, /*payload=*/0, flags);
+    }
+    return addParent(HirKind::ReturnStmt, {}, InvalidType, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeExprStmt(HirNodeId expr, HirFlags flags) {
+    HirNodeId const kids[] = {expr};
+    return addParent(HirKind::ExprStmt, kids, InvalidType, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeVarDecl(TypeId declaredType, std::uint32_t symbol,
+                                  std::optional<HirNodeId> init, HirFlags flags) {
+    if (init) {
+        HirNodeId const kids[] = {*init};
+        return addParent(HirKind::VarDecl, kids, declaredType, symbol, flags);
+    }
+    return addParent(HirKind::VarDecl, {}, declaredType, symbol, flags);
+}
+
+HirNodeId HirBuilder::makeAssignStmt(HirNodeId target, HirNodeId value, HirFlags flags) {
+    HirNodeId const kids[] = {target, value};
+    return addParent(HirKind::AssignStmt, kids, InvalidType, /*payload=*/0, flags);
+}
+
+// ── structured-CF typed accessors (HR3) ─────────────────────────────────────
+
+HirNodeId Hir::childAt(HirNodeId id, std::uint32_t i) const {
+    std::span<HirNodeId const> const kids = children(id);  // fail-loud on corrupt pool range
+    if (i >= kids.size()) {
+        std::fprintf(stderr,
+                     "dss::Hir fatal: childAt: child index %u out of range (HirNodeId=%u "
+                     "has %zu children)\n",
+                     i, id.v, kids.size());
+        std::abort();
+    }
+    return kids[i];
+}
+
+HirNodeId Hir::ifCondition(HirNodeId id) const {
+    assert(kind(id) == HirKind::IfStmt);
+    return childAt(id, 0);
+}
+HirNodeId Hir::ifThen(HirNodeId id) const {
+    assert(kind(id) == HirKind::IfStmt);
+    return childAt(id, 1);
+}
+std::optional<HirNodeId> Hir::ifElse(HirNodeId id) const {
+    assert(kind(id) == HirKind::IfStmt);
+    auto kids = children(id);
+    return kids.size() >= 3 ? std::optional<HirNodeId>{kids[2]} : std::nullopt;
+}
+
+HirNodeId Hir::loopBody(HirNodeId id) const {
+    switch (kind(id)) {
+        case HirKind::WhileStmt:   return childAt(id, 1);
+        case HirKind::DoWhileStmt: return childAt(id, 0);
+        case HirKind::ForStmt: {
+            // body is always the last child; childAt aborts loud if the node is
+            // malformed (no children at all).
+            auto const n = static_cast<std::uint32_t>(children(id).size());
+            return childAt(id, n == 0 ? 0 : n - 1);
+        }
+        default: assert(false && "loopBody on a non-loop kind"); return InvalidHirNode;
+    }
+}
+std::optional<HirNodeId> Hir::loopCondition(HirNodeId id) const {
+    switch (kind(id)) {
+        case HirKind::WhileStmt:   return childAt(id, 0);
+        case HirKind::DoWhileStmt: return childAt(id, 1);
+        case HirKind::ForStmt: {
+            ForClause const mask = forClauses(id);
+            if (!has(mask, ForClause::Cond)) return std::nullopt;
+            std::uint32_t const idx = has(mask, ForClause::Init) ? 1u : 0u;
+            return childAt(id, idx);
+        }
+        default: assert(false && "loopCondition on a non-loop kind"); return std::nullopt;
+    }
+}
+ForClause Hir::forClauses(HirNodeId id) const {
+    assert(kind(id) == HirKind::ForStmt);
+    // Mask off any stray high bits so accessors stay robust on a malformed
+    // payload; the verifier (checkNodeArity) is the layer that FLAGS stray bits.
+    return static_cast<ForClause>(payload(id) & kForClauseMask);
+}
+std::optional<HirNodeId> Hir::forInit(HirNodeId id) const {
+    ForClause const mask = forClauses(id);
+    if (!has(mask, ForClause::Init)) return std::nullopt;
+    return childAt(id, 0);  // Init is first in the clause order when present
+}
+std::optional<HirNodeId> Hir::forUpdate(HirNodeId id) const {
+    ForClause const mask = forClauses(id);
+    if (!has(mask, ForClause::Update)) return std::nullopt;
+    std::uint32_t const idx = (has(mask, ForClause::Init) ? 1u : 0u)
+                            + (has(mask, ForClause::Cond) ? 1u : 0u);
+    return childAt(id, idx);
+}
+
+HirNodeId Hir::switchDiscriminant(HirNodeId id) const {
+    assert(kind(id) == HirKind::SwitchStmt);
+    return childAt(id, 0);
+}
+std::span<HirNodeId const> Hir::switchArms(HirNodeId id) const {
+    assert(kind(id) == HirKind::SwitchStmt);
+    auto kids = children(id);
+    return kids.empty() ? kids : kids.subspan(1);  // empty only on a malformed switch
+}
+bool Hir::caseArmIsDefault(HirNodeId id) const {
+    assert(kind(id) == HirKind::CaseArm);
+    return (payload(id) & kCaseArmIsDefault) != 0;
+}
+std::optional<HirNodeId> Hir::caseArmValue(HirNodeId id) const {
+    if (caseArmIsDefault(id)) return std::nullopt;
+    auto kids = children(id);
+    return kids.empty() ? std::nullopt : std::optional<HirNodeId>{kids[0]};
+}
+std::span<HirNodeId const> Hir::caseArmBody(HirNodeId id) const {
+    auto kids = children(id);
+    // A valued arm's child 0 is the match value; default arms are all body.
+    if (!caseArmIsDefault(id) && !kids.empty()) return kids.subspan(1);
+    return kids;
+}
+
+std::uint32_t Hir::branchDepth(HirNodeId id) const {
+    assert(kind(id) == HirKind::BreakStmt || kind(id) == HirKind::ContinueStmt);
+    return payload(id);
+}
+std::optional<HirNodeId> Hir::returnValue(HirNodeId id) const {
+    assert(kind(id) == HirKind::ReturnStmt);
+    auto kids = children(id);
+    return kids.empty() ? std::nullopt : std::optional<HirNodeId>{kids[0]};
+}
+HirNodeId Hir::exprStmtExpr(HirNodeId id) const {
+    assert(kind(id) == HirKind::ExprStmt);
+    return childAt(id, 0);
+}
+
+TypeId Hir::varDeclType(HirNodeId id) const {
+    assert(kind(id) == HirKind::VarDecl);
+    return typeId(id);
+}
+SymbolId Hir::varDeclSymbol(HirNodeId id) const {
+    assert(kind(id) == HirKind::VarDecl);
+    return SymbolId{payload(id)};
+}
+std::optional<HirNodeId> Hir::varDeclInit(HirNodeId id) const {
+    assert(kind(id) == HirKind::VarDecl);
+    auto kids = children(id);
+    return kids.empty() ? std::nullopt : std::optional<HirNodeId>{kids[0]};
+}
+
+HirNodeId Hir::assignTarget(HirNodeId id) const {
+    assert(kind(id) == HirKind::AssignStmt);
+    return childAt(id, 0);
+}
+HirNodeId Hir::assignValue(HirNodeId id) const {
+    assert(kind(id) == HirKind::AssignStmt);
+    return childAt(id, 1);
+}
+
+// ── shared structural resolver (HR3) ─────────────────────────────────────────
+
+std::vector<HirNodeId> enclosingBranchTargets(Hir const& hir, HirNodeId id) {
+    std::vector<HirNodeId> targets;
+    // A well-formed module's parent chain is acyclic, so it terminates at the
+    // parentless root in fewer than nodeCount() hops. Exceeding that bound means
+    // a corrupt parent cycle — fail loud (like Hir::children's pool-range guard)
+    // rather than silently returning a truncated target stack that would feed a
+    // bogus break/continue verdict downstream.
+    std::size_t const cap = hir.nodeCount();
+    std::size_t steps = 0;
+    for (HirNodeId cur = hir.parent(id); cur.valid(); cur = hir.parent(cur), ++steps) {
+        if (steps >= cap) {
+            std::fprintf(stderr,
+                         "dss::enclosingBranchTargets fatal: parent chain from HirNodeId=%u "
+                         "exceeds nodeCount (%zu) — corrupt cycle\n",
+                         id.v, cap);
+            std::abort();
+        }
+        if (isBranchTargetKind(hir.kind(cur))) targets.push_back(cur);
+    }
+    return targets;
 }
 
 } // namespace dss

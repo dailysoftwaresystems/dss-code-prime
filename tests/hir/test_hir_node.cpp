@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <type_traits>
 
+using dss::ForClause;
 using dss::HirFlags;
 using dss::HirKind;
 using dss::detail::HirNode;
@@ -25,7 +26,9 @@ static_assert(HirKind::Error != HirKind::Module);
 static_assert(dss::requiresValidType(HirKind::Literal));
 static_assert(dss::requiresValidType(HirKind::BinaryOp));
 static_assert(dss::requiresValidType(HirKind::TypeRef));
-static_assert(!dss::requiresValidType(HirKind::VarDecl));
+// VarDecl carries its DECLARED type (HR3) — the verifier requires it, since a
+// typeless decl can't lower to a sized alloca and HIR is detached from semantic.
+static_assert(dss::requiresValidType(HirKind::VarDecl));
 static_assert(!dss::requiresValidType(HirKind::Block));
 static_assert(!dss::requiresValidType(HirKind::Module));
 static_assert(!dss::requiresValidType(HirKind::ReturnStmt));
@@ -35,6 +38,21 @@ static_assert(!dss::requiresValidType(HirKind::Unreachable));
 // unknown to the core predicate — so it must NOT be type-required here. If this
 // ever flips, an untyped Extension node would wrongly trip H_TypeUnresolved.
 static_assert(!dss::requiresValidType(HirKind::Extension));
+
+// ── childArity single-source-of-truth (compile-time) ──
+static_assert(dss::childArity(HirKind::BinaryOp).min == 2 && dss::childArity(HirKind::BinaryOp).max == 2);
+static_assert(dss::childArity(HirKind::Ternary).min == 3 && dss::childArity(HirKind::Ternary).max == 3);
+static_assert(dss::childArity(HirKind::IfStmt).min == 2 && dss::childArity(HirKind::IfStmt).max == 3);
+static_assert(dss::childArity(HirKind::BreakStmt).min == 0 && dss::childArity(HirKind::BreakStmt).max == 0);
+static_assert(dss::childArity(HirKind::ExprStmt).min == 1 && dss::childArity(HirKind::ExprStmt).max == 1);
+static_assert(dss::childArity(HirKind::Block).max == dss::kUnboundedArity);          // variadic
+static_assert(dss::childArity(HirKind::Module).max == dss::kUnboundedArity);         // HR4 — unconstrained
+
+// ── structured-CF kind predicates (compile-time) ──
+static_assert(dss::isLoopKind(HirKind::WhileStmt) && dss::isLoopKind(HirKind::ForStmt));
+static_assert(!dss::isLoopKind(HirKind::SwitchStmt));               // switch is not a loop
+static_assert(dss::isBranchTargetKind(HirKind::SwitchStmt));        // but break can target it
+static_assert(!dss::isBranchTargetKind(HirKind::IfStmt));
 
 // ── POD layout (compile-time) ──
 // Parent links live in a parallel array in `Hir` (not in the POD) so the
@@ -78,6 +96,16 @@ TEST(HirKind, ExtensionMarkerIsACoreMember) {
     // The Extension marker itself is a CORE kind (< 256); the concrete extension
     // kind it stands in for is a registry id >= 256, carried elsewhere.
     EXPECT_LT(static_cast<std::uint32_t>(HirKind::Extension), 256u);
+}
+
+TEST(ForClause, MaskHelpers) {
+    ForClause const m = ForClause::Init | ForClause::Update;  // init + update, no cond
+    EXPECT_TRUE(has(m, ForClause::Init));
+    EXPECT_FALSE(has(m, ForClause::Cond));
+    EXPECT_TRUE(has(m, ForClause::Update));
+    EXPECT_EQ(clauseCount(m), 2u);
+    EXPECT_EQ(clauseCount(ForClause::None), 0u);
+    EXPECT_EQ(clauseCount(ForClause::Init | ForClause::Cond | ForClause::Update), 3u);
 }
 
 TEST(HirKind, RequiresValidTypeCoversTheWholeExpressionGroup) {

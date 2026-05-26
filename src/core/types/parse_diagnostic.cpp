@@ -86,6 +86,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_UnresolvedImport:         return "D_UnresolvedImport";
         case DiagnosticCode::D_UnresolvedReference:      return "D_UnresolvedReference";
         case DiagnosticCode::H_TypeUnresolved:           return "H_TypeUnresolved";
+        case DiagnosticCode::H_InvalidBreak:             return "H_InvalidBreak";
+        case DiagnosticCode::H_VerifierFailure:          return "H_VerifierFailure";
     }
     return "Unknown";
 }

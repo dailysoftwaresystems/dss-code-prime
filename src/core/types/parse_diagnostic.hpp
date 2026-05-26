@@ -198,11 +198,19 @@ enum class DiagnosticCode : std::uint16_t {
     // (later) the CST→HIR lowering. Reserved for verifier-/lowering-time
     // failures only — config-load errors in a `hirLowering` block use the C_*
     // band (plan §4 Q8). Append, never renumber.
-    // H_TypeUnresolved: an expression (or TypeRef) node whose `typeId` is not
-    //   valid() — i.e. lowering/semantic analysis failed to resolve its type.
+    // H_TypeUnresolved: an expression / TypeRef / VarDecl node whose `typeId` is
+    //   not valid() — i.e. lowering/semantic analysis failed to resolve its type.
     //   A node already flagged `HirFlags::HasError` is skipped (cascade
     //   suppression), so this fires only on a genuinely untyped, non-error node.
     H_TypeUnresolved              = 0xF001,
+    // H_InvalidBreak: a BreakStmt/ContinueStmt whose nesting index does not name
+    //   an enclosing loop/switch — index out of range, or a ContinueStmt whose
+    //   resolved target is a switch (continue can only target a loop).
+    H_InvalidBreak                = 0xF002,
+    // H_VerifierFailure: a node violates a structural invariant — HR3 uses it for
+    //   a wrong child-arity for the node's kind (e.g. a BinaryOp with 1 child, a
+    //   ForStmt whose child count disagrees with its clause-presence mask).
+    H_VerifierFailure             = 0xF003,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
