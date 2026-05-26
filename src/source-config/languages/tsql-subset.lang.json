@@ -7,6 +7,8 @@
     "fileExtensions": [".sql", ".tsql"]
   },
 
+  "artifactProfiles": ["script", "sproc"],
+
   "imports": {
     "strategy":         "name-matching",
     "nameRule":         "qualifiedName",
@@ -305,16 +307,23 @@
     "bracketIdentifierToken": "BracketIdStart",
     "declarations": [
       { "rule": "createTableStmt", "name": 2, "kind": "table",
-        "nameMatch": "lastIdentifier" }
+        "nameMatch": "lastIdentifier" },
+      { "rule": "columnDecl", "name": 0, "type": 1, "kind": "variable" }
     ],
     "references": [
       { "rule": "qualifiedName", "nameMatch": "lastIdentifier" }
     ],
+    "scopes": [ "createTableStmt" ],
     "callRules": [
       { "rule": "callExpr", "callee": 0, "args": 2 }
     ],
     "builtinFunctions": [
       { "name": "COALESCE", "result": "I32", "variadic": true }
+    ],
+    "builtinTypes": [
+      { "name": "INT", "core": "I32" },
+      { "name": "BIT", "core": "Bool" },
+      { "name": "VARCHAR", "extension": "TSQL::Varchar" }
     ],
     "literalTypes": [
       { "literal": "IntLiteral", "core": "I32" }

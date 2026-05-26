@@ -117,6 +117,13 @@ struct DSS_EXPORT DeclarationRule {
     std::optional<SchemaTokenId> constMarker;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
+    // D8 unused-variable warning: when true, a symbol minted by this
+    // declaration that is NEVER referenced (empty use-set after analysis)
+    // emits S_UnusedVariable (a WARNING). Per-declaration opt-in so a
+    // language can warn on local variables but not on parameters (unused
+    // params are intentional) or globals/columns. Default false ⇒ no
+    // unused check for this declaration form.
+    bool            warnIfUnused = false;
     // Optional kind-discriminator. When set, the engine evaluates it at
     // pass 1 and uses the resulting effective kind / params / body
     // instead of the static fields above.
@@ -131,6 +138,13 @@ struct DSS_EXPORT DeclarationRule {
 // the rule only counts as an assignment when one of its visible children
 // is a token of that kind (so an operator-table `binaryExpr` reused for
 // every binary op only fires on the assignment operator).
+//
+// When several entries share the same `rule` (e.g. one per compound-assign
+// operator), the engine applies the FIRST entry whose `operatorToken` gate
+// matches, then stops. Invariant: an UNGATED entry (no `operatorToken`)
+// matches every node of its rule, so it must be the SOLE entry for that rule
+// — mixing an ungated entry with gated ones would let the ungated catch-all
+// fire first and shadow the gated entries. Shipped configs gate every entry.
 struct DSS_EXPORT AssignmentRule {
     RuleId                       rule{};
     std::optional<SchemaTokenId> operatorToken;
@@ -178,11 +192,22 @@ struct DSS_EXPORT ReferenceRule {
     std::string     ruleName;
 };
 
-// Source built-in type name → core TypeKind mapping. Used during
+// Source built-in type name → lattice type mapping. Used during
 // type-position resolution. e.g. `int` in c-subset's typeRef → I32.
+//
+// A mapping resolves to EITHER a core primitive (`core`, the common case)
+// OR a registered type-extension (`extension`, naming a `typeExtensions[]`
+// entry by its language-qualified name, e.g. "TSQL::Varchar"). The
+// extension form lets a language whose source type name has no core-lattice
+// equivalent (e.g. T-SQL's VARCHAR, which is the parameterized
+// `TSQL::Varchar` extension, not any core string kind) still resolve in
+// type position so the column does not spuriously emit S_UnknownType.
+// `extension` is mutually exclusive with `core`; the loader rejects both
+// or neither for an extension-named mapping.
 struct DSS_EXPORT BuiltinTypeMapping {
-    std::string name;       // user-visible name in source (e.g. "int")
-    TypeKind    core = TypeKind::Void;
+    std::string                name;       // user-visible name in source (e.g. "int")
+    TypeKind                   core = TypeKind::Void;
+    std::optional<std::string> extension;  // language-qualified extension name, when set
 };
 
 // Type-expression constructors. When a type-position subtree matches

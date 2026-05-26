@@ -354,6 +354,10 @@ std::span<TypeExtensionDescriptor const> GrammarSchema::typeExtensions() const n
     return d_.typeExtensions;
 }
 
+std::span<std::string const> GrammarSchema::artifactProfiles() const noexcept {
+    return d_.artifactProfiles;
+}
+
 ImportConfig const& GrammarSchema::imports() const noexcept {
     return d_.imports;
 }

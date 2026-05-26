@@ -257,6 +257,15 @@ struct DSS_EXPORT GrammarSchemaData {
     // TypeRegistry at CU build time via registerSchemaTypeExtensions.
     std::vector<TypeExtensionDescriptor>              typeExtensions;
 
+    // Artifact profiles this language supports (plan 06 AP1; optional
+    // top-level `artifactProfiles[]`, additive in schema v4). Each entry is
+    // a registered profile name (cli/gui/lib/staticlib/script/sproc/
+    // transpile/shader/hdl). Empty when the field is absent. AP1 is the
+    // schema-field + loader-validation slice ONLY — no codegen/driver
+    // consumes it yet; the driver-enforcement (AP2+) reads this set to
+    // reject a project asking for an unsupported profile.
+    std::vector<std::string>                          artifactProfiles;
+
     // Config-driven import resolution (schema v4 `imports` block). Default
     // `ImportStrategy::None` (no cross-refs) for v1/v2/v3 configs and any v4
     // config that omits the block. Consumed by ConfigDrivenImportResolver —
@@ -484,6 +493,12 @@ public:
     // Per-language type-extension declarations (SP2; schema v3 `typeExtensions[]`).
     // Empty for v1/v2 configs. Consumed by registerSchemaTypeExtensions.
     [[nodiscard]] std::span<TypeExtensionDescriptor const> typeExtensions() const noexcept;
+
+    // Artifact profiles this language supports (plan 06 AP1; schema v4
+    // optional `artifactProfiles[]`). Empty when the field is absent. Each
+    // entry is a loader-validated registered profile name. Consumed by the
+    // driver (AP2+) to reject a project requesting an unsupported profile.
+    [[nodiscard]] std::span<std::string const> artifactProfiles() const noexcept;
 
     // Config-driven import resolution (schema v4 `imports` block). Default
     // `ImportStrategy::None` when the config omits the block. Consumed by

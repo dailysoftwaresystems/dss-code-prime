@@ -184,6 +184,65 @@ TEST(SemanticAnalyzerCSubset, NonConstReassignmentIsClean) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 
+// D2: compound-assignment const-correctness. The c-subset grammar's
+// operator table registers every compound-assign token (`+=`, `-=`, `<<=`,
+// …) as an infix operator at the same precedence/associativity as `=`, so
+// `x += 2;` parses as a binaryExpr with the compound-assign token as its
+// operator. Each compound-assign token has its own `assignments` entry, so
+// reassigning a const through ANY of them emits S_ConstViolation exactly
+// like a plain `=`.
+TEST(SemanticAnalyzerCSubset, CompoundAssignToConstEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { const int x = 1; x += 2; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+    // `x` is the compound-assign LHS, which counts as a use — so the
+    // varDeclHead `warnIfUnused:true` opt-in does NOT spuriously fire.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_ConstViolation) EXPECT_EQ(d.actual, "x");
+    }
+}
+
+// D2: `*=` against a const → exactly one S_ConstViolation (a second
+// compound operator, proving the entry is per-token, not just `+=`).
+TEST(SemanticAnalyzerCSubset, CompoundStarAssignToConstEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { const int x = 4; x *= 2; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
+}
+
+// D2: `<<=` against a const → exactly one S_ConstViolation (a third,
+// three-char compound operator).
+TEST(SemanticAnalyzerCSubset, CompoundShlAssignToConstEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { const int x = 1; x <<= 2; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
+}
+
+// D2: a NON-const variable compound-assigned (`y <<= 2;`) → zero
+// S_ConstViolation. Proves the compound-assign entries gate on const-ness,
+// not on the operator alone.
+TEST(SemanticAnalyzerCSubset, CompoundAssignToNonConstIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int y = 1; y <<= 2; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
+}
+
 // SE5: a `typedef int Foo;` mints a Type-kind alias symbol carrying the
 // aliased TypeId (I32). (c-subset's grammar parses the typedef DECL; the
 // alias-in-type-position USE site is exercised generically — see the
@@ -327,6 +386,95 @@ TEST(SemanticAnalyzerCSubset, PostfixIncrementIsNotACall) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotCallable), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ArgCountMismatch), 0u);
+}
+
+// ── D8: unused-variable warning (warnIfUnused opt-in) ──────────────────────
+
+// `int main(){ int unused; int used=1; return used; }` — `unused` is never
+// referenced → exactly one S_UnusedVariable (a WARNING) whose `actual` is
+// "unused" and whose span covers the declaration. `used` IS referenced in
+// the return, so it does NOT warn.
+TEST(SemanticAnalyzerCSubset, UnusedLocalEmitsWarning) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(){ int unused; int used=1; return used; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 1u);
+    ParseDiagnostic const* d = nullptr;
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnusedVariable) d = &diag;
+    }
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->actual, "unused") << "the warning names the unused variable";
+    EXPECT_EQ(d->severity, DiagnosticSeverity::Warning);
+    // The span points at `unused`'s declaration (the varDeclHead node).
+    // Layout: "int main(){ int unused; int used=1; return used; }"
+    //          0123456789012345678901234567890
+    // The varDeclHead `int unused` starts at column 12 (`int`) and ends at
+    // the end of `unused` (column 22, half-open). Pin both ends so a
+    // regression that drifts the emit point off the decl node is loud.
+    EXPECT_EQ(d->span.start(), 12u);
+    EXPECT_EQ(d->span.end(),   22u);
+}
+
+// A function PARAMETER that is unused does NOT warn — c-subset sets
+// `warnIfUnused` on `varDeclHead` (locals) but NOT on `param`. This proves
+// the per-declaration opt-in: same engine, same empty use-set, but no
+// warning because the declaration didn't opt in.
+TEST(SemanticAnalyzerCSubset, UnusedParamDoesNotWarn) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(int unusedParam){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "unused params are intentional — param decls do not opt in";
+}
+
+// A USED local does not warn (companion non-false-positive guard): every
+// local is referenced, so zero S_UnusedVariable.
+TEST(SemanticAnalyzerCSubset, OneUnusedLocalAmongUsedWarnsOnlyForUnused) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(){ int a=1; int b=2; return a; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // `a` is used; `b` is NOT — so exactly one warning, for `b`. Proves the
+    // check fires per-symbol on the actual empty-use-set, not blanket.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnusedVariable) EXPECT_EQ(diag.actual, "b");
+    }
+}
+
+// An unused TOP-LEVEL global does NOT warn — c-subset does not set
+// `warnIfUnused` on `topLevelDecl`. Proves globals are exempt.
+TEST(SemanticAnalyzerCSubset, UnusedGlobalDoesNotWarn) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int unusedGlobal;\n"
+        "int main(){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "globals do not opt in to the unused-variable warning";
+}
+
+// A WRITE-ONLY local (assigned but never read) does NOT warn. The
+// unused-variable scope is "never referenced" ONLY: an assignment LHS
+// counts as a use, so `x = 5;` consumes `x`'s use-set even though `x`'s
+// value is never read. This pins the documented scope boundary — detecting
+// assigned-but-never-read is deferred to the optimizer/dataflow phase, not
+// the semantic analyzer.
+TEST(SemanticAnalyzerCSubset, WriteOnlyLocalDoesNotWarn) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(){ int x; x = 5; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "an assignment LHS counts as a use — write-only stays for the optimizer";
 }
 
 // ── GAP A: return-type checking (returnRules facet) ────────────────────────

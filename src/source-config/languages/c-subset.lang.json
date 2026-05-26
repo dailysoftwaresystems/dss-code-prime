@@ -7,6 +7,8 @@
     "fileExtensions": [".c", ".h"]
   },
 
+  "artifactProfiles": ["cli", "lib", "staticlib"],
+
   "imports": {
     "strategy":      "include-following",
     "directiveRule": "includeDirective",
@@ -405,7 +407,7 @@
     "identifierToken": "Identifier",
     "declarations": [
       { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
-        "constMarker": "ConstKeyword" },
+        "constMarker": "ConstKeyword", "warnIfUnused": true },
       { "rule": "param",       "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword" },
       { "rule": "topLevelDecl", "name": 1, "type": 0, "kind": "variable",
@@ -424,7 +426,17 @@
     ],
     "scopes": [ "block", "funcDefTail" ],
     "assignments": [
-      { "rule": "binaryExpr", "operatorToken": "AssignOp", "lhs": 0, "rhs": 2 }
+      { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "MinusAssignOp",  "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "StarAssignOp",   "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "SlashAssignOp",  "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "ModAssignOp",    "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "BitAndAssignOp", "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "BitOrAssignOp",  "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "BitXorAssignOp", "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "ShlAssignOp",    "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "ShrAssignOp",    "lhs": 0, "rhs": 2 }
     ],
     "callRules": [
       { "rule": "postfixExpr", "callee": 0, "args": 2,

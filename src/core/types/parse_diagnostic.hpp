@@ -133,6 +133,14 @@ enum class DiagnosticCode : std::uint16_t {
     // `C_MissingField`; dangling rule/token names stay `C_UnknownShape`/
     // `C_UnknownToken`.)
     C_InvalidSemantics            = 0xC031,
+    // An `artifactProfiles[]` entry (schema v4, plan 06 AP1) names a profile
+    // that is not in the loader's registered profile set (cli/gui/lib/
+    // staticlib/script/sproc/transpile/shader/hdl) — OR the block is
+    // malformed (not an array, or a non-string entry). Mirrors how
+    // C_UnknownTypeExtension covers BOTH the malformed-shape and the
+    // unknown-name cases for its top-level block. Absent field = valid
+    // (empty profile list).
+    C_UnknownArtifactProfile      = 0xC032,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
@@ -153,6 +161,17 @@ enum class DiagnosticCode : std::uint16_t {
     // A break/continue-style control statement (a `loopControls` rule)
     // appearing outside any loop-context subtree (a `loopRules` rule).
     S_ControlOutsideLoop          = 0xE009,
+    // A declared symbol whose minting declaration opted IN to unused-variable
+    // warnings (`warnIfUnused: true` on its DeclarationRule) but that has an
+    // EMPTY use-set after analysis (never referenced). A WARNING, not an
+    // error. Config-driven and per-declaration-kind: a language opts in for
+    // local variables but not for parameters (intentionally unused) or
+    // globals. Needs no CFG — it reads SE7's `usesBySymbol` reverse index.
+    // Scope: "never referenced" only. An assignment LHS is recorded as a use,
+    // so a write-only variable (assigned but never read) does NOT warn here;
+    // dead-store / write-only detection requires dataflow and stays with the
+    // optimizer phase (registry D9).
+    S_UnusedVariable              = 0xE00A,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

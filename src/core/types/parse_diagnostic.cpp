@@ -69,6 +69,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_InvalidNumberStyle:       return "C_InvalidNumberStyle";
         case DiagnosticCode::C_DuplicateWrapperRules:    return "C_DuplicateWrapperRules";
         case DiagnosticCode::C_InvalidSemantics:         return "C_InvalidSemantics";
+        case DiagnosticCode::C_UnknownArtifactProfile:   return "C_UnknownArtifactProfile";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";
@@ -78,6 +79,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_ConstViolation:           return "S_ConstViolation";
         case DiagnosticCode::S_ReturnTypeMismatch:       return "S_ReturnTypeMismatch";
         case DiagnosticCode::S_ControlOutsideLoop:       return "S_ControlOutsideLoop";
+        case DiagnosticCode::S_UnusedVariable:           return "S_UnusedVariable";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

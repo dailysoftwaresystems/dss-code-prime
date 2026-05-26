@@ -20,6 +20,7 @@
 #include <regex>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 namespace dss::detail {
@@ -2189,6 +2190,67 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // artifactProfiles ── profiles this language supports (plan 06 AP1;
+    // schema v4). Optional; absent ⇒ empty list. Each entry must be a name
+    // in the registered profile set (plan 06 §3). AP1 is the schema-field +
+    // loader-validation slice only — no codegen/driver consumes it yet.
+    // The registered set is the loader-owned vocabulary; new profiles arrive
+    // with the backend plan that introduces them (plan 06 §3 "registered set,
+    // not compile-time enum"). Listed here as the v1 ship set.
+    static constexpr std::string_view kRegisteredArtifactProfiles[] = {
+        "cli", "gui", "lib", "staticlib", "script", "sproc",
+        "transpile", "shader", "hdl",
+    };
+    // Single source of truth for the human-readable list in diagnostics —
+    // derived from the array above so the two can never drift.
+    auto registeredProfileList = [&] {
+        std::string out;
+        for (auto const& p : kRegisteredArtifactProfiles) {
+            if (!out.empty()) out += ", ";
+            out += p;
+        }
+        return out;
+    };
+    if (doc.contains("artifactProfiles")) {
+        json const& ap = doc.at("artifactProfiles");
+        if (!ap.is_array()) {
+            coll.emit(DiagnosticCode::C_UnknownArtifactProfile, "/artifactProfiles",
+                      "'artifactProfiles' must be an array of profile names");
+        } else {
+            std::unordered_set<std::string> seen;
+            for (std::size_t i = 0; i < ap.size(); ++i) {
+                const auto path = std::format("/artifactProfiles/{}", i);
+                json const& entry = ap[i];
+                if (!entry.is_string()) {
+                    coll.emit(DiagnosticCode::C_UnknownArtifactProfile, path,
+                              "each 'artifactProfiles' entry must be a string");
+                    continue;
+                }
+                auto profile = entry.get<std::string>();
+                const bool known = std::any_of(
+                    std::begin(kRegisteredArtifactProfiles),
+                    std::end(kRegisteredArtifactProfiles),
+                    [&](std::string_view p) { return p == profile; });
+                if (!known) {
+                    coll.emit(DiagnosticCode::C_UnknownArtifactProfile, path,
+                              std::format("unknown artifact profile '{}' (registered "
+                                          "profiles: {})", profile, registeredProfileList()));
+                    continue;
+                }
+                if (!seen.insert(profile).second) {
+                    // A name listed twice in a top-level array — same situation
+                    // as a duplicate typeExtensions name; use the same code
+                    // (C_ConflictingField) for consistency with that precedent.
+                    coll.emit(DiagnosticCode::C_ConflictingField, path,
+                              std::format("artifact profile '{}' declared more than once",
+                                          profile));
+                    continue;
+                }
+                data.artifactProfiles.push_back(std::move(profile));
+            }
+        }
+    }
+
     // shapes ──
     if (doc.contains("shapes")) {
         if (!doc.at("shapes").is_object()) {
@@ -2918,6 +2980,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D8: optional `warnIfUnused` flag (default false).
+                        // A non-bool value is the same C_InvalidSemantics
+                        // discipline used for other declaration sub-fields.
+                        if (entry.contains("warnIfUnused")) {
+                            if (!entry.at("warnIfUnused").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/warnIfUnused",
+                                          "'warnIfUnused' must be a boolean");
+                            } else {
+                                rule.warnIfUnused =
+                                    entry.at("warnIfUnused").get<bool>();
+                            }
+                        }
+
                         if (entry.contains("kind")) {
                             if (!entry.at("kind").is_string()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -3221,13 +3297,57 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "'name' is required and must be a string");
                             continue;
                         }
-                        if (!entry.contains("core") || !entry.at("core").is_string()) {
+                        // A mapping resolves to EITHER a core primitive
+                        // (`core`) OR a registered type-extension
+                        // (`extension`). Exactly one must be present.
+                        const bool hasCore = entry.contains("core");
+                        const bool hasExt  = entry.contains("extension");
+                        if (hasCore && hasExt) {
+                            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                      "'builtinTypes' entry must specify either 'core' "
+                                      "or 'extension', not both");
+                            continue;
+                        }
+                        if (!hasCore && !hasExt) {
                             coll.emit(DiagnosticCode::C_MissingField, path + "/core",
-                                      "'core' is required and must be a string");
+                                      "'builtinTypes' entry requires 'core' (a core "
+                                      "TypeKind) or 'extension' (a typeExtensions name)");
                             continue;
                         }
                         BuiltinTypeMapping m;
                         m.name = entry.at("name").get<std::string>();
+                        if (hasExt) {
+                            if (!entry.at("extension").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/extension",
+                                          "'extension' must be a string");
+                                continue;
+                            }
+                            auto extName = entry.at("extension").get<std::string>();
+                            // The extension must be declared in the top-level
+                            // `typeExtensions[]` block (parsed earlier).
+                            const bool declared = std::any_of(
+                                data.typeExtensions.begin(), data.typeExtensions.end(),
+                                [&](TypeExtensionDescriptor const& d) {
+                                    return d.name == extName;
+                                });
+                            if (!declared) {
+                                coll.emit(DiagnosticCode::C_UnknownTypeExtension,
+                                          path + "/extension",
+                                          std::format("'builtinTypes[{}].extension' references "
+                                                      "type extension '{}' not declared in "
+                                                      "'typeExtensions'", i, extName));
+                                continue;
+                            }
+                            m.extension = std::move(extName);
+                            cfg.builtinTypes.push_back(std::move(m));
+                            continue;
+                        }
+                        if (!entry.at("core").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/core",
+                                      "'core' is required and must be a string");
+                            continue;
+                        }
                         auto k = parseCore(entry.at("core").get<std::string>());
                         if (!k) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics, path + "/core",
@@ -3415,6 +3535,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
                         cfg.assignments.push_back(std::move(rule));
+                    }
+                    // Invariant (see AssignmentRule doc): an ungated entry (no
+                    // operatorToken) matches every node of its rule, so it must
+                    // be the SOLE entry for that rule. Reject a config that
+                    // mixes an ungated entry with other entries on the same
+                    // rule — otherwise the first-match-wins engine loop would
+                    // silently let the catch-all shadow the gated entries.
+                    for (std::size_t i = 0; i < cfg.assignments.size(); ++i) {
+                        if (cfg.assignments[i].operatorToken.has_value()) continue;
+                        bool shared = false;
+                        for (std::size_t j = 0; j < cfg.assignments.size(); ++j) {
+                            if (j != i &&
+                                cfg.assignments[j].rule.v == cfg.assignments[i].rule.v) {
+                                shared = true;
+                                break;
+                            }
+                        }
+                        if (shared) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/semantics/assignments",
+                                      std::format("assignment rule '{}' mixes an ungated "
+                                                  "entry (no operatorToken) with other "
+                                                  "entries; an ungated entry must be the "
+                                                  "sole entry for its rule",
+                                                  cfg.assignments[i].ruleName));
+                            break;
+                        }
                     }
                 }
             }

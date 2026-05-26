@@ -911,3 +911,177 @@ TEST(SemanticAnalyzerGenericity, Synth2BuiltinFunctionArity) {
         EXPECT_EQ(cnt(model, DiagnosticCode::S_NotCallable), 0u);
     }
 }
+
+// ── D8 genericity (a FIFTH synthetic schema) ───────────────────────────────
+//
+// Synth5 proves the `warnIfUnused` unused-variable facet (D8) is 100%
+// config-driven under NON-shipped rule/token names. None of `localDecl`,
+// `slotDecl`, `useRef` nor the `Word` identifier token overlap any shipped
+// language. TWO declaration forms exercise the per-declaration opt-in:
+//   - `localDecl` (`loc <Word> ;`) sets `warnIfUnused: true`  → warns.
+//   - `slotDecl`  (`slot <Word> ;`) omits it (default false)  → never warns.
+// If the engine hardcoded c-subset's `varDeclHead` name (or "Identifier"),
+// these would fail — proving the facet is language-agnostic.
+namespace {
+constexpr char kSynth5SchemaText[] = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "Synth5", "version": "0.0.1", "fileExtensions": [".syn5"] },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    ";": [{ "kind": "Semi" }]
+  },
+  "keywords": [
+    { "word": "loc",  "kind": "LocKw" },
+    { "word": "slot", "kind": "SlotKw" },
+    { "word": "aa", "kind": "Word" },
+    { "word": "bb", "kind": "Word" },
+    { "word": "cc", "kind": "Word" }
+  ],
+  "syncTokens": [ "Semi" ],
+  "shapes": {
+    "root":      { "sequence": [ { "repeat": "stmt" } ] },
+    "stmt":      { "alt": [ "localDecl", "slotDecl", "useStmt" ] },
+    "localDecl": { "sequence": [ "LocKw", "Word", "Semi" ] },
+    "slotDecl":  { "sequence": [ "SlotKw", "Word", "Semi" ] },
+    "useStmt":   { "sequence": [ "useRef", "Semi" ] },
+    "useRef":    { "sequence": [ "Word" ] }
+  },
+  "semantics": {
+    "identifierToken": "Word",
+    "declarations": [
+      { "rule": "localDecl", "name": 1, "kind": "variable", "warnIfUnused": true },
+      { "rule": "slotDecl",  "name": 1, "kind": "variable" }
+    ],
+    "references": [ { "rule": "useRef" } ]
+  }
+})JSON";
+
+[[nodiscard]] std::shared_ptr<CompilationUnit const> buildSynth5Cu(std::string source) {
+    auto loaded = GrammarSchema::loadFromText(kSynth5SchemaText, "<synth5>");
+    if (!loaded) {
+        ADD_FAILURE() << "synth5 schema failed to load: "
+                      << (loaded.error().empty() ? "<no diagnostics>"
+                                                : loaded.error()[0].message);
+        std::abort();
+    }
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(std::move(source), "<synth5-mem>");
+    return std::make_shared<CompilationUnit>(std::move(builder).finish());
+}
+} // namespace
+
+// D8 (generic): a `loc aa;` whose `aa` is never referenced → exactly one
+// S_UnusedVariable naming `aa`; a referenced `loc bb; bb;` → no warning for
+// bb. Proves the facet fires purely from the synthetic schema's opt-in.
+TEST(SemanticAnalyzerGenericity, Synth5UnusedVariableFromConfig) {
+    auto cu = buildSynth5Cu("loc aa; loc bb; bb;");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // `aa` unused → one warning; `bb` used → none.
+    EXPECT_EQ(cnt(model, DiagnosticCode::S_UnusedVariable), 1u);
+    ParseDiagnostic const* d = nullptr;
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnusedVariable) d = &diag;
+    }
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->actual, "aa");
+    EXPECT_EQ(d->severity, DiagnosticSeverity::Warning);
+}
+
+// D8 (generic): the per-declaration opt-in. `slot cc;` (a NON-opted-in
+// declaration form) whose `cc` is unused → ZERO warnings, even though the
+// use-set is just as empty as an opted-in local's. Proves the warning is
+// gated by the declaration's `warnIfUnused`, not by emptiness alone.
+TEST(SemanticAnalyzerGenericity, Synth5NonOptedInDeclDoesNotWarn) {
+    auto cu = buildSynth5Cu("slot cc;");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(cnt(model, DiagnosticCode::S_UnusedVariable), 0u)
+        << "a declaration form that does not opt in never warns";
+}
+
+// ── builtinTypes.extension genericity (a SIXTH synthetic schema) ────────────
+//
+// Synth6 proves the `builtinTypes.extension` facet (a type name resolving to
+// a registered `typeExtensions[]` entry rather than a core-lattice primitive)
+// is 100% config-driven under NON-shipped vocabulary. The extension name
+// (`Demo::Money`), the type keyword (`cash`), the declaration rule (`hold`),
+// and the identifier token (`Word`) overlap nothing in tsql/c-subset. If the
+// facet were shaped around tsql's VARCHAR / TSQL::Varchar, the resolved type
+// would not carry the arbitrary `Demo::Money` name — this pins that it does.
+namespace {
+constexpr char kSynth6SchemaText[] = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "Synth6", "version": "0.0.1", "fileExtensions": [".syn6"] },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    ";": [{ "kind": "Semi" }]
+  },
+  "keywords": [
+    { "word": "cash", "kind": "CashKw" },
+    { "word": "aa", "kind": "Word" }
+  ],
+  "syncTokens": [ "Semi" ],
+  "typeExtensions": [
+    { "name": "Demo::Money" }
+  ],
+  "shapes": {
+    "root":     { "sequence": [ { "repeat": "hold" } ] },
+    "hold":     { "sequence": [ "typeName", "Word", "Semi" ] },
+    "typeName": { "alt": [ "CashKw" ] }
+  },
+  "semantics": {
+    "identifierToken": "Word",
+    "declarations": [
+      { "rule": "hold", "type": 0, "name": 1, "kind": "variable" }
+    ],
+    "builtinTypes": [
+      { "name": "cash", "extension": "Demo::Money" }
+    ]
+  }
+})JSON";
+
+[[nodiscard]] std::shared_ptr<CompilationUnit const> buildSynth6Cu(std::string source) {
+    auto loaded = GrammarSchema::loadFromText(kSynth6SchemaText, "<synth6>");
+    if (!loaded) {
+        ADD_FAILURE() << "synth6 schema failed to load: "
+                      << (loaded.error().empty() ? "<no diagnostics>"
+                                                : loaded.error()[0].message);
+        std::abort();
+    }
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(std::move(source), "<synth6-mem>");
+    return std::make_shared<CompilationUnit>(std::move(builder).finish());
+}
+} // namespace
+
+// `cash aa;` declares `aa` of the extension type `Demo::Money`. The symbol's
+// resolved type must be `TypeKind::Extension` with the exact extension name,
+// and the type position must NOT emit S_UnknownType — proving the facet maps
+// an arbitrary type keyword to an arbitrary registered extension, with no
+// dependency on tsql's VARCHAR shape.
+TEST(SemanticAnalyzerGenericity, Synth6ExtensionBuiltinTypeResolves) {
+    auto cu = buildSynth6Cu("cash aa;");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& interner = model.lattice().interner();
+
+    SymbolId aaSym{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "aa")
+            aaSym = SymbolId{static_cast<std::uint32_t>(i)};
+    }
+    ASSERT_TRUE(aaSym.valid()) << "declaration `cash aa;` must mint a symbol";
+
+    auto const aaType = model.symbols()[aaSym.v].type;
+    ASSERT_TRUE(aaType.valid()) << "extension type must resolve, not stay Invalid";
+    EXPECT_EQ(interner.kind(aaType), TypeKind::Extension);
+    EXPECT_EQ(interner.name(aaType), "Demo::Money");
+
+    EXPECT_EQ(cnt(model, DiagnosticCode::S_UnknownType), 0u)
+        << "an extension-mapped type keyword must not be reported unknown";
+}

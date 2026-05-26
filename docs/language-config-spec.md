@@ -635,3 +635,29 @@ Languages with no numeric literals omit the block entirely. Configs that referen
 | `C_MissingField` on `numberStyle/...` | A required sub-field is absent or empty (e.g. `emitKind`, `emitKind.integer`, a prefix's `prefix`/`radix`/`digits`). |
 | `C_InvalidNumberStyle` | The block is present but malformed: wrong JSON type, `radix` outside `[2, 36]`, `fractionPoint`/`digitSeparator` not single-char, non-bool `signOptional`, etc. |
 | `C_UnknownToken` on `numberStyle/emitKind/*` | The named token kind isn't declared anywhere (built-in or `tokens`). |
+
+### 11.6 `artifactProfiles` — supported output shapes (plan 06 AP1)
+
+An **optional** top-level array naming the **artifact profiles** a language can be compiled into — the shape its output takes (a console binary, a shared library, a SQL script, …). It is per-language data: each `.lang.json` declares its own set. AP1 is the schema-field + loader-validation slice only; no codegen or driver consumes it yet (the driver-enforcement layer, AP2+, reads this set to reject a project asking for a profile the language can't produce).
+
+```jsonc
+{
+  "dssSchemaVersion": 4,
+  "language": { "name": "CSubset", "version": "0.1.0", "fileExtensions": [".c", ".h"] },
+
+  "artifactProfiles": ["cli", "lib", "staticlib"],   // ← this language's supported outputs
+
+  "tokens":  { /* ... */ },
+  "shapes":  { /* ... */ }
+}
+```
+
+- **Optional.** Absent ⇒ the language declares no profiles (`artifactProfiles()` returns an empty span); the config still loads cleanly.
+- Each entry must be a name in the **registered profile set**: `cli`, `gui`, `lib`, `staticlib`, `script`, `sproc`, `transpile`, `shader`, `hdl` (plan 06 §3). The set is loader-owned vocabulary, not a config-authored name — a new profile arrives with the backend plan that introduces it.
+- An unknown name → `C_UnknownArtifactProfile`. A malformed block (not an array, or a non-string entry) → the same `C_UnknownArtifactProfile`. A duplicate entry → `C_RedundantField` (the duplicate is dropped).
+- The shipped languages declare: `toy` → `["cli"]`; `c-subset` → `["cli", "lib", "staticlib"]`; `tsql-subset` → `["script", "sproc"]`.
+
+| Symptom | Likely fix |
+|---|---|
+| `C_UnknownArtifactProfile` | An entry isn't in the registered set, OR `artifactProfiles` isn't an array, OR an entry isn't a string. Use one of `cli`/`gui`/`lib`/`staticlib`/`script`/`sproc`/`transpile`/`shader`/`hdl`. |
+| `C_RedundantField` on `artifactProfiles` | The same profile is listed twice; remove the duplicate. |

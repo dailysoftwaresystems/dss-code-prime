@@ -78,7 +78,12 @@ struct EngineState {
     std::unordered_map<std::uint32_t, std::size_t> refByRule;
     std::unordered_map<std::uint32_t, std::size_t> typeShapeByRule;
     std::unordered_map<std::uint32_t, bool>        scopeByRule;
-    std::unordered_map<std::uint32_t, std::size_t> assignByRule;
+    // Multiple assignment entries may share one rule (e.g. c-subset's
+    // operator-table `binaryExpr` reused for `=` AND every compound-assign
+    // operator `+=`/`<<=`/…). Each entry is distinguished by its
+    // `operatorToken`, so the index maps a rule to ALL its entries and the
+    // check picks the one whose operator token is present in the node.
+    std::unordered_map<std::uint32_t, std::vector<std::size_t>> assignByRule;
     std::unordered_map<std::uint32_t, std::size_t> callByRule;
     std::unordered_map<std::uint32_t, std::size_t> returnByRule;   // GAP A
     std::unordered_map<std::uint32_t, bool>        loopByRule;      // GAP C loop contexts
@@ -278,7 +283,7 @@ void buildIndexes(EngineState& s, SemanticConfig const& cfg) {
     }
     for (auto const& sc : cfg.scopes) s.scopeByRule[sc.rule.v] = true;
     for (std::size_t i = 0; i < cfg.assignments.size(); ++i) {
-        s.assignByRule[cfg.assignments[i].rule.v] = i;
+        s.assignByRule[cfg.assignments[i].rule.v].push_back(i);
     }
     for (std::size_t i = 0; i < cfg.callRules.size(); ++i) {
         s.callByRule[cfg.callRules[i].rule.v] = i;
@@ -289,6 +294,32 @@ void buildIndexes(EngineState& s, SemanticConfig const& cfg) {
     for (auto const& lr : cfg.loopRules)    s.loopByRule[lr.rule.v] = true;
     for (auto const& lc : cfg.loopControls) s.loopControlByRule[lc.rule.v] = true;
     for (auto const& bt : cfg.builtinTypes) {
+        if (bt.extension.has_value()) {
+            // The mapping names a registered type-extension (e.g. T-SQL's
+            // VARCHAR → "TSQL::Varchar"). Extensions are registered into the
+            // CU registry BEFORE buildIndexes runs (see analyze()), so the
+            // kindId is available here. The extension type is built with no
+            // type/scalar args — the parameterized form (e.g. Varchar<N>) is
+            // resolved later if/when the grammar parses the parameter; a bare
+            // type-position name resolves to the un-parameterized extension so
+            // the type position does not spuriously emit S_UnknownType.
+            auto kindId = s.lattice.registry().findExtension(*bt.extension);
+            if (!kindId) {
+                // Loader invariant: a builtinType naming an `extension` is
+                // validated against typeExtensions[] at load
+                // (C_UnknownTypeExtension), and registerSchemaTypeExtensions
+                // runs before buildIndexes (see analyze()). An unregistered
+                // extension here means that invariant was violated — fail loud
+                // rather than silently degrade the type to S_UnknownType.
+                std::fputs("dss::analyze fatal: builtinType names an "
+                           "unregistered type-extension (loader invariant "
+                           "violated)\n", stderr);
+                std::abort();
+            }
+            s.builtinTypeIds[bt.name] =
+                s.lattice.interner().extension(*kindId, *bt.extension, {});
+            continue;
+        }
         s.builtinTypeIds[bt.name] = s.lattice.interner().primitive(bt.core);
     }
     for (auto const& lt : cfg.literalTypes) {
@@ -434,6 +465,7 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     rec.declRuleNode = node;
                     rec.tree         = tree.id();
                     rec.kind         = effectiveKind;
+                    rec.warnIfUnused = decl.warnIfUnused;
 
                     // SE4: const-marking. Scan the type subtree (or the
                     // whole decl subtree when no typeChild) for the
@@ -770,41 +802,49 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         auto const rule = tree.rule(node);
         auto assignIt = s.assignByRule.find(rule.v);
         if (assignIt != s.assignByRule.end()) {
-            auto const& assign = cfg.assignments[assignIt->second];
             auto kids = visibleChildren(tree, node);
-            // The operatorToken (when set) gates the match: a binaryExpr
-            // reused for every operator only counts as an assignment when
-            // one of its visible children IS that operator token.
-            bool gated = true;
-            if (assign.operatorToken.has_value()) {
-                gated = false;
-                for (auto kid : kids) {
-                    if (tree.kind(kid) == NodeKind::Token
-                        && tree.tokenKind(kid) == *assign.operatorToken) {
-                        gated = true;
-                        break;
+            // Several assignment entries may share this rule (operator-table
+            // `binaryExpr` reused for `=` and every compound-assign op). Each
+            // entry's `operatorToken` (when set) gates the match: a binaryExpr
+            // only counts as that assignment when one of its visible children
+            // IS that operator token. Apply the FIRST entry whose gate passes
+            // (a binaryExpr carries exactly one operator, so at most one entry
+            // can fire) — then stop.
+            for (auto assignIdx : assignIt->second) {
+                auto const& assign = cfg.assignments[assignIdx];
+                bool gated = true;
+                if (assign.operatorToken.has_value()) {
+                    gated = false;
+                    for (auto kid : kids) {
+                        if (tree.kind(kid) == NodeKind::Token
+                            && tree.tokenKind(kid) == *assign.operatorToken) {
+                            gated = true;
+                            break;
+                        }
                     }
                 }
-            }
-            if (gated && assign.lhsChild < kids.size()) {
-                NodeId lhsNode = kids[assign.lhsChild];
-                auto resolved = extractNameNode(
-                    tree, lhsNode, NameMatchMode::Self, cfg.identifierToken);
-                if (resolved.node.valid()
-                    && tree.kind(resolved.node) == NodeKind::Token
-                    && cfg.identifierToken.valid()
-                    && tree.tokenKind(resolved.node) == cfg.identifierToken) {
-                    SymbolId const lhsSym = s.scopes.lookup(here, resolved.name);
-                    if (lhsSym.valid() && s.symbols.at(lhsSym).isConst) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_ConstViolation;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(resolved.node);
-                        d.actual   = resolved.name;
-                        s.reporter.report(std::move(d));
+                if (!gated) continue;
+                if (assign.lhsChild < kids.size()) {
+                    NodeId lhsNode = kids[assign.lhsChild];
+                    auto resolved = extractNameNode(
+                        tree, lhsNode, NameMatchMode::Self, cfg.identifierToken);
+                    if (resolved.node.valid()
+                        && tree.kind(resolved.node) == NodeKind::Token
+                        && cfg.identifierToken.valid()
+                        && tree.tokenKind(resolved.node) == cfg.identifierToken) {
+                        SymbolId const lhsSym = s.scopes.lookup(here, resolved.name);
+                        if (lhsSym.valid() && s.symbols.at(lhsSym).isConst) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_ConstViolation;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(resolved.node);
+                            d.actual   = resolved.name;
+                            s.reporter.report(std::move(d));
+                        }
                     }
                 }
+                break;  // operator matched — no further entry can apply
             }
         }
     }
@@ -1110,11 +1150,13 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
     }
     EngineState s{*cu};
     auto const& cfg = cu->schema().semantics();
-    buildIndexes(s, cfg);
 
     // Register the schema's type extensions into the lattice's registry
-    // (tsql's TSQL::Varchar etc.).
+    // (tsql's TSQL::Varchar etc.) BEFORE buildIndexes, so a builtinType
+    // mapping that names an extension can resolve its kindId.
     registerSchemaTypeExtensions(s.lattice.registry(), cu->schema());
+
+    buildIndexes(s, cfg);
 
     // SE6: a CU-wide builtins scope (child of the CU root, parent of every
     // tree root) holds config-declared builtin functions. Visible
@@ -1181,6 +1223,43 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
     for (auto const& tree : trees) {
         if (!tree.root().valid()) continue;
         pass2(s, cfg, tree, tree.root(), treeRootScope.at(tree.id().v), 0);
+    }
+
+    // D8: unused-variable warnings. After Pass 2 has fully populated the
+    // SE7 reverse use-index (`usesBySymbol`), any symbol whose minting
+    // declaration opted in (`warnIfUnused`) AND whose use-set is EMPTY is
+    // never referenced — emit S_UnusedVariable (a WARNING) at the
+    // declaration's rule-node span. No CFG needed: never-referenced is a
+    // direct read of the reverse index. Config-driven and per-declaration:
+    // only symbols from a `warnIfUnused: true` declaration are candidates.
+    {
+        std::unordered_map<std::uint32_t /*TreeId.v*/, Tree const*> treeById;
+        for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+        auto const& records = s.symbols.records();
+        for (std::size_t i = 1; i < records.size(); ++i) {
+            auto const& rec = records[i];
+            if (!rec.warnIfUnused) continue;
+            auto useIt = s.usesBySymbol.find(static_cast<std::uint32_t>(i));
+            if (useIt != s.usesBySymbol.end() && !useIt->second.empty()) continue;
+            auto treeIt = treeById.find(rec.tree.v);
+            if (treeIt == treeById.end()) {
+                // Every minted user symbol carries a valid tree id (set at
+                // pass 1). A warnIfUnused symbol whose tree is absent from the
+                // CU is an internal invariant violation — fail loud.
+                std::fputs("dss::analyze fatal: unused-variable symbol "
+                           "references a tree absent from the compilation "
+                           "unit\n", stderr);
+                std::abort();
+            }
+            Tree const& tree = *treeIt->second;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_UnusedVariable;
+            d.severity = DiagnosticSeverity::Warning;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(rec.declRuleNode);
+            d.actual   = rec.name;
+            s.reporter.report(std::move(d));
+        }
     }
 
     return SemanticModel{

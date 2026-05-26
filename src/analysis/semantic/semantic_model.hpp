@@ -66,6 +66,10 @@ struct DSS_EXPORT SymbolRecord {
     // SE6: set on a builtin-function symbol declared `variadic` — the
     // call-check skips arg-count enforcement for it.
     bool            variadicBuiltin = false;
+    // SE7/D8: copied from the minting DeclarationRule's `warnIfUnused`. After
+    // analysis, a symbol with this flag set AND an empty use-set emits
+    // S_UnusedVariable (a WARNING) at `declRuleNode`'s span.
+    bool            warnIfUnused = false;
 };
 
 class DSS_EXPORT SemanticModel {

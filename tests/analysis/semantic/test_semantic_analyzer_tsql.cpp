@@ -22,23 +22,89 @@ namespace {
     }
     return n;
 }
+
+// Count user-declared symbols of a specific kind (D3: `columnDecl` now mints
+// Variable-kind column symbols per table, so "how many tables?" must filter
+// by Table-kind rather than counting every tree symbol).
+[[nodiscard]] std::size_t tableSymbolCount(SemanticModel const& model) {
+    std::size_t n = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& rec = model.symbols()[i];
+        if (rec.tree.valid() && rec.kind == DeclarationKind::Table) ++n;
+    }
+    return n;
+}
+
+// The single Table-kind symbol (asserts exactly one exists).
+[[nodiscard]] SymbolRecord const* singleTable(SemanticModel const& model) {
+    SymbolRecord const* found = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& rec = model.symbols()[i];
+        if (rec.tree.valid() && rec.kind == DeclarationKind::Table) {
+            EXPECT_EQ(found, nullptr) << "expected exactly one Table symbol";
+            found = &rec;
+        }
+    }
+    return found;
+}
 } // namespace
 
-// CREATE TABLE → one symbol minted, kind == DeclarationKind::Table.
+// CREATE TABLE → one Table symbol minted + one Variable symbol per column
+// (D3: `columnDecl` is now a declaration). The two columns (Id, Name) are
+// table-local (createTableStmt opens a scope), so the CU has 3 user symbols.
 TEST(SemanticAnalyzerTsql, CreateTableMintsTableSymbol) {
     auto cu = buildShippedUnit("tsql-subset", {
         "CREATE TABLE Customers (Id INT NOT NULL, Name VARCHAR);",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    ASSERT_EQ(userSymbolCount(model), 1u);
-    SymbolRecord const* rec = nullptr;
-    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
-        if (model.symbols()[i].tree.valid()) rec = &model.symbols()[i];
-    }
+    EXPECT_EQ(tableSymbolCount(model), 1u);
+    EXPECT_EQ(userSymbolCount(model), 3u) << "1 table + 2 columns (Id, Name)";
+    SymbolRecord const* rec = singleTable(model);
     ASSERT_NE(rec, nullptr);
     EXPECT_EQ(rec->name, "Customers");
     EXPECT_EQ(rec->kind, DeclarationKind::Table);
+}
+
+// D3: column types resolve via the tsql `builtinTypes` block. `INT`→I32,
+// `BIT`→Bool (both core primitives). `VARCHAR`→the `TSQL::Varchar`
+// extension (no core string kind exists, so VARCHAR maps to the registered
+// extension type rather than a core primitive). Critically, NO column emits
+// S_UnknownType — the no-regression property the D3 mapping must preserve.
+TEST(SemanticAnalyzerTsql, ColumnTypesResolveViaBuiltinTypes) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE t (a INT, b BIT, c VARCHAR);",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& interner = model.lattice().interner();
+
+    SymbolRecord const* aRec = nullptr;
+    SymbolRecord const* bRec = nullptr;
+    SymbolRecord const* cRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& rec = model.symbols()[i];
+        if (!rec.tree.valid() || rec.kind != DeclarationKind::Variable) continue;
+        if (rec.name == "a") aRec = &rec;
+        if (rec.name == "b") bRec = &rec;
+        if (rec.name == "c") cRec = &rec;
+    }
+    ASSERT_NE(aRec, nullptr) << "column a must mint a symbol";
+    ASSERT_NE(bRec, nullptr) << "column b must mint a symbol";
+    ASSERT_NE(cRec, nullptr) << "column c must mint a symbol";
+
+    ASSERT_TRUE(aRec->type.valid());
+    EXPECT_EQ(interner.kind(aRec->type), TypeKind::I32) << "INT → I32";
+    ASSERT_TRUE(bRec->type.valid());
+    EXPECT_EQ(interner.kind(bRec->type), TypeKind::Bool) << "BIT → Bool";
+    // VARCHAR resolves to the TSQL::Varchar extension type (kind Extension),
+    // NOT a core primitive and NOT S_UnknownType.
+    ASSERT_TRUE(cRec->type.valid()) << "VARCHAR must resolve, not stay Invalid";
+    EXPECT_EQ(interner.kind(cRec->type), TypeKind::Extension) << "VARCHAR → TSQL::Varchar";
+    EXPECT_EQ(interner.name(cRec->type), "TSQL::Varchar");
+
+    // No-regression: not one column type position emits S_UnknownType.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
 }
 
 // `dbo.Customers` in a CREATE TABLE — the `lastIdentifier` matcher
@@ -49,11 +115,8 @@ TEST(SemanticAnalyzerTsql, LastIdentifierMatcherExtractsRightmost) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    ASSERT_EQ(userSymbolCount(model), 1u);
-    SymbolRecord const* rec = nullptr;
-    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
-        if (model.symbols()[i].tree.valid()) rec = &model.symbols()[i];
-    }
+    EXPECT_EQ(tableSymbolCount(model), 1u);
+    SymbolRecord const* rec = singleTable(model);
     ASSERT_NE(rec, nullptr);
     EXPECT_EQ(rec->name, "Orders");
 }
@@ -106,9 +169,11 @@ TEST(SemanticAnalyzerTsql, CrossFileSameNameTablesDoNotCollide) {
     auto model = analyze(cu);
     // Per-tree-root isolation: NOT a redeclaration.
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
-    // Two independent symbols minted in two distinct tree-root scopes
-    // (the CU-wide COALESCE builtin is excluded by userSymbolCount).
-    EXPECT_EQ(userSymbolCount(model), 2u);
+    // Two independent table symbols minted in two distinct tree-root scopes
+    // (the CU-wide COALESCE builtin is excluded by userSymbolCount). Each
+    // table also mints its own table-local `Id` column → 4 user symbols.
+    EXPECT_EQ(tableSymbolCount(model), 2u);
+    EXPECT_EQ(userSymbolCount(model), 4u) << "2 tables + 2 (table-local) Id columns";
 }
 
 // Two CREATE TABLEs with the same name in the same CU → exactly one
@@ -229,11 +294,8 @@ TEST(SemanticAnalyzerTsql, BracketIdentifierMintsAndResolves) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
     // The table symbol minted with the bracketed name (brackets stripped).
-    ASSERT_EQ(userSymbolCount(model), 1u);
-    SymbolRecord const* rec = nullptr;
-    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
-        if (model.symbols()[i].tree.valid()) rec = &model.symbols()[i];
-    }
+    EXPECT_EQ(tableSymbolCount(model), 1u);
+    SymbolRecord const* rec = singleTable(model);
     ASSERT_NE(rec, nullptr);
     EXPECT_EQ(rec->name, "Orders");
     EXPECT_EQ(rec->kind, DeclarationKind::Table);
@@ -271,11 +333,8 @@ TEST(SemanticAnalyzerTsql, BracketIdDoubledDelimiterMintsAndResolves) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    ASSERT_EQ(userSymbolCount(model), 1u);
-    SymbolRecord const* rec = nullptr;
-    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
-        if (model.symbols()[i].tree.valid()) rec = &model.symbols()[i];
-    }
+    EXPECT_EQ(tableSymbolCount(model), 1u);
+    SymbolRecord const* rec = singleTable(model);
     ASSERT_NE(rec, nullptr);
     EXPECT_EQ(rec->name, "Ord]ers")
         << "the `]]` must un-double to a single literal `]` — name is Ord]ers";
