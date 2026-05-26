@@ -2,6 +2,8 @@ add_library(hir OBJECT
     hir.cpp
     hir_cursor.cpp
     hir_kind_registry.cpp
+    hir_op_registry.cpp
+    hir_verifier.cpp
 )
 
 target_include_directories(hir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

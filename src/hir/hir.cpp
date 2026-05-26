@@ -21,12 +21,14 @@ void resetMovedFrom_(Arena& arena,
                      std::vector<HirNodeId>& childPool,
                      std::vector<HirNodeId>& parentOf,
                      std::string& sourceLanguage,
-                     HirKindRegistry& registry) noexcept {
+                     HirKindRegistry& registry,
+                     HirOpRegistry& opRegistry) noexcept {
     arena = Arena{};
     childPool.clear();
     parentOf.clear();
     sourceLanguage.clear();
     registry = HirKindRegistry{};
+    opRegistry = HirOpRegistry{};
 }
 
 } // namespace
@@ -34,13 +36,15 @@ void resetMovedFrom_(Arena& arena,
 // ── Hir ─────────────────────────────────────────────────────────────────────
 
 Hir::Hir(Arena arena, std::vector<HirNodeId> childPool, std::vector<HirNodeId> parentOf,
-         HirNodeId root, std::string sourceLanguage, HirKindRegistry registry) noexcept
+         HirNodeId root, std::string sourceLanguage, HirKindRegistry registry,
+         HirOpRegistry opRegistry) noexcept
     : arena_(std::move(arena)),
       childPool_(std::move(childPool)),
       parentOf_(std::move(parentOf)),
       root_(root),
       sourceLanguage_(std::move(sourceLanguage)),
-      registry_(std::move(registry)) {
+      registry_(std::move(registry)),
+      opRegistry_(std::move(opRegistry)) {
     // The parallel parent array must align 1:1 with the arena (slot 0 sentinel
     // + one slot per minted node). HirBuilder maintains this in lockstep; this
     // boundary check catches any direct ctor misuse before `parent()` could
@@ -60,9 +64,10 @@ Hir::Hir(Hir&& other) noexcept
       parentOf_(std::move(other.parentOf_)),
       root_(std::exchange(other.root_, InvalidHirNode)),
       sourceLanguage_(std::move(other.sourceLanguage_)),
-      registry_(std::move(other.registry_)) {
+      registry_(std::move(other.registry_)),
+      opRegistry_(std::move(other.opRegistry_)) {
     resetMovedFrom_(other.arena_, other.childPool_, other.parentOf_,
-                    other.sourceLanguage_, other.registry_);
+                    other.sourceLanguage_, other.registry_, other.opRegistry_);
 }
 
 Hir& Hir::operator=(Hir&& other) noexcept {
@@ -73,8 +78,9 @@ Hir& Hir::operator=(Hir&& other) noexcept {
     root_           = std::exchange(other.root_, InvalidHirNode);
     sourceLanguage_ = std::move(other.sourceLanguage_);
     registry_       = std::move(other.registry_);
+    opRegistry_     = std::move(other.opRegistry_);
     resetMovedFrom_(other.arena_, other.childPool_, other.parentOf_,
-                    other.sourceLanguage_, other.registry_);
+                    other.sourceLanguage_, other.registry_, other.opRegistry_);
     return *this;
 }
 
@@ -193,7 +199,152 @@ Hir HirBuilder::finish(HirNodeId root) && {
     }
     return Hir{std::move(arena_).finish(), std::move(childPool_),
                std::move(parentOf_), root,
-               std::move(sourceLanguage_), std::move(registry_)};
+               std::move(sourceLanguage_), std::move(registry_),
+               std::move(opRegistry_)};
+}
+
+// ── typed expression helpers (HR2) ──────────────────────────────────────────
+
+namespace {
+
+// A construction-time arity check: `makeBinaryOp` on a unary operator (or vice
+// versa) is a caller bug that would build a structurally-impossible node, so it
+// aborts loud rather than producing malformed HIR the verifier only catches
+// later. `opLabel` names the operator for the message (the core opName() or the
+// extension descriptor name).
+[[noreturn]] void arityMismatch_(std::string_view opLabel, HirOpArity declared,
+                                 HirOpArity expected) {
+    std::fprintf(stderr,
+                 "dss::HirBuilder fatal: operator '%.*s' is %s but was used to build a "
+                 "%s expression node\n",
+                 static_cast<int>(opLabel.size()), opLabel.data(),
+                 arityLabel(declared), arityLabel(expected));
+    std::abort();
+}
+
+} // namespace
+
+HirNodeId HirBuilder::makeLiteral(TypeId type, std::uint32_t literalIndex, HirFlags flags) {
+    return addLeaf(HirKind::Literal, type, literalIndex, flags);
+}
+
+HirNodeId HirBuilder::makeRef(TypeId type, std::uint32_t symbol, HirFlags flags) {
+    return addLeaf(HirKind::Ref, type, symbol, flags);
+}
+
+HirNodeId HirBuilder::makeBinaryOp(HirOpKind op, HirNodeId lhs, HirNodeId rhs, TypeId type,
+                                   HirFlags flags) {
+    HirOpArity const declared = arityOf(op);
+    if (declared != HirOpArity::Binary) {
+        arityMismatch_(opName(op), declared, HirOpArity::Binary);
+    }
+    HirNodeId const kids[] = {lhs, rhs};
+    return addParent(HirKind::BinaryOp, kids, type, encodeOp(op), flags);
+}
+
+HirNodeId HirBuilder::makeBinaryOp(HirOpId op, HirNodeId lhs, HirNodeId rhs, TypeId type,
+                                   HirFlags flags) {
+    HirOpDescriptor const& d = opRegistry_.descriptor(op);  // aborts if never minted
+    if (d.arity() != HirOpArity::Binary) {
+        arityMismatch_(d.name(), d.arity(), HirOpArity::Binary);
+    }
+    HirNodeId const kids[] = {lhs, rhs};
+    return addParent(HirKind::BinaryOp, kids, type, encodeOp(op), flags);
+}
+
+HirNodeId HirBuilder::makeUnaryOp(HirOpKind op, HirNodeId operand, TypeId type, HirFlags flags) {
+    HirOpArity const declared = arityOf(op);
+    if (declared != HirOpArity::Unary) {
+        arityMismatch_(opName(op), declared, HirOpArity::Unary);
+    }
+    HirNodeId const kids[] = {operand};
+    return addParent(HirKind::UnaryOp, kids, type, encodeOp(op), flags);
+}
+
+HirNodeId HirBuilder::makeUnaryOp(HirOpId op, HirNodeId operand, TypeId type, HirFlags flags) {
+    HirOpDescriptor const& d = opRegistry_.descriptor(op);  // aborts if never minted
+    if (d.arity() != HirOpArity::Unary) {
+        arityMismatch_(d.name(), d.arity(), HirOpArity::Unary);
+    }
+    HirNodeId const kids[] = {operand};
+    return addParent(HirKind::UnaryOp, kids, type, encodeOp(op), flags);
+}
+
+HirNodeId HirBuilder::makeCall(HirNodeId callee, std::span<HirNodeId const> args, TypeId type,
+                               HirFlags flags) {
+    std::vector<HirNodeId> kids;
+    kids.reserve(args.size() + 1);
+    kids.push_back(callee);
+    kids.insert(kids.end(), args.begin(), args.end());
+    return addParent(HirKind::Call, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeIntrinsicCall(std::uint32_t intrinsicId,
+                                        std::span<HirNodeId const> args, TypeId type,
+                                        HirFlags flags) {
+    return addParent(HirKind::IntrinsicCall, args, type, intrinsicId, flags);
+}
+
+HirNodeId HirBuilder::makeCast(HirNodeId operand, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {operand};
+    return addParent(HirKind::Cast, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeMemberAccess(HirNodeId base, std::uint32_t fieldIndex, TypeId type,
+                                       HirFlags flags) {
+    HirNodeId const kids[] = {base};
+    return addParent(HirKind::MemberAccess, kids, type, fieldIndex, flags);
+}
+
+HirNodeId HirBuilder::makeIndex(HirNodeId base, HirNodeId index, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {base, index};
+    return addParent(HirKind::Index, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeSwizzle(HirNodeId base, std::uint32_t componentMask, TypeId type,
+                                  HirFlags flags) {
+    HirNodeId const kids[] = {base};
+    return addParent(HirKind::Swizzle, kids, type, componentMask, flags);
+}
+
+HirNodeId HirBuilder::makeConstructAggregate(std::span<HirNodeId const> fields, TypeId type,
+                                             HirFlags flags) {
+    return addParent(HirKind::ConstructAggregate, fields, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeTernary(HirNodeId cond, HirNodeId thenExpr, HirNodeId elseExpr,
+                                  TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {cond, thenExpr, elseExpr};
+    return addParent(HirKind::Ternary, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeLogicalAnd(HirNodeId lhs, HirNodeId rhs, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {lhs, rhs};
+    return addParent(HirKind::LogicalAnd, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeLogicalOr(HirNodeId lhs, HirNodeId rhs, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {lhs, rhs};
+    return addParent(HirKind::LogicalOr, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeSizeOf(HirNodeId typeRef, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {typeRef};
+    return addParent(HirKind::SizeOf, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeAddressOf(HirNodeId operand, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {operand};
+    return addParent(HirKind::AddressOf, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeDeref(HirNodeId operand, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {operand};
+    return addParent(HirKind::Deref, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeTypeRef(TypeId type, HirFlags flags) {
+    return addLeaf(HirKind::TypeRef, type, /*payload=*/0, flags);
 }
 
 } // namespace dss

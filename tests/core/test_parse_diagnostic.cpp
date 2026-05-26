@@ -2,7 +2,14 @@
 
 #include <gtest/gtest.h>
 
-using namespace dss;
+using dss::diagnosticCodeName;
+using dss::diagnosticCodePrefix;
+using dss::DiagnosticCode;
+using dss::DiagnosticSeverity;
+using dss::ParseDiagnostic;
+using dss::ScopeKind;
+using dss::scopeName;
+using dss::severityName;
 
 TEST(DiagnosticCode, SymbolicNameRoundtrip) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::P_UnexpectedToken),     "P_UnexpectedToken");
@@ -16,6 +23,8 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_UnknownTypeExtension), "C_UnknownTypeExtension");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::C_TypeExtensionParamMismatch),
               "C_TypeExtensionParamMismatch");
+    // H_* HIR verifier / lowering codes (plan 09, HR2).
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_TypeUnresolved),      "H_TypeUnresolved");
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
@@ -32,6 +41,9 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_DuplicateFile),    "D0003");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_UnknownTypeExtension),       "C002A");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::C_TypeExtensionParamMismatch), "C002B");
+    // H_* prefix; the 0xF high nibble renders as 'H' and is stripped from the
+    // numeric portion (like C/D/S).
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::H_TypeUnresolved),   "H0001");
 }
 
 TEST(DiagnosticSeverity, NameMapping) {

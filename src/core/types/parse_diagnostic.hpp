@@ -28,6 +28,7 @@ enum class DiagnosticSeverity : std::uint8_t {
 //   P_*    parse-time / tree-builder
 //   C_*    config-load (GrammarSchema)
 //   S_*    semantic (later)
+//   H_*    HIR verifier / lowering (plan 09)
 //   I_*    IR-gen   (later)
 //
 // Values are stable across versions — they appear in user-facing output
@@ -190,6 +191,18 @@ enum class DiagnosticCode : std::uint16_t {
     // the target, so the driver does not treat them as build-fatal here.
     D_UnresolvedImport            = 0xD004,
     D_UnresolvedReference         = 0xD005,
+
+    // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
+    // as the letter `H`, see diagnosticCodePrefix) ──
+    // Emitted by the language-agnostic HIR verifier (`src/hir/hir_verifier`) and
+    // (later) the CST→HIR lowering. Reserved for verifier-/lowering-time
+    // failures only — config-load errors in a `hirLowering` block use the C_*
+    // band (plan §4 Q8). Append, never renumber.
+    // H_TypeUnresolved: an expression (or TypeRef) node whose `typeId` is not
+    //   valid() — i.e. lowering/semantic analysis failed to resolve its type.
+    //   A node already flagged `HirFlags::HasError` is skipped (cascade
+    //   suppression), so this fires only on a genuinely untyped, non-error node.
+    H_TypeUnresolved              = 0xF001,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

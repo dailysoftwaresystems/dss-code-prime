@@ -85,6 +85,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
         case DiagnosticCode::D_UnresolvedImport:         return "D_UnresolvedImport";
         case DiagnosticCode::D_UnresolvedReference:      return "D_UnresolvedReference";
+        case DiagnosticCode::H_TypeUnresolved:           return "H_TypeUnresolved";
     }
     return "Unknown";
 }
@@ -96,6 +97,7 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0xCxxx → C0xxx     (config)
     //   0xDxxx → D0xxx     (driver / compilation-unit)
     //   0xExxx → S0xxx     (semantic analysis, plan 08.6)
+    //   0xFxxx → H0xxx     (HIR verifier / lowering, plan 09)
     // Render as the 4-digit hex grouping the user actually sees.
     const auto v          = static_cast<std::uint16_t>(c);
     const std::uint16_t nibble = v & 0xF000u;
@@ -106,11 +108,14 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'D';
     } else if (nibble == 0xE000u) {
         letter = 'S';
+    } else if (nibble == 0xF000u) {
+        letter = 'H';
     }
     // Strip the high nibble for the numeric portion when it's a phase
-    // marker (C/D/S). The 9xxx range stays 9xxx so P_BuilderInvariant prints
+    // marker (C/D/S/H). The 9xxx range stays 9xxx so P_BuilderInvariant prints
     // as "P9000".
-    const bool hasNibbleMarker = (nibble == 0xC000u || nibble == 0xD000u || nibble == 0xE000u);
+    const bool hasNibbleMarker = (nibble == 0xC000u || nibble == 0xD000u
+                                  || nibble == 0xE000u || nibble == 0xF000u);
     const std::uint16_t lo = hasNibbleMarker ? (v & 0x0FFFu) : v;
     return std::format("{}{:04X}", letter, lo);
 }

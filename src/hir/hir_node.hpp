@@ -70,6 +70,41 @@ static_assert(static_cast<std::uint32_t>(HirKind::Count_) < 256,
 // type lattice's kFirstExtensionKind.
 inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
 
+// Does a node of this kind carry a resolved result type — i.e. must its `typeId`
+// be `valid()`? True for the whole Expressions group (every expression has a
+// type, plan §2.4) plus `TypeRef` (which carries the referenced lattice TypeId).
+// False for declarations, statements, and the `Error`/`Unreachable` sentinels.
+// This is the predicate the HR2 verifier's expression-typing rule sweeps with.
+//
+// `Extension` is intentionally false here: whether an extension kind produces a
+// value (and so requires a type) lives in its `HirKindDescriptor` operand/value
+// shape, added in a later phase (HR5/HR6) — the core predicate can't know it.
+[[nodiscard]] constexpr bool requiresValidType(HirKind kind) noexcept {
+    switch (kind) {
+        // ── Expressions (plan §2.2) ──
+        case HirKind::Literal: case HirKind::Ref: case HirKind::Call:
+        case HirKind::IntrinsicCall: case HirKind::BinaryOp: case HirKind::UnaryOp:
+        case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
+        case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
+        case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
+        case HirKind::AddressOf: case HirKind::Deref:
+        // ── Types-as-values: carries the referenced lattice TypeId ──
+        case HirKind::TypeRef:
+            return true;
+        // ── Modules / Declarations / Statements / sentinels / Extension ──
+        case HirKind::Module: case HirKind::Function: case HirKind::Global:
+        case HirKind::TypeDecl: case HirKind::ExternFunction: case HirKind::ExternGlobal:
+        case HirKind::ImportGroup: case HirKind::Block: case HirKind::IfStmt:
+        case HirKind::WhileStmt: case HirKind::DoWhileStmt: case HirKind::ForStmt:
+        case HirKind::SwitchStmt: case HirKind::CaseArm: case HirKind::BreakStmt:
+        case HirKind::ContinueStmt: case HirKind::ReturnStmt: case HirKind::ExprStmt:
+        case HirKind::VarDecl: case HirKind::AssignStmt: case HirKind::Unreachable:
+        case HirKind::Error: case HirKind::Extension: case HirKind::Count_:
+            return false;
+    }
+    return false;  // unreachable for a well-formed core kind
+}
+
 // ── HirFlags: orthogonal per-node markers ────────────────────────────────────
 //
 // HasError mirrors CST's propagation discipline. Synthetic marks nodes the

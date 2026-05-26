@@ -86,6 +86,10 @@ DSS_STRONG_ID(TypeNameId);
 // [0,256)), mirroring TypeKindId.
 DSS_STRONG_ID(HirModuleId);
 DSS_STRONG_ID(HirKindId);
+// HIR operator id (HR2). Identifies an extension operator (registry-minted,
+// >= 256; core operators occupy the HirOpKind enum's [0,256)), the operator
+// analog of HirKindId. Carried in a BinaryOp/UnaryOp node's `payload`.
+DSS_STRONG_ID(HirOpId);
 
 // Arena-element ids (carry `arenaTag`): NodeId is the Tree's node index; TypeId
 // is the CU-scoped type lattice's index (its arena tag is the CompilationUnitId);
@@ -114,6 +118,7 @@ inline constexpr TypeKindId      InvalidTypeKind{};
 inline constexpr TypeNameId      InvalidTypeName{};
 inline constexpr HirModuleId     InvalidHirModule{};
 inline constexpr HirKindId       InvalidHirKind{};
+inline constexpr HirOpId         InvalidHirOp{};
 inline constexpr HirNodeId       InvalidHirNode{};
 
 } // namespace dss
@@ -143,6 +148,7 @@ DSS_HASH_ID(TypeKindId);
 DSS_HASH_ID(TypeNameId);
 DSS_HASH_ID(HirModuleId);
 DSS_HASH_ID(HirKindId);
+DSS_HASH_ID(HirOpId);
 DSS_HASH_ID(HirNodeId);
 
 #undef DSS_HASH_ID

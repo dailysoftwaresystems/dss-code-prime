@@ -7,6 +7,8 @@
 #include "core/types/type_lattice/type_id.hpp"
 #include "hir/hir_kind_registry.hpp"
 #include "hir/hir_node.hpp"
+#include "hir/hir_op.hpp"
+#include "hir/hir_op_registry.hpp"
 
 #include <cstdint>
 #include <span>
@@ -44,7 +46,8 @@ public:
     // here at the construction boundary — any direct (non-builder) ctor misuse
     // aborts loud rather than silently OOB-reading `parentOf_[id.v]` later.
     Hir(Arena arena, std::vector<HirNodeId> childPool, std::vector<HirNodeId> parentOf,
-        HirNodeId root, std::string sourceLanguage, HirKindRegistry registry) noexcept;
+        HirNodeId root, std::string sourceLanguage, HirKindRegistry registry,
+        HirOpRegistry opRegistry) noexcept;
 
     // Move-only: the arena is move-only (its cross-arena tag must stay unique),
     // so copying a module is meaningless — downstream consumers move it along.
@@ -63,7 +66,8 @@ public:
     [[nodiscard]] bool             empty()     const noexcept { return arena_.empty(); }
     [[nodiscard]] HirNodeId        root()      const noexcept { return root_; }
     [[nodiscard]] std::string_view sourceLanguage() const noexcept { return sourceLanguage_; }
-    [[nodiscard]] HirKindRegistry const& registry() const noexcept { return registry_; }
+    [[nodiscard]] HirKindRegistry const& registry()   const noexcept { return registry_; }
+    [[nodiscard]] HirOpRegistry const&   opRegistry() const noexcept { return opRegistry_; }
 
     // ── node accessors (bounds- + cross-module-checked via arena_.at) ──
     [[nodiscard]] HirKind       kind(HirNodeId id)    const { return arena_.at(id).kind; }
@@ -91,6 +95,7 @@ private:
     HirNodeId              root_;
     std::string            sourceLanguage_;
     HirKindRegistry        registry_;
+    HirOpRegistry          opRegistry_;
 };
 
 // `HirAttribute<T>` is the `ArenaT = Hir` alias of the generalized side-table —
@@ -134,6 +139,11 @@ public:
     // value of interest, the call on it is.
     HirKindRegistry& registry() noexcept { return registry_; }
 
+    // The build's extension-operator registry — register the extension operators
+    // a lowering emits beyond the core `HirOpKind` here; ownership transfers into
+    // the frozen Hir. Not `[[nodiscard]]` for the same reason as `registry()`.
+    HirOpRegistry& opRegistry() noexcept { return opRegistry_; }
+
     // A leaf node (no children).
     HirNodeId addLeaf(HirKind kind, TypeId typeId = InvalidType,
                       std::uint32_t payload = 0, HirFlags flags = HirFlags::None);
@@ -145,6 +155,72 @@ public:
     HirNodeId addParent(HirKind kind, std::span<HirNodeId const> children,
                         TypeId typeId = InvalidType, std::uint32_t payload = 0,
                         HirFlags flags = HirFlags::None);
+
+    // ── typed expression helpers (HR2) ──────────────────────────────────────
+    //
+    // Thin, self-documenting wrappers over addLeaf/addParent for the expression
+    // vocabulary. Each fixes its kind's child arity + payload convention in one
+    // place, so a malformed expression node can't be spelled. Every helper takes
+    // the node's resolved result `type`; the HR2 verifier (HirVerifier) asserts
+    // it is `valid()`. `makeBinaryOp`/`makeUnaryOp` additionally assert the
+    // operator's arity matches at construction (fail-loud abort on mismatch).
+
+    // Literal value. `literalIndex` is the per-CU literal-pool index (payload).
+    HirNodeId makeLiteral(TypeId type, std::uint32_t literalIndex = 0,
+                          HirFlags flags = HirFlags::None);
+    // Read of a resolved symbol. `symbol` is the SymbolId.v (payload).
+    HirNodeId makeRef(TypeId type, std::uint32_t symbol = 0,
+                      HirFlags flags = HirFlags::None);
+
+    // Binary operator over [lhs, rhs]. Aborts unless the operator is binary.
+    HirNodeId makeBinaryOp(HirOpKind op, HirNodeId lhs, HirNodeId rhs, TypeId type,
+                           HirFlags flags = HirFlags::None);
+    HirNodeId makeBinaryOp(HirOpId op, HirNodeId lhs, HirNodeId rhs, TypeId type,
+                           HirFlags flags = HirFlags::None);
+    // Unary operator over [operand]. Aborts unless the operator is unary.
+    HirNodeId makeUnaryOp(HirOpKind op, HirNodeId operand, TypeId type,
+                          HirFlags flags = HirFlags::None);
+    HirNodeId makeUnaryOp(HirOpId op, HirNodeId operand, TypeId type,
+                          HirFlags flags = HirFlags::None);
+
+    // Call: children are [callee, args...]; `type` is the call's result type.
+    HirNodeId makeCall(HirNodeId callee, std::span<HirNodeId const> args, TypeId type,
+                       HirFlags flags = HirFlags::None);
+    // Intrinsic call: children are [args...]; `intrinsicId` is the payload.
+    HirNodeId makeIntrinsicCall(std::uint32_t intrinsicId, std::span<HirNodeId const> args,
+                                TypeId type, HirFlags flags = HirFlags::None);
+
+    // Explicit conversion of [operand] to `type` (the target type).
+    HirNodeId makeCast(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
+    // Field read off [base]; `fieldIndex` is the payload, `type` the field type.
+    HirNodeId makeMemberAccess(HirNodeId base, std::uint32_t fieldIndex, TypeId type,
+                               HirFlags flags = HirFlags::None);
+    // Subscript: children are [base, index]; `type` is the element type.
+    HirNodeId makeIndex(HirNodeId base, HirNodeId index, TypeId type,
+                        HirFlags flags = HirFlags::None);
+    // Vector swizzle off [base]; `componentMask` is the payload.
+    HirNodeId makeSwizzle(HirNodeId base, std::uint32_t componentMask, TypeId type,
+                          HirFlags flags = HirFlags::None);
+    // Aggregate construction over [fields...]; `type` is the aggregate type.
+    HirNodeId makeConstructAggregate(std::span<HirNodeId const> fields, TypeId type,
+                                     HirFlags flags = HirFlags::None);
+    // Conditional: children are [cond, thenExpr, elseExpr].
+    HirNodeId makeTernary(HirNodeId cond, HirNodeId thenExpr, HirNodeId elseExpr,
+                          TypeId type, HirFlags flags = HirFlags::None);
+    // Short-circuit logical-and / -or over [lhs, rhs] (a distinct kind from
+    // BinaryOp because evaluation is short-circuit, not eager).
+    HirNodeId makeLogicalAnd(HirNodeId lhs, HirNodeId rhs, TypeId type,
+                             HirFlags flags = HirFlags::None);
+    HirNodeId makeLogicalOr(HirNodeId lhs, HirNodeId rhs, TypeId type,
+                            HirFlags flags = HirFlags::None);
+    // sizeof a type, given as a [TypeRef] child; `type` is the size's type.
+    HirNodeId makeSizeOf(HirNodeId typeRef, TypeId type, HirFlags flags = HirFlags::None);
+    // Address-of [operand]; `type` is the resulting pointer type.
+    HirNodeId makeAddressOf(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
+    // Pointer dereference of [operand]; `type` is the pointee type.
+    HirNodeId makeDeref(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
+    // A type used as a value; `type` is the referenced lattice type. Leaf.
+    HirNodeId makeTypeRef(TypeId type, HirFlags flags = HirFlags::None);
 
     // Freeze. `root` becomes the module's entry node and must be a node this
     // builder produced. Single-use; the builder is consumed.
@@ -166,6 +242,7 @@ private:
     std::vector<HirNodeId> parentOf_;
     std::string            sourceLanguage_;
     HirKindRegistry        registry_;
+    HirOpRegistry          opRegistry_;
 };
 
 } // namespace dss
