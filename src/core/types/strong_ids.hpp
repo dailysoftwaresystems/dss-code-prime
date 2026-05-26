@@ -79,11 +79,20 @@ DSS_STRONG_ID(ScopeId);
 // `TypeNameId` interns nominal type/extension names.
 DSS_STRONG_ID(TypeKindId);
 DSS_STRONG_ID(TypeNameId);
+// HIR ids (HR1). `HirModuleId` is a HIR arena's identity tag (the arena-tag
+// stamped onto every HirNodeId for the cross-module guard) — minted by a
+// monotonic counter, mirroring TreeId. `HirKindId` identifies an extension
+// HIR-kind (registry-minted, >= 256; core HirKinds occupy the HirKind enum's
+// [0,256)), mirroring TypeKindId.
+DSS_STRONG_ID(HirModuleId);
+DSS_STRONG_ID(HirKindId);
 
 // Arena-element ids (carry `arenaTag`): NodeId is the Tree's node index; TypeId
-// is the CU-scoped type lattice's index (its arena tag is the CompilationUnitId).
+// is the CU-scoped type lattice's index (its arena tag is the CompilationUnitId);
+// HirNodeId is a HIR module's node index (its arena tag is the HirModuleId).
 DSS_ARENA_ID(NodeId);
 DSS_ARENA_ID(TypeId);
+DSS_ARENA_ID(HirNodeId);
 
 #undef DSS_STRONG_ID
 #undef DSS_ARENA_ID
@@ -103,6 +112,9 @@ inline constexpr ScopeId         InvalidScope{};
 inline constexpr TypeId          InvalidType{};
 inline constexpr TypeKindId      InvalidTypeKind{};
 inline constexpr TypeNameId      InvalidTypeName{};
+inline constexpr HirModuleId     InvalidHirModule{};
+inline constexpr HirKindId       InvalidHirKind{};
+inline constexpr HirNodeId       InvalidHirNode{};
 
 } // namespace dss
 
@@ -129,5 +141,8 @@ DSS_HASH_ID(ScopeId);
 DSS_HASH_ID(TypeId);
 DSS_HASH_ID(TypeKindId);
 DSS_HASH_ID(TypeNameId);
+DSS_HASH_ID(HirModuleId);
+DSS_HASH_ID(HirKindId);
+DSS_HASH_ID(HirNodeId);
 
 #undef DSS_HASH_ID
