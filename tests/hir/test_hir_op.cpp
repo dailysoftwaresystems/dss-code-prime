@@ -44,6 +44,19 @@ TEST(HirOpKind, NamesAreStable) {
     EXPECT_EQ(opName(HirOpKind::BitNot), "BitNot");
 }
 
+TEST(HirOpKind, EveryCoreOpHasNameAndArity) {
+    // Exhaustively pin that no core operator falls through opName's "?" default
+    // or is left unclassified by arityOf — a new core op added without updating
+    // either switch would surface here (the build does not enforce -Wswitch).
+    auto const count = static_cast<std::uint32_t>(HirOpKind::Count_);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto const op = static_cast<HirOpKind>(i);
+        EXPECT_NE(opName(op), "?") << "core op ordinal " << i << " has no name";
+        HirOpArity const a = arityOf(op);
+        EXPECT_TRUE(a == HirOpArity::Binary || a == HirOpArity::Unary);
+    }
+}
+
 TEST(HirOpCodec, CoreOpRoundTripsBelow256) {
     std::uint32_t const p = encodeOp(HirOpKind::Add);
     EXPECT_EQ(p, 0u);                       // Add is the first core ordinal
@@ -61,6 +74,14 @@ TEST(HirOpCodec, ExtensionOpRoundTripsAtOrAbove256) {
     EXPECT_EQ(p, 256u);
     EXPECT_FALSE(isCoreOp(p));
     EXPECT_EQ(decodeExtOp(p), op);
+}
+
+TEST(HirOpCodec, CoreExtensionSplitIsExactlyAt256) {
+    // The off-by-one most likely to regress if kFirstHirExtensionOp or the
+    // comparison is ever edited: 255 is the last core payload, 256 the first
+    // extension payload.
+    EXPECT_TRUE(isCoreOp(255u));
+    EXPECT_FALSE(isCoreOp(256u));
 }
 
 // ── HirOpRegistry ──
@@ -129,4 +150,14 @@ TEST(HirOpRegistryDeathTest, DescriptorForCoreRangeIdAborts) {
     HirOpRegistry reg;
     EXPECT_DEATH({ (void)reg.descriptor(HirOpId{5}); },
                  "descriptor\\(\\) for HirOpId=5 this registry never minted");
+}
+
+TEST(HirOpRegistryDeathTest, DescriptorForUnmintedExtensionRangeIdAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    HirOpRegistry reg;
+    reg.registerExtension("L::Op", HirOpArity::Binary, "L");  // mints only id 256
+    // 300 is in the extension range (>= 256) but past what this registry minted
+    // — the other half of descriptor()'s guard, distinct from the core-range path.
+    EXPECT_DEATH({ (void)reg.descriptor(HirOpId{300}); },
+                 "descriptor\\(\\) for HirOpId=300 this registry never minted");
 }

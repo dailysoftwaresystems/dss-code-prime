@@ -77,8 +77,9 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
 // This is the predicate the HR2 verifier's expression-typing rule sweeps with.
 //
 // `Extension` is intentionally false here: whether an extension kind produces a
-// value (and so requires a type) lives in its `HirKindDescriptor` operand/value
-// shape, added in a later phase (HR5/HR6) — the core predicate can't know it.
+// value (and so requires a type) lives in its `HirKindDescriptor` operand/
+// attribute shape, added in a later phase (HR5/HR6) — the core predicate can't
+// know it.
 [[nodiscard]] constexpr bool requiresValidType(HirKind kind) noexcept {
     switch (kind) {
         // ── Expressions (plan §2.2) ──

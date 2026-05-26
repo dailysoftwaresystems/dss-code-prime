@@ -116,6 +116,105 @@ TEST(HirExpr, ExtensionOperatorEncodesRegistryId) {
     EXPECT_EQ(h.opRegistry().descriptor(spaceship).name(), "L::Spaceship");
 }
 
+TEST(HirExpr, PayloadCarryingHelpersStashTheirScalar) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+
+    HirBuilder b{"toy"};
+    // IntrinsicCall: children are [args...]; payload is the intrinsic id.
+    HirNodeId const ia = b.makeLiteral(i32);
+    HirNodeId const intr = b.makeIntrinsicCall(/*intrinsicId=*/7, std::array{ia}, i32);
+    // MemberAccess: one child [base]; payload is the field index.
+    HirNodeId const base = b.makeRef(i32, 1);
+    HirNodeId const mem  = b.makeMemberAccess(base, /*fieldIndex=*/3, i32);
+    // Swizzle: one child [base]; payload is the component mask.
+    HirNodeId const vbase = b.makeRef(i32, 2);
+    HirNodeId const swz   = b.makeSwizzle(vbase, /*componentMask=*/0b1100, i32);
+    HirNodeId const blk = b.addParent(HirKind::Block, std::array{intr, mem, swz});
+    Hir h = std::move(b).finish(blk);
+
+    EXPECT_EQ(h.kind(intr), HirKind::IntrinsicCall);
+    EXPECT_EQ(h.payload(intr), 7u);
+    EXPECT_EQ(h.children(intr).size(), 1u);
+    EXPECT_EQ(h.kind(mem), HirKind::MemberAccess);
+    EXPECT_EQ(h.payload(mem), 3u);
+    EXPECT_EQ(h.children(mem).size(), 1u);
+    EXPECT_EQ(h.kind(swz), HirKind::Swizzle);
+    EXPECT_EQ(h.payload(swz), 0b1100u);
+}
+
+TEST(HirExpr, SingleChildHelpersWrapTheirOperand) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+
+    HirBuilder b{"toy"};
+    HirNodeId const c1 = b.makeLiteral(i32);
+    HirNodeId const cast = b.makeCast(c1, i32);
+    HirNodeId const c2 = b.makeRef(i32, 1);
+    HirNodeId const addr = b.makeAddressOf(c2, i32);
+    HirNodeId const c3 = b.makeRef(i32, 2);
+    HirNodeId const der = b.makeDeref(c3, i32);
+    HirNodeId const tr  = b.makeTypeRef(i32);
+    HirNodeId const so  = b.makeSizeOf(tr, i32);
+    HirNodeId const blk = b.addParent(HirKind::Block, std::array{cast, addr, der, so});
+    Hir h = std::move(b).finish(blk);
+
+    EXPECT_EQ(h.kind(cast), HirKind::Cast);
+    EXPECT_EQ(h.children(cast).size(), 1u);
+    EXPECT_EQ(h.kind(addr), HirKind::AddressOf);
+    EXPECT_EQ(h.children(addr).size(), 1u);
+    EXPECT_EQ(h.kind(der), HirKind::Deref);
+    EXPECT_EQ(h.children(der).size(), 1u);
+    EXPECT_EQ(h.kind(so), HirKind::SizeOf);
+    ASSERT_EQ(h.children(so).size(), 1u);
+    EXPECT_EQ(h.children(so)[0], tr);   // SizeOf wraps a TypeRef
+}
+
+TEST(HirExpr, MultiChildHelpersOrderChildren) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+
+    HirBuilder b{"toy"};
+    // Index: [base, index].
+    HirNodeId const ibase = b.makeRef(i32, 1);
+    HirNodeId const idx   = b.makeLiteral(i32);
+    HirNodeId const index = b.makeIndex(ibase, idx, i32);
+    // Ternary: [cond, then, else].
+    HirNodeId const cond = b.makeLiteral(boolT);
+    HirNodeId const thn  = b.makeLiteral(i32);
+    HirNodeId const els  = b.makeLiteral(i32);
+    HirNodeId const tern = b.makeTernary(cond, thn, els, i32);
+    // LogicalAnd / LogicalOr: [lhs, rhs].
+    HirNodeId const la = b.makeLiteral(boolT);
+    HirNodeId const lb = b.makeLiteral(boolT);
+    HirNodeId const land = b.makeLogicalAnd(la, lb, boolT);
+    HirNodeId const lc = b.makeLiteral(boolT);
+    HirNodeId const ld = b.makeLiteral(boolT);
+    HirNodeId const lor = b.makeLogicalOr(lc, ld, boolT);
+    // ConstructAggregate: [fields...].
+    HirNodeId const f0 = b.makeLiteral(i32);
+    HirNodeId const f1 = b.makeLiteral(i32);
+    HirNodeId const agg = b.makeConstructAggregate(std::array{f0, f1}, i32);
+    HirNodeId const blk = b.addParent(HirKind::Block, std::array{index, tern, land, lor, agg});
+    Hir h = std::move(b).finish(blk);
+
+    EXPECT_EQ(h.kind(index), HirKind::Index);
+    EXPECT_EQ(h.children(index)[0], ibase);
+    EXPECT_EQ(h.children(index)[1], idx);
+    EXPECT_EQ(h.kind(tern), HirKind::Ternary);
+    ASSERT_EQ(h.children(tern).size(), 3u);
+    EXPECT_EQ(h.children(tern)[0], cond);
+    EXPECT_EQ(h.children(tern)[1], thn);
+    EXPECT_EQ(h.children(tern)[2], els);
+    EXPECT_EQ(h.kind(land), HirKind::LogicalAnd);
+    EXPECT_EQ(h.children(land).size(), 2u);
+    EXPECT_EQ(h.kind(lor), HirKind::LogicalOr);
+    EXPECT_EQ(h.children(lor).size(), 2u);
+    EXPECT_EQ(h.kind(agg), HirKind::ConstructAggregate);
+    EXPECT_EQ(h.children(agg).size(), 2u);
+}
+
 // ── construction-time arity guards (death tests) ──
 
 TEST(HirExprDeathTest, BinaryHelperRejectsUnaryOperator) {
@@ -149,4 +248,15 @@ TEST(HirExprDeathTest, ExtensionBinaryHelperRejectsUnaryExtensionOp) {
     HirNodeId const c = b.makeLiteral(i32);
     EXPECT_DEATH({ (void)b.makeBinaryOp(rot, a, c, i32); },
                  "operator 'L::Rotate' is unary but was used to build a binary expression node");
+}
+
+TEST(HirExprDeathTest, ExtensionUnaryHelperRejectsBinaryExtensionOp) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"L"};
+    HirOpId const cmp = b.opRegistry().registerExtension("L::Spaceship", HirOpArity::Binary, "L");
+    HirNodeId const a = b.makeLiteral(i32);
+    EXPECT_DEATH({ (void)b.makeUnaryOp(cmp, a, i32); },
+                 "operator 'L::Spaceship' is binary but was used to build a unary expression node");
 }

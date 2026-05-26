@@ -15,6 +15,13 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     std::size_t const errorsBefore = reporter.errorCount();
     checkExpressionTypes(reporter);
     // HR6 appends further rules here.
+    //
+    // A capped reporter (the global maxDiagnostics ceiling hit — here or in a
+    // prior phase sharing this reporter) silently drops further report() calls,
+    // so the error-count delta below can no longer prove "no violation". Refuse
+    // to certify a clean module when the reporter can't have recorded
+    // everything — never hand back a false all-clear.
+    if (reporter.hitCap()) return false;
     return reporter.errorCount() == errorsBefore;
 }
 

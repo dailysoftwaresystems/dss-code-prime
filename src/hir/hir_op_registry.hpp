@@ -26,9 +26,11 @@ namespace dss {
 
 // A HIR extension-operator as registered: its qualified name, minted opId, its
 // arity, and the owning language/domain. Construction is gated by a passkey type
-// only the registry can default-construct — preventing fabrication of a
-// descriptor whose `opId` violates the >= 256 invariant or whose `name` isn't
-// language-qualified. The passkey idiom (rather than `friend` + private ctor) is
+// only the registry can default-construct — preventing any code outside the
+// registry's minting path from fabricating a descriptor whose `opId` violates
+// the >= 256 invariant. (The "::"-qualified `name` is a naming convention, not
+// something the passkey enforces.) The passkey idiom (rather than `friend` +
+// private ctor) is
 // what lets `std::vector::emplace_back` build the descriptor in place:
 // allocator::construct goes through `std::construct_at`, which can't see
 // friend-only access. (Identical discipline to `HirKindDescriptor`.)

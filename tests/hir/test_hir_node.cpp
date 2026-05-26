@@ -19,6 +19,23 @@ static_assert(dss::kFirstHirExtensionKind == 256);
 // sentinel, never silently a valid Module/Literal).
 static_assert(HirKind::Error != HirKind::Module);
 
+// ── requiresValidType classification (compile-time) ──
+// The predicate the HR2 verifier sweeps with: expressions + TypeRef carry a
+// resolved result type; declarations/statements/sentinels do not.
+static_assert(dss::requiresValidType(HirKind::Literal));
+static_assert(dss::requiresValidType(HirKind::BinaryOp));
+static_assert(dss::requiresValidType(HirKind::TypeRef));
+static_assert(!dss::requiresValidType(HirKind::VarDecl));
+static_assert(!dss::requiresValidType(HirKind::Block));
+static_assert(!dss::requiresValidType(HirKind::Module));
+static_assert(!dss::requiresValidType(HirKind::ReturnStmt));
+static_assert(!dss::requiresValidType(HirKind::Error));
+static_assert(!dss::requiresValidType(HirKind::Unreachable));
+// Pinned deliberately: an Extension node's value-ness lives in its descriptor,
+// unknown to the core predicate — so it must NOT be type-required here. If this
+// ever flips, an untyped Extension node would wrongly trip H_TypeUnresolved.
+static_assert(!dss::requiresValidType(HirKind::Extension));
+
 // ── POD layout (compile-time) ──
 // Parent links live in a parallel array in `Hir` (not in the POD) so the
 // scan-hot kind/type sweeps stay dense in cache; the 32-byte budget reflects
@@ -61,4 +78,24 @@ TEST(HirKind, ExtensionMarkerIsACoreMember) {
     // The Extension marker itself is a CORE kind (< 256); the concrete extension
     // kind it stands in for is a registry id >= 256, carried elsewhere.
     EXPECT_LT(static_cast<std::uint32_t>(HirKind::Extension), 256u);
+}
+
+TEST(HirKind, RequiresValidTypeCoversTheWholeExpressionGroup) {
+    // All 17 expression kinds (plan §2.2) require a resolved type.
+    for (HirKind k : {HirKind::Literal, HirKind::Ref, HirKind::Call,
+                      HirKind::IntrinsicCall, HirKind::BinaryOp, HirKind::UnaryOp,
+                      HirKind::Cast, HirKind::MemberAccess, HirKind::Index,
+                      HirKind::Swizzle, HirKind::ConstructAggregate, HirKind::Ternary,
+                      HirKind::LogicalAnd, HirKind::LogicalOr, HirKind::SizeOf,
+                      HirKind::AddressOf, HirKind::Deref}) {
+        EXPECT_TRUE(dss::requiresValidType(k))
+            << "expression kind ordinal " << static_cast<unsigned>(k);
+    }
+    // A sampling of kinds that must NOT require a type.
+    for (HirKind k : {HirKind::Module, HirKind::Function, HirKind::IfStmt,
+                      HirKind::WhileStmt, HirKind::AssignStmt, HirKind::ExprStmt,
+                      HirKind::Extension, HirKind::Error}) {
+        EXPECT_FALSE(dss::requiresValidType(k))
+            << "non-expression kind ordinal " << static_cast<unsigned>(k);
+    }
 }

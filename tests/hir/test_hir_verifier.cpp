@@ -18,11 +18,13 @@
 using dss::CompilationUnitId;
 using dss::DiagnosticCode;
 using dss::DiagnosticReporter;
+using dss::DiagnosticSeverity;
 using dss::encodeOp;
 using dss::Hir;
 using dss::HirBuilder;
 using dss::HirFlags;
 using dss::HirKind;
+using dss::HirKindId;
 using dss::HirNodeId;
 using dss::HirOpKind;
 using dss::HirVerifier;
@@ -125,6 +127,45 @@ TEST(HirVerifier, UntypedStatementDoesNotFire) {
     DiagnosticReporter reporter;
     EXPECT_TRUE(HirVerifier{h}.verify(reporter));
     EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, UntypedExtensionNodeIsSkipped) {
+    // An Extension node is NOT type-required (requiresValidType(Extension) ==
+    // false — value-ness lives in the descriptor, not the core predicate), so an
+    // untyped one must pass cleanly rather than trip H_TypeUnresolved.
+    HirBuilder b{"L"};
+    HirKindId const widget = b.registry().registerExtension("L::Widget", "L");
+    HirNodeId const ext = b.addLeaf(HirKind::Extension, dss::InvalidType, widget.v);
+    Hir h = std::move(b).finish(ext);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, RefusesToCertifyCleanWhenReporterIsCapped) {
+    // A reporter capped by a prior phase silently drops further report() calls,
+    // so the error-count delta can't prove "no violation" — verify() must NOT
+    // hand back a false all-clear even for a genuinely clean module.
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 2;
+    DiagnosticReporter reporter{cfg};
+    for (int i = 0; i < 3; ++i) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::H_TypeUnresolved;
+        d.severity = DiagnosticSeverity::Error;
+        d.span     = dss::SourceSpan::empty(static_cast<dss::ByteOffset>(i + 1));
+        reporter.report(std::move(d));
+    }
+    ASSERT_TRUE(reporter.hitCap());
+
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"toy"};
+    HirNodeId const lit = b.makeLiteral(i32);   // a perfectly clean, typed module
+    Hir h = std::move(b).finish(lit);
+
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
 }
 
 TEST(HirVerifier, EveryUntypedExpressionIsReportedNotCoalesced) {

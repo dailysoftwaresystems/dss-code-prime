@@ -24,6 +24,10 @@ class DSS_EXPORT HirVerifier {
 public:
     explicit HirVerifier(Hir const& hir) noexcept : hir_(hir) {}
 
+    // The verifier stores a reference and must not outlive the module it
+    // inspects — forbid binding to a temporary `Hir` outright.
+    HirVerifier(Hir&&) = delete;
+
     // Run every HR2 rule, reporting each violation into `reporter`. Returns true
     // iff THIS run emitted no Error-severity diagnostic (computed by delta on the
     // reporter's error count, so a reporter carrying prior-phase errors doesn't

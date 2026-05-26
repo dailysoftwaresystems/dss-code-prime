@@ -160,10 +160,13 @@ public:
     //
     // Thin, self-documenting wrappers over addLeaf/addParent for the expression
     // vocabulary. Each fixes its kind's child arity + payload convention in one
-    // place, so a malformed expression node can't be spelled. Every helper takes
-    // the node's resolved result `type`; the HR2 verifier (HirVerifier) asserts
-    // it is `valid()`. `makeBinaryOp`/`makeUnaryOp` additionally assert the
-    // operator's arity matches at construction (fail-loud abort on mismatch).
+    // place, so a malformed expression node can't be spelled. The helpers do NOT
+    // inspect `type`: an untyped node builds fine and is caught later by
+    // `HirVerifier`, which *reports* `H_TypeUnresolved` (a recoverable
+    // diagnostic, NOT an abort) for any expression/TypeRef node left untyped. By
+    // contrast `makeBinaryOp`/`makeUnaryOp` DO check the operator's arity at
+    // construction and fail-loud `abort()` on mismatch — a wrong-arity node is a
+    // structurally impossible caller bug, not a diagnosable analysis outcome.
 
     // Literal value. `literalIndex` is the per-CU literal-pool index (payload).
     HirNodeId makeLiteral(TypeId type, std::uint32_t literalIndex = 0,

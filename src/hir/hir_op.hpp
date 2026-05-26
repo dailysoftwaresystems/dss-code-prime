@@ -2,6 +2,7 @@
 
 #include "core/types/strong_ids.hpp"
 
+#include <cassert>
 #include <cstdint>
 #include <string_view>
 
@@ -104,12 +105,18 @@ enum class HirOpArity : std::uint8_t { Unary, Binary };
     return op.v;
 }
 
-// Decode a payload known to name a core op (caller checked `isCoreOp`).
+// Decode a payload known to name a core op (caller checked `isCoreOp`). The
+// precondition is asserted: decoding an extension payload as a core op would
+// silently yield a garbage HirOpKind.
 [[nodiscard]] constexpr HirOpKind decodeCoreOp(std::uint32_t payload) noexcept {
+    assert(isCoreOp(payload) && "decodeCoreOp on an extension (>=256) payload");
     return static_cast<HirOpKind>(payload);
 }
 // Decode a payload known to name an extension op (caller checked `!isCoreOp`).
+// The precondition is asserted: a core-range value would yield an invalid
+// (core-range) HirOpId the registry could never resolve.
 [[nodiscard]] constexpr HirOpId decodeExtOp(std::uint32_t payload) noexcept {
+    assert(!isCoreOp(payload) && "decodeExtOp on a core (<256) payload");
     return HirOpId{payload};
 }
 
