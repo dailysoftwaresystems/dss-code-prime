@@ -432,3 +432,121 @@ TEST(HirVerifier, NestedBreakToOuterLoopIsValid) {
     EXPECT_TRUE(HirVerifier{h}.verify(reporter));
     EXPECT_EQ(reporter.errorCount(), 0u);
 }
+
+// ── declaration shape rule (H_VerifierFailure) + declaration typing ──
+
+namespace {
+// A valid one-param int->int FnSig for the declaration tests.
+TypeId intToIntSig(TypeInterner& ti) {
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    return ti.fnSig(std::array{i32}, i32, dss::CallConv::CcSysV);
+}
+} // namespace
+
+TEST(HirVerifier, FunctionBodyMustBeBlock) {
+    HirBuilder b{"c"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    // Last child is an ExprStmt, not a Block — checkDeclarationShape fires.
+    HirNodeId const notBody = b.makeExprStmt(b.makeLiteral(i32));
+    HirNodeId const fn = b.makeFunction(intToIntSig(ti), 1, {}, notBody);
+    Hir h = std::move(b).finish(fn);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 0u);
+}
+
+TEST(HirVerifier, FunctionParamMustBeVarDeclWithoutInit) {
+    HirBuilder b{"c"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    // A non-VarDecl "parameter" (a typed Literal) + a VarDecl param WITH an init.
+    HirNodeId const badParam  = b.makeLiteral(i32);                        // not a VarDecl
+    HirNodeId const initParam = b.makeVarDecl(i32, 9, b.makeLiteral(i32)); // has initializer
+    HirNodeId const body = b.makeBlock({});
+    HirNodeId const fn = b.makeFunction(intToIntSig(ti), 1,
+                                        std::array{badParam, initParam}, body);
+    Hir h = std::move(b).finish(fn);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 2u);  // both params
+}
+
+TEST(HirVerifier, FunctionWithBadParamAndBadBodyReportsBoth) {
+    // COLLECT-ALL guard: a non-VarDecl param AND a non-Block body must each be
+    // reported (the rule must not short-circuit after the first violation).
+    HirBuilder b{"c"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirNodeId const badParam = b.makeLiteral(i32);            // not a VarDecl
+    HirNodeId const notBody  = b.makeExprStmt(b.makeLiteral(i32));  // not a Block
+    HirNodeId const fn = b.makeFunction(intToIntSig(ti), 1, std::array{badParam}, notBody);
+    Hir h = std::move(b).finish(fn);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 2u);
+}
+
+TEST(HirVerifier, ExternFunctionNonVarDeclParamFires) {
+    HirBuilder b{"c"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    // An extern "param" that is a typed Literal (not a Block, not a VarDecl) —
+    // exercises checkParam's non-VarDecl arm on the ExternFunction path.
+    HirNodeId const badParam = b.makeLiteral(i32);
+    HirNodeId const ef = b.makeExternFunction(intToIntSig(ti), 6, std::array{badParam});
+    Hir h = std::move(b).finish(ef);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, ExternFunctionMustNotHaveBody) {
+    HirBuilder b{"c"};
+    TypeInterner ti = makeInterner();
+    HirNodeId const body = b.makeBlock({});   // an extern must not carry a body
+    HirNodeId const ef = b.makeExternFunction(intToIntSig(ti), 6, std::array{body});
+    Hir h = std::move(b).finish(ef);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, WellFormedFunctionAndExternAreClean) {
+    HirBuilder b{"c"};
+    TypeInterner ti = makeInterner();
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = intToIntSig(ti);
+    HirNodeId const fn = b.makeFunction(fnTy, 1, std::array{b.makeVarDecl(i32, 10)},
+                                        b.makeBlock({}));
+    HirNodeId const ef = b.makeExternFunction(fnTy, 6, std::array{b.makeVarDecl(i32, 11)});
+    HirNodeId const mod = b.makeModule(std::array{fn, ef});
+    Hir h = std::move(b).finish(mod);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, UntypedSourceDeclarationsFireButExternsDoNot) {
+    HirBuilder b{"c"};
+    // Function/Global/TypeDecl are type-required; Extern* are not.
+    HirNodeId const fn  = b.makeFunction(dss::InvalidType, 1, {}, b.makeBlock({}));
+    HirNodeId const g   = b.makeGlobal(dss::InvalidType, 2);
+    HirNodeId const td  = b.makeTypeDecl(dss::InvalidType, 3);
+    HirNodeId const ef  = b.makeExternFunction(dss::InvalidType, 6, {});   // OK untyped
+    HirNodeId const eg  = b.makeExternGlobal(dss::InvalidType, 7);          // OK untyped
+    HirNodeId const mod = b.makeModule(std::array{fn, g, td, ef, eg});
+    Hir h = std::move(b).finish(mod);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    // Exactly the three source declarations fire; the two externs do not.
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 3u);
+}

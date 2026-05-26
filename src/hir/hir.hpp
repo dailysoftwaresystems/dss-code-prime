@@ -131,6 +131,32 @@ public:
     [[nodiscard]] HirNodeId assignTarget(HirNodeId id) const;
     [[nodiscard]] HirNodeId assignValue(HirNodeId id)  const;
 
+    // ── declaration accessors (HR4) ──────────────────────────────────────────
+    // module: its top-level declarations.
+    [[nodiscard]] std::span<HirNodeId const> moduleDecls(HirNodeId id) const;
+    // function: FnSig, declared SymbolId, the param decls (all but last child),
+    // and the body Block (last child).
+    [[nodiscard]] TypeId                     functionSignature(HirNodeId id) const;
+    [[nodiscard]] SymbolId                   functionSymbol(HirNodeId id)    const;
+    [[nodiscard]] std::span<HirNodeId const> functionParams(HirNodeId id)    const;
+    [[nodiscard]] HirNodeId                  functionBody(HirNodeId id)      const;
+    // global: type, SymbolId, optional initializer.
+    [[nodiscard]] TypeId                     globalType(HirNodeId id)   const;
+    [[nodiscard]] SymbolId                   globalSymbol(HirNodeId id) const;
+    [[nodiscard]] std::optional<HirNodeId>   globalInit(HirNodeId id)   const;
+    // type declaration: the type it introduces + its SymbolId.
+    [[nodiscard]] TypeId                     typeDeclType(HirNodeId id)   const;
+    [[nodiscard]] SymbolId                   typeDeclSymbol(HirNodeId id) const;
+    // extern function: FnSig (may be invalid), SymbolId, param decls (no body).
+    [[nodiscard]] TypeId                     externFunctionSignature(HirNodeId id) const;
+    [[nodiscard]] SymbolId                   externFunctionSymbol(HirNodeId id)    const;
+    [[nodiscard]] std::span<HirNodeId const> externFunctionParams(HirNodeId id)    const;
+    // extern global: type (may be invalid) + SymbolId.
+    [[nodiscard]] TypeId                     externGlobalType(HirNodeId id)   const;
+    [[nodiscard]] SymbolId                   externGlobalSymbol(HirNodeId id) const;
+    // import group: the grouped members.
+    [[nodiscard]] std::span<HirNodeId const> importGroupMembers(HirNodeId id) const;
+
 private:
     // Checked positional child access for the mandatory-child accessors above:
     // aborts loud (like `children`'s pool-range guard) if `i` is past the node's
@@ -352,6 +378,60 @@ public:
     // target = value; — children [target, value]. `target` is an lvalue
     // expression (Ref / Index / MemberAccess / Deref).
     HirNodeId makeAssignStmt(HirNodeId target, HirNodeId value, HirFlags flags = HirFlags::None);
+
+    // ── typed declaration helpers (HR4) ──────────────────────────────────────
+    //
+    // A function PARAMETER is just a `makeVarDecl(type, symbol)` with no
+    // initializer — there is no separate Param kind; the body's `Ref`s resolve
+    // to a param via its SymbolId. The verifier (`checkDeclarationShape`) enforces
+    // that a Function's params are VarDecls and its last child is the body Block.
+
+    // The module — its children are the top-level declarations, in order.
+    HirNodeId makeModule(std::span<HirNodeId const> decls, HirFlags flags = HirFlags::None);
+
+    // A function definition. `signature` is its FnSig, carried in `typeId` (not
+    // as a child: the signature is lattice-interned + shared, so it rides the
+    // existing `typeId` slot — cheap, dedup'd, zero node-size cost — rather than
+    // spawning a per-function TypeRef child). The verifier requires it `valid()`
+    // (it does NOT separately check it is a FnSig — that is the caller's
+    // contract). `symbol` is the declared SymbolId (payload). children =
+    // [params…, body]; `body` (a Block) is always LAST — params are variadic and
+    // the body is singular, so body-last gives an O(1) `functionBody` (back of
+    // the child list) and a clean `functionParams` slice with no count payload.
+    HirNodeId makeFunction(TypeId signature, std::uint32_t symbol,
+                           std::span<HirNodeId const> params, HirNodeId body,
+                           HirFlags flags = HirFlags::None);
+
+    // A global variable. `type` is its type (typeId, verifier-required), `symbol`
+    // the SymbolId (payload), `init` the optional initializer (child).
+    HirNodeId makeGlobal(TypeId type, std::uint32_t symbol,
+                         std::optional<HirNodeId> init = std::nullopt,
+                         HirFlags flags = HirFlags::None);
+
+    // A named type declaration (e.g. typedef). `type` is the type it introduces
+    // (typeId, verifier-required), `symbol` the SymbolId. Leaf — a struct's field
+    // types live in the lattice type itself, not as HIR children.
+    HirNodeId makeTypeDecl(TypeId type, std::uint32_t symbol, HirFlags flags = HirFlags::None);
+
+    // An external function declaration (no body). `signature` is its FnSig (in
+    // `typeId`), which MAY be `InvalidType` — binary-only FFI ingestion can lack
+    // a resolved type, so externs are not type-required. `symbol` the SymbolId.
+    // children = [params…]. FFI linkage/library metadata attaches via
+    // `HirAttribute<FfiMetadata>`.
+    HirNodeId makeExternFunction(TypeId signature, std::uint32_t symbol,
+                                 std::span<HirNodeId const> params,
+                                 HirFlags flags = HirFlags::None);
+
+    // An external global declaration. `type` MAY be `InvalidType` (see above).
+    // Leaf. FFI metadata attaches via `HirAttribute<FfiMetadata>`.
+    HirNodeId makeExternGlobal(TypeId type, std::uint32_t symbol, HirFlags flags = HirFlags::None);
+
+    // A group of imports the module brings in. The builder accepts members now;
+    // the real CST→HIR lowering that fills them (e.g. the extern decls a
+    // `#include` introduces) arrives at HR9. Cross-module references live in a
+    // side-table, not as children (a child is always a same-module HirNodeId).
+    HirNodeId makeImportGroup(std::span<HirNodeId const> members = {},
+                              HirFlags flags = HirFlags::None);
 
     // Freeze. `root` becomes the module's entry node and must be a node this
     // builder produced. Single-use; the builder is consumed.

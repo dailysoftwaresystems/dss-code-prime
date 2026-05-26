@@ -447,6 +447,48 @@ HirNodeId HirBuilder::makeAssignStmt(HirNodeId target, HirNodeId value, HirFlags
     return addParent(HirKind::AssignStmt, kids, InvalidType, /*payload=*/0, flags);
 }
 
+// ── typed declaration helpers (HR4) ─────────────────────────────────────────
+
+HirNodeId HirBuilder::makeModule(std::span<HirNodeId const> decls, HirFlags flags) {
+    return addParent(HirKind::Module, decls, InvalidType, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeFunction(TypeId signature, std::uint32_t symbol,
+                                   std::span<HirNodeId const> params, HirNodeId body,
+                                   HirFlags flags) {
+    std::vector<HirNodeId> kids;
+    kids.reserve(params.size() + 1);
+    kids.insert(kids.end(), params.begin(), params.end());
+    kids.push_back(body);  // body is always the last child
+    return addParent(HirKind::Function, kids, signature, symbol, flags);
+}
+
+HirNodeId HirBuilder::makeGlobal(TypeId type, std::uint32_t symbol,
+                                 std::optional<HirNodeId> init, HirFlags flags) {
+    if (init) {
+        HirNodeId const kids[] = {*init};
+        return addParent(HirKind::Global, kids, type, symbol, flags);
+    }
+    return addParent(HirKind::Global, {}, type, symbol, flags);
+}
+
+HirNodeId HirBuilder::makeTypeDecl(TypeId type, std::uint32_t symbol, HirFlags flags) {
+    return addLeaf(HirKind::TypeDecl, type, symbol, flags);
+}
+
+HirNodeId HirBuilder::makeExternFunction(TypeId signature, std::uint32_t symbol,
+                                         std::span<HirNodeId const> params, HirFlags flags) {
+    return addParent(HirKind::ExternFunction, params, signature, symbol, flags);
+}
+
+HirNodeId HirBuilder::makeExternGlobal(TypeId type, std::uint32_t symbol, HirFlags flags) {
+    return addLeaf(HirKind::ExternGlobal, type, symbol, flags);
+}
+
+HirNodeId HirBuilder::makeImportGroup(std::span<HirNodeId const> members, HirFlags flags) {
+    return addParent(HirKind::ImportGroup, members, InvalidType, /*payload=*/0, flags);
+}
+
 // ── structured-CF typed accessors (HR3) ─────────────────────────────────────
 
 HirNodeId Hir::childAt(HirNodeId id, std::uint32_t i) const {
@@ -580,6 +622,91 @@ HirNodeId Hir::assignTarget(HirNodeId id) const {
 HirNodeId Hir::assignValue(HirNodeId id) const {
     assert(kind(id) == HirKind::AssignStmt);
     return childAt(id, 1);
+}
+
+// ── declaration accessors (HR4) ─────────────────────────────────────────────
+
+std::span<HirNodeId const> Hir::moduleDecls(HirNodeId id) const {
+    assert(kind(id) == HirKind::Module);
+    return children(id);
+}
+
+TypeId Hir::functionSignature(HirNodeId id) const {
+    assert(kind(id) == HirKind::Function);
+    return typeId(id);
+}
+SymbolId Hir::functionSymbol(HirNodeId id) const {
+    assert(kind(id) == HirKind::Function);
+    return SymbolId{payload(id)};
+}
+std::span<HirNodeId const> Hir::functionParams(HirNodeId id) const {
+    assert(kind(id) == HirKind::Function);
+    auto kids = children(id);  // [params…, body]; body is the last child
+    return kids.empty() ? kids : kids.subspan(0, kids.size() - 1);
+}
+HirNodeId Hir::functionBody(HirNodeId id) const {
+    assert(kind(id) == HirKind::Function);
+    // The body is the last child. A bodyless Function is an arity violation the
+    // verifier flags first (Function arity is {1, ∞}); aborting here is the
+    // defense-in-depth path for a consumer that reached an unverified node.
+    auto kids = children(id);
+    if (kids.empty()) {
+        std::fprintf(stderr,
+                     "dss::Hir fatal: functionBody: Function HirNodeId=%u has no body child\n",
+                     id.v);
+        std::abort();
+    }
+    return kids.back();
+}
+
+TypeId Hir::globalType(HirNodeId id) const {
+    assert(kind(id) == HirKind::Global);
+    return typeId(id);
+}
+SymbolId Hir::globalSymbol(HirNodeId id) const {
+    assert(kind(id) == HirKind::Global);
+    return SymbolId{payload(id)};
+}
+std::optional<HirNodeId> Hir::globalInit(HirNodeId id) const {
+    assert(kind(id) == HirKind::Global);
+    auto kids = children(id);
+    return kids.empty() ? std::nullopt : std::optional<HirNodeId>{kids[0]};
+}
+
+TypeId Hir::typeDeclType(HirNodeId id) const {
+    assert(kind(id) == HirKind::TypeDecl);
+    return typeId(id);
+}
+SymbolId Hir::typeDeclSymbol(HirNodeId id) const {
+    assert(kind(id) == HirKind::TypeDecl);
+    return SymbolId{payload(id)};
+}
+
+TypeId Hir::externFunctionSignature(HirNodeId id) const {
+    assert(kind(id) == HirKind::ExternFunction);
+    return typeId(id);  // may be InvalidType — extern type is optional
+}
+SymbolId Hir::externFunctionSymbol(HirNodeId id) const {
+    assert(kind(id) == HirKind::ExternFunction);
+    return SymbolId{payload(id)};
+}
+std::span<HirNodeId const> Hir::externFunctionParams(HirNodeId id) const {
+    assert(kind(id) == HirKind::ExternFunction);
+    return children(id);  // all children are params — an extern has no body
+}
+
+TypeId Hir::externGlobalType(HirNodeId id) const {
+    assert(kind(id) == HirKind::ExternGlobal);
+    return typeId(id);  // may be InvalidType
+}
+SymbolId Hir::externGlobalSymbol(HirNodeId id) const {
+    assert(kind(id) == HirKind::ExternGlobal);
+    return SymbolId{payload(id)};
+}
+
+std::span<HirNodeId const> Hir::importGroupMembers(HirNodeId id) const {
+    assert(kind(id) == HirKind::ImportGroup);
+    return children(id);
 }
 
 // ── shared structural resolver (HR3) ─────────────────────────────────────────

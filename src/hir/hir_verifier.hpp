@@ -10,10 +10,11 @@ class DiagnosticReporter;
 // HIR structural verifier (HR2–HR3; the full invariant set lands at HR6 per plan
 // §2.8). A verifier is constructed over a frozen `Hir` and run against a
 // `DiagnosticReporter`; each structural rule is a private method `verify()` calls
-// in turn. HR2 shipped `checkExpressionTypes`; HR3 added `checkNodeArity` and
-// `checkBreakContinueScoping`. HR6 grows the class further (Call-arg-vs-FnSig,
-// intrinsic-registered, block-structural-termination, shader restrictions) by
-// adding sibling rule methods to the same `verify()` body.
+// in turn. HR2 shipped the type rule (now `checkRequiredTypes`); HR3 added `checkNodeArity` and
+// `checkBreakContinueScoping`; HR4 added `checkDeclarationShape`. HR6 grows the
+// class further (Call-arg-vs-FnSig, intrinsic-registered, block-structural-
+// termination, shader restrictions) by adding sibling rule methods to the same
+// `verify()` body.
 //
 // Discipline (mirrors the semantic analyzer): COLLECT-ALL, never short-circuit —
 // every node is checked so one run surfaces every violation. Violations are
@@ -36,9 +37,10 @@ public:
 
 private:
     // Every node whose kind `requiresValidType` (the Expressions group + TypeRef
-    // + VarDecl) must carry a `typeId.valid()`. A node flagged `HasError` is
-    // skipped (cascade suppression). Each miss emits `H_TypeUnresolved`.
-    void checkExpressionTypes(DiagnosticReporter& reporter) const;
+    // + the source-defined declarations VarDecl/Function/Global/TypeDecl) must
+    // carry a `typeId.valid()`. A node flagged `HasError` is skipped (cascade
+    // suppression). Each miss emits `H_TypeUnresolved`.
+    void checkRequiredTypes(DiagnosticReporter& reporter) const;
 
     // Every node's child count must satisfy its kind's `childArity` (the single
     // arity source of truth in hir_node.hpp). `ForStmt`/`CaseArm` carry extra
@@ -50,6 +52,12 @@ private:
     // loop/switch (`enclosingBranchTargets`); a `ContinueStmt`'s resolved target
     // must be a loop, not a switch. Each violation emits `H_InvalidBreak`.
     void checkBreakContinueScoping(DiagnosticReporter& reporter) const;
+
+    // Declaration structure (HR4): a `Function`'s last child is its body `Block`
+    // and its other children are parameter `VarDecl`s with no initializer; an
+    // `ExternFunction` has no body `Block` and only parameter `VarDecl`s. Each
+    // violation emits `H_VerifierFailure`.
+    void checkDeclarationShape(DiagnosticReporter& reporter) const;
 
     Hir const& hir_;
 };

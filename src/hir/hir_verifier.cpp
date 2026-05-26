@@ -33,9 +33,10 @@ void reportAt(DiagnosticReporter& reporter, DiagnosticCode code, HirNodeId id,
 
 bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     std::size_t const errorsBefore = reporter.errorCount();
-    checkExpressionTypes(reporter);
+    checkRequiredTypes(reporter);
     checkNodeArity(reporter);
     checkBreakContinueScoping(reporter);
+    checkDeclarationShape(reporter);
     // HR6 appends further rules here.
     //
     // A capped reporter (the global maxDiagnostics ceiling hit — here or in a
@@ -47,7 +48,7 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     return reporter.errorCount() == errorsBefore;
 }
 
-void HirVerifier::checkExpressionTypes(DiagnosticReporter& reporter) const {
+void HirVerifier::checkRequiredTypes(DiagnosticReporter& reporter) const {
     // Linear sweep over every minted node (slot 0 is the sentinel). The node id's
     // arena tag is this module's id, so each `hir_` accessor validates provenance.
     std::uint32_t const moduleTag = hir_.id().v;
@@ -141,6 +142,52 @@ void HirVerifier::checkBreakContinueScoping(DiagnosticReporter& reporter) const 
             reportAt(reporter, DiagnosticCode::H_InvalidBreak, id,
                      std::format("continue #{} index {} resolves to a switch; continue "
                                  "can only target a loop", id.v, depth));
+        }
+    }
+}
+
+void HirVerifier::checkDeclarationShape(DiagnosticReporter& reporter) const {
+    // A parameter is a VarDecl with no initializer (no children). Shared by the
+    // Function and ExternFunction checks below.
+    auto checkParam = [&](HirNodeId param) {
+        if (hir_.kind(param) != HirKind::VarDecl) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, param,
+                     std::format("parameter #{} must be a VarDecl (HirKind ordinal {})",
+                                 param.v, static_cast<unsigned>(hir_.kind(param))));
+        } else if (!hir_.children(param).empty()) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, param,
+                     std::format("parameter VarDecl #{} must not have an initializer", param.v));
+        }
+    };
+
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        HirKind const kind = hir_.kind(id);
+        if (hasError(hir_.flags(id))) continue;
+
+        if (kind == HirKind::Function) {
+            auto kids = hir_.children(id);
+            if (kids.empty()) continue;  // arity rule already flagged the missing body
+            // Last child is the body Block; the rest are parameters.
+            if (hir_.kind(kids.back()) != HirKind::Block) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("Function #{} body (last child) must be a Block "
+                                     "(HirKind ordinal {})",
+                                     id.v, static_cast<unsigned>(hir_.kind(kids.back()))));
+            }
+            for (HirNodeId param : kids.subspan(0, kids.size() - 1)) checkParam(param);
+        } else if (kind == HirKind::ExternFunction) {
+            // No body: every child is a parameter, and none may be a Block.
+            for (HirNodeId child : hir_.children(id)) {
+                if (hir_.kind(child) == HirKind::Block) {
+                    reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                             std::format("ExternFunction #{} must not have a body Block "
+                                         "(child #{})", id.v, child.v));
+                } else {
+                    checkParam(child);
+                }
+            }
         }
     }
 }

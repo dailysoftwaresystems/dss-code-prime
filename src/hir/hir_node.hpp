@@ -72,12 +72,18 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
 
 // Does a node of this kind carry a resolved result type — i.e. must its `typeId`
 // be `valid()`? True for the whole Expressions group (every expression has a
-// type, plan §2.4), `TypeRef` (carries the referenced lattice TypeId), and
-// `VarDecl` (carries its DECLARED type: HIR materializes the resolved type onto
-// the node — rather than re-deriving it from a CST or symbol-table lookup at
-// lowering time — so MIR can size the variable's alloca directly; a typeless
-// VarDecl is unlowerable, so it fails loud at verify-time). False for the other
-// declarations/statements and the `Error`/`Unreachable` sentinels.
+// type, plan §2.4), `TypeRef` (carries the referenced lattice TypeId), and the
+// SOURCE-DEFINED declarations `VarDecl`/`Function`/`Global`/`TypeDecl` (each
+// materializes its declared type onto the node — rather than re-deriving it from
+// a CST or symbol-table lookup at lowering time — so MIR can size the alloca /
+// build the ABI directly; a typeless one is unlowerable, so it fails loud at
+// verify-time). False for `Module`, `ImportGroup`, the EXTERN declarations
+// (`ExternFunction`/`ExternGlobal` — see below), statements, and the
+// `Error`/`Unreachable` sentinels.
+//
+// `ExternFunction`/`ExternGlobal` are deliberately NOT required: 11-ffi-plan's
+// binary-only ingestion can yield an extern with no resolved type (its
+// resolvedType is optional), so a typeless extern is legitimate.
 //
 // `Extension` is intentionally false here: whether an extension kind produces a
 // value (and so requires a type) lives in its `HirKindDescriptor` operand/
@@ -94,12 +100,17 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::AddressOf: case HirKind::Deref:
         // ── Types-as-values: carries the referenced lattice TypeId ──
         case HirKind::TypeRef:
-        // ── Declaration carrying its own declared type ──
-        case HirKind::VarDecl:
+        // ── Declarations carrying their own (source-defined) type ──
+        //   VarDecl: declared local type. Function: its FnSig. Global: var type.
+        //   TypeDecl: the type it introduces. These are source-defined, so a
+        //   resolved type is always available and a typeless one is unlowerable.
+        //   ExternFunction/ExternGlobal are NOT here: 11-ffi-plan binary-only
+        //   ingestion can yield an extern with no resolved type (optional).
+        case HirKind::VarDecl: case HirKind::Function: case HirKind::Global:
+        case HirKind::TypeDecl:
             return true;
-        // ── Modules / other declarations / statements / sentinels / Extension ──
-        case HirKind::Module: case HirKind::Function: case HirKind::Global:
-        case HirKind::TypeDecl: case HirKind::ExternFunction: case HirKind::ExternGlobal:
+        // ── Module / extern decls / import / statements / sentinels / Extension ──
+        case HirKind::Module: case HirKind::ExternFunction: case HirKind::ExternGlobal:
         case HirKind::ImportGroup: case HirKind::Block: case HirKind::IfStmt:
         case HirKind::WhileStmt: case HirKind::DoWhileStmt: case HirKind::ForStmt:
         case HirKind::SwitchStmt: case HirKind::CaseArm: case HirKind::BreakStmt:
@@ -200,11 +211,16 @@ struct ChildArity {
             return {0, 1};                                             // [value/init?]
         case HirKind::BreakStmt: case HirKind::ContinueStmt: case HirKind::Unreachable:
             return {0, 0};
-        // ── No defined shape yet (HR4 declarations) / recovery / extension ──
-        case HirKind::Module: case HirKind::Function: case HirKind::Global:
-        case HirKind::TypeDecl: case HirKind::ExternFunction: case HirKind::ExternGlobal:
-        case HirKind::ImportGroup: case HirKind::Error: case HirKind::Extension:
-        case HirKind::Count_:
+        // ── Declarations (HR4) ──
+        case HirKind::Function:      return {1, kUnboundedArity};  // [params…, body Block]
+        case HirKind::ExternFunction: return {0, kUnboundedArity}; // [params…] (no body)
+        case HirKind::Global:        return {0, 1};                // [init?]
+        case HirKind::TypeDecl: case HirKind::ExternGlobal:
+            return {0, 0};                                         // leaf (type in typeId)
+        case HirKind::Module: case HirKind::ImportGroup:
+            return {0, kUnboundedArity};                           // [decls…] / [members…]
+        // ── recovery / extension (shape defined by the descriptor at HR5/HR6) ──
+        case HirKind::Error: case HirKind::Extension: case HirKind::Count_:
             return {0, kUnboundedArity};
     }
     // No core kind reaches here — every enumerator has a case above. A future

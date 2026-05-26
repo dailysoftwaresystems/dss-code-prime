@@ -38,6 +38,15 @@ static_assert(!dss::requiresValidType(HirKind::Unreachable));
 // unknown to the core predicate — so it must NOT be type-required here. If this
 // ever flips, an untyped Extension node would wrongly trip H_TypeUnresolved.
 static_assert(!dss::requiresValidType(HirKind::Extension));
+// HR4 declarations: source-defined decls are type-required; externs are not
+// (binary-only FFI ingestion can lack a resolved type), nor are Module/ImportGroup.
+static_assert(dss::requiresValidType(HirKind::Function));
+static_assert(dss::requiresValidType(HirKind::Global));
+static_assert(dss::requiresValidType(HirKind::TypeDecl));
+static_assert(!dss::requiresValidType(HirKind::ExternFunction));
+static_assert(!dss::requiresValidType(HirKind::ExternGlobal));
+static_assert(!dss::requiresValidType(HirKind::Module));
+static_assert(!dss::requiresValidType(HirKind::ImportGroup));
 
 // ── childArity single-source-of-truth (compile-time) ──
 static_assert(dss::childArity(HirKind::BinaryOp).min == 2 && dss::childArity(HirKind::BinaryOp).max == 2);
@@ -46,7 +55,14 @@ static_assert(dss::childArity(HirKind::IfStmt).min == 2 && dss::childArity(HirKi
 static_assert(dss::childArity(HirKind::BreakStmt).min == 0 && dss::childArity(HirKind::BreakStmt).max == 0);
 static_assert(dss::childArity(HirKind::ExprStmt).min == 1 && dss::childArity(HirKind::ExprStmt).max == 1);
 static_assert(dss::childArity(HirKind::Block).max == dss::kUnboundedArity);          // variadic
-static_assert(dss::childArity(HirKind::Module).max == dss::kUnboundedArity);         // HR4 — unconstrained
+// HR4 declarations:
+static_assert(dss::childArity(HirKind::Function).min == 1
+              && dss::childArity(HirKind::Function).max == dss::kUnboundedArity);     // params… + body
+static_assert(dss::childArity(HirKind::Global).min == 0 && dss::childArity(HirKind::Global).max == 1);
+static_assert(dss::childArity(HirKind::TypeDecl).min == 0 && dss::childArity(HirKind::TypeDecl).max == 0);
+static_assert(dss::childArity(HirKind::ExternGlobal).min == 0 && dss::childArity(HirKind::ExternGlobal).max == 0);
+static_assert(dss::childArity(HirKind::ExternFunction).max == dss::kUnboundedArity);  // params…, no body
+static_assert(dss::childArity(HirKind::Module).max == dss::kUnboundedArity);          // decls…
 
 // ── structured-CF kind predicates (compile-time) ──
 static_assert(dss::isLoopKind(HirKind::WhileStmt) && dss::isLoopKind(HirKind::ForStmt));
@@ -119,11 +135,13 @@ TEST(HirKind, RequiresValidTypeCoversTheWholeExpressionGroup) {
         EXPECT_TRUE(dss::requiresValidType(k))
             << "expression kind ordinal " << static_cast<unsigned>(k);
     }
-    // A sampling of kinds that must NOT require a type.
-    for (HirKind k : {HirKind::Module, HirKind::Function, HirKind::IfStmt,
-                      HirKind::WhileStmt, HirKind::AssignStmt, HirKind::ExprStmt,
-                      HirKind::Extension, HirKind::Error}) {
+    // A sampling of kinds that must NOT require a type (Module + extern decls
+    // are untyped; Function/Global/TypeDecl ARE type-required as of HR4).
+    for (HirKind k : {HirKind::Module, HirKind::ExternFunction, HirKind::ExternGlobal,
+                      HirKind::ImportGroup, HirKind::IfStmt, HirKind::WhileStmt,
+                      HirKind::AssignStmt, HirKind::ExprStmt, HirKind::Extension,
+                      HirKind::Error}) {
         EXPECT_FALSE(dss::requiresValidType(k))
-            << "non-expression kind ordinal " << static_cast<unsigned>(k);
+            << "non-type-required kind ordinal " << static_cast<unsigned>(k);
     }
 }
