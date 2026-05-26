@@ -9,7 +9,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 production-critical. |
-| Predecessors  | ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (arena reuse). ⏳ [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (input). |
+| Predecessors  | ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (arena reuse). 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (input — HR1 ✅ 2026-05-26, HR2–HR11 pending). |
 | Successors    | ⏳ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) consumes LIR. ⏳ Optimizer phase (master §10) operates on MIR. ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) consumes assembled bytes + relocations. ⏳ [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) reuses MIR for shader optimization. ⏳ [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) consumes MIR with structured-CF markers. |
 | Scope         | **Bounded.** ML1–ML4 MIR. ML5–ML8 LIR. |
 
