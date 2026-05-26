@@ -47,4 +47,52 @@ std::uint32_t utf8ByteOffsetToUtf16Column(std::string_view lineText,
     return utf16Count;
 }
 
+LineByteRange lineByteRangeFor(dss::SourceBuffer const& buffer,
+                                std::uint32_t            byteOffset) noexcept {
+    // Walk backwards from `byteOffset` to the previous line break, then
+    // forward to the next. Mirrors the two divergent implementations
+    // previously kept in diagnostic_translator.cpp and
+    // lsp_semantic_query.cpp — consolidated here so `\r` / `\n` /
+    // end-of-buffer clamping behaves identically on every path.
+    const auto text = buffer.text();
+    const std::uint32_t clamped =
+        byteOffset <= text.size() ? byteOffset
+                                  : static_cast<std::uint32_t>(text.size());
+    std::uint32_t start = clamped;
+    while (start > 0 && text[start - 1] != '\n' && text[start - 1] != '\r') {
+        --start;
+    }
+    std::uint32_t end = clamped;
+    while (end < text.size() && text[end] != '\n' && text[end] != '\r') {
+        ++end;
+    }
+    return {start, end};
+}
+
+std::uint32_t utf16ColumnToByteOffset(std::string_view lineText,
+                                      std::uint32_t    utf16Col) noexcept {
+    std::uint32_t utf16Seen = 0;
+    std::size_t   i         = 0;
+    while (i < lineText.size()) {
+        if (utf16Seen >= utf16Col) break;
+        const auto lead   = static_cast<std::uint8_t>(lineText[i]);
+        const auto seqLen = utf8SequenceLength(lead);
+        if (seqLen == 0) {
+            // Continuation / invalid lead: advance one byte, count one
+            // unit (best-effort, mirrors the forward function).
+            ++i;
+            ++utf16Seen;
+            continue;
+        }
+        const std::uint32_t units = (seqLen == 4) ? 2u : 1u;
+        // A target column landing inside this code point's UTF-16 units
+        // (the surrogate-pair midpoint) rounds DOWN: stop before consuming
+        // the code point so we return the start of it.
+        if (utf16Seen + units > utf16Col) break;
+        utf16Seen += units;
+        i         += seqLen;
+    }
+    return static_cast<std::uint32_t>(i);
+}
+
 } // namespace dss::lsp

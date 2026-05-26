@@ -21,9 +21,12 @@ enum class CoreTokenKind : std::uint16_t {
     IntLiteral,
     FloatLiteral,
     StringLiteral,
-    CharLiteral,
-    BoolLiteral,
-    NullLiteral,
+    // CharLiteral / BoolLiteral / NullLiteral were removed in the 08.55
+    // cleanup. They are not universal lexical categories — a language
+    // that uses them declares them via `tokens` (e.g. `'` as a string-
+    // body opener for char), `keywords` (`true`/`false`/`null`), or a
+    // body-mode `defaultToken.kind`. The tokenizer never emits these
+    // as core kinds.
 
     Punctuation,    // {} () [] , ; etc. — exact lexeme via span
     Operator,       // + - * / == != etc. — exact lexeme via span

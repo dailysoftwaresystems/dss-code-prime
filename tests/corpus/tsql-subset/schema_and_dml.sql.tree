@@ -475,16 +475,18 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Id"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Id"
           tok:","
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Name"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Name"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -494,9 +496,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Active"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Active"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -510,9 +513,10 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Id"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Id"
             tok:"AS"
             rule:nameAtom
               tok:"OrderId"
@@ -520,9 +524,10 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Amount"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Amount"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -532,9 +537,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Status"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Status"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -556,12 +562,13 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"u"
-                  tok:"."
-                  rule:nameAtom
-                    tok:"Name"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"u"
+                    tok:"."
+                    rule:nameAtom
+                      tok:"Name"
             tok:"AS"
             rule:nameAtom
               tok:"Customer"
@@ -569,12 +576,13 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"o"
-                  tok:"."
-                  rule:nameAtom
-                    tok:"Amount"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"o"
+                    tok:"."
+                    rule:nameAtom
+                      tok:"Amount"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -586,12 +594,13 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"u"
-              tok:"."
-              rule:nameAtom
-                tok:"Active"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"u"
+                tok:"."
+                rule:nameAtom
+                  tok:"Active"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -623,9 +632,10 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Id"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Id"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -635,9 +645,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Amount"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Amount"
           rule:binaryOp
             tok:">"
           rule:operand
@@ -651,9 +662,10 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Id"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Id"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -663,9 +675,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Amount"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Amount"
           rule:binaryOp
             tok:">="
           rule:operand
@@ -679,9 +692,10 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Id"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Id"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -691,9 +705,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Amount"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Amount"
           rule:binaryOp
             tok:"<"
           rule:operand
@@ -707,9 +722,10 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Id"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Id"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -719,9 +735,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Amount"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Amount"
           rule:binaryOp
             tok:"<="
           rule:operand
@@ -735,9 +752,10 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Id"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Id"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -747,9 +765,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Status"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Status"
           rule:binaryOp
             tok:"!="
           rule:operand
@@ -771,43 +790,46 @@ rule:root
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"["
-                  tok:"O"
-                  tok:"r"
-                  tok:"d"
-                  tok:"e"
-                  tok:"r"
-                  tok:" "
-                  tok:"I"
-                  tok:"d"
-                  tok:"]"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"["
+                    tok:"O"
+                    tok:"r"
+                    tok:"d"
+                    tok:"e"
+                    tok:"r"
+                    tok:" "
+                    tok:"I"
+                    tok:"d"
+                    tok:"]"
           tok:","
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"["
-                  tok:"P"
-                  tok:"r"
-                  tok:"o"
-                  tok:"d"
-                  tok:"u"
-                  tok:"c"
-                  tok:"t"
-                  tok:" "
-                  tok:"I"
-                  tok:"d"
-                  tok:"]"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"["
+                    tok:"P"
+                    tok:"r"
+                    tok:"o"
+                    tok:"d"
+                    tok:"u"
+                    tok:"c"
+                    tok:"t"
+                    tok:" "
+                    tok:"I"
+                    tok:"d"
+                    tok:"]"
           tok:","
           rule:selectItem
             rule:expression
               rule:operand
-                rule:qualifiedName
-                  rule:nameAtom
-                    tok:"Quantity"
+                rule:nameOrCall
+                  rule:qualifiedName
+                    rule:nameAtom
+                      tok:"Quantity"
       tok:"FROM"
       rule:tableRef
         rule:qualifiedName
@@ -845,9 +867,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Id"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Id"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -880,9 +903,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Id"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Id"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -902,9 +926,10 @@ rule:root
           tok:"="
           rule:expression
             rule:operand
-              rule:qualifiedName
-                rule:nameAtom
-                  tok:"Amount"
+              rule:nameOrCall
+                rule:qualifiedName
+                  rule:nameAtom
+                    tok:"Amount"
             rule:binaryOp
               tok:"+"
             rule:operand
@@ -913,9 +938,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"UserId"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"UserId"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -947,9 +973,10 @@ rule:root
           tok:"="
           rule:expression
             rule:operand
-              rule:qualifiedName
-                rule:nameAtom
-                  tok:"Quantity"
+              rule:nameOrCall
+                rule:qualifiedName
+                  rule:nameAtom
+                    tok:"Quantity"
             rule:binaryOp
               tok:"+"
             rule:operand
@@ -958,18 +985,19 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"["
-              tok:"O"
-              tok:"r"
-              tok:"d"
-              tok:"e"
-              tok:"r"
-              tok:" "
-              tok:"I"
-              tok:"d"
-              tok:"]"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"["
+                tok:"O"
+                tok:"r"
+                tok:"d"
+                tok:"e"
+                tok:"r"
+                tok:" "
+                tok:"I"
+                tok:"d"
+                tok:"]"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -986,9 +1014,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Status"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Status"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -1015,9 +1044,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Active"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Active"
           rule:binaryOp
             tok:"="
           rule:operand
@@ -1046,9 +1076,10 @@ rule:root
         tok:"WHERE"
         rule:expression
           rule:operand
-            rule:qualifiedName
-              rule:nameAtom
-                tok:"Quantity"
+            rule:nameOrCall
+              rule:qualifiedName
+                rule:nameAtom
+                  tok:"Quantity"
           rule:binaryOp
             tok:"="
           rule:operand

@@ -2,6 +2,7 @@ add_library(lsp OBJECT
     diagnostic_translator.cpp
     document_store.cpp
     json_rpc.cpp
+    lsp_semantic_query.cpp
     lsp_server.cpp
     method_dispatcher.cpp
     protocol.cpp
@@ -29,5 +30,7 @@ target_link_libraries(lsp
         core
         tokenizer
         analysis_syntactic
+        analysis_compilation_unit
+        analysis_semantic
         nlohmann_json::nlohmann_json
 )

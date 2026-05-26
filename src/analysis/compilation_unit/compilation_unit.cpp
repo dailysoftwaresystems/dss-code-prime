@@ -173,7 +173,24 @@ void UnitBuilder::addInMemory(std::string source, std::string label) {
     if (finished_) {
         cuFatal("UnitBuilder::addInMemory called after finish()");
     }
+    // Key the label into the SAME weakly-canonical path space addFile /
+    // loadAndAdd_ use BEFORE parsing, so an #include that later resolves to a
+    // path equal to this in-memory label dedups against this tree instead of
+    // re-loading the file from disk (GAP E). Computed before the move-out of
+    // `label`. Non-path-like labels (e.g. "<mem0>") canonicalize to a stable
+    // distinct key and simply never collide with a real file.
+    //
+    // NB: addInMemory deliberately does NOT dedup two explicit in-memory
+    // sources against each other (labels may legitimately repeat) — we only
+    // record the mapping for include-following to consult. A repeated label
+    // overwrites the map entry (last wins) without skipping the second tree.
+    std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(label, ec);
+    std::string const key =
+        (ec ? std::filesystem::path(label).lexically_normal() : canonical).string();
+    seenPaths_.insert(key);  // also block a later addFile re-loading this path.
     parseAndAdd_(SourceBuffer::fromString(std::move(source), std::move(label)));
+    pathToTreeIndex_[key] = trees_.size() - 1;
 }
 
 void UnitBuilder::addFile(std::filesystem::path path) {
@@ -223,7 +240,7 @@ CompilationUnit UnitBuilder::finish() && {
     // additional included files (include-following) via the loadFile callback,
     // which routes through addTree — and addTree aborts once finished_ is set.
     std::vector<CrossTreeRef> crossRefs;
-    auto const resolver = chooseResolver(schema_->name());
+    auto const resolver = chooseResolver(*schema_);
     ResolutionContext context{
         trees_,
         *schema_,

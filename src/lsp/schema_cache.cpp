@@ -2,20 +2,15 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 namespace dss::lsp {
 
 namespace {
-
-// Shipped grammar names probed during lazy lookup-by-extension.
-constexpr std::string_view kShippedLanguages[] = {
-    "toy",
-    "c-subset",
-    "tsql-subset",
-};
 
 // Case-insensitive (lowercase) view of an extension for portable
 // matching. Windows filesystems are case-insensitive; POSIX is
@@ -45,14 +40,49 @@ constexpr std::string_view kShippedLanguages[] = {
 
 } // namespace
 
-SchemaCache::SchemaCache(std::optional<std::filesystem::path> schemaDir)
-    : schemaDir_(std::move(schemaDir)) {
-    // In shipped mode, prime the candidates list — these are the
-    // names we'll try when resolving by extension.
-    if (!schemaDir_.has_value()) {
-        for (auto name : kShippedLanguages) {
-            shippedCandidates_.emplace_back(name);
+ShippedDiscoveryResult SchemaCache::discoverShippedLanguages(
+    std::optional<std::filesystem::path> startPath) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path here = startPath.value_or(fs::current_path(ec));
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        const fs::path candidate = here / "src" / "source-config" / "languages";
+        if (fs::is_directory(candidate, ec)) {
+            std::vector<std::string> names;
+            for (auto const& entry : fs::directory_iterator(candidate, ec)) {
+                if (!entry.is_regular_file()) continue;
+                const auto name = entry.path().filename().string();
+                constexpr std::string_view kSuffix = ".lang.json";
+                if (name.size() <= kSuffix.size()) continue;
+                if (name.compare(name.size() - kSuffix.size(),
+                                 kSuffix.size(), kSuffix) != 0) continue;
+                names.push_back(name.substr(0, name.size() - kSuffix.size()));
+            }
+            std::sort(names.begin(), names.end());
+            return {std::move(names), candidate};
         }
+        const fs::path parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+    // Walk exhausted without finding the directory. Distinguishing this
+    // "not located" outcome from "located but empty" is load-bearing —
+    // `resolveByExtension` surfaces the two as different errors so the
+    // operator knows whether to fix --schema-dir or to populate the dir.
+    return {{}, std::nullopt};
+}
+
+SchemaCache::SchemaCache(std::optional<std::filesystem::path> schemaDir,
+                         std::optional<std::filesystem::path> discoveryStartPath)
+    : schemaDir_(std::move(schemaDir)) {
+    // In shipped mode, prime the candidates list by scanning the
+    // shipped-config directory — every `*.lang.json` is a candidate
+    // when resolving by extension. No hardcoded language names
+    // anywhere (08.55 cleanup).
+    if (!schemaDir_.has_value()) {
+        auto result = discoverShippedLanguages(std::move(discoveryStartPath));
+        shippedCandidates_ = std::move(result.names);
+        shippedDir_        = std::move(result.directory);
     }
 }
 
@@ -116,9 +146,32 @@ SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
             if (auto cached = lookupCachedLocked(it->second)) return cached;
         }
     }
-    // Miss. Try each shipped candidate. If `--schema-dir` is set
-    // we have no candidate list, so the caller must use
-    // `resolveByName` for unknown extensions.
+    // Cache miss. In --schema-dir mode there is no shipped-candidate
+    // list (we don't enumerate the user's dir up front) — fall through
+    // to the NoExtensionMatch path below.
+    //
+    // In shipped mode an EMPTY candidate list is a config-error class,
+    // not a "valid: no language declares this extension" answer. Surface
+    // the *reason* the list is empty so the operator can act:
+    //   - directory not found  ⇒ ShippedDirNotFound (set --schema-dir or
+    //     run from the repo)
+    //   - directory empty      ⇒ ShippedDirEmpty (populate it)
+    // Without these distinct codes, a deploy mis-configuration silently
+    // looks like "your file isn't supported", which is the wrong fix.
+    if (!schemaDir_.has_value() && shippedCandidates_.empty()) {
+        if (!shippedDir_.has_value()) {
+            return std::unexpected(SchemaResolveError{
+                SchemaResolveErrorKind::ShippedDirNotFound,
+                "shipped-language directory `src/source-config/languages` "
+                "was not located within 8 parent levels of the working "
+                "directory; pass --schema-dir explicitly or invoke from "
+                "the repository"});
+        }
+        return std::unexpected(SchemaResolveError{
+            SchemaResolveErrorKind::ShippedDirEmpty,
+            std::string{"shipped-language directory `"} +
+                shippedDir_->string() + "` contains no `*.lang.json` files"});
+    }
     for (auto const& name : shippedCandidates_) {
         auto loaded = resolveByName(name);
         if (!loaded.has_value()) continue;

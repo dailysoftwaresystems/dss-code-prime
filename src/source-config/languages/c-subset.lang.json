@@ -1,5 +1,5 @@
 {
-  "dssSchemaVersion": 2,
+  "dssSchemaVersion": 4,
 
   "language": {
     "name":           "CSubset",
@@ -7,9 +7,18 @@
     "fileExtensions": [".c", ".h"]
   },
 
+  "artifactProfiles": ["cli", "lib", "staticlib"],
+
+  "imports": {
+    "strategy":      "include-following",
+    "directiveRule": "includeDirective",
+    "pathToken":     "StringStart"
+  },
+
   "lexerModes": {
     "main":          { "tokens": "default" },
     "string":        { "defaultToken": { "kind": "StringChar" } },
+    "charBody":      { "defaultToken": { "kind": "CharLiteral" } },
     "line-comment":  {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -48,11 +57,16 @@
     ",":  [{ "kind": "Comma" }],
     ":":  [{ "kind": "Colon" }],
 
-    "#include": [{ "kind": "IncludeKeyword" }],
+    "#": [{ "kind": "HashOp" }],
     "\"": [{
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "string",
       "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
+    "'": [{
+      "kind": "CharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
     }],
 
     "=":  [{ "kind": "AssignOp" }],
@@ -113,13 +127,36 @@
     ]
   },
 
+  "numberStyle": {
+    "decimal": true,
+    "integerPrefixes": [
+      { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" },
+      { "prefix": "0X", "radix": 16, "digits": "0-9a-fA-F" },
+      { "prefix": "0b", "radix": 2,  "digits": "01"        },
+      { "prefix": "0B", "radix": 2,  "digits": "01"        },
+      { "prefix": "0o", "radix": 8,  "digits": "0-7"       },
+      { "prefix": "0O", "radix": 8,  "digits": "0-7"       },
+      { "prefix": "0",  "radix": 8,  "digits": "0-7"       }
+    ],
+    "exponent":         { "letters": ["e", "E"], "signOptional": true },
+    "fractionPoint":    ".",
+    "digitSeparator":   "_",
+    "integerSuffixes":  ["u", "U", "l", "L", "ll", "LL", "ul", "UL", "lu", "LU",
+                          "ull", "ULL", "llu", "LLU"],
+    "floatSuffixes":    ["f", "F"],
+    "emitKind":         { "integer": "IntLiteral", "float": "FloatLiteral" }
+  },
+
   "syncTokens": ["EndStatement", "BlockClose"],
 
   "keywords": [
-    { "word": "void",   "kind": "VoidKeyword"   },
-    { "word": "int",    "kind": "IntKeyword"    },
-    { "word": "char",   "kind": "CharKeyword"   },
-    { "word": "const",  "kind": "ConstKeyword"  },
+    { "word": "include", "kind": "IncludeKeyword" },
+
+    { "word": "void",    "kind": "VoidKeyword"    },
+    { "word": "int",     "kind": "IntKeyword"     },
+    { "word": "char",    "kind": "CharKeyword"    },
+    { "word": "const",   "kind": "ConstKeyword"   },
+    { "word": "typedef", "kind": "TypedefKeyword" },
 
     { "word": "if",      "kind": "IfKeyword"      },
     { "word": "else",    "kind": "ElseKeyword"    },
@@ -141,13 +178,34 @@
     "topLevel": {
       "alt": [
         "includeDirective",
-        { "sequence": [ "typeRef", "Identifier", "topLevelTail" ] },
+        "typedefDecl",
+        "topLevelDecl",
         "externDecl"
       ]
     },
 
+    "topLevelDecl": {
+      "sequence": [ "typeRef", "Identifier", "topLevelDeclTail" ]
+    },
+
+    "topLevelDeclTail": {
+      "alt": [ "funcDefTail", "varDeclTail" ]
+    },
+
+    "funcDefTail": {
+      "sequence": [ "funcParams", "block" ]
+    },
+
+    "funcParams": {
+      "sequence": [ "ParenOpen", { "optional": "paramList" }, "ParenClose" ]
+    },
+
+    "typedefDecl": {
+      "sequence": [ "TypedefKeyword", "typeRef", "Identifier", "EndStatement" ]
+    },
+
     "includeDirective": {
-      "sequence": [ "IncludeKeyword", "StringStart" ]
+      "sequence": [ "HashOp", "IncludeKeyword", "StringStart" ]
     },
 
     "externDecl": {
@@ -168,17 +226,6 @@
             "EndStatement"
         ] },
         "varDeclTail"
-      ]
-    },
-
-    "topLevelTail": { "alt": [ "funcTail", "varDeclTail" ] },
-
-    "funcTail": {
-      "sequence": [
-        "ParenOpen",
-        { "optional": "paramList" },
-        "ParenClose",
-        "block"
       ]
     },
 
@@ -324,14 +371,24 @@
 
     "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
 
-    "expression": { "expr": { "atom": "operand" } },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    },
 
     "operand": {
       "alt": [
         "Identifier",
         "IntLiteral",
-        "CharLiteral",
-        "StringLiteral",
+        "FloatLiteral",
+        "StringStart",
+        "CharStart",
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
     },
@@ -344,5 +401,60 @@
         ]
       }
     }
+  },
+
+  "semantics": {
+    "identifierToken": "Identifier",
+    "declarations": [
+      { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
+        "constMarker": "ConstKeyword", "warnIfUnused": true },
+      { "rule": "param",       "name": 1, "type": 0, "kind": "variable",
+        "constMarker": "ConstKeyword" },
+      { "rule": "topLevelDecl", "name": 1, "type": 0, "kind": "variable",
+        "constMarker": "ConstKeyword",
+        "kindByChild": {
+          "childPath": [2, 0],
+          "whenRule": "funcDefTail",
+          "whenKind": "function",
+          "paramsPath": [0],
+          "bodyPath":   [1]
+        } },
+      { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" }
+    ],
+    "references": [
+      { "rule": "operand" }
+    ],
+    "scopes": [ "block", "funcDefTail" ],
+    "assignments": [
+      { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "MinusAssignOp",  "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "StarAssignOp",   "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "SlashAssignOp",  "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "ModAssignOp",    "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "BitAndAssignOp", "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "BitOrAssignOp",  "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "BitXorAssignOp", "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "ShlAssignOp",    "lhs": 0, "rhs": 2 },
+      { "rule": "binaryExpr", "operatorToken": "ShrAssignOp",    "lhs": 0, "rhs": 2 }
+    ],
+    "callRules": [
+      { "rule": "postfixExpr", "callee": 0, "args": 2,
+        "operatorToken": "ParenOpen" }
+    ],
+    "returnRules": [
+      { "rule": "returnStmt", "value": 1 }
+    ],
+    "loopRules": [ "whileStmt", "forStmt", "doStmt", "switchStmt" ],
+    "loopControls": [ { "rule": "breakStmt" } ],
+    "builtinTypes": [
+      { "name": "int",  "core": "I32"  },
+      { "name": "char", "core": "Char" },
+      { "name": "void", "core": "Void" }
+    ],
+    "literalTypes": [
+      { "literal": "IntLiteral",   "core": "I32" },
+      { "literal": "FloatLiteral", "core": "F64" }
+    ]
   }
 }

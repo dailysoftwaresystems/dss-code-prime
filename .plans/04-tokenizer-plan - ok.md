@@ -136,6 +136,10 @@ float  := ([0-9]+ \. [0-9]*  |  \. [0-9]+  |  [0-9]+)
 
 The grammar lives in the tokenizer, not in the schema. Languages that want different numeric syntax (e.g., Python's `1_000.5` underscores, Rust's `0x_dead_beef`, Ada's based literals) will need a **`numberStyle` descriptor** in a future `schema-expressiveness-v3-plan.md`. Gap-catalog row 14 already records this; TZ adds a reciprocal note that the tokenizer's hand-coded path is the **interim default**, not the long-term plan.
 
+**Post-TZ3 / 08.55 update:** `scanNumber()` is now fully config-driven by the schema v4 `numberStyle` block. Each language declares its numeric syntax (decimal/integerPrefixes/exponent/fractionPoint/digitSeparator/suffixes/emitKind); the engine has zero hardcoded numeric paradigm. v2-gap row 14 (numberStyle) is **closed**. See `.plans/08.55-pre-se1-cleanup-plan - ok.md` §2.2.
+
+**Post-08.55 (pre-interned token kinds):** Pre-interned token kinds were pruned to universal categories only — `Identifier`, `IntLiteral`, `FloatLiteral`, `StringLiteral`, `Eof`, `Error`, `Whitespace`, `Newline`. Paradigm-specific kinds (`BoolLiteral`/`CharLiteral`/`NullLiteral`) were demoted; languages declare them explicitly in their `tokens`/`keywords` blocks. The corresponding `CoreTokenKind` enumerators were removed.
+
 ### 2.5 Token.schemaKind ownership change
 
 **Token.hpp comment update**: drop the line "assigned by the schema-aware resolver inside `TreeBuilder::pushToken`"; replace with "assigned by `Tokenizer` via mode-aware lookup against `GrammarSchema::lookupLexemeInMode`."

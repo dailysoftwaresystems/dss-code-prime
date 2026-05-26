@@ -135,6 +135,7 @@ Why `NodeId` carries the tag rather than just the `Node` (as the plan's Option A
 **Out of scope (carried forward to potential future SH or v3 work).**
 - `TreeCursor::Bookmark`'s existing `TreeId` ABA-detection is unchanged — it was already correct and remains so.
 - The `SchemaTreeBuilder` test helper in `test_tree_views.cpp` doesn't tag its NodeIds (it predates SH3 and has no cross-tree test needs). Same-tree access works because untagged passes the validator.
+  - **Post-08.55:** `test_tree_views.cpp` was deleted in 08.55 alongside the typed Views it tested (test helper migrated; see `tests/core/` headers). The SH-* substrate work in this plan is unaffected.
 
 ---
 

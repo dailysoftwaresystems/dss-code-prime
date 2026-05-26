@@ -1,18 +1,26 @@
 #include "lsp/lsp_server.hpp"
 
-#include "analysis/syntactic/parser.hpp"
+#include "analysis/compilation_unit/compilation_unit.hpp"
+#include "analysis/semantic/semantic_analyzer.hpp"
+#include "analysis/semantic/semantic_model.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
+#include "core/types/tree_cursor.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "lsp/diagnostic_translator.hpp"
 #include "lsp/json_rpc.hpp"
-#include "tokenizer/tokenizer.hpp"
+#include "lsp/lsp_semantic_query.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace dss::lsp {
 
@@ -110,6 +118,115 @@ struct DidChangeParams {
     catch (...) { return std::nullopt; }
 }
 
+// A `TextDocumentPositionParams` (uri + {line, character}). Used by every
+// semantic request handler.
+struct TextDocumentPosition {
+    std::string uri;
+    Position    position;
+};
+
+[[nodiscard]] std::optional<TextDocumentPosition>
+parseTextDocumentPosition(Request const& req) {
+    if (req.params.empty()) return std::nullopt;
+    json params;
+    try { params = json::parse(req.params); }
+    catch (...) { return std::nullopt; }
+    TextDocumentPosition out;
+    if (auto td = params.find("textDocument"); td != params.end()) {
+        if (auto u = td->find("uri"); u != td->end() && u->is_string()) {
+            out.uri = u->get<std::string>();
+        }
+    }
+    if (auto p = params.find("position"); p != params.end()) {
+        if (auto l = p->find("line"); l != p->end() && l->is_number_integer()) {
+            out.position.line = l->get<std::uint32_t>();
+        }
+        if (auto c = p->find("character"); c != p->end() && c->is_number_integer()) {
+            out.position.character = c->get<std::uint32_t>();
+        }
+    }
+    if (out.uri.empty()) return std::nullopt;
+    return out;
+}
+
+// Render a TypeId to a short human string for hover / completion detail.
+// Uses the interner's structural kind + nominal name; FnSig formats as
+// `(params) -> result`. Keeps it minimal — no full pretty-printer.
+[[nodiscard]] std::string typeString(dss::TypeInterner const& interner,
+                                     dss::TypeId ty) {
+    if (!ty.valid()) return "<unknown>";
+    auto kindName = [](dss::TypeKind k) -> std::string {
+        switch (k) {
+            case dss::TypeKind::Bool: return "bool";
+            case dss::TypeKind::I8:   return "i8";
+            case dss::TypeKind::I16:  return "i16";
+            case dss::TypeKind::I32:  return "i32";
+            case dss::TypeKind::I64:  return "i64";
+            case dss::TypeKind::I128: return "i128";
+            case dss::TypeKind::U8:   return "u8";
+            case dss::TypeKind::U16:  return "u16";
+            case dss::TypeKind::U32:  return "u32";
+            case dss::TypeKind::U64:  return "u64";
+            case dss::TypeKind::U128: return "u128";
+            case dss::TypeKind::F16:  return "f16";
+            case dss::TypeKind::F32:  return "f32";
+            case dss::TypeKind::F64:  return "f64";
+            case dss::TypeKind::F128: return "f128";
+            case dss::TypeKind::Char: return "char";
+            case dss::TypeKind::Byte: return "byte";
+            case dss::TypeKind::Void: return "void";
+            default:                  return "type";
+        }
+    };
+    const auto k = interner.kind(ty);
+    if (k == dss::TypeKind::FnSig) {
+        std::string s = "(";
+        auto params = interner.fnParams(ty);
+        for (std::size_t i = 0; i < params.size(); ++i) {
+            if (i > 0) s += ", ";
+            s += kindName(interner.kind(params[i]));
+        }
+        s += ") -> ";
+        s += kindName(interner.kind(interner.fnResult(ty)));
+        return s;
+    }
+    auto nm = interner.name(ty);
+    if (!nm.empty()) return std::string{nm};
+    return kindName(k);
+}
+
+// LSP SymbolKind-ish detail string for a declaration kind (used as the
+// `kind` field hint and the hover label prefix).
+[[nodiscard]] std::string_view declKindLabel(dss::DeclarationKind k) {
+    switch (k) {
+        case dss::DeclarationKind::Variable: return "variable";
+        case dss::DeclarationKind::Function: return "function";
+        case dss::DeclarationKind::Table:    return "table";
+        case dss::DeclarationKind::Type:     return "type";
+    }
+    return "symbol";
+}
+
+// LSP CompletionItemKind (LSP §10.18): 6=Variable, 3=Function, 7=Class
+// (used for table/type), 22=Struct. Map our DeclarationKind onto the
+// closest wire value.
+[[nodiscard]] int completionItemKind(dss::DeclarationKind k) {
+    switch (k) {
+        case dss::DeclarationKind::Variable: return 6;
+        case dss::DeclarationKind::Function: return 3;
+        case dss::DeclarationKind::Table:    return 7;
+        case dss::DeclarationKind::Type:     return 7;
+    }
+    return 6;
+}
+
+[[nodiscard]] json rangeJson(Range const& r) {
+    return json{
+        {"start", {{"line", r.start.line}, {"character", r.start.character}}},
+        {"end",   {{"line", r.end.line},   {"character", r.end.character}}},
+    };
+}
+
 } // namespace
 
 LspServer::LspServer(std::unique_ptr<LspTransport> transport,
@@ -150,25 +267,19 @@ void LspServer::registerHandlers_() {
     dispatcher_.registerNotification(Method::TextDocumentDidSave,
         [this](Notification const& n) { handleDidSave_(n); });
 
-    // Stub handlers return their LSP-spec default result.
-    struct StubMethod {
-        Method            method;
-        std::string_view  defaultResult;
-    };
-    constexpr StubMethod kStubs[] = {
-        {Method::TextDocumentHover,         "null"},
-        {Method::TextDocumentCompletion,    "null"},
-        {Method::TextDocumentDefinition,    "null"},
-        {Method::TextDocumentReferences,    "[]"},
-        {Method::TextDocumentRename,        "null"},
-        {Method::TextDocumentSignatureHelp, "null"},
-    };
-    for (auto const& s : kStubs) {
-        dispatcher_.registerRequest(s.method,
-            [r = std::string{s.defaultResult}](Request const&) {
-                return std::optional<std::string>{r};
-            });
-    }
+    // Semantic request handlers (SE7) — backed by the cached SemanticModel.
+    dispatcher_.registerRequest(Method::TextDocumentHover,
+        [this](Request const& r) { return handleHover_(r); });
+    dispatcher_.registerRequest(Method::TextDocumentCompletion,
+        [this](Request const& r) { return handleCompletion_(r); });
+    dispatcher_.registerRequest(Method::TextDocumentDefinition,
+        [this](Request const& r) { return handleDefinition_(r); });
+    dispatcher_.registerRequest(Method::TextDocumentReferences,
+        [this](Request const& r) { return handleReferences_(r); });
+    dispatcher_.registerRequest(Method::TextDocumentRename,
+        [this](Request const& r) { return handleRename_(r); });
+    dispatcher_.registerRequest(Method::TextDocumentSignatureHelp,
+        [this](Request const& r) { return handleSignatureHelp_(r); });
 }
 
 int LspServer::run() {
@@ -305,19 +416,35 @@ void LspServer::enqueueParse_(std::string uri) {
             }
             return;
         }
-        auto src = dss::SourceBuffer::fromString(snap.text, uri);
-        dss::Tokenizer tk{src, snap.schema};
-        auto [stream, lexDiags] = std::move(tk).tokenize();
-        dss::Parser p{src, snap.schema, std::move(stream)};
-        auto result = std::move(p).parse();
+        // Build a single-file CompilationUnit and run full semantic
+        // analysis. The CU must outlive the SemanticModel (its side-tables
+        // hold raw Tree*), so we wrap it in a shared_ptr and hand it to
+        // analyze(), which keeps its own shared_ptr inside the model.
+        dss::UnitBuilder builder{snap.schema};
+        builder.addInMemory(snap.text, uri);
+        auto cu = std::make_shared<dss::CompilationUnit>(
+            std::move(builder).finish());
+        auto model = std::make_shared<dss::SemanticModel const>(
+            dss::analyze(cu));
 
-        // Copy out: the span aliases tree storage that dies at scope end.
-        std::vector<dss::ParseDiagnostic> diags(
-            result.tree.diagnostics().all().begin(),
-            result.tree.diagnostics().all().end());
+        // Union the per-tree parse diagnostics (lexer + parser, folded by
+        // UnitBuilder) with the semantic diagnostics for publishing.
+        std::vector<dss::ParseDiagnostic> diags;
+        if (!cu->trees().empty()) {
+            auto parseDiags = cu->trees()[0].diagnostics().all();
+            diags.assign(parseDiags.begin(), parseDiags.end());
+        }
+        auto semDiags = model->diagnostics().all();
+        diags.insert(diags.end(), semDiags.begin(), semDiags.end());
 
-        if (documents_.setDiagnostics(uri, snap.parseGeneration,
-                                       std::move(diags))) {
+        // Store the model under the same generation guard, then publish.
+        // setDiagnostics gates on generation too — a newer edit drops both.
+        const bool applied =
+            documents_.setDiagnostics(uri, snap.parseGeneration,
+                                      std::move(diags));
+        (void)documents_.setSemanticModel(uri, snap.parseGeneration,
+                                          std::move(model));
+        if (applied) {
             publishDiagnostics_(uri);
         }
     });
@@ -344,6 +471,302 @@ void LspServer::publishDiagnostics_(std::string const& uri) {
     const auto notif = JsonRpc::serializeNotification(
         "textDocument/publishDiagnostics", body);
     (void)transport_->writeMessage(notif);
+}
+
+// ── Semantic request handlers (SE7) ────────────────────────────────────
+
+namespace {
+
+// Resolve the (model, tree, byteOffset, node) tuple a position-based
+// handler needs. Returns false when no model/tree/node is available — the
+// caller returns the LSP default. The tree is always trees()[0] (single-
+// file CU per LSP document).
+struct ResolvedQuery {
+    std::shared_ptr<dss::SemanticModel const> model;
+    dss::Tree const*                          tree   = nullptr;
+    dss::ByteOffset                           offset{};
+    NodeId                                    node{};
+};
+
+[[nodiscard]] bool resolveQuery(DocumentStore const& docs,
+                                TextDocumentPosition const& tp,
+                                ResolvedQuery& out) {
+    out.model = docs.semanticModelFor(tp.uri);
+    if (!out.model) return false;
+    auto trees = out.model->unit().trees();
+    if (trees.empty() || !trees[0].root().valid()) return false;
+    out.tree   = &trees[0];
+    out.offset = positionToByteOffset(out.tree->source(), tp.position);
+    out.node   = nodeAtOffset(*out.tree, out.offset);
+    return out.node.valid();
+}
+
+// A Location {uri, range} for a node's span in `tree`.
+[[nodiscard]] json locationJson(std::string const& uri, dss::Tree const& tree,
+                                NodeId node) {
+    return json{
+        {"uri", uri},
+        {"range", rangeJson(spanToRange(tree.source(), tree.span(node)))},
+    };
+}
+
+} // namespace
+
+std::optional<std::string> LspServer::handleHover_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+    ResolvedQuery q;
+    if (!resolveQuery(documents_, *tp, q)) return std::string{"null"};
+
+    const SymbolId sym = q.model->symbolAt(q.node);
+    auto const* rec = q.model->recordFor(sym);
+    if (rec == nullptr) {
+        // No symbol bound here; fall back to the node's own type if any.
+        const dss::TypeId ty = q.model->typeAt(q.node);
+        if (!ty.valid()) return std::string{"null"};
+        json result;
+        result["contents"] = {
+            {"kind", "markdown"},
+            {"value", "```\n" + typeString(q.model->lattice().interner(), ty)
+                      + "\n```"},
+        };
+        result["range"] = rangeJson(spanToRange(q.tree->source(),
+                                                q.tree->span(q.node)));
+        return result.dump();
+    }
+
+    auto const& interner = q.model->lattice().interner();
+    std::string md = "```\n";
+    md += std::string{declKindLabel(rec->kind)};
+    md += ' ';
+    md += rec->name;
+    if (rec->type.valid()) {
+        md += ": ";
+        md += typeString(interner, rec->type);
+    }
+    md += "\n```";
+
+    json result;
+    result["contents"] = {{"kind", "markdown"}, {"value", md}};
+    result["range"] = rangeJson(spanToRange(q.tree->source(),
+                                            q.tree->span(q.node)));
+    return result.dump();
+}
+
+std::optional<std::string> LspServer::handleDefinition_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+    ResolvedQuery q;
+    if (!resolveQuery(documents_, *tp, q)) return std::string{"null"};
+
+    const SymbolId sym = q.model->symbolAt(q.node);
+    auto const* rec = q.model->recordFor(sym);
+    if (rec == nullptr || !rec->declNode.valid()) return std::string{"null"};
+    // The decl node belongs to the symbol's tree; for a single-file CU
+    // that is the same tree. Resolve via the model's CU trees by id.
+    dss::Tree const* declTree = q.tree;
+    for (auto const& t : q.model->unit().trees()) {
+        if (t.id().v == rec->tree.v) { declTree = &t; break; }
+    }
+    return locationJson(tp->uri, *declTree, rec->declNode).dump();
+}
+
+std::optional<std::string> LspServer::handleReferences_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"[]"};
+    ResolvedQuery q;
+    if (!resolveQuery(documents_, *tp, q)) return std::string{"[]"};
+
+    const SymbolId sym = q.model->symbolAt(q.node);
+    auto const* rec = q.model->recordFor(sym);
+    if (rec == nullptr) return std::string{"[]"};
+
+    // includeDeclaration defaults true per LSP; honor context if present.
+    bool includeDecl = true;
+    try {
+        auto params = json::parse(req.params);
+        if (auto ctx = params.find("context"); ctx != params.end()) {
+            if (auto inc = ctx->find("includeDeclaration");
+                inc != ctx->end() && inc->is_boolean()) {
+                includeDecl = inc->get<bool>();
+            }
+        }
+    } catch (...) { /* keep default */ }
+
+    json arr = json::array();
+    if (includeDecl && rec->declNode.valid()) {
+        arr.push_back(locationJson(tp->uri, *q.tree, rec->declNode));
+    }
+    for (NodeId use : q.model->usesOf(sym)) {
+        arr.push_back(locationJson(tp->uri, *q.tree, use));
+    }
+    return arr.dump();
+}
+
+std::optional<std::string> LspServer::handleRename_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+    ResolvedQuery q;
+    if (!resolveQuery(documents_, *tp, q)) return std::string{"null"};
+
+    std::string newName;
+    try {
+        auto params = json::parse(req.params);
+        if (auto n = params.find("newName"); n != params.end() && n->is_string()) {
+            newName = n->get<std::string>();
+        }
+    } catch (...) { return std::string{"null"}; }
+    if (newName.empty()) return std::string{"null"};
+
+    const SymbolId sym = q.model->symbolAt(q.node);
+    auto const* rec = q.model->recordFor(sym);
+    if (rec == nullptr) return std::string{"null"};
+
+    json edits = json::array();
+    auto pushEdit = [&](NodeId n) {
+        edits.push_back(json{
+            {"range", rangeJson(spanToRange(q.tree->source(), q.tree->span(n)))},
+            {"newText", newName},
+        });
+    };
+    if (rec->declNode.valid()) pushEdit(rec->declNode);
+    for (NodeId use : q.model->usesOf(sym)) pushEdit(use);
+
+    json result;
+    result["changes"] = json::object();
+    result["changes"][tp->uri] = std::move(edits);
+    return result.dump();
+}
+
+std::optional<std::string> LspServer::handleCompletion_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+    auto model = documents_.semanticModelFor(tp->uri);
+    if (!model) return std::string{"null"};
+    auto trees = model->unit().trees();
+    if (trees.empty() || !trees[0].root().valid()) return std::string{"null"};
+    dss::Tree const& tree = trees[0];
+    const dss::ByteOffset offset =
+        positionToByteOffset(tree.source(), tp->position);
+
+    // Find the deepest scope containing the offset, then collect bindings
+    // up the parent chain (inner shadows outer — first-seen wins).
+    auto const& interner = model->lattice().interner();
+    auto const& scopes   = model->scopes();
+    ScopeId scope = scopeAtOffset(*model, tree, offset);
+
+    std::unordered_map<std::string, SymbolId> visible;
+    while (scope.valid() && scope.v < scopes.size()) {
+        for (auto const& [name, symId] : scopes[scope.v].bindings) {
+            visible.emplace(name, symId);  // inner (earlier) wins
+        }
+        scope = scopes[scope.v].parent;
+    }
+
+    json items = json::array();
+    for (auto const& [name, symId] : visible) {
+        auto const* rec = model->recordFor(symId);
+        if (rec == nullptr) continue;
+        json item;
+        item["label"] = name;
+        item["kind"]  = completionItemKind(rec->kind);
+        std::string detail{declKindLabel(rec->kind)};
+        if (rec->type.valid()) {
+            detail += ": ";
+            detail += typeString(interner, rec->type);
+        }
+        item["detail"] = detail;
+        items.push_back(std::move(item));
+    }
+    return items.dump();
+}
+
+std::optional<std::string> LspServer::handleSignatureHelp_(Request const& req) {
+    auto tp = parseTextDocumentPosition(req);
+    if (!tp) return std::string{"null"};
+    ResolvedQuery q;
+    if (!resolveQuery(documents_, *tp, q)) return std::string{"null"};
+
+    // Walk ancestors to find an enclosing call-rule node, then resolve its
+    // callee to a FnSig. callRules come from the schema's SemanticConfig.
+    auto const& cfg = q.model->unit().schema().semantics();
+    auto const& interner = q.model->lattice().interner();
+
+    dss::TreeCursor cursor{*q.tree, q.node, dss::CursorMode::Ast};
+    for (;;) {
+        const NodeId cur = cursor.current();
+        if (q.tree->kind(cur) == NodeKind::Internal) {
+            const auto rule = q.tree->rule(cur);
+            for (auto const& cr : cfg.callRules) {
+                if (cr.rule.v != rule.v) continue;
+                // Resolve the callee child to a symbol via its bound node.
+                std::vector<NodeId> kids;
+                for (NodeId c : q.tree->children(cur)) {
+                    if (!isEmptySpace(q.tree->flags(c))) kids.push_back(c);
+                }
+                if (cr.calleeChild >= kids.size()) break;
+                // Resolve the callee: prefer the SymbolId already bound to
+                // the callee leaf (when it sits under a reference rule);
+                // otherwise fall back to a scope-chain lookup by name (a
+                // call callee — e.g. tsql's COALESCE — is not itself a
+                // reference node, so the engine resolves it by name; we
+                // mirror that here).
+                NodeId calleeLeaf = kids[cr.calleeChild];
+                SymbolId calleeSym = q.model->symbolAt(calleeLeaf);
+                if (!calleeSym.valid()) {
+                    for (NodeId c : q.tree->children(calleeLeaf)) {
+                        if (isEmptySpace(q.tree->flags(c))) continue;
+                        calleeSym = q.model->symbolAt(c);
+                        if (calleeSym.valid()) break;
+                    }
+                }
+                if (!calleeSym.valid()) {
+                    // Name-based scope lookup. The callee leaf is a token
+                    // (or wraps one); take its text and search the scope
+                    // chain from the call site.
+                    std::string_view calleeText = q.tree->text(calleeLeaf);
+                    ScopeId scope = scopeAtOffset(*q.model, *q.tree, q.offset);
+                    auto const& scopes = q.model->scopes();
+                    while (scope.valid() && scope.v < scopes.size()) {
+                        auto it = scopes[scope.v].bindings.find(
+                            std::string{calleeText});
+                        if (it != scopes[scope.v].bindings.end()) {
+                            calleeSym = it->second;
+                            break;
+                        }
+                        scope = scopes[scope.v].parent;
+                    }
+                }
+                auto const* rec = q.model->recordFor(calleeSym);
+                if (rec == nullptr || !rec->type.valid()
+                    || interner.kind(rec->type) != dss::TypeKind::FnSig) {
+                    return std::string{"null"};
+                }
+                auto params = interner.fnParams(rec->type);
+                json paramArr = json::array();
+                std::string label = rec->name + "(";
+                for (std::size_t i = 0; i < params.size(); ++i) {
+                    if (i > 0) label += ", ";
+                    const std::string pstr = typeString(interner, params[i]);
+                    label += pstr;
+                    paramArr.push_back(json{{"label", pstr}});
+                }
+                label += ") -> ";
+                label += typeString(interner, interner.fnResult(rec->type));
+
+                json sig;
+                sig["label"]      = label;
+                sig["parameters"] = std::move(paramArr);
+                json result;
+                result["signatures"]      = json::array({std::move(sig)});
+                result["activeSignature"] = 0;
+                result["activeParameter"] = 0;
+                return result.dump();
+            }
+        }
+        if (!cursor.gotoParent()) break;
+    }
+    return std::string{"null"};
 }
 
 } // namespace dss::lsp

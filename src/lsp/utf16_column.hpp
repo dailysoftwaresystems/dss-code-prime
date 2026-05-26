@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/source_buffer.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -32,5 +33,36 @@ namespace dss::lsp {
 [[nodiscard]] DSS_EXPORT std::uint32_t utf8ByteOffsetToUtf16Column(
     std::string_view lineText,
     std::uint32_t    byteOffsetInLine) noexcept;
+
+// Inverse of the above: given a line's UTF-8 text and a 0-based UTF-16
+// code-unit column (an LSP `Position.character`), return the
+// corresponding 0-based UTF-8 BYTE offset within that line. Used to map
+// an LSP position back onto the parser's byte-span world.
+//
+// A `utf16Col` past the end of the line clamps to the line length. A
+// column that lands in the MIDDLE of a surrogate pair (4-byte UTF-8 code
+// point) rounds DOWN to the start of that code point — the same
+// best-effort tolerance the forward function applies, since LSP positions
+// are hints. Continuation bytes are never returned as an offset.
+[[nodiscard]] DSS_EXPORT std::uint32_t utf16ColumnToByteOffset(
+    std::string_view lineText,
+    std::uint32_t    utf16Col) noexcept;
+
+// The UTF-8 byte range [startByte, endByte) of the source line
+// containing `byteOffset` in `buffer`. `endByte` is exclusive of the
+// terminating `\n` / `\r` (or end-of-buffer for the last line without
+// a trailing newline). One canonical helper consumed by the
+// diagnostic translator AND the LSP semantic query layer — keeping
+// `\r` handling consistent across both. Walks backwards from
+// `byteOffset` to the previous line break, then forward to the next.
+// Clamps `byteOffset` to the buffer length.
+struct LineByteRange {
+    std::uint32_t startByte;
+    std::uint32_t endByte;
+};
+
+[[nodiscard]] DSS_EXPORT LineByteRange lineByteRangeFor(
+    dss::SourceBuffer const& buffer,
+    std::uint32_t            byteOffset) noexcept;
 
 } // namespace dss::lsp

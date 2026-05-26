@@ -28,34 +28,10 @@ using json = nlohmann::json;
     return DiagnosticSeverity::Error;
 }
 
-// Compute the UTF-8 byte range of the source line containing
-// `byteOffset`. Returns `[lineStartByte, lineEndByte)` (lineEndByte
-// exclusive of the terminating `\n`, or end-of-buffer if the line is
-// the last with no trailing newline).
-struct LineByteRange {
-    std::uint32_t startByte;
-    std::uint32_t endByte;
-};
-
-[[nodiscard]] LineByteRange lineByteRangeFor(dss::SourceBuffer const& buffer,
-                                              std::uint32_t            byteOffset) {
-    const auto lc = buffer.lineCol(dss::ByteOffset{byteOffset});
-    // lineCol returns 1-based columns; lineStart = byteOffset - (col-1).
-    // Use a signed-safe subtraction — lc.column could be 0 for an
-    // empty buffer past-end clamp, and `lc.column - 1` would wrap.
-    const std::uint32_t colMinusOne = (lc.column > 0) ? lc.column - 1 : 0u;
-    const std::uint32_t lineStart =
-        (byteOffset >= colMinusOne) ? byteOffset - colMinusOne : 0;
-    const auto text = buffer.text();
-    auto endByte = lineStart;
-    while (endByte < text.size() && text[endByte] != '\n' && text[endByte] != '\r') {
-        ++endByte;
-    }
-    return {lineStart, endByte};
-}
-
 // Convert a 1-based byte column from `SourceBuffer::lineCol` into a
-// 0-based UTF-16 character column.
+// 0-based UTF-16 character column. Uses the shared lineByteRangeFor
+// helper in `utf16_column.hpp` so every LSP line-resolution path
+// agrees on `\r`/`\n`/EOB clamping.
 [[nodiscard]] std::uint32_t lspCharacter(dss::SourceBuffer const& buffer,
                                           std::uint32_t            byteOffset) {
     const auto range = lineByteRangeFor(buffer, byteOffset);

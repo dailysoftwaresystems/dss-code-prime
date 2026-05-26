@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <format>
+#include <string>
 #include <string_view>
 
 using namespace dss;
@@ -277,13 +279,14 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     auto const& schema = **result;
 
     EXPECT_EQ(schema.name(), "CSubset");
-    EXPECT_EQ(schema.schemaVersion(), 2u);
+    EXPECT_EQ(schema.schemaVersion(), 4u);
 
     // Every shape name declared in the JSON must resolve. A typo would
     // currently load cleanly and only fail when a caller asks for the
     // missing name; pinning here makes the regression visible at load.
-    for (std::string_view rule : {"root", "topLevel", "topLevelTail",
-                                  "funcTail", "varDeclTail",
+    for (std::string_view rule : {"root", "topLevel", "topLevelDecl",
+                                  "topLevelDeclTail", "funcDefTail",
+                                  "funcParams", "varDeclTail",
                                   "typeBase", "typeRef",
                                   "varDeclHead", "varDecl",
                                   "paramList", "param", "block", "statement",
@@ -311,10 +314,11 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     ASSERT_EQ(forKw.size(), 1u);
     EXPECT_EQ(schema.schemaTokens().name(forKw[0].id), "ForKeyword");
 
-    // `typedef` is not a keyword in this config (deferred — see
-    // v2-gap-catalog row 2). Confirm the lexeme has no meaning so a
-    // future regression that silently adds it gets caught.
-    EXPECT_TRUE(schema.lookupLexeme("typedef").empty());
+    // `typedef` IS a keyword as of SE5 (typedef resolution): it leads the
+    // `typedefDecl` shape and resolves to the TypedefKeyword token kind.
+    auto const typedefKw = schema.lookupLexeme("typedef");
+    ASSERT_EQ(typedefKw.size(), 1u);
+    EXPECT_EQ(schema.schemaTokens().name(typedefKw[0].id), "TypedefKeyword");
 }
 
 // Pin the `expr`-shape accessors on c-subset. `expression` is the
@@ -366,12 +370,29 @@ TEST(GrammarSchema, WrapperRulesAbsentInNonExprSchema) {
 // redeclaration would let the schema cursor see a body for them,
 // breaking the "transparent wrapper" invariant.
 TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
+    // 08.55: wrapper-rule names are declared per-language via
+    // `expr.wrapperRules`. The loader rejects a top-level `shapes`
+    // entry whose name collides with any wrapper rule name declared
+    // by this schema (so the schema cursor can't enter through a
+    // user-defined body for what is supposed to be a walker-
+    // synthesized frame).
     constexpr std::string_view kReservedShape = R"JSON({
-      "dssSchemaVersion": 2,
+      "dssSchemaVersion": 4,
       "language": { "name": "Bad", "version": "0.1.0" },
       "tokens": { "x": [{ "kind": "X" }] },
       "shapes": {
-        "root":       { "sequence": ["X"] },
+        "root":       { "sequence": ["expression"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "binaryExpr",
+              "unary":   "unaryExpr",
+              "postfix": "postfixExpr"
+            }
+          }
+        },
+        "operand":    { "sequence": ["X"] },
         "binaryExpr": { "sequence": ["X"] }
       }
     })JSON";
@@ -380,7 +401,7 @@ TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
     bool sawReservedDiag = false;
     for (auto const& d : result.error()) {
         if (d.message.find("binaryExpr") != std::string::npos
-            && d.message.find("reserved") != std::string::npos) {
+            && d.message.find("wrapper") != std::string::npos) {
             sawReservedDiag = true;
             break;
         }
@@ -652,7 +673,7 @@ TEST(GrammarSchema, RejectsBodyDefaultKindInScopeForbid) {
 // `P_NoAlternativeMatched` before the walker ever ran.
 TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
     constexpr std::string_view kPrefixSchema = R"JSON({
-      "dssSchemaVersion": 2,
+      "dssSchemaVersion": 4,
       "language": { "name": "PrefixFirst", "version": "0.1.0" },
       "tokens": {
         "-":  [{ "kind": "MinusOp" }]
@@ -664,7 +685,16 @@ TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
       },
       "shapes": {
         "root":       { "sequence": ["expression"] },
-        "expression": { "expr": { "atom": "operand" } },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "binaryExpr",
+              "unary":   "unaryExpr",
+              "postfix": "postfixExpr"
+            }
+          }
+        },
         "operand":    { "alt": ["Identifier"] }
       }
     })JSON";
@@ -716,9 +746,8 @@ TEST(GrammarSchema, SchemaVersionTwoAccepted) {
     EXPECT_EQ((*result)->schemaVersion(), 2u);
 }
 
-// dssSchemaVersion 3 is the upper bound of the loader's accepted window since
-// SP2 (it adds the optional `typeExtensions[]` field). A v3 doc with no
-// extensions loads cleanly.
+// dssSchemaVersion 3 added the optional `typeExtensions[]` field (SP2). A v3
+// doc with no extensions loads cleanly.
 TEST(GrammarSchema, SchemaVersionThreeAccepted) {
     auto result = GrammarSchema::loadFromText(
         R"({"dssSchemaVersion":3,"language":{"name":"X","version":"0.1.0"}})");
@@ -729,20 +758,33 @@ TEST(GrammarSchema, SchemaVersionThreeAccepted) {
     EXPECT_TRUE((*result)->typeExtensions().empty());
 }
 
+// dssSchemaVersion 4 is the upper bound of the loader's accepted window since
+// the config-driven import refactor (it adds the optional `imports` block). A
+// v4 doc with no `imports` block loads cleanly and defaults to strategy None.
+TEST(GrammarSchema, SchemaVersionFourAccepted) {
+    auto result = GrammarSchema::loadFromText(
+        R"({"dssSchemaVersion":4,"language":{"name":"X","version":"0.1.0"}})");
+    ASSERT_TRUE(result.has_value())
+        << "v4 doc should load: "
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    EXPECT_EQ((*result)->schemaVersion(), 4u);
+    EXPECT_EQ((*result)->imports().strategy, ImportStrategy::None);
+}
+
 // Outside the accepted window, the loader must emit C_VersionMismatch with a
 // message naming the supported range. The range string is the load-bearing
 // fragment — full-message equality would over-pin the surrounding prose, but
 // the range itself MUST be there or the diagnostic is uselessly opaque.
-TEST(GrammarSchema, SchemaVersionFourRejectedWithRangeMessage) {
+TEST(GrammarSchema, SchemaVersionFiveRejectedWithRangeMessage) {
     auto result = GrammarSchema::loadFromText(
-        R"({"dssSchemaVersion":4,"language":{"name":"X","version":"0.1.0"}})");
+        R"({"dssSchemaVersion":5,"language":{"name":"X","version":"0.1.0"}})");
     ASSERT_FALSE(result.has_value());
     auto const& diags = result.error();
     auto it = std::ranges::find_if(diags, [](auto const& d) {
         return d.code == DiagnosticCode::C_VersionMismatch;
     });
     ASSERT_NE(it, diags.end());
-    EXPECT_NE(it->message.find("1..3"), std::string::npos)
+    EXPECT_NE(it->message.find("1..4"), std::string::npos)
         << "version-mismatch message should name the supported range; got: "
         << it->message;
 }
@@ -850,11 +892,217 @@ TEST(GrammarSchema, TypeExtensionParametersNotArrayReportsMismatch) {
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_TypeExtensionParamMismatch));
 }
 
+// ── imports block (schema v4) ──────────────────────────────────────────────
+
+// An include-following `imports` block populates every parameterized field —
+// the resolver reads these instead of hardcoding rule/token names.
+TEST(GrammarSchema, ImportsIncludeFollowingLoadsAndPopulates) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "CSubset", "version": "0.1.0" },
+        "tokens": { "#": [ { "kind": "IncludeKeyword" } ],
+                    "\"": [ { "kind": "StringStart" } ] },
+        "shapes": {
+            "root": { "sequence": [ "includeDirective" ] },
+            "includeDirective": { "sequence": [ "IncludeKeyword", "StringStart" ] }
+        }
+    })JSON");
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto const& cfg = (*result)->imports();
+    EXPECT_EQ(cfg.strategy, ImportStrategy::None)  // no block declared yet
+        << "control: a config without an `imports` block stays None";
+}
+
+TEST(GrammarSchema, ImportsIncludeFollowingFieldsParse) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "CSubset", "version": "0.1.0" },
+        "imports": { "strategy": "include-following",
+                     "directiveRule": "includeDirective", "pathToken": "StringStart" },
+        "tokens": { "#": [ { "kind": "IncludeKeyword" } ],
+                    "\"": [ { "kind": "StringStart" } ] },
+        "shapes": {
+            "root": { "sequence": [ "includeDirective" ] },
+            "includeDirective": { "sequence": [ "IncludeKeyword", "StringStart" ] }
+        }
+    })JSON");
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto const& cfg = (*result)->imports();
+    EXPECT_EQ(cfg.strategy, ImportStrategy::IncludeFollowing);
+    EXPECT_EQ(cfg.directiveRule, "includeDirective");
+    EXPECT_EQ(cfg.pathToken, "StringStart");
+    EXPECT_TRUE(cfg.caseSensitive);  // default
+}
+
+TEST(GrammarSchema, ImportsNameMatchingFieldsParse) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "TsqlSubset", "version": "0.1.0" },
+        "imports": { "strategy": "name-matching",
+                     "nameRule": "qualifiedName", "definitionRule": "createTableStmt",
+                     "referenceParents": [ "tableRef" ], "nameToken": "Identifier",
+                     "caseSensitive": false },
+        "shapes": {
+            "root": { "sequence": [ "createTableStmt", "tableRef" ] },
+            "qualifiedName": { "sequence": [ "Identifier" ] },
+            "createTableStmt": { "sequence": [ "qualifiedName" ] },
+            "tableRef": { "sequence": [ "qualifiedName" ] }
+        }
+    })JSON");
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto const& cfg = (*result)->imports();
+    EXPECT_EQ(cfg.strategy, ImportStrategy::NameMatching);
+    EXPECT_EQ(cfg.nameRule, "qualifiedName");
+    EXPECT_EQ(cfg.definitionRule, "createTableStmt");
+    ASSERT_EQ(cfg.referenceParents.size(), 1u);
+    EXPECT_EQ(cfg.referenceParents[0], "tableRef");
+    EXPECT_EQ(cfg.nameToken, "Identifier");
+    EXPECT_FALSE(cfg.caseSensitive);
+}
+
+// An unknown `strategy` is a malformed block — C_InvalidImports.
+TEST(GrammarSchema, ImportsUnknownStrategyReportsInvalid) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "telepathy" }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidImports));
+}
+
+// include-following without `directiveRule` is missing a required field.
+TEST(GrammarSchema, ImportsIncludeFollowingMissingDirectiveRuleReportsMissingField) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "include-following", "pathToken": "StringStart" },
+        "tokens": { "\"": [ { "kind": "StringStart" } ] },
+        "shapes": { "root": { "sequence": [ "StringStart" ] } }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+// A `directiveRule` that names no declared shape is C_UnknownShape (the loader
+// parses `imports` late, after shapes are interned, so it can check existence).
+TEST(GrammarSchema, ImportsUnknownRuleReportsUnknownShape) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "include-following",
+                     "directiveRule": "ghostRule", "pathToken": "StringStart" },
+        "tokens": { "\"": [ { "kind": "StringStart" } ] },
+        "shapes": { "root": { "sequence": [ "StringStart" ] } }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// A `pathToken` that names no declared token kind is C_UnknownToken — the
+// token-side analogue of C_UnknownShape above (loader checks both interners).
+TEST(GrammarSchema, ImportsUnknownTokenReportsUnknownToken) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "include-following",
+                     "directiveRule": "includeDirective", "pathToken": "GhostToken" },
+        "tokens": { "\"": [ { "kind": "StringStart" } ] },
+        "shapes": {
+            "root": { "sequence": [ "includeDirective" ] },
+            "includeDirective": { "sequence": [ "StringStart" ] }
+        }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// A `referenceParents[i]` that names no declared shape is C_UnknownShape —
+// the per-entry analogue of the scalar-field dangling-name check.
+TEST(GrammarSchema, ImportsUnknownReferenceParentReportsUnknownShape) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "name-matching",
+                     "nameRule": "qualifiedName", "definitionRule": "createTableStmt",
+                     "referenceParents": [ "ghostParent" ], "nameToken": "Identifier" },
+        "tokens": { "x": [ { "kind": "Identifier" } ] },
+        "shapes": {
+            "root": { "sequence": [ "qualifiedName" ] },
+            "qualifiedName": { "sequence": [ "Identifier" ] },
+            "createTableStmt": { "sequence": [ "qualifiedName" ] },
+            "tableRef": { "sequence": [ "qualifiedName" ] }
+        }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// name-matching with an empty `referenceParents` array is malformed —
+// without parents there is nowhere to anchor reference recognition.
+TEST(GrammarSchema, ImportsNameMatchingEmptyReferenceParentsReportsInvalid) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "name-matching",
+                     "nameRule": "qualifiedName", "definitionRule": "createTableStmt",
+                     "referenceParents": [], "nameToken": "Identifier" },
+        "tokens": { "x": [ { "kind": "Identifier" } ] },
+        "shapes": {
+            "root": { "sequence": [ "qualifiedName" ] },
+            "qualifiedName": { "sequence": [ "Identifier" ] },
+            "createTableStmt": { "sequence": [ "qualifiedName" ] }
+        }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidImports) ||
+                hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+// `caseSensitive` is documented as an optional bool — any other JSON type is
+// a malformed block (C_InvalidImports), not silently coerced.
+TEST(GrammarSchema, ImportsCaseSensitiveWrongTypeReportsInvalid) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": { "strategy": "name-matching",
+                     "nameRule": "qualifiedName", "definitionRule": "createTableStmt",
+                     "referenceParents": [ "tableRef" ], "nameToken": "Identifier",
+                     "caseSensitive": "yes" },
+        "tokens": { "x": [ { "kind": "Identifier" } ] },
+        "shapes": {
+            "root": { "sequence": [ "qualifiedName" ] },
+            "qualifiedName": { "sequence": [ "Identifier" ] },
+            "createTableStmt": { "sequence": [ "qualifiedName" ] },
+            "tableRef": { "sequence": [ "qualifiedName" ] }
+        }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidImports));
+}
+
+// `imports` itself must be a JSON object, not a string/array/number — the
+// shape-level type guard.
+TEST(GrammarSchema, ImportsNotAnObjectReportsInvalid) {
+    auto result = GrammarSchema::loadFromText(R"JSON({
+        "dssSchemaVersion": 4,
+        "language": { "name": "X", "version": "0.1.0" },
+        "imports": "include-following",
+        "tokens": { "x": [ { "kind": "Identifier" } ] },
+        "shapes": { "root": { "sequence": [ "Identifier" ] } }
+    })JSON");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidImports));
+}
+
 // Pins the cookbook example in docs/language-config-spec.md §7 against the
 // loader. If this fails, the doc's "Loads cleanly because:" claims are wrong.
 TEST(GrammarSchema, DocsCookbookCalcExampleLoadsCleanly) {
     constexpr std::string_view kCalcCookbook = R"JSON({
-  "dssSchemaVersion": 1,
+  "dssSchemaVersion": 4,
 
   "language": {
     "name":           "Calc",
@@ -880,6 +1128,11 @@ TEST(GrammarSchema, DocsCookbookCalcExampleLoadsCleanly) {
     { "word": "let", "kind": "LetKeyword" }
   ],
 
+  "numberStyle": {
+    "decimal":  true,
+    "emitKind": { "integer": "IntLiteral" }
+  },
+
   "shapes": {
     "root":     { "sequence": [{ "repeat": "stmt" }] },
     "stmt":     { "alt":      ["letDecl", "exprStmt"] },
@@ -904,4 +1157,1746 @@ TEST(GrammarSchema, LoadShippedRejectsPathLikeNames) {
     EXPECT_FALSE(b.has_value());
     EXPECT_FALSE(c.has_value());
     EXPECT_FALSE(d.has_value());
+}
+
+// ── 08.55 cleanup: wrapperRules + numberStyle strict pins ──────────────
+
+// Missing `wrapperRules` block fails to load with C_MissingWrapperRules.
+TEST(GrammarSchema, ExprShapeWithoutWrapperRulesIsRejected) {
+    constexpr std::string_view kNoWrap = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NoWrap", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root":       { "sequence": ["expression", "Semi"] },
+        "expression": { "expr": { "atom": "operand" } },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kNoWrap);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingWrapperRules));
+}
+
+// Partial `wrapperRules` (missing one of binary/unary/postfix) is rejected.
+TEST(GrammarSchema, ExprShapeWithPartialWrapperRulesIsRejected) {
+    constexpr std::string_view kPartial = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "PartialWrap", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root":       { "sequence": ["expression", "Semi"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": { "binary": "bExpr", "unary": "uExpr" }
+          }
+        },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kPartial);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingWrapperRules));
+}
+
+// Happy-path: distinct (non-c-subset) wrapper-rule names load cleanly,
+// the parser-side schema lookup returns the right RuleIds. Genericity
+// pin: the engine has NO hardcoded `binaryExpr`/`unaryExpr`/`postfixExpr`
+// names — any names work.
+TEST(GrammarSchema, ExprShapeWithCustomWrapperRuleNamesIsAccepted) {
+    constexpr std::string_view kCustom = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "CustomWrap", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root":       { "sequence": ["expression", "Semi"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "bExpr",
+              "unary":   "uExpr",
+              "postfix": "pExpr"
+            }
+          }
+        },
+        "operand":    { "alt": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCustom);
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto& schema = **result;
+    const auto exprRule = schema.rules().find("expression");
+    ASSERT_TRUE(exprRule.valid());
+    const auto pack = schema.exprWrapperRules(exprRule);
+    EXPECT_TRUE(pack.valid());
+    EXPECT_EQ(schema.rules().name(pack.binary),  "bExpr");
+    EXPECT_EQ(schema.rules().name(pack.unary),   "uExpr");
+    EXPECT_EQ(schema.rules().name(pack.postfix), "pExpr");
+}
+
+// numberStyle absent + IntLiteral referenced in a shape is rejected.
+TEST(GrammarSchema, IntLiteralInShapeWithoutNumberStyleIsRejected) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NoNum", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingNumberStyle));
+}
+
+// Happy-path: numberStyle parsed cleanly, all fields round-trip.
+TEST(GrammarSchema, NumberStyleHappyPathRoundTrips) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "Nums", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "numberStyle": {
+        "decimal":         true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F" }
+        ],
+        "exponent":        { "letters": ["e", "E"], "signOptional": true },
+        "fractionPoint":   ".",
+        "digitSeparator":  "_",
+        "integerSuffixes": ["u", "L"],
+        "floatSuffixes":   ["f"],
+        "emitKind":        { "integer": "IntLiteral", "float": "FloatLiteral" }
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto const* ns = (*result)->numberStyle();
+    ASSERT_NE(ns, nullptr);
+    EXPECT_TRUE(ns->decimal);
+    ASSERT_EQ(ns->integerPrefixes.size(), 1u);
+    EXPECT_EQ(ns->integerPrefixes[0].prefix, "0x");
+    EXPECT_EQ(ns->integerPrefixes[0].radix,  16u);
+    ASSERT_TRUE(ns->exponent.has_value());
+    EXPECT_EQ(ns->exponent->letters.size(), 2u);
+    EXPECT_EQ(ns->exponent->letters[0], 'e');
+    EXPECT_TRUE(ns->exponent->signOptional);
+    ASSERT_TRUE(ns->fractionPoint.has_value());
+    EXPECT_EQ(*ns->fractionPoint, '.');
+    ASSERT_TRUE(ns->digitSeparator.has_value());
+    EXPECT_EQ(*ns->digitSeparator, '_');
+    EXPECT_EQ(ns->integerSuffixes.size(), 2u);
+    EXPECT_EQ(ns->floatSuffixes.size(),   1u);
+}
+
+// emitKind.integer is required.
+TEST(GrammarSchema, NumberStyleMissingEmitKindIntegerIsRejected) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NoEmit", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "numberStyle": {
+        "decimal":  true,
+        "emitKind": { "float": "FloatLiteral" }
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    // F13 (08.55 remediation): C_MissingNumberStyle is reserved for
+    // "block entirely absent". A required sub-field that is missing
+    // or empty inside an existing block uses C_MissingField.
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+// F13: out-of-range radix is now C_InvalidNumberStyle (was overloaded
+// onto C_MissingNumberStyle prior to the 08.55 remediation pass).
+TEST(GrammarSchema, NumberStyleRadixOutOfRangeReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "BadRadix", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "numberStyle": {
+        "decimal": true,
+        "integerPrefixes": [ { "prefix": "0x", "radix": 99, "digits": "0-9a-fA-F" } ],
+        "emitKind": { "integer": "IntLiteral" }
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+// F13: numberStyle that isn't an object is C_InvalidNumberStyle (the
+// block is present but malformed at the top level).
+TEST(GrammarSchema, NumberStyleNotAnObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "BadType", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "numberStyle": "wrong",
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+// F3: tsql-subset declares typeExtensions[] for parameterized types
+// (VARCHAR(N) — Integer parameter). Verify the shipped config carries
+// the registration so a future grammar-level update can wire the
+// shape parser through it.
+TEST(GrammarSchema, TsqlSubsetTypeExtensionsAreDeclared) {
+    auto r = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(r.has_value());
+    auto exts = (*r)->typeExtensions();
+    ASSERT_FALSE(exts.empty());
+    bool sawVarchar = false;
+    for (auto const& e : exts) {
+        if (e.name == "TSQL::Varchar") {
+            sawVarchar = true;
+            ASSERT_EQ(e.parameters.size(), 1u);
+            EXPECT_EQ(e.parameters[0].kind, TypeParamKind::Integer);
+        }
+    }
+    EXPECT_TRUE(sawVarchar);
+}
+
+// F5: pairwise-distinct check on wrapperRules. The walker tags
+// Pratt frames by RuleId; two rules collapsing to the same id
+// would silently miscount nesting depth.
+TEST(GrammarSchema, ExprWrapperRulesDuplicateRuleNamesRejected) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "DupWrap", "version": "0.1.0" },
+      "tokens": {
+        "+": [{ "kind": "PlusOp" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "operators": {
+        "groups": [ { "precedence": 10, "operators": ["+"] } ]
+      },
+      "shapes": {
+        "root":     { "sequence": ["expression", "Semi"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "X",
+              "unary":   "X",
+              "postfix": "Y"
+            }
+          }
+        },
+        "operand": { "sequence": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_DuplicateWrapperRules));
+}
+
+// F17: unknown wrapperRules key is C_UnknownShape (matches the
+// sibling expr-body unknown-key check), NOT C_MissingWrapperRules
+// (reserved for "field absent/empty").
+TEST(GrammarSchema, ExprWrapperRulesUnknownKeyReportsUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "UnkKey", "version": "0.1.0" },
+      "tokens": {
+        "+": [{ "kind": "PlusOp" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "operators": {
+        "groups": [ { "precedence": 10, "operators": ["+"] } ]
+      },
+      "shapes": {
+        "root":     { "sequence": ["expression", "Semi"] },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "B",
+              "unary":   "U",
+              "postfix": "P",
+              "infix":   "I"
+            }
+          }
+        },
+        "operand": { "sequence": ["Identifier"] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// F15: built-in token kinds are exactly the eight universal
+// categories. Paradigm-specific kinds (CharLiteral, BoolLiteral,
+// NullLiteral) are NOT pre-interned and must be declared by the
+// language.
+TEST(GrammarSchema, BuiltinTokenKindsAreExactlyUniversal) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "Empty", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": ["Semi"] } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value());
+    auto const& tokens = (*r)->schemaTokens();
+    EXPECT_TRUE(tokens.contains("Identifier"));
+    EXPECT_TRUE(tokens.contains("IntLiteral"));
+    EXPECT_TRUE(tokens.contains("FloatLiteral"));
+    EXPECT_TRUE(tokens.contains("StringLiteral"));
+    EXPECT_TRUE(tokens.contains("Eof"));
+    EXPECT_TRUE(tokens.contains("Error"));
+    EXPECT_TRUE(tokens.contains("Whitespace"));
+    EXPECT_TRUE(tokens.contains("Newline"));
+    EXPECT_FALSE(tokens.contains("CharLiteral"));
+    EXPECT_FALSE(tokens.contains("BoolLiteral"));
+    EXPECT_FALSE(tokens.contains("NullLiteral"));
+}
+
+// F15: a config that references a demoted built-in without
+// declaring it must emit C_UnknownToken.
+TEST(GrammarSchema, DemotedBuiltinReferencedWithoutDeclarationReportsCode) {
+    for (auto const* name : {"BoolLiteral", "CharLiteral", "NullLiteral"}) {
+        const std::string kCfg = std::format(R"JSON({{
+          "dssSchemaVersion": 4,
+          "language": {{ "name": "Demoted", "version": "0.1.0" }},
+          "tokens": {{ ";": [{{ "kind": "Semi" }}] }},
+          "shapes": {{ "root": {{ "sequence": ["{}", "Semi"] }} }}
+        }})JSON", name);
+        auto r = GrammarSchema::loadFromText(kCfg);
+        ASSERT_FALSE(r.has_value()) << "unexpected success for " << name;
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape)
+                    || hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken))
+            << "no diagnostic flagging the demoted built-in '" << name << "'";
+    }
+}
+
+// F15: a config that DECLARES `BoolLiteral` via keywords loads
+// cleanly. The demotion is value-neutral — the kind is just no
+// longer auto-interned at schema-build time.
+TEST(GrammarSchema, DemotedBuiltinDeclaredExplicitlyLoadsCleanly) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "WithBool", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "keywords": [
+        { "word": "true",  "kind": "BoolLiteral" },
+        { "word": "false", "kind": "BoolLiteral" }
+      ],
+      "shapes": { "root": { "sequence": ["BoolLiteral", "Semi"] } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_TRUE((*r)->schemaTokens().contains("BoolLiteral"));
+}
+
+// ── semantics block (schema v4; plan 08.6) ───────────────────────────────
+
+// Happy-path: a complete `semantics` block round-trips, exposing
+// declarations / references / scopes / builtinTypes / typeShapes /
+// literalTypes via SemanticConfig.
+TEST(GrammarSchema, SemanticsBlockHappyPathRoundTrips) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "=": [{ "kind": "Eq" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "keywords": [ { "word": "let", "kind": "LetKw" } ],
+      "shapes": {
+        "root":  { "sequence": [ { "repeat": "stmt" } ] },
+        "stmt":  { "alt": [ "decl", "use" ] },
+        "decl":  { "sequence": [ "LetKw", "Identifier", "Eq", "use", "Semi" ] },
+        "use":   { "sequence": [ "Identifier" ] },
+        "block": { "sequence": [ "stmt" ] }
+      },
+      "semantics": {
+        "declarations": [
+          { "rule": "decl", "name": 1, "init": 3, "kind": "variable" }
+        ],
+        "references": [
+          { "rule": "use" }
+        ],
+        "scopes": [ "block" ],
+        "builtinTypes": [
+          { "name": "int",  "core": "I32"  },
+          { "name": "bool", "core": "Bool" }
+        ],
+        "literalTypes": []
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& sem = (*r)->semantics();
+    ASSERT_EQ(sem.declarations.size(), 1u);
+    EXPECT_EQ(sem.declarations[0].ruleName, "decl");
+    EXPECT_EQ(sem.declarations[0].nameChild, 1);
+    EXPECT_EQ(sem.declarations[0].initChild, 3);
+    EXPECT_EQ(sem.declarations[0].kind, DeclarationKind::Variable);
+    ASSERT_EQ(sem.references.size(), 1u);
+    EXPECT_EQ(sem.references[0].ruleName, "use");
+    ASSERT_EQ(sem.scopes.size(), 1u);
+    EXPECT_EQ(sem.scopes[0].ruleName, "block");
+    ASSERT_EQ(sem.builtinTypes.size(), 2u);
+    EXPECT_EQ(sem.builtinTypes[0].name, "int");
+    EXPECT_EQ(sem.builtinTypes[0].core, TypeKind::I32);
+    EXPECT_EQ(sem.builtinTypes[1].core, TypeKind::Bool);
+}
+
+// Absent `semantics` block is fine — analyzer just doesn't analyze.
+TEST(GrammarSchema, SemanticsAbsentLoadsCleanly) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value());
+    auto const& sem = (*r)->semantics();
+    EXPECT_TRUE(sem.declarations.empty());
+    EXPECT_TRUE(sem.references.empty());
+    EXPECT_TRUE(sem.scopes.empty());
+    EXPECT_TRUE(sem.builtinTypes.empty());
+}
+
+// `semantics` itself must be an object — array/string is malformed.
+TEST(GrammarSchema, SemanticsNotAnObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": [1, 2, 3]
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// Missing required `rule` field on a declaration entry → C_MissingField.
+TEST(GrammarSchema, SemanticsDeclarationMissingRuleField) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "name": 0 } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// A declaration whose `rule` names no declared shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsDeclarationUnknownRuleShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "ghostDecl", "name": 0 } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// Unknown declaration `kind` string → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsUnknownDeclKindReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "telepathic" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `literalTypes[i].literal` that names no declared token → C_UnknownToken.
+TEST(GrammarSchema, SemanticsLiteralUnknownTokenReportsUnknownToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "literalTypes": [ { "literal": "GhostLit", "core": "I32" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// An unknown `core` TypeKind string → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsUnknownCoreKindReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "builtinTypes": [ { "name": "weird", "core": "NotAKind" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// Unknown typeShape `constructor` string → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsUnknownTypeConstructorReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "typeShapes": [ { "rule": "root", "constructor": "magic" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `scopes[i]` referencing an unknown shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsScopesUnknownRuleReportsUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "scopes": [ "ghostScope" ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// `identifierToken` round-trips: a valid token name resolves to a
+// SchemaTokenId exposed on the SemanticConfig.
+TEST(GrammarSchema, SemanticsIdentifierTokenRoundTrips) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Identifier", "Semi" ] } },
+      "semantics": { "identifierToken": "Identifier" }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& sem = (*r)->semantics();
+    EXPECT_TRUE(sem.identifierToken.valid());
+    EXPECT_EQ(sem.identifierToken.v,
+              (*r)->schemaTokens().find("Identifier").v);
+}
+
+// An `identifierToken` naming a token kind that doesn't exist →
+// C_UnknownToken.
+TEST(GrammarSchema, SemanticsIdentifierTokenUnknownReportsUnknownToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "identifierToken": "GhostToken" }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// A `nameMatch: "lastIdentifier"` rule WITHOUT an `identifierToken` is a
+// config gap → C_MissingField (the engine has no token kind to scan for).
+TEST(GrammarSchema, SemanticsLastIdentifierWithoutIdentifierTokenReportsMissing) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "Identifier", "Semi" ] },
+        "qname": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "references": [ { "rule": "qname", "nameMatch": "lastIdentifier" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// Unknown `nameMatch` mode string → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsUnknownNameMatchReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "references": [ { "rule": "root", "nameMatch": "telepathy" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── SE4-SE6 facet negative tests ─────────────────────────────────────────
+// Each one mirrors the SE1-SE3 facet-test style: tight scenario, one
+// diagnostic-code assertion, JSON-pointer path implicit in the surface.
+
+// `assignments`: not-an-array → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsAssignmentsNotArrayReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": { "rule": "root" } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `assignments[0]` not an object → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsAssignmentsEntryNotObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [ "root" ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `assignments[0].rule` missing → C_MissingField.
+TEST(GrammarSchema, SemanticsAssignmentsMissingRule) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [ { "lhs": 0, "rhs": 1 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// `assignments[0].rule` references unknown shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsAssignmentsUnknownRule) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [
+        { "rule": "ghostRule", "lhs": 0, "rhs": 1 }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// `assignments[0].lhs` missing → C_MissingField.
+TEST(GrammarSchema, SemanticsAssignmentsMissingLhs) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [ { "rule": "root", "rhs": 1 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// An ungated `assignments` entry (no operatorToken) sharing a rule with
+// another entry → C_ConflictingField. An ungated entry matches every node of
+// its rule, so it must be the sole entry for that rule (else it would shadow
+// the gated entries under the engine's first-match-wins loop).
+TEST(GrammarSchema, SemanticsAssignmentsUngatedMixedWithGatedConflicts) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }], "=": [{ "kind": "Assign" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [
+        { "rule": "root", "lhs": 0, "rhs": 1 },
+        { "rule": "root", "operatorToken": "Assign", "lhs": 0, "rhs": 1 }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_ConflictingField));
+}
+
+// Two GATED entries on the same rule (distinct operatorTokens) is fine —
+// only the ungated-mixed case conflicts.
+TEST(GrammarSchema, SemanticsAssignmentsTwoGatedSameRuleLoadsCleanly) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        ";":  [{ "kind": "Semi" }],
+        "=":  [{ "kind": "Assign" }],
+        "+=": [{ "kind": "PlusAssign" }]
+      },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [
+        { "rule": "root", "operatorToken": "Assign",     "lhs": 0, "rhs": 1 },
+        { "rule": "root", "operatorToken": "PlusAssign", "lhs": 0, "rhs": 1 }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value());
+}
+
+// `assignments[0].rhs` non-integer → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsAssignmentsRhsNotInteger) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [
+        { "rule": "root", "lhs": 0, "rhs": "two" }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `assignments[0].lhs` negative → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsAssignmentsLhsNegative) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [
+        { "rule": "root", "lhs": -1, "rhs": 0 }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `assignments[0].operatorToken` unknown → C_UnknownToken.
+TEST(GrammarSchema, SemanticsAssignmentsUnknownOperatorToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "assignments": [
+        { "rule": "root", "lhs": 0, "rhs": 0, "operatorToken": "GhostOp" }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// ── callRules ─────────────────────────────────────────────────────────────
+
+TEST(GrammarSchema, SemanticsCallRulesNotArrayReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": { "rule": "root" } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsCallRulesMissingRule) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": [ { "callee": 0, "args": 1 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, SemanticsCallRulesUnknownRule) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": [
+        { "rule": "ghostCall", "callee": 0, "args": 1 }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+TEST(GrammarSchema, SemanticsCallRulesMissingCallee) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": [ { "rule": "root", "args": 1 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, SemanticsCallRulesMissingArgs) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": [ { "rule": "root", "callee": 0 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// `callRules[0].callee` non-integer → C_InvalidSemantics. Mirrors
+// SemanticsAssignmentsRhsNotInteger for the call-rule facet so the
+// readReqIndex validation path is pinned on BOTH semantics blocks.
+TEST(GrammarSchema, SemanticsCallRulesCalleeNotInteger) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": [
+        { "rule": "root", "callee": "zero", "args": 1 }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `callRules[0].args` negative → C_InvalidSemantics. Mirrors
+// SemanticsAssignmentsLhsNegative — the same range check has to gate
+// every facet that reads a visible-child index.
+TEST(GrammarSchema, SemanticsCallRulesArgsNegative) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": [
+        { "rule": "root", "callee": 0, "args": -1 }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `callRules[0].operatorToken` unknown → C_UnknownToken. Mirrors
+// SemanticsAssignmentsUnknownOperatorToken — the optional operator-gate
+// token must be a declared token kind for BOTH facets.
+TEST(GrammarSchema, SemanticsCallRulesUnknownOperatorToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": [
+        { "rule": "root", "callee": 0, "args": 0, "operatorToken": "GhostOp" }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// ── builtinFunctions ──────────────────────────────────────────────────────
+
+TEST(GrammarSchema, SemanticsBuiltinFunctionsMissingName) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "builtinFunctions": [ { "result": "I32" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, SemanticsBuiltinFunctionsMissingResult) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "builtinFunctions": [ { "name": "FOO" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, SemanticsBuiltinFunctionsUnknownResultCore) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "builtinFunctions": [
+        { "name": "FOO", "result": "NotAKind" }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsBuiltinFunctionsParamsNotArray) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "builtinFunctions": [
+        { "name": "FOO", "result": "I32", "params": "I32" }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsBuiltinFunctionsParamEntryNotString) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "builtinFunctions": [
+        { "name": "FOO", "result": "I32", "params": [ 42 ] }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsBuiltinFunctionsParamUnknownCore) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "builtinFunctions": [
+        { "name": "FOO", "result": "I32", "params": [ "NotAKind" ] }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsBuiltinFunctionsVariadicNotBool) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "builtinFunctions": [
+        { "name": "FOO", "result": "I32", "variadic": "yes" }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── constMarker (on a declaration entry) ─────────────────────────────────
+
+TEST(GrammarSchema, SemanticsConstMarkerUnknownTokenReportsUnknownToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "constMarker": "GhostConst" }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+}
+
+TEST(GrammarSchema, SemanticsConstMarkerNotStringReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "constMarker": 42 }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── kindByChild ───────────────────────────────────────────────────────────
+
+TEST(GrammarSchema, SemanticsKindByChildMissingChild) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "kindByChild": { "whenRule": "root" } }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, SemanticsKindByChildMissingWhenRule) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "kindByChild": { "child": 0 } }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+TEST(GrammarSchema, SemanticsKindByChildUnknownWhenRule) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "kindByChild": { "child": 0, "whenRule": "ghostRule" } }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+TEST(GrammarSchema, SemanticsKindByChildUnknownWhenKind) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "kindByChild": { "child": 0, "whenRule": "root",
+                            "whenKind": "telepathic" } }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsKindByChildParamsPathNotArray) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "kindByChild": { "child": 0, "whenRule": "root",
+                            "paramsPath": 1 } }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsKindByChildBodyPathEntryNotInteger) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "kindByChild": { "child": 0, "whenRule": "root",
+                            "bodyPath": [ "one" ] } }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsKindByChildBothChildAndChildPathConflicts) {
+    // Specifying both `child` and `childPath` is a config bug → conflict.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable",
+          "kindByChild": { "child": 0, "childPath": [0],
+                            "whenRule": "root" } }
+      ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_ConflictingField));
+}
+
+// Happy-path round-trip: a schema declaring all SE4-SE6 facets loads
+// and the SemanticConfig accessors return correctly-populated values.
+// Mirrors `SemanticsBlockHappyPathRoundTrips` but for the new facets.
+TEST(GrammarSchema, SemanticsSE4SE6FacetsHappyPathRoundTrips) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "=": [{ "kind": "Eq" }],
+        "(": [{ "kind": "LParen", "opensScope": "Paren" }],
+        ")": [{ "kind": "RParen", "closesScope": true }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "keywords": [
+        { "word": "lock", "kind": "Lock" }
+      ],
+      "shapes": {
+        "root": { "sequence": [ { "repeat": "decl" } ] },
+        "decl": { "sequence": [ "Identifier", "tail" ] },
+        "tail": { "alt": [ "fnTail", "varTail" ] },
+        "fnTail": { "sequence": [ "LParen", "RParen" ] },
+        "varTail": { "sequence": [ "Semi" ] },
+        "assign": { "sequence": [ "Identifier", "Eq", "Identifier", "Semi" ] },
+        "call":   { "sequence": [ "Identifier", "LParen", "RParen" ] }
+      },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "declarations": [
+          { "rule": "decl", "name": 0, "kind": "variable",
+            "constMarker": "Lock",
+            "kindByChild": {
+              "childPath": [1, 0],
+              "whenRule": "fnTail",
+              "whenKind": "function",
+              "paramsPath": [],
+              "bodyPath":   []
+            } }
+        ],
+        "assignments": [
+          { "rule": "assign", "operatorToken": "Eq", "lhs": 0, "rhs": 2 }
+        ],
+        "callRules": [
+          { "rule": "call", "callee": 0, "args": 1, "operatorToken": "LParen" }
+        ],
+        "builtinFunctions": [
+          { "name": "SUM", "params": [ "I32", "I32" ], "result": "I32" },
+          { "name": "ANY", "result": "I32", "variadic": true }
+        ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& sem = (*r)->semantics();
+    ASSERT_EQ(sem.declarations.size(), 1u);
+    EXPECT_EQ(sem.declarations[0].ruleName, "decl");
+    ASSERT_TRUE(sem.declarations[0].constMarker.has_value());
+    ASSERT_TRUE(sem.declarations[0].kindByChild.has_value());
+    auto const& disc = *sem.declarations[0].kindByChild;
+    ASSERT_EQ(disc.childPath.size(), 2u);
+    EXPECT_EQ(disc.childPath[0], 1u);
+    EXPECT_EQ(disc.childPath[1], 0u);
+    EXPECT_EQ(disc.whenRuleName, "fnTail");
+    EXPECT_EQ(disc.whenKind, DeclarationKind::Function);
+    ASSERT_EQ(sem.assignments.size(), 1u);
+    EXPECT_EQ(sem.assignments[0].ruleName, "assign");
+    EXPECT_EQ(sem.assignments[0].lhsChild, 0u);
+    EXPECT_EQ(sem.assignments[0].rhsChild, 2u);
+    ASSERT_TRUE(sem.assignments[0].operatorToken.has_value());
+    ASSERT_EQ(sem.callRules.size(), 1u);
+    EXPECT_EQ(sem.callRules[0].ruleName, "call");
+    EXPECT_EQ(sem.callRules[0].calleeChild, 0u);
+    EXPECT_EQ(sem.callRules[0].argsChild, 1u);
+    ASSERT_TRUE(sem.callRules[0].operatorToken.has_value());
+    ASSERT_EQ(sem.builtinFunctions.size(), 2u);
+    EXPECT_EQ(sem.builtinFunctions[0].name, "SUM");
+    EXPECT_EQ(sem.builtinFunctions[0].paramCores.size(), 2u);
+    EXPECT_EQ(sem.builtinFunctions[0].resultCore, TypeKind::I32);
+    EXPECT_FALSE(sem.builtinFunctions[0].variadic);
+    EXPECT_EQ(sem.builtinFunctions[1].name, "ANY");
+    EXPECT_TRUE(sem.builtinFunctions[1].variadic);
+}
+
+// ── GAP A/C/D facet negative + happy-path tests ───────────────────────────
+
+// `returnRules`: not-an-array → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsReturnRulesNotArrayReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": { "rule": "root" } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `returnRules[i].rule` naming no declared shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsReturnRulesUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": [ { "rule": "ghostRet" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// `returnRules[i].value` of the wrong type → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsReturnRulesValueNotInteger) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": [ { "rule": "root", "value": "x" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `loopRules[i]` naming no declared shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsLoopRulesUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopRules": [ "ghostLoop" ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// `loopControls[i].rule` naming no declared shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsLoopControlsUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopControls": [ { "rule": "ghostBreak" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// `loopControls[i].rule` missing → C_MissingField.
+TEST(GrammarSchema, SemanticsLoopControlsMissingRule) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopControls": [ { } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// FIX 7: `returnRules[i]` missing `rule` → C_MissingField (the loader's
+// required-field branch). Entry is an object but has no `rule` key.
+TEST(GrammarSchema, SemanticsReturnRulesMissingRuleReportsMissingField) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": [ { "value": 0 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// FIX 7: `returnRules[i].value` out of the int32 range → C_InvalidSemantics
+// (the loader's range branch; distinct from the wrong-TYPE branch tested by
+// SemanticsReturnRulesValueNotInteger). 9999999999 > INT32_MAX.
+TEST(GrammarSchema, SemanticsReturnRulesValueOutOfRangeReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": [ { "rule": "root", "value": 9999999999 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// FIX 7: a `loopRules` entry that is not a string → C_InvalidSemantics (the
+// per-entry type guard; distinct from the not-an-ARRAY guard which is the
+// scalar-shaped block). The array is present but an entry is an object.
+TEST(GrammarSchema, SemanticsLoopRulesEntryNotStringReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopRules": [ { "rule": "root" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// FIX 7: a `loopControls` entry that is not an object → C_InvalidSemantics
+// (the per-entry object guard; distinct from the not-an-ARRAY guard). The
+// array is present but an entry is a bare string.
+TEST(GrammarSchema, SemanticsLoopControlsEntryNotObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopControls": [ "root" ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// FIX 7: a `loopControls` that is not an array → C_InvalidSemantics (the
+// block-level type guard, the array analogue of the per-entry guards above).
+TEST(GrammarSchema, SemanticsLoopControlsNotArrayReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopControls": { "rule": "root" } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `bracketIdentifierToken` naming no declared token → C_UnknownToken.
+TEST(GrammarSchema, SemanticsBracketIdentifierTokenUnknownReportsUnknownToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "bracketIdentifierToken": "GhostBracket" }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// `bracketIdentifierToken` of the wrong JSON type → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsBracketIdentifierTokenNotStringReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "bracketIdentifierToken": 7 }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// Happy-path: returnRules / loopRules / loopControls / bracketIdentifierToken
+// round-trip onto SemanticConfig with the expected shapes.
+TEST(GrammarSchema, SemanticsGapAcdFacetsHappyPathRoundTrips) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        ";": [{ "kind": "Semi" }],
+        "[": [{ "kind": "Brk" }]
+      },
+      "keywords": [
+        { "word": "ret",  "kind": "RetKw"  },
+        { "word": "spin", "kind": "SpinKw" },
+        { "word": "halt", "kind": "HaltKw" }
+      ],
+      "shapes": {
+        "root":     { "sequence": [ { "repeat": "stmt" } ] },
+        "stmt":     { "alt": [ "retStmt", "spinStmt", "haltStmt" ] },
+        "retStmt":  { "sequence": [ "RetKw", { "optional": "Identifier" }, "Semi" ] },
+        "spinStmt": { "sequence": [ "SpinKw", "Semi" ] },
+        "haltStmt": { "sequence": [ "HaltKw", "Semi" ] }
+      },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "bracketIdentifierToken": "Brk",
+        "returnRules":  [ { "rule": "retStmt", "value": 1 }, { "rule": "haltStmt" } ],
+        "loopRules":    [ "spinStmt" ],
+        "loopControls": [ { "rule": "haltStmt" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& sem = (*r)->semantics();
+    ASSERT_EQ(sem.returnRules.size(), 2u);
+    EXPECT_EQ(sem.returnRules[0].ruleName, "retStmt");
+    ASSERT_TRUE(sem.returnRules[0].valueChild.has_value());
+    EXPECT_EQ(*sem.returnRules[0].valueChild, 1u);
+    EXPECT_EQ(sem.returnRules[1].ruleName, "haltStmt");
+    EXPECT_FALSE(sem.returnRules[1].valueChild.has_value()) << "absent value ⇒ bare-return shape";
+    ASSERT_EQ(sem.loopRules.size(), 1u);
+    EXPECT_EQ(sem.loopRules[0].ruleName, "spinStmt");
+    ASSERT_EQ(sem.loopControls.size(), 1u);
+    EXPECT_EQ(sem.loopControls[0].ruleName, "haltStmt");
+    ASSERT_TRUE(sem.bracketIdentifierToken.has_value());
+    EXPECT_TRUE(sem.bracketIdentifierToken->valid());
+    EXPECT_EQ(sem.bracketIdentifierToken->v, (*r)->schemaTokens().find("Brk").v);
+}
+
+// ─── artifactProfiles (plan 06 AP1) ───────────────────────────────────────
+
+namespace {
+[[nodiscard]] std::size_t countConfigCode(
+    std::vector<ConfigDiagnostic> const& diags, DiagnosticCode code) {
+    return static_cast<std::size_t>(
+        std::ranges::count_if(diags, [code](ConfigDiagnostic const& d) {
+            return d.code == code;
+        }));
+}
+} // namespace
+
+// ── builtinTypes extension form + warnIfUnused (D3 / D8) ───────────────────
+// A `builtinTypes` entry may carry `extension: "Name"` (mutually exclusive
+// with `core`) mapping a type name to a registered `typeExtensions[]` entry.
+
+// Happy path: an `extension`-form mapping naming a declared typeExtension
+// loads cleanly (no diagnostics) and round-trips the resolved name.
+TEST(GrammarSchema, BuiltinTypeExtensionFormLoadsCleanly) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "typeExtensions": [ { "name": "Ext::Foo" } ],
+      "semantics": {
+        "builtinTypes": [ { "name": "MyT", "extension": "Ext::Foo" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& sem = (*r)->semantics();
+    ASSERT_EQ(sem.builtinTypes.size(), 1u);
+    EXPECT_EQ(sem.builtinTypes[0].name, "MyT");
+    ASSERT_TRUE(sem.builtinTypes[0].extension.has_value());
+    EXPECT_EQ(*sem.builtinTypes[0].extension, "Ext::Foo");
+}
+
+// Both `core` AND `extension` on one entry → exactly one C_ConflictingField.
+TEST(GrammarSchema, BuiltinTypeCoreAndExtensionReportsConflict) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "typeExtensions": [ { "name": "Ext::Foo" } ],
+      "semantics": {
+        "builtinTypes": [ { "name": "MyT", "core": "I32", "extension": "Ext::Foo" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countConfigCode(r.error(), DiagnosticCode::C_ConflictingField), 1u);
+}
+
+// Neither `core` NOR `extension` → exactly one C_MissingField.
+TEST(GrammarSchema, BuiltinTypeNeitherCoreNorExtensionReportsMissing) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "builtinTypes": [ { "name": "MyT" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countConfigCode(r.error(), DiagnosticCode::C_MissingField), 1u);
+}
+
+// `extension` value not a string → exactly one C_InvalidSemantics.
+TEST(GrammarSchema, BuiltinTypeExtensionNonStringReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "typeExtensions": [ { "name": "Ext::Foo" } ],
+      "semantics": {
+        "builtinTypes": [ { "name": "MyT", "extension": 42 } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countConfigCode(r.error(), DiagnosticCode::C_InvalidSemantics), 1u);
+}
+
+// `extension` naming an extension NOT declared in `typeExtensions[]` →
+// exactly one C_UnknownTypeExtension.
+TEST(GrammarSchema, BuiltinTypeExtensionUndeclaredReportsUnknown) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "typeExtensions": [ { "name": "Ext::Foo" } ],
+      "semantics": {
+        "builtinTypes": [ { "name": "MyT", "extension": "Ext::Ghost" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countConfigCode(r.error(), DiagnosticCode::C_UnknownTypeExtension), 1u);
+}
+
+// A non-boolean `warnIfUnused` on a declaration entry → exactly one
+// C_InvalidSemantics.
+TEST(GrammarSchema, DeclarationWarnIfUnusedNonBooleanReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Identifier", "Semi" ] } },
+      "semantics": {
+        "declarations": [
+          { "rule": "root", "name": 0, "kind": "variable", "warnIfUnused": "yes" }
+        ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countConfigCode(r.error(), DiagnosticCode::C_InvalidSemantics), 1u);
+}
+
+// A config declaring valid profiles loads cleanly and `artifactProfiles()`
+// returns the exact declared vector, in order.
+TEST(GrammarSchema, ArtifactProfilesValidLoadsAndReturnsExactVector) {
+    constexpr std::string_view cfg = R"({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "artifactProfiles": ["cli", "lib", "staticlib"],
+      "shapes": { "root": { "sequence": ["Identifier"] } }
+    })";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto profiles = (*result)->artifactProfiles();
+    ASSERT_EQ(profiles.size(), 3u);
+    EXPECT_EQ(profiles[0], "cli");
+    EXPECT_EQ(profiles[1], "lib");
+    EXPECT_EQ(profiles[2], "staticlib");
+}
+
+// An unknown profile name emits exactly one C_UnknownArtifactProfile.
+TEST(GrammarSchema, ArtifactProfilesUnknownNameReportsCode) {
+    constexpr std::string_view bad = R"({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "artifactProfiles": ["cli", "wat"],
+      "shapes": { "root": { "sequence": ["Identifier"] } }
+    })";
+    auto result = GrammarSchema::loadFromText(bad);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(countConfigCode(result.error(),
+                              DiagnosticCode::C_UnknownArtifactProfile), 1u);
+}
+
+// Absent field → `artifactProfiles()` is empty AND the load is clean (no
+// spurious diagnostic for the missing optional block).
+TEST(GrammarSchema, ArtifactProfilesAbsentIsEmptyAndClean) {
+    constexpr std::string_view cfg = R"({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "shapes": { "root": { "sequence": ["Identifier"] } }
+    })";
+    auto result = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(result.has_value())
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    EXPECT_TRUE((*result)->artifactProfiles().empty());
+}
+
+// A non-array value emits exactly one C_UnknownArtifactProfile.
+TEST(GrammarSchema, ArtifactProfilesNonArrayReportsCode) {
+    constexpr std::string_view bad = R"({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "artifactProfiles": "cli",
+      "shapes": { "root": { "sequence": ["Identifier"] } }
+    })";
+    auto result = GrammarSchema::loadFromText(bad);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(countConfigCode(result.error(),
+                              DiagnosticCode::C_UnknownArtifactProfile), 1u);
+}
+
+// A non-string entry emits exactly one C_UnknownArtifactProfile.
+TEST(GrammarSchema, ArtifactProfilesNonStringEntryReportsCode) {
+    constexpr std::string_view bad = R"({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "artifactProfiles": ["cli", 42],
+      "shapes": { "root": { "sequence": ["Identifier"] } }
+    })";
+    auto result = GrammarSchema::loadFromText(bad);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(countConfigCode(result.error(),
+                              DiagnosticCode::C_UnknownArtifactProfile), 1u);
+}
+
+// A profile name listed twice emits exactly one C_ConflictingField (matching
+// the typeExtensions duplicate-name precedent) and the load hard-fails.
+TEST(GrammarSchema, ArtifactProfilesDuplicateNameReportsConflict) {
+    constexpr std::string_view bad = R"({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "artifactProfiles": ["cli", "cli"],
+      "shapes": { "root": { "sequence": ["Identifier"] } }
+    })";
+    auto result = GrammarSchema::loadFromText(bad);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(countConfigCode(result.error(),
+                              DiagnosticCode::C_ConflictingField), 1u);
+}
+
+// The shipped configs declare their per-language profile sets (plan 06 §4).
+TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
+    auto toy = GrammarSchema::loadShipped("toy");
+    if (!toy.has_value()) {
+        FAIL() << "loadShipped toy failed: " << toy.error()[0].message
+               << " (cwd=" << std::filesystem::current_path().string() << ")";
+    }
+    {
+        auto p = (*toy)->artifactProfiles();
+        ASSERT_EQ(p.size(), 1u);
+        EXPECT_EQ(p[0], "cli");
+    }
+
+    auto c = GrammarSchema::loadShipped("c-subset");
+    if (!c.has_value()) {
+        FAIL() << "loadShipped c-subset failed: " << c.error()[0].message;
+    }
+    {
+        auto p = (*c)->artifactProfiles();
+        ASSERT_EQ(p.size(), 3u);
+        EXPECT_EQ(p[0], "cli");
+        EXPECT_EQ(p[1], "lib");
+        EXPECT_EQ(p[2], "staticlib");
+    }
+
+    auto t = GrammarSchema::loadShipped("tsql-subset");
+    if (!t.has_value()) {
+        FAIL() << "loadShipped tsql-subset failed: " << t.error()[0].message;
+    }
+    {
+        auto p = (*t)->artifactProfiles();
+        ASSERT_EQ(p.size(), 2u);
+        EXPECT_EQ(p[0], "script");
+        EXPECT_EQ(p[1], "sproc");
+    }
 }

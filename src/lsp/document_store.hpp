@@ -1,5 +1,6 @@
 #pragma once
 
+#include "analysis/semantic/semantic_model.hpp"
 #include "core/export.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -78,6 +79,23 @@ public:
     [[nodiscard]] std::vector<dss::ParseDiagnostic>
         diagnosticsFor(std::string const& uri) const;
 
+    // Store the SemanticModel produced by a parse that started at
+    // `expectedGen`. Dropped (returns false) on a generation mismatch —
+    // mirrors setDiagnostics' stale-suppression. SemanticModel is
+    // move-only, so it is handed in as a shared_ptr<const> the store keeps
+    // and hands back lock-free to query handlers.
+    [[nodiscard]] bool setSemanticModel(
+        std::string const& uri,
+        std::uint32_t expectedGen,
+        std::shared_ptr<dss::SemanticModel const> model);
+
+    // Snapshot the current SemanticModel for a URI (under the mutex). The
+    // returned shared_ptr lets the handler read the model lock-free for as
+    // long as it holds the pointer, even if a newer parse swaps in a
+    // replacement. Null if none stored.
+    [[nodiscard]] std::shared_ptr<dss::SemanticModel const>
+        semanticModelFor(std::string const& uri) const;
+
 private:
     struct Entry {
         std::int32_t                                clientVersion = 0;
@@ -85,6 +103,8 @@ private:
         std::string                                 text;
         std::shared_ptr<dss::GrammarSchema const>   schema;
         std::vector<dss::ParseDiagnostic>           diagnostics;
+        std::shared_ptr<dss::SemanticModel const>   semanticModel;
+        std::uint32_t                               semanticGeneration = 0;
     };
 
     mutable std::mutex                                  mutex_;

@@ -354,6 +354,14 @@ std::span<TypeExtensionDescriptor const> GrammarSchema::typeExtensions() const n
     return d_.typeExtensions;
 }
 
+std::span<std::string const> GrammarSchema::artifactProfiles() const noexcept {
+    return d_.artifactProfiles;
+}
+
+ImportConfig const& GrammarSchema::imports() const noexcept {
+    return d_.imports;
+}
+
 bool GrammarSchema::isNullable(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return false;
@@ -376,6 +384,20 @@ std::int32_t GrammarSchema::exprMinPrecedence(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return 0;
     return it->second.exprMinPrecedence;
+}
+
+ExprWrapperRules GrammarSchema::exprWrapperRules(RuleId rule) const noexcept {
+    auto it = d_.exprWrapperRules.find(rule.v);
+    if (it == d_.exprWrapperRules.end()) return ExprWrapperRules{};
+    return it->second;
+}
+
+NumberStyle const* GrammarSchema::numberStyle() const noexcept {
+    return d_.numberStyle.has_value() ? &(*d_.numberStyle) : nullptr;
+}
+
+SemanticConfig const& GrammarSchema::semantics() const noexcept {
+    return d_.semantics;
 }
 
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,

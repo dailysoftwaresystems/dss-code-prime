@@ -9,7 +9,6 @@
 #include "core/types/token.hpp"
 #include "core/types/tree_builder.hpp"
 #include "core/types/tree_node.hpp"
-#include "core/types/well_known_names.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -137,8 +136,9 @@ struct Parser::Impl {
     // without going through builder-internal state. Notably, this
     // lets `panicRecover` find the nearest compiled-body ancestor's
     // FOLLOW set when the immediate `currentRule()` is an auto-
-    // interned Pratt wrapper (`binaryExpr`/`unaryExpr`/`postfixExpr`,
-    // none of which have compiled bodies).
+    // interned Pratt wrapper (per the active schema's
+    // `expr.wrapperRules.{binary,unary,postfix}` — names are
+    // config-sourced, none of these wrapper rules have compiled bodies).
     std::vector<RuleId>                 frameRules;
 
     // Parser-side walker. The builder embeds its own; the two are
@@ -291,11 +291,11 @@ struct Parser::Impl {
     // Lookup helper: returns true when `kind` is in the FOLLOW set
     // of the nearest enclosing rule that has a non-empty followSet.
     // Walking frames lets recovery succeed inside Pratt wrappers
-    // (`binaryExpr`/`unaryExpr`/`postfixExpr` — auto-interned, no
-    // compiled body, empty followSet) by consulting the surrounding
-    // compiled rule. Stops at the first non-empty followSet rather
-    // than unioning all ancestors — the innermost compiled context
-    // is the precise resync horizon.
+    // (the schema's `expr.wrapperRules.{binary,unary,postfix}` rules
+    // — auto-interned per config, no compiled body, empty followSet)
+    // by consulting the surrounding compiled rule. Stops at the
+    // first non-empty followSet rather than unioning all ancestors —
+    // the innermost compiled context is the precise resync horizon.
     [[nodiscard]] bool followContains(SchemaTokenId kind) const noexcept {
         for (auto it = frameRules.rbegin(); it != frameRules.rend(); ++it) {
             const auto follow = schema->followSetOf(*it);
@@ -620,7 +620,8 @@ struct Parser::Impl {
 
     // Four-machine snapshot used by `DefaultPrattWalker` to roll back
     // a tentatively-built primary so it can be rebuilt inside a wrap
-    // (binaryExpr / postfixExpr). Distinct from `SpeculationProbe` —
+    // (the schema's `expr.wrapperRules.binary` / `.postfix` rules).
+    // Distinct from `SpeculationProbe` —
     // the walker's rollback is always intentional (no commit-vs-fail
     // discipline) and the budget / watchdog re-baseline aren't
     // applicable. Token bookmark + builder checkpoint + schema-walker
@@ -901,8 +902,9 @@ struct Parser::Impl {
                 // `expr`-shape rules hand off to the Pratt walker
                 // instead of the schema-driven RuleLeaf descent. The
                 // walker opens its own `exprRule` frame plus any
-                // wrapper frames (binaryExpr / unaryExpr /
-                // postfixExpr); on return the frame stack is balanced
+                // wrapper frames (the three rules declared in
+                // `expr.wrapperRules.{binary,unary,postfix}` — names
+                // are config-sourced); on return the frame stack is balanced
                 // with entry. The walker is responsible for advancing
                 // tokens — the watchdog's next iteration will observe
                 // the post-walker (cursor, tokPos, depth) tuple and
@@ -1168,11 +1170,12 @@ ParseResult Parser::parse() && {
 // ── DefaultPrattWalker ──────────────────────────────────────────────────
 //
 // Schema-driven operator-precedence climber. Produces a right-recursive
-// tree wrapping operator results in the auto-interned `binaryExpr` /
-// `unaryExpr` / `postfixExpr` rules (loader registers these when any
-// schema declares an `expr`-kind shape). Left- vs. right-associativity
-// is encoded in the operator table, not in the tree's structural
-// nesting — a downstream semantic pass reads associativity from
+// tree wrapping operator results in the three rules declared by the
+// schema's `expr.wrapperRules.{binary,unary,postfix}` block — names
+// are config-sourced (loader auto-interns them when any `expr` shape
+// is declared). Left- vs. right-associativity is encoded in the
+// operator table, not in the tree's structural nesting — a downstream
+// semantic pass reads associativity from
 // `operatorTable().lookup(kind, Infix)->associativity`.
 //
 // Each `parseExpressionAt(minPrec)` call:
@@ -1189,12 +1192,14 @@ namespace {
 // Bundles the wrapper rule ids resolved once per `walkExpression`
 // entry. Threading these through avoids re-doing the same `rules()
 // .find(...)` lookup at every climb level + makes the dependency on
-// the loader's auto-intern explicit.
+// the loader's auto-intern explicit. Field names mirror the
+// schema-side `ExprWrapperRules` (binary/unary/postfix) so there's
+// no translation layer between schema and walker.
 struct PrattRules {
     RuleId atom;
-    RuleId binaryExpr;
-    RuleId unaryExpr;
-    RuleId postfixExpr;
+    RuleId binary;
+    RuleId unary;
+    RuleId postfix;
 };
 
 // Push trivia tokens through the builder until peek is meaningful.
@@ -1221,14 +1226,15 @@ void parsePrimary(Parser::Impl& I, PrattRules const& rules,
     const auto prefix = I.schema->operatorTable().lookup(
         kind, OperatorArity::Prefix);
     if (prefix && prefix->precedence >= minPrec) {
-        I.openExprFrame(rules.unaryExpr);
+        I.openExprFrame(rules.unary);
         // pushOperatorToken returns false only on EOF, which can't
         // happen here — we already inspected peek via effectiveKind
         // and got a real Prefix entry from the operator table.
         (void)I.pushOperatorToken();
         // Recurse at the prefix's own precedence so tighter ops bind
         // inside the operand (e.g. `-a * b` parses as
-        // `unaryExpr[-, binaryExpr[a, *, b]]` when `*` is tighter).
+        // unary[-, binary[a, *, b]] when `*` is tighter — wrapper
+        // rule names come from `expr.wrapperRules`).
         parseExpressionAt(I, rules, prefix->precedence);
         I.closeFrameOnce();
         return;
@@ -1289,15 +1295,15 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
         //
         // Postfix is LEFT-associative: iterative wrapping via
         // `wrapLastChildExprFrame` wraps the previously-built primary
-        // (or a prior chain wrap) as the new `postfixExpr`'s first
+        // (or a prior chain wrap) as the new postfix-wrapper's first
         // child. The pre-primary `snap` is INTENTIONALLY NOT advanced
         // across postfix iterations — a later same-level infix iter
         // (`f(a) + g(b)`) needs that snap to roll the entire chain
-        // back and rebuild it inside the binaryExpr via the recursive
-        // LHS parse at `prec + 1`. Using rollback-replay (infix's
-        // strategy) for postfix would lose iter-1's wrap on iter-2.
+        // back and rebuild it inside the binary-wrapper via the
+        // recursive LHS parse at `prec + 1`. Using rollback-replay
+        // (infix's strategy) for postfix would lose iter-1's wrap on iter-2.
         if (postfixInClimb) {
-            I.wrapLastChildExprFrame(rules.postfixExpr);
+            I.wrapLastChildExprFrame(rules.postfix);
             if (!I.pushOperatorToken()) {
                 // Truly defensive: peek was non-Eof when we entered
                 // this iteration, so pushOperatorToken should have
@@ -1351,7 +1357,7 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                     // Closer missing. Emit the diagnostic AND drop an
                     // Error leaf at the missing-closer position so the
                     // HasError flag propagates up through the
-                    // postfixExpr wrap and the tree carries the
+                    // postfix wrapper and the tree carries the
                     // structural signal (not just a sidecar diagnostic).
                     // We do NOT consume `closerPeek` — the parent
                     // dispatch resumes from it (typically `recoverAt`
@@ -1371,19 +1377,19 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             // above the postfix branch. A subsequent infix iteration
             // at the same level needs the original pre-primary snap
             // so its rollback-replay can wipe this postfix wrap and
-            // rebuild the chain inside the binaryExpr frame.
+            // rebuild the chain inside the binary-wrapper frame.
             continue;
         }
 
         // Infix path keeps the right-recursive rollback-replay: roll
-        // back to before the primary was built, open the binaryExpr
-        // wrap, and rebuild the primary inside it. Re-snap to the
+        // back to before the primary was built, open the binary
+        // wrapper, and rebuild the primary inside it. Re-snap to the
         // post-rollback state so a chained infix at lower precedence
         // can do the same dance.
         I.rollbackForWalker(snap);
         snap = I.snapForWalker();
 
-        I.openExprFrame(rules.binaryExpr);
+        I.openExprFrame(rules.binary);
         // LHS: strictly tighter (op.prec + 1) so it doesn't gobble
         // this same-prec op (which would loop forever).
         parseExpressionAt(I, rules, infix->precedence + 1);
@@ -1398,7 +1404,7 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             return;
         }
         // RHS uses op.prec, so same-prec ops fold into a nested
-        // binaryExpr (right-recursive shape; left-assoc is conveyed
+        // binary-wrapper (right-recursive shape; left-assoc is conveyed
         // only via the operator table).
         parseExpressionAt(I, rules, infix->precedence);
         I.closeFrameOnce();
@@ -1415,27 +1421,35 @@ void DefaultPrattWalker::walkExpression(Parser& parser,
     // Resolve atom + wrapper rules ONCE. Mid-climb the builder's
     // current rule is whichever wrapper we're inside, so
     // `exprAtom(currentRule())` would return InvalidRule.
+    //
+    // The wrapper rule names come from the language's
+    // `expr.wrapperRules` schema block (08.55 cleanup) — the
+    // engine no longer hardcodes any names. The loader has
+    // already validated all three are present and interned;
+    // `exprWrapperRules(exprRule)` returns a `.valid()` bundle
+    // here for any rule the loader compiled as `isExprRule`.
+    const auto wrapperPack = I.schema->exprWrapperRules(exprRule);
     PrattRules const rules{
-        .atom        = I.schema->exprAtom(exprRule),
-        .binaryExpr  = I.schema->rules().find(dss::rules::kBinaryExpr),
-        .unaryExpr   = I.schema->rules().find(dss::rules::kUnaryExpr),
-        .postfixExpr = I.schema->rules().find(dss::rules::kPostfixExpr),
+        .atom    = I.schema->exprAtom(exprRule),
+        .binary  = wrapperPack.binary,
+        .unary   = wrapperPack.unary,
+        .postfix = wrapperPack.postfix,
     };
     if (!rules.atom.valid()) {
         fatal("dss::DefaultPrattWalker::walkExpression: exprRule's "
               "atom is InvalidRule — schema didn't compile this rule "
               "as `expr`-kind");
     }
-    // The loader is contractually obligated to intern these when any
-    // schema declares an `expr` shape — if any is missing, the loader
-    // and walker disagree on the schema's shape kind. Loud halt
-    // beats silent corruption.
-    if (!rules.binaryExpr.valid() || !rules.unaryExpr.valid()
-        || !rules.postfixExpr.valid()) {
-        fatal("dss::DefaultPrattWalker::walkExpression: wrapper rule "
-              "(binaryExpr/unaryExpr/postfixExpr) not interned — "
-              "loader's auto-intern path failed to register the "
-              "well-known wrapper names");
+    // Sanity check: the loader validated `wrapperRules` at config-
+    // load time (`C_MissingWrapperRules`), so an unreachable case
+    // by the time we get here. Keeping the guard catches a loader-
+    // walker disagreement (e.g. a future loader bug that interned
+    // wrapper names but forgot to record them on the owning rule).
+    if (!wrapperPack.valid()) {
+        fatal("dss::DefaultPrattWalker::walkExpression: schema did "
+              "not record `expr.wrapperRules` for this rule — the "
+              "loader's wrapper-rule pass disagreed with the parser "
+              "(loader bug)");
     }
 
     I.openExprFrame(exprRule);

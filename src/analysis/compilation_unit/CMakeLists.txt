@@ -1,7 +1,6 @@
 add_library(analysis_compilation_unit OBJECT
     compilation_unit.cpp
     import_resolver.cpp
-    symbol_population.cpp
 )
 
 target_include_directories(analysis_compilation_unit PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)

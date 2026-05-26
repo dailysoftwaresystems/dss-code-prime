@@ -476,21 +476,26 @@ TEST(ParserCSubsetSmoke, TopLevelArrayDeclParses) {
 
     const NodeId tl = findFirstNodeWithRule(t, "topLevel");
     ASSERT_NE(tl, NodeId{});
+    // SE6 reshaped the top-level decl: `topLevel` now wraps a named
+    // `topLevelDecl` (shared `typeRef Identifier` prefix) whose
+    // `topLevelDeclTail` splits func-vs-var (LL(1), funcDefTail FIRST=`(`
+    // vs varDeclTail FIRST=`[`/`=`/`;`).
     constexpr std::string_view kExpected =
         "rule:topLevel\n"
-        "  rule:typeRef\n"
-        "    rule:typeBase\n"
-        "      tok:\"int\"\n"
-        "  tok:\"a\"\n"
-        "  rule:topLevelTail\n"
-        "    rule:varDeclTail\n"
-        "      rule:arrayDeclSuffix\n"
-        "        tok:\"[\"\n"
-        "        rule:expression\n"
-        "          rule:operand\n"
-        "            tok:\"10\"\n"
-        "        tok:\"]\"\n"
-        "      tok:\";\"\n";
+        "  rule:topLevelDecl\n"
+        "    rule:typeRef\n"
+        "      rule:typeBase\n"
+        "        tok:\"int\"\n"
+        "    tok:\"a\"\n"
+        "    rule:topLevelDeclTail\n"
+        "      rule:varDeclTail\n"
+        "        rule:arrayDeclSuffix\n"
+        "          tok:\"[\"\n"
+        "          rule:expression\n"
+        "            rule:operand\n"
+        "              tok:\"10\"\n"
+        "          tok:\"]\"\n"
+        "        tok:\";\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, tl), kExpected);
 }
 
@@ -845,4 +850,33 @@ TEST(ParserCSubsetSmoke, ParenGroupingForcesOuterPrecedence) {
         "    rule:operand\n"
         "      tok:\"c\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+// F2: c-subset reintroduces CharLiteral via a `'`-opened body mode
+// (mirrors the `"`-opened string mode). `'a'` parses cleanly: the
+// `'` opener token, one `CharLiteral` body byte, the `'` closer
+// (same token kind back-popping the body mode). Pin via a tree-
+// presence assertion on the body-mode CharLiteral token kind.
+TEST(ParserCSubsetSmoke, CharLiteralParsesAsOperand) {
+    auto harness = loadAndTokenize("int main() { return 'a'; }");
+    Parser parser{harness.src, harness.schema, std::move(harness.stream)};
+    auto const result = std::move(parser).parse();
+    auto const& tree = result.tree;
+    EXPECT_FALSE(tree.diagnostics().hasErrors())
+        << "c-subset failed to parse CharLiteral cleanly";
+    // The body-mode emits a CharLiteral schema-token inside the
+    // `'a'` span; verify the token kind appears in the leaf stream.
+    const auto charLitId = tree.schema().schemaTokens().find("CharLiteral");
+    ASSERT_TRUE(charLitId.valid());
+    bool sawCharLiteralToken = false;
+    for (std::uint32_t i = 1; i < tree.nodeCount(); ++i) {
+        const NodeId id{i};
+        if (tree.kind(id) == NodeKind::Token
+            && tree.tokenKind(id).v == charLitId.v) {
+            sawCharLiteralToken = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawCharLiteralToken)
+        << "expected at least one CharLiteral body-token in the parse tree";
 }

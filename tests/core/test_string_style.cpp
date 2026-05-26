@@ -20,6 +20,47 @@ TEST(StringStyle, EscapeKindNameMapping) {
     EXPECT_EQ(escapeKindName(EscapeKind::DoubledDelimiter), "doubled-delimiter");
 }
 
+// ── bracketInnerText: doubled-delimiter un-escaping ────────────────────
+//
+// The shared decoder both the semantic engine and the import resolver call
+// to read a bracket-quoted identifier's body. It MUST match the tokenizer's
+// `EscapeKind::DoubledDelimiter` rule for the `[` opener: a `]]` is an
+// escaped literal `]`, a lone `]` is the close.
+
+TEST(StringStyle, BracketInnerTextPlain) {
+    EXPECT_EQ(bracketInnerText("[Orders]", 0), "Orders");
+}
+
+TEST(StringStyle, BracketInnerTextDoubledDelimiterUnescapes) {
+    // `[a]]b]` → the single identifier `a]b` (the `]]` un-doubles to one `]`).
+    EXPECT_EQ(bracketInnerText("[a]]b]", 0), "a]b");
+    // `[Ord]]ers]` → `Ord]ers` (the ground-truth shape from the tsql tests).
+    EXPECT_EQ(bracketInnerText("[Ord]]ers]", 0), "Ord]ers");
+}
+
+TEST(StringStyle, BracketInnerTextTrailingDoubledPair) {
+    // A `]]` immediately before the close is two escaped `]` then the close:
+    // `[a]]]]` → body bytes `]]` `]]`... actually `[` then `a` `]]` `]]` —
+    // four `]` after `a` are two escaped pairs → `a]]`, then EOF with no
+    // close → malformed → empty. Pin that EOF-without-close is empty.
+    EXPECT_EQ(bracketInnerText("[a]]]]", 0), "");
+    // `[a]]]` → `a` then `]]` (escaped `]`) then a lone `]` (close) → `a]`.
+    EXPECT_EQ(bracketInnerText("[a]]]", 0), "a]");
+}
+
+TEST(StringStyle, BracketInnerTextMalformedReturnsEmpty) {
+    EXPECT_EQ(bracketInnerText("Orders]", 0), "");   // no opener at `open`
+    EXPECT_EQ(bracketInnerText("[Orders", 0), "");    // no close
+    EXPECT_EQ(bracketInnerText("[", 0), "");          // bare opener
+    EXPECT_EQ(bracketInnerText("", 0), "");           // empty source
+    EXPECT_EQ(bracketInnerText("x[a]", 99), "");      // open past end
+}
+
+TEST(StringStyle, BracketInnerTextWithOffsetOpener) {
+    // The opener need not be at byte 0 — read from an interior `[`.
+    EXPECT_EQ(bracketInnerText("FROM [Orders];", 5), "Orders");
+}
+
 // ── Happy-path loader ──────────────────────────────────────────────────
 
 TEST(StringStyleLoader, CStyleQuotedStringLoadsAndPopulates) {

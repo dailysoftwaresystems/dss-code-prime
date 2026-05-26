@@ -85,10 +85,12 @@ At project-load time, the driver:
 
 ### 2.4 Codegen consumption
 
-`gen/link` reads the profile to:
-- Pick the entry-point symbol name (`main` for `cli`, `WinMain`/`wWinMain` for `gui` on Windows, `DllMain` for `lib` on Windows + `_init`/`_fini` on ELF, `__attribute__((constructor))` registration on Mach-O).
-- Set the PE subsystem field (`IMAGE_SUBSYSTEM_WINDOWS_CUI` vs `IMAGE_SUBSYSTEM_WINDOWS_GUI` vs the DLL flag).
-- Choose the output file extension (`.exe` / `.dll` / `.so` / `.dylib` / no-extension).
+> **Config-driven, not hardcoded per profile (thesis decision #4).** The mappings below are **defaults/derivations the codegen computes from config**, not a hardwired `if (profile == "gui")` ladder. The entry-point *symbol convention* is **declared by the language config** (the language config declares the convention — e.g. a `main`-named symbol, or whichever symbol the language's own `semantics` block / per-target overrides indicate) with **per-target overrides**; the profile + target supply the subsystem/extension/runtime knobs. Codegen branches on the **target** axis (PE vs ELF vs Mach-O — expected) and reads language/profile **config**, never on `schema.name()`. A new language picks its entry convention in config, not by editing codegen.
+
+`gen/link` resolves, from the language config + selected profile + target:
+- The entry-point symbol — sourced from the language config's declared entry convention (default `main`), with target overrides (e.g. `gui`+PE → `WinMain`/`wWinMain`; `lib`+PE → `DllMain`; ELF `_init`/`_fini`; Mach-O `__attribute__((constructor))` registration).
+- The PE subsystem field (`IMAGE_SUBSYSTEM_WINDOWS_CUI` vs `IMAGE_SUBSYSTEM_WINDOWS_GUI` vs the DLL flag) — from profile × target.
+- The output file extension (`.exe` / `.dll` / `.so` / `.dylib` / no-extension) — from profile × target.
 - Pick the linker default-library set (CRT for CLI/GUI, none for freestanding libraries).
 
 For T-SQL-style languages (`script`, `sproc`), "codegen" is a text-emission phase, not a native-binary phase — the driver picks an entirely different backend variant.
@@ -135,10 +137,10 @@ These ship as part of AP4. The list is per-language data, not a hardcoded driver
 
 | PR  | Title                                              | Scope                                                                                                                                                                                              |
 |-----|----------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| AP1 | Schema field + loader                              | `dssSchemaVersion` bump to 3 (back-compat for absent field per §2.1); new field `artifactProfiles` on `GrammarSchemaData`; new diagnostic codes `C_UnknownArtifactProfile`, `C_MissingArtifactProfile`. Loader pass validates entries against the built-in vocabulary. Unit tests in `tests/core/test_grammar_schema.cpp`. |
+| ~~AP1~~ ✅ | Schema field + loader                              | **Closed 2026-05-26.** New field `artifactProfiles` on `GrammarSchemaData` + `GrammarSchema::artifactProfiles()` accessor; new diagnostic `C_UnknownArtifactProfile` (covers unknown-name + malformed-shape + duplicate via `C_ConflictingField`). Loader validates entries against the built-in vocabulary (`cli`/`gui`/`lib`/`staticlib`/`script`/`sproc`/`transpile`/`shader`/`hdl`). Unit tests in `tests/core/test_grammar_schema.cpp`; documented in `docs/language-config-spec.md`. **Deviation from original spec (deliberate):** the field landed as **optional with no `dssSchemaVersion` bump and no `C_MissingArtifactProfile`** — making it *required* is a breaking policy change best decided alongside the driver that consumes it (AP2), so absent = valid (empty list) for now. |
 | AP2 | Project-config file + driver enforcement           | New `program/project_config.{hpp,cpp}` + JSON loader (reuses the nlohmann/json infra). New `D_*` diagnostic namespace + `D_ArtifactProfileNotSupported`. Driver-layer integration test fixture. |
 | AP3 | `CompilationContext` plumbing                      | Resolved profile flows from driver → IR → codegen via the compilation context. Each backend reads it instead of looking it up per-phase. Pinned by an interface test that the IR builder sees the right profile.                                                                  |
-| AP4 | Onboarding for shipped languages                   | Add `artifactProfiles` to toy / c-subset / tsql-subset. Snapshot tests for the per-language matrix in §4. Driver integration test that compiles each language × each profile, asserting the produced artifact has the expected shape (extension, entry-point symbol, subsystem flag).                                                                                                                                                                                |
+| AP4 | Onboarding for shipped languages                   | Config-declaration part ✅ 2026-05-26: `artifactProfiles` added to toy (`["cli"]`) / c-subset (`["cli","lib","staticlib"]`) / tsql-subset (`["script","sproc"]`). **Remaining:** snapshot tests for the per-language matrix in §4 + the driver integration test that compiles each language × each profile and asserts the artifact shape (extension, entry-point symbol, subsystem flag) — both need the AP2/AP3 driver. |
 
 ---
 

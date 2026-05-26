@@ -402,12 +402,21 @@ TEST(OperatorTable, AbsentSectionYieldsEmptyTable) {
 
 TEST(OperatorTable, ExprShapeAtomResolvesToKnownRule) {
     constexpr std::string_view kCfg = R"JSON({
-      "dssSchemaVersion": 2,
+      "dssSchemaVersion": 4,
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { "+": [{ "kind": "PlusOp" }] },
       "shapes": {
         "root":       { "sequence": [ "expression" ] },
-        "expression": { "expr":     { "atom": "primary" } },
+        "expression": {
+          "expr": {
+            "atom": "primary",
+            "wrapperRules": {
+              "binary":  "binaryExpr",
+              "unary":   "unaryExpr",
+              "postfix": "postfixExpr"
+            }
+          }
+        },
         "primary":    { "sequence": [ "Identifier" ] }
       }
     })JSON";
@@ -779,18 +788,17 @@ TEST(OperatorTableEndsAtBodyRule, BodyRuleReferencesUndefinedShape) {
                         "no shape with that name is declared"));
 }
 
-// Walker-wrapper rules (`binaryExpr`/`unaryExpr`/`postfixExpr`) have
-// no compiled body — they're synthesized by the Pratt walker. The
-// `validateOperatorBodyRules` post-shapes pass must NOT flag them as
-// missing shapes. Regression guard for the skip list living in
-// `well_known_names.hpp`: a future renaming or new wrapper without
-// updating the skip would break every shipped grammar at load time.
+// Walker-wrapper rules (declared per-language via `expr.wrapperRules`)
+// have no compiled body — they're synthesized by the Pratt walker.
+// The `validateOperatorBodyRules` post-shapes pass must NOT flag them
+// as missing shapes. Regression guard for the skip list, which since
+// 08.55 reads from each `expr.wrapperRules` block (no hardcoded names
+// anywhere in the engine).
 TEST(OperatorTableEndsAtBodyRule, WalkerWrapperNamesDoNotTripValidation) {
     // Loading c-subset exercises the wrappers (the c-subset operator
-    // table declares prefix/infix/postfix groups, the loader interns
-    // `binaryExpr`/`unaryExpr`/`postfixExpr` as wrapper rules but
-    // doesn't declare them as shapes). Clean load = walker wrappers
-    // correctly skipped.
+    // table declares prefix/infix/postfix groups, and its `expression`
+    // shape declares `wrapperRules: { binary, unary, postfix }`).
+    // Clean load = walker wrappers correctly skipped.
     auto loaded = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(loaded.has_value())
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);

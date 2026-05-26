@@ -1,11 +1,13 @@
 {
-  "dssSchemaVersion": 1,
+  "dssSchemaVersion": 4,
 
   "language": {
     "name": "Toy",
     "version": "0.1.0",
     "fileExtensions": [".toy"]
   },
+
+  "artifactProfiles": ["cli"],
 
   "tokens": {
     " ":  [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
@@ -48,5 +50,15 @@
     "varDecl":    { "sequence": ["VarKeyword", "Identifier", "AssignmentOperator", "expression", "EndCommand"] },
     "exprStmt":   { "sequence": ["expression", "EndCommand"] },
     "expression": { "sequence": ["Identifier"] }
+  },
+
+  "semantics": {
+    "identifierToken": "Identifier",
+    "declarations": [
+      { "rule": "varDecl", "name": 1, "init": 3, "kind": "variable" }
+    ],
+    "references": [
+      { "rule": "expression" }
+    ]
   }
 }

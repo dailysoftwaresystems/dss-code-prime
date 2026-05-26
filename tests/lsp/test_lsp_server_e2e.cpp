@@ -111,8 +111,12 @@ TEST(LspServerE2E, DidChangeRepublishesWithMonotonicVersions) {
 TEST(LspServerE2E, DidOpenPublishesDiagnosticsForToySource) {
     LspTestHarness h;
     h.push(lspInitialize(1));
-    // "1 + 2;" — toy grammar expects Identifier or VarKeyword to
-    // start a statement, so `1` and `;` each emit one diagnostic.
+    // "1 + 2;" — toy grammar declares no numberStyle, so the tokenizer
+    // rejects `1` and `2` as illegal characters (P_IllegalChar). The
+    // parser then sees those Error tokens and emits P_NoAlternativeMatched
+    // when scanning for a statement starter. Both flavors land in the
+    // published-diagnostics array (F4: LSP now threads tokenizer
+    // diagnostics into the Parser).
     h.push(lspDidOpen("file:///hello.toy", 1, "1 + 2;"));
     h.push(lspShutdown(2));
     h.push(std::string{lspExit});
@@ -128,7 +132,17 @@ TEST(LspServerE2E, DidOpenPublishesDiagnosticsForToySource) {
     auto const& diags = params.at("diagnostics");
     ASSERT_TRUE(diags.is_array());
     EXPECT_GE(diags.size(), 1u);
-    EXPECT_EQ(diags[0].at("code"), "P_NoAlternativeMatched");
+    // Lexer diagnostics are produced first (they walk the source
+    // left-to-right) and the LSP layer concatenates them ahead of
+    // the parser's diagnostics.
+    EXPECT_EQ(diags[0].at("code"), "P_IllegalChar");
+    // The parser-side P_NoAlternativeMatched is still present in
+    // the array; scan for it explicitly.
+    bool sawParser = false;
+    for (auto const& d : diags) {
+        if (d.at("code") == "P_NoAlternativeMatched") { sawParser = true; break; }
+    }
+    EXPECT_TRUE(sawParser);
 }
 
 TEST(LspServerE2E, DidOpenWithoutExtensionPublishesEmptyDiagnostics) {

@@ -96,6 +96,82 @@ enum class DiagnosticCode : std::uint16_t {
     //   (not "Integer"/"Type") or a malformed parameter spec.
     C_UnknownTypeExtension        = 0xC02A,
     C_TypeExtensionParamMismatch  = 0xC02B,
+    // The `imports` block (schema v4) is malformed: `strategy` missing or not
+    // one of "none"/"include-following"/"name-matching", or a required field
+    // has the wrong JSON type. (Missing-but-required fields use C_MissingField;
+    // unknown rule/token names use C_UnknownShape/C_UnknownToken.)
+    C_InvalidImports              = 0xC02C,
+    // An `expr` shape was declared without a complete `wrapperRules` block
+    // (08.55 cleanup; schema v4). Every `expr`-shape rule must name the three
+    // Pratt-walker wrapper rules (binary / unary / postfix); the engine
+    // auto-interns and threads those names — it never hardcodes them.
+    C_MissingWrapperRules         = 0xC02D,
+    // The language declared `IntLiteral`/`FloatLiteral` as multi-char tokens
+    // but no `numberStyle` block (08.55 cleanup; schema v4). The tokenizer's
+    // scanNumber() drives entirely from the schema's NumberStyle; without it
+    // the scanner has no rules to apply. Use ONLY for the "block is required
+    // but absent" case at the end of the numberStyle parse — type/shape/
+    // range errors inside an existing block use C_InvalidNumberStyle.
+    C_MissingNumberStyle          = 0xC02E,
+    // The `numberStyle` block is present but malformed: wrong JSON type,
+    // out-of-range radix, non-single-char fractionPoint/digitSeparator,
+    // unknown emitKind reference, etc. Mirrors the `imports` block's
+    // C_InvalidImports discipline (08.55 cleanup; schema v4). Missing
+    // required sub-fields use C_MissingField; unknown sub-keys use
+    // C_UnknownShape.
+    C_InvalidNumberStyle          = 0xC02F,
+    // Two or more `wrapperRules` roles (binary/unary/postfix) resolved to the
+    // same RuleId — a duplicate-name config error. Distinct from
+    // `C_MissingWrapperRules` (missing field) so the operator sees the actual
+    // class of failure: the three Pratt-walker frames MUST be distinct or the
+    // walker's tree-building corrupts silently.
+    C_DuplicateWrapperRules       = 0xC030,
+    // The `semantics` block (schema v4) is present but malformed: wrong JSON
+    // shape, unknown `kind`/`core`/`constructor`/`nameMatch` enum string, an
+    // out-of-range child index, or a typeShape `operandChild` that doesn't
+    // point to a valid visible child slot. (Missing required sub-fields stay
+    // `C_MissingField`; dangling rule/token names stay `C_UnknownShape`/
+    // `C_UnknownToken`.)
+    C_InvalidSemantics            = 0xC031,
+    // An `artifactProfiles[]` entry (schema v4, plan 06 AP1) names a profile
+    // that is not in the loader's registered profile set (cli/gui/lib/
+    // staticlib/script/sproc/transpile/shader/hdl) — OR the block is
+    // malformed (not an array, or a non-string entry). Mirrors how
+    // C_UnknownTypeExtension covers BOTH the malformed-shape and the
+    // unknown-name cases for its top-level block. Absent field = valid
+    // (empty profile list).
+    C_UnknownArtifactProfile      = 0xC032,
+
+    // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
+    // Emitted by the language-agnostic semantic analyzer
+    // (`src/analysis/semantic/`). The 0xE high nibble renders as the letter
+    // `S` (see `diagnosticCodePrefix`). Append, never renumber.
+    S_UndeclaredIdentifier        = 0xE001,
+    S_RedeclaredSymbol            = 0xE002,
+    S_TypeMismatch                = 0xE003,
+    S_NotCallable                 = 0xE004,
+    S_ArgCountMismatch            = 0xE005,
+    S_UnknownType                 = 0xE006,
+    S_ConstViolation              = 0xE007,
+    // A `return` statement whose returned expression type does not assign
+    // into the enclosing function's result type — OR a bare `return;` in a
+    // non-Void function — OR a `return expr;` in a Void function. Emitted by
+    // the config-driven `returnRules` facet.
+    S_ReturnTypeMismatch          = 0xE008,
+    // A break/continue-style control statement (a `loopControls` rule)
+    // appearing outside any loop-context subtree (a `loopRules` rule).
+    S_ControlOutsideLoop          = 0xE009,
+    // A declared symbol whose minting declaration opted IN to unused-variable
+    // warnings (`warnIfUnused: true` on its DeclarationRule) but that has an
+    // EMPTY use-set after analysis (never referenced). A WARNING, not an
+    // error. Config-driven and per-declaration-kind: a language opts in for
+    // local variables but not for parameters (intentionally unused) or
+    // globals. Needs no CFG — it reads SE7's `usesBySymbol` reverse index.
+    // Scope: "never referenced" only. An assignment LHS is recorded as a use,
+    // so a write-only variable (assigned but never read) does NOT warn here;
+    // dead-store / write-only detection requires dataflow and stays with the
+    // optimizer phase (registry D9).
+    S_UnusedVariable              = 0xE00A,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

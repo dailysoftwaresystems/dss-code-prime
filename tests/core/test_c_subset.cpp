@@ -44,6 +44,7 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto top  = b.open(h.schema->rules().find("topLevel"));
+        auto tld  = b.open(h.schema->rules().find("topLevelDecl"));
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
@@ -52,7 +53,7 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
         drainWhitespace(b, h.stream);
         b.pushToken(h.stream.advance());
         {
-            auto tail   = b.open(h.schema->rules().find("topLevelTail"));
+            auto tail   = b.open(h.schema->rules().find("topLevelDeclTail"));
             auto vdTail = b.open(h.schema->rules().find("varDeclTail"));
             drainWhitespace(b, h.stream);
             pushNext(b, h.stream);
@@ -72,17 +73,18 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     const std::string_view expected =
         "rule:root\n"
         "  rule:topLevel\n"
-        "    rule:typeRef\n"
-        "      rule:typeBase\n"
-        "        tok:\"int\"\n"
-        "    tok:\"x\"\n"
-        "    rule:topLevelTail\n"
-        "      rule:varDeclTail\n"
-        "        tok:\"=\"\n"
-        "        rule:expression\n"
-        "          rule:operand\n"
-        "            tok:\"5\"\n"
-        "        tok:\";\"\n";
+        "    rule:topLevelDecl\n"
+        "      rule:typeRef\n"
+        "        rule:typeBase\n"
+        "          tok:\"int\"\n"
+        "      tok:\"x\"\n"
+        "      rule:topLevelDeclTail\n"
+        "        rule:varDeclTail\n"
+        "          tok:\"=\"\n"
+        "          rule:expression\n"
+        "            rule:operand\n"
+        "              tok:\"5\"\n"
+        "          tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
@@ -99,6 +101,7 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto top  = b.open(h.schema->rules().find("topLevel"));
+        auto tld  = b.open(h.schema->rules().find("topLevelDecl"));
         {
             auto ty = b.open(h.schema->rules().find("typeRef"));
             auto tb = b.open(h.schema->rules().find("typeBase"));
@@ -107,8 +110,9 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         drainWhitespace(b, h.stream);
         b.pushToken(h.stream.advance());
         {
-            auto tail = b.open(h.schema->rules().find("topLevelTail"));
-            auto fn   = b.open(h.schema->rules().find("funcTail"));
+            auto tail = b.open(h.schema->rules().find("topLevelDeclTail"));
+            auto fn   = b.open(h.schema->rules().find("funcDefTail"));
+            auto fp   = b.open(h.schema->rules().find("funcParams"));
             b.pushToken(h.stream.advance());
             {
                 auto pl = b.open(h.schema->rules().find("paramList"));
@@ -118,6 +122,9 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
                 b.pushToken(h.stream.advance());
             }
             pushNext(b, h.stream);
+            // funcParams closes here (after the `)`); the block is a
+            // sibling of funcParams under funcDefTail.
+            fp.close();
             {
                 auto blk = b.open(h.schema->rules().find("block"));
                 pushNext(b, h.stream);
@@ -168,41 +175,43 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
     const std::string_view expected =
         "rule:root\n"
         "  rule:topLevel\n"
-        "    rule:typeRef\n"
-        "      rule:typeBase\n"
-        "        tok:\"int\"\n"
-        "    tok:\"main\"\n"
-        "    rule:topLevelTail\n"
-        "      rule:funcTail\n"
-        "        tok:\"(\"\n"
-        "        rule:paramList\n"
-        "          rule:param\n"
-        "            rule:typeRef\n"
-        "              rule:typeBase\n"
-        "                tok:\"void\"\n"
-        "        tok:\")\"\n"
-        "        rule:block\n"
-        "          tok:\"{\"\n"
-        "          rule:statement\n"
-        "            rule:ifStmt\n"
-        "              tok:\"if\"\n"
-        "              tok:\"(\"\n"
-        "              rule:expression\n"
-        "                rule:operand\n"
-        "                  tok:\"x\"\n"
-        "              tok:\")\"\n"
-        "              rule:statement\n"
-        "                rule:block\n"
-        "                  tok:\"{\"\n"
-        "                  rule:statement\n"
-        "                    rule:returnStmt\n"
-        "                      tok:\"return\"\n"
-        "                      rule:expression\n"
-        "                        rule:operand\n"
-        "                          tok:\"x\"\n"
-        "                      tok:\";\"\n"
-        "                  tok:\"}\"\n"
-        "          tok:\"}\"\n";
+        "    rule:topLevelDecl\n"
+        "      rule:typeRef\n"
+        "        rule:typeBase\n"
+        "          tok:\"int\"\n"
+        "      tok:\"main\"\n"
+        "      rule:topLevelDeclTail\n"
+        "        rule:funcDefTail\n"
+        "          rule:funcParams\n"
+        "            tok:\"(\"\n"
+        "            rule:paramList\n"
+        "              rule:param\n"
+        "                rule:typeRef\n"
+        "                  rule:typeBase\n"
+        "                    tok:\"void\"\n"
+        "            tok:\")\"\n"
+        "          rule:block\n"
+        "            tok:\"{\"\n"
+        "            rule:statement\n"
+        "              rule:ifStmt\n"
+        "                tok:\"if\"\n"
+        "                tok:\"(\"\n"
+        "                rule:expression\n"
+        "                  rule:operand\n"
+        "                    tok:\"x\"\n"
+        "                tok:\")\"\n"
+        "                rule:statement\n"
+        "                  rule:block\n"
+        "                    tok:\"{\"\n"
+        "                    rule:statement\n"
+        "                      rule:returnStmt\n"
+        "                        tok:\"return\"\n"
+        "                        rule:expression\n"
+        "                          rule:operand\n"
+        "                            tok:\"x\"\n"
+        "                        tok:\";\"\n"
+        "                    tok:\"}\"\n"
+        "            tok:\"}\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 

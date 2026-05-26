@@ -1,18 +1,23 @@
 #pragma once
 
-// Per-language import resolution (CU4). Bridges parser output and the semantic
-// phase by populating a CompilationUnit's `crossRefs` — the cross-tree edges
-// linking a use/reference in one file to its definition in another.
+// Config-driven import resolution (CU4). Bridges parser output and the
+// semantic phase by populating a CompilationUnit's `crossRefs` — the
+// cross-tree edges linking a use/reference in one file to its definition in
+// another.
 //
-// Two resolution styles ship, dispatched by language NAME (plan Q5 — a
-// schema-declared `imports.syntax` field is a v3 candidate):
-//   - c-subset: include-following. `#include "x.h"` directives are resolved
-//     against the including file's directory + declared include dirs; missing
-//     files are LOADED into the CU (recursively), and each directive becomes a
-//     CrossTreeRef (filename token -> included tree root, importSpan = directive).
-//   - tsql-subset: name-matching. A table-position `qualifiedName` is matched to
-//     a `CREATE TABLE` of the same name in ANOTHER tree (importSpan = nullopt).
-//   - everything else (toy): identity — no cross-refs.
+// ONE language-agnostic engine (ConfigDrivenImportResolver) reads the schema's
+// `imports` block (schema v4) — NO code branches on the source language name.
+// The block's `strategy` selects one of two generic strategies (or none):
+//   - include-following. Each `directiveRule` node carries a `pathToken` whose
+//     quoted literal is resolved against the including file's directory +
+//     declared include dirs; missing files are LOADED into the CU (recursively),
+//     and each directive becomes a CrossTreeRef (path token -> included tree
+//     root, importSpan = directive). (c-subset uses this.)
+//   - name-matching. A `nameRule` in a `referenceParents` position is matched
+//     to a `nameRule` under a `definitionRule` of the same name in ANOTHER tree
+//     (importSpan = nullopt), keyed on the last `nameToken` text (case-folded
+//     unless `caseSensitive`). (tsql-subset uses this.)
+//   - none (or no `imports` block): identity — no cross-refs. (toy uses this.)
 //
 // Unresolved references are surfaced as driver diagnostics (D_UnresolvedImport
 // / D_UnresolvedReference), never silently dropped.
@@ -25,13 +30,13 @@
 // `driverDiagnostics()` holds only the D_* driver codes.
 //
 // Known v1 limitations (documented, not bugs):
-//   - c-subset `#include` is a single `"#include"` lexeme, so `# include`
-//     (whitespace between `#` and `include`) is not recognized.
+//   - include-following: a directive whose path lexeme is a single token (e.g.
+//     c-subset's `"#include"`) won't recognize a split spelling (`# include`).
 //   - `addInMemory` sources are never deduplicated against include targets;
 //     if an in-memory `label` happens to equal a real on-disk path that
-//     another file `#include`s, the file is loaded a second time from disk.
-//   - tsql table names composed only of bracketed identifiers (`[Name]`) are
-//     not matched (the matcher keys on the last `Identifier` token).
+//     another file follows, the file is loaded a second time from disk.
+//   - name-matching: a name composed only of bracketed identifiers (`[Name]`)
+//     is not matched (the matcher keys on the last `nameToken`).
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/export.hpp"
@@ -81,9 +86,11 @@ public:
     virtual void resolve(ResolutionContext& context) const = 0;
 };
 
-// Pick the resolver for a language by name. Always returns a non-null resolver
-// (unknown languages get the identity resolver).
+// Build the resolver from a schema's config-driven `imports` block. Always
+// returns a non-null resolver — a schema with no `imports` block (or
+// `strategy: "none"`) gets one that produces no cross-refs. NO dispatch on the
+// language name: behavior comes entirely from `schema.imports()`.
 [[nodiscard]] DSS_EXPORT std::unique_ptr<ImportResolver>
-chooseResolver(std::string_view languageName);
+chooseResolver(GrammarSchema const& schema);
 
 } // namespace dss

@@ -557,6 +557,7 @@ TEST(ContextualKeywords, CSubsetIntDeclEmitsNoContextualResolution) {
     {
         auto root = b.open(schema->rules().find("root"));
         auto top  = b.open(schema->rules().find("topLevel"));
+        auto tld  = b.open(schema->rules().find("topLevelDecl"));
         {
             auto ty = b.open(schema->rules().find("typeRef"));
             auto tb = b.open(schema->rules().find("typeBase"));
@@ -564,7 +565,7 @@ TEST(ContextualKeywords, CSubsetIntDeclEmitsNoContextualResolution) {
         }
         b.pushToken(tokAt(*src, "x", CoreTokenKind::Word));
         {
-            auto tail   = b.open(schema->rules().find("topLevelTail"));
+            auto tail   = b.open(schema->rules().find("topLevelDeclTail"));
             auto vdTail = b.open(schema->rules().find("varDeclTail"));
             b.pushToken(tokAt(*src, ";", CoreTokenKind::Operator));
         }

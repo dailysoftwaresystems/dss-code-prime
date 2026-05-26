@@ -68,6 +68,12 @@ DSS_STRONG_ID(CompilationUnitId);
 // phase keys its symbol table by SymbolId, bound through a NodeId via
 // `UnitAttribute<SymbolId>` (see analysis/compilation_unit/unit_attribute.hpp).
 DSS_STRONG_ID(SymbolId);
+// CU-scoped lexical-scope identity. Minted per-CompilationUnit by the
+// semantic phase's scope tree. A ScopeId is only meaningful against the CU
+// that produced it; the sentinel `InvalidScope` (`v == 0`) means "no scope"
+// — slot 0 of the scope tree is reserved. Real scopes start at id 1
+// (typically the CU root scope).
+DSS_STRONG_ID(ScopeId);
 // Type-system ids (SP2). `TypeKindId` identifies an extension type-kind
 // (registry-minted, >= 256; core kinds occupy the TypeKind enum's [0,256)).
 // `TypeNameId` interns nominal type/extension names.
@@ -93,6 +99,7 @@ inline constexpr StringStyleId   InvalidStringStyle{};
 inline constexpr SchemaId        InvalidSchemaId{};
 inline constexpr CompilationUnitId InvalidCompilationUnit{};
 inline constexpr SymbolId        InvalidSymbol{};
+inline constexpr ScopeId         InvalidScope{};
 inline constexpr TypeId          InvalidType{};
 inline constexpr TypeKindId      InvalidTypeKind{};
 inline constexpr TypeNameId      InvalidTypeName{};
@@ -118,6 +125,7 @@ DSS_HASH_ID(StringStyleId);
 DSS_HASH_ID(SchemaId);
 DSS_HASH_ID(CompilationUnitId);
 DSS_HASH_ID(SymbolId);
+DSS_HASH_ID(ScopeId);
 DSS_HASH_ID(TypeId);
 DSS_HASH_ID(TypeKindId);
 DSS_HASH_ID(TypeNameId);

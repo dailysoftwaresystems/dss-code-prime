@@ -1,5 +1,5 @@
 {
-  "dssSchemaVersion": 2,
+  "dssSchemaVersion": 4,
 
   "language": {
     "name":           "TsqlSubset",
@@ -7,7 +7,29 @@
     "fileExtensions": [".sql", ".tsql"]
   },
 
+  "artifactProfiles": ["script", "sproc"],
+
+  "imports": {
+    "strategy":         "name-matching",
+    "nameRule":         "qualifiedName",
+    "definitionRule":   "createTableStmt",
+    "referenceParents": ["tableRef", "insertStmt", "updateStmt", "deleteStmt"],
+    "nameToken":        "Identifier",
+    "caseSensitive":    false
+  },
+
   "reservedWordPolicy": "contextual",
+
+  "numberStyle": {
+    "decimal":          true,
+    "exponent":         { "letters": ["e", "E"], "signOptional": true },
+    "fractionPoint":    ".",
+    "emitKind":         { "integer": "IntLiteral", "float": "FloatLiteral" }
+  },
+
+  "typeExtensions": [
+    { "name": "TSQL::Varchar", "parameters": [ { "name": "N", "kind": "Integer" } ] }
+  ],
 
   "syncTokens": ["EndStatement"],
 
@@ -248,7 +270,7 @@
 
     "operand": {
       "alt": [
-        "qualifiedName",
+        "nameOrCall",
         "IntLiteral",
         "StringStart",
         "UnicodeStringStart",
@@ -256,6 +278,55 @@
         { "sequence": [ "MinusOp", "operand" ] },
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
+    },
+
+    "nameOrCall": {
+      "alt": [ "callExpr", "qualifiedName" ],
+      "speculative": true
+    },
+
+    "callExpr": {
+      "sequence": [
+        "Identifier",
+        "ParenOpen",
+        { "optional": "callArgList" },
+        "ParenClose"
+      ]
+    },
+
+    "callArgList": {
+      "sequence": [
+        "expression",
+        { "repeat": { "sequence": [ "Comma", "expression" ] } }
+      ]
     }
+  },
+
+  "semantics": {
+    "identifierToken": "Identifier",
+    "bracketIdentifierToken": "BracketIdStart",
+    "declarations": [
+      { "rule": "createTableStmt", "name": 2, "kind": "table",
+        "nameMatch": "lastIdentifier" },
+      { "rule": "columnDecl", "name": 0, "type": 1, "kind": "variable" }
+    ],
+    "references": [
+      { "rule": "qualifiedName", "nameMatch": "lastIdentifier" }
+    ],
+    "scopes": [ "createTableStmt" ],
+    "callRules": [
+      { "rule": "callExpr", "callee": 0, "args": 2 }
+    ],
+    "builtinFunctions": [
+      { "name": "COALESCE", "result": "I32", "variadic": true }
+    ],
+    "builtinTypes": [
+      { "name": "INT", "core": "I32" },
+      { "name": "BIT", "core": "Bool" },
+      { "name": "VARCHAR", "extension": "TSQL::Varchar" }
+    ],
+    "literalTypes": [
+      { "literal": "IntLiteral", "core": "I32" }
+    ]
   }
 }

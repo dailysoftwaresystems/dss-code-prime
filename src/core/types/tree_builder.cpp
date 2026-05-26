@@ -555,16 +555,21 @@ struct ResolvedMeaning {
     return true;
 }
 
-// Built-in literal kinds the tokenizer is allowed to pre-resolve. These
-// names are predeclared at schema load (see kBuiltinTokenKindNames in
-// grammar_schema_json.cpp) so the interner always has them. The list is
-// the synthesis-allowlist's "non-body-mode" half — body kinds come from
-// the caller's `bodyKinds` set.
+// Universal literal kinds the tokenizer is allowed to pre-resolve.
+// These names are predeclared at schema load (see
+// kBuiltinTokenKindNames in grammar_schema_json.cpp) so the interner
+// always has them. The list is the synthesis-allowlist's "non-body-
+// mode" half — body kinds come from the caller's `bodyKinds` set.
+//
+// Paradigm-specific kinds (`BoolLiteral`/`CharLiteral`/`NullLiteral`)
+// were pruned in the 08.55 cleanup; the tokenizer never emits them
+// directly — a language that uses them resolves the lexeme via its
+// own `tokens`/`keywords` block, which produces a real per-lexeme
+// candidate (no synthesis required).
 [[nodiscard]] bool isBuiltinLiteralKind(GrammarSchema const& schema,
                                         SchemaTokenId id) noexcept {
     static constexpr std::string_view kLiterals[] = {
         "IntLiteral", "FloatLiteral", "StringLiteral",
-        "CharLiteral", "BoolLiteral", "NullLiteral",
     };
     const auto name = schema.schemaTokens().name(id);
     for (auto lit : kLiterals) {

@@ -36,7 +36,7 @@ namespace {
 // the walker's output against this minimal grammar to avoid the
 // surrounding c-subset machinery (function decls, blocks, etc.).
 constexpr std::string_view kInfixSchema = R"JSON({
-  "dssSchemaVersion": 2,
+  "dssSchemaVersion": 4,
   "language": { "name": "PrattInfix", "version": "0.1.0" },
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -59,7 +59,16 @@ constexpr std::string_view kInfixSchema = R"JSON({
   "shapes": {
     "root":       { "sequence": [{ "repeat": "stmt" }] },
     "stmt":       { "sequence": ["expression", "Semi"] },
-    "expression": { "expr": { "atom": "operand" } },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    },
     "operand":    { "alt": ["Identifier"] }
   }
 })JSON";
@@ -68,7 +77,7 @@ constexpr std::string_view kInfixSchema = R"JSON({
 // ship any postfix ops yet (PA4 will add `++`/`--`/`()`/`[]`), so we
 // need a dedicated schema to pin postfix behavior here.
 constexpr std::string_view kPostfixSchema = R"JSON({
-  "dssSchemaVersion": 2,
+  "dssSchemaVersion": 4,
   "language": { "name": "PrattPostfix", "version": "0.1.0" },
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -85,7 +94,16 @@ constexpr std::string_view kPostfixSchema = R"JSON({
   "shapes": {
     "root":       { "sequence": [{ "repeat": "stmt" }] },
     "stmt":       { "sequence": ["expression", "Semi"] },
-    "expression": { "expr": { "atom": "operand" } },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    },
     "operand":    { "alt": ["Identifier"] }
   }
 })JSON";
@@ -422,7 +440,7 @@ TEST(PrattWalker, HappyPathEmitsNoDiagnostics) {
 // is below the floor and is not consumed, so the assignment sits
 // outside the expression as a trailing token.
 constexpr std::string_view kMinPrecSchema = R"JSON({
-  "dssSchemaVersion": 2,
+  "dssSchemaVersion": 4,
   "language": { "name": "PrattMinPrec", "version": "0.1.0" },
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -439,7 +457,17 @@ constexpr std::string_view kMinPrecSchema = R"JSON({
   "shapes": {
     "root":       { "sequence": [{ "repeat": "stmt" }] },
     "stmt":       { "sequence": ["expression", { "optional": { "sequence": ["AssignOp", "Identifier"] } }, "Semi"] },
-    "expression": { "expr": { "atom": "operand", "minPrecedence": 20 } },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "minPrecedence": 20,
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    },
     "operand":    { "alt": ["Identifier"] }
   }
 })JSON";
@@ -491,7 +519,7 @@ TEST(PrattWalker, AltChoiceScanRoutesExprRuleThroughWalker) {
     // climbing — `binaryExpr` is absent and the tree has the
     // operator + operand as flat siblings.
     constexpr std::string_view kAltSchema = R"JSON({
-      "dssSchemaVersion": 2,
+      "dssSchemaVersion": 4,
       "language": { "name": "PrattAlt", "version": "0.1.0" },
       "tokens": {
         " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -507,7 +535,16 @@ TEST(PrattWalker, AltChoiceScanRoutesExprRuleThroughWalker) {
         "root":       { "sequence": [{ "repeat": "stmt" }] },
         "stmt":       { "sequence": ["body", "Semi"] },
         "body":       { "alt": ["expression"] },
-        "expression": { "expr": { "atom": "operand" } },
+        "expression": {
+          "expr": {
+            "atom": "operand",
+            "wrapperRules": {
+              "binary":  "binaryExpr",
+              "unary":   "unaryExpr",
+              "postfix": "postfixExpr"
+            }
+          }
+        },
         "operand":    { "alt": ["Identifier"] }
       }
     })JSON";
@@ -567,4 +604,136 @@ TEST(PrattWalkerDeath, ExceedingMaxExpressionDepthAborts) {
     };
     EXPECT_DEATH(run(),
         "expression recursion depth exceeded ParserConfig::maxExpressionDepth");
+}
+
+// ── 08.55: wrapperRules genericity pin ─────────────────────────────────────
+//
+// Drive the Pratt walker against a schema whose wrapperRules name the
+// frames `bExpr`/`uExpr`/`pExpr` — distinct from the c-subset names. The
+// walker reads the names from the schema's `expr.wrapperRules` block;
+// any hardcoded `binaryExpr`/`unaryExpr`/`postfixExpr` somewhere would
+// make this test fail because the wrapper frames in the resulting tree
+// would have the wrong rule.
+namespace {
+constexpr std::string_view kGenericWrapSchema = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "GenWrap", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "+":  [{ "kind": "PlusOp" }],
+    ";":  [{ "kind": "Semi"   }]
+  },
+  "operators": {
+    "groups": [
+      { "precedence": 65, "associativity": "left", "operators": ["+"] }
+    ]
+  },
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":       { "sequence": ["expression", "Semi"] },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "bExpr",
+          "unary":   "uExpr",
+          "postfix": "pExpr"
+        }
+      }
+    },
+    "operand":    { "alt": ["Identifier"] }
+  }
+})JSON";
+} // namespace
+
+TEST(PrattWalker, CustomWrapperRuleNamesDriveOperatorClimb) {
+    Tree t = parse(kGenericWrapSchema, "a + b;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    // The wrapper frame in the resulting tree carries the SCHEMA-DECLARED
+    // wrapper rule name `bExpr` — proving the walker read it from the
+    // language's `expr.wrapperRules` (no hardcoded engine names).
+    const std::string_view expected =
+        "rule:root\n"
+        "  rule:stmt\n"
+        "    rule:expression\n"
+        "      rule:bExpr\n"
+        "        rule:operand\n"
+        "          tok:\"a\"\n"
+        "        tok:\"+\"\n"
+        "        rule:operand\n"
+        "          tok:\"b\"\n"
+        "    tok:\";\"\n";
+    EXPECT_EQ(prettyPrint(t), expected);
+}
+
+// F16: end-to-end genericity test combining custom wrapperRules
+// (bExpr/uExpr/pExpr) AND custom numberStyle ($-prefixed hex with
+// `^` exponent and a `q` float suffix). Pin that both the wrapper
+// rule names AND the numeric literal kinds reach the tree, proving
+// the engine has no hardcoded grammar.
+namespace {
+constexpr std::string_view kGenericE2eSchema = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "GenE2E", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "+":  [{ "kind": "PlusOp" }],
+    ";":  [{ "kind": "Semi"   }]
+  },
+  "operators": {
+    "groups": [
+      { "precedence": 65, "associativity": "left", "operators": ["+"] }
+    ]
+  },
+  "numberStyle": {
+    "decimal": true,
+    "integerPrefixes": [
+      { "prefix": "$", "radix": 16, "digits": "0-9a-fA-F" }
+    ],
+    "exponent":      { "letters": ["^"], "signOptional": true },
+    "fractionPoint": ".",
+    "floatSuffixes": ["q"],
+    "emitKind":      { "integer": "IntLiteral", "float": "FloatLiteral" }
+  },
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":       { "sequence": ["expression", "Semi"] },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "bExpr",
+          "unary":   "uExpr",
+          "postfix": "pExpr"
+        }
+      }
+    },
+    "operand":    { "alt": ["IntLiteral", "FloatLiteral"] }
+  }
+})JSON";
+} // namespace
+
+TEST(PrattWalker, CustomWrapperRulesAndNumberStyleE2E) {
+    // `$10 + 2.5q;` — first literal exercises the `$` hex prefix
+    // (IntLiteral); second exercises the bare-decimal path with the
+    // custom `.` fraction point AND the `q` float suffix (FloatLiteral).
+    // The wrapper frame must be `bExpr` (NOT a hardcoded binaryExpr).
+    // Schema deliberately keeps decimal=false on prefix branches —
+    // bare-decimal path is enabled by the fractional/exponent presence.
+    Tree t = parse(kGenericE2eSchema, "$10 + 2.5q;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "expected clean parse; first diag: "
+        << (t.diagnostics().all().empty()
+                ? ""
+                : t.diagnostics().all()[0].actual);
+    const auto pp = prettyPrint(t);
+    EXPECT_NE(pp.find("rule:bExpr"), std::string::npos)
+        << "expected the custom wrapper rule `bExpr` in the tree";
+    EXPECT_NE(pp.find("tok:\"$10\""), std::string::npos)
+        << "expected `$10` to tokenize as a single IntLiteral";
+    EXPECT_NE(pp.find("tok:\"2.5q\""), std::string::npos)
+        << "expected `2.5q` to tokenize as a single FloatLiteral";
 }

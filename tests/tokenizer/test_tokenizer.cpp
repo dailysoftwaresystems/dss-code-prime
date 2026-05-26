@@ -134,7 +134,9 @@ TEST(Tokenizer, IdentifiersAcceptUnderscoreAndDigits) {
 
 
 TEST(Tokenizer, IntegerLiteral) {
-    auto h      = loadToy("12345");
+    // 08.55: numeric scanning is config-driven; toy has no `numberStyle`
+    // so we use c-subset which declares the full C-style block.
+    auto h      = loadCSubset("12345");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -144,7 +146,7 @@ TEST(Tokenizer, IntegerLiteral) {
 }
 
 TEST(Tokenizer, FloatLiteralWithFractionalPart) {
-    auto h      = loadToy("3.14");
+    auto h      = loadCSubset("3.14");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -152,7 +154,7 @@ TEST(Tokenizer, FloatLiteralWithFractionalPart) {
 }
 
 TEST(Tokenizer, FloatLiteralWithExponent) {
-    auto h      = loadToy("1e10");
+    auto h      = loadCSubset("1e10");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -160,7 +162,7 @@ TEST(Tokenizer, FloatLiteralWithExponent) {
 }
 
 TEST(Tokenizer, FloatLiteralWithSignedExponent) {
-    auto h      = loadToy("1.5e-3");
+    auto h      = loadCSubset("1.5e-3");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -168,7 +170,7 @@ TEST(Tokenizer, FloatLiteralWithSignedExponent) {
 }
 
 TEST(Tokenizer, FloatLiteralWithFSuffixPromotesIntToFloat) {
-    auto h      = loadToy("0f");
+    auto h      = loadCSubset("0f");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
@@ -177,7 +179,7 @@ TEST(Tokenizer, FloatLiteralWithFSuffixPromotesIntToFloat) {
 TEST(Tokenizer, BareENotConsumedAsExponentWhenNoDigitFollows) {
     // `1e+` is NOT a float — no digit after the sign. Tokenizer emits
     // exactly three tokens: IntLiteral("1"), Word("e"), Operator("+").
-    auto h      = loadToy("1e+");
+    auto h      = loadCSubset("1e+");
     auto result = lex(h);
     ASSERT_EQ(result.tokens.size(), 3u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
@@ -340,19 +342,39 @@ TEST(Tokenizer, MultipleIllegalCharsEmitSeparateTokensAndDiagnostics) {
     EXPECT_EQ(result.diags.size(), 3u);
 }
 
-TEST(Tokenizer, EmptyHexPrefixFallsBackToZeroPlusWord) {
-    // `0x` alone (no digit, no underscore, EOF after) must NOT be
-    // consumed as a hex literal. Tokenizer emits `0` (Int) then `x`
-    // (Word). Companion to ZeroFollowedByLetterIsNotHexUnlessLetterIsValidDigit
-    // for the EOF-after-prefix case.
+TEST(Tokenizer, BareHexPrefixAtEofIsMalformed) {
+    // `0x` at EOF — prefix matched, no body byte to consume. F7
+    // (08.55 remediation): emit exactly one P_MalformedNumber and
+    // consume the prefix as a malformed IntLiteral. The previous
+    // behavior silently split `0x` into `0` (IntLiteral) + `x`
+    // (Word), masking the user's typo.
     auto h      = loadCSubset("0x");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 2u);
+    ASSERT_EQ(result.tokens.size(), 1u);
     EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
-    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0");
-    EXPECT_EQ(result.tokens[1].coreKind, CoreTokenKind::Word);
-    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "x");
-    EXPECT_TRUE(result.diags.empty());
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x");
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
+}
+
+TEST(Tokenizer, BareBinaryPrefixAtEofIsMalformed) {
+    auto h      = loadCSubset("0b");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0b");
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
+}
+
+TEST(Tokenizer, BareOctalPrefixAtEofIsMalformed) {
+    auto h      = loadCSubset("0o");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0o");
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_MalformedNumber);
 }
 
 TEST(Tokenizer, HexPrefixFollowedByUnderscoreOnlyEmitsMalformedDiagnostic) {
@@ -1345,4 +1367,263 @@ TEST(Tokenizer, IdStartProbe_RawStringOpenerPushesMode) {
     EXPECT_EQ(rawA.schemaKind.v,
               schema->schemaTokens().find("RawChar").v)
         << "expected RawChar body token after `r\"`; modeOp must have fired";
+}
+
+// ── 08.55: numberStyle genericity pin ──────────────────────────────────────
+//
+// A synthetic, NON-C-style numberStyle drives scanNumber correctly. Tests
+// pin: `$` hex prefix, `^` exponent letter, `'` digit separator, the
+// Pascal-style `B` integer suffix, ``q`` float suffix, and a custom
+// fraction point. If any of these were hardcoded anywhere in the engine,
+// this test would tokenize incorrectly.
+namespace {
+constexpr std::string_view kGenericNumSchema = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "GenericNums", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "numberStyle": {
+    "decimal":         true,
+    "integerPrefixes": [
+      { "prefix": "$",  "radix": 16, "digits": "0-9a-fA-F" },
+      { "prefix": "%",  "radix": 2,  "digits": "01"        }
+    ],
+    "exponent":        { "letters": ["^"], "signOptional": false },
+    "fractionPoint":   ".",
+    "digitSeparator":  "'",
+    "integerSuffixes": ["B"],
+    "floatSuffixes":   ["q"],
+    "emitKind":        { "integer": "IntLiteral", "float": "FloatLiteral" }
+  },
+  "shapes": {
+    "root": { "sequence": [ "IntLiteral", "Semi" ] }
+  }
+})JSON";
+}
+
+TEST(Tokenizer, GenericNumberStyleHexPrefixDollar) {
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "" : loaded.error()[0].message);
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("$ff", "<gen>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    ASSERT_EQ(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "$ff");
+}
+
+TEST(Tokenizer, GenericNumberStyleCustomExponentLetter) {
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("1.5^3", "<gen>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    ASSERT_EQ(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "1.5^3");
+}
+
+TEST(Tokenizer, GenericNumberStyleApostropheSeparator) {
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("1'000'000", "<gen>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    ASSERT_EQ(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "1'000'000");
+}
+
+TEST(Tokenizer, GenericNumberStyleFloatSuffixPromotesKind) {
+    auto loaded = GrammarSchema::loadFromText(kGenericNumSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    // `42q` — q is a float suffix in this schema (NOT C-style).
+    auto src    = SourceBuffer::fromString("42q", "<gen>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    ASSERT_EQ(tokens.size(), 1u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+}
+
+// F1: `l`/`L` are integer suffixes (long / long long), NOT float
+// suffixes. An earlier 08.55 c-subset config listed `l`/`L` under
+// `floatSuffixes`, which silently promoted long integers to the
+// floating-literal kind — a regression vs. the hand-coded scanner.
+// The fix removes them from `floatSuffixes`; pin the corrected
+// behavior here (every L-suffixed integer stays an IntLiteral).
+TEST(Tokenizer, CSubsetLongIntegerSuffixesStayInteger) {
+    {
+        auto h      = loadCSubset("42L");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42L");
+    }
+    {
+        auto h      = loadCSubset("42l");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42l");
+    }
+    {
+        auto h      = loadCSubset("42LL");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42LL");
+    }
+    {
+        auto h      = loadCSubset("42ll");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "42ll");
+    }
+}
+
+TEST(Tokenizer, CSubsetFloatSuffixesPromoteToFloat) {
+    {
+        auto h      = loadCSubset("1.5f");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "1.5f");
+    }
+    {
+        auto h      = loadCSubset("1.5F");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "1.5F");
+    }
+    {
+        auto h      = loadCSubset("1.5e3");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "1.5e3");
+    }
+    {
+        auto h      = loadCSubset("1.5e3f");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "1.5e3f");
+    }
+}
+
+// F8: c-subset declares `0` (octal) prefix so `017` tokenizes as an
+// IntLiteral (octal 15), not decimal 17 + nothing. `0x17` continues
+// to tokenize as a single hex literal because the longer prefix wins
+// the declaration-order loop. `09` is malformed (8 is not a valid
+// octal digit, so the prefix arm sees no body digit and surfaces
+// P_MalformedNumber).
+TEST(Tokenizer, CSubsetBareZeroOctalPrefixWorks) {
+    {
+        auto h      = loadCSubset("017");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "017");
+        EXPECT_TRUE(result.diags.empty());
+    }
+    {
+        auto h      = loadCSubset("0x17");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u);
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), "0x17");
+        EXPECT_TRUE(result.diags.empty());
+    }
+}
+
+// F18: `signOptional: false` rejects a sign between the exponent
+// letter and digits. `2^+3` tokenizes as three tokens: IntLiteral `2`,
+// the schema-mapped `^` (XorOp in c-subset), IntLiteral `3`. Pin via
+// an inline schema since none of the shipped configs use the
+// non-default value.
+TEST(Tokenizer, NumberStyleSignOptionalFalseRejectsSign) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "SignTest", "version": "0.1.0", "fileExtensions": [".st"] },
+      "tokens": {
+        "+": [{ "kind": "PlusOp" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "numberStyle": {
+        "decimal": true,
+        "exponent": { "letters": ["^"], "signOptional": false },
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      },
+      "shapes": {
+        "root": { "sequence": ["IntLiteral", "Semi"] }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    auto src    = SourceBuffer::fromString("2^+3", "<sign>");
+    Tokenizer tk{src, schema};
+    auto [stream, _] = std::move(tk).tokenize();
+    std::vector<Token> tokens;
+    while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+    // Three tokens: `2`, `+`, `3`. The exponent letter `^` does NOT
+    // appear because signOptional=false rejects the `+` follow-up,
+    // so the exponent branch fails AND the trailing letter is left
+    // unconsumed (it then has no longest-match landing in this
+    // schema, so it falls into the illegal-char path — manifests as
+    // an Error token).
+    ASSERT_GE(tokens.size(), 3u);
+    EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+    EXPECT_EQ(textOf(*src, tokens[0]), "2");
+    // tokens[1] is the unmatched `^` — emitted as an Error
+    EXPECT_EQ(tokens[1].coreKind, CoreTokenKind::Error);
+    // tokens[2] is `+`
+    EXPECT_EQ(textOf(*src, tokens[2]), "+");
+}
+
+// F22: T-SQL numberStyle smoke test. `1.5e3` is a FloatLiteral; T-SQL
+// declares no integer-prefix block, so `0x10` is NOT one number.
+TEST(Tokenizer, TsqlNumberStyleSmoke) {
+    auto schemaR = GrammarSchema::loadShipped("tsql-subset");
+    ASSERT_TRUE(schemaR.has_value());
+    auto schema = *schemaR;
+    {
+        auto src = SourceBuffer::fromString("1.5e3", "<sql>");
+        Tokenizer tk{src, schema};
+        auto [stream, _] = std::move(tk).tokenize();
+        std::vector<Token> tokens;
+        while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+        ASSERT_EQ(tokens.size(), 1u);
+        EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+        EXPECT_EQ(textOf(*src, tokens[0]), "1.5e3");
+    }
+    {
+        auto src = SourceBuffer::fromString("0x10", "<sql>");
+        Tokenizer tk{src, schema};
+        auto [stream, _] = std::move(tk).tokenize();
+        std::vector<Token> tokens;
+        while (!stream.isAtEnd()) tokens.push_back(stream.advance());
+        // T-SQL declares no integer prefixes, so this is two tokens:
+        // IntLiteral `0` + Identifier-ish `x10` (a Word run).
+        ASSERT_GE(tokens.size(), 2u);
+        EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
+        EXPECT_EQ(textOf(*src, tokens[0]), "0");
+    }
 }

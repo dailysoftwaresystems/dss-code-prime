@@ -2,10 +2,13 @@
 
 #include "core/export.hpp"
 #include "core/types/compiled_shape.hpp"
+#include "core/types/import_config.hpp"
 #include "core/types/lexer_mode.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeExtensionDescriptor
+#include "core/types/number_style.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/semantic_config.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/schema_cursor.hpp"
 #include "core/types/schema_token_interner.hpp"
@@ -66,6 +69,39 @@ struct DSS_EXPORT ScopeMatch {
 static_assert(std::is_trivially_copyable_v<ScopeMatch>,
               "ScopeMatch must stay trivially copyable — copied through "
               "the candidate-filtering hot path in resolveMeaning.");
+
+// Pratt-walker wrapper rule names per `expr` shape (schema v4
+// `expr.wrapperRules`). Each `expr`-kind rule declares the three
+// names the walker will synthesize around operator-precedence
+// results — the engine no longer hardcodes `binaryExpr`/`unaryExpr`/
+// `postfixExpr`. The loader auto-interns the declared names and
+// stores their RuleIds here; the parser's Pratt walker reads
+// `GrammarSchema::exprWrapperRules(exprRule)` once per
+// walkExpression entry.
+struct DSS_EXPORT ExprWrapperRules {
+    RuleId binary;
+    RuleId unary;
+    RuleId postfix;
+
+    // All three RuleIds are valid AND pairwise-distinct. The walker
+    // tags frames by RuleId; a duplicate id would collide silently
+    // (e.g. both `binary` and `unary` interned to the same name and
+    // RuleId — Pratt frames meant for two different climb shapes
+    // would land in one bucket). The loader rejects duplicates up
+    // front (see `C_MissingWrapperRules` in grammar_schema_json.cpp);
+    // this predicate is the runtime safety net.
+    [[nodiscard]] bool valid() const noexcept {
+        return binary.valid() && unary.valid() && postfix.valid()
+            && binary.v != unary.v
+            && unary.v  != postfix.v
+            && binary.v != postfix.v;
+    }
+};
+
+static_assert(std::is_trivially_copyable_v<ExprWrapperRules>,
+              "ExprWrapperRules must stay trivially copyable — read once "
+              "per walkExpression call and copied by value into the Pratt "
+              "wrapper bundle.");
 
 // One resolved meaning of a lexeme, sourced from a single entry under
 // the config's `tokens` map. A lexeme may have several meanings — the
@@ -220,6 +256,49 @@ struct DSS_EXPORT GrammarSchemaData {
     // additive in schema v3). Empty for v1/v2 configs. Registered into a CU's
     // TypeRegistry at CU build time via registerSchemaTypeExtensions.
     std::vector<TypeExtensionDescriptor>              typeExtensions;
+
+    // Artifact profiles this language supports (plan 06 AP1; optional
+    // top-level `artifactProfiles[]`, additive in schema v4). Each entry is
+    // a registered profile name (cli/gui/lib/staticlib/script/sproc/
+    // transpile/shader/hdl). Empty when the field is absent. AP1 is the
+    // schema-field + loader-validation slice ONLY — no codegen/driver
+    // consumes it yet; the driver-enforcement (AP2+) reads this set to
+    // reject a project asking for an unsupported profile.
+    std::vector<std::string>                          artifactProfiles;
+
+    // Config-driven import resolution (schema v4 `imports` block). Default
+    // `ImportStrategy::None` (no cross-refs) for v1/v2/v3 configs and any v4
+    // config that omits the block. Consumed by ConfigDrivenImportResolver —
+    // the single language-agnostic import engine.
+    ImportConfig                                      imports;
+
+    // Pratt-walker wrapper rule ids per `expr` shape (08.55 cleanup;
+    // schema v4 `expr.wrapperRules`). Keyed by the expr rule's RuleId
+    // value. The loader populates this BEFORE shape compile so the
+    // shape-existence skip-list and the Pratt walker both read from
+    // the same authoritative table. Empty for languages that declare
+    // no `expr` shapes.
+    std::unordered_map<std::uint32_t, ExprWrapperRules> exprWrapperRules;
+
+    // Set of every wrapper RuleId synthesized by the Pratt walker
+    // (union across `exprWrapperRules`). The shape-existence
+    // validator (`validateOperatorBodyRules`) uses this to skip
+    // interned rule names that have no compiled body BY DESIGN —
+    // walker-managed frames, not user-declared shapes.
+    std::unordered_set<std::uint32_t>                 wrapperRuleIds;
+
+    // Numeric-literal lexical grammar (08.55 cleanup; schema v4
+    // `numberStyle`). nullopt for languages that declare no numeric
+    // literals; required (loader emits `C_MissingNumberStyle`)
+    // when the language declares `IntLiteral`/`FloatLiteral` tokens.
+    std::optional<NumberStyle>                        numberStyle;
+
+    // Per-language semantic config (plan 08.6; schema v4 `semantics`
+    // block). Empty / default-constructed when the language omits the
+    // block — the analyzer then performs no semantic analysis for that
+    // language. Read-only after construction; the loader is the only
+    // writer.
+    SemanticConfig                                    semantics;
 };
 
 } // namespace detail
@@ -415,6 +494,18 @@ public:
     // Empty for v1/v2 configs. Consumed by registerSchemaTypeExtensions.
     [[nodiscard]] std::span<TypeExtensionDescriptor const> typeExtensions() const noexcept;
 
+    // Artifact profiles this language supports (plan 06 AP1; schema v4
+    // optional `artifactProfiles[]`). Empty when the field is absent. Each
+    // entry is a loader-validated registered profile name. Consumed by the
+    // driver (AP2+) to reject a project requesting an unsupported profile.
+    [[nodiscard]] std::span<std::string const> artifactProfiles() const noexcept;
+
+    // Config-driven import resolution (schema v4 `imports` block). Default
+    // `ImportStrategy::None` when the config omits the block. Consumed by
+    // chooseResolver/ConfigDrivenImportResolver — the single language-agnostic
+    // import engine; NO engine code branches on the language name.
+    [[nodiscard]] ImportConfig const& imports() const noexcept;
+
     // `expr`-shape introspection. `isExprRule` is true when the rule's
     // body was declared as `{ "expr": { "atom": ..., "minPrecedence": ... } }`.
     // For such rules `exprAtom` returns the operand rule and
@@ -423,6 +514,31 @@ public:
     [[nodiscard]] bool         isExprRule(RuleId rule)        const noexcept;
     [[nodiscard]] RuleId       exprAtom(RuleId rule)          const noexcept;
     [[nodiscard]] std::int32_t exprMinPrecedence(RuleId rule) const noexcept;
+
+    // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
+    // for `rule`. The loader auto-interned the declared names and
+    // validated all three were present, so for an `isExprRule(rule)`
+    // the returned struct is `.valid()`. For non-expr rules every
+    // field is `InvalidRule`. Read once per `walkExpression` entry —
+    // the walker bundles the three ids into its `PrattRules` and
+    // threads them through the climb.
+    [[nodiscard]] ExprWrapperRules exprWrapperRules(RuleId rule) const noexcept;
+
+    // Numeric-literal lexical grammar declared by the language's
+    // `numberStyle` block. Returns nullptr when no block was
+    // declared — the tokenizer then knows the language has no
+    // numeric literals (e.g. toy). The loader rejects schemas that
+    // declare `IntLiteral`/`FloatLiteral` tokens without a block
+    // (`C_MissingNumberStyle`), so any reachable scanNumber call
+    // sees a non-null pointer.
+    [[nodiscard]] NumberStyle const* numberStyle() const noexcept;
+
+    // Per-language semantic config (plan 08.6; schema v4 `semantics`).
+    // Default-constructed (every facet empty) when the language omits
+    // the block — the analyzer then performs zero semantic analysis
+    // for that language and the model produces no symbols/types/
+    // diagnostics. Read-only; the loader is the only writer.
+    [[nodiscard]] SemanticConfig const& semantics() const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

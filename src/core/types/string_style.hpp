@@ -43,4 +43,23 @@ struct DSS_EXPORT StringStyle {
     std::string  tagPattern;                    // non-empty ⇒ dynamic delimiter tag
 };
 
+// Decode the inner text of a bracket-quoted identifier whose opener `[`
+// begins at byte `open` in `src` (e.g. tsql's `[Orders]` → "Orders").
+// The opener token spans only the `[`; the body bytes are off-grammar
+// default-mode tokens, so the content is read directly from the source
+// slice rather than from the parse tree.
+//
+// This MATCHES the tokenizer's `EscapeKind::DoubledDelimiter` rule for the
+// `[` opener (tsql-subset declares `escapeKind: doubled-delimiter,
+// endsAt: "]"`): a doubled `]]` inside the body is an escaped literal `]`,
+// NOT the close — so `[a]]b]` decodes to the single identifier `a]b`. A
+// lone `]` (next byte is not `]`) is the close.
+//
+// Both the semantic engine (identifier extraction) and the import resolver
+// (cross-file name matching) decode bracket-ids; sharing one implementation
+// keeps them byte-identical with the tokenizer. Returns empty when the
+// slice is not a well-formed `[...]` (no opener at `open`, or no close).
+[[nodiscard]] DSS_EXPORT std::string
+bracketInnerText(std::string_view src, std::size_t open);
+
 } // namespace dss

@@ -45,7 +45,12 @@ src/shader/
 
 ### 2.2 HIR shader extensions
 
-Added to `09-hir-plan` §2.2's `HirKind` enum (these are first-class HIR kinds, not lattice extensions):
+**Two distinct registration paths — do not conflate them:**
+
+- Shader **types** (`Sampler`, `Texture<>`, `UAV<>`, `ConstantBuffer<>`, `WorkgroupShared<>`): registered via the language schema's `typeExtensions[]` block (v3, SP2) into the `TypeRegistry` (per [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) §2.2). Listed in the "Shader-shape extensions" table below.
+- Shader **HIR kinds** (`WorkgroupBarrier`, `DerivativeX`/`Y`, `TextureSample`, `TextureLoad`, `ImageStore`, `AtomicOp`, etc.): registered via the language schema's `hirLowering` block (v4, planned per [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) §2.5) into the `HirKindRegistry` (`HirKind ≥ 256`). They are **registered HIR extension kinds, not hardcoded core HIR enum members** — the open core + per-language registered-extensions pattern from `09-hir-plan` §2.2 applies. Listed in the table immediately below.
+
+The shader-extension HIR kinds (registered via `hirLowering` per the language schema, into the `HirKindRegistry`):
 
 | Kind | Purpose |
 |---|---|
