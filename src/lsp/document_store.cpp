@@ -66,4 +66,25 @@ DocumentStore::diagnosticsFor(std::string const& uri) const {
     return it->second.diagnostics;
 }
 
+bool DocumentStore::setSemanticModel(
+    std::string const& uri,
+    std::uint32_t expectedGen,
+    std::shared_ptr<dss::SemanticModel const> model) {
+    std::lock_guard lk{mutex_};
+    auto it = docs_.find(uri);
+    if (it == docs_.end()) return false;
+    if (it->second.parseGeneration != expectedGen) return false;
+    it->second.semanticModel      = std::move(model);
+    it->second.semanticGeneration = expectedGen;
+    return true;
+}
+
+std::shared_ptr<dss::SemanticModel const>
+DocumentStore::semanticModelFor(std::string const& uri) const {
+    std::lock_guard lk{mutex_};
+    auto it = docs_.find(uri);
+    if (it == docs_.end()) return nullptr;
+    return it->second.semanticModel;
+}
+
 } // namespace dss::lsp

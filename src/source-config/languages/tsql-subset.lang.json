@@ -268,13 +268,34 @@
 
     "operand": {
       "alt": [
-        "qualifiedName",
+        "nameOrCall",
         "IntLiteral",
         "StringStart",
         "UnicodeStringStart",
         "NullKw",
         { "sequence": [ "MinusOp", "operand" ] },
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
+      ]
+    },
+
+    "nameOrCall": {
+      "alt": [ "callExpr", "qualifiedName" ],
+      "speculative": true
+    },
+
+    "callExpr": {
+      "sequence": [
+        "Identifier",
+        "ParenOpen",
+        { "optional": "callArgList" },
+        "ParenClose"
+      ]
+    },
+
+    "callArgList": {
+      "sequence": [
+        "expression",
+        { "repeat": { "sequence": [ "Comma", "expression" ] } }
       ]
     }
   },
@@ -287,6 +308,12 @@
     ],
     "references": [
       { "rule": "qualifiedName", "nameMatch": "lastIdentifier" }
+    ],
+    "callRules": [
+      { "rule": "callExpr", "callee": 0, "args": 2 }
+    ],
+    "builtinFunctions": [
+      { "name": "COALESCE", "result": "I32", "variadic": true }
     ],
     "literalTypes": [
       { "literal": "IntLiteral", "core": "I32" }

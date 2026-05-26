@@ -38,4 +38,10 @@ TypeId SemanticModel::typeAt(NodeId id) const {
     return p ? *p : InvalidType;
 }
 
+std::span<NodeId const> SemanticModel::usesOf(SymbolId symbol) const noexcept {
+    auto it = usesBySymbol_.find(symbol.v);
+    if (it == usesBySymbol_.end()) return {};
+    return std::span<NodeId const>{it->second};
+}
+
 } // namespace dss

@@ -10,5 +10,12 @@ dss_add_test(NAME lsp/test_schema_cache         SOURCES test_schema_cache.cpp)
 dss_add_test(NAME lsp/test_diagnostic_translator SOURCES test_diagnostic_translator.cpp)
 dss_add_test(NAME lsp/test_lsp_server_e2e       SOURCES test_lsp_server_e2e.cpp)
 dss_add_test(NAME lsp/test_lsp_replay           SOURCES test_lsp_replay.cpp)
+dss_add_test(NAME lsp/test_lsp_semantic         SOURCES test_lsp_semantic.cpp)
 target_link_libraries(dss_lsp_test_lsp_server_e2e PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(dss_lsp_test_lsp_replay     PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(dss_lsp_test_lsp_semantic   PRIVATE nlohmann_json::nlohmann_json)
+# lsp_semantic uses semantic_test_fixture.hpp (FIX 4: real SemanticModel
+# instead of a reinterpret_cast-fabricated shared_ptr for the stale-model
+# test). Mirror the include path the semantic suite already wires up.
+target_include_directories(dss_lsp_test_lsp_semantic
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

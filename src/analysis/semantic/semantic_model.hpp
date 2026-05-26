@@ -10,6 +10,7 @@
 #include "core/types/type_lattice/type_lattice.hpp"
 
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -58,6 +59,13 @@ struct DSS_EXPORT SymbolRecord {
     // The DeclarationRule's `kind` — Variable/Function/Table/Type. Read by
     // type-resolution (a Function symbol carries a FnSig type, etc.).
     DeclarationKind kind = DeclarationKind::Variable;
+    // SE4 const-correctness: set when the decl's `constMarker` token was
+    // found in the type subtree. A reassignment of a const symbol emits
+    // S_ConstViolation.
+    bool            isConst = false;
+    // SE6: set on a builtin-function symbol declared `variadic` — the
+    // call-check skips arg-count enforcement for it.
+    bool            variadicBuiltin = false;
 };
 
 class DSS_EXPORT SemanticModel {
@@ -70,14 +78,16 @@ public:
                   std::vector<SymbolRecord>              symbols,
                   UnitAttribute<SymbolId>                nodeToSymbol,
                   UnitAttribute<TypeId>                  nodeToType,
-                  DiagnosticReporter                     diagnostics) noexcept
+                  DiagnosticReporter                     diagnostics,
+                  std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
           symbols_(std::move(symbols)),
           nodeToSymbol_(std::move(nodeToSymbol)),
           nodeToType_(std::move(nodeToType)),
-          diagnostics_(std::move(diagnostics)) {}
+          diagnostics_(std::move(diagnostics)),
+          usesBySymbol_(std::move(usesBySymbol)) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -113,6 +123,12 @@ public:
     [[nodiscard]] SymbolId symbolAt(NodeId id) const;
     [[nodiscard]] TypeId   typeAt(NodeId id)   const;
 
+    // Reverse use-index (SE7): every NodeId that resolved to `symbol`
+    // during Pass 2 (the symbol's USE sites — NOT its declaration name
+    // node). Returns an empty span for an unknown / never-used symbol.
+    // Powers LSP references / rename.
+    [[nodiscard]] std::span<NodeId const> usesOf(SymbolId symbol) const noexcept;
+
     // The full attributes — convenient for tooling / forEach iteration.
     [[nodiscard]] UnitAttribute<SymbolId> const& nodeToSymbol() const noexcept { return nodeToSymbol_; }
     [[nodiscard]] UnitAttribute<TypeId>   const& nodeToType()   const noexcept { return nodeToType_; }
@@ -125,6 +141,8 @@ private:
     UnitAttribute<SymbolId>                nodeToSymbol_;
     UnitAttribute<TypeId>                  nodeToType_;
     DiagnosticReporter                     diagnostics_;
+    // SymbolId.v → its USE-site NodeIds. Built once during analyze().
+    std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol_;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

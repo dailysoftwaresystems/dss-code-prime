@@ -12,6 +12,18 @@
 using namespace dss;
 using namespace dss::sem_test;
 
+namespace {
+// Count symbols that originate from a tree (user-declared), excluding the
+// CU-wide builtin functions (SE6) which carry an invalid `tree`.
+[[nodiscard]] std::size_t userSymbolCount(SemanticModel const& model) {
+    std::size_t n = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].tree.valid()) ++n;
+    }
+    return n;
+}
+} // namespace
+
 // CREATE TABLE → one symbol minted, kind == DeclarationKind::Table.
 TEST(SemanticAnalyzerTsql, CreateTableMintsTableSymbol) {
     auto cu = buildShippedUnit("tsql-subset", {
@@ -19,10 +31,14 @@ TEST(SemanticAnalyzerTsql, CreateTableMintsTableSymbol) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    ASSERT_EQ(model.symbols().size() - 1, 1u);
-    auto const& rec = model.symbols()[1];
-    EXPECT_EQ(rec.name, "Customers");
-    EXPECT_EQ(rec.kind, DeclarationKind::Table);
+    ASSERT_EQ(userSymbolCount(model), 1u);
+    SymbolRecord const* rec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].tree.valid()) rec = &model.symbols()[i];
+    }
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(rec->name, "Customers");
+    EXPECT_EQ(rec->kind, DeclarationKind::Table);
 }
 
 // `dbo.Customers` in a CREATE TABLE — the `lastIdentifier` matcher
@@ -33,8 +49,13 @@ TEST(SemanticAnalyzerTsql, LastIdentifierMatcherExtractsRightmost) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    ASSERT_EQ(model.symbols().size() - 1, 1u);
-    EXPECT_EQ(model.symbols()[1].name, "Orders");
+    ASSERT_EQ(userSymbolCount(model), 1u);
+    SymbolRecord const* rec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].tree.valid()) rec = &model.symbols()[i];
+    }
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(rec->name, "Orders");
 }
 
 // Cross-statement (SAME tree): a CREATE TABLE and a SELECT referencing
@@ -84,8 +105,9 @@ TEST(SemanticAnalyzerTsql, CrossFileSameNameTablesDoNotCollide) {
     auto model = analyze(cu);
     // Per-tree-root isolation: NOT a redeclaration.
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
-    // Two independent symbols minted in two distinct tree-root scopes.
-    EXPECT_EQ(model.symbols().size() - 1, 2u);
+    // Two independent symbols minted in two distinct tree-root scopes
+    // (the CU-wide COALESCE builtin is excluded by userSymbolCount).
+    EXPECT_EQ(userSymbolCount(model), 2u);
 }
 
 // Two CREATE TABLEs with the same name in the same CU → exactly one
@@ -108,6 +130,35 @@ TEST(SemanticAnalyzerTsql, DuplicateCreateTableEmitsRedecl) {
     EXPECT_TRUE(sawRelated);
 }
 
+// SE6: COALESCE is a config-declared VARIADIC builtin function bound into
+// a CU-wide builtins scope. A call `COALESCE(...)` with any arity resolves
+// as callable (no S_NotCallable, no S_ArgCountMismatch).
+TEST(SemanticAnalyzerTsql, CoalesceBuiltinIsVariadicCallable) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE T (a INT);"
+        "SELECT COALESCE(a, a, a) FROM T;",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotCallable), 0u)
+        << "COALESCE must resolve to a callable builtin FnSig";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ArgCountMismatch), 0u)
+        << "a variadic builtin accepts any arity";
+}
+
+// SE6: calling a NON-function symbol (a table) → S_NotCallable.
+TEST(SemanticAnalyzerTsql, CallingTableSymbolIsNotCallable) {
+    // `T(a)` in expression position: T is a Table-kind symbol (not a
+    // FnSig), so calling it emits S_NotCallable.
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE T (a INT);"
+        "SELECT T(a) FROM T;",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotCallable), 1u);
+}
+
 // SELECT against a table that doesn't exist → exactly one
 // S_UndeclaredIdentifier; the table name (last identifier) is in
 // `actual`.
@@ -123,4 +174,44 @@ TEST(SemanticAnalyzerTsql, MissingTableEmitsUndeclared) {
             EXPECT_EQ(d.actual, "Ghosts");
         }
     }
+}
+
+// SE6 (tsql): a call to an unknown function → an S_UndeclaredIdentifier
+// on the callee. tsql's `callExpr` callee is a bare `Identifier` token
+// NOT covered by the `qualifiedName` reference rule, so the engine's
+// checkCall path is the one that has to be loud about the unresolved
+// callee — otherwise `BOGUS(...)` would silently produce zero call-
+// related diagnostics. The arg `a` (a table column) is independently
+// undeclared in this SE-era model — so the engine emits one for `BOGUS`
+// and one for `a`. We assert exactly the BOGUS undeclared is present.
+TEST(SemanticAnalyzerTsql, UnknownFunctionCallEmitsUndeclared) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE T (a INT);"
+        "SELECT BOGUS(a) FROM T;",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    std::size_t bogusCount = 0;
+    ParseDiagnostic const* bogusDiag = nullptr;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_UndeclaredIdentifier
+            && d.actual == "BOGUS") {
+            ++bogusCount;
+            bogusDiag = &d;
+        }
+    }
+    EXPECT_EQ(bogusCount, 1u)
+        << "the unknown callee must produce an S_UndeclaredIdentifier "
+           "with actual == 'BOGUS'";
+    // Pin the BYTE offsets of the BOGUS token. The two source string
+    // literals concat to:
+    //     "CREATE TABLE T (a INT);SELECT BOGUS(a) FROM T;"
+    // `CREATE TABLE T (a INT);` is 23 bytes (offsets 0..22), then
+    // `SELECT ` adds 7 (23..29), so `BOGUS` spans offsets 30..34 — i.e.
+    // a half-open span [30, 35). The engine emits the diagnostic on the
+    // callee token's span; pinning these here catches any future
+    // regression that drifts the emit point off the callee leaf.
+    ASSERT_NE(bogusDiag, nullptr);
+    EXPECT_EQ(bogusDiag->span.start(), 30u);
+    EXPECT_EQ(bogusDiag->span.end(),   35u);
 }

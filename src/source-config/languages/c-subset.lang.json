@@ -148,10 +148,11 @@
   "syncTokens": ["EndStatement", "BlockClose"],
 
   "keywords": [
-    { "word": "void",   "kind": "VoidKeyword"   },
-    { "word": "int",    "kind": "IntKeyword"    },
-    { "word": "char",   "kind": "CharKeyword"   },
-    { "word": "const",  "kind": "ConstKeyword"  },
+    { "word": "void",    "kind": "VoidKeyword"    },
+    { "word": "int",     "kind": "IntKeyword"     },
+    { "word": "char",    "kind": "CharKeyword"    },
+    { "word": "const",   "kind": "ConstKeyword"   },
+    { "word": "typedef", "kind": "TypedefKeyword" },
 
     { "word": "if",      "kind": "IfKeyword"      },
     { "word": "else",    "kind": "ElseKeyword"    },
@@ -173,9 +174,30 @@
     "topLevel": {
       "alt": [
         "includeDirective",
-        { "sequence": [ "typeRef", "Identifier", "topLevelTail" ] },
+        "typedefDecl",
+        "topLevelDecl",
         "externDecl"
       ]
+    },
+
+    "topLevelDecl": {
+      "sequence": [ "typeRef", "Identifier", "topLevelDeclTail" ]
+    },
+
+    "topLevelDeclTail": {
+      "alt": [ "funcDefTail", "varDeclTail" ]
+    },
+
+    "funcDefTail": {
+      "sequence": [ "funcParams", "block" ]
+    },
+
+    "funcParams": {
+      "sequence": [ "ParenOpen", { "optional": "paramList" }, "ParenClose" ]
+    },
+
+    "typedefDecl": {
+      "sequence": [ "TypedefKeyword", "typeRef", "Identifier", "EndStatement" ]
     },
 
     "includeDirective": {
@@ -200,17 +222,6 @@
             "EndStatement"
         ] },
         "varDeclTail"
-      ]
-    },
-
-    "topLevelTail": { "alt": [ "funcTail", "varDeclTail" ] },
-
-    "funcTail": {
-      "sequence": [
-        "ParenOpen",
-        { "optional": "paramList" },
-        "ParenClose",
-        "block"
       ]
     },
 
@@ -391,13 +402,32 @@
   "semantics": {
     "identifierToken": "Identifier",
     "declarations": [
-      { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable" },
-      { "rule": "param",       "name": 1, "type": 0, "kind": "variable" }
+      { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
+        "constMarker": "ConstKeyword" },
+      { "rule": "param",       "name": 1, "type": 0, "kind": "variable",
+        "constMarker": "ConstKeyword" },
+      { "rule": "topLevelDecl", "name": 1, "type": 0, "kind": "variable",
+        "constMarker": "ConstKeyword",
+        "kindByChild": {
+          "childPath": [2, 0],
+          "whenRule": "funcDefTail",
+          "whenKind": "function",
+          "paramsPath": [0],
+          "bodyPath":   [1]
+        } },
+      { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" }
     ],
     "references": [
       { "rule": "operand" }
     ],
-    "scopes": [ "block" ],
+    "scopes": [ "block", "funcDefTail" ],
+    "assignments": [
+      { "rule": "binaryExpr", "operatorToken": "AssignOp", "lhs": 0, "rhs": 2 }
+    ],
+    "callRules": [
+      { "rule": "postfixExpr", "callee": 0, "args": 2,
+        "operatorToken": "ParenOpen" }
+    ],
     "builtinTypes": [
       { "name": "int",  "core": "I32"  },
       { "name": "char", "core": "Char" },

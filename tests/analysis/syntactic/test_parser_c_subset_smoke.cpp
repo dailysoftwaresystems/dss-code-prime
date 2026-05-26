@@ -476,21 +476,26 @@ TEST(ParserCSubsetSmoke, TopLevelArrayDeclParses) {
 
     const NodeId tl = findFirstNodeWithRule(t, "topLevel");
     ASSERT_NE(tl, NodeId{});
+    // SE6 reshaped the top-level decl: `topLevel` now wraps a named
+    // `topLevelDecl` (shared `typeRef Identifier` prefix) whose
+    // `topLevelDeclTail` splits func-vs-var (LL(1), funcDefTail FIRST=`(`
+    // vs varDeclTail FIRST=`[`/`=`/`;`).
     constexpr std::string_view kExpected =
         "rule:topLevel\n"
-        "  rule:typeRef\n"
-        "    rule:typeBase\n"
-        "      tok:\"int\"\n"
-        "  tok:\"a\"\n"
-        "  rule:topLevelTail\n"
-        "    rule:varDeclTail\n"
-        "      rule:arrayDeclSuffix\n"
-        "        tok:\"[\"\n"
-        "        rule:expression\n"
-        "          rule:operand\n"
-        "            tok:\"10\"\n"
-        "        tok:\"]\"\n"
-        "      tok:\";\"\n";
+        "  rule:topLevelDecl\n"
+        "    rule:typeRef\n"
+        "      rule:typeBase\n"
+        "        tok:\"int\"\n"
+        "    tok:\"a\"\n"
+        "    rule:topLevelDeclTail\n"
+        "      rule:varDeclTail\n"
+        "        rule:arrayDeclSuffix\n"
+        "          tok:\"[\"\n"
+        "          rule:expression\n"
+        "            rule:operand\n"
+        "              tok:\"10\"\n"
+        "          tok:\"]\"\n"
+        "        tok:\";\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, tl), kExpected);
 }
 

@@ -144,6 +144,7 @@ enum class DiagnosticCode : std::uint16_t {
     S_NotCallable                 = 0xE004,
     S_ArgCountMismatch            = 0xE005,
     S_UnknownType                 = 0xE006,
+    S_ConstViolation              = 0xE007,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

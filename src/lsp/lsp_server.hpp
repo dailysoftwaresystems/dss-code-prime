@@ -67,6 +67,17 @@ private:
     [[nodiscard]] std::optional<std::string> handleInitialize_(Request const& req);
     [[nodiscard]] std::optional<std::string> handleShutdown_(Request const& req);
 
+    // Semantic request handlers (SE7). Each resolves the document's cached
+    // SemanticModel and maps the request position onto the AST/symbol
+    // tables. Returns the LSP-spec default (null / []) when no model is
+    // available or the position resolves to nothing.
+    [[nodiscard]] std::optional<std::string> handleHover_(Request const& req);
+    [[nodiscard]] std::optional<std::string> handleDefinition_(Request const& req);
+    [[nodiscard]] std::optional<std::string> handleReferences_(Request const& req);
+    [[nodiscard]] std::optional<std::string> handleRename_(Request const& req);
+    [[nodiscard]] std::optional<std::string> handleCompletion_(Request const& req);
+    [[nodiscard]] std::optional<std::string> handleSignatureHelp_(Request const& req);
+
     // Notification handlers.
     void handleInitialized_(Notification const& n);
     void handleExit_(Notification const& n);

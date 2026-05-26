@@ -75,6 +75,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_NotCallable:              return "S_NotCallable";
         case DiagnosticCode::S_ArgCountMismatch:         return "S_ArgCountMismatch";
         case DiagnosticCode::S_UnknownType:              return "S_UnknownType";
+        case DiagnosticCode::S_ConstViolation:           return "S_ConstViolation";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

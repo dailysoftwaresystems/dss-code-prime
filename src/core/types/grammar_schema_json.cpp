@@ -2806,6 +2806,41 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 return std::nullopt;
             };
 
+            // Shared "required, non-negative, in-range, integer" reader for
+            // visible-child indices on the new SE4-SE7 facets (assignments,
+            // callRules, kindByChild). Out param + boolean ok so the caller
+            // can short-circuit when any facet field is malformed without
+            // partially-pushing the entry. Mirrors the readIndex closure in
+            // the declarations loader but for REQUIRED slots.
+            auto const readReqIndex = [&](json const& entry, char const* key,
+                                          std::string const& path,
+                                          std::uint32_t& out, bool& ok) {
+                if (!entry.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              path + "/" + key,
+                              std::format("'{}' visible-child index is required",
+                                          key));
+                    ok = false;
+                    return;
+                }
+                if (!entry.at(key).is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/" + key,
+                              std::format("'{}' must be a non-negative integer", key));
+                    ok = false;
+                    return;
+                }
+                auto v = entry.at(key).get<std::int64_t>();
+                if (v < 0 || v > std::numeric_limits<std::int32_t>::max()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/" + key,
+                              std::format("'{}' visible-child index out of range", key));
+                    ok = false;
+                    return;
+                }
+                out = static_cast<std::uint32_t>(v);
+            };
+
             // ── declarations ──
             if (sem.contains("declarations")) {
                 json const& arr = sem.at("declarations");
@@ -2858,6 +2893,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         readIndex("name",   rule.nameChild);
                         readIndex("type",   rule.typeChild);
                         readIndex("init",   rule.initChild);
+                        readIndex("params", rule.paramsChild);
+                        readIndex("body",   rule.bodyChild);
+
+                        // SE4: optional const-marker token. A bad token
+                        // name is C_UnknownToken; the symbol is still
+                        // minted (just never marked const).
+                        if (entry.contains("constMarker")) {
+                            if (!entry.at("constMarker").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/constMarker",
+                                          "'constMarker' must be a string");
+                            } else {
+                                auto const cm = entry.at("constMarker").get<std::string>();
+                                if (!data.schemaTokens->contains(cm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              path + "/constMarker",
+                                              std::format("'declarations[{}].constMarker' "
+                                                          "references unknown token kind '{}'",
+                                                          i, cm));
+                                } else {
+                                    rule.constMarker = data.schemaTokens->find(cm);
+                                }
+                            }
+                        }
 
                         if (entry.contains("kind")) {
                             if (!entry.at("kind").is_string()) {
@@ -2896,6 +2955,163 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 }
                             }
                         }
+
+                        // kindByChild — optional kind-discriminator. Lets a
+                        // single declaration shape decide its effective
+                        // `kind` by inspecting a child sub-rule. Schema:
+                        //   { "child": <int>, "whenRule": "<ruleName>",
+                        //     "whenKind": "<kind>",
+                        //     "paramsPath": [n,m,...]?,
+                        //     "bodyPath":   [n,m,...]? }
+                        if (entry.contains("kindByChild")) {
+                            json const& k = entry.at("kindByChild");
+                            const auto kPath = path + "/kindByChild";
+                            if (!k.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, kPath,
+                                          "'kindByChild' must be an object");
+                            } else {
+                                KindDiscriminator disc;
+                                bool dOk = true;
+                                // Accept EITHER a single `child` int OR a
+                                // `childPath` array; presence of both is a
+                                // config bug. At least one is required so
+                                // the discriminator has something to
+                                // descend.
+                                const bool hasChild     = k.contains("child");
+                                const bool hasChildPath = k.contains("childPath");
+                                if (hasChild && hasChildPath) {
+                                    coll.emit(DiagnosticCode::C_ConflictingField,
+                                              kPath,
+                                              "specify either 'child' (single index) "
+                                              "or 'childPath' (array), not both");
+                                    dOk = false;
+                                } else if (!hasChild && !hasChildPath) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              kPath,
+                                              "'kindByChild' requires 'child' (single "
+                                              "index) or 'childPath' (array of indices)");
+                                    dOk = false;
+                                } else if (hasChild) {
+                                    std::uint32_t idx = 0;
+                                    readReqIndex(k, "child", kPath, idx, dOk);
+                                    if (dOk) disc.childPath.push_back(idx);
+                                } else {
+                                    json const& cp = k.at("childPath");
+                                    if (!cp.is_array()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  kPath + "/childPath",
+                                                  "'childPath' must be an array of "
+                                                  "non-negative integers");
+                                        dOk = false;
+                                    } else {
+                                        for (auto const& e : cp) {
+                                            if (!e.is_number_integer()) {
+                                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                          kPath + "/childPath",
+                                                          "each 'childPath' entry must "
+                                                          "be a non-negative integer");
+                                                dOk = false;
+                                                break;
+                                            }
+                                            auto v = e.get<std::int64_t>();
+                                            if (v < 0
+                                                || v > std::numeric_limits<std::int32_t>::max()) {
+                                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                          kPath + "/childPath",
+                                                          "'childPath' entry out of range");
+                                                dOk = false;
+                                                break;
+                                            }
+                                            disc.childPath.push_back(
+                                                static_cast<std::uint32_t>(v));
+                                        }
+                                    }
+                                }
+                                if (!k.contains("whenRule")
+                                    || !k.at("whenRule").is_string()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              kPath + "/whenRule",
+                                              "'whenRule' is required and must be a string");
+                                    dOk = false;
+                                } else {
+                                    disc.whenRuleName =
+                                        k.at("whenRule").get<std::string>();
+                                    if (!data.rules->contains(disc.whenRuleName)) {
+                                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                                  kPath + "/whenRule",
+                                                  std::format("'kindByChild.whenRule' "
+                                                              "references unknown shape '{}'",
+                                                              disc.whenRuleName));
+                                        dOk = false;
+                                    } else {
+                                        disc.whenRule = data.rules->find(disc.whenRuleName);
+                                    }
+                                }
+                                if (k.contains("whenKind")) {
+                                    if (!k.at("whenKind").is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  kPath + "/whenKind",
+                                                  "'whenKind' must be a string");
+                                        dOk = false;
+                                    } else {
+                                        auto wk = parseKind(
+                                            k.at("whenKind").get<std::string>());
+                                        if (!wk) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      kPath + "/whenKind",
+                                                      std::format("unknown declaration "
+                                                                  "kind '{}' (expected "
+                                                                  "'variable', 'function', "
+                                                                  "'table', or 'type')",
+                                                                  k.at("whenKind").get<std::string>()));
+                                            dOk = false;
+                                        } else {
+                                            disc.whenKind = *wk;
+                                        }
+                                    }
+                                }
+                                auto readPath = [&](char const* key,
+                                                    std::vector<std::uint32_t>& out) {
+                                    if (!k.contains(key)) return;
+                                    if (!k.at(key).is_array()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  kPath + "/" + key,
+                                                  std::format("'{}' must be an array of "
+                                                              "non-negative integers", key));
+                                        dOk = false;
+                                        return;
+                                    }
+                                    for (auto const& e : k.at(key)) {
+                                        if (!e.is_number_integer()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      kPath + "/" + key,
+                                                      std::format("each '{}' entry must "
+                                                                  "be a non-negative integer",
+                                                                  key));
+                                            dOk = false;
+                                            return;
+                                        }
+                                        auto v = e.get<std::int64_t>();
+                                        if (v < 0
+                                            || v > std::numeric_limits<std::int32_t>::max()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      kPath + "/" + key,
+                                                      std::format("'{}' entry out of range",
+                                                                  key));
+                                            dOk = false;
+                                            return;
+                                        }
+                                        out.push_back(static_cast<std::uint32_t>(v));
+                                    }
+                                };
+                                readPath("paramsPath", disc.paramsPath);
+                                readPath("bodyPath",   disc.bodyPath);
+                                if (dOk) {
+                                    rule.kindByChild = std::move(disc);
+                                }
+                            }
+                        }
+
                         cfg.declarations.push_back(std::move(rule));
                     }
                 }
@@ -3136,6 +3352,215 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         m.core = *k;
                         cfg.literalTypes.push_back(std::move(m));
+                    }
+                }
+            }
+
+            // ── assignments (SE4 const-correctness) ──
+            // A rule whose match is an assignment. `lhs`/`rhs` are
+            // required visible-child indices; `operatorToken` is an
+            // optional gating token kind (for operator-table rules reused
+            // across every binary operator).
+            if (sem.contains("assignments")) {
+                json const& arr = sem.at("assignments");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/assignments",
+                              "'semantics.assignments' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/assignments/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'assignments' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        AssignmentRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'assignments[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+
+                        bool ok = true;
+                        readReqIndex(entry, "lhs", path, rule.lhsChild, ok);
+                        readReqIndex(entry, "rhs", path, rule.rhsChild, ok);
+                        if (!ok) continue;
+
+                        if (entry.contains("operatorToken")) {
+                            if (!entry.at("operatorToken").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/operatorToken",
+                                          "'operatorToken' must be a string");
+                            } else {
+                                auto const ot = entry.at("operatorToken").get<std::string>();
+                                if (!data.schemaTokens->contains(ot)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              path + "/operatorToken",
+                                              std::format("'assignments[{}].operatorToken' "
+                                                          "references unknown token kind '{}'",
+                                                          i, ot));
+                                } else {
+                                    rule.operatorToken = data.schemaTokens->find(ot);
+                                }
+                            }
+                        }
+                        cfg.assignments.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── callRules (SE6 call checking) ──
+            if (sem.contains("callRules")) {
+                json const& arr = sem.at("callRules");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/callRules",
+                              "'semantics.callRules' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/callRules/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'callRules' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        CallRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'callRules[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+
+                        bool ok = true;
+                        readReqIndex(entry, "callee", path, rule.calleeChild, ok);
+                        readReqIndex(entry, "args",   path, rule.argsChild,   ok);
+                        if (!ok) continue;
+
+                        // Optional `operatorToken` gate. Mirrors
+                        // AssignmentRule's gating — needed when a single
+                        // shape (e.g. c-subset's `postfixExpr`) covers
+                        // call AND non-call postfix forms.
+                        if (entry.contains("operatorToken")) {
+                            if (!entry.at("operatorToken").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/operatorToken",
+                                          "'operatorToken' must be a string");
+                            } else {
+                                auto const ot = entry.at("operatorToken").get<std::string>();
+                                if (!data.schemaTokens->contains(ot)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              path + "/operatorToken",
+                                              std::format("'callRules[{}].operatorToken' "
+                                                          "references unknown token kind '{}'",
+                                                          i, ot));
+                                } else {
+                                    rule.operatorToken = data.schemaTokens->find(ot);
+                                }
+                            }
+                        }
+                        cfg.callRules.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── builtinFunctions (SE6) ──
+            // A named function the engine interns + binds into a CU-wide
+            // builtins scope. `params` is an array of core-kind names;
+            // `result` is a single core-kind name; `variadic` (optional)
+            // makes the call-check skip arg-count enforcement.
+            if (sem.contains("builtinFunctions")) {
+                json const& arr = sem.at("builtinFunctions");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/builtinFunctions",
+                              "'semantics.builtinFunctions' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/builtinFunctions/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'builtinFunctions' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("name") || !entry.at("name").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/name",
+                                      "'name' is required and must be a string");
+                            continue;
+                        }
+                        if (!entry.contains("result") || !entry.at("result").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/result",
+                                      "'result' is required and must be a string");
+                            continue;
+                        }
+                        BuiltinFunctionMapping m;
+                        m.name = entry.at("name").get<std::string>();
+                        auto rk = parseCore(entry.at("result").get<std::string>());
+                        if (!rk) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path + "/result",
+                                      std::format("unknown core TypeKind '{}'",
+                                                  entry.at("result").get<std::string>()));
+                            continue;
+                        }
+                        m.resultCore = *rk;
+                        bool paramsOk = true;
+                        if (entry.contains("params")) {
+                            if (!entry.at("params").is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/params",
+                                          "'params' must be an array of core TypeKind names");
+                                continue;
+                            }
+                            for (auto const& p : entry.at("params")) {
+                                if (!p.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/params",
+                                              "each 'params' entry must be a string");
+                                    paramsOk = false;
+                                    break;
+                                }
+                                auto pk = parseCore(p.get<std::string>());
+                                if (!pk) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/params",
+                                              std::format("unknown core TypeKind '{}'",
+                                                          p.get<std::string>()));
+                                    paramsOk = false;
+                                    break;
+                                }
+                                m.paramCores.push_back(*pk);
+                            }
+                        }
+                        if (!paramsOk) continue;
+                        if (entry.contains("variadic")) {
+                            if (!entry.at("variadic").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/variadic",
+                                          "'variadic' must be a boolean");
+                                continue;
+                            }
+                            m.variadic = entry.at("variadic").get<bool>();
+                        }
+                        cfg.builtinFunctions.push_back(std::move(m));
                     }
                 }
             }
