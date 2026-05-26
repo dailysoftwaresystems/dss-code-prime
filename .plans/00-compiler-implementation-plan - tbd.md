@@ -115,6 +115,27 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 
 > **v1 critical path (first signed binary):** 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → **{9 ‖ 10}** → **{11 ‖ 12}** → 13 → 14 → 15 → 16. **P1 (artifact-profile)** must land before step 13 and step 16 reach acceptance — schedule it anywhere in parallel from step 1 onward.
 
+## 0.2. Deferred & Known-Open Items (registry)
+
+> **Single authoritative list of everything consciously left open as of the pre-HIR gap-closure (2026-05-26).** Each item names WHY it's deferred, the plan/phase that OWNS its eventual closure, and the TRIGGER. Nothing here is a silent gap — it's all tracked. `cheap-config` = closeable any time as additive `.lang.json` config with no engine work (do when a corpus/language needs it); `blocked` = genuinely needs a downstream layer; `feature` = language-surface expansion (v1.x). When an item closes, strike it through with the closing commit.
+>
+> This registry is the index; the detail lives in the owning plan (linked). Do not duplicate detail here — it drifts.
+
+| # | Deferred item | Why deferred (not a silent gap) | Class | Owner / closure | Trigger |
+|---|---|---|---|---|---|
+| D1 | **Pointer / array *type-level* modelling** + `&` addr-of (c-subset) | c-subset uses C declarator syntax (`int *p`), not a named type-constructor rule, so a `typeShapes`/grammar round is needed; the expression-side `*p` (deref) already works. Not codegen-blocking for the current corpus. | feature/config | future c-subset grammar+`typeShapes` round; [07](./07-production-readiness-plan%20-%20tbd.md) G-105 | a corpus program needs typed pointers/arrays, or HIR lowering of pointer types |
+| D2 | **Compound-assignment const-correctness** (c-subset) | SE4's `assignments` facet covers `AssignOp` (`=`) only; `+=`/`-=`/`<<=`/`&=`/… (ModAssignOp, BitAndAssignOp, ShlAssignOp, …) are declared in the grammar but not yet in the facet, so `const int x=1; x+=2;` isn't flagged. | cheap-config | add per-op entries to c-subset `assignments` (or a multi-token form); [08.6](./08.6-semantic-plan%20-%20ok.md) follow-up | next c-subset semantics touch |
+| D3 | **tsql column-type coverage** | Only `TSQL::Varchar` is declared (typeExtensions); `INT`/`BIT`/`DECIMAL(p,s)`/`MONEY`/`DATE`/`NVARCHAR(N)`/… are parsed but not mapped to core/extension `TypeKind`s, so tsql column types are largely untyped. | cheap-config | tsql `builtinTypes` + `typeExtensions` additions; [08.6](./08.6-semantic-plan%20-%20ok.md) follow-up | tsql type-checking or HIR lowering of SQL types |
+| D4 | **Driver / project-config / `artifactProfile` / CLI diagnostic rendering** | A whole phase, not a gap. The `DiagnosticReporter::format()` clang-style renderer + LSP translation already exist; there is no CLI driver to wire them into, and no `.dss-project.json` loader. | blocked (own phase) | phase #12 `program-api` + [06](./06-artifact-profile-plan%20-%20tbd.md) AP1–AP4; [07](./07-production-readiness-plan%20-%20tbd.md) G-601..G-609 | step 16 (`program-api`); P1 (artifact-profile) any time |
+| D5 | **c-subset structs / unions / enums** | Language-surface expansion beyond the v1 subset; needs grammar + declaration/reference rules + aggregate type constructors. | feature (v1.x) | a future `c-subset` expansion round | credibility-as-real-C goal, or a corpus need |
+| D6 | **tsql JOINs / subqueries / CTEs / stored-procs / transactions** | Language-surface expansion; current tsql is single-table query/DML + CREATE TABLE. | feature (v1.x) | a future `tsql-subset` expansion round | same |
+| D7 | **Ternary `? :` (mixfix)** | The v1+v2 operator-arity enum (`Prefix`/`Infix`/`Postfix`) can't model a mixfix operator; needs a schema-v3-style grammar extension. | blocked (schema) | [v2-gap-catalog](./v2-gap-catalog%20-%20tbd.md) row 17 (schema v3 candidate) | a language needs ternary |
+| D8 | **Unused-variable / dead-code analysis** | Needs use-counting / liveness; deliberately a v1-optional lint, not a correctness blocker. | blocked (optimizer) | phase #10 `gen-optimizer`; [07](./07-production-readiness-plan%20-%20tbd.md) G-210 | optimizer phase |
+| D9 | **Use-before-init / unreachable-after-return** | Needs a control-flow graph; the semantic layer is pre-CFG. HIR/MIR will have the CFG to do this strength of analysis. | blocked (HIR/MIR) | phase #9 HIR + phase #10 optimizer | CFG exists |
+| D10 | **CU6 cross-CU references / incremental rebuild** | v1 is single-CU-per-binary; cross-CU + incremental are paired CU6 ↔ LK11 substrate hooks already reserved. | blocked (v1.x) | [08](./08-compilation-unit-plan%20-%20tbd.md) CU6 + [14](./14-linker-plan%20-%20tbd.md) LK11 | artifact profile needing multiple CUs |
+
+> **Pre-HIR readiness:** none of D1–D10 blocks opening **HR1** (HIR). D9 is the only one HIR itself helps *unblock* (it provides the CFG). D2/D3 are cheap-config closeable any time; D1/D5/D6 are feature rounds; D4/D7/D8/D10 are owned by their named downstream phases.
+
 ## 1. Vision & Overview
 
 **DSS Code Prime** is a universal, configurable compiler written in C++. Its core design principle is that **both the source language and the target platform are configurable**, making it a single compiler engine capable of compiling _any_ defined language to _any_ supported target.
