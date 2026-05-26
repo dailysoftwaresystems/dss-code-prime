@@ -705,6 +705,187 @@ TEST(SemanticAnalyzerGenericity, Synth3KindByChildOutOfRangePathsNoOpsCleanly) {
     EXPECT_EQ(interner.kind(interner.fnResult(ffRec->type)), TypeKind::I32);
 }
 
+// ── GAP A / C / D genericity (a FOURTH synthetic schema) ───────────────────
+//
+// Synth4 proves returnRules (GAP A), loopRules/loopControls (GAP C), and
+// bracketIdentifierToken (GAP D) are 100% config-driven under NON-shipped
+// rule/token names. None of `fun`/`retStmt`/`spin`/`halt`/`tag`/`nameRef`
+// nor the `Word` identifier token nor the `Brk` bracket-id opener overlap
+// any shipped language. The function result type threads to the body walk
+// purely via the config (no hardcoded `returnStmt`/`while`/`BracketIdStart`).
+namespace {
+constexpr char kSynth4SchemaText[] = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "Synth4", "version": "0.0.1", "fileExtensions": [".syn4"] },
+  "lexerModes": {
+    "main":     { "tokens": "default" },
+    "tag-body": { "defaultToken": { "kind": "TagChar" } }
+  },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    ";": [{ "kind": "Semi" }],
+    "{": [{ "kind": "LBrace", "opensScope": "Block" }],
+    "}": [{ "kind": "RBrace", "closesScope": true }],
+    "(": [{ "kind": "LParen", "opensScope": "Paren" }],
+    ")": [{ "kind": "RParen", "closesScope": true }],
+    "[": [{
+      "kind": "Brk",
+      "modeOp": "pushMode", "modeArg": "tag-body",
+      "stringStyle": { "escapeKind": "none", "endsAt": "]" }
+    }]
+  },
+  "keywords": [
+    { "word": "fun",  "kind": "FunKw" },
+    { "word": "ret",  "kind": "RetKw" },
+    { "word": "spin", "kind": "SpinKw" },
+    { "word": "halt", "kind": "HaltKw" },
+    { "word": "next", "kind": "NextKw" },
+    { "word": "wide", "kind": "WideKw" },
+    { "word": "small","kind": "SmallKw" },
+    { "word": "vd",   "kind": "VoidKw" },
+    { "word": "aa", "kind": "Word" },
+    { "word": "bb", "kind": "Word" },
+    { "word": "ff", "kind": "Word" }
+  ],
+  "syncTokens": [ "Semi" ],
+  "shapes": {
+    "root":     { "sequence": [ { "repeat": "fun" } ] },
+    "fun":      { "sequence": [ "typeName", "Word", "LParen", "RParen", "fbody" ] },
+    "fbody":    { "sequence": [ "LBrace", { "repeat": "stmt" }, "RBrace" ] },
+    "stmt":     { "alt": [ "retStmt", "spinStmt", "haltStmt", "nextStmt", "useStmt" ] },
+    "retStmt":  { "sequence": [ "RetKw", { "optional": "nameRef" }, "Semi" ] },
+    "spinStmt": { "sequence": [ "SpinKw", "LBrace", { "repeat": "stmt" }, "RBrace" ] },
+    "haltStmt": { "sequence": [ "HaltKw", "Semi" ] },
+    "nextStmt": { "sequence": [ "NextKw", "Semi" ] },
+    "useStmt":  { "sequence": [ "nameRef", "Semi" ] },
+    "nameRef":  { "sequence": [ "tag" ] },
+    "tag":      { "alt": [ "Word", "Brk" ] },
+    "typeName": { "alt": [ "WideKw", "SmallKw", "VoidKw" ] }
+  },
+  "semantics": {
+    "identifierToken": "Word",
+    "bracketIdentifierToken": "Brk",
+    "declarations": [
+      { "rule": "fun", "name": 1, "type": 0, "body": 4, "kind": "function" }
+    ],
+    "references": [ { "rule": "nameRef", "nameMatch": "lastIdentifier" } ],
+    "scopes": [ "fbody" ],
+    "returnRules": [ { "rule": "retStmt", "value": 1 } ],
+    "loopRules": [ "spinStmt" ],
+    "loopControls": [ { "rule": "haltStmt" }, { "rule": "nextStmt" } ],
+    "builtinTypes": [
+      { "name": "wide",  "core": "I32" },
+      { "name": "small", "core": "I8"  },
+      { "name": "vd",    "core": "Void" }
+    ]
+  }
+})JSON";
+
+[[nodiscard]] std::shared_ptr<CompilationUnit const> buildSynth4Cu(std::string source) {
+    auto loaded = GrammarSchema::loadFromText(kSynth4SchemaText, "<synth4>");
+    if (!loaded) {
+        ADD_FAILURE() << "synth4 schema failed to load: "
+                      << (loaded.error().empty() ? "<no diagnostics>"
+                                                : loaded.error()[0].message);
+        std::abort();
+    }
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(std::move(source), "<synth4-mem>");
+    return std::make_shared<CompilationUnit>(std::move(builder).finish());
+}
+} // namespace
+
+// GAP A (generic): a bare `ret;` in a non-Void (`wide`) function →
+// S_ReturnTypeMismatch; a `ret;` in a Void (`vd`) function → clean.
+TEST(SemanticAnalyzerGenericity, Synth4ReturnRulesFromConfig) {
+    {   // non-void function, bare return → mismatch
+        auto cu = buildSynth4Cu("wide ff() { ret; }");
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(cnt(model, DiagnosticCode::S_ReturnTypeMismatch), 1u);
+    }
+    {   // void function, bare return → clean
+        auto cu = buildSynth4Cu("vd ff() { ret; }");
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(cnt(model, DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    }
+}
+
+// GAP A (generic): returning a value from a Void function → mismatch. The
+// returned `aa` is a (forward-declared-as-undeclared) name use; we declare
+// it as a param-free use that resolves to nothing, so its type is Invalid —
+// to force a typed value we instead return the function itself is awkward,
+// so use a non-void function returning a value of the WRONG width: a
+// `small` (I8) function returning a `wide`-typed... but Synth4 has no
+// locals. Simplest: a Void function returning ANY value node → mismatch
+// regardless of the value's resolved type (the Void rule fires first).
+TEST(SemanticAnalyzerGenericity, Synth4ValueReturnInVoidIsMismatch) {
+    auto cu = buildSynth4Cu("vd ff() { ret aa; }");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(cnt(model, DiagnosticCode::S_ReturnTypeMismatch), 1u);
+}
+
+// GAP C (generic): `halt;` inside a `spin { ... }` loop → clean; a bare
+// `halt;` outside any loop → exactly one S_ControlOutsideLoop.
+TEST(SemanticAnalyzerGenericity, Synth4LoopControlsFromConfig) {
+    {   // inside the loop → clean
+        auto cu = buildSynth4Cu("vd ff() { spin { halt; } }");
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(cnt(model, DiagnosticCode::S_ControlOutsideLoop), 0u);
+    }
+    {   // outside any loop → one diagnostic
+        auto cu = buildSynth4Cu("vd ff() { halt; }");
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(cnt(model, DiagnosticCode::S_ControlOutsideLoop), 1u);
+    }
+}
+
+// FIX 4 (multi-entry loopControls): Synth4 declares TWO loopControls —
+// `halt` (break-style) and `next` (continue-style). BOTH must emit
+// S_ControlOutsideLoop outside a loop AND be clean inside the `spin` loop.
+// Single-entry coverage above can't catch a regression that only honored the
+// first loopControls entry; this exercises the second entry too.
+TEST(SemanticAnalyzerGenericity, Synth4MultipleLoopControlsFromConfig) {
+    {   // both controls inside the loop → clean
+        auto cu = buildSynth4Cu("vd ff() { spin { halt; next; } }");
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(cnt(model, DiagnosticCode::S_ControlOutsideLoop), 0u)
+            << "both halt and next are valid inside the loop context";
+    }
+    {   // both controls outside any loop → one diagnostic EACH (two total)
+        auto cu = buildSynth4Cu("vd ff() { halt; next; }");
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_EQ(cnt(model, DiagnosticCode::S_ControlOutsideLoop), 2u)
+            << "each of the two loopControls fires outside a loop — proving "
+               "multi-entry loopControls works, not just the first entry";
+    }
+}
+
+// GAP D (generic): a bracket-id `[aa]` reference resolves against a
+// bracket-id declaration name — proving bracketIdentifierToken is not
+// tsql-coupled. We declare a function named via a plain Word and reference
+// it via a bracket-id `[ff]`; the lookup must find it (no undeclared).
+TEST(SemanticAnalyzerGenericity, Synth4BracketIdentifierResolves) {
+    auto cu = buildSynth4Cu("wide ff() { [ff]; ret; }");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // `[ff]` resolves to the function symbol `ff` (bracket text stripped).
+    EXPECT_EQ(cnt(model, DiagnosticCode::S_UndeclaredIdentifier), 0u);
+    // A bracket-id reference to an unknown name IS loud.
+    auto cu2 = buildSynth4Cu("wide ff() { [bb]; ret; }");
+    assertNoBuilderErrors(*cu2);
+    auto model2 = analyze(cu2);
+    EXPECT_EQ(cnt(model2, DiagnosticCode::S_UndeclaredIdentifier), 1u);
+}
+
 // SE6 (generic): a fixed-arity builtin (SUM: (I32,I32)->I32) accepts the
 // right count and rejects the wrong one; a variadic builtin (ANY) accepts
 // any arity. Builtins are bound CU-wide and shadowable.

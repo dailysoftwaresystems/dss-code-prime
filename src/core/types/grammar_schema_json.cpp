@@ -3565,6 +3565,129 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── returnRules (GAP A return-type checking) ──
+            // A return-statement shape. `value` is an OPTIONAL visible-child
+            // index naming the returned expression; absent ⇒ a bare
+            // `return;` shape.
+            if (sem.contains("returnRules")) {
+                json const& arr = sem.at("returnRules");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/returnRules",
+                              "'semantics.returnRules' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/returnRules/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'returnRules' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        ReturnRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'returnRules[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+                        // `value` is OPTIONAL — absent ⇒ bare return shape.
+                        if (entry.contains("value")) {
+                            if (!entry.at("value").is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/value",
+                                          "'value' must be a non-negative integer");
+                                continue;
+                            }
+                            auto v = entry.at("value").get<std::int64_t>();
+                            if (v < 0 || v > std::numeric_limits<std::int32_t>::max()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/value",
+                                          "'value' visible-child index out of range");
+                                continue;
+                            }
+                            rule.valueChild = static_cast<std::uint32_t>(v);
+                        }
+                        cfg.returnRules.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── loopRules (GAP C loop contexts) ──
+            // Rules whose subtree establishes a break/continue-valid context
+            // (while/for/do/switch). Array of rule-name strings, mirroring
+            // `scopes`.
+            if (sem.contains("loopRules")) {
+                json const& arr = sem.at("loopRules");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/loopRules",
+                              "'semantics.loopRules' must be an array of rule names");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/loopRules/{}", i);
+                        if (!arr[i].is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'loopRules' entry must be a string");
+                            continue;
+                        }
+                        auto const name = arr[i].get<std::string>();
+                        if (!data.rules->contains(name)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'loopRules[{}]' references unknown shape '{}'",
+                                                  i, name));
+                            continue;
+                        }
+                        ScopeRule loopRule;
+                        loopRule.rule     = data.rules->find(name);
+                        loopRule.ruleName = name;
+                        cfg.loopRules.push_back(std::move(loopRule));
+                    }
+                }
+            }
+
+            // ── loopControls (GAP C break/continue statements) ──
+            if (sem.contains("loopControls")) {
+                json const& arr = sem.at("loopControls");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/loopControls",
+                              "'semantics.loopControls' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/loopControls/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'loopControls' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        LoopControlRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'loopControls[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+                        cfg.loopControls.push_back(std::move(rule));
+                    }
+                }
+            }
+
             // ── identifierToken ──
             // Names the token kind whose text is a language identifier. The
             // engine reads the resolved SchemaTokenId instead of hardcoding
@@ -3585,6 +3708,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                               "token kind '{}'", name));
                     } else {
                         cfg.identifierToken = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
+            // ── bracketIdentifierToken (GAP D) ──
+            // An OPTIONAL second token kind whose leaf also counts as a name
+            // in LastIdentifier mode (tsql's `[Orders]` → "BracketIdStart").
+            // A bad token name is C_UnknownToken.
+            if (sem.contains("bracketIdentifierToken")) {
+                json const& tok = sem.at("bracketIdentifierToken");
+                if (!tok.is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/bracketIdentifierToken",
+                              "'bracketIdentifierToken' must be a string");
+                } else {
+                    auto const name = tok.get<std::string>();
+                    if (!data.schemaTokens->contains(name)) {
+                        coll.emit(DiagnosticCode::C_UnknownToken,
+                                  "/semantics/bracketIdentifierToken",
+                                  std::format("'bracketIdentifierToken' references unknown "
+                                              "token kind '{}'", name));
+                    } else {
+                        cfg.bracketIdentifierToken = data.schemaTokens->find(name);
                     }
                 }
             }

@@ -55,7 +55,7 @@
     ",":  [{ "kind": "Comma" }],
     ":":  [{ "kind": "Colon" }],
 
-    "#include": [{ "kind": "IncludeKeyword" }],
+    "#": [{ "kind": "HashOp" }],
     "\"": [{
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "string",
@@ -148,6 +148,8 @@
   "syncTokens": ["EndStatement", "BlockClose"],
 
   "keywords": [
+    { "word": "include", "kind": "IncludeKeyword" },
+
     { "word": "void",    "kind": "VoidKeyword"    },
     { "word": "int",     "kind": "IntKeyword"     },
     { "word": "char",    "kind": "CharKeyword"    },
@@ -201,7 +203,7 @@
     },
 
     "includeDirective": {
-      "sequence": [ "IncludeKeyword", "StringStart" ]
+      "sequence": [ "HashOp", "IncludeKeyword", "StringStart" ]
     },
 
     "externDecl": {
@@ -428,6 +430,11 @@
       { "rule": "postfixExpr", "callee": 0, "args": 2,
         "operatorToken": "ParenOpen" }
     ],
+    "returnRules": [
+      { "rule": "returnStmt", "value": 1 }
+    ],
+    "loopRules": [ "whileStmt", "forStmt", "doStmt", "switchStmt" ],
+    "loopControls": [ { "rule": "breakStmt" } ],
     "builtinTypes": [
       { "name": "int",  "core": "I32"  },
       { "name": "char", "core": "Char" },

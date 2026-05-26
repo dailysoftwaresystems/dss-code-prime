@@ -145,6 +145,14 @@ enum class DiagnosticCode : std::uint16_t {
     S_ArgCountMismatch            = 0xE005,
     S_UnknownType                 = 0xE006,
     S_ConstViolation              = 0xE007,
+    // A `return` statement whose returned expression type does not assign
+    // into the enclosing function's result type — OR a bare `return;` in a
+    // non-Void function — OR a `return expr;` in a Void function. Emitted by
+    // the config-driven `returnRules` facet.
+    S_ReturnTypeMismatch          = 0xE008,
+    // A break/continue-style control statement (a `loopControls` rule)
+    // appearing outside any loop-context subtree (a `loopRules` rule).
+    S_ControlOutsideLoop          = 0xE009,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

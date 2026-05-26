@@ -8,6 +8,8 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/tree.hpp"
+#include "core/types/tree_cursor.hpp"
+#include "core/types/tree_visitor.hpp"
 
 #include "analysis/compilation_unit/toy_cu_fixture.hpp"
 
@@ -330,6 +332,54 @@ TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
     EXPECT_EQ(cu.trees().size(), 1u);
     EXPECT_TRUE(cu.crossRefs().empty());
     EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport), 1u);
+}
+
+// GAP E: an in-memory source whose LABEL equals a real on-disk path an
+// #include later follows must NOT be loaded twice. We register `helper.h`
+// in memory under its real absolute path, then add a `main.c` that
+// `#include "helper.h"`s it. Include-following must dedup against the
+// in-memory tree (by weakly-canonical path) instead of re-parsing the file
+// from disk — so the CU has exactly TWO trees (main + the in-memory helper),
+// not three, and one cross-ref edge to the in-memory tree.
+TEST(ImportResolver, CSubsetInMemoryLabelDedupsAgainstIncludedPath) {
+    TempDir dir;
+    // helper.h exists on disk too (its content differs so a double-load
+    // would be observable), but the in-memory label claims the same path.
+    auto helperPath = dir.write("helper.h", "int disk_helper() { return 9; }\n");
+    auto mainPath   = dir.write("main.c",
+        "#include \"helper.h\"\nint main() { return 0; }\n");
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    // Register the helper in memory under its REAL canonical path label.
+    builder.addInMemory("int mem_helper() { return 1; }\n", helperPath.string());
+    builder.addFile(mainPath);
+    auto cu = std::move(builder).finish();
+
+    // Two trees only — the include reused the in-memory helper tree.
+    EXPECT_EQ(cu.trees().size(), 2u)
+        << "an #include matching an in-memory label must not double-load";
+    ASSERT_EQ(cu.crossRefs().size(), 1u);
+    // The edge targets the in-memory helper tree (index 0), not a third tree.
+    EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.trees()[0].id());
+    EXPECT_FALSE(hasCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
+
+    // FIX 9: actually OBSERVE that the surviving helper tree is the IN-MEMORY
+    // one, not a disk re-parse. The in-memory body declares `mem_helper`; the
+    // on-disk file declares `disk_helper`. If the dedup had silently re-loaded
+    // from disk, the surviving tree would carry `disk_helper`. Scan the helper
+    // tree's tokens: the in-memory name MUST be present and the disk name MUST
+    // be absent — turning the stated tripwire into a real assertion.
+    Tree const& helperTree = cu.trees()[0];
+    bool sawMem = false, sawDisk = false;
+    walkPreOrder(helperTree, [&](TreeCursor const& cursor) {
+        NodeId const n = cursor.current();
+        if (helperTree.kind(n) != NodeKind::Token) return;
+        auto const text = helperTree.text(n);
+        if (text == "mem_helper")  sawMem  = true;
+        if (text == "disk_helper") sawDisk = true;
+    });
+    EXPECT_TRUE(sawMem)   << "the surviving helper tree must carry the in-memory content";
+    EXPECT_FALSE(sawDisk) << "the disk file must NOT have been re-parsed over the in-memory tree";
 }
 
 // ── genericity: resolution is driven by the `imports` block, not the name ─────

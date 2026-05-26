@@ -2364,3 +2364,245 @@ TEST(GrammarSchema, SemanticsSE4SE6FacetsHappyPathRoundTrips) {
     EXPECT_EQ(sem.builtinFunctions[1].name, "ANY");
     EXPECT_TRUE(sem.builtinFunctions[1].variadic);
 }
+
+// ── GAP A/C/D facet negative + happy-path tests ───────────────────────────
+
+// `returnRules`: not-an-array → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsReturnRulesNotArrayReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": { "rule": "root" } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `returnRules[i].rule` naming no declared shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsReturnRulesUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": [ { "rule": "ghostRet" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// `returnRules[i].value` of the wrong type → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsReturnRulesValueNotInteger) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": [ { "rule": "root", "value": "x" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `loopRules[i]` naming no declared shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsLoopRulesUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopRules": [ "ghostLoop" ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// `loopControls[i].rule` naming no declared shape → C_UnknownShape.
+TEST(GrammarSchema, SemanticsLoopControlsUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopControls": [ { "rule": "ghostBreak" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// `loopControls[i].rule` missing → C_MissingField.
+TEST(GrammarSchema, SemanticsLoopControlsMissingRule) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopControls": [ { } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// FIX 7: `returnRules[i]` missing `rule` → C_MissingField (the loader's
+// required-field branch). Entry is an object but has no `rule` key.
+TEST(GrammarSchema, SemanticsReturnRulesMissingRuleReportsMissingField) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": [ { "value": 0 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// FIX 7: `returnRules[i].value` out of the int32 range → C_InvalidSemantics
+// (the loader's range branch; distinct from the wrong-TYPE branch tested by
+// SemanticsReturnRulesValueNotInteger). 9999999999 > INT32_MAX.
+TEST(GrammarSchema, SemanticsReturnRulesValueOutOfRangeReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "returnRules": [ { "rule": "root", "value": 9999999999 } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// FIX 7: a `loopRules` entry that is not a string → C_InvalidSemantics (the
+// per-entry type guard; distinct from the not-an-ARRAY guard which is the
+// scalar-shaped block). The array is present but an entry is an object.
+TEST(GrammarSchema, SemanticsLoopRulesEntryNotStringReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopRules": [ { "rule": "root" } ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// FIX 7: a `loopControls` entry that is not an object → C_InvalidSemantics
+// (the per-entry object guard; distinct from the not-an-ARRAY guard). The
+// array is present but an entry is a bare string.
+TEST(GrammarSchema, SemanticsLoopControlsEntryNotObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopControls": [ "root" ] }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// FIX 7: a `loopControls` that is not an array → C_InvalidSemantics (the
+// block-level type guard, the array analogue of the per-entry guards above).
+TEST(GrammarSchema, SemanticsLoopControlsNotArrayReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "loopControls": { "rule": "root" } }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// `bracketIdentifierToken` naming no declared token → C_UnknownToken.
+TEST(GrammarSchema, SemanticsBracketIdentifierTokenUnknownReportsUnknownToken) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "bracketIdentifierToken": "GhostBracket" }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// `bracketIdentifierToken` of the wrong JSON type → C_InvalidSemantics.
+TEST(GrammarSchema, SemanticsBracketIdentifierTokenNotStringReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "bracketIdentifierToken": 7 }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// Happy-path: returnRules / loopRules / loopControls / bracketIdentifierToken
+// round-trip onto SemanticConfig with the expected shapes.
+TEST(GrammarSchema, SemanticsGapAcdFacetsHappyPathRoundTrips) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        ";": [{ "kind": "Semi" }],
+        "[": [{ "kind": "Brk" }]
+      },
+      "keywords": [
+        { "word": "ret",  "kind": "RetKw"  },
+        { "word": "spin", "kind": "SpinKw" },
+        { "word": "halt", "kind": "HaltKw" }
+      ],
+      "shapes": {
+        "root":     { "sequence": [ { "repeat": "stmt" } ] },
+        "stmt":     { "alt": [ "retStmt", "spinStmt", "haltStmt" ] },
+        "retStmt":  { "sequence": [ "RetKw", { "optional": "Identifier" }, "Semi" ] },
+        "spinStmt": { "sequence": [ "SpinKw", "Semi" ] },
+        "haltStmt": { "sequence": [ "HaltKw", "Semi" ] }
+      },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "bracketIdentifierToken": "Brk",
+        "returnRules":  [ { "rule": "retStmt", "value": 1 }, { "rule": "haltStmt" } ],
+        "loopRules":    [ "spinStmt" ],
+        "loopControls": [ { "rule": "haltStmt" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& sem = (*r)->semantics();
+    ASSERT_EQ(sem.returnRules.size(), 2u);
+    EXPECT_EQ(sem.returnRules[0].ruleName, "retStmt");
+    ASSERT_TRUE(sem.returnRules[0].valueChild.has_value());
+    EXPECT_EQ(*sem.returnRules[0].valueChild, 1u);
+    EXPECT_EQ(sem.returnRules[1].ruleName, "haltStmt");
+    EXPECT_FALSE(sem.returnRules[1].valueChild.has_value()) << "absent value ⇒ bare-return shape";
+    ASSERT_EQ(sem.loopRules.size(), 1u);
+    EXPECT_EQ(sem.loopRules[0].ruleName, "spinStmt");
+    ASSERT_EQ(sem.loopControls.size(), 1u);
+    EXPECT_EQ(sem.loopControls[0].ruleName, "haltStmt");
+    ASSERT_TRUE(sem.bracketIdentifierToken.has_value());
+    EXPECT_TRUE(sem.bracketIdentifierToken->valid());
+    EXPECT_EQ(sem.bracketIdentifierToken->v, (*r)->schemaTokens().find("Brk").v);
+}

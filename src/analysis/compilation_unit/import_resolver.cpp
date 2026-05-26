@@ -3,6 +3,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
+#include "core/types/string_style.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_node.hpp"
 #include "core/types/tree_visitor.hpp"
@@ -98,18 +99,40 @@ void reportDriver(DiagnosticReporter& reporter,
     return std::nullopt;
 }
 
-// Text of the last `nameToken` token under `nameNode` — the table name in
-// `db.schema.table`. Case-folded ONLY when `!caseSensitive` (SQL folds; the
-// config carries the policy). Returns empty when the name is composed only of
-// bracketed identifiers (`[Name]`), which v1 does not match (documented
-// limitation: the matcher keys on the last `nameToken`).
+// Read the inner text of a bracket-quoted identifier opener (tsql's
+// `[Orders]` → "Orders", `[a]]b]` → "a]b"). The opener token spans only
+// `[`; the body bytes are off-grammar default-mode tokens, so the content
+// comes from the source slice. The `]]` doubled-delimiter un-escaping
+// (matching the tokenizer's `EscapeKind::DoubledDelimiter` rule for `[`)
+// lives in the shared `bracketInnerText` helper, which the semantic engine
+// also calls — keeping both decoders byte-identical with the tokenizer.
+// Returns empty on a malformed `[...]`.
+[[nodiscard]] std::string bracketIdText(Tree const& tree, NodeId openerNode) {
+    return bracketInnerText(tree.source().text(), tree.span(openerNode).start());
+}
+
+// Text of the last name-bearing leaf under `nameNode` — the table name in
+// `db.schema.table`. A name leaf is the `nameToken` (plain identifier) OR,
+// when set, the `bracketToken` (a bracket-quoted identifier opener; GAP D),
+// whose inner text is read from the source slice. Case-folded ONLY when
+// `!caseSensitive` (SQL folds; the config carries the policy). Returns empty
+// when no name leaf is found.
 [[nodiscard]] std::string lastIdentifierText(Tree const& tree, NodeId nameNode,
-                                             SchemaTokenId nameToken, bool caseSensitive) {
+                                             SchemaTokenId nameToken,
+                                             std::optional<SchemaTokenId> bracketToken,
+                                             bool caseSensitive) {
     std::string last;
     walkPreOrder(tree, nameNode, [&](TreeCursor const& cursor) {
         NodeId const id = cursor.current();
-        if (tree.kind(id) == NodeKind::Token && tree.tokenKind(id) == nameToken) {
+        if (tree.kind(id) != NodeKind::Token) return;
+        auto const tk = tree.tokenKind(id);
+        if (nameToken.valid() && tk == nameToken) {
             last = std::string(tree.text(id));
+        } else if (bracketToken.has_value() && bracketToken->valid()
+                   && tk == *bracketToken) {
+            if (std::string inner = bracketIdText(tree, id); !inner.empty()) {
+                last = std::move(inner);
+            }
         }
     });
     if (!caseSensitive) {
@@ -208,6 +231,10 @@ private:
         RuleId const createRule    = schema.rules().find(config_.definitionRule);
         SchemaTokenId const identifierKind = schema.schemaTokens().find(config_.nameToken);
         bool const caseSensitive = config_.caseSensitive;
+        // GAP D: a bracket-quoted identifier (`[Orders]`) also counts as a
+        // name leaf when the semantics block declares a bracketIdentifierToken.
+        std::optional<SchemaTokenId> const bracketKind =
+            schema.semantics().bracketIdentifierToken;
 
         // A reference-position name is a direct child of one of these.
         std::vector<RuleId> tablePositions;
@@ -239,7 +266,7 @@ private:
         for (Tree const& tree : context.trees) {
             forEachQualifiedName(tree, [&](NodeId node, RuleId parentRule) {
                 if (parentRule != createRule) return;
-                std::string name = lastIdentifierText(tree, node, identifierKind, caseSensitive);
+                std::string name = lastIdentifierText(tree, node, identifierKind, bracketKind, caseSensitive);
                 if (!name.empty()) definitions.emplace(std::move(name), std::pair{tree.id(), node});
             });
         }
@@ -251,8 +278,8 @@ private:
             BufferId const buffer = tree.source().id();
             forEachQualifiedName(tree, [&](NodeId node, RuleId parentRule) {
                 if (!isTablePosition(parentRule)) return;
-                std::string name = lastIdentifierText(tree, node, identifierKind, caseSensitive);
-                if (name.empty()) return;  // bracket-id-only name — v1 doesn't match.
+                std::string name = lastIdentifierText(tree, node, identifierKind, bracketKind, caseSensitive);
+                if (name.empty()) return;  // no resolvable name leaf.
                 auto const it = definitions.find(name);
                 if (it == definitions.end()) {
                     reportDriver(context.diagnostics, DiagnosticCode::D_UnresolvedReference,

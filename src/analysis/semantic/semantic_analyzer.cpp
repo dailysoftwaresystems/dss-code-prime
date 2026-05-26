@@ -9,6 +9,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
+#include "core/types/string_style.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
@@ -79,6 +80,13 @@ struct EngineState {
     std::unordered_map<std::uint32_t, bool>        scopeByRule;
     std::unordered_map<std::uint32_t, std::size_t> assignByRule;
     std::unordered_map<std::uint32_t, std::size_t> callByRule;
+    std::unordered_map<std::uint32_t, std::size_t> returnByRule;   // GAP A
+    std::unordered_map<std::uint32_t, bool>        loopByRule;      // GAP C loop contexts
+    std::unordered_map<std::uint32_t, bool>        loopControlByRule; // GAP C break/continue
+    // GAP A: scope opened by a function's BODY → that function's result
+    // type. A `return` statement walks its scope parent chain to find the
+    // nearest enclosing function result type for assignability checking.
+    std::unordered_map<std::uint32_t /*ScopeId.v*/, TypeId> fnResultByScope;
     // Built-in type name → TypeId (interned once per CU).
     std::unordered_map<std::string, TypeId>        builtinTypeIds;
     // Literal token-kind → TypeId.
@@ -134,6 +142,8 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
                        std::vector<TypeId>& out);
 void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                NodeId node, ScopeId scope, CallRule const& call);
+void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                 NodeId node, ScopeId scope, ReturnRule const& ret);
 void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 
@@ -166,9 +176,43 @@ struct ResolvedName {
     NodeId      node;
 };
 
+// GAP D: read the inner text of a bracket-quoted identifier opener (tsql's
+// `[Orders]` → "Orders", `[a]]b]` → "a]b"). The opener token
+// (`BracketIdStart`) spans only the `[`; the body bytes are off-grammar
+// default-mode tokens, so the content is read from the source slice. The
+// `]]` doubled-delimiter un-escaping (matching the tokenizer's
+// `EscapeKind::DoubledDelimiter` rule) lives in the shared `bracketInnerText`
+// helper, which the import resolver also calls — keeping both decoders
+// byte-identical with the tokenizer. Returns empty on a malformed `[...]`.
+[[nodiscard]] std::string
+bracketIdText(Tree const& tree, NodeId openerNode) {
+    return bracketInnerText(tree.source().text(), tree.span(openerNode).start());
+}
+
+// True when `node` is a name-bearing leaf per the config: either the plain
+// identifier token (`idKind`) or — when set — the bracket-id opener
+// (`bracketKind`). Out param `text` receives the resolved name (bracketed
+// text stripped of its brackets for the bracket-id case).
+[[nodiscard]] bool
+nameLeafText(Tree const& tree, NodeId node, SchemaTokenId idKind,
+             std::optional<SchemaTokenId> bracketKind, std::string& text) {
+    if (tree.kind(node) != NodeKind::Token) return false;
+    auto const tk = tree.tokenKind(node);
+    if (idKind.valid() && tk == idKind) {
+        text = std::string{tree.text(node)};
+        return true;
+    }
+    if (bracketKind.has_value() && bracketKind->valid() && tk == *bracketKind) {
+        text = bracketIdText(tree, node);
+        return !text.empty();
+    }
+    return false;
+}
+
 [[nodiscard]] ResolvedName
 extractNameNode(Tree const& tree, NodeId node, NameMatchMode mode,
-                SchemaTokenId idKind) {
+                SchemaTokenId idKind,
+                std::optional<SchemaTokenId> bracketKind = std::nullopt) {
     if (!node.valid()) return {};
     if (mode == NameMatchMode::Self) {
         if (tree.kind(node) == NodeKind::Token) {
@@ -178,20 +222,23 @@ extractNameNode(Tree const& tree, NodeId node, NameMatchMode mode,
         if (kids.size() == 1) {
             // Recurse one level so an `expression[Identifier]` wrapper
             // bottoms out at the identifier token (not the wrapper).
-            return extractNameNode(tree, kids[0], NameMatchMode::Self, idKind);
+            return extractNameNode(tree, kids[0], NameMatchMode::Self, idKind,
+                                   bracketKind);
         }
         return {std::string{tree.text(node)}, node};
     }
-    // LastIdentifier — DFS for the last identifier token (the kind the
-    // schema's `semantics.identifierToken` names; resolved by the loader).
+    // LastIdentifier — DFS for the last name-bearing leaf (the kind the
+    // schema's `semantics.identifierToken` names — OR, when configured, a
+    // `bracketIdentifierToken` leaf; both resolved by the loader).
     NodeId found{};
+    std::string foundText;
     std::vector<NodeId> stack{node};
     while (!stack.empty()) {
         NodeId cur = stack.back();
         stack.pop_back();
-        if (tree.kind(cur) == NodeKind::Token && idKind.valid()
-            && tree.tokenKind(cur) == idKind) {
-            found = cur;
+        if (std::string leaf; nameLeafText(tree, cur, idKind, bracketKind, leaf)) {
+            found     = cur;
+            foundText = std::move(leaf);
         }
         auto kids = tree.children(cur);
         // Reverse-push so visit order is left-to-right.
@@ -199,7 +246,7 @@ extractNameNode(Tree const& tree, NodeId node, NameMatchMode mode,
             if (!isEmptySpace(tree.flags(*it))) stack.push_back(*it);
         }
     }
-    if (found.valid()) return {std::string{tree.text(found)}, found};
+    if (found.valid()) return {std::move(foundText), found};
     return {};
 }
 
@@ -236,6 +283,11 @@ void buildIndexes(EngineState& s, SemanticConfig const& cfg) {
     for (std::size_t i = 0; i < cfg.callRules.size(); ++i) {
         s.callByRule[cfg.callRules[i].rule.v] = i;
     }
+    for (std::size_t i = 0; i < cfg.returnRules.size(); ++i) {
+        s.returnByRule[cfg.returnRules[i].rule.v] = i;
+    }
+    for (auto const& lr : cfg.loopRules)    s.loopByRule[lr.rule.v] = true;
+    for (auto const& lc : cfg.loopControls) s.loopControlByRule[lc.rule.v] = true;
     for (auto const& bt : cfg.builtinTypes) {
         s.builtinTypeIds[bt.name] = s.lattice.interner().primitive(bt.core);
     }
@@ -365,7 +417,8 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 NodeId const nameContainer = kids[*decl.nameChild];
                 auto resolved = extractNameNode(
-                    tree, nameContainer, decl.nameMatch, cfg.identifierToken);
+                    tree, nameContainer, decl.nameMatch, cfg.identifierToken,
+                    cfg.bracketIdentifierToken);
                 if (!resolved.name.empty() && resolved.node.valid()) {
                     // A declaration's NAME binds into the ENCLOSING scope
                     // (`current`), NOT the scope this rule itself opens
@@ -439,6 +492,23 @@ childScopeFor(EngineState& s, Tree const& tree, NodeId node, ScopeId current) {
     return current;
 }
 
+// GAP A: find the scope (anywhere in the tree) whose anchor IS `node` —
+// used to key a function's result type on the scope its body opens. The
+// body scope can be nested under an intermediate scope (e.g. c-subset's
+// `block` sits inside the `funcDefTail` scope), so a parent-children scan
+// (as in `childScopeFor`) is insufficient; this scans all scopes for the
+// matching anchor. Returns InvalidScope if none.
+[[nodiscard]] ScopeId
+scopeAnchoredAt(EngineState& s, Tree const& tree, NodeId node) {
+    auto const& scopes = s.scopes.scopes();
+    for (std::size_t i = 1; i < scopes.size(); ++i) {
+        if (scopes[i].anchor.v == node.v && scopes[i].tree.v == tree.id().v) {
+            return ScopeId{static_cast<std::uint32_t>(i)};
+        }
+    }
+    return InvalidScope;
+}
+
 // ── Pass 1.5: post-order — resolve declaration types + FnSigs ──────────────
 void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                       NodeId node, ScopeId current) {
@@ -463,7 +533,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
             auto kids = visibleChildren(tree, node);
             if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 auto resolved = extractNameNode(
-                    tree, kids[*decl.nameChild], decl.nameMatch, cfg.identifierToken);
+                    tree, kids[*decl.nameChild], decl.nameMatch, cfg.identifierToken,
+                    cfg.bracketIdentifierToken);
                 SymbolId sym = resolved.node.valid()
                     ? s.symbolAtOr(resolved.node) : InvalidSymbol;
                 if (sym.valid()) {
@@ -514,13 +585,6 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             bodyNode = kids[*decl.bodyChild];
                         }
                     }
-                    // The body node is intentionally resolved but currently
-                    // unused beyond signaling Function-ness (scope opening
-                    // is handled by the `scopes` facet on the body rule
-                    // itself, e.g. c-subset declares `funcDefTail` as a
-                    // scope rule so the params bind there).
-                    (void)bodyNode;
-
                     if (effectiveKind == DeclarationKind::Function) {
                         // SE6: build a FnSig over the param types.
                         std::vector<TypeId> paramTypes;
@@ -532,6 +596,19 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             paramTypes, returnTy, CallConv::CcSysV);
                         s.symbols.at(sym).type = fnTy;
                         s.nodeToType.set(resolved.node, fnTy);
+                        // GAP A: record the function's RESULT type keyed on
+                        // the scope its body opens. A `return` inside the body
+                        // walks its scope parent chain to find the nearest
+                        // enclosing function result. The body rule is itself a
+                        // `scopes` rule (returns must live in a body scope), so
+                        // we look up the scope anchored at the body node.
+                        if (bodyNode.valid()) {
+                            ScopeId const bodyScope =
+                                scopeAnchoredAt(s, tree, bodyNode);
+                            if (bodyScope.valid()) {
+                                s.fnResultByScope[bodyScope.v] = returnTy;
+                            }
+                        }
                     } else if (returnTy.valid()) {
                         s.symbols.at(sym).type = returnTy;
                         s.nodeToType.set(resolved.node, returnTy);
@@ -543,8 +620,11 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
 }
 
 // ── Pass 2: post-order — resolve uses + literal/init typing + checks ───────
+// `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
+// walk is currently inside; a `loopControls` node at depth 0 is outside
+// any loop and emits S_ControlOutsideLoop.
 void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-           NodeId node, ScopeId current) {
+           NodeId node, ScopeId current, int loopDepth) {
     if (!node.valid()) return;
     if (isEmptySpace(tree.flags(node))) return;
     auto const k = tree.kind(node);
@@ -554,8 +634,16 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         here = childScopeFor(s, tree, node, current);
     }
 
+    // GAP C: entering a loop-context subtree raises the depth for the
+    // children walk. Detected on the node itself; the increment applies to
+    // descendants (a break/continue is valid anywhere inside the subtree).
+    int const childLoopDepth =
+        (k == NodeKind::Internal && s.loopByRule.contains(tree.rule(node).v))
+            ? loopDepth + 1
+            : loopDepth;
+
     for (auto const& child : tree.children(node)) {
-        pass2(s, cfg, tree, child, here);
+        pass2(s, cfg, tree, child, here, childLoopDepth);
     }
 
     // Literal typing.
@@ -591,18 +679,26 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             if (!isDeclSite) {
                 auto const& ref = cfg.references[refIt->second];
                 auto resolved = extractNameNode(
-                    tree, node, ref.nameMatch, cfg.identifierToken);
+                    tree, node, ref.nameMatch, cfg.identifierToken,
+                    cfg.bracketIdentifierToken);
                 // Only treat the site as an identifier USE when the resolved
-                // leaf is genuinely the identifier token (per the config's
-                // `identifierToken`). Reference rules can structurally cover
-                // non-name leaves (e.g. c-subset's `operand` covers
-                // IntLiteral too); resolving those as names would emit
-                // phantom S_UndeclaredIdentifier diagnostics.
+                // leaf is genuinely a name-bearing leaf (the config's
+                // `identifierToken` OR, when set, its `bracketIdentifierToken`
+                // — GAP D). Reference rules can structurally cover non-name
+                // leaves (e.g. c-subset's `operand` covers IntLiteral too);
+                // resolving those as names would emit phantom
+                // S_UndeclaredIdentifier diagnostics.
                 bool isIdentifier = false;
-                if (cfg.identifierToken.valid() && resolved.node.valid()
-                    && tree.kind(resolved.node) == NodeKind::Token
-                    && tree.tokenKind(resolved.node) == cfg.identifierToken) {
-                    isIdentifier = true;
+                if (resolved.node.valid()
+                    && tree.kind(resolved.node) == NodeKind::Token) {
+                    auto const rtk = tree.tokenKind(resolved.node);
+                    if (cfg.identifierToken.valid() && rtk == cfg.identifierToken) {
+                        isIdentifier = true;
+                    } else if (cfg.bracketIdentifierToken.has_value()
+                               && cfg.bracketIdentifierToken->valid()
+                               && rtk == *cfg.bracketIdentifierToken) {
+                        isIdentifier = true;
+                    }
                 }
                 if (isIdentifier && !resolved.name.empty()) {
                     SymbolId const found = s.scopes.lookup(here, resolved.name);
@@ -721,6 +817,33 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             checkCall(s, cfg, tree, node, here, cfg.callRules[callIt->second]);
         }
     }
+
+    // GAP A: return-type checking. When this node is a `returnRules` rule,
+    // find the nearest enclosing function result type (walk the scope parent
+    // chain via `fnResultByScope`) and check the returned expression against
+    // it. A bare `return;` is valid only in a Void function; a `return expr;`
+    // in a Void function — or a bare `return;` in a non-Void function — is a
+    // mismatch. An unknown/Invalid enclosing result is skipped (cascade
+    // suppression).
+    if (k == NodeKind::Internal) {
+        auto retIt = s.returnByRule.find(tree.rule(node).v);
+        if (retIt != s.returnByRule.end()) {
+            checkReturn(s, cfg, tree, node, here, cfg.returnRules[retIt->second]);
+        }
+    }
+
+    // GAP C: break/continue outside any loop. A `loopControls` node at
+    // depth 0 is outside every loop-context subtree.
+    if (k == NodeKind::Internal && loopDepth == 0
+        && s.loopControlByRule.contains(tree.rule(node).v)) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ControlOutsideLoop;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(node);
+        d.actual   = std::string{tree.text(node)};
+        s.reporter.report(std::move(d));
+    }
 }
 
 // Collect parameter types from a params subtree, in source (left-to-right)
@@ -837,6 +960,17 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         return;
     }
 
+    // FIX 2: the call EXPRESSION carries the callee's RESULT type — not its
+    // FnSig. Without this, a `return f(args);` walk (subtreeType) would
+    // surface the callee identifier's FnSig (which IS typed, below) and
+    // wrongly fail `isAssignable(I32, FnSig)` → a spurious
+    // S_ReturnTypeMismatch on legal `int g(){ return f(); }`. Typing the
+    // call node with its result also feeds future consumers (e.g.
+    // `int x = f();` initializer-type-flow). Set BEFORE arity/arg checks so
+    // the result type is present even when an arg mismatch is reported (the
+    // call's value type is its declared result regardless of arg errors).
+    s.nodeToType.set(node, s.lattice.interner().fnResult(fnTy));
+
     // Collect arg expression nodes (visible children of the args subtree
     // that are NOT separators). The argsChild subtree is a comma-separated
     // list of `expression`s; count the non-token visible children.
@@ -875,6 +1009,95 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             d.actual   = std::string{tree.text(argNodes[i])};
             s.reporter.report(std::move(d));
         }
+    }
+}
+
+// GAP A: the type carried by an expression subtree. Pass 2 types literal
+// leaves and propagates resolved-symbol types to reference wrapper nodes,
+// but a literal's type lives on the leaf, not the enclosing expression
+// wrapper. So check `node` first, then DFS for the first typed descendant.
+// Generic — no rule names, just the side-table.
+[[nodiscard]] TypeId
+subtreeType(EngineState const& s, Tree const& tree, NodeId node) {
+    if (!node.valid()) return InvalidType;
+    if (TypeId t = s.typeAt(node); t.valid()) return t;
+    std::vector<NodeId> stack{node};
+    while (!stack.empty()) {
+        NodeId cur = stack.back();
+        stack.pop_back();
+        if (TypeId t = s.typeAt(cur); t.valid()) return t;
+        for (auto child : tree.children(cur)) {
+            if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
+        }
+    }
+    return InvalidType;
+}
+
+// GAP A: check a return statement against the nearest enclosing function
+// result type. See the call site in pass2 for the policy summary.
+void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                 NodeId node, ScopeId scope, ReturnRule const& ret) {
+    (void)cfg;
+    // Walk the scope parent chain for the nearest enclosing function result.
+    TypeId fnResult = InvalidType;
+    bool   foundFn  = false;
+    auto const& scopes = s.scopes.scopes();
+    for (ScopeId cur = scope; cur.valid() && cur.v < scopes.size();
+         cur = scopes[cur.v].parent) {
+        auto it = s.fnResultByScope.find(cur.v);
+        if (it != s.fnResultByScope.end()) {
+            fnResult = it->second;
+            foundFn  = true;
+            break;
+        }
+    }
+    // A return outside any function we tracked → nothing to check against.
+    if (!foundFn) return;
+
+    // Resolve the returned-expression node. The `value` child (when
+    // configured) names the expression slot; but an OPTIONAL expression
+    // grammar means a bare `return;` puts the statement terminator (a
+    // Token) at that slot — treat only an Internal node as a real returned
+    // expression.
+    NodeId valueNode{};
+    if (ret.valueChild.has_value()) {
+        auto kids = visibleChildren(tree, node);
+        if (*ret.valueChild < kids.size()
+            && tree.kind(kids[*ret.valueChild]) == NodeKind::Internal) {
+            valueNode = kids[*ret.valueChild];
+        }
+    }
+
+    bool const isVoid =
+        fnResult.valid()
+        && s.lattice.interner().kind(fnResult) == TypeKind::Void;
+
+    auto emitMismatch = [&](NodeId span) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ReturnTypeMismatch;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(span);
+        d.actual   = std::string{tree.text(span)};
+        s.reporter.report(std::move(d));
+    };
+
+    if (!valueNode.valid()) {
+        // Bare `return;` — valid ONLY in a Void function. If the enclosing
+        // result is unknown/Invalid, skip (cascade suppression).
+        if (fnResult.valid() && !isVoid) emitMismatch(node);
+        return;
+    }
+
+    // `return expr;` in a Void function is always a mismatch.
+    if (isVoid) { emitMismatch(valueNode); return; }
+
+    // Otherwise compare the returned expression's type to the result type.
+    // An unknown result OR unknown expr type → skip (cascade suppression).
+    TypeId const exprTy = subtreeType(s, tree, valueNode);
+    if (!fnResult.valid() || !exprTy.valid()) return;
+    if (!isAssignable(s.lattice.interner(), fnResult, exprTy)) {
+        emitMismatch(valueNode);
     }
 }
 
@@ -953,10 +1176,11 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
         resolveDeclTypes(s, cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
     }
 
-    // Pass 2 per tree, against that tree's root scope.
+    // Pass 2 per tree, against that tree's root scope. Loop-context depth
+    // starts at 0 (GAP C).
     for (auto const& tree : trees) {
         if (!tree.root().valid()) continue;
-        pass2(s, cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
+        pass2(s, cfg, tree, tree.root(), treeRootScope.at(tree.id().v), 0);
     }
 
     return SemanticModel{

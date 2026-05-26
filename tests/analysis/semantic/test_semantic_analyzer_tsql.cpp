@@ -81,9 +81,10 @@ TEST(SemanticAnalyzerTsql, CrossFileTableReferenceResolvesViaImportEdge) {
         "SELECT * FROM Orders;",           // tree 1 references it
     });
     assertNoBuilderErrors(*cu);
-    // The NameMatching resolver recorded a cross-tree edge.
-    ASSERT_GE(cu->crossRefs().size(), 1u)
-        << "tsql name-matching must produce a cross-file edge";
+    // The NameMatching resolver recorded exactly one cross-tree edge
+    // (the SELECT's `Orders` reference → the CREATE's `Orders` definition).
+    ASSERT_EQ(cu->crossRefs().size(), 1u)
+        << "tsql name-matching must produce exactly one cross-file edge";
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "the import edge injects Orders into the referencing tree";
@@ -214,4 +215,103 @@ TEST(SemanticAnalyzerTsql, UnknownFunctionCallEmitsUndeclared) {
     ASSERT_NE(bogusDiag, nullptr);
     EXPECT_EQ(bogusDiag->span.start(), 30u);
     EXPECT_EQ(bogusDiag->span.end(),   35u);
+}
+
+// ── GAP D: bracket-quoted identifier `[Name]` matching ─────────────────────
+
+// `CREATE TABLE [Orders] (...); SELECT * FROM [Orders];` — the bracket-id
+// `[Orders]` both MINTS the table symbol and RESOLVES the reference. No
+// S_UndeclaredIdentifier. Pins the bracketIdentifierToken facet (GAP D).
+TEST(SemanticAnalyzerTsql, BracketIdentifierMintsAndResolves) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE [Orders] (id INT); SELECT * FROM [Orders];",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // The table symbol minted with the bracketed name (brackets stripped).
+    ASSERT_EQ(userSymbolCount(model), 1u);
+    SymbolRecord const* rec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].tree.valid()) rec = &model.symbols()[i];
+    }
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(rec->name, "Orders");
+    EXPECT_EQ(rec->kind, DeclarationKind::Table);
+    // The bracket-id reference resolves — no undeclared.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+}
+
+// A bracket-id reference to a table that does not exist → loud (exactly one
+// S_UndeclaredIdentifier), not a silent miss.
+TEST(SemanticAnalyzerTsql, BracketIdentifierUnknownTableEmitsUndeclared) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "SELECT * FROM [Unknown];",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_UndeclaredIdentifier) {
+            EXPECT_EQ(d.actual, "Unknown");
+        }
+    }
+}
+
+// FIX 1: a `]]` doubled-delimiter inside a bracket-id is an ESCAPED literal
+// `]`, so `[Ord]]ers]` is the SINGLE identifier `Ord]ers` (the tokenizer
+// declares `escapeKind: doubled-delimiter, endsAt: "]"` for `[`; confirmed by
+// test_tsql_subset BracketIdentifierHasDoubledDelimiterStyle). The bracket-id
+// decoder must MATCH the tokenizer: stopping at the first `]` (pre-fix) would
+// mint `Ord` and look up `Ord` for the reference, diverging from the
+// tokenizer's `Ord]ers`. Same-file: the table mints under `Ord]ers` AND the
+// SELECT reference resolves (zero S_UndeclaredIdentifier).
+TEST(SemanticAnalyzerTsql, BracketIdDoubledDelimiterMintsAndResolves) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE [Ord]]ers] (id INT); SELECT * FROM [Ord]]ers];",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_EQ(userSymbolCount(model), 1u);
+    SymbolRecord const* rec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].tree.valid()) rec = &model.symbols()[i];
+    }
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(rec->name, "Ord]ers")
+        << "the `]]` must un-double to a single literal `]` — name is Ord]ers";
+    EXPECT_EQ(rec->kind, DeclarationKind::Table);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "the escaped-bracket reference must resolve to the escaped-bracket decl";
+}
+
+// FIX 1 cross-FILE: the SAME `]]`-escaped name spanning two files resolves via
+// exactly one name-matching crossRef edge — the import resolver's bracket-id
+// decoder shares the same `]]` un-escaping, so both files agree on `Ord]ers`.
+TEST(SemanticAnalyzerTsql, BracketIdDoubledDelimiterCrossFileResolves) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE [Ord]]ers] (Id INT);",   // tree 0 defines Ord]ers
+        "SELECT * FROM [Ord]]ers];",            // tree 1 references it
+    });
+    assertNoBuilderErrors(*cu);
+    ASSERT_EQ(cu->crossRefs().size(), 1u)
+        << "both files decode the escaped bracket-id to the same name → one edge";
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+}
+
+// GAP D cross-FILE: a CREATE TABLE [Orders] in one file and a SELECT FROM
+// [Orders] in another resolve via a name-matching crossRef edge — the
+// import resolver's lastIdentifierText must also read the bracket-id text.
+TEST(SemanticAnalyzerTsql, BracketIdentifierCrossFileResolvesViaImportEdge) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE [Orders] (Id INT);",   // tree 0 defines [Orders]
+        "SELECT * FROM [Orders];",           // tree 1 references it
+    });
+    assertNoBuilderErrors(*cu);
+    // FIX 9: a deterministic two-file input produces EXACTLY one cross-tree
+    // edge — assert equality, not a lower bound.
+    ASSERT_EQ(cu->crossRefs().size(), 1u)
+        << "bracket-id name-matching must produce exactly one cross-file edge";
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }

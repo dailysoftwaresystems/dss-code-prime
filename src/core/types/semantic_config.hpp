@@ -217,6 +217,30 @@ struct DSS_EXPORT ScopeRule {
     std::string ruleName;
 };
 
+// A return-statement shape (GAP A). When Pass 2 sees a node with this
+// rule, it resolves the nearest enclosing function's result type (via the
+// scope→fnResult map the analyzer builds in pass 1.5) and the returned
+// expression's type (the visible child at `valueChild`), then checks
+// assignability. `valueChild` absent ⇒ this rule is a bare `return;`
+// shape (no returned expression). A `return expr;` shape whose value
+// child is structurally optional in the grammar is handled by the engine:
+// if the child at `valueChild` is the statement terminator (not an
+// expression), it is treated as a bare return.
+struct DSS_EXPORT ReturnRule {
+    RuleId                       rule{};       // the return-statement shape
+    std::optional<std::uint32_t> valueChild;   // visible-child index of the returned expr
+    std::string                  ruleName;
+};
+
+// A break/continue-style control statement (GAP C). When Pass 2 visits a
+// node with this rule at loop-context depth 0 (outside any `loopRules`
+// subtree), the engine emits S_ControlOutsideLoop. Bundles rule+ruleName
+// like ScopeRule.
+struct DSS_EXPORT LoopControlRule {
+    RuleId      rule{};        // a break/continue statement shape
+    std::string ruleName;
+};
+
 // Literal token-kind → core TypeKind. Pass 2 reads the token-kind of a
 // matched literal leaf and assigns the corresponding lattice type via
 // `TypeInterner::primitive(core)`.
@@ -238,6 +262,11 @@ struct DSS_EXPORT SemanticConfig {
     std::vector<AssignmentRule>     assignments;       // SE4 const-correctness
     std::vector<CallRule>           callRules;         // SE6 call checking
     std::vector<BuiltinFunctionMapping> builtinFunctions;  // SE6 builtins
+    std::vector<ReturnRule>         returnRules;       // GAP A return-type checking
+    // Rules that establish a break/continue-valid context (while/for/do/
+    // switch). Bundled rule+ruleName via ScopeRule — same house pattern.
+    std::vector<ScopeRule>          loopRules;         // GAP C loop contexts
+    std::vector<LoopControlRule>    loopControls;      // GAP C break/continue stmts
     // The token kind whose text is a language identifier (e.g.
     // "Identifier"). Resolved by the loader to a SchemaTokenId; absent
     // (InvalidSchemaToken) when the language declares no identifierToken.
@@ -246,6 +275,13 @@ struct DSS_EXPORT SemanticConfig {
     // The loader emits C_MissingField when a `nameMatch: "lastIdentifier"`
     // rule is declared without an identifierToken.
     SchemaTokenId                   identifierToken{};
+    // GAP D: an OPTIONAL second token kind whose leaf also counts as a name
+    // in LastIdentifier mode — a bracket-quoted identifier opener (tsql's
+    // `[Orders]` → `BracketIdStart`). When set, `extractNameNode` /
+    // lastIdentifierText accept it in addition to `identifierToken`, reading
+    // the bracketed text from the source slice (brackets stripped). Absent
+    // (InvalidSchemaToken) for languages with no bracket-id syntax.
+    std::optional<SchemaTokenId>    bracketIdentifierToken;
 };
 
 } // namespace dss

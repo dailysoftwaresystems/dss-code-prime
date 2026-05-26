@@ -302,6 +302,7 @@
 
   "semantics": {
     "identifierToken": "Identifier",
+    "bracketIdentifierToken": "BracketIdStart",
     "declarations": [
       { "rule": "createTableStmt", "name": 2, "kind": "table",
         "nameMatch": "lastIdentifier" }
