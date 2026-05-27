@@ -873,13 +873,31 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             s.nodeToType.set(node, rec.type);
                         }
                     } else {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_UndeclaredIdentifier;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(resolved.node);
-                        d.actual   = resolved.name;
-                        s.reporter.report(std::move(d));
+                        // Hard (must-resolve) iff `hardParents` is empty (the
+                        // lexical default) OR this reference's parent rule is one
+                        // of the configured must-resolve positions. A soft
+                        // position (e.g. a SQL column in an expression) leaves the
+                        // name unresolved (sym 0) without an error — the lowering
+                        // recovers it from source provenance.
+                        bool hard = ref.hardParents.empty();
+                        if (!hard) {
+                            NodeId refParent = tree.parent(node);
+                            if (refParent.valid()
+                                && tree.kind(refParent) == NodeKind::Internal) {
+                                RuleId const pr = tree.rule(refParent);
+                                for (RuleId hp : ref.hardParents)
+                                    if (hp.v == pr.v) { hard = true; break; }
+                            }
+                        }
+                        if (hard) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_UndeclaredIdentifier;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(resolved.node);
+                            d.actual   = resolved.name;
+                            s.reporter.report(std::move(d));
+                        }
                     }
                 }
             }

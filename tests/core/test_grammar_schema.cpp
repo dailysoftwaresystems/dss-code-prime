@@ -2912,3 +2912,63 @@ TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
         EXPECT_EQ(p[1], "sproc");
     }
 }
+
+// ── HR10: hirLowering fail-loud config validation ──────────────────────────
+
+// `refExtensionKind` naming a kind absent from `extensionKinds` → loud at LOAD
+// (C_InvalidHirLowering), so the engine's extKind() lookup stays total.
+TEST(GrammarSchema, HirLoweringRefExtensionKindUndeclaredReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "hirLowering": {
+        "extensionKinds": [ { "name": "X::Foo", "lang": "X" } ],
+        "refExtensionKind": "X::Bar"
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidHirLowering));
+}
+
+// `nullLiteral.hirKind` naming an undeclared extension kind → C_InvalidHirLowering.
+TEST(GrammarSchema, HirLoweringNullExtensionKindUndeclaredReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "hirLowering": {
+        "extensionKinds": [ { "name": "X::Foo", "lang": "X" } ],
+        "nullLiteral": { "token": "Semi", "hirKind": "X::Bar" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidHirLowering));
+}
+
+// An unknown `childGathering` lower verb (not expr/flatExpr/ext/ref/varDecl) →
+// C_InvalidHirLowering at LOAD, the counterpart to the unreachable lowerSlot
+// default. Guards the closed ChildLower verb set.
+TEST(GrammarSchema, HirLoweringUnknownChildLowerVerbReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "hirLowering": {
+        "extensionKinds": [ { "name": "X::Foo", "lang": "X" } ],
+        "ruleMappings": [
+          { "rule": "root", "hirKind": "X::Foo", "childGathering": [
+            { "match": { "rule": "root" }, "lower": "bogusVerb", "role": "x" }
+          ] }
+        ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidHirLowering));
+}

@@ -764,25 +764,23 @@ TEST(Tokenizer, UnterminatedCoalescedStringEmitsDiagnostic) {
 
 TEST(Tokenizer, TsqlSingleStringDoubledDelimiterEscape) {
     // SQL string with a doubled single-quote — `'a''b'` represents the
-    // literal `a'b`. Token breakdown:
-    //   [0] `'`  StringStart (opener)
-    //   [1] `a`  StringChar  (per-codepoint default)
-    //   [2] `''` StringChar  (doubled-delim escape — 2 bytes)
-    //   [3] `b`  StringChar  (per-codepoint default)
-    //   [4] `'`  StringChar  (endsAt-match close — pops frame)
+    // literal `a'b`. The body mode coalesces (HR10), so the whole body is
+    // one in-grammar token; the doubled-delim escape is preserved verbatim
+    // in the body text and decoded later (decodeDoubledDelimiterBody). Token
+    // breakdown:
+    //   [0] `'`    StringStart   (opener)
+    //   [1] `a''b` StringLiteral (coalesced body; doubled `''` kept raw)
+    // The closing `'` is consumed on mode-pop, not emitted as a token.
     auto h      = loadTsql("'a''b'");
     auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 5u);
+    ASSERT_EQ(result.tokens.size(), 2u);
     EXPECT_EQ(result.tokens[0].schemaKind,
               h.schema->schemaTokens().find("StringStart"));
-    const auto stringCharKind = h.schema->schemaTokens().find("StringChar");
-    EXPECT_EQ(result.tokens[1].schemaKind, stringCharKind);
-    EXPECT_EQ(result.tokens[2].schemaKind, stringCharKind);
-    EXPECT_EQ(result.tokens[3].schemaKind, stringCharKind);
-    EXPECT_EQ(result.tokens[4].schemaKind, stringCharKind);
-    // The doubled-delim token spans 2 bytes; the close spans 1.
-    EXPECT_EQ(result.tokens[2].span.length(), 2u);
-    EXPECT_EQ(result.tokens[4].span.length(), 1u);
+    EXPECT_EQ(result.tokens[1].schemaKind,
+              h.schema->schemaTokens().find("StringLiteral"));
+    // The coalesced body spans `a''b` — 4 bytes (the doubled-delim escape
+    // kept raw; the close delimiter is not part of the body).
+    EXPECT_EQ(result.tokens[1].span.length(), 4u);
     EXPECT_TRUE(result.diags.empty());
 }
 

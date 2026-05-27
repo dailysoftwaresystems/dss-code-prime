@@ -73,6 +73,25 @@ namespace dss {
     return out;
 }
 
+// Decode a DOUBLED-DELIMITER string body (SQL `'…''…'`): a doubled `delimiter`
+// is one literal delimiter byte; every other byte passes through. The coalesced
+// body the tokenizer captured contains `''` pairs for embedded quotes and no
+// lone delimiter (the closer was consumed on mode-pop), so this never fails.
+[[nodiscard]] inline std::string
+decodeDoubledDelimiterBody(std::string_view body, char delimiter) {
+    std::string out;
+    out.reserve(body.size());
+    for (std::size_t i = 0; i < body.size(); ++i) {
+        if (body[i] == delimiter && i + 1 < body.size() && body[i + 1] == delimiter) {
+            out.push_back(delimiter);
+            ++i;   // consume the second delimiter of the pair
+            continue;
+        }
+        out.push_back(body[i]);
+    }
+    return out;
+}
+
 // Decode a char-literal body to a single codepoint. The body must resolve to
 // EXACTLY one byte (ASCII or a single-byte escape); empty, multi-byte, or
 // malformed-escape bodies return std::nullopt (caller fails loud).

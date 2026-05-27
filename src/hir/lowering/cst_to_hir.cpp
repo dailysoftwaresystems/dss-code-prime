@@ -132,6 +132,34 @@ struct Lowerer {
             litCore_.emplace(lt.literal.v, lt.core);
         }
         for (RuleId r : cfg.deferredRules) deferred_.emplace(r.v, true);
+        // HR10: register every declared extension kind up front, so a rule mapped
+        // to one (or a NULL literal) lowers to a HirKind::Extension carrying its id.
+        for (auto const& e : cfg.extensionKinds)
+            extKindByName_.emplace(e.name, builder.registry().registerExtension(e.name, e.lang));
+        for (std::size_t i = 0; i < sem.callRules.size(); ++i)
+            callMap_.emplace(sem.callRules[i].rule.v, i);
+        for (auto const& rr : sem.references) refRule_.emplace(rr.rule.v, true);
+    }
+
+    std::unordered_map<std::string, HirKindId> extKindByName_;  // HR10 extension kinds
+    std::unordered_map<std::uint32_t, std::size_t> callMap_;    // RuleId.v → sem.callRules idx
+    std::unordered_map<std::uint32_t, bool>        refRule_;     // RuleId.v of reference rules
+
+    // The registered HirKindId for an extension-kind name. Every name reaching
+    // here is declared in cfg.extensionKinds: ruleMapping/nested-ext callers are
+    // gated by `extKindByName_.count`, and the loader validates `nullExtensionKind`
+    // / `refExtensionKind` against `extensionKinds`. A miss is therefore an
+    // internal invariant violation, not user-config drift — report it loud (never
+    // silently mint a phantom kind) and still register so the node stays
+    // well-formed for the rest of the pass.
+    [[nodiscard]] HirKindId extKind(std::string const& name) {
+        auto it = extKindByName_.find(name);
+        if (it != extKindByName_.end()) return it->second;
+        unsupported(NodeId{}, std::format("internal: extension kind '{}' was not "
+                                          "declared in hirLowering.extensionKinds", name));
+        HirKindId id = builder.registry().registerExtension(name, std::string{model.unit().schema().name()});
+        extKindByName_.emplace(name, id);
+        return id;
     }
 
     // True iff the subtree rooted at `node` contains a node whose rule is
@@ -243,6 +271,8 @@ struct Lowerer {
     E lowerExpr(NodeId node) {
         if (tree().kind(node) == NodeKind::Internal) {
             std::uint32_t const r = tree().rule(node).v;
+            if (cfg.flatExprRule.valid() && r == cfg.flatExprRule.v)
+                return lowerFlatExpr(node);   // HR10: SQL-style flat expression
             if (r == cfg.operandRule.v)     return lowerOperand(node);
             if (r == cfg.binaryExprRule.v)  return lowerBinary(node);
             if (r == cfg.unaryExprRule.v)   return lowerUnary(node);
@@ -269,15 +299,27 @@ struct Lowerer {
         return found;
     }
 
-    E lowerOperand(NodeId node) {
-        // operand = Identifier | <literal token> | <char/string literal> | ( expression )
-        // A char/string literal materializes as a subtree [startToken, bodyToken]
-        // (the body is one COALESCED in-grammar token). Detect it BEFORE the
-        // generic internal-child descent, since that subtree isn't an expression.
+    // Detect and lower a value-bearing LEAF literal directly under `node`: the
+    // char / string / unicode-string forms materialize as a `[startToken,
+    // COALESCED body]` subtree, and NULL as a single child token — none of which
+    // is an expression node, so both operand lowerers probe for them before the
+    // generic internal-child descent. std::nullopt ⇒ not such a leaf literal.
+    [[nodiscard]] std::optional<E> tryLowerLeafLiteral(NodeId node) {
         if (NodeId chl = bodyLiteralNodeOf(node, cfg.charStartToken); chl.valid())
             return lowerCharLiteral(chl);
         if (NodeId sl = bodyLiteralNodeOf(node, cfg.stringStartToken); sl.valid())
             return lowerStringLiteral(sl);
+        if (NodeId us = bodyLiteralNodeOf(node, cfg.unicodeStringStartToken); us.valid())
+            return lowerStringLiteral(us);   // SQL `N'…'` — same body token + decoder
+        if (cfg.nullToken.valid())            // SQL NULL → a typeless extension leaf
+            if (NodeId nt = childTokenOfKind(node, cfg.nullToken); nt.valid())
+                return lowerNullLiteral(node);
+        return std::nullopt;
+    }
+
+    E lowerOperand(NodeId node) {
+        // operand = Identifier | <literal token> | <char/string literal> | ( expression )
+        if (auto lit = tryLowerLeafLiteral(node)) return *lit;
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) return lowerExpr(c);  // paren-wrapped
         }
@@ -339,17 +381,312 @@ struct Lowerer {
     E lowerStringLiteral(NodeId node) {
         NodeId const bodyTok = childTokenOfKind(node, cfg.stringBodyToken);
         std::string_view const body = bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
-        auto bytes = decodeStringLiteralBody(body);
-        if (!bytes) {
+        std::string bytes;
+        if (cfg.stringDoubledDelimiter) {
+            // SQL `'…''…'`: doubled-delimiter escaping (never fails — pairs only).
+            bytes = decodeDoubledDelimiterBody(body, cfg.stringDelimiter);
+        } else if (auto decoded = decodeStringLiteralBody(body)) {  // C-family backslash escapes
+            bytes = std::move(*decoded);
+        } else {
             unsupported(node, std::format("string literal \"{}\" has an unsupported escape", body));
             return {errorNode(node), InvalidType};
         }
         TypeId const type = interner.array(interner.primitive(TypeKind::Char),
-                                           static_cast<std::int64_t>(bytes->size() + 1));
+                                           static_cast<std::int64_t>(bytes.size() + 1));
         HirLiteralValue v;
         v.core  = TypeKind::Char;
-        v.value = std::move(*bytes);
+        v.value = std::move(bytes);
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+    }
+
+    // SQL `NULL` (typeless) → a leaf Extension node of the configured kind.
+    E lowerNullLiteral(NodeId node) {
+        HirKindId const kid = extKind(cfg.nullExtensionKind);
+        return {track(builder.addLeaf(HirKind::Extension, InvalidType, kid.v), node), InvalidType};
+    }
+
+    // ── HR10: flat expression + SQL operand lowering ───────────────────────────
+    [[nodiscard]] bool isNameToken(NodeId n) const {
+        if (!isToken(n)) return false;
+        SchemaTokenId const tk = tree().tokenKind(n);
+        return (sem.identifierToken.valid() && tk.v == sem.identifierToken.v)
+            || (sem.bracketIdentifierToken && sem.bracketIdentifierToken->valid()
+                && tk.v == sem.bracketIdentifierToken->v);
+    }
+
+    // A flat `operand (binaryOpRule operand)*` sequence (SQL's `expression`),
+    // left-folded into nested core BinaryOp nodes. Distinct from the Pratt path.
+    E lowerFlatExpr(NodeId node) {
+        std::vector<NodeId> operands;
+        std::vector<NodeId> opToks;
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (cfg.flatBinaryOpRule.valid() && tree().rule(c).v == cfg.flatBinaryOpRule.v) {
+                for (NodeId t : visible(c)) if (isToken(t)) { opToks.push_back(t); break; }
+            } else {
+                operands.push_back(c);
+            }
+        }
+        if (operands.empty()) return exprError(node, "flat expression has no operand");
+        // A well-formed `operand (op operand)*` has exactly one fewer operator
+        // than operands. A mismatch is a malformed parse — fail loud rather than
+        // silently fold a truncated expression.
+        if (opToks.size() + 1 != operands.size())
+            return exprError(node, std::format("malformed flat expression: {} operands "
+                                               "but {} operators", operands.size(), opToks.size()));
+        E acc = lowerFlatOperand(operands[0]);
+        for (std::size_t i = 0; i + 1 < operands.size() && i < opToks.size(); ++i) {
+            auto it = binOp_.find(tree().tokenKind(opToks[i]).v);
+            if (it == binOp_.end()) {
+                unsupported(opToks[i], std::format("binary operator '{}' has no hirLowering mapping",
+                                                   tree().text(opToks[i])));
+                return {errorNode(node), InvalidType};
+            }
+            acc = combineBinary(opToks[i], cfg.binaryOps[it->second], acc, lowerFlatOperand(operands[i + 1]));
+        }
+        return acc;
+    }
+
+    // One operand of a flat SQL expression: literal / string / NULL / unary-minus
+    // / call / name-reference / parenthesized sub-expression.
+    E lowerFlatOperand(NodeId node) {
+        if (auto lit = tryLowerLeafLiteral(node)) return *lit;
+        // Unary prefix (SQL `-operand`): a unary-op token + an inner operand.
+        {
+            NodeId negTok{}, inner{};
+            for (NodeId c : visible(node)) {
+                if (isToken(c)) { if (unOp_.count(tree().tokenKind(c).v)) negTok = c; }
+                else if (!inner.valid()) inner = c;
+            }
+            if (negTok.valid() && inner.valid()) {
+                auto it = unOp_.find(tree().tokenKind(negTok).v);
+                auto op = coreOpFromName(cfg.unaryOps[it->second].target);
+                E e = lowerFlatOperand(inner);
+                if (!op || arityOf(*op) != HirOpArity::Unary)
+                    return exprError(node, "unary operand has no core unary op");
+                return {track(builder.addParent(HirKind::UnaryOp, std::array{e.id}, e.type,
+                                                encodeOp(*op)), node), e.type};
+            }
+        }
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (cfg.flatExprRule.valid() && tree().rule(c).v == cfg.flatExprRule.v)
+                return lowerFlatExpr(c);                       // parenthesized expression
+            // SQL call `f(args)`: the operand wraps a call rule (e.g. nameOrCall →
+            // callExpr). `peelToCore` would descend PAST the call into its sole
+            // non-token child (the argument list), so detect the call rule
+            // explicitly in the subtree before the name-reference fallback.
+            if (NodeId call = findCallNode(c); call.valid()) return lowerSqlCall(call);
+            // A name reference: `c` peels directly to a name token, or wraps one
+            // (qualifiedName → nameAtom → Identifier — `peelToCore` stops at the
+            // nameAtom wrapper, so probe the subtree for the name token).
+            if (firstNameToken(c).node.valid()) return nameRefExpr(c);
+            return lowerExpr(c);                                // defensive fallback
+        }
+        for (NodeId c : visible(node)) {                        // direct literal token (IntLiteral)
+            if (!isToken(c)) continue;
+            SchemaTokenId const tk = tree().tokenKind(c);
+            auto lit = litType_.find(tk.v);
+            if (lit != litType_.end()) return lowerLiteral(node, c, tk, lit->second);
+        }
+        return exprError(node, "SQL operand has no recognizable form");
+    }
+
+    // SQL `f(args)` → a core Call (callee Ref + lowered argument expressions),
+    // reusing the semantics `callRules` callee/args child positions.
+    E lowerSqlCall(NodeId callNode) {
+        auto it = callMap_.find(tree().rule(callNode).v);
+        if (it == callMap_.end()) return exprError(callNode, "call rule has no semantics entry");
+        CallRule const& cr = sem.callRules[it->second];
+        auto vis = visible(callNode);
+        HirNodeId callee{};
+        TypeId calleeTy = InvalidType;
+        if (cr.calleeChild < vis.size()) {
+            NodeId calleeNode = vis[cr.calleeChild];
+            NodeId tok = isToken(calleeNode) ? calleeNode : peelToCore(calleeNode);
+            SymbolId const sym = isNameToken(tok) ? model.symbolAt(tok) : SymbolId{};
+            calleeTy = typeAtOr(calleeNode, InvalidType);
+            // The callee is a name. In a relational-name language (refExtensionKind
+            // set), a function name is symbolic like any other name — not a typed
+            // value read — so it lowers to the name Extension; the Call node itself
+            // carries the result type. Otherwise a typed core Ref (C-family).
+            callee = makeNameNode(calleeNode, sym, calleeTy);
+        } else {
+            return exprError(callNode, "call has no callee child");
+        }
+        std::vector<HirNodeId> args;
+        if (cr.argsChild < vis.size()) {
+            for (NodeId a : visible(vis[cr.argsChild])) {
+                if (isToken(a)) continue;                       // skip commas
+                args.push_back(lowerFlatExpr(a).id);
+            }
+        }
+        TypeId const result = (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig)
+                            ? interner.fnResult(calleeTy) : typeAtOr(callNode, InvalidType);
+        return {track(builder.makeCall(callee, args, result), callNode), result};
+    }
+
+    // ── HR10: generic extension-node lowering ──────────────────────────────────
+    // Build a HirKind::Extension node of `m.hirKind`, gathering role children per
+    // `m.childGathering`. Entirely config-driven — no language vocabulary here.
+    HirNodeId lowerExtensionNode(NodeId cstNode, HirRuleMapping const& m) {
+        HirKindId const kid = extKind(m.hirKind);
+        std::vector<HirNodeId> children;
+        for (ChildSlotSpec const& slot : m.childGathering) {
+            if (slot.list) {
+                // Lower EACH `matchRule` item of a comma-separated list. Some
+                // grammars flatten `item (, item)*` (all items direct children);
+                // others nest the tail in a repeat-group node. `collectListItems`
+                // handles both by gathering matches in document order, stopping
+                // descent at each match (list items don't nest), so it never
+                // double-counts. A required (non-optional) list that matched no
+                // item is a malformed tree — fail loud rather than emit an empty
+                // grouping.
+                std::vector<NodeId> items;
+                collectListItems(cstNode, slot.matchRule, items);
+                if (items.empty() && !slot.optional) {
+                    children.push_back(reportedError(cstNode,
+                        std::format("extension list slot '{}' matched no items", slot.role)));
+                    continue;
+                }
+                for (NodeId item : items) children.push_back(lowerSlot(item, slot));
+                continue;
+            }
+            NodeId child = slot.classifier == "expr"
+                ? findExprChild(cstNode)
+                : (slot.matchRule.valid() ? findChildByRule(cstNode, slot.matchRule) : NodeId{});
+            if (!child.valid()) {
+                if (!slot.optional)
+                    children.push_back(reportedError(cstNode,
+                        std::format("extension slot '{}' not found", slot.role)));
+                continue;
+            }
+            children.push_back(lowerSlot(child, slot));
+        }
+        return track(builder.addParent(HirKind::Extension, children, typeAtOr(cstNode, InvalidType),
+                                       kid.v), cstNode);
+    }
+
+    // Collect, in document order, every descendant of `parent` whose rule is
+    // `matchRule`, descending through intervening wrapper nodes (e.g. a grammar's
+    // repeat-group) but STOPPING at each match — so a same-rule list item nested
+    // inside another (were a grammar to allow it) is not flattened into the outer
+    // list. When `matchRule` is unset, gathers the direct internal children.
+    void collectListItems(NodeId parent, RuleId matchRule, std::vector<NodeId>& out) {
+        for (NodeId c : visible(parent)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (!matchRule.valid()) { out.push_back(c); continue; }
+            if (tree().rule(c).v == matchRule.v) { out.push_back(c); continue; }  // matched: don't descend
+            collectListItems(c, matchRule, out);   // descend through repeat-group wrappers
+        }
+    }
+
+    // The outermost call-rule node within `subtree` (a node whose rule is in the
+    // semantics `callRules`), or invalid if none. Descent stops at the first
+    // match, so a call's own argument subtrees (which may contain nested calls)
+    // are not mistaken for the operand's call.
+    [[nodiscard]] NodeId findCallNode(NodeId subtree) const {
+        std::vector<NodeId> stack{subtree};
+        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+            NodeId n = stack.back(); stack.pop_back();
+            if (tree().kind(n) == NodeKind::Internal && callMap_.count(tree().rule(n).v))
+                return n;                                   // matched: don't descend
+            for (NodeId k : visible(n)) stack.push_back(k);
+        }
+        return {};
+    }
+
+    // Lower one located child per the slot's `lower` verb. The loader validated
+    // the verb against the closed ChildLower set, so the switch is exhaustive.
+    HirNodeId lowerSlot(NodeId child, ChildSlotSpec const& slot) {
+        switch (slot.lower) {
+            case ChildLower::Expr:     return lowerExpr(child).id;
+            case ChildLower::FlatExpr: return lowerFlatExpr(flatExprChildOf(child)).id;
+            case ChildLower::Ext:      return lowerNestedExtension(child);
+            case ChildLower::VarDecl:  return lowerVarLike(child, /*asGlobal=*/false);
+            case ChildLower::Ref:      return nameRefExpr(child).id;
+        }
+        return reportedError(child, "unhandled childGathering lower verb");
+    }
+
+    // The name token inside `subtree` (e.g. a qualifiedName → nameAtom →
+    // Identifier) and its resolved symbol. Prefers a symbol-bearing token (the
+    // resolved last identifier — what `nameMatch: lastIdentifier` binds); when no
+    // name resolves, falls back to the rightmost name token's span (the LIFO walk
+    // pushes children in order and pops the deepest/rightmost first), which is the
+    // qualified name's last segment — the right span for an unresolved column.
+    struct NameHit { NodeId node{}; SymbolId sym{}; };
+    [[nodiscard]] NameHit firstNameToken(NodeId subtree) const {
+        NameHit hit;
+        std::vector<NodeId> stack{subtree};
+        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+            NodeId n = stack.back(); stack.pop_back();
+            if (isNameToken(n)) {
+                if (!hit.node.valid()) hit.node = n;            // rightmost name (for the span)
+                if (model.symbolAt(n).valid()) { hit.sym = model.symbolAt(n); hit.node = n; break; }
+            }
+            for (NodeId k : visible(n)) stack.push_back(k);
+        }
+        return hit;
+    }
+
+    // A name reference as an expression (id + type): resolves the last identifier
+    // the semantic phase bound inside `subtree` (e.g. a qualifiedName's last name)
+    // and builds the configured node. When `cfg.refExtensionKind` is set the
+    // language's names are relational, not typed value reads (SQL table/column
+    // names), so this emits a leaf Extension node (no type requirement); otherwise
+    // a core typed `Ref`. An unresolved name (sym 0) is fine — its text is
+    // recoverable from source provenance (correct for SQL columns, which bind
+    // relationally, not lexically). See `makeNameNode`.
+    E nameRefExpr(NodeId subtree) {
+        NameHit h = firstNameToken(subtree);
+        if (!h.node.valid())   // a `ref`-lowered slot that holds no name token: fail loud
+            return exprError(subtree, "name reference subtree has no name token");
+        TypeId const t = typeAtOr(h.node, InvalidType);
+        HirNodeId const node = makeNameNode(h.node, h.sym, t);
+        return {node, cfg.refExtensionKind.empty() ? t : InvalidType};
+    }
+
+    // Emit a name reference: a leaf Extension of `cfg.refExtensionKind` when the
+    // language declares one (SQL relational names — untyped), else a core typed
+    // `Ref`. Single seam so every "name reference" site agrees.
+    HirNodeId makeNameNode(NodeId at, SymbolId sym, TypeId type) {
+        if (!cfg.refExtensionKind.empty())
+            return track(builder.addLeaf(HirKind::Extension, InvalidType,
+                                         extKind(cfg.refExtensionKind).v), at);
+        return track(builder.makeRef(type, sym.v), at);
+    }
+
+    // `ext` slot: the child rule must itself be extension-mapped.
+    HirNodeId lowerNestedExtension(NodeId child) {
+        NodeId core = peelToCore(child);
+        HirRuleMapping const* cm = mappingFor(core);
+        if (cm && extKindByName_.count(cm->hirKind)) return lowerExtensionNode(core, *cm);
+        return reportedError(child, "ext slot's child is not an extension-mapped rule");
+    }
+
+    // For a `flatExpr` slot whose match is a clause wrapper (e.g. whereClause =
+    // [WHERE, expression]): descend to the flat-expression child. If the matched
+    // node IS the flat-expression already, use it directly.
+    [[nodiscard]] NodeId flatExprChildOf(NodeId node) {
+        if (cfg.flatExprRule.valid() && tree().kind(node) == NodeKind::Internal
+            && tree().rule(node).v == cfg.flatExprRule.v)
+            return node;
+        if (NodeId e = findChildByRule(node, cfg.flatExprRule); e.valid()) return e;
+        return node;
+    }
+
+    [[nodiscard]] NodeId findChildByRule(NodeId parent, RuleId rule) {
+        if (!rule.valid()) return {};
+        for (NodeId c : visible(parent)) {
+            if (tree().kind(c) == NodeKind::Internal && tree().rule(c).v == rule.v) return c;
+        }
+        return {};
+    }
+    [[nodiscard]] NodeId findExprChild(NodeId parent) {
+        for (NodeId c : visible(parent))
+            if (tree().kind(c) == NodeKind::Internal && isExprNode(peelToCore(c))) return c;
+        return {};
     }
 
     E lowerLiteral(NodeId operandNode, NodeId tokenNode, SchemaTokenId tk, TypeId type) {
@@ -371,6 +708,28 @@ struct Lowerer {
             unsupported(tokenNode, std::format("literal '{}' is out of range / undecodable", text));
         std::uint32_t const idx = literals.add(val);
         return {track(builder.makeLiteral(type, idx), operandNode), type};
+    }
+
+    // Combine two lowered operands under an ALREADY-RESOLVED binary-operator entry
+    // `e`, anchoring provenance + diagnostics at `anchor`. Shared by the Pratt
+    // (`lowerBinary`) and flat (`lowerFlatExpr`) paths so the logical-op special
+    // cases and operator-result typing (comparison → Bool, else the left operand's
+    // type) stay identical. Does NOT handle `Assign` (an expression-position
+    // store) — that is Pratt-only and resolved by the caller before this point.
+    E combineBinary(NodeId anchor, HirOperatorEntry const& e, E lhs, E rhs) {
+        if (e.target == "LogicalAnd")
+            return {track(builder.makeLogicalAnd(lhs.id, rhs.id, boolType()), anchor), boolType()};
+        if (e.target == "LogicalOr")
+            return {track(builder.makeLogicalOr(lhs.id, rhs.id, boolType()), anchor), boolType()};
+        auto op = coreOpFromName(e.target);
+        if (!op || arityOf(*op) != HirOpArity::Binary) {
+            unsupported(anchor, std::format("binary target '{}' is not a core binary operator", e.target));
+            return {errorNode(anchor), InvalidType};
+        }
+        TypeId const result = isComparison(*op) ? boolType()
+                            : (lhs.type.valid() ? lhs.type : rhs.type);
+        return {track(builder.addParent(HirKind::BinaryOp, std::array{lhs.id, rhs.id},
+                                        result, encodeOp(*op)), anchor), result};
     }
 
     E lowerBinary(NodeId node) {
@@ -419,20 +778,7 @@ struct Lowerer {
             return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
                     lv->type};
         }
-        E lhs = lowerExpr(lhsN), rhs = lowerExpr(rhsN);
-        if (e.target == "LogicalAnd")
-            return {track(builder.makeLogicalAnd(lhs.id, rhs.id, boolType()), node), boolType()};
-        if (e.target == "LogicalOr")
-            return {track(builder.makeLogicalOr(lhs.id, rhs.id, boolType()), node), boolType()};
-        auto op = coreOpFromName(e.target);
-        if (!op || arityOf(*op) != HirOpArity::Binary) {
-            unsupported(node, std::format("binary target '{}' is not a core binary operator", e.target));
-            return {errorNode(node), InvalidType};
-        }
-        TypeId const result = isComparison(*op) ? boolType()
-                            : (lhs.type.valid() ? lhs.type : rhs.type);
-        return {track(builder.addParent(HirKind::BinaryOp, std::array{lhs.id, rhs.id},
-                                        result, encodeOp(*op)), node), result};
+        return combineBinary(node, e, lowerExpr(lhsN), lowerExpr(rhsN));
     }
 
     E lowerUnary(NodeId node) {
@@ -595,6 +941,8 @@ struct Lowerer {
         if (k == "DoWhileStmt") return lowerWhile(node, /*doWhile=*/true);
         if (k == "ForStmt")     return lowerFor(node);
         if (k == "SwitchStmt")  return lowerSwitch(node);
+        // HR10: a rule mapped to a registered extension kind → an Extension node.
+        if (extKindByName_.count(k)) return lowerExtensionNode(node, *m);
         unsupported(node, std::format("statement maps to unsupported HIR kind '{}'", k));
         return errorNode(node);
     }
@@ -941,7 +1289,10 @@ struct Lowerer {
         TypeId type = InvalidType;
         if (decl && decl->nameChild && *decl->nameChild < vis.size()) {
             NodeId nameNode = vis[*decl->nameChild];
+            // The symbol may sit on a name token nested under a wrapper (tsql's
+            // columnDecl name is a `nameAtom`, not a bare Identifier); probe for it.
             sym = model.symbolAt(nameNode);
+            if (!sym.valid()) sym = firstNameToken(nameNode).sym;
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
         std::optional<HirNodeId> init;

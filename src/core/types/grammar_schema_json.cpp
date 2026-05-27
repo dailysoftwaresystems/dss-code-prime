@@ -3378,6 +3378,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 }
                             }
                         }
+                        if (entry.contains("hardParents")) {
+                            json const& hp = entry.at("hardParents");
+                            if (!hp.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/hardParents",
+                                          "'hardParents' must be an array of rule names");
+                            } else {
+                                for (std::size_t k = 0; k < hp.size(); ++k) {
+                                    if (!hp[k].is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  std::format("{}/hardParents/{}", path, k),
+                                                  "each 'hardParents' entry must be a string");
+                                        continue;
+                                    }
+                                    auto name = hp[k].get<std::string>();
+                                    if (!data.rules->contains(name)) {
+                                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                                  std::format("{}/hardParents/{}", path, k),
+                                                  std::format("'hardParents' references unknown "
+                                                              "shape '{}'", name));
+                                        continue;
+                                    }
+                                    rule.hardParents.push_back(data.rules->find(name));
+                                    rule.hardParentNames.push_back(std::move(name));
+                                }
+                            }
+                        }
                         cfg.references.push_back(std::move(rule));
                     }
                 }
@@ -4133,6 +4160,68 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         m.hirKind = entry.at("hirKind").get<std::string>();
+                        // HR10: optional childGathering [{ match:{rule|classifier},
+                        // optional?, list?, lower, role? }] for extension-kind mappings.
+                        if (entry.contains("childGathering")) {
+                            json const& cg = entry.at("childGathering");
+                            if (!cg.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering, path + "/childGathering",
+                                          "'childGathering' must be an array");
+                            } else {
+                                for (std::size_t j = 0; j < cg.size(); ++j) {
+                                    const auto sPath = std::format("{}/childGathering/{}", path, j);
+                                    json const& sj = cg[j];
+                                    if (!sj.is_object() || !sj.contains("lower")
+                                        || !sj.at("lower").is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath,
+                                                  "each childGathering slot needs a string 'lower'");
+                                        continue;
+                                    }
+                                    ChildSlotSpec slot;
+                                    {   // map the `lower` verb string → ChildLower (closed set)
+                                        auto const lv = sj.at("lower").get<std::string>();
+                                        if      (lv == "expr")     slot.lower = ChildLower::Expr;
+                                        else if (lv == "flatExpr") slot.lower = ChildLower::FlatExpr;
+                                        else if (lv == "ext")      slot.lower = ChildLower::Ext;
+                                        else if (lv == "ref")      slot.lower = ChildLower::Ref;
+                                        else if (lv == "varDecl")  slot.lower = ChildLower::VarDecl;
+                                        else {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath + "/lower",
+                                                      std::format("unknown childGathering lower verb '{}' "
+                                                                  "(expected expr/flatExpr/ext/ref/varDecl)", lv));
+                                            continue;
+                                        }
+                                    }
+                                    if (sj.contains("role") && sj.at("role").is_string())
+                                        slot.role = sj.at("role").get<std::string>();
+                                    if (sj.contains("optional") && sj.at("optional").is_boolean())
+                                        slot.optional = sj.at("optional").get<bool>();
+                                    if (sj.contains("list") && sj.at("list").is_boolean())
+                                        slot.list = sj.at("list").get<bool>();
+                                    // match: exactly one of { rule } / { classifier }.
+                                    if (sj.contains("match") && sj.at("match").is_object()) {
+                                        json const& mj = sj.at("match");
+                                        if (mj.contains("rule"))
+                                            (void)resolveRuleField(mj, "rule", sPath + "/match",
+                                                                   slot.matchRule, slot.matchRuleName);
+                                        else if (mj.contains("classifier") && mj.at("classifier").is_string()) {
+                                            slot.classifier = mj.at("classifier").get<std::string>();
+                                            if (slot.classifier != "expr")
+                                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                          sPath + "/match/classifier",
+                                                          std::format("unknown classifier '{}' (only "
+                                                                      "'expr' is supported)", slot.classifier));
+                                        } else
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath + "/match",
+                                                      "'match' needs a 'rule' or 'classifier'");
+                                    } else {
+                                        coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath,
+                                                  "childGathering slot needs a 'match' object");
+                                    }
+                                    m.childGathering.push_back(std::move(slot));
+                                }
+                            }
+                        }
                         cfg.ruleMappings.push_back(std::move(m));
                     }
                 }
@@ -4148,6 +4237,76 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("postfixExprRule", cfg.postfixExprRule, cfg.postfixExprRuleName);
             readExprRule("ternaryExprRule", cfg.ternaryExprRule, cfg.ternaryExprRuleName);
             readExprRule("operandRule",     cfg.operandRule,     cfg.operandRuleName);
+            readExprRule("flatExprRule",     cfg.flatExprRule,     cfg.flatExprRuleName);
+            readExprRule("flatBinaryOpRule", cfg.flatBinaryOpRule, cfg.flatBinaryOpRuleName);
+
+            // ── HR10: extensionKinds [{ name, lang }] ──
+            if (hl.contains("extensionKinds")) {
+                json const& arr = hl.at("extensionKinds");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/extensionKinds",
+                              "'extensionKinds' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/hirLowering/extensionKinds/{}", i);
+                        json const& e = arr[i];
+                        if (!e.is_object() || !e.contains("name") || !e.at("name").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each extensionKind needs a string 'name'");
+                            continue;
+                        }
+                        ExtensionKindEntry ek;
+                        ek.name = e.at("name").get<std::string>();
+                        if (ek.name.find("::") == std::string::npos) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path + "/name",
+                                      std::format("extension kind name '{}' must be language-"
+                                                  "qualified (contain '::')", ek.name));
+                            continue;
+                        }
+                        if (e.contains("lang") && e.at("lang").is_string())
+                            ek.lang = e.at("lang").get<std::string>();
+                        cfg.extensionKinds.push_back(std::move(ek));
+                    }
+                }
+            }
+
+            // An extension kind named by a non-array facet (nullExtensionKind /
+            // refExtensionKind) MUST be declared in `extensionKinds`, so the
+            // lowering engine's `extKind()` lookup is total (it never silently
+            // registers an undeclared kind). Emits C_InvalidHirLowering otherwise.
+            auto requireDeclaredExtKind = [&](std::string const& name, std::string const& path) {
+                for (auto const& ek : cfg.extensionKinds) if (ek.name == name) return;
+                coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                          std::format("extension kind '{}' is not declared in "
+                                      "'hirLowering.extensionKinds'", name));
+            };
+
+            // ── HR10: nullLiteral { token, hirKind } ──
+            if (hl.contains("nullLiteral")) {
+                json const& nl = hl.at("nullLiteral");
+                if (!nl.is_object() || !nl.contains("token") || !nl.at("token").is_string()
+                    || !nl.contains("hirKind") || !nl.at("hirKind").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/nullLiteral",
+                              "'nullLiteral' needs string 'token' and 'hirKind'");
+                } else {
+                    cfg.nullTokenName = nl.at("token").get<std::string>();
+                    (void)resolveToken(cfg.nullTokenName, "/hirLowering/nullLiteral/token", cfg.nullToken);
+                    cfg.nullExtensionKind = nl.at("hirKind").get<std::string>();
+                    requireDeclaredExtKind(cfg.nullExtensionKind, "/hirLowering/nullLiteral/hirKind");
+                }
+            }
+
+            // ── HR10: refExtensionKind (string) — name refs lower to this
+            // extension kind instead of a core Ref (SQL relational names). ──
+            if (hl.contains("refExtensionKind")) {
+                if (!hl.at("refExtensionKind").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/refExtensionKind",
+                              "'refExtensionKind' must be a string");
+                } else {
+                    cfg.refExtensionKind = hl.at("refExtensionKind").get<std::string>();
+                    requireDeclaredExtKind(cfg.refExtensionKind, "/hirLowering/refExtensionKind");
+                }
+            }
 
             // ── operator dispatch tables: [{ token, target, compoundBase? }] ──
             auto readOps = [&](char const* key, std::vector<HirOperatorEntry>& out) {
@@ -4270,6 +4429,38 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             cfg.charBodyToken,   cfg.charBodyTokenName);
             readBodyLiteral("stringLiteral", cfg.stringStartToken, cfg.stringStartTokenName,
                             cfg.stringBodyToken, cfg.stringBodyTokenName);
+            // HR10: a second string opener (SQL's `N'…'`) sharing stringBodyToken.
+            if (hl.contains("unicodeStringStartToken")
+                && hl.at("unicodeStringStartToken").is_string()) {
+                cfg.unicodeStringStartTokenName = hl.at("unicodeStringStartToken").get<std::string>();
+                (void)resolveToken(cfg.unicodeStringStartTokenName,
+                                   "/hirLowering/unicodeStringStartToken",
+                                   cfg.unicodeStringStartToken);
+            }
+            // HR10: string bodies use doubled-delimiter (`''`) escaping (SQL).
+            // Derive the delimiter byte from the string opener's StringStyle.endsAt
+            // (single source of truth) so the engine's decoder doesn't duplicate it.
+            if (hl.contains("stringDoubledDelimiter")
+                && hl.at("stringDoubledDelimiter").is_boolean()
+                && hl.at("stringDoubledDelimiter").get<bool>()) {
+                cfg.stringDoubledDelimiter = true;
+                for (auto const& [lex, meanings] : data.lexemeTable) {
+                    (void)lex;
+                    for (auto const& mn : meanings) {
+                        if (mn.id.v == cfg.stringStartToken.v && mn.stringStyleId.valid()
+                            && mn.stringStyleId.v < data.stringStyles.size()) {
+                            auto const& ss = data.stringStyles[mn.stringStyleId.v];
+                            if (!ss.endsAt.empty()) cfg.stringDelimiter = ss.endsAt[0];
+                        }
+                    }
+                }
+                if (cfg.stringDelimiter == '\0') {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/hirLowering/stringDoubledDelimiter",
+                              "could not derive the doubled-delimiter byte from the "
+                              "string opener's StringStyle.endsAt");
+                }
+            }
 
             data.hirLowering = std::move(cfg);
         }

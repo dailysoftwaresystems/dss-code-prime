@@ -9,7 +9,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 production-critical. |
-| Predecessors  | ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (arena reuse). 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (input — HR1–HR9 ✅ 2026-05-26..27 (HR8 = config-driven CST→HIR lowering on c-subset, incl. a `HirLiteralPool` of decoded literal values MIR reads; HR9 enriched toy into a typed language + un-deferred arrays → `Array<T,N>` types MIR will lower), HR10–HR11 pending; HR7's `.dsshir` text format is the sibling-discipline reference for ML4's `.dssir` / ML8's `.dsslir` round-trip). |
+| Predecessors  | ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (arena reuse). 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (input — HR1–HR10 ✅ 2026-05-26..28 (HR8 = config-driven CST→HIR lowering on c-subset, incl. a `HirLiteralPool` of decoded literal values MIR reads; HR9 enriched toy into a typed language + un-deferred arrays → `Array<T,N>` types MIR will lower; HR10 added tsql-subset lowering), only HR11 (multi-language CU) pending; HR7's `.dsshir` text format is the sibling-discipline reference for ML4's `.dssir` / ML8's `.dsslir` round-trip). |
 | Successors    | ⏳ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) consumes LIR. ⏳ Optimizer phase (master §10) operates on MIR. ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) consumes assembled bytes + relocations. ⏳ [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) reuses MIR for shader optimization. ⏳ [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) consumes MIR with structured-CF markers. |
 | Scope         | **Bounded.** ML1–ML4 MIR. ML5–ML8 LIR. |
 

@@ -38,10 +38,53 @@ namespace dss {
 // statement node, or a token — not by fixed indices — so optional keywords and
 // punctuation need no configuration. (The for-loop's optional `;`-separated
 // clauses are the one exception; see `forClauseSeparator`.)
+// HR10: one role-child slot of an extension node. The engine LOCATES a child of
+// the mapped CST node (by sub-rule name, or by the "expr" classifier) and LOWERS
+// it one way. Children named by no slot (keywords, punctuation) are dropped. This
+// is the generic, language-agnostic vocabulary — the engine reads it, never SQL
+// rule/kind names. `list` lowers EACH item of a matched list rule (a grouping
+// node's children); `optional` lets an absent match produce no child.
+// How the engine lowers a located child (or each item of a `list` slot). A
+// closed set of engine dispatch verbs — NOT an `hir`-layer enum, so it lives in
+// this `core` header and the loader validates the JSON string against it at load
+// time (an unknown verb is a config error reported then, never at lowering time).
+enum class ChildLower : std::uint8_t {
+    Expr,      // lowerExpr (the language's general expression rule)
+    FlatExpr,  // lowerFlatExpr (a flat `operand (op operand)*` sequence)
+    Ext,       // lowerExtensionNode (the located rule is itself extension-mapped)
+    Ref,       // a name reference (core Ref, or refExtensionKind leaf) to the resolved name
+    VarDecl,   // lowerVarLike (core VarDecl, reusing the semantics declaration)
+};
+
+struct DSS_EXPORT ChildSlotSpec {
+    RuleId      matchRule{};      std::string matchRuleName;  // sub-rule to find (xor classifier)
+    std::string classifier;       // "expr" — the first expression child (xor matchRule)
+    bool        optional = false;
+    bool        list     = false; // matched node is a list: lower each of its item children
+    ChildLower  lower    = ChildLower::Expr;   // how to lower the located node / each list item
+    std::string role;             // human label (diagnostics + .dsshir readability); engine ignores
+};
+
 struct DSS_EXPORT HirRuleMapping {
     RuleId      rule{};
-    std::string hirKind;     // HirKind member name, resolved by the engine
+    std::string hirKind;     // core HirKind name OR a registered extension-kind name
     std::string ruleName;    // source-text rule name, retained for diagnostics
+    // HR10: when `hirKind` names an extension kind, the role-children of the
+    // Extension node, gathered generically from the CST node's children. Empty
+    // for core-kind mappings (which have bespoke lowering).
+    std::vector<ChildSlotSpec> childGathering;
+};
+
+// HR10: a HIR extension kind to register before lowering (language/domain-
+// qualified, e.g. "TSQL::Select"). The engine registers each into the builder's
+// HirKindRegistry so a rule mapped to this name lowers to a HirKind::Extension
+// node carrying the minted HirKindId; .dsshir round-trips via the registry preamble.
+struct DSS_EXPORT ExtensionKindEntry {
+    std::string name;   // language/domain-qualified, e.g. "TSQL::Select"
+    // The owning language as the registry records it — independent of `name`'s
+    // `::` prefix (e.g. name "TSQL::Select" but lang "TsqlSubset"), so it is NOT
+    // derivable from the prefix.
+    std::string lang;
 };
 
 // One operator-token → HIR target. Used for the three Pratt wrapper rules
@@ -118,11 +161,44 @@ struct DSS_EXPORT HirLoweringConfig {
     SchemaTokenId charBodyToken{};     std::string charBodyTokenName;
     SchemaTokenId stringStartToken{};  std::string stringStartTokenName;
     SchemaTokenId stringBodyToken{};   std::string stringBodyTokenName;
+    // HR10: a SECOND string opener (e.g. SQL's `N'…'` unicode strings) sharing
+    // the same coalesced `stringBodyToken`. Invalid ⇒ language has one string form.
+    SchemaTokenId unicodeStringStartToken{}; std::string unicodeStringStartTokenName;
+    // HR10: string bodies use doubled-delimiter escaping (`''`→`'`, SQL) rather
+    // than C-family backslash escapes. Selects the decoder in lowerStringLiteral.
+    // `stringDelimiter` is the doubled byte (the string's close delimiter), which
+    // the loader derives from the opener's StringStyle so the engine needn't.
+    bool stringDoubledDelimiter = false;
+    char stringDelimiter = '\0';
+
+    // HR10 — extension kinds + flat-expression + NULL literal (SQL et al.):
+    // The extension kinds to register before lowering (so a rule mapped to one
+    // builds a HirKind::Extension node).
+    std::vector<ExtensionKindEntry> extensionKinds;
+    // A FLAT binary-expression rule `operand (binaryOpRule operand)*` (SQL's
+    // `expression`), as opposed to the Pratt wrappers. When the engine meets this
+    // rule it left-folds it into nested core BinaryOp nodes. `flatBinaryOpRule`
+    // wraps each operator token; `binaryOps` maps the token → HIR op (shared).
+    RuleId      flatExprRule{};       std::string flatExprRuleName;
+    RuleId      flatBinaryOpRule{};   std::string flatBinaryOpRuleName;
+    // A typeless literal token (SQL `NULL`) → a leaf Extension node of this kind.
+    SchemaTokenId nullToken{};        std::string nullTokenName;
+    std::string   nullExtensionKind;  // e.g. "TSQL::Null"
+
+    // HR10: when set, a name reference (the `ref` lower verb, and the bare-name
+    // operand of a flat expression) lowers to a leaf Extension node of THIS kind
+    // rather than a core `Ref`. SQL relational names — table names and column
+    // references — are NOT typed value reads (tables have no value-type; columns
+    // bind relationally, and this phase deliberately does not resolve them), so a
+    // core `Ref` (which the verifier requires to be typed) is the wrong vehicle.
+    // The name stays recoverable via source provenance, exactly as for an
+    // unresolved core Ref. Empty ⇒ refs lower to core `Ref` (typed languages).
+    std::string   refExtensionKind;   // e.g. "TSQL::Name"
 
     // True when the block carries no facets — the engine then does nothing.
     [[nodiscard]] bool empty() const noexcept {
         return ruleMappings.empty() && binaryOps.empty() && unaryOps.empty()
-            && postfixOps.empty();
+            && postfixOps.empty() && extensionKinds.empty();
     }
 };
 

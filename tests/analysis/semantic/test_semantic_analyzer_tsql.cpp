@@ -242,6 +242,52 @@ TEST(SemanticAnalyzerTsql, MissingTableEmitsUndeclared) {
     }
 }
 
+// HR10 `ReferenceRule.hardParents`: a relational COLUMN reference that doesn't
+// resolve lexically is NOT an error — columns bind against the FROM relation,
+// which this frontend doesn't model. The `qualifiedName` reference rule is hard
+// only under the statement-target parents (tableRef / insert/update/delete), so
+// a column in a WHERE/projection position stays soft (sym 0).
+TEST(SemanticAnalyzerTsql, UnresolvedColumnInExpressionStaysSoft) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "CREATE TABLE T (a INT);"
+        "SELECT * FROM T WHERE Ghost = 1;",   // Ghost is a column, not in scope
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "an unresolved relational column must not emit S_UndeclaredIdentifier";
+}
+
+// The discriminating case: a missing TABLE (hard, under tableRef) errors while
+// the column references in the SAME statement (soft, under expression) do not —
+// so the count is exactly one, on the table name.
+TEST(SemanticAnalyzerTsql, HardTableErrorsWhileColumnsStaySoft) {
+    auto cu = buildShippedUnit("tsql-subset", {
+        "SELECT Ghost FROM Missing WHERE Other = 1;",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "exactly the table (hard) errors; the two columns (soft) do not";
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_UndeclaredIdentifier)
+            EXPECT_EQ(d.actual, "Missing");
+}
+
+// The hard parents beyond tableRef (insert/update/delete statement targets) must
+// also still error on a missing table — they're otherwise unreachable via SELECT.
+TEST(SemanticAnalyzerTsql, MissingTableInUpdateAndDeleteErrors) {
+    auto upd = buildShippedUnit("tsql-subset", { "UPDATE Missing SET a = 1;" });
+    assertNoBuilderErrors(*upd);
+    EXPECT_EQ(countCode(analyze(upd).diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "UPDATE on a missing table (hard target) must error";
+
+    auto del = buildShippedUnit("tsql-subset", { "DELETE FROM Missing WHERE a = 1;" });
+    assertNoBuilderErrors(*del);
+    EXPECT_EQ(countCode(analyze(del).diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "DELETE on a missing table (hard target) must error";
+}
+
 // SE6 (tsql): a call to an unknown function → an S_UndeclaredIdentifier
 // on the callee. tsql's `callExpr` callee is a bare `Identifier` token
 // NOT covered by the `qualifiedName` reference rule, so the engine's

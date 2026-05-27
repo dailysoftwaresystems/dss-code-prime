@@ -1,0 +1,75 @@
+dsshir 1
+ext_kinds {
+  "TSQL::Select" lang "TsqlSubset"
+  "TSQL::Insert" lang "TsqlSubset"
+  "TSQL::Update" lang "TsqlSubset"
+  "TSQL::Delete" lang "TsqlSubset"
+  "TSQL::CreateTable" lang "TsqlSubset"
+  "TSQL::Projection" lang "TsqlSubset"
+  "TSQL::Star" lang "TsqlSubset"
+  "TSQL::ValueList" lang "TsqlSubset"
+  "TSQL::ColumnList" lang "TsqlSubset"
+  "TSQL::AssignList" lang "TsqlSubset"
+  "TSQL::Assignment" lang "TsqlSubset"
+  "TSQL::Columns" lang "TsqlSubset"
+  "TSQL::Null" lang "TsqlSubset"
+  "TSQL::Name" lang "TsqlSubset"
+}
+symbols {
+  %1 "Id"
+  %2 "Name"
+  %3 "Active"
+}
+module "TsqlSubset" {
+  ext_node "TSQL::CreateTable" {
+    ext_node "TSQL::Name"
+    ext_node "TSQL::Columns" {
+      var %1 : i32
+      var %2 : ext "TSQL::Varchar" ()
+      var %3 : bool
+    }
+  }
+  ext_node "TSQL::Insert" {
+    ext_node "TSQL::Name"
+    ext_node "TSQL::ColumnList" {
+      ext_node "TSQL::Name"
+      ext_node "TSQL::Name"
+      ext_node "TSQL::Name"
+    }
+    ext_node "TSQL::ValueList" {
+      lit int 1 : i32
+      lit str "Alice" : arr<char, 6>
+      lit int 1 : i32
+    }
+  }
+  ext_node "TSQL::Insert" {
+    ext_node "TSQL::Name"
+    ext_node "TSQL::ValueList" {
+      lit int 2 : i32
+      ext_node "TSQL::Null"
+      lit int 0 : i32
+    }
+  }
+  ext_node "TSQL::Update" {
+    ext_node "TSQL::Name"
+    ext_node "TSQL::AssignList" {
+      ext_node "TSQL::Assignment" {
+        ext_node "TSQL::Name"
+        lit int 0 : i32
+      }
+    }
+    binop Eq : bool (ext_node "TSQL::Name", lit int 1 : i32)
+  }
+  ext_node "TSQL::Select" {
+    ext_node "TSQL::Projection" {
+      ext_node "TSQL::Name"
+      ext_node "TSQL::Name"
+    }
+    ext_node "TSQL::Name"
+    binop Eq : bool (ext_node "TSQL::Name", lit int 1 : i32)
+  }
+  ext_node "TSQL::Delete" {
+    ext_node "TSQL::Name"
+    binop Eq : bool (ext_node "TSQL::Name", lit int 2 : i32)
+  }
+}

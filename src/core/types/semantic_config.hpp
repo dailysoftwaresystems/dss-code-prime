@@ -208,6 +208,19 @@ struct DSS_EXPORT ReferenceRule {
     RuleId          rule{};
     NameMatchMode   nameMatch = NameMatchMode::Self;
     std::string     ruleName;
+    // Positional control over the "unresolved is an error" decision, for
+    // languages where the SAME reference rule appears both in must-resolve and
+    // bind-late positions. T-SQL's `qualifiedName` is a TABLE reference under
+    // `tableRef` / the DML-statement target (must resolve — a missing table is an
+    // error) but a relational COLUMN reference inside an expression (binds
+    // against the FROM relation, which this frontend does not model — unresolved
+    // is NOT an error). When `hardParents` is non-empty, an unresolved reference
+    // emits S_UndeclaredIdentifier ONLY when its parent node's rule is in the
+    // list; elsewhere it stays soft (sym 0, name recoverable from provenance).
+    // Empty (the default) ⇒ hard everywhere (c-subset / toy lexical resolution).
+    // A resolvable name always binds regardless of position.
+    std::vector<RuleId>      hardParents;
+    std::vector<std::string> hardParentNames;   // source names, for diagnostics
 };
 
 // Source built-in type name → lattice type mapping. Used during
