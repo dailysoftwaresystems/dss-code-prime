@@ -388,11 +388,37 @@ struct Lowerer {
             return {errorNode(node), InvalidType};
         }
         HirOperatorEntry const& e = cfg.binaryOps[it->second];
-        // Assignment is a STATEMENT in HIR; it has no value as a sub-expression.
+        // Assignment is a STATEMENT in HIR, but C lets it be used as a value
+        // (`while ((c = f()) != EOF)`). Lower it as a SeqExpr that performs the
+        // store then yields the stored value — the sound, position-independent
+        // form (hoisting the store out would be wrong inside a loop condition).
+        // Covers compound assignment too (`(x += 1)` reads, applies the op, writes).
         if (e.target == "Assign") {
-            unsupported(node, "assignment as a sub-expression is not representable in HIR "
-                              "(HR8 lowers assignment only in statement position)");
-            return {errorNode(node), InvalidType};
+            NodeId lhsN2{}, rhsN2{};
+            for (NodeId c : visible(node)) {
+                if (isToken(c)) continue;
+                if (!lhsN2.valid()) lhsN2 = c; else if (!rhsN2.valid()) rhsN2 = c;
+            }
+            auto lv = lhsN2.valid() ? classifyLvalue(lhsN2) : std::nullopt;
+            if (!lv || !rhsN2.valid())
+                return exprError(node, "assignment sub-expression needs an lvalue and a value");
+            HirNodeId stored;
+            if (e.compoundBase.empty()) {
+                stored = lowerExpr(rhsN2).id;                       // plain `=`
+            } else {
+                auto op = coreOpFromName(e.compoundBase);           // `OP=`
+                if (!op || arityOf(*op) != HirOpArity::Binary)
+                    return exprError(node, std::format("compound base op '{}' is not binary",
+                                                       e.compoundBase));
+                stored = builder.addParent(HirKind::BinaryOp,
+                                           std::array{lvRead(*lv), lowerExpr(rhsN2).id},
+                                           lv->type, encodeOp(*op));
+            }
+            std::vector<HirNodeId> stmts = lv->prep;
+            stmts.push_back(lvWrite(*lv, stored));
+            HirNodeId yield = lvRead(*lv);   // the new value (re-read of the lvalue)
+            return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
+                    lv->type};
         }
         E lhs = lowerExpr(lhsN), rhs = lowerExpr(rhsN);
         if (e.target == "LogicalAnd")
@@ -469,6 +495,24 @@ struct Lowerer {
             return {errorNode(node), InvalidType};
         }
         HirOperatorEntry const& e = cfg.postfixOps[it->second];
+        // Value-yielding `x++` / `x--` (postfix yields the OLD value): save it in
+        // a temp, mutate the lvalue, yield the temp — all in a SeqExpr. Handled
+        // before lowering `base` (classifyLvalue lowers the lvalue itself).
+        if (e.target == "PostInc" || e.target == "PostDec") {
+            auto lv = classifyLvalue(baseN);
+            if (!lv) return exprError(node, "++/-- needs an lvalue operand");
+            SymbolId const tmp = freshSymbol();
+            std::vector<HirNodeId> stmts = lv->prep;
+            stmts.push_back(builder.makeVarDecl(lv->type, tmp.v, lvRead(*lv), HirFlags::Synthetic));
+            HirNodeId one = synthOne(lv->type);
+            HirNodeId inc = builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), one}, lv->type,
+                                              encodeOp(e.target == "PostInc" ? HirOpKind::Add
+                                                                             : HirOpKind::Sub));
+            stmts.push_back(lvWrite(*lv, inc));
+            HirNodeId yield = builder.makeRef(lv->type, tmp.v);
+            return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
+                    lv->type};
+        }
         E base = lowerExpr(baseN);
         if (e.target == "Call") {
             std::vector<HirNodeId> args;
@@ -494,9 +538,6 @@ struct Lowerer {
             TypeId const result = typeAtOr(node, inferred);
             return {track(builder.makeIndex(base.id, idx, result), node), result};
         }
-        if (e.target == "PostInc" || e.target == "PostDec")
-            return exprError(node, "value-yielding ++/-- (e.g. `y = x++`) needs sequencing HIR "
-                                   "can't express yet; only statement-position ++/-- is lowered");
         return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
     }
 
@@ -589,6 +630,76 @@ struct Lowerer {
         return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
     }
 
+    // A fresh SymbolId for a lowering-synthesized temporary, minted above the
+    // semantic symbol table so it can never collide with a source symbol. These
+    // temps are self-contained (declared + referenced within one SeqExpr/Block),
+    // so they need no name table — the `.dsshir` writer falls back to a `%sN`
+    // handle and MIR maps them by their VarDecl node, not by an external table.
+    [[nodiscard]] SymbolId freshSymbol() {
+        if (nextSyntheticSym_ == 0)
+            nextSyntheticSym_ = static_cast<std::uint32_t>(model.symbols().size());
+        return SymbolId{nextSyntheticSym_++};
+    }
+    std::uint32_t nextSyntheticSym_ = 0;
+
+    // A resolved lvalue: how to READ its current value and WRITE a new one, plus
+    // the prep statements that must run FIRST. A SIMPLE variable lvalue needs no
+    // prep (reading a `Ref` is side-effect-free, so it can be read repeatedly). A
+    // COMPLEX lvalue (an index / deref whose address sub-expressions may have
+    // side effects) binds its ADDRESS into a temp pointer once in `prep`, then
+    // reads/writes through `*ptr` — so `a[f()] += 1` evaluates `f()` exactly
+    // once. This is what makes compound-assign / ++ / assignment-as-value correct
+    // for every lvalue, not just simple variables.
+    struct Lvalue {
+        bool                   simple = true;
+        TypeId                 type{};       // the lvalue's value type
+        SymbolId               sym{};        // simple: the variable; via-ptr: the temp pointer
+        TypeId                 ptrType{};    // via-ptr only: interner.pointer(type)
+        std::vector<HirNodeId> prep;         // via-ptr only: [ var ptr = &<lvalue> ]
+    };
+
+    [[nodiscard]] HirNodeId lvRead(Lvalue const& lv) {
+        if (lv.simple) return builder.makeRef(lv.type, lv.sym.v);
+        return builder.makeDeref(builder.makeRef(lv.ptrType, lv.sym.v), lv.type, HirFlags::Synthetic);
+    }
+    [[nodiscard]] HirNodeId lvWrite(Lvalue const& lv, HirNodeId value) {
+        HirNodeId target = lv.simple
+            ? builder.makeRef(lv.type, lv.sym.v)
+            : builder.makeDeref(builder.makeRef(lv.ptrType, lv.sym.v), lv.type, HirFlags::Synthetic);
+        return builder.makeAssignStmt(target, value);
+    }
+
+    // Classify an lvalue CST. A plain variable → simple (no prep). Anything else
+    // (index / deref) → via a temp pointer bound in `prep`. nullopt when the
+    // lvalue can't be lowered (no resolved type / not an addressable form).
+    [[nodiscard]] std::optional<Lvalue> classifyLvalue(NodeId exprCst) {
+        if (auto s = simpleLvalue(exprCst)) {
+            Lvalue lv; lv.simple = true; lv.sym = s->first; lv.type = s->second;
+            if (!lv.type.valid()) return std::nullopt;
+            return lv;
+        }
+        E target = lowerExpr(peelToCore(exprCst));
+        if (!target.type.valid()) return std::nullopt;
+        Lvalue lv;
+        lv.simple  = false;
+        lv.type    = target.type;
+        lv.ptrType = interner.pointer(target.type);
+        lv.sym     = freshSymbol();
+        HirNodeId addr = builder.makeAddressOf(target.id, lv.ptrType, HirFlags::Synthetic);
+        lv.prep.push_back(builder.makeVarDecl(lv.ptrType, lv.sym.v, addr, HirFlags::Synthetic));
+        return lv;
+    }
+
+    // Wrap [prep..., assign] as a single statement: the bare assign when there's
+    // no prep (simple lvalue), else a Block (complex lvalue's temp-pointer bind +
+    // the store). Used by statement-position compound-assign / ++.
+    [[nodiscard]] HirNodeId asStmt(Lvalue const& lv, HirNodeId assign, NodeId cst) {
+        if (lv.prep.empty()) return track(assign, cst);
+        std::vector<HirNodeId> stmts = lv.prep;
+        stmts.push_back(assign);
+        return track(builder.makeBlock(stmts), cst);
+    }
+
     // `lhs OP= rhs` → `lhs = lhs OP rhs` (statement). Safe only for a simple
     // lvalue (duplicating the read has no effect); complex lvalues fail loud.
     HirNodeId lowerCompoundAssign(NodeId binNode, std::string const& baseOpName) {
@@ -597,38 +708,32 @@ struct Lowerer {
             if (isToken(c)) continue;
             if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
         }
-        auto lv = lhsN.valid() ? simpleLvalue(lhsN) : std::nullopt;
         auto op = coreOpFromName(baseOpName);
+        auto lv = lhsN.valid() ? classifyLvalue(lhsN) : std::nullopt;
         if (!lv || !rhsN.valid() || !op || arityOf(*op) != HirOpArity::Binary)
-            return reportedError(binNode, "compound assignment is only lowered for a simple "
-                                          "variable lvalue (complex lvalues need once-only "
-                                          "evaluation HIR can't express yet)");
-        auto const [sym, type] = *lv;
-        HirNodeId target = track(builder.makeRef(type, sym.v), lhsN);
-        HirNodeId reread = track(builder.makeRef(type, sym.v), lhsN);
+            return reportedError(binNode, "compound assignment needs an lvalue and a binary base op");
         HirNodeId rhs = lowerExpr(rhsN).id;
-        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{reread, rhs},
-                                                  type, encodeOp(*op)), binNode);
-        return track(builder.makeAssignStmt(target, value), binNode);
+        // lhs OP= rhs → lhs = (lhs OP rhs); the lvalue is read once + written once
+        // (a complex lvalue's address is bound in lv.prep, evaluated once).
+        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), rhs},
+                                                  lv->type, encodeOp(*op)), binNode);
+        return asStmt(*lv, lvWrite(*lv, value), binNode);
     }
 
     // `x++` / `x--` in STATEMENT position → `x = x +/- 1` (the produced value is
-    // discarded). Value-yielding ++/-- (e.g. `y = x++`) needs sequencing HIR
-    // lacks and is handled (failed loud) in lowerPostfix.
+    // discarded). Value-yielding ++/-- (e.g. `y = x++`) lowers via a SeqExpr in
+    // lowerPostfix.
     HirNodeId lowerIncDecStmt(NodeId postfixNode, bool isInc) {
         NodeId baseN{};
         for (NodeId c : visible(postfixNode)) { if (!isToken(c)) { baseN = c; break; } }
-        auto lv = baseN.valid() ? simpleLvalue(baseN) : std::nullopt;
-        if (!lv)
-            return reportedError(postfixNode, "++/-- is only lowered for a simple variable lvalue");
-        auto const [sym, type] = *lv;
-        HirNodeId target = track(builder.makeRef(type, sym.v), baseN);
-        HirNodeId reread = track(builder.makeRef(type, sym.v), baseN);
-        HirNodeId one = synthOne(type);
-        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{reread, one}, type,
+        auto lv = baseN.valid() ? classifyLvalue(baseN) : std::nullopt;
+        if (!lv) return reportedError(postfixNode, "++/-- needs an lvalue operand");
+        HirNodeId one = synthOne(lv->type);
+        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), one},
+                                                  lv->type,
                                                   encodeOp(isInc ? HirOpKind::Add : HirOpKind::Sub)),
                                 postfixNode);
-        return track(builder.makeAssignStmt(target, value), postfixNode);
+        return asStmt(*lv, lvWrite(*lv, value), postfixNode);
     }
 
     // The statement-position dispatch shared by exprStmt and for-init/update:

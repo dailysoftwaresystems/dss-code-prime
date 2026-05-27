@@ -241,14 +241,63 @@ TEST(HirLoweringCSubset, ForUpdateIncrement) {
     EXPECT_TRUE(res->hir.forUpdate(forS).has_value());
 }
 
-TEST(HirLoweringCSubset, ValueYieldingIncrementIsDeferred) {
-    // `y = x++` needs sequencing (yield old value then mutate) HIR lacks.
+TEST(HirLoweringCSubset, ValueYieldingIncrementLowersToSeqExpr) {
+    // `return x++;` — postfix yields the OLD value, then mutates. Lowers to a
+    // SeqExpr: { var tmp = x; x = x + 1; yield tmp }.
     SemanticModel model = analyzeCSubset("int f(int x) { return x++; }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok);
-    EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ret  = res->hir.children(body)[0];
+    HirNodeId val  = *res->hir.returnValue(ret);
+    ASSERT_EQ(res->hir.kind(val), HirKind::SeqExpr);
+    // stmts: [var tmp = x, assign x = x+1]; result: ref tmp.
+    EXPECT_EQ(res->hir.seqExprStmts(val).size(), 2u);
+    EXPECT_EQ(res->hir.kind(res->hir.seqExprStmts(val)[0]), HirKind::VarDecl);
+    EXPECT_EQ(res->hir.kind(res->hir.seqExprStmts(val)[1]), HirKind::AssignStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.seqExprResult(val)), HirKind::Ref);
+}
+
+TEST(HirLoweringCSubset, AssignmentAsSubExpressionLowersToSeqExpr) {
+    // `while ((x = x + 1) < 10) {}` — the assignment is used as a value. Lowers
+    // to a SeqExpr yielding the assigned value (sound inside a loop condition,
+    // where hoisting the store would be wrong).
+    SemanticModel model = analyzeCSubset("void f(int x) { while ((x = x + 1) < 10) {} }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body  = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId wh    = res->hir.children(body)[0];
+    ASSERT_EQ(res->hir.kind(wh), HirKind::WhileStmt);
+    HirNodeId cond  = *res->hir.loopCondition(wh);     // (x = x+1) < 10  → BinaryOp Lt
+    ASSERT_EQ(res->hir.kind(cond), HirKind::BinaryOp);
+    HirNodeId lhs   = res->hir.children(cond)[0];       // the (x = x+1) sub-expr
+    EXPECT_EQ(res->hir.kind(lhs), HirKind::SeqExpr);
+}
+
+TEST(HirLoweringCSubset, ComplexLvalueCompoundAssignUsesTempPointer) {
+    // `a[i] += 1;` — a complex lvalue. To evaluate `a[i]`'s address once, the
+    // lowering binds a temp pointer and reads/writes through it: a Block of
+    // { var p = &a[i]; *p = *p + 1; }.
+    SemanticModel model = analyzeCSubset("void f(int i) { int a[4]; a[i] += 1; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    // children: [ var a[4], <block for a[i] += 1> ]
+    HirNodeId stmt = res->hir.children(body)[1];
+    ASSERT_EQ(res->hir.kind(stmt), HirKind::Block);
+    auto inner = res->hir.children(stmt);
+    ASSERT_EQ(inner.size(), 2u);
+    EXPECT_EQ(res->hir.kind(inner[0]), HirKind::VarDecl);     // var p = &a[i]
+    EXPECT_EQ(res->hir.kind(inner[1]), HirKind::AssignStmt);  // *p = *p + 1
+    // the temp pointer's type is Ptr<I32>
+    auto const& ti = model.lattice().interner();
+    EXPECT_EQ(ti.kind(res->hir.varDeclType(inner[0])), TypeKind::Ptr);
 }
 
 TEST(HirLoweringCSubset, ArrayDeclarationLowersToArrayType) {
