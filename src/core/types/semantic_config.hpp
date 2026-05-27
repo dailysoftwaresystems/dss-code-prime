@@ -95,6 +95,19 @@ struct DSS_EXPORT KindDiscriminator {
     std::vector<std::uint32_t> bodyPath;
 };
 
+// SE-arrays (HR9): a C-style declarator suffix (e.g. `int a[10]`). When a
+// declaration configures one and a node of `rule` appears in its subtree, the
+// declared type is wrapped as Array<base, length>, where `length` is the
+// constant integer in the suffix's visible child at `lengthChild`. A missing or
+// non-constant length fails loud (S_NonConstantArrayLength); an out-of-range one
+// is S_ArrayLengthOutOfRange — never a silent pointer decay. Nested in an
+// `optional` (like `kindByChild`) so the off state can't carry stray fields.
+struct DSS_EXPORT ArraySuffix {
+    RuleId                       rule{};        // the suffix shape rule
+    std::string                  ruleName;      // source spelling, for diagnostics
+    std::optional<std::uint32_t> lengthChild;   // visible-child index of the length expr
+};
+
 struct DSS_EXPORT DeclarationRule {
     // The rule (resolved to RuleId) whose subtree introduces the decl.
     RuleId          rule{};
@@ -129,16 +142,10 @@ struct DSS_EXPORT DeclarationRule {
     // instead of the static fields above.
     std::optional<KindDiscriminator> kindByChild;
     // SE-arrays (HR9): optional C-style declarator suffix (e.g. `int a[10]`).
-    // When set and a node of `arraySuffixRule` appears among the declaration's
-    // visible children, the declared type is wrapped as Array<base, length>,
-    // where `length` is the constant integer in the suffix's visible child at
-    // `arrayLengthChild`. A missing or non-constant length fails loud
-    // (S_NonConstantArrayLength) — never a silent pointer decay. The suffix is
-    // a sibling of the type (not a type-position constructor), so it is matched
-    // by rule among the declaration's children rather than via `typeShapes`.
-    std::optional<RuleId>        arraySuffixRule;
-    std::optional<std::uint32_t> arrayLengthChild;
-    std::string                  arraySuffixRuleName;  // for diagnostics/round-trip
+    // The suffix is a sibling of the type (not a type-position constructor), so
+    // the engine matches it by rule within the declaration subtree rather than
+    // via `typeShapes`. `nullopt` ⇒ this declaration form has no array syntax.
+    std::optional<ArraySuffix> arraySuffix;
     // Source-text name of the declared rule, retained for diagnostics.
     std::string     ruleName;
 };

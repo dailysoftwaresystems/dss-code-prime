@@ -81,6 +81,63 @@ TEST(SemanticAnalyzerCSubset, NonConstantArrayLengthEmitsDiagnostic) {
                         DiagnosticCode::S_NonConstantArrayLength), 1u);
 }
 
+// SE-arrays: an empty-bracket declarator (`int a[]`) has no length — a DIFFERENT
+// path from `[n]` (the length node lands on the `]` token, not an identifier).
+// Must also fail loud.
+TEST(SemanticAnalyzerCSubset, EmptyArrayLengthEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", { "int main() { int a[]; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+}
+
+// SE-arrays: a non-decimal length exercises the shared decodeInteger through the
+// NEW semantic consumer — `0x10` must decode to 16 (radix handling), not be
+// rejected as non-constant.
+TEST(SemanticAnalyzerCSubset, HexArrayLengthDecodes) {
+    auto cu = buildShippedUnit("c-subset", { "int main() { int a[0x10]; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 16);
+}
+
+// SE-arrays: a constant length that decodes but exceeds the signed length the
+// lattice stores must NOT wrap to a negative length — fail loud with the
+// dedicated S_ArrayLengthOutOfRange (regression for a silent sign-flip).
+TEST(SemanticAnalyzerCSubset, OutOfRangeArrayLengthEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int a[0xFFFFFFFFFFFFFFFF]; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u);
+}
+
+// SE-arrays: a GLOBAL array (`int g[10];`) — the suffix nests under
+// `topLevelDecl → varDeclTail → arrayDeclSuffix`, exercising applyArraySuffix's
+// descendant scan. Must type as Array<I32,10> just like the local case.
+TEST(SemanticAnalyzerCSubset, GlobalArrayDeclaratorTypedAsArray) {
+    auto cu = buildShippedUnit("c-subset", { "int g[10];\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* gRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "g") gRec = &model.symbols()[i];
+    ASSERT_NE(gRec, nullptr);
+    ASSERT_EQ(ti.kind(gRec->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(gRec->type)[0], 10);
+    EXPECT_EQ(ti.kind(ti.operands(gRec->type)[0]), TypeKind::I32);
+}
+
 // `int x;` in two DIFFERENT blocks is NOT a redecl — c-subset's
 // `block` is declared as a scope opener in the language semantics, so
 // each nested block produces its own ScopeId and same-name decls are

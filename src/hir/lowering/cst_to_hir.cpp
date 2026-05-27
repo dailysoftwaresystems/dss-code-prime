@@ -762,8 +762,8 @@ struct Lowerer {
             // Skip an array-declarator suffix: its `[N]` length expression is
             // part of the TYPE (already folded into an Array<elem,N> by the
             // semantic phase), not the variable's initializer.
-            if (decl && decl->arraySuffixRule && tree().kind(c) == NodeKind::Internal
-                && tree().rule(c).v == decl->arraySuffixRule->v)
+            if (decl && decl->arraySuffix && tree().kind(c) == NodeKind::Internal
+                && tree().rule(c).v == decl->arraySuffix->rule.v)
                 continue;
             if (classify(c) == Role::Expr) { init = lowerExpr(c).id; break; }
         }
@@ -813,7 +813,7 @@ struct Lowerer {
             return reportedError(node, "array declarator is deferred to HR9 "
                                        "(the lattice has no Array type yet)");
         std::optional<HirNodeId> init;
-        RuleId const skip = decl.arraySuffixRule.value_or(RuleId{});
+        RuleId const skip = decl.arraySuffix ? decl.arraySuffix->rule : RuleId{};
         for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) { init = lowerExpr(c).id; break; }
         return track(builder.makeGlobal(type, sym.v, init), node);
     }

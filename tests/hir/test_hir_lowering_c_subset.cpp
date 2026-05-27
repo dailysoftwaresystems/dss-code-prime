@@ -273,10 +273,29 @@ TEST(HirLoweringCSubset, ArrayDeclarationLowersToArrayType) {
     EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32);     // element
 }
 
+TEST(HirLoweringCSubset, GlobalArrayLowersToArrayTypeWithNoInit) {
+    // A GLOBAL array exercises a different path from the local case: the suffix
+    // nests under `topLevelDecl → varDeclTail → arrayDeclSuffix` (a descendant,
+    // not a direct child), and `descendantsForInit` must NOT mistake the `[10]`
+    // length for the global's initializer.
+    SemanticModel model = analyzeCSubset("int g[10];\nint main() { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId g = res->hir.moduleDecls(res->hir.root())[0];
+    ASSERT_EQ(res->hir.kind(g), HirKind::Global);
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = res->hir.globalType(g);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 10);
+    EXPECT_FALSE(res->hir.globalInit(g).has_value()) << "the `[10]` length must not become an initializer";
+}
+
 TEST(HirLoweringCSubset, NonConstantArrayLengthFailsLoud) {
-    // `int a[n]` (variable length) and `int a[]` (no length) must NOT silently
-    // decay or assume a length — the semantic phase emits
-    // S_NonConstantArrayLength and the symbol type stays unresolved.
+    // `int a[n]` (variable length) must NOT silently decay or assume a length —
+    // the semantic phase emits S_NonConstantArrayLength.
     SemanticModel model = analyzeCSubset("void f(int n) { int a[n]; }");
     EXPECT_TRUE(model.hasErrors());
 }

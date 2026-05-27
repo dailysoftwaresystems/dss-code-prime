@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -466,7 +467,8 @@ constIntLength(EngineState& s, Tree const& tree, NodeId node) {
 [[nodiscard]] TypeId
 applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
                  NodeId declNode, TypeId base) {
-    if (!decl.arraySuffixRule.has_value() || !base.valid()) return base;
+    if (!decl.arraySuffix.has_value() || !base.valid()) return base;
+    ArraySuffix const& as = *decl.arraySuffix;
     // Bounded descendant search for the suffix rule. The suffix is a direct
     // child for a local/param declarator (`varDeclHead`, `param`) but nested
     // under a tail rule for a global (`topLevelDecl` → `varDeclTail`), so a
@@ -478,26 +480,33 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
         NodeId c = stack.back(); stack.pop_back();
         if (tree.kind(c) != NodeKind::Internal) continue;
-        if (tree.rule(c) == *decl.arraySuffixRule) { suffix = c; break; }
+        if (tree.rule(c) == as.rule) { suffix = c; break; }
         for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
     }
     if (!suffix.valid()) return base;  // this declarator has no `[..]`
 
-    NodeId lenNode{};
-    if (decl.arrayLengthChild.has_value()) {
-        auto sufKids = visibleChildren(tree, suffix);
-        if (*decl.arrayLengthChild < sufKids.size())
-            lenNode = sufKids[*decl.arrayLengthChild];
-    }
-    auto len = constIntLength(s, tree, lenNode);
-    if (!len.has_value()) {
+    auto emit = [&](DiagnosticCode code) {
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::S_NonConstantArrayLength;
+        d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(suffix);
         d.actual   = std::string{tree.text(suffix)};
         s.reporter.report(std::move(d));
+    };
+
+    NodeId lenNode{};
+    if (as.lengthChild.has_value()) {
+        auto sufKids = visibleChildren(tree, suffix);
+        if (*as.lengthChild < sufKids.size())
+            lenNode = sufKids[*as.lengthChild];
+    }
+    auto len = constIntLength(s, tree, lenNode);
+    if (!len.has_value()) { emit(DiagnosticCode::S_NonConstantArrayLength); return InvalidType; }
+    // A constant that decodes but exceeds the signed length the interner stores
+    // (int64) must NOT wrap to a negative length — fail loud instead.
+    if (*len > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        emit(DiagnosticCode::S_ArrayLengthOutOfRange);
         return InvalidType;
     }
     return s.lattice.interner().array(base, static_cast<std::int64_t>(*len));

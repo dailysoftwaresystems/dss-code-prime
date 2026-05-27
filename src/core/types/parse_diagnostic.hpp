@@ -188,6 +188,11 @@ enum class DiagnosticCode : std::uint16_t {
     // type stays unresolved so downstream phases fail loud rather than
     // miscompile. Config-driven via DeclarationRule::arraySuffixRule.
     S_NonConstantArrayLength      = 0xE00B,
+    // An array declarator whose length IS a constant integer literal but is too
+    // large to represent as the signed length the type lattice stores (it would
+    // wrap to a negative length). Distinct from S_NonConstantArrayLength (which
+    // is "not a constant at all"); kept separate so the message matches reality.
+    S_ArrayLengthOutOfRange       = 0xE00C,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

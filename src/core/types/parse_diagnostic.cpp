@@ -82,6 +82,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_ControlOutsideLoop:       return "S_ControlOutsideLoop";
         case DiagnosticCode::S_UnusedVariable:           return "S_UnusedVariable";
         case DiagnosticCode::S_NonConstantArrayLength:   return "S_NonConstantArrayLength";
+        case DiagnosticCode::S_ArrayLengthOutOfRange:    return "S_ArrayLengthOutOfRange";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

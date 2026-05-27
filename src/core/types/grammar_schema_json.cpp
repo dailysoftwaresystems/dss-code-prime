@@ -3007,8 +3007,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                               std::format("'arraySuffix.rule' references "
                                                           "unknown shape '{}'", rn));
                                 } else {
-                                    rule.arraySuffixRule     = data.rules->find(rn);
-                                    rule.arraySuffixRuleName = rn;
+                                    ArraySuffix suffix;
+                                    suffix.rule     = data.rules->find(rn);
+                                    suffix.ruleName = rn;
                                     if (as.contains("lengthChild")) {
                                         auto const& lc = as.at("lengthChild");
                                         if (!lc.is_number_integer()
@@ -3020,10 +3021,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                       "'lengthChild' must be a non-negative "
                                                       "integer");
                                         } else {
-                                            rule.arrayLengthChild =
+                                            suffix.lengthChild =
                                                 static_cast<std::uint32_t>(lc.get<std::int64_t>());
                                         }
                                     }
+                                    rule.arraySuffix = std::move(suffix);
                                 }
                             }
                         }
