@@ -46,7 +46,7 @@ enum class HirKind : std::uint16_t {
     // ── Expressions ──
     Literal, Ref, Call, IntrinsicCall, BinaryOp, UnaryOp, Cast, MemberAccess,
     Index, Swizzle, ConstructAggregate, Ternary, LogicalAnd, LogicalOr,
-    SizeOf, AddressOf, Deref,
+    SizeOf, AddressOf, Deref, SeqExpr,
     // ── Types-as-values ──
     TypeRef,
     // ── Special ──
@@ -97,7 +97,7 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
-        case HirKind::AddressOf: case HirKind::Deref:
+        case HirKind::AddressOf: case HirKind::Deref: case HirKind::SeqExpr:
         // ── Types-as-values: carries the referenced lattice TypeId ──
         case HirKind::TypeRef:
         // ── Declarations carrying their own (source-defined) type ──
@@ -198,6 +198,13 @@ struct ChildArity {
         case HirKind::LogicalOr:
             return {2, 2};
         case HirKind::Ternary:            return {3, 3};
+        // SeqExpr: [stmt..., resultExpr] — N>=0 statements then the value-
+        // yielding expression (always the LAST child). The minimum is 1 (the
+        // result expression); a SeqExpr with no statements is degenerate but
+        // legal (equals its result). Models GCC statement-expressions / the
+        // comma operator: the substrate for value-yielding `++`, assignment-as-
+        // expression, and complex-lvalue compound-assign that need a temp.
+        case HirKind::SeqExpr:            return {1, kUnboundedArity};
         // ── Statements (HR3) ──
         case HirKind::Block:              return {0, kUnboundedArity};  // [stmts...]
         case HirKind::IfStmt:             return {2, 3};                // [cond, then, else?]

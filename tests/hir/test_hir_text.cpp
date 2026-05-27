@@ -158,6 +158,30 @@ TEST(HirText, RoundTripControlFlow) {
     EXPECT_NE(text.find("default {"), std::string::npos);
 }
 
+TEST(HirText, RoundTripSeqExpr) {
+    // A SeqExpr (statements then a yielded value) round-trips through the
+    // `seq : type { … yield <expr> }` form. Models a value-yielding desugar.
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId i32   = in.primitive(TypeKind::I32);
+    TypeId voidT = in.primitive(TypeKind::Void);
+    TypeId sig   = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId lit = b.makeLiteral(i32, 0);
+    HirNodeId vd  = b.makeVarDecl(i32, 2, lit);              // var %2 = lit#0
+    HirNodeId seq = b.makeSeqExpr(std::vector<HirNodeId>{vd}, b.makeRef(i32, 2), i32);
+    HirNodeId body = b.makeBlock(std::vector<HirNodeId>{b.makeExprStmt(seq), b.makeReturn()});
+    HirNodeId fn   = b.makeFunction(sig, 1, {}, body);
+    HirNodeId root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main", "tmp"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("seq : i32 {"), std::string::npos);
+    EXPECT_NE(text.find("yield ref %2"), std::string::npos);
+}
+
 TEST(HirText, RoundTripTypesAndFlags) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId i32 = in.primitive(TypeKind::I32);

@@ -239,7 +239,8 @@ namespace {
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
-        case HirKind::AddressOf: case HirKind::Deref: case HirKind::TypeRef:
+        case HirKind::AddressOf: case HirKind::Deref: case HirKind::SeqExpr:
+        case HirKind::TypeRef:
             return true;
         default: return false;
     }
@@ -742,6 +743,16 @@ private:
             case HirKind::SizeOf:             typedCall("sizeof"); return;
             case HirKind::AddressOf:          typedCall("addressof"); return;
             case HirKind::Deref:              typedCall("deref"); return;
+            case HirKind::SeqExpr: {
+                // `seq : type { <stmt-lines> yield <resultExpr> }` — the
+                // statement children render as normal statement lines; the
+                // result (last child) is the yielded value. Mirrors the
+                // inline-brace form `error`/`ext_node` use.
+                typed("seq"); out_ += " {\n";
+                for (HirNodeId s : hir_.seqExprStmts(id)) emitNodeLine(s, 1);
+                out_ += indent(1); out_ += "yield "; emitExpr(hir_.seqExprResult(id));
+                out_ += "\n}"; return;
+            }
             case HirKind::TypeRef:    typed("typeref"); return;
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/true, 0); return;
@@ -1229,7 +1240,7 @@ private:
             || kw == "binop" || kw == "unop" || kw == "cast" || kw == "member"
             || kw == "index" || kw == "swizzle" || kw == "construct" || kw == "ternary"
             || kw == "logical_and" || kw == "logical_or" || kw == "sizeof"
-            || kw == "addressof" || kw == "deref" || kw == "typeref";
+            || kw == "addressof" || kw == "deref" || kw == "seq" || kw == "typeref";
     }
 
     // Parse any node (decl/stmt/expr/wildcard). Handles attrs + pre-order index.
@@ -1306,6 +1317,21 @@ private:
             TypeId t = parseTypeAnnot(); auto k = parseParenOperands();
             return builder_.addParent(HirKind::Swizzle, k, t, m, flags); }
         if (kw == "typeref") { TypeId t = parseTypeAnnot(); return builder_.makeTypeRef(t, flags); }
+        if (kw == "seq") {
+            // seq : type { <stmt-lines> yield <resultExpr> }
+            TypeId t = parseTypeAnnot();
+            expect(Tk::LBrace, "'{'");
+            std::vector<HirNodeId> stmts;
+            while (!peekKeyword("yield") && !peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                std::uint32_t const off = cursorOff();
+                stmts.push_back(parseNode());
+                if (cursorOff() == off) lex_.take();   // progress guard
+            }
+            if (!acceptKeyword("yield")) malformed("seq body needs a 'yield <expr>'");
+            HirNodeId result = parseNode();
+            expect(Tk::RBrace, "'}'");
+            return builder_.makeSeqExpr(stmts, result, t, flags);
+        }
         // The `kw : type (operands...)` family — mirror of the emitter's typedCall
         // list. Payload is always 0; arity is enforced later by the verifier.
         static constexpr std::pair<std::string_view, HirKind> kTypedExprs[] = {

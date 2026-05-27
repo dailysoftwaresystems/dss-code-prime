@@ -126,6 +126,12 @@ public:
     [[nodiscard]] std::optional<HirNodeId> returnValue(HirNodeId id)  const;
     [[nodiscard]] HirNodeId                exprStmtExpr(HirNodeId id) const;
 
+    // SeqExpr: the statements evaluated for effect (all but the last child) and
+    // the result expression (the last child, which supplies the SeqExpr's value
+    // + type).
+    [[nodiscard]] std::span<HirNodeId const> seqExprStmts(HirNodeId id)  const;
+    [[nodiscard]] HirNodeId                  seqExprResult(HirNodeId id) const;
+
     // var decl: declared type (== typeId), declared SymbolId, optional initializer.
     [[nodiscard]] TypeId                   varDeclType(HirNodeId id)   const;
     [[nodiscard]] SymbolId                 varDeclSymbol(HirNodeId id) const;
@@ -320,6 +326,15 @@ public:
                                      HirFlags flags = HirFlags::None);
     // Conditional: children are [cond, thenExpr, elseExpr].
     HirNodeId makeTernary(HirNodeId cond, HirNodeId thenExpr, HirNodeId elseExpr,
+                          TypeId type, HirFlags flags = HirFlags::None);
+    // Sequenced expression: evaluate `stmts` in order for their effects, then
+    // yield `result` (whose type is the SeqExpr's `type`). Children are
+    // [stmts..., result]. The substrate for desugaring value-yielding `++`,
+    // assignment-used-as-a-value, and complex-lvalue compound-assign — each
+    // needs to run statements (a temp save, a store) and yield a value, which no
+    // plain expression node can express. Transparently flattenable by MIR and
+    // transpilable (→ comma operator / statement-expression).
+    HirNodeId makeSeqExpr(std::span<HirNodeId const> stmts, HirNodeId result,
                           TypeId type, HirFlags flags = HirFlags::None);
     // Short-circuit logical-and / -or over [lhs, rhs] (a distinct kind from
     // BinaryOp because evaluation is short-circuit, not eager).

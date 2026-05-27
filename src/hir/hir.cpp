@@ -333,6 +333,13 @@ HirNodeId HirBuilder::makeTernary(HirNodeId cond, HirNodeId thenExpr, HirNodeId 
     return addParent(HirKind::Ternary, kids, type, /*payload=*/0, flags);
 }
 
+HirNodeId HirBuilder::makeSeqExpr(std::span<HirNodeId const> stmts, HirNodeId result,
+                                  TypeId type, HirFlags flags) {
+    std::vector<HirNodeId> kids(stmts.begin(), stmts.end());
+    kids.push_back(result);   // result is always the LAST child
+    return addParent(HirKind::SeqExpr, kids, type, /*payload=*/0, flags);
+}
+
 HirNodeId HirBuilder::makeLogicalAnd(HirNodeId lhs, HirNodeId rhs, TypeId type, HirFlags flags) {
     HirNodeId const kids[] = {lhs, rhs};
     return addParent(HirKind::LogicalAnd, kids, type, /*payload=*/0, flags);
@@ -612,6 +619,17 @@ std::optional<HirNodeId> Hir::returnValue(HirNodeId id) const {
 HirNodeId Hir::exprStmtExpr(HirNodeId id) const {
     assert(kind(id) == HirKind::ExprStmt);
     return childAt(id, 0);
+}
+std::span<HirNodeId const> Hir::seqExprStmts(HirNodeId id) const {
+    assert(kind(id) == HirKind::SeqExpr);
+    auto kids = children(id);
+    // [stmts..., result] — all but the last (childArity guarantees ≥ 1 child).
+    return kids.subspan(0, kids.size() - 1);
+}
+HirNodeId Hir::seqExprResult(HirNodeId id) const {
+    assert(kind(id) == HirKind::SeqExpr);
+    auto kids = children(id);
+    return kids.back();
 }
 
 TypeId Hir::varDeclType(HirNodeId id) const {
