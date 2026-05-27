@@ -411,11 +411,14 @@
     "identifierToken": "Identifier",
     "declarations": [
       { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
-        "constMarker": "ConstKeyword", "warnIfUnused": true },
+        "constMarker": "ConstKeyword", "warnIfUnused": true,
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } },
       { "rule": "param",       "name": 1, "type": 0, "kind": "variable",
-        "constMarker": "ConstKeyword" },
+        "constMarker": "ConstKeyword",
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } },
       { "rule": "topLevelDecl", "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword",
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
         "kindByChild": {
           "childPath": [2, 0],
           "whenRule": "funcDefTail",
@@ -541,8 +544,6 @@
 
     "forClauseSeparator": "EndStatement",
     "caseLabelRule":      "caseLabel",
-    "caseDefaultToken":   "DefaultKeyword",
-
-    "deferredRules": ["arrayDeclSuffix"]
+    "caseDefaultToken":   "DefaultKeyword"
   }
 }

@@ -5,6 +5,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/tree.hpp"
@@ -56,42 +57,8 @@ namespace {
     }
 }
 
-// Decode an integer literal's text per the language's NumberStyle: strip digit
-// separators, detect a radix prefix (0x/0b/0o/0), strip an integer suffix.
-// std::nullopt on overflow of the 64-bit accumulator (the value is reported, not
-// silently wrapped).
-[[nodiscard]] std::optional<std::uint64_t> decodeInteger(std::string_view text, NumberStyle const* ns) {
-    std::string s;
-    s.reserve(text.size());
-    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
-    for (char c : text) {
-        if (sep != '\0' && c == sep) continue;
-        s += c;
-    }
-    std::string_view v{s};
-    std::uint64_t base = 10;
-    if (v.size() >= 2 && v[0] == '0') {
-        char const p = static_cast<char>(std::tolower(static_cast<unsigned char>(v[1])));
-        if (p == 'x') { base = 16; v.remove_prefix(2); }
-        else if (p == 'b') { base = 2; v.remove_prefix(2); }
-        else if (p == 'o') { base = 8; v.remove_prefix(2); }
-        else { base = 8; v.remove_prefix(1); }  // C octal: leading 0
-    }
-    // Parse as many base-valid digits as possible (stops at a suffix like u/l).
-    std::uint64_t value = 0;
-    for (char c : v) {
-        std::uint64_t digit;
-        if (c >= '0' && c <= '9') digit = static_cast<std::uint64_t>(c - '0');
-        else if (c >= 'a' && c <= 'f') digit = static_cast<std::uint64_t>(10 + (c - 'a'));
-        else if (c >= 'A' && c <= 'F') digit = static_cast<std::uint64_t>(10 + (c - 'A'));
-        else break;  // suffix or stray char
-        if (digit >= base) break;
-        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / base)
-            return std::nullopt;  // overflow — caller reports
-        value = value * base + digit;
-    }
-    return value;
-}
+// decodeInteger lives in core/types/number_decode.hpp — shared with the
+// semantic phase so a literal's text is interpreted identically everywhere.
 
 [[nodiscard]] double decodeFloat(std::string_view text, NumberStyle const* ns, bool& ok) {
     std::string s;
@@ -791,7 +758,15 @@ struct Lowerer {
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
         std::optional<HirNodeId> init;
-        for (NodeId c : vis) if (classify(c) == Role::Expr) { init = lowerExpr(c).id; break; }
+        for (NodeId c : vis) {
+            // Skip an array-declarator suffix: its `[N]` length expression is
+            // part of the TYPE (already folded into an Array<elem,N> by the
+            // semantic phase), not the variable's initializer.
+            if (decl && decl->arraySuffixRule && tree().kind(c) == NodeKind::Internal
+                && tree().rule(c).v == decl->arraySuffixRule->v)
+                continue;
+            if (classify(c) == Role::Expr) { init = lowerExpr(c).id; break; }
+        }
         return asGlobal ? track(builder.makeGlobal(type, sym.v, init), node)
                         : track(builder.makeVarDecl(type, sym.v, init), node);
     }
@@ -838,7 +813,8 @@ struct Lowerer {
             return reportedError(node, "array declarator is deferred to HR9 "
                                        "(the lattice has no Array type yet)");
         std::optional<HirNodeId> init;
-        for (NodeId c : descendantsForInit(node)) if (isExprNode(c)) { init = lowerExpr(c).id; break; }
+        RuleId const skip = decl.arraySuffixRule.value_or(RuleId{});
+        for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) { init = lowerExpr(c).id; break; }
         return track(builder.makeGlobal(type, sym.v, init), node);
     }
 
@@ -909,12 +885,17 @@ struct Lowerer {
         for (NodeId c : visible(n)) if (!isToken(c)) collectParams(c, out);
     }
 
-    // Direct children to scan for a global's initializer expression.
-    [[nodiscard]] std::vector<NodeId> descendantsForInit(NodeId node) {
+    // Direct children to scan for a global's initializer expression. A subtree
+    // rooted at `skipRule` (the array-declarator suffix) is pruned so a global
+    // array's `[N]` length is never mistaken for the initializer.
+    [[nodiscard]] std::vector<NodeId> descendantsForInit(NodeId node, RuleId skipRule = {}) {
         std::vector<NodeId> out;
         std::vector<NodeId> stack = visible(node);
         while (!stack.empty()) {
             NodeId c = stack.back(); stack.pop_back();
+            if (skipRule.valid() && tree().kind(c) == NodeKind::Internal
+                && tree().rule(c).v == skipRule.v)
+                continue;
             if (isExprNode(c)) { out.push_back(c); continue; }
             if (tree().kind(c) == NodeKind::Internal)
                 for (NodeId g : visible(c)) stack.push_back(g);

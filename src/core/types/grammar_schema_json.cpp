@@ -2980,6 +2980,51 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // SE-arrays (HR9): optional C-style declarator suffix.
+                        //   "arraySuffix": { "rule": "arrayDeclSuffix",
+                        //                    "lengthChild": 1 }
+                        // `rule` names the suffix shape (matched among the
+                        // declaration's visible children); `lengthChild` is the
+                        // visible-child index of the length expression inside
+                        // that suffix. An unknown rule is C_UnknownShape; the
+                        // declaration is still usable (just without arrays).
+                        if (entry.contains("arraySuffix")) {
+                            json const& as = entry.at("arraySuffix");
+                            if (!as.is_object() || !as.contains("rule")
+                                || !as.at("rule").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/arraySuffix",
+                                          "'arraySuffix' must be an object with a "
+                                          "string 'rule'");
+                            } else {
+                                auto const rn = as.at("rule").get<std::string>();
+                                if (!data.rules->contains(rn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/arraySuffix/rule",
+                                              std::format("'arraySuffix.rule' references "
+                                                          "unknown shape '{}'", rn));
+                                } else {
+                                    rule.arraySuffixRule     = data.rules->find(rn);
+                                    rule.arraySuffixRuleName = rn;
+                                    if (as.contains("lengthChild")) {
+                                        auto const& lc = as.at("lengthChild");
+                                        if (!lc.is_number_integer()
+                                            || lc.get<std::int64_t>() < 0
+                                            || lc.get<std::int64_t>()
+                                                   > std::numeric_limits<std::int32_t>::max()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/arraySuffix/lengthChild",
+                                                      "'lengthChild' must be a non-negative "
+                                                      "integer");
+                                        } else {
+                                            rule.arrayLengthChild =
+                                                static_cast<std::uint32_t>(lc.get<std::int64_t>());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // D8: optional `warnIfUnused` flag (default false).
                         // A non-bool value is the same C_InvalidSemantics
                         // discipline used for other declaration sub-fields.

@@ -128,6 +128,17 @@ struct DSS_EXPORT DeclarationRule {
     // pass 1 and uses the resulting effective kind / params / body
     // instead of the static fields above.
     std::optional<KindDiscriminator> kindByChild;
+    // SE-arrays (HR9): optional C-style declarator suffix (e.g. `int a[10]`).
+    // When set and a node of `arraySuffixRule` appears among the declaration's
+    // visible children, the declared type is wrapped as Array<base, length>,
+    // where `length` is the constant integer in the suffix's visible child at
+    // `arrayLengthChild`. A missing or non-constant length fails loud
+    // (S_NonConstantArrayLength) — never a silent pointer decay. The suffix is
+    // a sibling of the type (not a type-position constructor), so it is matched
+    // by rule among the declaration's children rather than via `typeShapes`.
+    std::optional<RuleId>        arraySuffixRule;
+    std::optional<std::uint32_t> arrayLengthChild;
+    std::string                  arraySuffixRuleName;  // for diagnostics/round-trip
     // Source-text name of the declared rule, retained for diagnostics.
     std::string     ruleName;
 };

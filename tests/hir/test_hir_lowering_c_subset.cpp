@@ -251,14 +251,34 @@ TEST(HirLoweringCSubset, ValueYieldingIncrementIsDeferred) {
     EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
 }
 
-TEST(HirLoweringCSubset, ArrayDeclarationIsDeferred) {
-    // `int a[10]` must FAIL LOUD, not silently lower to a scalar `int a = 10`
-    // (the lattice has no Array type yet). Regression for the silent-miscompile.
+TEST(HirLoweringCSubset, ArrayDeclarationLowersToArrayType) {
+    // `int a[10]` lowers to a local VarDecl whose type is Array<I32, 10>. (HR9
+    // un-deferred arrays: the semantic phase folds the `[10]` declarator suffix
+    // into the element type via a constant-length eval.)
     SemanticModel model = analyzeCSubset("void f() { int a[10]; }");
+    ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok);
-    EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId vd   = res->hir.children(body)[0];
+    ASSERT_EQ(res->hir.kind(vd), HirKind::VarDecl);
+    TypeId const ty = res->hir.varDeclType(vd);
+    auto const& ti  = model.lattice().interner();
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(ty).size(), 1u);
+    EXPECT_EQ(ti.scalars(ty)[0], 10);                          // length
+    ASSERT_EQ(ti.operands(ty).size(), 1u);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32);     // element
+}
+
+TEST(HirLoweringCSubset, NonConstantArrayLengthFailsLoud) {
+    // `int a[n]` (variable length) and `int a[]` (no length) must NOT silently
+    // decay or assume a length — the semantic phase emits
+    // S_NonConstantArrayLength and the symbol type stays unresolved.
+    SemanticModel model = analyzeCSubset("void f(int n) { int a[n]; }");
+    EXPECT_TRUE(model.hasErrors());
 }
 
 TEST(HirLoweringCSubset, IntegerOverflowReported) {

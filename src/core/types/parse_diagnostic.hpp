@@ -182,6 +182,12 @@ enum class DiagnosticCode : std::uint16_t {
     // dead-store / write-only detection requires dataflow and stays with the
     // optimizer phase (registry D9).
     S_UnusedVariable              = 0xE00A,
+    // An array declarator suffix (`int a[N]`) whose length `N` is absent or is
+    // not a compile-time constant integer literal. The engine refuses to guess
+    // (e.g. silently decay to a pointer or assume length 0); the declaration's
+    // type stays unresolved so downstream phases fail loud rather than
+    // miscompile. Config-driven via DeclarationRule::arraySuffixRule.
+    S_NonConstantArrayLength      = 0xE00B,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

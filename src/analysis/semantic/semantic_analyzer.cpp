@@ -7,6 +7,7 @@
 #include "analysis/semantic/type_rules.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/string_style.hpp"
@@ -18,6 +19,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -98,6 +101,9 @@ struct EngineState {
     std::unordered_map<std::uint32_t, TypeId>      literalTypeIds;
     // SE7 reverse use-index: SymbolId.v → its use-site NodeIds.
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol;
+    // The schema's numeric-literal style (for constant array-length decode);
+    // null when the language declares no numeric literals.
+    NumberStyle const* numberStyle = nullptr;
 
     [[nodiscard]] TypeId typeAt(NodeId id) const {
         auto const* p = nodeToType.tryGet(id);
@@ -409,6 +415,94 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     return InvalidType;
 }
 
+// True for the core integer kinds (signed + unsigned). Array lengths must be
+// an integer literal; a float/char literal in length position is rejected.
+[[nodiscard]] constexpr bool isIntegerKind(TypeKind k) {
+    return k >= TypeKind::I8 && k <= TypeKind::U128;
+}
+
+// SE-arrays: evaluate a declarator-suffix length expression to a compile-time
+// constant. Succeeds ONLY when the expression peels to a single integer
+// literal — a wrapper rule (expression/operand) or a parenthesized literal is
+// fine, but any branching (a binary op, a call, an identifier) is non-constant
+// and returns nullopt so the caller fails loud. decodeInteger overflow also
+// surfaces as nullopt.
+[[nodiscard]] std::optional<std::uint64_t>
+constIntLength(EngineState& s, Tree const& tree, NodeId node) {
+    NodeId cur = node;
+    for (int guard = 0; guard < 64 && cur.valid(); ++guard) {
+        if (tree.kind(cur) == NodeKind::Token) {
+            auto it = s.literalTypeIds.find(tree.tokenKind(cur).v);
+            if (it == s.literalTypeIds.end()) return std::nullopt;
+            if (!isIntegerKind(s.lattice.interner().kind(it->second))) return std::nullopt;
+            return decodeInteger(tree.text(cur), s.numberStyle);
+        }
+        // Count meaningful children: exactly one internal child ⇒ a wrapper
+        // (expression → operand, operand → `( expr )`) to descend through;
+        // zero internal + one literal token ⇒ the leaf literal.
+        NodeId onlyInternal{};
+        int internalCount = 0;
+        NodeId onlyLiteral{};
+        int literalCount = 0;
+        for (NodeId c : visibleChildren(tree, cur)) {
+            if (tree.kind(c) == NodeKind::Internal) { ++internalCount; onlyInternal = c; }
+            else if (s.literalTypeIds.count(tree.tokenKind(c).v) != 0) {
+                ++literalCount; onlyLiteral = c;
+            }
+        }
+        if (internalCount == 1) { cur = onlyInternal; continue; }
+        if (internalCount == 0 && literalCount == 1) { cur = onlyLiteral; continue; }
+        return std::nullopt;  // branching / no literal ⇒ non-constant
+    }
+    return std::nullopt;
+}
+
+// SE-arrays: if `decl` configures an array declarator suffix and a node of that
+// suffix rule appears among the declaration's visible children, wrap `base` as
+// Array<base, length>. A present-but-non-constant (or absent) length emits
+// S_NonConstantArrayLength and returns InvalidType so the symbol's type stays
+// unresolved (downstream fails loud rather than silently using the element
+// type or decaying to a pointer). No suffix present ⇒ returns `base` unchanged.
+[[nodiscard]] TypeId
+applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
+                 NodeId declNode, TypeId base) {
+    if (!decl.arraySuffixRule.has_value() || !base.valid()) return base;
+    // Bounded descendant search for the suffix rule. The suffix is a direct
+    // child for a local/param declarator (`varDeclHead`, `param`) but nested
+    // under a tail rule for a global (`topLevelDecl` → `varDeclTail`), so a
+    // descendant scan handles every form uniformly. It cannot false-match an
+    // array SUBSCRIPT — that is a distinct postfix `Index` rule, never the
+    // declarator-suffix rule — so descending into an initializer is harmless.
+    NodeId suffix{};
+    std::vector<NodeId> stack{declNode};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c) == *decl.arraySuffixRule) { suffix = c; break; }
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+    if (!suffix.valid()) return base;  // this declarator has no `[..]`
+
+    NodeId lenNode{};
+    if (decl.arrayLengthChild.has_value()) {
+        auto sufKids = visibleChildren(tree, suffix);
+        if (*decl.arrayLengthChild < sufKids.size())
+            lenNode = sufKids[*decl.arrayLengthChild];
+    }
+    auto len = constIntLength(s, tree, lenNode);
+    if (!len.has_value()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_NonConstantArrayLength;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(suffix);
+        d.actual   = std::string{tree.text(suffix)};
+        s.reporter.report(std::move(d));
+        return InvalidType;
+    }
+    return s.lattice.interner().array(base, static_cast<std::int64_t>(*len));
+}
+
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
 void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
            NodeId node, ScopeId current) {
@@ -642,8 +736,16 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             }
                         }
                     } else if (returnTy.valid()) {
-                        s.symbols.at(sym).type = returnTy;
-                        s.nodeToType.set(resolved.node, returnTy);
+                        // SE-arrays: a `[N]` declarator suffix wraps the
+                        // element type as Array<elem, N>. A non-constant length
+                        // leaves the type unresolved (applyArraySuffix already
+                        // emitted S_NonConstantArrayLength) so we fail loud.
+                        TypeId const declTy =
+                            applyArraySuffix(s, tree, decl, node, returnTy);
+                        if (declTy.valid()) {
+                            s.symbols.at(sym).type = declTy;
+                            s.nodeToType.set(resolved.node, declTy);
+                        }
                     }
                 }
             }
@@ -900,8 +1002,12 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = visibleChildren(tree, cur);
             if (decl.typeChild.has_value() && *decl.typeChild < kids.size()) {
-                out.push_back(resolveTypeNode(
-                    s, cfg, tree, kids[*decl.typeChild], scope));
+                TypeId pty = resolveTypeNode(
+                    s, cfg, tree, kids[*decl.typeChild], scope);
+                // SE-arrays: an array-declarator param (`int a[10]`) carries
+                // the Array type into the signature.
+                pty = applyArraySuffix(s, tree, decl, cur, pty);
+                out.push_back(pty);
             }
             return;  // a param decl is a leaf for parameter-collection
         }
@@ -1150,6 +1256,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
     }
     EngineState s{*cu};
     auto const& cfg = cu->schema().semantics();
+    s.numberStyle = cu->schema().numberStyle();  // for constant array-length decode
 
     // Register the schema's type extensions into the lattice's registry
     // (tsql's TSQL::Varchar etc.) BEFORE buildIndexes, so a builtinType
