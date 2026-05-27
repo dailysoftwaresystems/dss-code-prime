@@ -3,62 +3,213 @@
 
   "language": {
     "name": "Toy",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "fileExtensions": [".toy"]
   },
 
   "artifactProfiles": ["cli"],
 
   "tokens": {
-    " ":  [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
-    "\t": [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
-    "\n": [{ "kind": "Newline",      "flags": ["EmptySpace"] }],
-    "\r": [{ "kind": "Whitespace",   "flags": ["EmptySpace"] }],
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "\r": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
 
-    "+":  [
-      { "kind": "SumOperator",          "priority": 10 },
-      { "kind": "StringAppendOperator", "priority": 20 }
-    ],
-    "<":  [
-      { "kind": "LtOperator",              "priority": 10 },
-      { "kind": "GenericDefinitionOpener", "priority": 5, "opensScope": "Generic" }
-    ],
-    "{":  [{ "kind": "BlockOpen",          "opensScope": "Block" }],
-    "}":  [{ "kind": "BlockClose",         "closesScope": true }],
-    "(":  [{ "kind": "ParenOpen",          "opensScope": "Paren" }],
-    ")":  [{ "kind": "ParenClose",         "closesScope": true }],
+    "+":  [{ "kind": "SumOperator"  }],
+    "-":  [{ "kind": "SubOperator"  }],
+    "*":  [{ "kind": "MulOperator"  }],
+    "<":  [{ "kind": "LtOperator"   }],
+    "==": [{ "kind": "EqOperator"   }],
+
+    "{":  [{ "kind": "BlockOpen",   "opensScope": "Block" }],
+    "}":  [{ "kind": "BlockClose",  "closesScope": true   }],
+    "(":  [{ "kind": "ParenOpen",   "opensScope": "Paren" }],
+    ")":  [{ "kind": "ParenClose",  "closesScope": true   }],
     ";":  [{ "kind": "EndCommand" }],
+    ":":  [{ "kind": "Colon" }],
+    ",":  [{ "kind": "Comma" }],
+    "->": [{ "kind": "Arrow" }],
     "=":  [{ "kind": "AssignmentOperator" }]
+  },
+
+  "numberStyle": {
+    "decimal":  true,
+    "emitKind": { "integer": "IntLiteral" }
   },
 
   "syncTokens": ["EndCommand", "BlockClose"],
 
   "keywords": [
-    { "word": "var", "kind": "VarKeyword" },
-    { "word": "if",  "kind": "IfKeyword" }
+    { "word": "func",   "kind": "FuncKeyword"   },
+    { "word": "var",    "kind": "VarKeyword"    },
+    { "word": "return", "kind": "ReturnKeyword" },
+    { "word": "if",     "kind": "IfKeyword"     },
+    { "word": "else",   "kind": "ElseKeyword"   },
+    { "word": "while",  "kind": "WhileKeyword"  },
+    { "word": "int",    "kind": "IntKeyword"    },
+    { "word": "bool",   "kind": "BoolKeyword"   },
+    { "word": "void",   "kind": "VoidKeyword"   }
   ],
 
-  "scopes": {
-    "validity": [
-      { "scope": "Generic", "forbid": ["LtOperator"] }
+  "operators": {
+    "groups": [
+      { "precedence": 50, "associativity": "left", "operators": ["=="]      },
+      { "precedence": 55, "associativity": "left", "operators": ["<"]       },
+      { "precedence": 65, "associativity": "left", "operators": ["+", "-"]  },
+      { "precedence": 70, "associativity": "left", "operators": ["*"]       },
+      { "precedence": 90, "associativity": "right", "arity": "prefix",  "operators": ["-"] },
+      { "precedence": 100, "arity": "postfix", "operators": ["("], "endsAt": ")", "bodyRule": "argList" }
     ]
   },
 
   "shapes": {
-    "root":       { "sequence": [{ "repeat": "statement" }] },
-    "statement":  { "alt":      ["varDecl", "exprStmt"] },
-    "varDecl":    { "sequence": ["VarKeyword", "Identifier", "AssignmentOperator", "expression", "EndCommand"] },
-    "exprStmt":   { "sequence": ["expression", "EndCommand"] },
-    "expression": { "sequence": ["Identifier"] }
+    "root":     { "sequence": [ { "repeat": "topLevel" } ] },
+    "topLevel": { "alt": [ "funcDef", "varDecl" ] },
+
+    "funcDef": {
+      "sequence": [
+        "FuncKeyword", "Identifier",
+        "funcParams",
+        "Arrow", "typeRef",
+        "block"
+      ]
+    },
+
+    "funcParams": {
+      "sequence": [ "ParenOpen", { "optional": "paramList" }, "ParenClose" ]
+    },
+    "paramList": {
+      "sequence": [ "param", { "repeat": { "sequence": [ "Comma", "param" ] } } ]
+    },
+    "param": { "sequence": [ "Identifier", "Colon", "typeRef" ] },
+
+    "typeBase": { "alt": [ "IntKeyword", "BoolKeyword", "VoidKeyword" ] },
+    "typeRef":  { "sequence": [ "typeBase" ] },
+
+    "block": {
+      "sequence": [ "BlockOpen", { "repeat": "statement" }, "BlockClose" ]
+    },
+
+    "statement": {
+      "alt": [ "varDecl", "returnStmt", "ifStmt", "whileStmt", "block", "exprStmt" ]
+    },
+
+    "varDecl": {
+      "sequence": [
+        "VarKeyword", "Identifier", "Colon", "typeRef",
+        "AssignmentOperator", "expression", "EndCommand"
+      ]
+    },
+
+    "returnStmt": {
+      "sequence": [ "ReturnKeyword", { "optional": "expression" }, "EndCommand" ]
+    },
+
+    "ifStmt": {
+      "sequence": [
+        "IfKeyword", "ParenOpen", "expression", "ParenClose",
+        "block",
+        { "optional": { "sequence": [ "ElseKeyword", "block" ] } }
+      ]
+    },
+
+    "whileStmt": {
+      "sequence": [
+        "WhileKeyword", "ParenOpen", "expression", "ParenClose", "block"
+      ]
+    },
+
+    "exprStmt": { "sequence": [ "expression", "EndCommand" ] },
+
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    },
+
+    "operand": {
+      "alt": [
+        "Identifier",
+        "IntLiteral",
+        { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
+      ]
+    },
+
+    "argList": {
+      "optional": {
+        "sequence": [
+          "expression",
+          { "repeat": { "sequence": [ "Comma", "expression" ] } }
+        ]
+      }
+    }
   },
 
   "semantics": {
     "identifierToken": "Identifier",
     "declarations": [
-      { "rule": "varDecl", "name": 1, "init": 3, "kind": "variable" }
+      { "rule": "funcDef", "name": 1, "kind": "function", "type": 4,
+        "params": 2, "body": 5 },
+      { "rule": "param",   "name": 0, "type": 2, "kind": "variable" },
+      { "rule": "varDecl", "name": 1, "type": 3, "init": 5, "kind": "variable" }
     ],
     "references": [
-      { "rule": "expression" }
+      { "rule": "operand" }
+    ],
+    "scopes": [ "block", "funcDef" ],
+    "callRules": [
+      { "rule": "postfixExpr", "callee": 0, "args": 2, "operatorToken": "ParenOpen" }
+    ],
+    "returnRules": [
+      { "rule": "returnStmt", "value": 1 }
+    ],
+    "loopRules": [ "whileStmt" ],
+    "builtinTypes": [
+      { "name": "int",  "core": "I32"  },
+      { "name": "bool", "core": "Bool" },
+      { "name": "void", "core": "Void" }
+    ],
+    "literalTypes": [
+      { "literal": "IntLiteral", "core": "I32" }
+    ]
+  },
+
+  "hirLowering": {
+    "ruleMappings": [
+      { "rule": "funcDef",    "hirKind": "Function"   },
+      { "rule": "varDecl",    "hirKind": "VarDecl"    },
+      { "rule": "param",      "hirKind": "VarDecl"    },
+      { "rule": "block",      "hirKind": "Block"      },
+      { "rule": "ifStmt",     "hirKind": "IfStmt"     },
+      { "rule": "whileStmt",  "hirKind": "WhileStmt"  },
+      { "rule": "returnStmt", "hirKind": "ReturnStmt" },
+      { "rule": "exprStmt",   "hirKind": "ExprStmt"   }
+    ],
+
+    "binaryExprRule":  "binaryExpr",
+    "unaryExprRule":   "unaryExpr",
+    "postfixExprRule": "postfixExpr",
+    "operandRule":     "operand",
+
+    "binaryOps": [
+      { "token": "SumOperator", "target": "Add" },
+      { "token": "SubOperator", "target": "Sub" },
+      { "token": "MulOperator", "target": "Mul" },
+      { "token": "LtOperator",  "target": "Lt"  },
+      { "token": "EqOperator",  "target": "Eq"  }
+    ],
+
+    "unaryOps": [
+      { "token": "SubOperator", "target": "Neg" }
+    ],
+
+    "postfixOps": [
+      { "token": "ParenOpen", "target": "Call" }
     ]
   }
 }

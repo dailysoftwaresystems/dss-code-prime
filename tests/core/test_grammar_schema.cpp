@@ -350,13 +350,25 @@ TEST(GrammarSchema, ExprShapeAccessorsOnCSubset) {
 }
 
 // Wrapper rules `binaryExpr` / `unaryExpr` / `postfixExpr` MUST NOT be
-// auto-interned in schemas that don't use any `expr` shape. The toy
-// grammar's `expression` rule is `sequence`-shaped (not `expr`); a
-// regression that unconditionally interns the wrappers would inflate
-// every shipped grammar's RuleInterner and silently change RuleId
-// numbering.
+// auto-interned in schemas that don't use any `expr` shape; a regression that
+// unconditionally interns the wrappers would inflate every shipped grammar's
+// RuleInterner and silently change RuleId numbering. Pinned against a synthetic
+// non-expr grammar (the shipped toy grammar gained an `expr` shape at HR9).
 TEST(GrammarSchema, WrapperRulesAbsentInNonExprSchema) {
-    auto result = GrammarSchema::loadShipped("toy");
+    constexpr char const* kNonExprSchema = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NonExpr", "version": "0.0.1", "fileExtensions": [".ne"] },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "keywords": [ { "word": "go", "kind": "GoKw" } ],
+      "shapes": {
+        "root": { "sequence": [ { "repeat": "stmt" } ] },
+        "stmt": { "sequence": [ "GoKw", "Identifier", "Semi" ] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kNonExprSchema);
     ASSERT_TRUE(result.has_value());
     auto const& schema = **result;
 

@@ -1,5 +1,5 @@
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///clean.toy","languageId":"toy","version":1,"text":"1 + 2;"}}}
+{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///clean.toy","languageId":"toy","version":1,"text":"var x : int = 1 + 2;"}}}
 {"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///clean.toy"}}}
 {"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}
 {"jsonrpc":"2.0","method":"exit","params":null}

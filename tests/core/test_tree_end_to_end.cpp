@@ -67,41 +67,85 @@ std::size_t countErrorDescendants(Tree const& t, NodeId start) {
     return n;
 }
 
-// Drive a "var <name> = <value>;" statement by consuming the next 8
-// tokens from `ts` in order: var, ' ', name, ' ', =, ' ', value, ;.
-// The token stream supplies the actual lexemes — the helper is
-// parameterless because the source bytes drive what each advance()
-// yields.
+// Drive a top-level "var <name> : int = <value> ;" global, consuming the
+// 12 tokens (including interleaved whitespace) from `ts` in source order:
+// var ' ' name ' ' : ' ' int ' ' = ' ' value ;. The helper is parameterless
+// because the source bytes drive what each advance() yields — callers must
+// supply exactly that spacing. EmptySpace tokens are off-grammar so they
+// never advance the schema cursor; only the structural tokens must land in
+// the right rule frame.
 void driveVarDecl(TreeBuilder& b, TokenStream& ts, GrammarSchema const& schema) {
-    auto stmt = b.open(schema.rules().find("statement"));
-    auto vd   = b.open(schema.rules().find("varDecl"));
-    b.pushToken(ts.advance());
-    b.pushToken(ts.advance());
-    b.pushToken(ts.advance());
-    b.pushToken(ts.advance());
-    b.pushToken(ts.advance());
-    b.pushToken(ts.advance());
+    auto top = b.open(schema.rules().find("topLevel"));
+    auto vd  = b.open(schema.rules().find("varDecl"));
+    b.pushToken(ts.advance());   // var
+    b.pushToken(ts.advance());   // ' '
+    b.pushToken(ts.advance());   // name
+    b.pushToken(ts.advance());   // ' '
+    b.pushToken(ts.advance());   // :
+    b.pushToken(ts.advance());   // ' '
+    {
+        auto tr = b.open(schema.rules().find("typeRef"));
+        auto tb = b.open(schema.rules().find("typeBase"));
+        b.pushToken(ts.advance());   // int
+    }
+    b.pushToken(ts.advance());   // ' '
+    b.pushToken(ts.advance());   // =
+    b.pushToken(ts.advance());   // ' '
     {
         auto expr = b.open(schema.rules().find("expression"));
-        b.pushToken(ts.advance());
+        auto op   = b.open(schema.rules().find("operand"));
+        b.pushToken(ts.advance());   // value
     }
-    b.pushToken(ts.advance());
+    b.pushToken(ts.advance());   // ;
 }
 
-void driveExprStmt(TreeBuilder& b, TokenStream& ts, GrammarSchema const& schema) {
-    auto stmt = b.open(schema.rules().find("statement"));
-    auto es   = b.open(schema.rules().find("exprStmt"));
+// Drive a top-level "func <name>() -> int { <id> ; }" definition, consuming
+// the 16 tokens from `ts` in source order. Exercises the nested
+// funcParams / typeRef / block / statement / exprStmt frames in one go —
+// the richest single top-level form in the toy grammar.
+void driveFuncDef(TreeBuilder& b, TokenStream& ts, GrammarSchema const& schema) {
+    auto top = b.open(schema.rules().find("topLevel"));
+    auto fn  = b.open(schema.rules().find("funcDef"));
+    b.pushToken(ts.advance());   // func
+    b.pushToken(ts.advance());   // ' '
+    b.pushToken(ts.advance());   // name
     {
-        auto expr = b.open(schema.rules().find("expression"));
-        b.pushToken(ts.advance());
+        auto fp = b.open(schema.rules().find("funcParams"));
+        b.pushToken(ts.advance());   // (
+        b.pushToken(ts.advance());   // )
     }
-    b.pushToken(ts.advance());
+    b.pushToken(ts.advance());   // ' '
+    b.pushToken(ts.advance());   // ->
+    b.pushToken(ts.advance());   // ' '
+    {
+        auto tr = b.open(schema.rules().find("typeRef"));
+        auto tb = b.open(schema.rules().find("typeBase"));
+        b.pushToken(ts.advance());   // int
+    }
+    b.pushToken(ts.advance());   // ' '
+    {
+        auto blk = b.open(schema.rules().find("block"));
+        b.pushToken(ts.advance());   // {
+        b.pushToken(ts.advance());   // ' '
+        {
+            auto stmt = b.open(schema.rules().find("statement"));
+            auto es   = b.open(schema.rules().find("exprStmt"));
+            {
+                auto expr = b.open(schema.rules().find("expression"));
+                auto op   = b.open(schema.rules().find("operand"));
+                b.pushToken(ts.advance());   // id
+            }
+            b.pushToken(ts.advance());   // ;
+        }
+        b.pushToken(ts.advance());   // ' '
+        b.pushToken(ts.advance());   // }
+    }
 }
 
 } // namespace
 
 TEST(TreeEndToEnd, HappyPath_SingleVarDecl_PrintsExpectedTree) {
-    auto h = tokenizeShipped("var x = y;");
+    auto h = tokenizeShipped("var x : int = y;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
@@ -117,25 +161,34 @@ TEST(TreeEndToEnd, HappyPath_SingleVarDecl_PrintsExpectedTree) {
 
     const std::string_view expected =
         "rule:root\n"
-        "  rule:statement\n"
+        "  rule:topLevel\n"
         "    rule:varDecl\n"
         "      tok:\"var\"\n"
         "      tok:\"x\"\n"
+        "      tok:\":\"\n"
+        "      rule:typeRef\n"
+        "        rule:typeBase\n"
+        "          tok:\"int\"\n"
         "      tok:\"=\"\n"
         "      rule:expression\n"
-        "        tok:\"y\"\n"
+        "        rule:operand\n"
+        "          tok:\"y\"\n"
         "      tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
-TEST(TreeEndToEnd, HappyPath_SingleExprStmt_PrintsExpectedTree) {
-    auto h = tokenizeShipped("y;");
+TEST(TreeEndToEnd, HappyPath_FuncDef_PrintsExpectedTree) {
+    // exprStmt is only grammatical inside a block, so the e2e shape that
+    // exercises it is a full function definition. This pins the nested
+    // funcParams / typeRef / block / statement / exprStmt / expression
+    // frames in one pretty-print assertion.
+    auto h = tokenizeShipped("func f() -> int { y; }");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
     {
         auto root = b.open(h.schema->rules().find("root"));
-        driveExprStmt(b, h.stream, *h.schema);
+        driveFuncDef(b, h.stream, *h.schema);
     }
     Tree t = std::move(b).finish();
 
@@ -144,34 +197,49 @@ TEST(TreeEndToEnd, HappyPath_SingleExprStmt_PrintsExpectedTree) {
 
     const std::string_view expected =
         "rule:root\n"
-        "  rule:statement\n"
-        "    rule:exprStmt\n"
-        "      rule:expression\n"
-        "        tok:\"y\"\n"
-        "      tok:\";\"\n";
+        "  rule:topLevel\n"
+        "    rule:funcDef\n"
+        "      tok:\"func\"\n"
+        "      tok:\"f\"\n"
+        "      rule:funcParams\n"
+        "        tok:\"(\"\n"
+        "        tok:\")\"\n"
+        "      tok:\"->\"\n"
+        "      rule:typeRef\n"
+        "        rule:typeBase\n"
+        "          tok:\"int\"\n"
+        "      rule:block\n"
+        "        tok:\"{\"\n"
+        "        rule:statement\n"
+        "          rule:exprStmt\n"
+        "            rule:expression\n"
+        "              rule:operand\n"
+        "                tok:\"y\"\n"
+        "            tok:\";\"\n"
+        "        tok:\"}\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
 
 TEST(TreeEndToEnd, HappyPath_MultipleStatements_PrintsExpectedTree) {
-    auto h = tokenizeShipped("var x = a; y; var w = b;");
+    auto h = tokenizeShipped("var x : int = a; func f() -> int { y; } var w : int = b;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
     {
         auto root = b.open(h.schema->rules().find("root"));
         driveVarDecl(b, h.stream, *h.schema);
-        b.pushToken(h.stream.advance());
-        driveExprStmt(b, h.stream, *h.schema);
-        b.pushToken(h.stream.advance());
+        b.pushToken(h.stream.advance());   // ' ' between frames
+        driveFuncDef(b, h.stream, *h.schema);
+        b.pushToken(h.stream.advance());   // ' ' between frames
         driveVarDecl(b, h.stream, *h.schema);
     }
     Tree t = std::move(b).finish();
 
     EXPECT_TRUE(t.diagnostics().all().empty());
 
-    // Whitespace between statements attaches as a child of root, not of the
-    // preceding statement. Verify directly — pretty-print skips EmptySpace
-    // so the string assertion alone wouldn't catch a re-attachment regression.
+    // Whitespace between top-level frames attaches as a child of root, not of
+    // the preceding frame. Verify directly — pretty-print skips EmptySpace so
+    // the string assertion alone wouldn't catch a re-attachment regression.
     std::size_t rootWsCount = 0;
     for (NodeId c : t.children(t.root())) {
         if (isEmptySpace(t.flags(c))) ++rootWsCount;
@@ -180,26 +248,51 @@ TEST(TreeEndToEnd, HappyPath_MultipleStatements_PrintsExpectedTree) {
 
     const std::string_view expected =
         "rule:root\n"
-        "  rule:statement\n"
+        "  rule:topLevel\n"
         "    rule:varDecl\n"
         "      tok:\"var\"\n"
         "      tok:\"x\"\n"
+        "      tok:\":\"\n"
+        "      rule:typeRef\n"
+        "        rule:typeBase\n"
+        "          tok:\"int\"\n"
         "      tok:\"=\"\n"
         "      rule:expression\n"
-        "        tok:\"a\"\n"
+        "        rule:operand\n"
+        "          tok:\"a\"\n"
         "      tok:\";\"\n"
-        "  rule:statement\n"
-        "    rule:exprStmt\n"
-        "      rule:expression\n"
-        "        tok:\"y\"\n"
-        "      tok:\";\"\n"
-        "  rule:statement\n"
+        "  rule:topLevel\n"
+        "    rule:funcDef\n"
+        "      tok:\"func\"\n"
+        "      tok:\"f\"\n"
+        "      rule:funcParams\n"
+        "        tok:\"(\"\n"
+        "        tok:\")\"\n"
+        "      tok:\"->\"\n"
+        "      rule:typeRef\n"
+        "        rule:typeBase\n"
+        "          tok:\"int\"\n"
+        "      rule:block\n"
+        "        tok:\"{\"\n"
+        "        rule:statement\n"
+        "          rule:exprStmt\n"
+        "            rule:expression\n"
+        "              rule:operand\n"
+        "                tok:\"y\"\n"
+        "            tok:\";\"\n"
+        "        tok:\"}\"\n"
+        "  rule:topLevel\n"
         "    rule:varDecl\n"
         "      tok:\"var\"\n"
         "      tok:\"w\"\n"
+        "      tok:\":\"\n"
+        "      rule:typeRef\n"
+        "        rule:typeBase\n"
+        "          tok:\"int\"\n"
         "      tok:\"=\"\n"
         "      rule:expression\n"
-        "        tok:\"b\"\n"
+        "        rule:operand\n"
+        "          tok:\"b\"\n"
         "      tok:\";\"\n";
     EXPECT_EQ(prettyPrint(t), expected);
 }
@@ -208,7 +301,7 @@ TEST(TreeEndToEnd, HappyPath_DirectRuleLookupResolvesOnRealParse) {
     // 08.55 retired the typed-view layer entirely. The same shape can
     // be expressed via direct rule lookups against the schema — the
     // engine has zero hardcoded rule names.
-    auto h = tokenizeShipped("var x = a; y; var w = b;");
+    auto h = tokenizeShipped("var x : int = a; func f() -> int { y; } var w : int = b;");
     ASSERT_NE(h.schema, nullptr);
 
     TreeBuilder b{h.src, h.schema};
@@ -216,54 +309,49 @@ TEST(TreeEndToEnd, HappyPath_DirectRuleLookupResolvesOnRealParse) {
         auto root = b.open(h.schema->rules().find("root"));
         driveVarDecl(b, h.stream, *h.schema);
         b.pushToken(h.stream.advance());
-        driveExprStmt(b, h.stream, *h.schema);
+        driveFuncDef(b, h.stream, *h.schema);
         b.pushToken(h.stream.advance());
         driveVarDecl(b, h.stream, *h.schema);
     }
     Tree t = std::move(b).finish();
     ASSERT_FALSE(t.diagnostics().hasErrors());
 
-    const auto kStatement = h.schema->rules().find("statement");
-    const auto kVarDecl   = h.schema->rules().find("varDecl");
-    const auto kExprStmt  = h.schema->rules().find("exprStmt");
+    const auto kTopLevel = h.schema->rules().find("topLevel");
+    const auto kVarDecl  = h.schema->rules().find("varDecl");
+    const auto kFuncDef  = h.schema->rules().find("funcDef");
 
     std::vector<std::string> seen;
     walkPreOrder(t.astCursor(), [&](TreeCursor const& c) {
         const auto id = c.current();
         if (t.kind(id) != NodeKind::Internal) return WalkAction::Continue;
-        if (t.rule(id).v != kStatement.v) return WalkAction::Continue;
+        if (t.rule(id).v != kTopLevel.v) return WalkAction::Continue;
 
-        // Statement's first VISIBLE child is the actual decl / expr-stmt
+        // topLevel's first VISIBLE child is the actual funcDef / varDecl
         // node. nthVisibleChild (test helper) is robust to any future
         // leading-EmptySpace refactor; raw children().front() would
         // silently break.
         const auto inner = dss::tests::nthVisibleChild(t, id, 0);
         if (!inner.valid()) {
-            ADD_FAILURE() << "statement has no visible child";
+            ADD_FAILURE() << "topLevel has no visible child";
             return WalkAction::Stop;
         }
 
+        // Both funcDef and varDecl carry the bound name at visible child 1
+        // (var/func keyword is child 0, the Identifier is child 1).
         if (t.kind(inner) == NodeKind::Internal && t.rule(inner).v == kVarDecl.v) {
-            // toy varDecl shape: [VarKeyword, Identifier, AssignmentOperator,
-            // expression, EndCommand]. Visible child 1 is the name token.
             const auto nameNode = dss::tests::nthVisibleChild(t, inner, 1);
             seen.push_back("varDecl:" + std::string{t.text(nameNode)});
-        } else if (t.kind(inner) == NodeKind::Internal && t.rule(inner).v == kExprStmt.v) {
-            const auto expr  = dss::tests::nthVisibleChild(t, inner, 0);
-            const auto first = dss::tests::nthVisibleChild(t, expr, 0);
-            if (!first.valid()) {
-                ADD_FAILURE() << "exprStmt's expression has no visible child";
-                return WalkAction::Stop;
-            }
-            seen.push_back("exprStmt:" + std::string{t.text(first)});
+        } else if (t.kind(inner) == NodeKind::Internal && t.rule(inner).v == kFuncDef.v) {
+            const auto nameNode = dss::tests::nthVisibleChild(t, inner, 1);
+            seen.push_back("funcDef:" + std::string{t.text(nameNode)});
         } else {
-            ADD_FAILURE() << "statement's first child was neither varDecl nor exprStmt";
+            ADD_FAILURE() << "topLevel's first child was neither varDecl nor funcDef";
         }
         return WalkAction::SkipChildren;
     });
 
     EXPECT_EQ(seen, (std::vector<std::string>{
-        "varDecl:x", "exprStmt:y", "varDecl:w",
+        "varDecl:x", "funcDef:f", "varDecl:w",
     }));
 }
 

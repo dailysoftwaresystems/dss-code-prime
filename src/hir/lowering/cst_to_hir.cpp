@@ -772,7 +772,11 @@ struct Lowerer {
     }
 
     // ── declarations ──────────────────────────────────────────────────────────
-    HirNodeId lowerVarDecl(NodeId node) {
+    // A `var`-style declaration. The SAME rule lowers to a local `VarDecl`
+    // inside a block and to a `Global` at module scope (`asGlobal`); a language
+    // whose top-level and local variables share one rule — toy's `varDecl` — is
+    // disambiguated by lowering context, not by a second rule.
+    HirNodeId lowerVarLike(NodeId node, bool asGlobal) {
         if (subtreeHasDeferred(node))
             return reportedError(node, "array declarator is deferred to HR9 "
                                        "(the lattice has no Array type yet)");
@@ -788,8 +792,11 @@ struct Lowerer {
         }
         std::optional<HirNodeId> init;
         for (NodeId c : vis) if (classify(c) == Role::Expr) { init = lowerExpr(c).id; break; }
-        return track(builder.makeVarDecl(type, sym.v, init), node);
+        return asGlobal ? track(builder.makeGlobal(type, sym.v, init), node)
+                        : track(builder.makeVarDecl(type, sym.v, init), node);
     }
+
+    HirNodeId lowerVarDecl(NodeId node) { return lowerVarLike(node, /*asGlobal=*/false); }
 
     HirNodeId lowerTypeDecl(NodeId node) {
         auto it = declMap_.find(tree().rule(node).v);
@@ -833,6 +840,30 @@ struct Lowerer {
         std::optional<HirNodeId> init;
         for (NodeId c : descendantsForInit(node)) if (isExprNode(c)) { init = lowerExpr(c).id; break; }
         return track(builder.makeGlobal(type, sym.v, init), node);
+    }
+
+    // A function declared by a DEDICATED rule (e.g. toy's `funcDef`), as opposed
+    // to c-subset's dual-purpose `topLevelDecl`+kindByChild. Reads the params/body
+    // subtrees from the semantic DeclarationRule's `paramsChild`/`bodyChild`
+    // visible-child indices.
+    HirNodeId lowerFunctionDecl(NodeId node) {
+        auto it = declMap_.find(tree().rule(node).v);
+        if (it == declMap_.end()) return reportedError(node, "function decl has no semantics rule");
+        DeclarationRule const& decl = sem.declarations[it->second];
+        auto vis = visible(node);
+        SymbolId sym{};
+        TypeId sig = InvalidType;
+        if (decl.nameChild && *decl.nameChild < vis.size()) {
+            sym = model.symbolAt(vis[*decl.nameChild]);
+            if (auto const* rec = model.recordFor(sym)) sig = rec->type;
+        }
+        std::vector<HirNodeId> params;
+        if (decl.paramsChild && *decl.paramsChild < vis.size())
+            collectParams(vis[*decl.paramsChild], params);
+        HirNodeId body = (decl.bodyChild && *decl.bodyChild < vis.size())
+                       ? lowerStmt(vis[*decl.bodyChild])
+                       : track(builder.makeBlock({}), node);
+        return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 
     // extern function / global (no body). The FnSig/var type comes from the
@@ -916,8 +947,12 @@ struct Lowerer {
             return errorNode(core);
         }
         if (m->hirKind == "Decl")       return lowerTopLevel(core);
+        if (m->hirKind == "Function")   return lowerFunctionDecl(core);
         if (m->hirKind == "TypeDecl")   return lowerTypeDecl(core);
         if (m->hirKind == "ExternDecl") return lowerExternDecl(core);
+        // A `var`-style declaration at module scope is a Global (the same rule
+        // is a local VarDecl inside a block — see lowerVarLike).
+        if (m->hirKind == "VarDecl")    return lowerVarLike(core, /*asGlobal=*/true);
         // A bare statement-level decl appearing at top level (unusual): route it.
         return lowerStmt(core);
     }

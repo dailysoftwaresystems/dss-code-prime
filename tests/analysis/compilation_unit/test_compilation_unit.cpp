@@ -87,7 +87,7 @@ TEST(CompilationUnit, BuildSingleTreeMatchesContract) {
 
     UnitBuilder b{schema};
     auto const builderId = b.id();
-    b.addTree(parseToyTree("var x = 1;"));
+    b.addTree(parseToyTree("var x : int = 1;"));
     auto cu = std::move(b).finish();
 
     EXPECT_TRUE(cu.id().valid());
@@ -101,9 +101,9 @@ TEST(CompilationUnit, BuildSingleTreeMatchesContract) {
 TEST(CompilationUnit, BuildMultipleTreesPreservesOrder) {
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addTree(parseToyTree("var a = 1;"));
-    b.addTree(parseToyTree("var b = 2;"));
-    b.addTree(parseToyTree("var c = 3;"));
+    b.addTree(parseToyTree("var a : int = 1;"));
+    b.addTree(parseToyTree("var b : int = 2;"));
+    b.addTree(parseToyTree("var c : int = 3;"));
     auto cu = std::move(b).finish();
 
     ASSERT_EQ(cu.trees().size(), 3u);
@@ -150,7 +150,7 @@ TEST(CompilationUnit, NextIdIsMonotonic) {
 TEST(CompilationUnit, MoveTransfersOwnership) {
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addTree(parseToyTree("var x = 1;"));
+    b.addTree(parseToyTree("var x : int = 1;"));
     auto cu = std::move(b).finish();
     auto const originalId = cu.id();
 
@@ -162,12 +162,12 @@ TEST(CompilationUnit, MoveTransfersOwnership) {
 TEST(CompilationUnit, MoveAssignmentTransfersOwnership) {
     auto schema = loadToySchema();
     UnitBuilder b1{schema};
-    b1.addTree(parseToyTree("var a = 1;"));
+    b1.addTree(parseToyTree("var a : int = 1;"));
     auto cu1 = std::move(b1).finish();
 
     UnitBuilder b2{schema};
-    b2.addTree(parseToyTree("var b = 2;"));
-    b2.addTree(parseToyTree("var c = 3;"));
+    b2.addTree(parseToyTree("var b : int = 2;"));
+    b2.addTree(parseToyTree("var c : int = 3;"));
     auto cu2       = std::move(b2).finish();
     auto const cu2Id = cu2.id();
 
@@ -184,7 +184,7 @@ TEST(CompilationUnit, CrossRefsEmptyForToy) {
     // test_import_resolver.cpp.
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addTree(parseToyTree("var x = 1;"));
+    b.addTree(parseToyTree("var x : int = 1;"));
     auto cu = std::move(b).finish();
     EXPECT_TRUE(cu.crossRefs().empty());
 }
@@ -217,7 +217,7 @@ TEST(CompilationUnitDeathTest, AddTreeAfterFinishAborts) {
     [[maybe_unused]] auto cu = std::move(b).finish();
     // `b` is non-movable; `std::move(b)` only casts to rvalue-ref. The
     // object's `finished_` latch is now true — addTree must abort.
-    EXPECT_DEATH({ b.addTree(parseToyTree("var x = 1;")); },
+    EXPECT_DEATH({ b.addTree(parseToyTree("var x : int = 1;")); },
                  "addTree.*called after finish");
 }
 
@@ -241,7 +241,7 @@ TEST(CompilationUnitDeathTest, ReadingSchemaOnMovedFromCuAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addTree(parseToyTree("var x = 1;"));
+    b.addTree(parseToyTree("var x : int = 1;"));
     auto cu = std::move(b).finish();
     CompilationUnit moved{std::move(cu)};
     // `cu` is moved-from: its schema_ shared_ptr is null. Reading schema()
@@ -255,7 +255,7 @@ TEST(CompilationUnitDeathTest, ReadingSchemaOnMovedFromCuAborts) {
 TEST(CompilationUnitCU2, AddInMemoryParsesAndAdds) {
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addInMemory("var x = y;", "<mem>");   // identifier RHS — clean toy program
+    b.addInMemory("var x : int = y;", "<mem>");   // identifier RHS — clean toy program
     auto cu = std::move(b).finish();
 
     ASSERT_EQ(cu.trees().size(), 1u);
@@ -267,9 +267,9 @@ TEST(CompilationUnitCU2, AddInMemoryParsesAndAdds) {
 TEST(CompilationUnitCU2, AddMultipleInMemoryPreservesOrder) {
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addInMemory("var a = 1;", "a.toy");
-    b.addInMemory("var b = 2;", "b.toy");
-    b.addInMemory("var c = 3;", "c.toy");
+    b.addInMemory("var a : int = 1;", "a.toy");
+    b.addInMemory("var b : int = 2;", "b.toy");
+    b.addInMemory("var c : int = 3;", "c.toy");
     auto cu = std::move(b).finish();
 
     ASSERT_EQ(cu.trees().size(), 3u);
@@ -298,7 +298,7 @@ TEST(CompilationUnitCU2, LexerDiagnosticsMergedIntoTree) {
     // P_NoAlternativeMatched here; we assert specifically on the LEXER code.)
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addInMemory("var x = @;", "<mem>");
+    b.addInMemory("var x : int = @;", "<mem>");
     auto cu = std::move(b).finish();
 
     ASSERT_EQ(cu.trees().size(), 1u);
@@ -309,7 +309,7 @@ TEST(CompilationUnitCU2, LexerDiagnosticsMergedIntoTree) {
 }
 
 TEST(CompilationUnitCU2, AddFileReadsParsesAndAdds) {
-    TempFile f{"var x = y;"};
+    TempFile f{"var x : int = y;"};
     auto schema = loadToySchema();
     UnitBuilder b{schema};
     b.addFile(f.path());
@@ -324,7 +324,7 @@ TEST(CompilationUnitCU2, AddFileMissingEmitsFileNotFoundAndContinues) {
     auto schema = loadToySchema();
     UnitBuilder b{schema};
     b.addFile("definitely/does/not/exist_a8f3.toy");   // → D_FileNotFound, skip
-    b.addInMemory("var ok = 1;", "<mem>");             // continue: still added
+    b.addInMemory("var ok : int = 1;", "<mem>");             // continue: still added
     auto cu = std::move(b).finish();
 
     EXPECT_EQ(cu.trees().size(), 1u);   // only the good one
@@ -332,7 +332,7 @@ TEST(CompilationUnitCU2, AddFileMissingEmitsFileNotFoundAndContinues) {
 }
 
 TEST(CompilationUnitCU2, AddFileDuplicateEmitsWarningAndSkips) {
-    TempFile f{"var x = y;"};
+    TempFile f{"var x : int = y;"};
     auto schema = loadToySchema();
     UnitBuilder b{schema};
     b.addFile(f.path());
@@ -346,7 +346,7 @@ TEST(CompilationUnitCU2, AddFileDuplicateEmitsWarningAndSkips) {
 TEST(CompilationUnitCU2, AddFileDuplicateViaDifferentSpellingSkips) {
     // Proves dedup keys on the weakly-canonical path, not the raw string:
     // the same file reached via a `/./` detour must still be detected.
-    TempFile f{"var x = y;"};
+    TempFile f{"var x : int = y;"};
     auto alt = f.path().parent_path() / "." / f.path().filename();
     auto schema = loadToySchema();
     UnitBuilder b{schema};
@@ -363,8 +363,8 @@ TEST(CompilationUnitCU2, AddInMemorySameLabelTwiceAddsTwo) {
     // sources are parsed and added; no D_DuplicateFile.
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addInMemory("var x = y;", "dup");
-    b.addInMemory("var z = y;", "dup");
+    b.addInMemory("var x : int = y;", "dup");
+    b.addInMemory("var z : int = y;", "dup");
     auto cu = std::move(b).finish();
 
     EXPECT_EQ(cu.trees().size(), 2u);
@@ -374,12 +374,12 @@ TEST(CompilationUnitCU2, AddInMemorySameLabelTwiceAddsTwo) {
 TEST(CompilationUnitCU2, MixedFileAndInMemoryPreservesOrder) {
     // addFile and addInMemory share parseAndAdd_/addTree; interleaving them
     // preserves add-order (strictly increasing TreeIds).
-    TempFile f{"var b = y;"};
+    TempFile f{"var b : int = y;"};
     auto schema = loadToySchema();
     UnitBuilder b{schema};
-    b.addInMemory("var a = y;", "a.toy");
+    b.addInMemory("var a : int = y;", "a.toy");
     b.addFile(f.path());
-    b.addInMemory("var c = y;", "c.toy");
+    b.addInMemory("var c : int = y;", "c.toy");
     auto cu = std::move(b).finish();
 
     ASSERT_EQ(cu.trees().size(), 3u);
@@ -392,7 +392,7 @@ TEST(CompilationUnitCU2DeathTest, AddInMemoryAfterFinishAborts) {
     auto schema = loadToySchema();
     UnitBuilder b{schema};
     [[maybe_unused]] auto cu = std::move(b).finish();
-    EXPECT_DEATH({ b.addInMemory("var x = y;", "<mem>"); },
+    EXPECT_DEATH({ b.addInMemory("var x : int = y;", "<mem>"); },
                  "addInMemory.*called after finish");
 }
 

@@ -1,41 +1,32 @@
-var alpha = beta;
-var gamma = delta;
-var epsilon = zeta;
+var threshold : int = 10;
 
-beta;
-delta;
-zeta;
+func add(a : int, b : int) -> int {
+  return a + b;
+}
 
-var one = two;
-var three = four;
-var five = six;
-var seven = eight;
-var nine = ten;
+func max(a : int, b : int) -> int {
+  if (a < b) {
+    return b;
+  } else {
+    return a;
+  }
+}
 
-one;
-three;
-five;
-seven;
-nine;
+func countdown(n : int) -> void {
+  while (0 < n) {
+    var step : int = n - 1;
+    return;
+  }
+}
 
-var aa = bb;
-var cc = dd;
-var ee = ff;
-var gg = hh;
-var ii = jj;
-var kk = ll;
-var mm = nn;
-var oo = pp;
-var qq = rr;
-var ss = tt;
+func compute(n : int) -> int {
+  var doubled : int = n * 2;
+  var neg : int = -doubled;
+  var shifted : int = doubled - threshold;
+  return max(shifted, add(n, threshold));
+}
 
-aa;
-cc;
-ee;
-gg;
-ii;
-kk;
-mm;
-oo;
-qq;
-ss;
+func main() -> int {
+  add(threshold, 1);
+  return compute(threshold);
+}
