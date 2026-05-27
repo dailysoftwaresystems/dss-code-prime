@@ -61,6 +61,9 @@ std::string expectRoundTrip(Hir const& hir, HirTextContext const& ctx) {
     ctx2.shaderMap     = &res->shaderMap;
     ctx2.transpileMap  = &res->transpileMap;
     ctx2.diagnosticMap = &res->diagnosticMap;
+    // Thread the rebuilt pool so a pooled module re-emits its inline values
+    // (byte-identity would otherwise fail when the first emit used a pool).
+    if (ctx.literalPool) ctx2.literalPool = &res->literalPool;
 
     DiagnosticReporter r3;
     std::string const second = emitHir(res->hir, ctx2, r3);
@@ -156,6 +159,57 @@ TEST(HirText, RoundTripControlFlow) {
     EXPECT_NE(text.find("for {"), std::string::npos);
     EXPECT_NE(text.find("switch ("), std::string::npos);
     EXPECT_NE(text.find("default {"), std::string::npos);
+}
+
+TEST(HirText, RoundTripLiteralValues) {
+    // Every HirLiteralValue arm round-trips its VALUE inline (G17): int / uint /
+    // char(uint) / float / string. Pin both byte-identity AND that the rebuilt
+    // pool carries the decoded values.
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId i32  = in.primitive(TypeKind::I32);
+    TypeId u32  = in.primitive(TypeKind::U32);
+    TypeId chr  = in.primitive(TypeKind::Char);
+    TypeId f64  = in.primitive(TypeKind::F64);
+    TypeId arrc = in.array(chr, 3);                 // "hi" + NUL
+    TypeId voidT = in.primitive(TypeKind::Void);
+    TypeId sig  = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirLiteralPool pool;
+    HirBuilder b{"toy"};
+    auto litOf = [&](TypeId t, HirLiteralValue v) {
+        return b.makeLiteral(t, pool.add(std::move(v)));
+    };
+    HirNodeId stmts[] = {
+        b.makeExprStmt(litOf(i32,  HirLiteralValue{std::int64_t{-7}, TypeKind::I32})),
+        b.makeExprStmt(litOf(u32,  HirLiteralValue{std::uint64_t{42}, TypeKind::U32})),
+        b.makeExprStmt(litOf(chr,  HirLiteralValue{std::uint64_t{'a'}, TypeKind::Char})),
+        b.makeExprStmt(litOf(f64,  HirLiteralValue{double{3.5}, TypeKind::F64})),
+        b.makeExprStmt(litOf(arrc, HirLiteralValue{std::string{"hi"}, TypeKind::Char})),
+        b.makeReturn(),
+    };
+    HirNodeId body = b.makeBlock(stmts);
+    HirNodeId fn   = b.makeFunction(sig, 1, {}, body);
+    HirNodeId root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names; ctx.literalPool = &pool;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("lit int -7 : i32"), std::string::npos) << text;
+    EXPECT_NE(text.find("lit uint 42 : u32"), std::string::npos) << text;
+    EXPECT_NE(text.find("lit uint 97 : char"), std::string::npos) << text;
+    EXPECT_NE(text.find("lit float 3.5 : f64"), std::string::npos) << text;
+    EXPECT_NE(text.find("lit str \"hi\" : arr<char, 3>"), std::string::npos) << text;
+
+    // The rebuilt pool carries the decoded values.
+    DiagnosticReporter pr;
+    auto res = parseHir(text, CompilationUnitId{9}, pr);
+    ASSERT_TRUE(res->ok);
+    ASSERT_EQ(res->literalPool.size(), 5u);
+    EXPECT_EQ(std::get<std::int64_t>(res->literalPool.at(0).value), -7);
+    EXPECT_EQ(std::get<std::uint64_t>(res->literalPool.at(2).value), static_cast<std::uint64_t>('a'));
+    EXPECT_EQ(std::get<double>(res->literalPool.at(3).value), 3.5);
+    EXPECT_EQ(std::get<std::string>(res->literalPool.at(4).value), "hi");
 }
 
 TEST(HirText, RoundTripSeqExpr) {

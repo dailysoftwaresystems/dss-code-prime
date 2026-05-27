@@ -5,6 +5,7 @@
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner (by-value in the parse result)
 #include "hir/hir.hpp"                              // Hir
 #include "hir/hir_attrs.hpp"                        // the five HirAttribute<T> side-table aliases
+#include "hir/lowering/hir_literal_pool.hpp"        // HirLiteralPool (literal values)
 
 #include <memory>
 #include <string>
@@ -29,9 +30,14 @@
 //     emit, and reconstructed into `HirParseResult::symbolNames` on parse so a
 //     re-emit reproduces them. Absent a name table, the emitter writes a stable
 //     synthetic handle (`%s7`) and the file is still self-contained + round-trips.
-//   - Literal VALUES are not yet stored anywhere in the pipeline (no literal pool
-//     exists), so a `Literal` renders as `lit #<index> : <type>`; the grammar
-//     leaves room to carry an inline value when a pool lands.
+//   - Literal VALUES live in a `HirLiteralPool` OUTSIDE the `Hir` (the node
+//     carries only its pool index in `payload`). Like the side-tables, emit
+//     takes the pool by pointer and parse hands a rebuilt one back. When a pool
+//     is supplied, a `Literal` renders its VALUE inline (`lit int 42 : i32`,
+//     `lit str "hi" : arr<char,3>`) so the value round-trips; absent a pool it
+//     falls back to the bare index form (`lit #<index> : <type>`) — still
+//     self-contained and re-parseable, just value-less (used by hand-built test
+//     modules that have no pool).
 //   - The five per-node side-tables (source-loc / ffi / shader / transpile / diag)
 //     live OUTSIDE the `Hir`, so emit takes them by pointer and parse hands them
 //     back, bound to the rebuilt module.
@@ -59,6 +65,11 @@ struct DSS_EXPORT HirTextContext {
     // production caller fills this from the CU's symbol table; a unit test may
     // leave it null.
     std::vector<std::string> const* symbolNames = nullptr;
+
+    // Decoded literal values, indexed by a `Literal` node's `payload`. When set,
+    // each literal renders its value inline; null ⇒ the bare `#<index>` form.
+    // The lowering supplies `&CstToHirResult::literalPool`.
+    HirLiteralPool const* literalPool = nullptr;
 
     // The five side-tables to serialize. Null = nothing of that kind is emitted.
     HirSourceMap     const* sourceMap     = nullptr;
@@ -96,6 +107,9 @@ struct DSS_EXPORT HirParseResult {
     HirShaderMap     shaderMap;
     HirTranspileMap  transpileMap;
     HirDiagnosticMap diagnosticMap;
+    // Literal values rebuilt from the text's inline `lit <value>` forms (empty
+    // when the source used the bare `#<index>` form). Indexed by `payload`.
+    HirLiteralPool   literalPool;
 
     // True iff neither the parse nor the verify-on-load pass emitted an
     // Error-severity diagnostic (computed by delta on the reporter, so prior

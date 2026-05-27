@@ -479,6 +479,7 @@ TEST(HirLoweringCSubset, LoweredSeqExprRoundTrips) {
     HirTextContext ctx;
     ctx.interner    = &model.lattice().interner();
     ctx.symbolNames = &names;
+    ctx.literalPool = &res->literalPool;
     DiagnosticReporter er;
     std::string const out = emitHir(res->hir, ctx, er);
     EXPECT_NE(out.find("seq "), std::string::npos) << "expected a seq expr in:\n" << out;
@@ -582,6 +583,7 @@ TEST(HirLoweringCSubset, GoldenRepresentativeProgram) {
     HirTextContext ctx;
     ctx.interner    = &model.lattice().interner();
     ctx.symbolNames = &names;
+    ctx.literalPool = &res->literalPool;
     DiagnosticReporter er;
     std::string const out = emitHir(res->hir, ctx, er);
 

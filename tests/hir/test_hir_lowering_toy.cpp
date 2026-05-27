@@ -243,6 +243,7 @@ TEST(HirLoweringToy, GoldenRepresentativeProgram) {
     HirTextContext ctx;
     ctx.interner    = &model.lattice().interner();
     ctx.symbolNames = &names;
+    ctx.literalPool = &res->literalPool;
     DiagnosticReporter er;
     std::string const out = emitHir(res->hir, ctx, er);
 

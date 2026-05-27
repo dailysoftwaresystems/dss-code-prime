@@ -710,8 +710,17 @@ private:
         // kTypedExprs table so the two sides can't drift.
         auto typedCall = [&](char const* kw) { typed(kw); out_ += ' '; operands(hir_.children(id)); };
         switch (hir_.kind(id)) {
-            case HirKind::Literal:
-                header("lit"); out_ += std::format(" #{} : ", hir_.payload(id)); appendType(hir_.typeId(id)); return;
+            case HirKind::Literal: {
+                header("lit"); out_ += ' ';
+                std::uint32_t const idx = hir_.payload(id);
+                // Inline the VALUE when a pool is supplied (faithful round-trip);
+                // else the bare index form (value-less, for pool-less modules).
+                if (ctx_.literalPool && idx < ctx_.literalPool->size())
+                    appendLiteralValue(ctx_.literalPool->at(idx));
+                else
+                    out_ += std::format("#{}", idx);
+                out_ += " : "; appendType(hir_.typeId(id)); return;
+            }
             case HirKind::Ref:
                 header("ref"); out_ += std::format(" %{} : ", handleOf(hir_.payload(id))); appendType(hir_.typeId(id)); return;
             case HirKind::IntrinsicCall: {
@@ -757,6 +766,29 @@ private:
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/true, 0); return;
             default: report("unexpected node kind in expression position"); out_ += "error"; return;
+        }
+    }
+
+    // A pool literal's inline value, tagged by variant arm so the parser
+    // reconstructs the exact arm: `none` / `bool true` / `int -7` / `uint 42` /
+    // `float 3.14` / `str "hi"`. Floats use std::format's shortest round-trip
+    // repr (to_chars); strings use the same escaped-quote form as symbol names.
+    void appendLiteralValue(HirLiteralValue const& v) {
+        if (std::holds_alternative<std::monostate>(v.value)) { out_ += "none"; return; }
+        if (auto const* b = std::get_if<bool>(&v.value)) {
+            out_ += *b ? "bool true" : "bool false"; return;
+        }
+        if (auto const* i = std::get_if<std::int64_t>(&v.value)) {
+            out_ += std::format("int {}", *i); return;
+        }
+        if (auto const* u = std::get_if<std::uint64_t>(&v.value)) {
+            out_ += std::format("uint {}", *u); return;
+        }
+        if (auto const* d = std::get_if<double>(&v.value)) {
+            out_ += std::format("float {}", *d); return;
+        }
+        if (auto const* s = std::get_if<std::string>(&v.value)) {
+            out_ += "str "; out_ += quote(*s); return;
         }
     }
 
@@ -823,15 +855,16 @@ std::string emitHir(Hir const& hir, HirTextContext const& ctx, DiagnosticReporte
 namespace {
 
 enum class Tk : std::uint8_t {
-    Eof, Unknown, Ident, Int, Str,
+    Eof, Unknown, Ident, Int, Float, Str,
     LBrace, RBrace, LParen, RParen, LAngle, RAngle, LBrack, RBrack,
     Colon, Comma, Percent, Hash, Equal, Arrow, Minus, DotDot, At,
 };
 
 struct Tok {
     Tk          kind = Tk::Eof;
-    std::string text;          // ident/str content (unescaped) or int digits
+    std::string text;          // ident/str content (unescaped) or int/float digits
     std::uint64_t num = 0;     // for Int
+    double        dnum = 0;    // for Float
     std::uint32_t off = 0;     // byte offset (diagnostics)
 };
 
@@ -908,12 +941,35 @@ private:
         cur_.text.assign(s_.substr(start, p_ - start));
     }
     void lexInt() {
-        cur_.kind = Tk::Int;
         std::size_t const start = p_;
         std::uint64_t v = 0;
         while (p_ < s_.size() && isDigit(s_[p_])) { v = v * 10 + static_cast<std::uint64_t>(s_[p_] - '0'); ++p_; }
-        cur_.num = v;
+        // Float: a fractional part (`.` + digit) and/or an exponent (`e`/`E`)
+        // following the integer digits promote this to a Float token. (A bare
+        // trailing `.` is NOT consumed — that's the `..` range or a stray dot.)
+        bool isFloat = false;
+        if (p_ + 1 < s_.size() && s_[p_] == '.' && isDigit(s_[p_ + 1])) {
+            isFloat = true;
+            p_ += 2;
+            while (p_ < s_.size() && isDigit(s_[p_])) ++p_;
+        }
+        if (p_ < s_.size() && (s_[p_] == 'e' || s_[p_] == 'E')) {
+            std::size_t q = p_ + 1;
+            if (q < s_.size() && (s_[q] == '+' || s_[q] == '-')) ++q;
+            if (q < s_.size() && isDigit(s_[q])) {
+                isFloat = true;
+                p_ = q + 1;
+                while (p_ < s_.size() && isDigit(s_[p_])) ++p_;
+            }
+        }
         cur_.text.assign(s_.substr(start, p_ - start));
+        if (isFloat) {
+            cur_.kind = Tk::Float;
+            cur_.dnum = std::strtod(cur_.text.c_str(), nullptr);
+        } else {
+            cur_.kind = Tk::Int;
+            cur_.num  = v;
+        }
     }
     void lexStr() {
         cur_.kind = Tk::Str;
@@ -957,6 +1013,7 @@ public:
     struct DiagPend { HirNodeId node; DiagnosticInfo info; bool hasOrigin; std::uint32_t originPre; };
     std::vector<DiagPend> pDiag_;
     std::vector<HirNodeId> indexToId_;          // pre-order index -> built node
+    HirLiteralPool        pLiterals_;           // values from inline `lit <value>` forms
 
     // Parse the whole file. Returns the module root (invalid on a fatal header
     // error). Populates the builder, interner, side-table pending lists.
@@ -1004,6 +1061,38 @@ private:
     [[nodiscard]] std::uint64_t takeInt() {
         if (peekIs(Tk::Int)) return lex_.take().num;
         malformed("expected integer"); return 0;
+    }
+    // A float value accepts both Float (`3.14`) and Int (`42` — a whole-valued
+    // double that std::format rendered without a decimal point).
+    [[nodiscard]] double takeFloat() {
+        if (peekIs(Tk::Float)) return lex_.take().dnum;
+        if (peekIs(Tk::Int))   return static_cast<double>(lex_.take().num);
+        malformed("expected float"); return 0.0;
+    }
+    // Parse a tagged inline literal value (the `lit <tag> <value>` form).
+    [[nodiscard]] HirLiteralValue parseLiteralValue() {
+        HirLiteralValue v;
+        std::string const tag = takeIdent();
+        if (tag == "none") { /* monostate */ }
+        else if (tag == "bool") { v.value = (takeIdent() == "true"); }
+        else if (tag == "int")  { bool n = accept(Tk::Minus);
+                                  std::int64_t i = static_cast<std::int64_t>(takeInt());
+                                  v.value = n ? -i : i; }
+        else if (tag == "uint") { v.value = takeInt(); }
+        else if (tag == "float"){ bool n = accept(Tk::Minus); double d = takeFloat();
+                                  v.value = n ? -d : d; }
+        else if (tag == "str")  { v.value = takeStr(); }
+        else malformed(std::format("unknown literal value tag '{}'", tag));
+        return v;
+    }
+    // The pool `core` for a parsed value: a string literal's element core is
+    // Char (its node type is Array<Char,N+1>); a bool is Bool; monostate is
+    // Void; everything else mirrors the node's resolved type kind.
+    [[nodiscard]] TypeKind literalCoreFor(TypeId t, HirLiteralValue const& v) const {
+        if (std::holds_alternative<std::string>(v.value))   return TypeKind::Char;
+        if (std::holds_alternative<bool>(v.value))          return TypeKind::Bool;
+        if (std::holds_alternative<std::monostate>(v.value)) return TypeKind::Void;
+        return t.valid() ? interner_.kind(t) : TypeKind::Void;
     }
     void malformed(std::string detail) {
         ParseDiagnostic d; d.code = DiagnosticCode::H_TextMalformed;
@@ -1289,8 +1378,19 @@ private:
     HirNodeId parseExprInner() {
         std::string kw = takeIdent();
         HirFlags flags = parseFlags();
-        if (kw == "lit") { expect(Tk::Hash, "'#'"); std::uint32_t i = static_cast<std::uint32_t>(takeInt());
-            TypeId t = parseTypeAnnot(); return builder_.makeLiteral(t, i, flags); }
+        if (kw == "lit") {
+            if (accept(Tk::Hash)) {   // bare index form: `lit #N : type` (no pool)
+                std::uint32_t const i = static_cast<std::uint32_t>(takeInt());
+                TypeId t = parseTypeAnnot();
+                return builder_.makeLiteral(t, i, flags);
+            }
+            // value form: `lit <tagged-value> : type` — rebuild the pool entry.
+            HirLiteralValue v = parseLiteralValue();
+            TypeId t = parseTypeAnnot();
+            v.core = literalCoreFor(t, v);
+            std::uint32_t const idx = pLiterals_.add(std::move(v));
+            return builder_.makeLiteral(t, idx, flags);
+        }
         if (kw == "ref") { std::uint32_t h = parseSymHandle(); TypeId t = parseTypeAnnot();
             return builder_.makeRef(t, h, flags); }
         if (kw == "call") { TypeId t = parseTypeAnnot(); auto kids = parseParenOperands();
@@ -1597,6 +1697,9 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
     Hir hir = std::move(parser.builder_).finish(root);
     auto res = std::make_unique<HirParseResult>(
         std::move(hir), std::move(parser.interner_), std::move(parser.symbolNames_));
+
+    // Hand back the rebuilt literal pool (empty if the source used `#index`).
+    res->literalPool = std::move(parser.pLiterals_);
 
     // Apply the collected side-table annotations to the frozen module's maps.
     for (auto& [id, v] : parser.pLoc_)       res->sourceMap.set(id, v);

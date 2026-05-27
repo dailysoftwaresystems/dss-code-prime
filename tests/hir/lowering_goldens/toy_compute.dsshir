@@ -9,7 +9,7 @@ symbols {
   %7 "doubled"
 }
 module "Toy" {
-  global %1 : i32 = lit #0 : i32
+  global %1 : i32 = lit int 10 : i32
   function %2 : fn(i32, i32) -> i32 {
     param %3 : i32
     param %4 : i32
@@ -20,7 +20,7 @@ module "Toy" {
   function %5 : fn(i32) -> i32 {
     param %6 : i32
     block {
-      var %7 : i32 = binop Mul : i32 (ref %6 : i32, lit #1 : i32)
+      var %7 : i32 = binop Mul : i32 (ref %6 : i32, lit int 2 : i32)
       if (binop Lt : bool (ref %7 : i32, ref %1 : i32))
         block {
           return ref %7 : i32
