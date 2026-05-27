@@ -376,6 +376,34 @@ TEST(HirLoweringCSubset, IncludeDirectiveIsSkippedNotFailed) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
 }
 
+TEST(HirLoweringCSubset, PointerDerefAndAddressOfLower) {
+    // `*p = x` (deref-assign through a pointer) and `p = &x` (address-of into a
+    // pointer) lower with correct Ptr / pointee result types.
+    SemanticModel model = analyzeCSubset(
+        "void f(int x) {\n"
+        "  int *p;\n"
+        "  p = &x;\n"
+        "  *p = x;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    auto stmts = res->hir.children(body);
+    // [ var p, assign p = &x, assign *p = x ]
+    ASSERT_EQ(stmts.size(), 3u);
+    // `p = &x`: value is AddressOf typed Ptr<I32>.
+    HirNodeId addr = res->hir.assignValue(stmts[1]);
+    ASSERT_EQ(res->hir.kind(addr), HirKind::AddressOf);
+    ASSERT_EQ(ti.kind(res->hir.typeId(addr)), TypeKind::Ptr);
+    // `*p = x`: target is Deref typed I32 (the pointee).
+    HirNodeId deref = res->hir.assignTarget(stmts[2]);
+    ASSERT_EQ(res->hir.kind(deref), HirKind::Deref);
+    EXPECT_EQ(ti.kind(res->hir.typeId(deref)), TypeKind::I32);
+}
+
 TEST(HirLoweringCSubset, CharLiteralLowersToCharValue) {
     // `'a'` — coalesced body token, decoded to a Char codepoint.
     SemanticModel model = analyzeCSubset("char f() { return 'a'; }");

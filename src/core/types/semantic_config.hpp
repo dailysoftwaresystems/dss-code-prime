@@ -325,6 +325,13 @@ struct DSS_EXPORT SemanticConfig {
     // the bracketed text from the source slice (brackets stripped). Absent
     // (InvalidSchemaToken) for languages with no bracket-id syntax.
     std::optional<SchemaTokenId>    bracketIdentifierToken;
+    // SE-pointers (G5): a token whose occurrence in a type-position subtree
+    // wraps the resolved type one level in `Ptr<…>` (C's `int *p` / `int **p`
+    // declarator stars). The engine counts these tokens within a type node and
+    // applies that many `Ptr` constructors — a declarator-DEPTH model. Absent
+    // (InvalidSchemaToken) for languages with no pointer declarator. Full C
+    // declarators (function pointers, arrays-of-pointers) stay future surface.
+    std::optional<SchemaTokenId>    pointerToken;
 };
 
 } // namespace dss

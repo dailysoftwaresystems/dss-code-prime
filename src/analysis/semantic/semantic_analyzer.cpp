@@ -380,9 +380,28 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             return InvalidType;
         }
         auto kids = visibleChildren(tree, node);
+        // SE-pointers (G5): count `pointerToken` children at THIS node (C
+        // declarator stars: `int *p`, `int **p`) and wrap the resolved base type
+        // that many times in Ptr. The stars are a flat token run in `typeRef`;
+        // the base type comes from the non-star child (typeBase).
+        std::uint32_t ptrDepth = 0;
+        TypeId inner = InvalidType;
         for (auto child : kids) {
-            auto inner = resolveTypeNode(s, cfg, tree, child, scope, /*emitOnMiss=*/false);
-            if (inner.valid()) return inner;
+            if (cfg.pointerToken.has_value()
+                && tree.kind(child) == NodeKind::Token
+                && tree.tokenKind(child) == *cfg.pointerToken) {
+                ++ptrDepth;
+                continue;
+            }
+            if (!inner.valid()) {
+                auto t = resolveTypeNode(s, cfg, tree, child, scope, /*emitOnMiss=*/false);
+                if (t.valid()) inner = t;
+            }
+        }
+        if (inner.valid()) {
+            for (std::uint32_t i = 0; i < ptrDepth; ++i)
+                inner = s.lattice.interner().pointer(inner);
+            return inner;
         }
         if (emitOnMiss) {
             ParseDiagnostic d;

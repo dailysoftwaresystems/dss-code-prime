@@ -3951,6 +3951,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── pointerToken (SE-pointers / G5) ──
+            // An OPTIONAL token whose occurrence in a type-position subtree wraps
+            // the resolved type one level in Ptr (C's `int *p` declarator stars).
+            if (sem.contains("pointerToken")) {
+                json const& tok = sem.at("pointerToken");
+                if (!tok.is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/pointerToken",
+                              "'pointerToken' must be a string");
+                } else {
+                    auto const name = tok.get<std::string>();
+                    if (!data.schemaTokens->contains(name)) {
+                        coll.emit(DiagnosticCode::C_UnknownToken,
+                                  "/semantics/pointerToken",
+                                  std::format("'pointerToken' references unknown "
+                                              "token kind '{}'", name));
+                    } else {
+                        cfg.pointerToken = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
             // A `nameMatch: "lastIdentifier"` rule (declaration or
             // reference) descends a subtree for its LAST identifier token —
             // which requires the engine to know which token kind IS the

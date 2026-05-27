@@ -120,7 +120,7 @@
       { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
       { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
       { "precedence": 70, "associativity": "left",                       "operators": ["*", "/"]                               },
-      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*"]                     },
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&"]                },
       { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" }
@@ -255,6 +255,7 @@
       "sequence": [
         { "optional": "ConstKeyword" },
         "typeBase",
+        { "repeat": "StarOp" },
         { "optional": "ConstKeyword" }
       ]
     },
@@ -412,6 +413,7 @@
 
   "semantics": {
     "identifierToken": "Identifier",
+    "pointerToken":    "StarOp",
     "declarations": [
       { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword", "warnIfUnused": true,

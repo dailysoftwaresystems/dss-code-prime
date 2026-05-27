@@ -121,6 +121,46 @@ TEST(SemanticAnalyzerCSubset, OutOfRangeArrayLengthEmitsDiagnostic) {
                         DiagnosticCode::S_ArrayLengthOutOfRange), 1u);
 }
 
+// SE-pointers (G5): `int *p` declarator → Ptr<I32>; `int **pp` → Ptr<Ptr<I32>>.
+// The declarator stars wrap the base type one level each (declarator-depth).
+TEST(SemanticAnalyzerCSubset, PointerDeclaratorTypedAsPtr) {
+    auto cu = buildShippedUnit("c-subset", {
+        "void f() { int *p; int **pp; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* p = nullptr;
+    SymbolRecord const* pp = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "p")  p  = &model.symbols()[i];
+        if (model.symbols()[i].name == "pp") pp = &model.symbols()[i];
+    }
+    ASSERT_NE(p, nullptr);
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(p->type)[0]), TypeKind::I32);
+    ASSERT_NE(pp, nullptr);
+    ASSERT_EQ(ti.kind(pp->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(pp->type)[0]), TypeKind::Ptr);          // Ptr<Ptr<I32>>
+    EXPECT_EQ(ti.kind(ti.operands(ti.operands(pp->type)[0])[0]), TypeKind::I32);
+}
+
+// SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
+TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
+    auto cu = buildShippedUnit("c-subset", { "void f(int *p) {}\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* f = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "f") f = &model.symbols()[i];
+    ASSERT_NE(f, nullptr);
+    ASSERT_EQ(ti.kind(f->type), TypeKind::FnSig);
+    auto params = ti.fnParams(f->type);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(ti.kind(params[0]), TypeKind::Ptr);
+}
+
 // SE-arrays: a GLOBAL array (`int g[10];`) — the suffix nests under
 // `topLevelDecl → varDeclTail → arrayDeclSuffix`, exercising applyArraySuffix's
 // descendant scan. Must type as Array<I32,10> just like the local case.
