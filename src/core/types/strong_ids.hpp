@@ -91,6 +91,12 @@ DSS_STRONG_ID(HirKindId);
 // analog of HirKindId. Carried in a BinaryOp/UnaryOp node's `payload`.
 DSS_STRONG_ID(HirOpId);
 
+// A registered HIR intrinsic id (HR6). Unlike HirKindId/HirOpId there is NO
+// universal core intrinsic set — every intrinsic is registry-minted — so ids run
+// monotonically from 1 (0 == InvalidHirIntrinsic). Carried in an IntrinsicCall
+// node's `payload`; resolved against the module's HirIntrinsicRegistry.
+DSS_STRONG_ID(HirIntrinsicId);
+
 // Arena-element ids (carry `arenaTag`): NodeId is the Tree's node index; TypeId
 // is the CU-scoped type lattice's index (its arena tag is the CompilationUnitId);
 // HirNodeId is a HIR module's node index (its arena tag is the HirModuleId).
@@ -119,6 +125,7 @@ inline constexpr TypeNameId      InvalidTypeName{};
 inline constexpr HirModuleId     InvalidHirModule{};
 inline constexpr HirKindId       InvalidHirKind{};
 inline constexpr HirOpId         InvalidHirOp{};
+inline constexpr HirIntrinsicId  InvalidHirIntrinsic{};
 inline constexpr HirNodeId       InvalidHirNode{};
 
 } // namespace dss
@@ -149,6 +156,7 @@ DSS_HASH_ID(TypeNameId);
 DSS_HASH_ID(HirModuleId);
 DSS_HASH_ID(HirKindId);
 DSS_HASH_ID(HirOpId);
+DSS_HASH_ID(HirIntrinsicId);
 DSS_HASH_ID(HirNodeId);
 
 #undef DSS_HASH_ID

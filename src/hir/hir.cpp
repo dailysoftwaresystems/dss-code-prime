@@ -24,13 +24,15 @@ void resetMovedFrom_(Arena& arena,
                      std::vector<HirNodeId>& parentOf,
                      std::string& sourceLanguage,
                      HirKindRegistry& registry,
-                     HirOpRegistry& opRegistry) noexcept {
+                     HirOpRegistry& opRegistry,
+                     HirIntrinsicRegistry& intrinsicRegistry) noexcept {
     arena = Arena{};
     childPool.clear();
     parentOf.clear();
     sourceLanguage.clear();
     registry = HirKindRegistry{};
     opRegistry = HirOpRegistry{};
+    intrinsicRegistry = HirIntrinsicRegistry{};
 }
 
 } // namespace
@@ -39,14 +41,15 @@ void resetMovedFrom_(Arena& arena,
 
 Hir::Hir(Arena arena, std::vector<HirNodeId> childPool, std::vector<HirNodeId> parentOf,
          HirNodeId root, std::string sourceLanguage, HirKindRegistry registry,
-         HirOpRegistry opRegistry) noexcept
+         HirOpRegistry opRegistry, HirIntrinsicRegistry intrinsicRegistry) noexcept
     : arena_(std::move(arena)),
       childPool_(std::move(childPool)),
       parentOf_(std::move(parentOf)),
       root_(root),
       sourceLanguage_(std::move(sourceLanguage)),
       registry_(std::move(registry)),
-      opRegistry_(std::move(opRegistry)) {
+      opRegistry_(std::move(opRegistry)),
+      intrinsicRegistry_(std::move(intrinsicRegistry)) {
     // The parallel parent array must align 1:1 with the arena (slot 0 sentinel
     // + one slot per minted node). HirBuilder maintains this in lockstep; this
     // boundary check catches any direct ctor misuse before `parent()` could
@@ -67,9 +70,11 @@ Hir::Hir(Hir&& other) noexcept
       root_(std::exchange(other.root_, InvalidHirNode)),
       sourceLanguage_(std::move(other.sourceLanguage_)),
       registry_(std::move(other.registry_)),
-      opRegistry_(std::move(other.opRegistry_)) {
+      opRegistry_(std::move(other.opRegistry_)),
+      intrinsicRegistry_(std::move(other.intrinsicRegistry_)) {
     resetMovedFrom_(other.arena_, other.childPool_, other.parentOf_,
-                    other.sourceLanguage_, other.registry_, other.opRegistry_);
+                    other.sourceLanguage_, other.registry_, other.opRegistry_,
+                    other.intrinsicRegistry_);
 }
 
 Hir& Hir::operator=(Hir&& other) noexcept {
@@ -81,8 +86,10 @@ Hir& Hir::operator=(Hir&& other) noexcept {
     sourceLanguage_ = std::move(other.sourceLanguage_);
     registry_       = std::move(other.registry_);
     opRegistry_     = std::move(other.opRegistry_);
+    intrinsicRegistry_ = std::move(other.intrinsicRegistry_);
     resetMovedFrom_(other.arena_, other.childPool_, other.parentOf_,
-                    other.sourceLanguage_, other.registry_, other.opRegistry_);
+                    other.sourceLanguage_, other.registry_, other.opRegistry_,
+                    other.intrinsicRegistry_);
     return *this;
 }
 
@@ -202,7 +209,7 @@ Hir HirBuilder::finish(HirNodeId root) && {
     return Hir{std::move(arena_).finish(), std::move(childPool_),
                std::move(parentOf_), root,
                std::move(sourceLanguage_), std::move(registry_),
-               std::move(opRegistry_)};
+               std::move(opRegistry_), std::move(intrinsicRegistry_)};
 }
 
 // ── typed expression helpers (HR2) ──────────────────────────────────────────
@@ -279,6 +286,12 @@ HirNodeId HirBuilder::makeCall(HirNodeId callee, std::span<HirNodeId const> args
     kids.push_back(callee);
     kids.insert(kids.end(), args.begin(), args.end());
     return addParent(HirKind::Call, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeIntrinsicCall(HirIntrinsicId intrinsic,
+                                        std::span<HirNodeId const> args, TypeId type,
+                                        HirFlags flags) {
+    return addParent(HirKind::IntrinsicCall, args, type, intrinsic.v, flags);
 }
 
 HirNodeId HirBuilder::makeIntrinsicCall(std::uint32_t intrinsicId,

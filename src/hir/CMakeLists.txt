@@ -1,6 +1,7 @@
 add_library(hir OBJECT
     hir.cpp
     hir_cursor.cpp
+    hir_intrinsic_registry.cpp
     hir_kind_registry.cpp
     hir_op_registry.cpp
     hir_verifier.cpp

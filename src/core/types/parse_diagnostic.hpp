@@ -209,8 +209,20 @@ enum class DiagnosticCode : std::uint16_t {
     H_InvalidBreak                = 0xF002,
     // H_VerifierFailure: a node violates a structural invariant — HR3 uses it for
     //   a wrong child-arity for the node's kind (e.g. a BinaryOp with 1 child, a
-    //   ForStmt whose child count disagrees with its clause-presence mask).
+    //   ForStmt whose child count disagrees with its clause-presence mask). HR6
+    //   extends it to: a statement after an unconditional terminator in a Block
+    //   (dead code), a non-void function body that may fall through without
+    //   returning, and a Call whose argument count/types disagree with the
+    //   callee's FnSig.
     H_VerifierFailure             = 0xF003,
+    // H_UnknownIntrinsic: an IntrinsicCall whose payload (intrinsic id) does not
+    //   resolve to an intrinsic registered in the module's HirIntrinsicRegistry.
+    H_UnknownIntrinsic            = 0xF004,
+    // H_ShaderViolation: a node inside a `ShaderUsable`-flagged function subtree
+    //   violates a shader restriction — recursion, an indirect / function-pointer
+    //   call, or a call to a non-shader (host) function. (Dynamic allocation is
+    //   not yet expressible in HIR; the check lands when an alloc intrinsic does.)
+    H_ShaderViolation             = 0xF005,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

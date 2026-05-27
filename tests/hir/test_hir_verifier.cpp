@@ -1,6 +1,10 @@
-// HR2: the HirVerifier expression-typing rule — every expression (and TypeRef)
-// node must carry a valid TypeId, reported as H_TypeUnresolved. Collect-all,
-// recoverable-diagnostic discipline (no abort); HasError nodes are skipped.
+// HR2–HR6: the HirVerifier rules — type resolution (H_TypeUnresolved), node
+// arity + ForStmt/CaseArm shape (H_VerifierFailure), break/continue scoping
+// (H_InvalidBreak), declaration shape, block dead-code, non-void return
+// completeness, Call argument-vs-FnSig, intrinsic registration
+// (H_UnknownIntrinsic), and the shader-restriction subverifier (H_ShaderViolation).
+// Collect-all, recoverable-diagnostic discipline (no abort); HasError nodes are
+// skipped (cascade suppression).
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -31,6 +35,7 @@ using dss::ForClause;
 using dss::Hir;
 using dss::HirBuilder;
 using dss::HirFlags;
+using dss::HirIntrinsicId;
 using dss::HirKind;
 using dss::HirKindId;
 using dss::HirNodeId;
@@ -47,6 +52,8 @@ using dss::TypeKind;
 static_assert(std::is_constructible_v<HirVerifier, Hir const&>);
 static_assert(!std::is_constructible_v<HirVerifier, Hir&&>);
 static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*>);
+static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*,
+                                       dss::TypeInterner const*>);
 
 namespace {
 
@@ -592,4 +599,424 @@ TEST(HirVerifier, UntypedSourceDeclarationsFireButExternsDoNot) {
     EXPECT_FALSE(HirVerifier{h}.verify(reporter));
     // Exactly the three source declarations fire; the two externs do not.
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 3u);
+}
+
+// ── block dead-code rule (HR6, H_VerifierFailure) ──
+
+TEST(HirVerifier, DeadCodeAfterReturnFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"toy"};
+    HirNodeId const ret  = b.makeReturn(b.makeLiteral(i32));
+    HirNodeId const dead = b.makeExprStmt(b.makeLiteral(i32));   // unreachable: follows return
+    HirNodeId const blk  = b.makeBlock(std::array{ret, dead});
+    Hir h = std::move(b).finish(blk);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, DeadCodeAfterBreakFires) {
+    // Break is an unconditional transfer too — code after it in the block is dead.
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+    HirBuilder b{"toy"};
+    HirNodeId const br   = b.makeBreak(0);
+    HirNodeId const dead = b.makeExprStmt(b.makeLiteral(i32));
+    HirNodeId const body = b.makeBlock(std::array{br, dead});
+    HirNodeId const wh   = b.makeWhileStmt(b.makeLiteral(boolT), body);
+    Hir h = std::move(b).finish(wh);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, TerminatorAsLastStatementIsClean) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"toy"};
+    HirNodeId const blk = b.makeBlock(std::array{b.makeExprStmt(b.makeLiteral(i32)),
+                                                 b.makeReturn(b.makeLiteral(i32))});
+    Hir h = std::move(b).finish(blk);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+// ── return completeness rule (HR6, interner-gated, H_VerifierFailure) ──
+
+namespace {
+// A bare ()->ret function whose body is `body`; finished module.
+Hir fnReturning(HirBuilder& b, TypeInterner& ti, TypeId ret, HirNodeId body) {
+    TypeId const sig = ti.fnSig({}, ret, dss::CallConv::CcSysV);
+    HirNodeId const fn = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    return std::move(b).finish(fn);
+}
+} // namespace
+
+TEST(HirVerifier, NonVoidFunctionFallingThroughFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c"};
+    Hir h = fnReturning(b, ti, i32, b.makeBlock({}));   // empty body, returns i32
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, VoidFunctionMayFallThroughCleanly) {
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    HirBuilder b{"c"};
+    Hir h = fnReturning(b, ti, voidT, b.makeBlock({}));
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, NonVoidFunctionEndingInReturnIsClean) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c"};
+    HirNodeId const body = b.makeBlock(std::array{b.makeReturn(b.makeLiteral(i32))});
+    Hir h = fnReturning(b, ti, i32, body);
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, NonVoidIfBothBranchesReturnIsClean) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+    HirBuilder b{"c"};
+    HirNodeId const iff = b.makeIfStmt(b.makeLiteral(boolT),
+                                       b.makeReturn(b.makeLiteral(i32)),
+                                       b.makeReturn(b.makeLiteral(i32)));
+    Hir h = fnReturning(b, ti, i32, b.makeBlock(std::array{iff}));
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, NonVoidIfWithoutElseFallsThroughFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+    HirBuilder b{"c"};
+    // if (c) return 1;  — the else path falls off the end.
+    HirNodeId const iff = b.makeIfStmt(b.makeLiteral(boolT), b.makeReturn(b.makeLiteral(i32)));
+    Hir h = fnReturning(b, ti, i32, b.makeBlock(std::array{iff}));
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, ReturnCompletenessSkippedWithoutInterner) {
+    // The same falling-through non-void function is NOT flagged when no interner
+    // is supplied — the rule cannot read the return type, so it stays silent.
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c"};
+    Hir h = fnReturning(b, ti, i32, b.makeBlock({}));
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));   // no interner → no return-completeness check
+}
+
+// ── call argument rule (HR6, interner-gated, H_VerifierFailure) ──
+
+TEST(HirVerifier, CallArgCountMismatchFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const sig = ti.fnSig(std::array{i32}, i32, dss::CallConv::CcSysV);  // (i32)->i32
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, /*symbol=*/1);
+    HirNodeId const call   = b.makeCall(callee, {}, i32);   // 0 args, expects 1
+    Hir h = std::move(b).finish(call);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, CallArgTypeMismatchFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+    TypeId const sig   = ti.fnSig(std::array{i32}, i32, dss::CallConv::CcSysV);
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, 1);
+    HirNodeId const call   = b.makeCall(callee, std::array{b.makeLiteral(boolT)}, i32);  // bool ≠ i32
+    Hir h = std::move(b).finish(call);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, CallArgWideningIsAssignableClean) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const i64 = ti.primitive(TypeKind::I64);
+    TypeId const sig = ti.fnSig(std::array{i64}, i64, dss::CallConv::CcSysV);  // (i64)->i64
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, 1);
+    HirNodeId const call   = b.makeCall(callee, std::array{b.makeLiteral(i32)}, i64);  // i32→i64 ok
+    Hir h = std::move(b).finish(call);
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+// ── intrinsic rule (HR6, H_UnknownIntrinsic) ──
+
+TEST(HirVerifier, UnregisteredIntrinsicFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"toy"};
+    // Raw id 7, never registered in this module.
+    HirNodeId const intr = b.makeIntrinsicCall(/*intrinsicId=*/7u, std::array{b.makeLiteral(i32)}, i32);
+    Hir h = std::move(b).finish(intr);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_UnknownIntrinsic), 1u);
+}
+
+TEST(HirVerifier, RegisteredIntrinsicIsClean) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"toy"};
+    HirIntrinsicId const sqrt = b.intrinsicRegistry().registerIntrinsic("toy::sqrt", "toy");
+    HirNodeId const intr = b.makeIntrinsicCall(sqrt, std::array{b.makeLiteral(i32)}, i32);
+    Hir h = std::move(b).finish(intr);
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+// ── shader-restriction subverifier (HR6, H_ShaderViolation) ──
+
+namespace {
+TypeId voidSig(TypeInterner& ti) {
+    return ti.fnSig({}, ti.primitive(TypeKind::Void), dss::CallConv::CcSysV);
+}
+} // namespace
+
+TEST(HirVerifier, ShaderRecursionFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const sig   = voidSig(ti);
+    HirBuilder b{"shader"};
+    // function #1 calls itself.
+    HirNodeId const call = b.makeCall(b.makeRef(sig, /*symbol=*/1), {}, voidT);
+    HirNodeId const body = b.makeBlock(std::array{b.makeExprStmt(call)});
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body, HirFlags::ShaderUsable);
+    Hir h = std::move(b).finish(fn);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_ShaderViolation), 1u);
+}
+
+TEST(HirVerifier, ShaderCallingHostFunctionFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const sig   = voidSig(ti);
+    HirBuilder b{"shader"};
+    // host function (#2) is NOT shader-usable.
+    HirNodeId const host = b.makeFunction(sig, /*symbol=*/2, {}, b.makeBlock({}));
+    HirNodeId const call = b.makeCall(b.makeRef(sig, /*symbol=*/2), {}, voidT);
+    HirNodeId const shader = b.makeFunction(sig, /*symbol=*/1, {},
+                                            b.makeBlock(std::array{b.makeExprStmt(call)}),
+                                            HirFlags::ShaderUsable);
+    HirNodeId const mod = b.makeModule(std::array{shader, host});
+    Hir h = std::move(b).finish(mod);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_ShaderViolation), 1u);
+}
+
+TEST(HirVerifier, ShaderIndirectCallFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const sig   = voidSig(ti);
+    HirBuilder b{"shader"};
+    // callee is not a direct Ref — a function-typed Literal stands in for an
+    // indirect / function-pointer call.
+    HirNodeId const call = b.makeCall(b.makeLiteral(sig), {}, voidT);
+    HirNodeId const fn   = b.makeFunction(sig, 1, {},
+                                          b.makeBlock(std::array{b.makeExprStmt(call)}),
+                                          HirFlags::ShaderUsable);
+    Hir h = std::move(b).finish(fn);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_ShaderViolation), 1u);
+}
+
+TEST(HirVerifier, WellFormedShaderFunctionIsClean) {
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const sig   = voidSig(ti);
+    HirBuilder b{"shader"};
+    // shader #1 calls shader helper #2 — both ShaderUsable, no recursion.
+    HirNodeId const helper = b.makeFunction(sig, /*symbol=*/2, {}, b.makeBlock({}),
+                                            HirFlags::ShaderUsable);
+    HirNodeId const call   = b.makeCall(b.makeRef(sig, /*symbol=*/2), {}, voidT);
+    HirNodeId const main   = b.makeFunction(sig, /*symbol=*/1, {},
+                                            b.makeBlock(std::array{b.makeExprStmt(call)}),
+                                            HirFlags::ShaderUsable);
+    HirNodeId const mod = b.makeModule(std::array{main, helper});
+    Hir h = std::move(b).finish(mod);
+    DiagnosticReporter reporter;
+    EXPECT_TRUE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_ShaderViolation), 0u);
+}
+
+// ── HR6 review-pass coverage: distinct branches the first tests didn't exercise ──
+
+TEST(HirVerifier, DeadCodeAfterUnreachableFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"toy"};
+    HirNodeId const unr  = b.addLeaf(HirKind::Unreachable);
+    HirNodeId const dead = b.makeExprStmt(b.makeLiteral(i32));
+    HirNodeId const blk  = b.makeBlock(std::array{unr, dead});
+    Hir h = std::move(b).finish(blk);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, DeadCodeAfterContinueFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const boolT = ti.primitive(TypeKind::Bool);
+    HirBuilder b{"toy"};
+    HirNodeId const co   = b.makeContinue(0);
+    HirNodeId const dead = b.makeExprStmt(b.makeLiteral(i32));
+    HirNodeId const wh   = b.makeWhileStmt(b.makeLiteral(boolT),
+                                           b.makeBlock(std::array{co, dead}));
+    Hir h = std::move(b).finish(wh);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, OnlyOneDeadCodeDiagnosticPerBlock) {
+    // Two terminator+follower pairs in one block must still yield ONE diagnostic
+    // (the rest is cascade) — guards the inner-loop `break`.
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"toy"};
+    HirNodeId const blk = b.makeBlock(std::array{
+        b.makeReturn(b.makeLiteral(i32)), b.makeExprStmt(b.makeLiteral(i32)),
+        b.makeReturn(b.makeLiteral(i32)), b.makeExprStmt(b.makeLiteral(i32))});
+    Hir h = std::move(b).finish(blk);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, NonVoidSwitchWithDefaultAllArmsReturnIsClean) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c"};
+    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32),
+                                         std::array{b.makeReturn(b.makeLiteral(i32))});
+    HirNodeId const armD = b.makeCaseArm(std::nullopt,
+                                         std::array{b.makeReturn(b.makeLiteral(i32))});
+    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), std::array{arm0, armD});
+    Hir h = fnReturning(b, ti, i32, b.makeBlock(std::array{sw}));
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, NonVoidSwitchWithoutDefaultFallsThroughFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c"};
+    // Only a valued arm (returns); no default ⇒ the switch can fall through.
+    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32),
+                                         std::array{b.makeReturn(b.makeLiteral(i32))});
+    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), std::array{arm0});
+    Hir h = fnReturning(b, ti, i32, b.makeBlock(std::array{sw}));
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, ReturnCompletenessSuppressedForHasErrorFunction) {
+    // A non-void function that falls through is NOT flagged when it carries
+    // HasError — the fault was reported upstream; cascade suppression applies.
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const sig = ti.fnSig({}, i32, dss::CallConv::CcSysV);
+    HirBuilder b{"c"};
+    HirNodeId const fn = b.makeFunction(sig, /*symbol=*/1, {}, b.makeBlock({}),
+                                        HirFlags::HasError);
+    Hir h = std::move(b).finish(fn);
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, CallWithUntypedCalleeDoesNotFireArgRule) {
+    // An untyped callee fires H_TypeUnresolved (the type rule) but must NOT
+    // produce a spurious H_VerifierFailure from the argument rule — cascade
+    // suppression via isAssignable's InvalidType handling + the callee-valid guard.
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.addLeaf(HirKind::Ref, dss::InvalidType, /*symbol=*/1);
+    HirNodeId const call   = b.makeCall(callee, std::array{b.makeLiteral(i32)}, i32);
+    Hir h = std::move(b).finish(call);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 0u);
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 1u);
+}
+
+TEST(HirVerifier, ShaderMutualRecursionFires) {
+    // shadeA (#1) calls #2; shadeB (#2) calls #1 — both ShaderUsable.
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const sig   = voidSig(ti);
+    HirBuilder b{"shader"};
+    HirNodeId const a = b.makeFunction(sig, /*symbol=*/1, {},
+        b.makeBlock(std::array{b.makeExprStmt(b.makeCall(b.makeRef(sig, 2), {}, voidT))}),
+        HirFlags::ShaderUsable);
+    HirNodeId const c = b.makeFunction(sig, /*symbol=*/2, {},
+        b.makeBlock(std::array{b.makeExprStmt(b.makeCall(b.makeRef(sig, 1), {}, voidT))}),
+        HirFlags::ShaderUsable);
+    HirNodeId const mod = b.makeModule(std::array{a, c});
+    Hir h = std::move(b).finish(mod);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_ShaderViolation), 2u);  // one per shader fn
+}
+
+TEST(HirVerifier, ShaderReachingARecursiveHelperFires) {
+    // main (#1, shader) calls helper (#2, shader); helper recurses on itself.
+    // main is not itself recursive but REACHES the cycle — must be flagged.
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const sig   = voidSig(ti);
+    HirBuilder b{"shader"};
+    HirNodeId const helper = b.makeFunction(sig, /*symbol=*/2, {},
+        b.makeBlock(std::array{b.makeExprStmt(b.makeCall(b.makeRef(sig, 2), {}, voidT))}),
+        HirFlags::ShaderUsable);
+    HirNodeId const main = b.makeFunction(sig, /*symbol=*/1, {},
+        b.makeBlock(std::array{b.makeExprStmt(b.makeCall(b.makeRef(sig, 2), {}, voidT))}),
+        HirFlags::ShaderUsable);
+    HirNodeId const mod = b.makeModule(std::array{main, helper});
+    Hir h = std::move(b).finish(mod);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    // helper (direct recursion) AND main (reaches the cycle) are both reported.
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_ShaderViolation), 2u);
 }

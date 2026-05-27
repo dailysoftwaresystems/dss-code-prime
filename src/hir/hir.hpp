@@ -5,6 +5,7 @@
 #include "core/substrate/arena_container.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_id.hpp"
+#include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_kind_registry.hpp"
 #include "hir/hir_node.hpp"
 #include "hir/hir_op.hpp"
@@ -48,7 +49,7 @@ public:
     // aborts loud rather than silently OOB-reading `parentOf_[id.v]` later.
     Hir(Arena arena, std::vector<HirNodeId> childPool, std::vector<HirNodeId> parentOf,
         HirNodeId root, std::string sourceLanguage, HirKindRegistry registry,
-        HirOpRegistry opRegistry) noexcept;
+        HirOpRegistry opRegistry, HirIntrinsicRegistry intrinsicRegistry) noexcept;
 
     // Move-only: the arena is move-only (its cross-arena tag must stay unique),
     // so copying a module is meaningless — downstream consumers move it along.
@@ -69,6 +70,9 @@ public:
     [[nodiscard]] std::string_view sourceLanguage() const noexcept { return sourceLanguage_; }
     [[nodiscard]] HirKindRegistry const& registry()   const noexcept { return registry_; }
     [[nodiscard]] HirOpRegistry const&   opRegistry() const noexcept { return opRegistry_; }
+    [[nodiscard]] HirIntrinsicRegistry const& intrinsicRegistry() const noexcept {
+        return intrinsicRegistry_;
+    }
 
     // ── node accessors (bounds- + cross-module-checked via arena_.at) ──
     [[nodiscard]] HirKind       kind(HirNodeId id)    const { return arena_.at(id).kind; }
@@ -177,6 +181,7 @@ private:
     std::string            sourceLanguage_;
     HirKindRegistry        registry_;
     HirOpRegistry          opRegistry_;
+    HirIntrinsicRegistry   intrinsicRegistry_;
 };
 
 // `HirAttribute<T>` is the `ArenaT = Hir` alias of the generalized side-table —
@@ -233,6 +238,11 @@ public:
     // the frozen Hir. Not `[[nodiscard]]` for the same reason as `registry()`.
     HirOpRegistry& opRegistry() noexcept { return opRegistry_; }
 
+    // The build's intrinsic registry — register the intrinsics a lowering's
+    // `IntrinsicCall`s reference here; ownership transfers into the frozen Hir.
+    // Not `[[nodiscard]]` for the same reason as `registry()`.
+    HirIntrinsicRegistry& intrinsicRegistry() noexcept { return intrinsicRegistry_; }
+
     // A leaf node (no children).
     HirNodeId addLeaf(HirKind kind, TypeId typeId = InvalidType,
                       std::uint32_t payload = 0, HirFlags flags = HirFlags::None);
@@ -278,7 +288,12 @@ public:
     // Call: children are [callee, args...]; `type` is the call's result type.
     HirNodeId makeCall(HirNodeId callee, std::span<HirNodeId const> args, TypeId type,
                        HirFlags flags = HirFlags::None);
-    // Intrinsic call: children are [args...]; `intrinsicId` is the payload.
+    // Intrinsic call: children are [args...]; the intrinsic id is the payload.
+    // The typed overload takes a `HirIntrinsicId` minted by `intrinsicRegistry()`
+    // (the verifier's `checkIntrinsicCalls` rejects an id this module never
+    // registered); the raw-`uint32_t` overload is the low-level escape hatch.
+    HirNodeId makeIntrinsicCall(HirIntrinsicId intrinsic, std::span<HirNodeId const> args,
+                                TypeId type, HirFlags flags = HirFlags::None);
     HirNodeId makeIntrinsicCall(std::uint32_t intrinsicId, std::span<HirNodeId const> args,
                                 TypeId type, HirFlags flags = HirFlags::None);
 
@@ -454,6 +469,7 @@ private:
     std::string            sourceLanguage_;
     HirKindRegistry        registry_;
     HirOpRegistry          opRegistry_;
+    HirIntrinsicRegistry   intrinsicRegistry_;
 };
 
 } // namespace dss

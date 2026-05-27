@@ -7,15 +7,15 @@
 namespace dss {
 
 class DiagnosticReporter;
+class TypeInterner;
 
-// HIR structural verifier (HR2–HR5; the full invariant set lands at HR6 per plan
-// §2.8). A verifier is constructed over a frozen `Hir` and run against a
+// HIR structural verifier (HR2–HR6; the full invariant set per plan §2.8). A
+// verifier is constructed over a frozen `Hir` and run against a
 // `DiagnosticReporter`; each structural rule is a private method `verify()` calls
 // in turn. HR2 shipped the type rule (now `checkRequiredTypes`); HR3 added `checkNodeArity` and
-// `checkBreakContinueScoping`; HR4 added `checkDeclarationShape`. HR6 grows the
-// class further (Call-arg-vs-FnSig, intrinsic-registered, block-structural-
-// termination, shader restrictions) by adding sibling rule methods to the same
-// `verify()` body.
+// `checkBreakContinueScoping`; HR4 added `checkDeclarationShape`; HR6 added block
+// termination, return completeness, Call-arg-vs-FnSig, intrinsic-registered, and
+// the shader-restriction subverifier.
 //
 // Discipline (mirrors the semantic analyzer): COLLECT-ALL, never short-circuit —
 // every node is checked so one run surfaces every violation. Violations are
@@ -29,18 +29,27 @@ class DiagnosticReporter;
 // the node id travels in the message text. The verifier is fully usable without a
 // map (e.g. a unit test that builds HIR directly) — the map only enriches where a
 // diagnostic points.
+//
+// Type interner (HR6): an OPTIONAL `TypeInterner` may be supplied. The rules that
+// must decode a `TypeId` — Call argument-vs-FnSig matching, non-void return
+// completeness, and function-pointer detection in shaders — RUN ONLY when it is
+// present; without it they are skipped (a module built directly in a test, with
+// no semantic phase, has no interner to consult). The real pipeline always
+// supplies the interner the semantic phase produced, so these rules always run
+// in production.
 class DSS_EXPORT HirVerifier {
 public:
-    explicit HirVerifier(Hir const& hir, HirSourceMap const* sourceMap = nullptr) noexcept
-        : hir_(hir), sourceMap_(sourceMap) {}
+    explicit HirVerifier(Hir const& hir, HirSourceMap const* sourceMap = nullptr,
+                         TypeInterner const* interner = nullptr) noexcept
+        : hir_(hir), sourceMap_(sourceMap), interner_(interner) {}
 
     // The verifier stores a reference and must not outlive the module it
-    // inspects — forbid binding to a temporary `Hir` outright. Both arities are
-    // deleted: the 2-arg form is needed because the defaulted `sourceMap`
-    // parameter would otherwise let `HirVerifier{std::move(h), &map}` bind the
-    // rvalue to `Hir const&` and dangle.
-    HirVerifier(Hir&&)                      = delete;
-    HirVerifier(Hir&&, HirSourceMap const*) = delete;
+    // inspects — forbid binding to a temporary `Hir` outright. Every arity is
+    // deleted: each defaulted parameter would otherwise let an
+    // `HirVerifier{std::move(h), ...}` bind the rvalue to `Hir const&` and dangle.
+    HirVerifier(Hir&&)                                           = delete;
+    HirVerifier(Hir&&, HirSourceMap const*)                      = delete;
+    HirVerifier(Hir&&, HirSourceMap const*, TypeInterner const*) = delete;
 
     // Run every rule, reporting each violation into `reporter`. Returns true
     // iff THIS run emitted no Error-severity diagnostic (computed by delta on the
@@ -72,8 +81,40 @@ private:
     // violation emits `H_VerifierFailure`.
     void checkDeclarationShape(DiagnosticReporter& reporter) const;
 
+    // Block dead-code (HR6, plan §2.8 "no fall-through past Return/Unreachable",
+    // extended to all unconditional transfers): no statement may follow an
+    // unconditional terminator (`Return`/`Unreachable`/`Break`/`Continue`) within
+    // a `Block` — control can never reach it. Each violation emits
+    // `H_VerifierFailure`.
+    void checkBlockTermination(DiagnosticReporter& reporter) const;
+
+    // Return completeness (HR6, plan §2.8): a non-void `Function`'s body `Block`
+    // must terminate on every structural path (each path ends in a `Return` or
+    // `Unreachable`). Loops are conservatively non-terminating, so lowering must
+    // append an `Unreachable` after a provably-infinite loop. Interner-gated (the
+    // return type is read from the FnSig). Each violation emits `H_VerifierFailure`.
+    void checkReturnCompleteness(DiagnosticReporter& reporter) const;
+
+    // Call arguments (HR6, plan §2.8): a `Call`'s argument count and types must
+    // match the callee's `FnSig` (each arg `isAssignable` to its parameter).
+    // Interner-gated (the FnSig is decoded from the callee's `TypeId`). Each
+    // violation emits `H_VerifierFailure`.
+    void checkCallArguments(DiagnosticReporter& reporter) const;
+
+    // Intrinsics (HR6, plan §2.8): every `IntrinsicCall`'s payload must resolve to
+    // an intrinsic the module's `HirIntrinsicRegistry` minted. Each miss emits
+    // `H_UnknownIntrinsic`.
+    void checkIntrinsicCalls(DiagnosticReporter& reporter) const;
+
+    // Shader restrictions (HR6, plan §2.8): inside a `ShaderUsable` function's
+    // subtree — no recursion (call-graph cycle), no indirect / function-pointer
+    // call, no call to a non-shader (host) function. Each violation emits
+    // `H_ShaderViolation`. (Dynamic allocation is not yet expressible in HIR.)
+    void checkShaderRestrictions(DiagnosticReporter& reporter) const;
+
     Hir const&          hir_;
     HirSourceMap const* sourceMap_;   // optional; nullptr = no source provenance
+    TypeInterner const* interner_;    // optional; nullptr = skip type-decoding rules
 };
 
 } // namespace dss
