@@ -4,8 +4,11 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/source_span.hpp"
+#include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
+#include "hir/hir_attrs.hpp"
 #include "hir/hir_node.hpp"
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
@@ -16,6 +19,8 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <string>
+#include <type_traits>
 
 using dss::CompilationUnitId;
 using dss::DiagnosticCode;
@@ -35,6 +40,13 @@ using dss::ParseDiagnostic;
 using dss::TypeId;
 using dss::TypeInterner;
 using dss::TypeKind;
+
+// The verifier holds a reference into the module, so it must not bind to a
+// temporary `Hir` in EITHER arity — the HR5 source-map overload's defaulted
+// parameter must not reopen the rvalue hole the single-arg deletion closes.
+static_assert(std::is_constructible_v<HirVerifier, Hir const&>);
+static_assert(!std::is_constructible_v<HirVerifier, Hir&&>);
+static_assert(!std::is_constructible_v<HirVerifier, Hir&&, dss::HirSourceMap const*>);
 
 namespace {
 
@@ -84,10 +96,40 @@ TEST(HirVerifier, UntypedExpressionFiresTypeUnresolved) {
     DiagnosticReporter reporter;
     EXPECT_FALSE(HirVerifier{h}.verify(reporter));
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 1u);
-    // The offending node id is stashed in the span offset (HR2 stand-in until
-    // HR5 threads real source spans).
+    // No source map was supplied, so the diagnostic carries an honest "no
+    // location" (InvalidBuffer + empty span) and the node identity lives in the
+    // message text — NOT smuggled into the span offset.
     ASSERT_FALSE(reporter.all().empty());
-    EXPECT_EQ(reporter.all().front().span.start(), bad.v);
+    EXPECT_EQ(reporter.all().front().buffer, dss::InvalidBuffer);
+    EXPECT_TRUE(reporter.all().front().span.isEmpty());
+    EXPECT_NE(reporter.all().front().actual.find("#" + std::to_string(bad.v)),
+              std::string::npos);
+}
+
+TEST(HirVerifier, MapsRealSourceSpanWhenSourceMapProvided) {
+    // HR5: when a HirSourceMap is supplied, a violating node's diagnostic carries
+    // its real (buffer, span) — the IOU HR2 left ("until HR5 threads real source
+    // spans") is now closed.
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+
+    HirBuilder b{"toy"};
+    HirNodeId const lhs = b.makeLiteral(i32);
+    HirNodeId const rhs = b.makeLiteral(i32);
+    HirNodeId const bad = b.addParent(HirKind::BinaryOp, std::array{lhs, rhs},
+                                      dss::InvalidType, encodeOp(HirOpKind::Add));
+    Hir h = std::move(b).finish(bad);
+
+    dss::HirSourceMap spans{h};
+    dss::BufferId const buf{7};
+    dss::SourceSpan const sp = dss::SourceSpan::of(10, 20);
+    spans.set(bad, dss::HirSourceLoc{buf, sp});
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, &spans}.verify(reporter)));
+    ASSERT_FALSE(reporter.all().empty());
+    EXPECT_EQ(reporter.all().front().buffer, buf);
+    EXPECT_EQ(reporter.all().front().span, sp);
 }
 
 TEST(HirVerifier, UntypedTypeRefFires) {
@@ -202,8 +244,9 @@ TEST(HirVerifier, EveryUntypedExpressionIsReportedNotCoalesced) {
 
     DiagnosticReporter reporter;
     EXPECT_FALSE(HirVerifier{h}.verify(reporter));
-    // Distinct span offsets (each node's id) keep the reporter's dedup window
-    // from collapsing the two violations into one.
+    // With no source map the two violations share the empty span, but each
+    // carries its own node id in `actual` — and `actual` is part of the dedup
+    // key — so the window does NOT collapse the two distinct findings into one.
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 2u);
 }
 

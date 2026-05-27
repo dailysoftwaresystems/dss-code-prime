@@ -4,6 +4,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
+#include "hir/hir_attrs.hpp"
 #include "hir/hir_node.hpp"
 
 #include <cstdint>
@@ -14,18 +15,28 @@ namespace dss {
 
 namespace {
 
-// Emit one HIR verifier diagnostic. HIR has no source spans until HR5, so the
-// offending HirNodeId is stashed in the span offset: it both locates the node
-// for debugging AND keeps each diagnostic's (code, buffer, span) key distinct,
-// so the reporter's dedup window can't coalesce sibling violations into one.
+// Emit one HIR verifier diagnostic, locating it via the source map when one is
+// available. A node WITH a `HirSourceLoc` gets its real (buffer, span); a node
+// without one — a synthetic lowering node with no origin, or any run with no map
+// (e.g. a unit test that builds HIR directly) — gets an honest "no location"
+// (`InvalidBuffer` + empty span). Either way the node's identity travels in
+// `actual` ("hir node #N …"); because `actual` participates in the reporter's
+// dedup key, two findings on DIFFERENT nodes are never coalesced even when both
+// lack a span and so share the empty one.
 void reportAt(DiagnosticReporter& reporter, DiagnosticCode code, HirNodeId id,
-              std::string actual) {
+              std::string actual, HirSourceMap const* sourceMap) {
     ParseDiagnostic d;
     d.code     = code;
     d.severity = DiagnosticSeverity::Error;
-    d.buffer   = InvalidBuffer;
-    d.span     = SourceSpan::empty(id.v);
-    d.actual   = std::move(actual);
+    if (sourceMap != nullptr && sourceMap->has(id)) {
+        HirSourceLoc const& loc = sourceMap->get(id);
+        d.buffer = loc.buffer;
+        d.span   = loc.span;
+    } else {
+        d.buffer = InvalidBuffer;
+        d.span   = SourceSpan::empty(0);
+    }
+    d.actual = std::move(actual);
     reporter.report(std::move(d));
 }
 
@@ -64,7 +75,8 @@ void HirVerifier::checkRequiredTypes(DiagnosticReporter& reporter) const {
 
         reportAt(reporter, DiagnosticCode::H_TypeUnresolved, id,
                  std::format("hir node #{} (HirKind ordinal {})",
-                             id.v, static_cast<unsigned>(kind)));
+                             id.v, static_cast<unsigned>(kind)),
+                 sourceMap_);
     }
 }
 
@@ -84,7 +96,8 @@ void HirVerifier::checkNodeArity(DiagnosticReporter& reporter) const {
             if ((p & ~kForClauseMask) != 0) {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
                          std::format("ForStmt #{} payload {:#x} sets bits outside the "
-                                     "clause mask", id.v, p));
+                                     "clause mask", id.v, p),
+                         sourceMap_);
                 continue;
             }
             std::uint32_t const expected =
@@ -92,7 +105,8 @@ void HirVerifier::checkNodeArity(DiagnosticReporter& reporter) const {
             if (count != expected) {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
                          std::format("ForStmt #{} has {} children but its clause mask "
-                                     "implies {}", id.v, count, expected));
+                                     "implies {}", id.v, count, expected),
+                         sourceMap_);
             }
             continue;
         }
@@ -100,7 +114,8 @@ void HirVerifier::checkNodeArity(DiagnosticReporter& reporter) const {
         if (kind == HirKind::CaseArm) {
             if (!hir_.caseArmIsDefault(id) && count < 1) {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
-                         std::format("valued CaseArm #{} has no match-value child", id.v));
+                         std::format("valued CaseArm #{} has no match-value child", id.v),
+                         sourceMap_);
             }
             continue;
         }
@@ -113,7 +128,8 @@ void HirVerifier::checkNodeArity(DiagnosticReporter& reporter) const {
                 : std::format("[{}, {}]", a.min, a.max);
             reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
                      std::format("HirKind ordinal {} node #{} expects {} children, got {}",
-                                 static_cast<unsigned>(kind), id.v, bound, count));
+                                 static_cast<unsigned>(kind), id.v, bound, count),
+                     sourceMap_);
         }
     }
 }
@@ -133,7 +149,8 @@ void HirVerifier::checkBreakContinueScoping(DiagnosticReporter& reporter) const 
         if (depth >= targets.size()) {
             reportAt(reporter, DiagnosticCode::H_InvalidBreak, id,
                      std::format("{} #{} index {} has no enclosing loop/switch at that "
-                                 "depth ({} enclosing)", what, id.v, depth, targets.size()));
+                                 "depth ({} enclosing)", what, id.v, depth, targets.size()),
+                     sourceMap_);
             continue;
         }
         // continue can only target a loop — never a switch.
@@ -141,7 +158,8 @@ void HirVerifier::checkBreakContinueScoping(DiagnosticReporter& reporter) const 
             && hir_.kind(targets[depth]) == HirKind::SwitchStmt) {
             reportAt(reporter, DiagnosticCode::H_InvalidBreak, id,
                      std::format("continue #{} index {} resolves to a switch; continue "
-                                 "can only target a loop", id.v, depth));
+                                 "can only target a loop", id.v, depth),
+                     sourceMap_);
         }
     }
 }
@@ -153,10 +171,12 @@ void HirVerifier::checkDeclarationShape(DiagnosticReporter& reporter) const {
         if (hir_.kind(param) != HirKind::VarDecl) {
             reportAt(reporter, DiagnosticCode::H_VerifierFailure, param,
                      std::format("parameter #{} must be a VarDecl (HirKind ordinal {})",
-                                 param.v, static_cast<unsigned>(hir_.kind(param))));
+                                 param.v, static_cast<unsigned>(hir_.kind(param))),
+                     sourceMap_);
         } else if (!hir_.children(param).empty()) {
             reportAt(reporter, DiagnosticCode::H_VerifierFailure, param,
-                     std::format("parameter VarDecl #{} must not have an initializer", param.v));
+                     std::format("parameter VarDecl #{} must not have an initializer", param.v),
+                     sourceMap_);
         }
     };
 
@@ -174,7 +194,8 @@ void HirVerifier::checkDeclarationShape(DiagnosticReporter& reporter) const {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
                          std::format("Function #{} body (last child) must be a Block "
                                      "(HirKind ordinal {})",
-                                     id.v, static_cast<unsigned>(hir_.kind(kids.back()))));
+                                     id.v, static_cast<unsigned>(hir_.kind(kids.back()))),
+                         sourceMap_);
             }
             for (HirNodeId param : kids.subspan(0, kids.size() - 1)) checkParam(param);
         } else if (kind == HirKind::ExternFunction) {
@@ -183,7 +204,8 @@ void HirVerifier::checkDeclarationShape(DiagnosticReporter& reporter) const {
                 if (hir_.kind(child) == HirKind::Block) {
                     reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
                              std::format("ExternFunction #{} must not have a body Block "
-                                         "(child #{})", id.v, child.v));
+                                         "(child #{})", id.v, child.v),
+                             sourceMap_);
                 } else {
                     checkParam(child);
                 }

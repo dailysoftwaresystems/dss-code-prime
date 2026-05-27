@@ -103,14 +103,23 @@ std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d
 }
 
 namespace {
-// FNV-1a 64-bit on (code, buffer, span.start, span.end). The reporter's
-// dedup window only needs a low-collision identifier, not a cryptographic
-// hash — false positives become false drops, which the cap behaviour
-// already absorbs.
+// FNV-1a 64-bit on (code, buffer, span.start, span.end, ruleContext, actual).
+// The reporter's dedup window only needs a low-collision identifier, not a
+// cryptographic hash — false positives become false drops, which the cap
+// behaviour already absorbs.
 constexpr std::uint64_t fnv1a64(std::uint64_t seed, std::uint64_t v) noexcept {
     constexpr std::uint64_t prime = 1099511628211ull;
     for (int i = 0; i < 8; ++i) {
         seed ^= (v >> (i * 8)) & 0xFFu;
+        seed *= prime;
+    }
+    return seed;
+}
+
+std::uint64_t fnv1a64Bytes(std::uint64_t seed, std::string const& s) noexcept {
+    constexpr std::uint64_t prime = 1099511628211ull;
+    for (unsigned char c : s) {
+        seed ^= c;
         seed *= prime;
     }
     return seed;
@@ -126,6 +135,15 @@ std::uint64_t hashKey(ParseDiagnostic const& d) noexcept {
     // a span but have distinct ruleContexts) don't dedup-collapse against
     // each other.
     h = fnv1a64(h, d.ruleContext ? static_cast<std::uint64_t>(d.ruleContext->v) : 0u);
+    // Include `actual` so diagnostics that share (code, buffer, span, rule) but
+    // carry DIFFERENT detail are not coalesced — they convey distinct
+    // information: a different missing-file path for D_FileNotFound, or a
+    // different node id for an H_* verifier finding whose nodes have no source
+    // span (and so all share the empty span). True duplicates carry identical
+    // `actual`, so the window still collapses them. (Without this, distinct such
+    // findings collide on the key — the deficiency UnitBuilder's driver reporter
+    // sidesteps by disabling dedup wholesale.)
+    h = fnv1a64Bytes(h, d.actual);
     return h;
 }
 } // namespace

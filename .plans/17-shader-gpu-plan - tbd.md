@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1.x — lit up once the user's custom language begins (`20-custom-language-reserved-plan`). Reserved scope today; design lands now to keep HIR honest. |
-| Predecessors  | 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (shader-shape HIR extensions — HR1 ✅ 2026-05-26 ships the open `HirKindRegistry` shader-shape extensions will register against, HR2 ✅ adds the typed-expression + `HirOpRegistry` substrate, HR3 ✅ adds structured control flow, HR4 ✅ adds the declaration + extern surface; HR5–HR11 pending). ⏳ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) (structured-CF markers carry into SPIR-V `OpLoopMerge` / `OpSelectionMerge`). |
+| Predecessors  | 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (shader-shape HIR extensions — HR1 ✅ 2026-05-26 ships the open `HirKindRegistry` shader-shape extensions will register against, HR2 ✅ adds the typed-expression + `HirOpRegistry` substrate, HR3 ✅ adds structured control flow, HR4 ✅ adds the declaration + extern surface, HR5 ✅ adds the attribute side-tables — incl. the `ShaderIntrinsic` / `HirShaderMap` side-table shader lowering populates (stage / built-in / workgroup / binding); HR6–HR11 pending). ⏳ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) (structured-CF markers carry into SPIR-V `OpLoopMerge` / `OpSelectionMerge`). |
 | Successors    | [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md) for SPIR-V→{DXIL, MSL, WGSL} transpile post-v1. |
 | Scope         | **Bounded.** SG1–SG10. v1 deliverable for the custom language is "compute + vertex + fragment shaders compile to spirv-val-clean SPIR-V." |
 
@@ -94,7 +94,7 @@ A function tagged BOTH `[[shader.usable]]` AND `[[host.usable]]` lowers twice:
 - **Shader lowering**: HIR (after shader-verifier pass) → MIR → SPIR-V via this plan.
 - **Host lowering**: HIR → MIR → LIR → native bytes via `12-mir-lir` + `13-assembler` + `14-linker`.
 
-Both lowerings produce instructions with `HirAttribute<SourceSpan>` pointing at the same user-authored function. Debug info per `15-debug-info-plan` reflects the dual nature (DWARF + SPIR-V `OpLine` both reference the same source span).
+Both lowerings produce instructions with `HirSourceMap` (`HirAttribute<HirSourceLoc>`) pointing at the same user-authored function. Debug info per `15-debug-info-plan` reflects the dual nature (DWARF + SPIR-V `OpLine` both reference the same source span).
 
 ### 2.5 Lowering strategy
 

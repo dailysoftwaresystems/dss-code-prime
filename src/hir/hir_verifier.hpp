@@ -2,12 +2,13 @@
 
 #include "core/export.hpp"
 #include "hir/hir.hpp"
+#include "hir/hir_attrs.hpp"   // HirSourceMap
 
 namespace dss {
 
 class DiagnosticReporter;
 
-// HIR structural verifier (HR2–HR3; the full invariant set lands at HR6 per plan
+// HIR structural verifier (HR2–HR5; the full invariant set lands at HR6 per plan
 // §2.8). A verifier is constructed over a frozen `Hir` and run against a
 // `DiagnosticReporter`; each structural rule is a private method `verify()` calls
 // in turn. HR2 shipped the type rule (now `checkRequiredTypes`); HR3 added `checkNodeArity` and
@@ -21,13 +22,25 @@ class DiagnosticReporter;
 // recoverable diagnostics (`reporter.report`), NOT aborts: an untyped expression
 // is a diagnosable lowering/analysis outcome, not a compiler-internal invariant
 // breach (those still abort at the substrate/builder layer).
+//
+// Source spans (HR5): an OPTIONAL `HirSourceMap` may be supplied. When a violating
+// node has an entry, its diagnostic carries the real (buffer, span); otherwise the
+// diagnostic carries an honest "no location" (`InvalidBuffer` + empty span) and
+// the node id travels in the message text. The verifier is fully usable without a
+// map (e.g. a unit test that builds HIR directly) — the map only enriches where a
+// diagnostic points.
 class DSS_EXPORT HirVerifier {
 public:
-    explicit HirVerifier(Hir const& hir) noexcept : hir_(hir) {}
+    explicit HirVerifier(Hir const& hir, HirSourceMap const* sourceMap = nullptr) noexcept
+        : hir_(hir), sourceMap_(sourceMap) {}
 
     // The verifier stores a reference and must not outlive the module it
-    // inspects — forbid binding to a temporary `Hir` outright.
-    HirVerifier(Hir&&) = delete;
+    // inspects — forbid binding to a temporary `Hir` outright. Both arities are
+    // deleted: the 2-arg form is needed because the defaulted `sourceMap`
+    // parameter would otherwise let `HirVerifier{std::move(h), &map}` bind the
+    // rvalue to `Hir const&` and dangle.
+    HirVerifier(Hir&&)                      = delete;
+    HirVerifier(Hir&&, HirSourceMap const*) = delete;
 
     // Run every rule, reporting each violation into `reporter`. Returns true
     // iff THIS run emitted no Error-severity diagnostic (computed by delta on the
@@ -59,7 +72,8 @@ private:
     // violation emits `H_VerifierFailure`.
     void checkDeclarationShape(DiagnosticReporter& reporter) const;
 
-    Hir const& hir_;
+    Hir const&          hir_;
+    HirSourceMap const* sourceMap_;   // optional; nullptr = no source provenance
 };
 
 } // namespace dss
