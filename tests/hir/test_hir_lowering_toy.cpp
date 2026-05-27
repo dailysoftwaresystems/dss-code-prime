@@ -210,7 +210,10 @@ namespace {
 [[nodiscard]] std::string readFile(fs::path const& p) {
     std::ifstream in{p, std::ios::binary};
     if (!in) { ADD_FAILURE() << "cannot open " << p.string(); std::abort(); }
-    std::ostringstream buf; buf << in.rdbuf(); return std::move(buf).str();
+    std::ostringstream buf; buf << in.rdbuf();
+    std::string s = std::move(buf).str();
+    std::erase(s, '\r');   // CRLF→LF: golden compare is line-ending agnostic (Windows autocrlf)
+    return s;
 }
 
 } // namespace

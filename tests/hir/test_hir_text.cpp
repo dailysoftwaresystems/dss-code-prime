@@ -212,6 +212,23 @@ TEST(HirText, RoundTripLiteralValues) {
     EXPECT_EQ(std::get<std::string>(res->literalPool.at(4).value), "hi");
 }
 
+TEST(HirText, MalformedLiteralValuesFailLoud) {
+    // Each malformed inline literal value must fail loud (res->ok == false),
+    // never silently default. Pins the bool/overflow/unknown-tag guards.
+    auto parseFails = [](std::string_view body) {
+        std::string const text =
+            std::string("dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+                        "  function %1 : fn() -> void {\n    block {\n      expr ")
+            + std::string(body) + "\n      return\n    }\n  }\n}\n";
+        DiagnosticReporter r;
+        auto res = parseHir(text, CompilationUnitId{1}, r);
+        return res->ok;
+    };
+    EXPECT_FALSE(parseFails("lit bool maybe : i1"))            << "non-true/false bool must fail";
+    EXPECT_FALSE(parseFails("lit uint 99999999999999999999999 : u64")) << "overflow must fail";
+    EXPECT_FALSE(parseFails("lit wat 1 : i32"))                << "unknown value tag must fail";
+}
+
 TEST(HirText, RoundTripSeqExpr) {
     // A SeqExpr (statements then a yielded value) round-trips through the
     // `seq : type { … yield <expr> }` form. Models a value-yielding desugar.
@@ -485,7 +502,14 @@ namespace {
 [[nodiscard]] std::string readFile(fs::path const& p) {
     std::ifstream in{p, std::ios::binary};
     if (!in) { ADD_FAILURE() << "cannot open " << p.string(); std::abort(); }
-    std::ostringstream buf; buf << in.rdbuf(); return std::move(buf).str();
+    std::ostringstream buf; buf << in.rdbuf();
+    std::string s = std::move(buf).str();
+    // Normalize CRLF→LF: `emitHir` always writes LF, and `.dsshir` carries no
+    // legitimate `\r`. A Windows checkout with core.autocrlf=true can rewrite the
+    // LF-in-repo golden to CRLF on disk despite the `.gitattributes eol=lf`, so
+    // the byte-compare must be line-ending agnostic to stay green on every runner.
+    std::erase(s, '\r');
+    return s;
 }
 
 } // namespace
@@ -507,6 +531,7 @@ TEST(HirText, GoldenCorpus) {
         ctx.interner = &res->interner; ctx.symbolNames = &res->symbolNames;
         ctx.sourceMap = &res->sourceMap; ctx.ffiMap = &res->ffiMap; ctx.shaderMap = &res->shaderMap;
         ctx.transpileMap = &res->transpileMap; ctx.diagnosticMap = &res->diagnosticMap;
+        ctx.literalPool = &res->literalPool;   // thread like the side-tables (empty for #index corpus)
         DiagnosticReporter r2;
         std::string const out = emitHir(res->hir, ctx, r2);
 
@@ -532,6 +557,7 @@ TEST(HirText, GoldenCorpus) {
         ctx2.interner = &res2->interner; ctx2.symbolNames = &res2->symbolNames;
         ctx2.sourceMap = &res2->sourceMap; ctx2.ffiMap = &res2->ffiMap; ctx2.shaderMap = &res2->shaderMap;
         ctx2.transpileMap = &res2->transpileMap; ctx2.diagnosticMap = &res2->diagnosticMap;
+        ctx2.literalPool = &res2->literalPool;
         DiagnosticReporter r4;
         EXPECT_EQ(out, emitHir(res2->hir, ctx2, r4));
     }

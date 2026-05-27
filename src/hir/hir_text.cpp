@@ -715,10 +715,17 @@ private:
                 std::uint32_t const idx = hir_.payload(id);
                 // Inline the VALUE when a pool is supplied (faithful round-trip);
                 // else the bare index form (value-less, for pool-less modules).
-                if (ctx_.literalPool && idx < ctx_.literalPool->size())
+                if (ctx_.literalPool && idx < ctx_.literalPool->size()) {
                     appendLiteralValue(ctx_.literalPool->at(idx));
-                else
+                } else {
+                    // A pool IS supplied but the index is past it ⇒ a lowering
+                    // bug (a Literal pointing past its pool). Warn instead of
+                    // silently dropping the value into the index fallback.
+                    if (ctx_.literalPool)
+                        report(std::format("literal #{} is out of range of the pool (size {})",
+                                           idx, ctx_.literalPool->size()));
                     out_ += std::format("#{}", idx);
+                }
                 out_ += " : "; appendType(hir_.typeId(id)); return;
             }
             case HirKind::Ref:
@@ -785,7 +792,10 @@ private:
             out_ += std::format("uint {}", *u); return;
         }
         if (auto const* d = std::get_if<double>(&v.value)) {
-            out_ += std::format("float {}", *d); return;
+            // std::format renders non-finite doubles as `inf`/`-inf`/`nan`, which
+            // takeFloat() accepts back — so they round-trip too (e.g. synthetic
+            // HIR from constant folding).
+            out_ += "float "; out_ += std::format("{}", *d); return;
         }
         if (auto const* s = std::get_if<std::string>(&v.value)) {
             out_ += "str "; out_ += quote(*s); return;
@@ -865,6 +875,7 @@ struct Tok {
     std::string text;          // ident/str content (unescaped) or int/float digits
     std::uint64_t num = 0;     // for Int
     double        dnum = 0;    // for Float
+    bool          overflow = false;  // Int: digits exceeded uint64 (→ malformed)
     std::uint32_t off = 0;     // byte offset (diagnostics)
 };
 
@@ -943,7 +954,13 @@ private:
     void lexInt() {
         std::size_t const start = p_;
         std::uint64_t v = 0;
-        while (p_ < s_.size() && isDigit(s_[p_])) { v = v * 10 + static_cast<std::uint64_t>(s_[p_] - '0'); ++p_; }
+        bool overflow = false;
+        while (p_ < s_.size() && isDigit(s_[p_])) {
+            std::uint64_t const d = static_cast<std::uint64_t>(s_[p_] - '0');
+            if (v > (std::numeric_limits<std::uint64_t>::max() - d) / 10) overflow = true;
+            v = v * 10 + d;
+            ++p_;
+        }
         // Float: a fractional part (`.` + digit) and/or an exponent (`e`/`E`)
         // following the integer digits promote this to a Float token. (A bare
         // trailing `.` is NOT consumed — that's the `..` range or a stray dot.)
@@ -965,10 +982,13 @@ private:
         cur_.text.assign(s_.substr(start, p_ - start));
         if (isFloat) {
             cur_.kind = Tk::Float;
-            cur_.dnum = std::strtod(cur_.text.c_str(), nullptr);
+            char* end = nullptr;
+            cur_.dnum = std::strtod(cur_.text.c_str(), &end);  // exact for to_chars output
+            (void)end;
         } else {
             cur_.kind = Tk::Int;
             cur_.num  = v;
+            cur_.overflow = overflow;   // surfaced by takeInt → H_TextMalformed
         }
     }
     void lexStr() {
@@ -1059,14 +1079,24 @@ private:
         malformed("expected string literal"); return {};
     }
     [[nodiscard]] std::uint64_t takeInt() {
-        if (peekIs(Tk::Int)) return lex_.take().num;
+        if (peekIs(Tk::Int)) {
+            Tok t = lex_.take();
+            if (t.overflow) malformed(std::format("integer literal '{}' exceeds 64 bits", t.text));
+            return t.num;
+        }
         malformed("expected integer"); return 0;
     }
-    // A float value accepts both Float (`3.14`) and Int (`42` — a whole-valued
-    // double that std::format rendered without a decimal point).
+    // A float value accepts Float (`3.14`), Int (`42` — a whole-valued double
+    // std::format rendered without a point), and the `inf`/`nan` idents
+    // std::format emits for non-finite doubles (so synthetic HIR round-trips).
     [[nodiscard]] double takeFloat() {
         if (peekIs(Tk::Float)) return lex_.take().dnum;
         if (peekIs(Tk::Int))   return static_cast<double>(lex_.take().num);
+        if (peekIs(Tk::Ident)) {
+            std::string const& t = lex_.peek().text;
+            if (t == "inf") { lex_.take(); return std::numeric_limits<double>::infinity(); }
+            if (t == "nan") { lex_.take(); return std::numeric_limits<double>::quiet_NaN(); }
+        }
         malformed("expected float"); return 0.0;
     }
     // Parse a tagged inline literal value (the `lit <tag> <value>` form).
@@ -1074,10 +1104,19 @@ private:
         HirLiteralValue v;
         std::string const tag = takeIdent();
         if (tag == "none") { /* monostate */ }
-        else if (tag == "bool") { v.value = (takeIdent() == "true"); }
-        else if (tag == "int")  { bool n = accept(Tk::Minus);
-                                  std::int64_t i = static_cast<std::int64_t>(takeInt());
-                                  v.value = n ? -i : i; }
+        else if (tag == "bool") {
+            std::string const b = takeIdent();
+            if (b == "true")       v.value = true;
+            else if (b == "false") v.value = false;
+            else malformed(std::format("expected 'true' or 'false', got '{}'", b));
+        }
+        else if (tag == "int")  {
+            bool n = accept(Tk::Minus);
+            std::uint64_t u = takeInt();
+            // Negate in the unsigned domain (forming -INT64_MIN as a signed op
+            // is UB); the two's-complement cast back is well-defined in C++20.
+            v.value = n ? static_cast<std::int64_t>(0u - u) : static_cast<std::int64_t>(u);
+        }
         else if (tag == "uint") { v.value = takeInt(); }
         else if (tag == "float"){ bool n = accept(Tk::Minus); double d = takeFloat();
                                   v.value = n ? -d : d; }
