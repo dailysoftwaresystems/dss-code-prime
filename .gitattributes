@@ -8,3 +8,13 @@
 # LF prevents `core.autocrlf` from injecting CR bytes the shipped schemas
 # need to declare explicitly as `Whitespace` lexemes (see e.g. c-subset.lang.json).
 tests/corpus/** text eol=lf
+
+# `.dsshir` HIR text-format goldens — emitted with LF by `emitHir` and compared
+# byte-exact by the HIR text + lowering golden tests (test_hir_text.cpp,
+# test_hir_lowering_*.cpp). Without this a Windows `core.autocrlf` checkout
+# rewrites them to CRLF and the byte-compare diverges on `\r` (CI: windows-msvc).
+*.dsshir text eol=lf
+
+# LSP replay session goldens — line-compared by test_lsp_replay.cpp. The reader
+# already strips trailing CR, but pin LF so the goldens are platform-stable.
+tests/lsp/sessions/** text eol=lf
