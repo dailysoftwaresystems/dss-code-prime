@@ -463,8 +463,10 @@ struct Lowerer {
             TypeId const result = typeAtOr(node, inferred);
             return {track(builder.makeIndex(base.id, idx, result), node), result};
         }
-        unsupported(node, std::format("postfix target '{}' has no lowering", e.target));
-        return {errorNode(node), InvalidType};
+        if (e.target == "PostInc" || e.target == "PostDec")
+            return exprError(node, "value-yielding ++/-- (e.g. `y = x++`) needs sequencing HIR "
+                                   "can't express yet; only statement-position ++/-- is lowered");
+        return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
     }
 
     // The argument expressions inside an argList subtree (skip Comma tokens).
@@ -513,25 +515,7 @@ struct Lowerer {
         // Peel the `expression` wrapper so a top-level assignment is recognized
         // (C's assignment is an expression; HIR's AssignStmt is a statement, so
         // an assignment in statement position lowers to AssignStmt, not ExprStmt).
-        NodeId core = peelToCore(exprNode);
-        if (tree().kind(core) == NodeKind::Internal
-            && tree().rule(core).v == cfg.binaryExprRule.v) {
-            NodeId opTok{};
-            for (NodeId c : visible(core)) if (isToken(c)) { opTok = c; break; }
-            if (opTok.valid()) {
-                auto it = binOp_.find(tree().tokenKind(opTok).v);
-                if (it != binOp_.end() && cfg.binaryOps[it->second].target == "Assign"
-                    && cfg.binaryOps[it->second].compoundBase.empty()) {
-                    return lowerAssign(core);
-                }
-                if (it != binOp_.end() && !cfg.binaryOps[it->second].compoundBase.empty()) {
-                    unsupported(core, "compound assignment (e.g. `+=`) is deferred to HR9 "
-                                      "(needs once-only lvalue evaluation)");
-                    return errorNode(core);
-                }
-            }
-        }
-        return track(builder.makeExprStmt(lowerExpr(core).id), exprNode);
+        return lowerStmtExprCore(peelToCore(exprNode), /*wrapBare=*/true);
     }
 
     HirNodeId lowerAssign(NodeId binNode) {
@@ -544,6 +528,109 @@ struct Lowerer {
             return reportedError(binNode, "malformed assignment expression");
         E lhs = lowerExpr(lhsN), rhs = lowerExpr(rhsN);
         return track(builder.makeAssignStmt(lhs.id, rhs.id), binNode);
+    }
+
+    // A simple, side-effect-free lvalue (a plain variable reference): its CST
+    // peels to an `operand` whose content is an Identifier. Such an lvalue can be
+    // READ MORE THAN ONCE with no observable effect, which is what lets
+    // compound-assignment and ++/-- lower by duplicating it. Returns (symbol,
+    // type); nullopt for a complex lvalue (index / deref / call — those would
+    // need once-only evaluation HIR can't express, and c-subset can't form them).
+    [[nodiscard]] std::optional<std::pair<SymbolId, TypeId>> simpleLvalue(NodeId exprCst) {
+        NodeId core = peelToCore(exprCst);
+        if (tree().kind(core) != NodeKind::Internal || tree().rule(core).v != cfg.operandRule.v)
+            return std::nullopt;
+        for (NodeId c : visible(core)) {
+            if (isToken(c) && sem.identifierToken.valid()
+                && tree().tokenKind(c).v == sem.identifierToken.v)
+                return std::pair{model.symbolAt(c), typeAtOr(core, InvalidType)};
+        }
+        return std::nullopt;
+    }
+    // A synthetic `1` literal of `type` (for ++/--). Synthetic ⇒ no source span.
+    [[nodiscard]] HirNodeId synthOne(TypeId type) {
+        TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
+        HirLiteralValue v;
+        v.core = core;
+        if (isFloatCore(core))       v.value = 1.0;
+        else if (isSignedCore(core)) v.value = std::int64_t{1};
+        else                         v.value = std::uint64_t{1};
+        return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+    }
+
+    // `lhs OP= rhs` → `lhs = lhs OP rhs` (statement). Safe only for a simple
+    // lvalue (duplicating the read has no effect); complex lvalues fail loud.
+    HirNodeId lowerCompoundAssign(NodeId binNode, std::string const& baseOpName) {
+        NodeId lhsN{}, rhsN{};
+        for (NodeId c : visible(binNode)) {
+            if (isToken(c)) continue;
+            if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
+        }
+        auto lv = lhsN.valid() ? simpleLvalue(lhsN) : std::nullopt;
+        auto op = coreOpFromName(baseOpName);
+        if (!lv || !rhsN.valid() || !op || arityOf(*op) != HirOpArity::Binary)
+            return reportedError(binNode, "compound assignment is only lowered for a simple "
+                                          "variable lvalue (complex lvalues need once-only "
+                                          "evaluation HIR can't express yet)");
+        auto const [sym, type] = *lv;
+        HirNodeId target = track(builder.makeRef(type, sym.v), lhsN);
+        HirNodeId reread = track(builder.makeRef(type, sym.v), lhsN);
+        HirNodeId rhs = lowerExpr(rhsN).id;
+        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{reread, rhs},
+                                                  type, encodeOp(*op)), binNode);
+        return track(builder.makeAssignStmt(target, value), binNode);
+    }
+
+    // `x++` / `x--` in STATEMENT position → `x = x +/- 1` (the produced value is
+    // discarded). Value-yielding ++/-- (e.g. `y = x++`) needs sequencing HIR
+    // lacks and is handled (failed loud) in lowerPostfix.
+    HirNodeId lowerIncDecStmt(NodeId postfixNode, bool isInc) {
+        NodeId baseN{};
+        for (NodeId c : visible(postfixNode)) { if (!isToken(c)) { baseN = c; break; } }
+        auto lv = baseN.valid() ? simpleLvalue(baseN) : std::nullopt;
+        if (!lv)
+            return reportedError(postfixNode, "++/-- is only lowered for a simple variable lvalue");
+        auto const [sym, type] = *lv;
+        HirNodeId target = track(builder.makeRef(type, sym.v), baseN);
+        HirNodeId reread = track(builder.makeRef(type, sym.v), baseN);
+        HirNodeId one = synthOne(type);
+        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{reread, one}, type,
+                                                  encodeOp(isInc ? HirOpKind::Add : HirOpKind::Sub)),
+                                postfixNode);
+        return track(builder.makeAssignStmt(target, value), postfixNode);
+    }
+
+    // The statement-position dispatch shared by exprStmt and for-init/update:
+    // assignment / compound-assignment / inc-dec become statements; anything else
+    // is the bare lowered expression (wrapped in ExprStmt when `wrapBare`).
+    HirNodeId lowerStmtExprCore(NodeId core, bool wrapBare) {
+        if (tree().kind(core) == NodeKind::Internal) {
+            std::uint32_t const rv = tree().rule(core).v;
+            if (rv == cfg.binaryExprRule.v) {
+                for (NodeId c : visible(core)) {
+                    if (!isToken(c)) continue;
+                    auto it = binOp_.find(tree().tokenKind(c).v);
+                    if (it != binOp_.end() && cfg.binaryOps[it->second].target == "Assign") {
+                        std::string const& base = cfg.binaryOps[it->second].compoundBase;
+                        return base.empty() ? lowerAssign(core) : lowerCompoundAssign(core, base);
+                    }
+                    break;  // first token is the operator
+                }
+            } else if (rv == cfg.postfixExprRule.v) {
+                for (NodeId c : visible(core)) {
+                    if (!isToken(c)) continue;
+                    auto it = postOp_.find(tree().tokenKind(c).v);
+                    if (it != postOp_.end()) {
+                        std::string const& t = cfg.postfixOps[it->second].target;
+                        if (t == "PostInc") return lowerIncDecStmt(core, /*isInc=*/true);
+                        if (t == "PostDec") return lowerIncDecStmt(core, /*isInc=*/false);
+                    }
+                    break;
+                }
+            }
+        }
+        HirNodeId e = lowerExpr(core).id;
+        return wrapBare ? track(builder.makeExprStmt(e), core) : e;
     }
 
     HirNodeId lowerExprStmt(NodeId node) {
@@ -632,17 +719,7 @@ struct Lowerer {
         NodeId core = peelToCore(c);
         HirRuleMapping const* m = mappingFor(core);
         if (m != nullptr && m->hirKind == "VarDecl") return lowerVarDecl(core);
-        if (tree().kind(core) == NodeKind::Internal && tree().rule(core).v == cfg.binaryExprRule.v) {
-            for (NodeId k : visible(core)) {
-                if (!isToken(k)) continue;
-                auto it = binOp_.find(tree().tokenKind(k).v);
-                if (it != binOp_.end() && cfg.binaryOps[it->second].target == "Assign"
-                    && cfg.binaryOps[it->second].compoundBase.empty())
-                    return lowerAssign(core);
-                break;
-            }
-        }
-        return lowerExpr(core).id;
+        return lowerStmtExprCore(core, /*wrapBare=*/false);
     }
 
     HirNodeId lowerSwitch(NodeId node) {
@@ -758,6 +835,32 @@ struct Lowerer {
         return track(builder.makeGlobal(type, sym.v, init), node);
     }
 
+    // extern function / global (no body). The FnSig/var type comes from the
+    // symbol the semantic phase minted (FFI linkage metadata is plan 11).
+    HirNodeId lowerExternDecl(NodeId node) {
+        auto it = declMap_.find(tree().rule(node).v);
+        if (it == declMap_.end()) return reportedError(node, "extern decl has no semantics rule");
+        DeclarationRule const& decl = sem.declarations[it->second];
+        auto vis = visible(node);
+        SymbolId sym{};
+        TypeId type = InvalidType;
+        if (decl.nameChild && *decl.nameChild < vis.size()) {
+            sym = model.symbolAt(vis[*decl.nameChild]);
+            if (auto const* rec = model.recordFor(sym)) type = rec->type;
+        }
+        if (decl.kindByChild) {
+            NodeId disc = descend(node, decl.kindByChild->childPath);
+            if (disc.valid() && tree().kind(disc) == NodeKind::Internal
+                && tree().rule(disc).v == decl.kindByChild->whenRule.v) {
+                std::vector<HirNodeId> params;
+                NodeId paramsNode = descend(disc, decl.kindByChild->paramsPath);
+                if (paramsNode.valid()) collectParams(paramsNode, params);
+                return track(builder.makeExternFunction(type, sym.v, params), node);
+            }
+        }
+        return track(builder.makeExternGlobal(type, sym.v), node);
+    }
+
     HirNodeId lowerFunction(NodeId node, SymbolId sym, TypeId sig,
                             KindDiscriminator const& disc, NodeId discNode) {
         std::vector<HirNodeId> params;
@@ -812,8 +915,9 @@ struct Lowerer {
                                               : std::string{"<token>"}));
             return errorNode(core);
         }
-        if (m->hirKind == "Decl")     return lowerTopLevel(core);
-        if (m->hirKind == "TypeDecl") return lowerTypeDecl(core);
+        if (m->hirKind == "Decl")       return lowerTopLevel(core);
+        if (m->hirKind == "TypeDecl")   return lowerTypeDecl(core);
+        if (m->hirKind == "ExternDecl") return lowerExternDecl(core);
         // A bare statement-level decl appearing at top level (unusual): route it.
         return lowerStmt(core);
     }

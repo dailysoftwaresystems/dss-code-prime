@@ -178,6 +178,23 @@ TEST(HirLoweringCSubset, CallAndTypedef) {
     EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Call);
 }
 
+TEST(HirLoweringCSubset, ExternFunctionAndGlobal) {
+    SemanticModel model = analyzeCSubset(
+        "extern int puts(int c);\n"
+        "extern int errcode;\n"
+        "int f() { return puts(0); }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 3u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::ExternFunction);   // puts
+    EXPECT_EQ(res->hir.externFunctionParams(decls[0]).size(), 1u);  // c
+    EXPECT_EQ(res->hir.kind(decls[1]), HirKind::ExternGlobal);     // errcode
+    EXPECT_EQ(res->hir.kind(decls[2]), HirKind::Function);         // f
+}
+
 TEST(HirLoweringCSubset, GlobalVariable) {
     SemanticModel model = analyzeCSubset("int counter;\nint f() { return 0; }\n");
     ASSERT_FALSE(model.hasErrors());
@@ -189,9 +206,44 @@ TEST(HirLoweringCSubset, GlobalVariable) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Global);
 }
 
-TEST(HirLoweringCSubset, CompoundAssignIsDeferred) {
-    // `+=` needs once-only lvalue evaluation HIR can't express → fail loud.
+TEST(HirLoweringCSubset, CompoundAssignLowers) {
+    // `x += 1` → `x = x + 1`: a simple variable lvalue is read twice safely.
     SemanticModel model = analyzeCSubset("void f(int x) { x += 1; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId stmt = res->hir.children(body)[0];
+    ASSERT_EQ(res->hir.kind(stmt), HirKind::AssignStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.assignValue(stmt)), HirKind::BinaryOp);  // x + 1
+}
+
+TEST(HirLoweringCSubset, IncrementInStatementPositionLowers) {
+    // `x++;` (value discarded) → `x = x + 1`.
+    SemanticModel model = analyzeCSubset("void f(int x) { x++; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    EXPECT_EQ(res->hir.kind(res->hir.children(body)[0]), HirKind::AssignStmt);
+}
+
+TEST(HirLoweringCSubset, ForUpdateIncrement) {
+    SemanticModel model = analyzeCSubset("void f() { for (int i = 0; i < 3; i++) {} }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId forS = res->hir.children(res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]))[0];
+    ASSERT_EQ(res->hir.kind(forS), HirKind::ForStmt);
+    EXPECT_TRUE(res->hir.forUpdate(forS).has_value());
+}
+
+TEST(HirLoweringCSubset, ValueYieldingIncrementIsDeferred) {
+    // `y = x++` needs sequencing (yield old value then mutate) HIR lacks.
+    SemanticModel model = analyzeCSubset("int f(int x) { return x++; }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);

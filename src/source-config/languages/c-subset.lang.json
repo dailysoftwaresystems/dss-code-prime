@@ -217,14 +217,18 @@
       ]
     },
 
+    "externFuncTail": {
+      "sequence": [
+        "ParenOpen",
+        { "optional": "paramList" },
+        "ParenClose",
+        "EndStatement"
+      ]
+    },
+
     "externTail": {
       "alt": [
-        { "sequence": [
-            "ParenOpen",
-            { "optional": "paramList" },
-            "ParenClose",
-            "EndStatement"
-        ] },
+        "externFuncTail",
         "varDeclTail"
       ]
     },
@@ -419,7 +423,14 @@
           "paramsPath": [0],
           "bodyPath":   [1]
         } },
-      { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" }
+      { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" },
+      { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
+        "kindByChild": {
+          "childPath": [3, 0],
+          "whenRule": "externFuncTail",
+          "whenKind": "function",
+          "paramsPath": [1]
+        } }
     ],
     "references": [
       { "rule": "operand" }
@@ -464,6 +475,7 @@
       { "rule": "varDeclHead",  "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
+      { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },
       { "rule": "whileStmt",    "hirKind": "WhileStmt"   },
@@ -521,8 +533,10 @@
     ],
 
     "postfixOps": [
-      { "token": "ParenOpen",   "target": "Call"  },
-      { "token": "BracketOpen", "target": "Index" }
+      { "token": "ParenOpen",    "target": "Call"    },
+      { "token": "BracketOpen",  "target": "Index"   },
+      { "token": "PlusPlusOp",   "target": "PostInc" },
+      { "token": "MinusMinusOp", "target": "PostDec" }
     ],
 
     "forClauseSeparator": "EndStatement",

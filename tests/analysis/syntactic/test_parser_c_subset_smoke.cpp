@@ -437,15 +437,16 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
         "      tok:\"int\"\n"
         "  tok:\"printf\"\n"
         "  rule:externTail\n"
-        "    tok:\"(\"\n"
-        "    rule:paramList\n"
-        "      rule:param\n"
-        "        rule:typeRef\n"
-        "          rule:typeBase\n"
-        "            tok:\"char\"\n"
-        "        tok:\"x\"\n"
-        "    tok:\")\"\n"
-        "    tok:\";\"\n";
+        "    rule:externFuncTail\n"
+        "      tok:\"(\"\n"
+        "      rule:paramList\n"
+        "        rule:param\n"
+        "          rule:typeRef\n"
+        "            rule:typeBase\n"
+        "              tok:\"char\"\n"
+        "          tok:\"x\"\n"
+        "      tok:\")\"\n"
+        "      tok:\";\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, ext), kExpected);
 }
 
