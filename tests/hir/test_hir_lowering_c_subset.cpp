@@ -310,6 +310,23 @@ TEST(HirLoweringCSubset, IntegerOverflowReported) {
     EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
 }
 
+TEST(HirLoweringCSubset, IncludeDirectiveIsSkippedNotFailed) {
+    // An `#include` directive contributes NO HIR node (its declarations arrive
+    // via the CU import resolver's cross-refs). Lowering must SKIP it cleanly,
+    // not emit H_UnsupportedLoweringForKind. The include target is unresolved
+    // here (single in-memory buffer), but the directive node still parses and
+    // reaches the top-level lowering loop — which is exactly what we pin.
+    SemanticModel model = analyzeCSubset("#include \"x.h\"\nint f() { return 0; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u)
+        << "the #include directive must be skipped, not fail loud";
+    // Exactly one decl: the function. The directive added nothing.
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
+}
+
 TEST(HirLoweringCSubset, CharLiteralLowersToCharValue) {
     // `'a'` — coalesced body token, decoded to a Char codepoint.
     SemanticModel model = analyzeCSubset("char f() { return 'a'; }");

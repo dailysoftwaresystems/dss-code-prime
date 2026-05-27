@@ -984,13 +984,18 @@ struct Lowerer {
         NodeId core = peelToCore(node);
         HirRuleMapping const* m = mappingFor(core);
         if (m == nullptr) {
-            unsupported(core, std::format("top-level construct '{}' is not lowered in HR8 "
-                                          "(externs / includes deferred)",
+            unsupported(core, std::format("top-level construct '{}' is not lowered "
+                                          "(no hirLowering mapping)",
                                           tree().kind(core) == NodeKind::Internal
                                               ? std::string{tree().rules().name(tree().rule(core))}
                                               : std::string{"<token>"}));
             return errorNode(core);
         }
+        // "Skip": a top-level construct that contributes NO HIR node (e.g. an
+        // `#include` directive — its declarations arrive via the CU import
+        // resolver's cross-refs, not as HIR nodes from the directive itself).
+        // Config-driven (no hardcoded rule name); lowerModule drops invalid ids.
+        if (m->hirKind == "Skip")       return HirNodeId{};
         if (m->hirKind == "Decl")       return lowerTopLevel(core);
         if (m->hirKind == "Function")   return lowerFunctionDecl(core);
         if (m->hirKind == "TypeDecl")   return lowerTypeDecl(core);
@@ -1010,7 +1015,8 @@ struct Lowerer {
             if (!t.root().valid()) continue;
             for (NodeId top : visible(t.root())) {
                 if (isToken(top)) continue;
-                decls.push_back(lowerDecl(top));
+                HirNodeId const d = lowerDecl(top);
+                if (d.valid()) decls.push_back(d);   // skip "Skip"-mapped nodes (e.g. #include)
             }
         }
         // The module spans trees; tag its span to the first tree.

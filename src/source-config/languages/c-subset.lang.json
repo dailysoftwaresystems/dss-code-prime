@@ -476,6 +476,7 @@
 
   "hirLowering": {
     "ruleMappings": [
+      { "rule": "includeDirective", "hirKind": "Skip"    },
       { "rule": "topLevelDecl", "hirKind": "Decl"        },
       { "rule": "varDeclHead",  "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
