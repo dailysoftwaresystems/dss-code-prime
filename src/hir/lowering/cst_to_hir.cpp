@@ -27,6 +27,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -88,6 +89,13 @@ namespace {
     return k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64 || k == TypeKind::F128;
 }
 
+// HR11: one Lowerer is a single-LANGUAGE lowering context bound to one schema's
+// `cfg`/`sem`/`numberStyle` + its schema-specific rule/token index maps. A
+// multi-language CU runs one Lowerer per distinct schema, all sharing the one
+// `builder` / `literals` / `spans` (and thus one HIR module + arena + kind
+// registry + literal pool + source map), so the whole CU lowers to ONE module.
+// A homogeneous CU is the one-Lowerer case. The single-language body below never
+// changed for HR11 — only the shared output moved out of the struct.
 struct Lowerer {
     SemanticModel&           model;
     HirLoweringConfig const& cfg;
@@ -95,12 +103,12 @@ struct Lowerer {
     NumberStyle const*       numberStyle;
     TypeInterner&            interner;
     DiagnosticReporter&      reporter;
-    HirBuilder               builder;
-    HirLiteralPool           literals;
+    HirBuilder&              builder;    // shared across all per-schema Lowerers
+    HirLiteralPool&          literals;   // shared
     Tree const*              t_ = nullptr;
 
-    // pendingSpans: applied to the result's HirSourceMap after finish().
-    std::vector<std::pair<HirNodeId, HirSourceLoc>> spans;
+    // pendingSpans (shared): applied to the result's HirSourceMap after finish().
+    std::vector<std::pair<HirNodeId, HirSourceLoc>>& spans;
 
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
@@ -114,9 +122,10 @@ struct Lowerer {
     struct E { HirNodeId id; TypeId type; };
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
-            NumberStyle const* ns, DiagnosticReporter& r)
+            NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
+            HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
-          reporter(r), builder(std::string{m.unit().schema().name()}) {
+          reporter(r), builder(b), literals(lits), spans(sp) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -1482,20 +1491,17 @@ struct Lowerer {
     }
 
     // ── driver ─────────────────────────────────────────────────────────────────
-    HirNodeId lowerModule() {
-        std::vector<HirNodeId> decls;
-        for (Tree const& t : model.unit().trees()) {
-            t_ = &t;
-            if (!t.root().valid()) continue;
-            for (NodeId top : visible(t.root())) {
-                if (isToken(top)) continue;
-                HirNodeId const d = lowerDecl(top);
-                if (d.valid()) decls.push_back(d);   // skip "Skip"-mapped nodes (e.g. #include)
-            }
+    // Lower one tree's top-level declarations, appending to the shared module
+    // decls (in tree order). The caller selects the Lowerer whose schema matches
+    // this tree (HR11), so `lowerDecl` always reads this tree's own language config.
+    void lowerTree(Tree const& t, std::vector<HirNodeId>& decls) {
+        t_ = &t;
+        if (!t.root().valid()) return;
+        for (NodeId top : visible(t.root())) {
+            if (isToken(top)) continue;
+            HirNodeId const d = lowerDecl(top);
+            if (d.valid()) decls.push_back(d);   // skip "Skip"-mapped nodes (e.g. #include)
         }
-        // The module spans trees; tag its span to the first tree.
-        if (!model.unit().trees().empty()) t_ = &model.unit().trees().front();
-        return builder.makeModule(decls);
     }
 };
 
@@ -1504,14 +1510,39 @@ struct Lowerer {
 std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticReporter& reporter) {
     std::size_t const errBefore = reporter.errorCount();
 
-    GrammarSchema const& schema = model.unit().schema();
-    Lowerer L{model, schema.hirLowering(), schema.semantics(), schema.numberStyle(), reporter};
+    // The shared output every per-schema Lowerer writes into: one builder (→ one
+    // module, arena, kind registry, literal pool) + one literal pool + one span
+    // list. The module is labelled with the CU's composite source language.
+    auto const trees = model.unit().trees();
+    HirBuilder builder{model.unit().compositeSourceLanguage()};
+    HirLiteralPool literals;
+    std::vector<std::pair<HirNodeId, HirSourceLoc>> spans;
 
-    HirNodeId const root = L.lowerModule();
-    Hir hir = std::move(L.builder).finish(root);
+    // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
+    // to its language's config + the shared output. `Tree::schema()` is the
+    // authoritative per-file language.
+    std::unordered_map<std::uint32_t, std::unique_ptr<Lowerer>> lowerers;
+    for (Tree const& t : trees) {
+        GrammarSchema const& sch = t.schema();
+        if (lowerers.contains(sch.schemaId().v)) continue;
+        lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
+            model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
+            reporter, builder, literals, spans));
+    }
 
-    auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(L.literals));
-    for (auto& [id, loc] : L.spans) result->sourceMap.set(id, loc);
+    // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
+    // one shared decls list (so module decls follow tree-add order).
+    std::vector<HirNodeId> decls;
+    for (Tree const& t : trees) {
+        lowerers.at(t.schema().schemaId().v)->lowerTree(t, decls);
+    }
+
+    HirNodeId const root = builder.makeModule(decls);
+    Hir hir = std::move(builder).finish(root);
+    lowerers.clear();   // drop the Lowerers (their builder ref is now moved-from)
+
+    auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals));
+    for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
 
     // verify-on-load.
     HirVerifier verifier{result->hir, &result->sourceMap, &model.lattice().interner()};

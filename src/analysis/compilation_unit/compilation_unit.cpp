@@ -7,11 +7,14 @@
 #include "tokenizer/tokenizer.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -77,6 +80,19 @@ std::span<Tree const>         CompilationUnit::trees()             const noexcep
 DiagnosticReporter const&     CompilationUnit::driverDiagnostics() const noexcept { return driverDiagnostics_; }
 std::span<CrossTreeRef const> CompilationUnit::crossRefs()         const noexcept { return crossRefs_; }
 
+std::string CompilationUnit::compositeSourceLanguage() const {
+    std::string out;
+    std::unordered_set<std::string> seen;
+    for (Tree const& t : trees_) {
+        std::string name{t.schema().name()};
+        if (seen.insert(name).second) {
+            if (!out.empty()) out += '+';
+            out += name;
+        }
+    }
+    return out.empty() ? std::string{schema().name()} : out;
+}
+
 GrammarSchema const& CompilationUnit::schema() const noexcept {
     // Mirrors Tree::schema (tree.cpp): a moved-from CU has a null schema_
     // (the shared_ptr was moved out). Dereferencing it is UB; abort loudly
@@ -103,6 +119,30 @@ UnitBuilder::UnitBuilder(std::shared_ptr<GrammarSchema const> schema)
     if (!schema_) {
         cuFatal("UnitBuilder: schema is null");
     }
+    schemas_.push_back(schema_);   // primary is also the sole registry entry
+}
+
+UnitBuilder::UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas)
+    : id_(CompilationUnit::nextId())
+    , driverDiagnostics_(DiagnosticReporter::Config{.dedupWindow = 0}) {
+    if (schemas.empty()) {
+        cuFatal("UnitBuilder: schema registry is empty");
+    }
+    for (auto const& s : schemas) {
+        if (!s) cuFatal("UnitBuilder: a registry schema is null");
+    }
+    schema_  = schemas.front();    // primary = first registered
+    schemas_ = std::move(schemas);
+}
+
+void UnitBuilder::registerSchema(std::shared_ptr<GrammarSchema const> schema) {
+    if (finished_) {
+        cuFatal("UnitBuilder::registerSchema called after finish()");
+    }
+    if (!schema) {
+        cuFatal("UnitBuilder::registerSchema: schema is null");
+    }
+    schemas_.push_back(std::move(schema));
 }
 
 UnitBuilder::~UnitBuilder() = default;
@@ -116,7 +156,19 @@ void UnitBuilder::addTree(Tree&& tree) {
     trees_.push_back(std::move(tree));
 }
 
-TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src) {
+TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
+                                std::shared_ptr<GrammarSchema const> schema) {
+    // Keep the registry the authoritative set of EVERY schema used in this CU
+    // (an explicit-schema addInMemory may name a schema never registered): so
+    // finish()'s per-schema import resolution covers this tree, and so a later
+    // addFile can route to it. Dedup by SchemaId (idempotent re-registration).
+    {
+        bool known = false;
+        for (auto const& s : schemas_) {
+            if (s->schemaId() == schema->schemaId()) { known = true; break; }
+        }
+        if (!known) schemas_.push_back(schema);
+    }
     // Empty translation unit is valid (consistent with "empty CU is valid"):
     // note it as Info but still parse + add the (empty) tree. Lives here so
     // both addFile and addInMemory get the check from one place; the buffer
@@ -127,14 +179,42 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src) {
                      std::string{src->name()});
     }
     // Canonical tokenize → parse → ingest sequence (mirrors the LSP parse
-    // path). The tokenizer's lexer diagnostics are handed to the Parser,
-    // which folds them into the produced Tree's reporter (§2.6 C2-L1), so
-    // the finished Tree owns lexer + parser diagnostics in one stream.
-    Tokenizer tk{src, schema_};
+    // path), UNDER the file's resolved schema (HR11/CU5 — multi-language CUs
+    // parse each file with its own language). The tokenizer's lexer
+    // diagnostics are handed to the Parser, which folds them into the produced
+    // Tree's reporter (§2.6 C2-L1), so the finished Tree owns lexer + parser
+    // diagnostics in one stream — and the Tree carries `schema` for the
+    // downstream per-tree semantic + lowering dispatch.
+    Tokenizer tk{src, schema};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema_, std::move(stream), {}, std::move(lexDiags)};
+    Parser p{src, std::move(schema), std::move(stream), {}, std::move(lexDiags)};
     addTree(std::move(p).parse().tree);
     return trees_.back().id();
+}
+
+namespace {
+// ASCII lower-case a copy (file extensions are ASCII; case-insensitive match).
+[[nodiscard]] std::string asciiLower(std::string_view in) {
+    std::string out{in};
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+} // namespace
+
+std::shared_ptr<GrammarSchema const>
+UnitBuilder::schemaForPath_(std::filesystem::path const& path) const {
+    // Match the path's extension (case-insensitively, including the leading dot)
+    // against each registered schema's declared `fileExtensions`; first
+    // registered match wins. Returns null on no match — `addFile` decides
+    // whether that is the single-schema fall-through or a multi-language error.
+    std::string const ext = asciiLower(path.extension().string());
+    if (ext.empty()) return nullptr;
+    for (auto const& s : schemas_) {
+        for (std::string_view declared : s->fileExtensions()) {
+            if (asciiLower(declared) == ext) return s;
+        }
+    }
+    return nullptr;
 }
 
 void UnitBuilder::addIncludeDir(std::filesystem::path dir) {
@@ -144,7 +224,8 @@ void UnitBuilder::addIncludeDir(std::filesystem::path dir) {
     includeDirs_.push_back(std::move(dir));
 }
 
-TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok) {
+TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,
+                               std::shared_ptr<GrammarSchema const> schema) {
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(path, ec);
     std::string const key = (ec ? path.lexically_normal() : canonical).string();
@@ -163,15 +244,23 @@ TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok) {
         return InvalidTree;  // caller (resolver) emits D_UnresolvedImport.
     }
     seenPaths_.insert(key);
-    TreeId const id = parseAndAdd_(std::move(src));
+    TreeId const id = parseAndAdd_(std::move(src), std::move(schema));
     pathToTreeIndex_[key] = trees_.size() - 1;
     ok = true;
     return id;
 }
 
 void UnitBuilder::addInMemory(std::string source, std::string label) {
+    addInMemory(std::move(source), std::move(label), schema_);
+}
+
+void UnitBuilder::addInMemory(std::string source, std::string label,
+                              std::shared_ptr<GrammarSchema const> schema) {
     if (finished_) {
         cuFatal("UnitBuilder::addInMemory called after finish()");
+    }
+    if (!schema) {
+        cuFatal("UnitBuilder::addInMemory: schema is null");
     }
     // Key the label into the SAME weakly-canonical path space addFile /
     // loadAndAdd_ use BEFORE parsing, so an #include that later resolves to a
@@ -189,7 +278,7 @@ void UnitBuilder::addInMemory(std::string source, std::string label) {
     std::string const key =
         (ec ? std::filesystem::path(label).lexically_normal() : canonical).string();
     seenPaths_.insert(key);  // also block a later addFile re-loading this path.
-    parseAndAdd_(SourceBuffer::fromString(std::move(source), std::move(label)));
+    parseAndAdd_(SourceBuffer::fromString(std::move(source), std::move(label)), std::move(schema));
     pathToTreeIndex_[key] = trees_.size() - 1;
 }
 
@@ -225,7 +314,22 @@ void UnitBuilder::addFile(std::filesystem::path path) {
                      DiagnosticSeverity::Error, InvalidBuffer, e.what());
         return;
     }
-    parseAndAdd_(std::move(src));
+    // Route to a source language by file extension (HR11/CU5). A single-schema
+    // builder routes to its one schema regardless of extension (CU1-CU4
+    // behavior — the registry has one entry and the caller chose the language).
+    // A multi-language builder with an UNMATCHED extension fails loud rather
+    // than silently parsing under the wrong grammar.
+    std::shared_ptr<GrammarSchema const> schema = schemaForPath_(path);
+    if (!schema) {
+        if (schemas_.size() == 1) {
+            schema = schema_;
+        } else {
+            reportDriver(driverDiagnostics_, DiagnosticCode::D_UnknownFileExtension,
+                         DiagnosticSeverity::Error, InvalidBuffer, path.string());
+            return;  // do not parse under an arbitrary grammar.
+        }
+    }
+    parseAndAdd_(std::move(src), std::move(schema));
     // Record the path→tree mapping so a later #include resolving to this same
     // file dedups against it instead of re-parsing.
     pathToTreeIndex_[key] = trees_.size() - 1;
@@ -236,20 +340,38 @@ CompilationUnit UnitBuilder::finish() && {
         cuFatal("UnitBuilder::finish() called twice");
     }
 
-    // Resolve imports BEFORE marking finished: the c-subset resolver may load
-    // additional included files (include-following) via the loadFile callback,
-    // which routes through addTree — and addTree aborts once finished_ is set.
+    // Resolve imports BEFORE marking finished: a resolver may load additional
+    // included files (include-following) via the loadFile callback, which routes
+    // through addTree — and addTree aborts once finished_ is set.
+    //
+    // HR11/CU5: run ONE resolver per DISTINCT registered schema (deduped below),
+    // each bound to its language (chooseResolver) and processing only the trees
+    // built from that schema. The edges all land in the one CU-global crossRefs;
+    // injection is language-blind downstream. A homogeneous CU has a one-entry
+    // registry, so this is a single resolver pass — identical to CU1-CU4. The
+    // loadFile callback carries the including tree's schema so an #include loads
+    // its target under the same language.
     std::vector<CrossTreeRef> crossRefs;
-    auto const resolver = chooseResolver(*schema_);
     ResolutionContext context{
         trees_,
-        *schema_,
         driverDiagnostics_,
         includeDirs_,
-        [this](std::filesystem::path const& path, bool& ok) { return loadAndAdd_(path, ok); },
+        [this](std::filesystem::path const& path, bool& ok,
+               std::shared_ptr<GrammarSchema const> schema) {
+            return loadAndAdd_(path, ok, std::move(schema));
+        },
         crossRefs,
     };
-    resolver->resolve(context);
+    // One resolver per DISTINCT schema (dedup by SchemaId — registerSchema does
+    // not dedup, and a duplicate would double-run a resolver over the same trees,
+    // double-appending cross-refs). `schemas_` now contains every schema any tree
+    // was parsed with (auto-registered in parseAndAdd_), so every tree gets its
+    // own language's import resolution.
+    std::unordered_set<std::uint32_t> resolvedSchemaIds;
+    for (auto const& schema : schemas_) {
+        if (!resolvedSchemaIds.insert(schema->schemaId().v).second) continue;
+        chooseResolver(schema)->resolve(context);
+    }
 
     finished_ = true;
     return CompilationUnit{

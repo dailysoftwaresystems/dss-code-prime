@@ -211,6 +211,11 @@ enum class DiagnosticCode : std::uint16_t {
     // the target, so the driver does not treat them as build-fatal here.
     D_UnresolvedImport            = 0xD004,
     D_UnresolvedReference         = 0xD005,
+    // HR11/CU5: in a MULTI-language CU, `addFile`'s path extension matched no
+    // registered source language's `fileExtensions` — fail loud rather than
+    // silently parse the file under the primary grammar. (A single-language CU
+    // always routes to its one schema, so this never fires there.)
+    D_UnknownFileExtension        = 0xD006,
 
     // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

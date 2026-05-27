@@ -64,20 +64,14 @@ namespace dss {
 
 namespace {
 
-// One transient per `analyze()` call. Consumed into the returned model.
-struct EngineState {
-    explicit EngineState(CompilationUnit const& cu)
-        : lattice{cu.id(), std::string{cu.schema().name()}},
-          nodeToSymbol{cu},
-          nodeToType{cu} {}
-
-    DiagnosticReporter         reporter;
-    TypeLattice                lattice;
-    ScopeTree                  scopes;
-    SymbolTable                symbols;
-    UnitAttribute<SymbolId>    nodeToSymbol;
-    UnitAttribute<TypeId>      nodeToType;
-    // Per-rule index caches.
+// HR11: the per-SCHEMA index caches + config pointers. A `RuleId`/`SchemaTokenId`
+// is only meaningful within its own schema, so these maps (keyed by such ids)
+// are built once PER distinct schema in the CU and selected per tree by
+// `EngineState::activate(tree.schema())`. A homogeneous CU has exactly one
+// bundle. No field here is CU-global; the CU-global state stays on EngineState.
+struct SchemaIndexes {
+    SemanticConfig const* cfg         = nullptr;  // the owning schema's semantics
+    NumberStyle const*    numberStyle = nullptr;  // its numeric-literal style (may be null)
     std::unordered_map<std::uint32_t, std::size_t> declByRule;
     std::unordered_map<std::uint32_t, std::size_t> refByRule;
     std::unordered_map<std::uint32_t, std::size_t> typeShapeByRule;
@@ -92,19 +86,51 @@ struct EngineState {
     std::unordered_map<std::uint32_t, std::size_t> returnByRule;   // GAP A
     std::unordered_map<std::uint32_t, bool>        loopByRule;      // GAP C loop contexts
     std::unordered_map<std::uint32_t, bool>        loopControlByRule; // GAP C break/continue
+    // Built-in type name → TypeId (interned once per schema, into the CU lattice).
+    std::unordered_map<std::string, TypeId>        builtinTypeIds;
+    // Literal token-kind → TypeId.
+    std::unordered_map<std::uint32_t, TypeId>      literalTypeIds;
+};
+
+// One transient per `analyze()` call. Consumed into the returned model.
+struct EngineState {
+    explicit EngineState(CompilationUnit const& cu)
+        : lattice{cu.id(), cu.compositeSourceLanguage()},
+          nodeToSymbol{cu},
+          nodeToType{cu} {}
+
+    DiagnosticReporter         reporter;
+    TypeLattice                lattice;
+    ScopeTree                  scopes;
+    SymbolTable                symbols;
+    UnitAttribute<SymbolId>    nodeToSymbol;
+    UnitAttribute<TypeId>      nodeToType;
+    // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
+    // bundle for the tree currently being processed (set via `activate`).
+    std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
+    SchemaIndexes const*                             active_ = nullptr;
     // GAP A: scope opened by a function's BODY → that function's result
     // type. A `return` statement walks its scope parent chain to find the
     // nearest enclosing function result type for assignability checking.
     std::unordered_map<std::uint32_t /*ScopeId.v*/, TypeId> fnResultByScope;
-    // Built-in type name → TypeId (interned once per CU).
-    std::unordered_map<std::string, TypeId>        builtinTypeIds;
-    // Literal token-kind → TypeId.
-    std::unordered_map<std::uint32_t, TypeId>      literalTypeIds;
     // SE7 reverse use-index: SymbolId.v → its use-site NodeIds.
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol;
-    // The schema's numeric-literal style (for constant array-length decode);
-    // null when the language declares no numeric literals.
-    NumberStyle const* numberStyle = nullptr;
+
+    // Select the index bundle for `schema` before processing one of its trees.
+    void activate(GrammarSchema const& schema) {
+        active_ = &schemaIndexes.at(schema.schemaId().v);
+    }
+    // The active per-schema bundle. Valid only during a per-tree pass (after
+    // `activate`); the passes never cross a tree boundary mid-walk. Asserts
+    // rather than silently null-deref if a caller reads it without activating.
+    [[nodiscard]] SchemaIndexes const& idx() const {
+        if (active_ == nullptr) {
+            std::fputs("dss::analyze fatal: idx() read before activate() — a "
+                       "per-schema index was used outside a per-tree pass\n", stderr);
+            std::abort();
+        }
+        return *active_;
+    }
 
     [[nodiscard]] TypeId typeAt(NodeId id) const {
         auto const* p = nodeToType.tryGet(id);
@@ -278,28 +304,32 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
     }
 }
 
-void buildIndexes(EngineState& s, SemanticConfig const& cfg) {
+// Fill `idx` from `cfg` (the owning schema's semantics). Interns the schema's
+// builtin types into the shared CU lattice (idempotent). Called once per
+// distinct schema in the CU (HR11).
+void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg) {
+    idx.cfg = &cfg;
     for (std::size_t i = 0; i < cfg.declarations.size(); ++i) {
-        s.declByRule[cfg.declarations[i].rule.v] = i;
+        idx.declByRule[cfg.declarations[i].rule.v] = i;
     }
     for (std::size_t i = 0; i < cfg.references.size(); ++i) {
-        s.refByRule[cfg.references[i].rule.v] = i;
+        idx.refByRule[cfg.references[i].rule.v] = i;
     }
     for (std::size_t i = 0; i < cfg.typeShapes.size(); ++i) {
-        s.typeShapeByRule[cfg.typeShapes[i].rule.v] = i;
+        idx.typeShapeByRule[cfg.typeShapes[i].rule.v] = i;
     }
-    for (auto const& sc : cfg.scopes) s.scopeByRule[sc.rule.v] = true;
+    for (auto const& sc : cfg.scopes) idx.scopeByRule[sc.rule.v] = true;
     for (std::size_t i = 0; i < cfg.assignments.size(); ++i) {
-        s.assignByRule[cfg.assignments[i].rule.v].push_back(i);
+        idx.assignByRule[cfg.assignments[i].rule.v].push_back(i);
     }
     for (std::size_t i = 0; i < cfg.callRules.size(); ++i) {
-        s.callByRule[cfg.callRules[i].rule.v] = i;
+        idx.callByRule[cfg.callRules[i].rule.v] = i;
     }
     for (std::size_t i = 0; i < cfg.returnRules.size(); ++i) {
-        s.returnByRule[cfg.returnRules[i].rule.v] = i;
+        idx.returnByRule[cfg.returnRules[i].rule.v] = i;
     }
-    for (auto const& lr : cfg.loopRules)    s.loopByRule[lr.rule.v] = true;
-    for (auto const& lc : cfg.loopControls) s.loopControlByRule[lc.rule.v] = true;
+    for (auto const& lr : cfg.loopRules)    idx.loopByRule[lr.rule.v] = true;
+    for (auto const& lc : cfg.loopControls) idx.loopControlByRule[lc.rule.v] = true;
     for (auto const& bt : cfg.builtinTypes) {
         if (bt.extension.has_value()) {
             // The mapping names a registered type-extension (e.g. T-SQL's
@@ -323,14 +353,14 @@ void buildIndexes(EngineState& s, SemanticConfig const& cfg) {
                            "violated)\n", stderr);
                 std::abort();
             }
-            s.builtinTypeIds[bt.name] =
+            idx.builtinTypeIds[bt.name] =
                 s.lattice.interner().extension(*kindId, *bt.extension, {});
             continue;
         }
-        s.builtinTypeIds[bt.name] = s.lattice.interner().primitive(bt.core);
+        idx.builtinTypeIds[bt.name] = s.lattice.interner().primitive(bt.core);
     }
     for (auto const& lt : cfg.literalTypes) {
-        s.literalTypeIds[lt.literal.v] = s.lattice.interner().primitive(lt.core);
+        idx.literalTypeIds[lt.literal.v] = s.lattice.interner().primitive(lt.core);
     }
 }
 
@@ -348,8 +378,8 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const k = tree.kind(node);
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
-        auto it = s.typeShapeByRule.find(rule.v);
-        if (it != s.typeShapeByRule.end()) {
+        auto it = s.idx().typeShapeByRule.find(rule.v);
+        if (it != s.idx().typeShapeByRule.end()) {
             auto const& shape = cfg.typeShapes[it->second];
             auto kids = visibleChildren(tree, node);
             if (shape.operandChild < 0
@@ -416,8 +446,8 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     }
     if (k == NodeKind::Token) {
         std::string const text{tree.text(node)};
-        auto it = s.builtinTypeIds.find(text);
-        if (it != s.builtinTypeIds.end()) return it->second;
+        auto it = s.idx().builtinTypeIds.find(text);
+        if (it != s.idx().builtinTypeIds.end()) return it->second;
         // SE5: a non-builtin name in type position may be a type alias.
         // Resolve it through the scope chain; a Type-kind symbol with a
         // valid type contributes the aliased type.
@@ -452,10 +482,10 @@ constIntLength(EngineState& s, Tree const& tree, NodeId node) {
     NodeId cur = node;
     for (int guard = 0; guard < 64 && cur.valid(); ++guard) {
         if (tree.kind(cur) == NodeKind::Token) {
-            auto it = s.literalTypeIds.find(tree.tokenKind(cur).v);
-            if (it == s.literalTypeIds.end()) return std::nullopt;
+            auto it = s.idx().literalTypeIds.find(tree.tokenKind(cur).v);
+            if (it == s.idx().literalTypeIds.end()) return std::nullopt;
             if (!isIntegerKind(s.lattice.interner().kind(it->second))) return std::nullopt;
-            return decodeInteger(tree.text(cur), s.numberStyle);
+            return decodeInteger(tree.text(cur), s.idx().numberStyle);
         }
         // Count meaningful children: exactly one internal child ⇒ a wrapper
         // (expression → operand, operand → `( expr )`) to descend through;
@@ -466,7 +496,7 @@ constIntLength(EngineState& s, Tree const& tree, NodeId node) {
         int literalCount = 0;
         for (NodeId c : visibleChildren(tree, cur)) {
             if (tree.kind(c) == NodeKind::Internal) { ++internalCount; onlyInternal = c; }
-            else if (s.literalTypeIds.count(tree.tokenKind(c).v) != 0) {
+            else if (s.idx().literalTypeIds.count(tree.tokenKind(c).v) != 0) {
                 ++literalCount; onlyLiteral = c;
             }
         }
@@ -543,12 +573,12 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
 
-        if (s.scopeByRule.contains(rule.v)) {
+        if (s.idx().scopeByRule.contains(rule.v)) {
             here = s.scopes.pushScope(current, node, tree.id());
         }
 
-        auto declIt = s.declByRule.find(rule.v);
-        if (declIt != s.declByRule.end()) {
+        auto declIt = s.idx().declByRule.find(rule.v);
+        if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = visibleChildren(tree, node);
 
@@ -671,7 +701,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
 
     ScopeId here = current;
     if (tree.kind(node) == NodeKind::Internal
-        && s.scopeByRule.contains(tree.rule(node).v)) {
+        && s.idx().scopeByRule.contains(tree.rule(node).v)) {
         here = childScopeFor(s, tree, node, current);
     }
 
@@ -681,8 +711,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
 
     if (tree.kind(node) == NodeKind::Internal) {
         auto const rule = tree.rule(node);
-        auto declIt = s.declByRule.find(rule.v);
-        if (declIt != s.declByRule.end()) {
+        auto declIt = s.idx().declByRule.find(rule.v);
+        if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = visibleChildren(tree, node);
             if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
@@ -792,7 +822,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const k = tree.kind(node);
     ScopeId here = current;
 
-    if (k == NodeKind::Internal && s.scopeByRule.contains(tree.rule(node).v)) {
+    if (k == NodeKind::Internal && s.idx().scopeByRule.contains(tree.rule(node).v)) {
         here = childScopeFor(s, tree, node, current);
     }
 
@@ -800,7 +830,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // children walk. Detected on the node itself; the increment applies to
     // descendants (a break/continue is valid anywhere inside the subtree).
     int const childLoopDepth =
-        (k == NodeKind::Internal && s.loopByRule.contains(tree.rule(node).v))
+        (k == NodeKind::Internal && s.idx().loopByRule.contains(tree.rule(node).v))
             ? loopDepth + 1
             : loopDepth;
 
@@ -811,8 +841,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // Literal typing.
     if (k == NodeKind::Token) {
         auto tk = tree.tokenKind(node);
-        auto litIt = s.literalTypeIds.find(tk.v);
-        if (litIt != s.literalTypeIds.end()) {
+        auto litIt = s.idx().literalTypeIds.find(tk.v);
+        if (litIt != s.idx().literalTypeIds.end()) {
             s.nodeToType.set(node, litIt->second);
         }
     }
@@ -821,14 +851,14 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // slot (declaration and reference shapes can structurally overlap).
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
-        auto refIt = s.refByRule.find(rule.v);
-        if (refIt != s.refByRule.end()) {
+        auto refIt = s.idx().refByRule.find(rule.v);
+        if (refIt != s.idx().refByRule.end()) {
             bool isDeclSite = false;
             NodeId parent = tree.parent(node);
             if (parent.valid() && tree.kind(parent) == NodeKind::Internal) {
                 auto parentRule = tree.rule(parent);
-                auto parentDeclIt = s.declByRule.find(parentRule.v);
-                if (parentDeclIt != s.declByRule.end()) {
+                auto parentDeclIt = s.idx().declByRule.find(parentRule.v);
+                if (parentDeclIt != s.idx().declByRule.end()) {
                     auto const& parentDecl = cfg.declarations[parentDeclIt->second];
                     auto kids = visibleChildren(tree, parent);
                     if (parentDecl.nameChild.has_value()
@@ -909,8 +939,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // ALSO: type-check assignment when an explicit type IS present.
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
-        auto declIt = s.declByRule.find(rule.v);
-        if (declIt != s.declByRule.end()) {
+        auto declIt = s.idx().declByRule.find(rule.v);
+        if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = visibleChildren(tree, node);
             if (decl.initChild.has_value() && *decl.initChild < kids.size()
@@ -948,8 +978,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // SE4: const-violation check on assignment rules.
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
-        auto assignIt = s.assignByRule.find(rule.v);
-        if (assignIt != s.assignByRule.end()) {
+        auto assignIt = s.idx().assignByRule.find(rule.v);
+        if (assignIt != s.idx().assignByRule.end()) {
             auto kids = visibleChildren(tree, node);
             // Several assignment entries may share this rule (operator-table
             // `binaryExpr` reused for `=` and every compound-assign op). Each
@@ -1000,8 +1030,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // SE6: call checking.
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
-        auto callIt = s.callByRule.find(rule.v);
-        if (callIt != s.callByRule.end()) {
+        auto callIt = s.idx().callByRule.find(rule.v);
+        if (callIt != s.idx().callByRule.end()) {
             checkCall(s, cfg, tree, node, here, cfg.callRules[callIt->second]);
         }
     }
@@ -1014,8 +1044,8 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // mismatch. An unknown/Invalid enclosing result is skipped (cascade
     // suppression).
     if (k == NodeKind::Internal) {
-        auto retIt = s.returnByRule.find(tree.rule(node).v);
-        if (retIt != s.returnByRule.end()) {
+        auto retIt = s.idx().returnByRule.find(tree.rule(node).v);
+        if (retIt != s.idx().returnByRule.end()) {
             checkReturn(s, cfg, tree, node, here, cfg.returnRules[retIt->second]);
         }
     }
@@ -1023,7 +1053,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // GAP C: break/continue outside any loop. A `loopControls` node at
     // depth 0 is outside every loop-context subtree.
     if (k == NodeKind::Internal && loopDepth == 0
-        && s.loopControlByRule.contains(tree.rule(node).v)) {
+        && s.idx().loopControlByRule.contains(tree.rule(node).v)) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::S_ControlOutsideLoop;
         d.severity = DiagnosticSeverity::Error;
@@ -1043,8 +1073,8 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
                        std::vector<TypeId>& out) {
     if (!cur.valid() || isEmptySpace(tree.flags(cur))) return;
     if (tree.kind(cur) == NodeKind::Internal) {
-        auto declIt = s.declByRule.find(tree.rule(cur).v);
-        if (declIt != s.declByRule.end()) {
+        auto declIt = s.idx().declByRule.find(tree.rule(cur).v);
+        if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = visibleChildren(tree, cur);
             if (decl.typeChild.has_value() && *decl.typeChild < kids.size()) {
@@ -1122,7 +1152,7 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             NodeId probe = calleeNode;
             while (probe.valid()
                    && tree.kind(probe) == NodeKind::Internal) {
-                if (s.refByRule.contains(tree.rule(probe).v)) {
+                if (s.idx().refByRule.contains(tree.rule(probe).v)) {
                     return;  // ref-rule path already emitted (or will)
                 }
                 auto kids2 = visibleChildren(tree, probe);
@@ -1301,53 +1331,72 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
         std::abort();
     }
     EngineState s{*cu};
-    auto const& cfg = cu->schema().semantics();
-    s.numberStyle = cu->schema().numberStyle();  // for constant array-length decode
 
-    // Register the schema's type extensions into the lattice's registry
-    // (tsql's TSQL::Varchar etc.) BEFORE buildIndexes, so a builtinType
-    // mapping that names an extension can resolve its kindId.
-    registerSchemaTypeExtensions(s.lattice.registry(), cu->schema());
-
-    buildIndexes(s, cfg);
-
-    // SE6: a CU-wide builtins scope (child of the CU root, parent of every
-    // tree root) holds config-declared builtin functions. Visible
-    // everywhere; user declarations in a tree root shadow it.
-    ScopeId const cuRoot = s.scopes.root();
-    ScopeId const builtinScope = s.scopes.pushScope(cuRoot, InvalidNode, InvalidTree);
-    for (auto const& bf : cfg.builtinFunctions) {
-        std::vector<TypeId> paramTypes;
-        paramTypes.reserve(bf.paramCores.size());
-        for (auto pc : bf.paramCores) {
-            paramTypes.push_back(s.lattice.interner().primitive(pc));
-        }
-        TypeId const fnTy = s.lattice.interner().fnSig(
-            paramTypes, s.lattice.interner().primitive(bf.resultCore),
-            CallConv::CcSysV);
-        SymbolRecord rec;
-        rec.name            = bf.name;
-        rec.scope           = builtinScope;
-        rec.tree            = InvalidTree;
-        rec.kind            = DeclarationKind::Function;
-        rec.type            = fnTy;
-        rec.variadicBuiltin = bf.variadic;
-        SymbolId const id = s.symbols.mint(rec);
-        s.scopes.injectBinding(builtinScope, bf.name, id);
+    // HR11: build one index bundle per DISTINCT schema in the CU (keyed by
+    // SchemaId), each with its type extensions registered into the shared CU
+    // lattice FIRST (so a builtinType naming an extension resolves its kindId).
+    // A homogeneous CU has exactly one bundle. `tree.schema()` is the
+    // authoritative per-file language; the CU-level `schema()` is unused here.
+    std::vector<GrammarSchema const*> distinctSchemas;
+    for (Tree const& tree : cu->trees()) {
+        GrammarSchema const& sch = tree.schema();
+        if (s.schemaIndexes.contains(sch.schemaId().v)) continue;
+        registerSchemaTypeExtensions(s.lattice.registry(), sch);
+        SchemaIndexes& idx = s.schemaIndexes[sch.schemaId().v];
+        idx.numberStyle = sch.numberStyle();           // for constant array-length decode
+        buildIndexes(s, idx, sch.semantics());
+        distinctSchemas.push_back(&sch);
     }
 
-    // Each tree gets its OWN root scope (a child of the builtins scope) so
-    // two unrelated files' top-level decls live in separate namespaces but
-    // both still see the builtins.
+    // SE6 + HR11: a PER-LANGUAGE builtins scope (child of the CU root) holds that
+    // schema's config-declared builtin functions, and a tree's root scope parents
+    // to ITS language's builtin scope. So builtins are visible within their own
+    // language (and shadowable by user decls) but DON'T leak across languages — a
+    // c-subset file must not resolve tsql's COALESCE; a genuine cross-language
+    // call is the FFI plan's job, not a silent builtin hit. Homogeneous CU: one
+    // builtin scope, identical to CU1-CU4.
+    ScopeId const cuRoot = s.scopes.root();
+    std::unordered_map<std::uint32_t /*SchemaId.v*/, ScopeId> builtinScopeBySchema;
+    for (GrammarSchema const* sch : distinctSchemas) {
+        ScopeId const builtinScope = s.scopes.pushScope(cuRoot, InvalidNode, InvalidTree);
+        builtinScopeBySchema[sch->schemaId().v] = builtinScope;
+        for (auto const& bf : sch->semantics().builtinFunctions) {
+            std::vector<TypeId> paramTypes;
+            paramTypes.reserve(bf.paramCores.size());
+            for (auto pc : bf.paramCores) {
+                paramTypes.push_back(s.lattice.interner().primitive(pc));
+            }
+            TypeId const fnTy = s.lattice.interner().fnSig(
+                paramTypes, s.lattice.interner().primitive(bf.resultCore),
+                CallConv::CcSysV);
+            SymbolRecord rec;
+            rec.name            = bf.name;
+            rec.scope           = builtinScope;
+            rec.tree            = InvalidTree;
+            rec.kind            = DeclarationKind::Function;
+            rec.type            = fnTy;
+            rec.variadicBuiltin = bf.variadic;
+            SymbolId const id = s.symbols.mint(rec);
+            s.scopes.injectBinding(builtinScope, bf.name, id);
+        }
+    }
+
+    // Each tree gets its OWN root scope (a child of ITS language's builtins
+    // scope) so two unrelated files' top-level decls live in separate namespaces
+    // but each still sees its own language's builtins.
     auto const trees = cu->trees();
     std::unordered_map<std::uint32_t /*TreeId.v*/, ScopeId> treeRootScope;
 
-    // Pass 1 per tree, declaring into THAT tree's root scope.
+    // Pass 1 per tree, declaring into THAT tree's root scope. `activate` selects
+    // the tree's own schema bundle (HR11) so its rule-id index lookups + cfg are
+    // its own language's — a tree never sees another schema's config.
     for (auto const& tree : trees) {
         if (!tree.root().valid()) continue;
+        s.activate(tree.schema());
+        ScopeId const builtinScope = builtinScopeBySchema.at(tree.schema().schemaId().v);
         ScopeId const treeRoot = s.scopes.pushScope(builtinScope, tree.root(), tree.id());
         treeRootScope[tree.id().v] = treeRoot;
-        pass1(s, cfg, tree, tree.root(), treeRoot);
+        pass1(s, *s.idx().cfg, tree, tree.root(), treeRoot);
     }
 
     // Cross-tree symbol visibility — runs AFTER every tree's Pass 1 so
@@ -1368,14 +1417,16 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
     // Pass 1.5 per tree: resolve declaration types + function signatures.
     for (auto const& tree : trees) {
         if (!tree.root().valid()) continue;
-        resolveDeclTypes(s, cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
+        s.activate(tree.schema());
+        resolveDeclTypes(s, *s.idx().cfg, tree, tree.root(), treeRootScope.at(tree.id().v));
     }
 
     // Pass 2 per tree, against that tree's root scope. Loop-context depth
     // starts at 0 (GAP C).
     for (auto const& tree : trees) {
         if (!tree.root().valid()) continue;
-        pass2(s, cfg, tree, tree.root(), treeRootScope.at(tree.id().v), 0);
+        s.activate(tree.schema());
+        pass2(s, *s.idx().cfg, tree, tree.root(), treeRootScope.at(tree.id().v), 0);
     }
 
     // D8: unused-variable warnings. After Pass 2 has fully populated the

@@ -18,3 +18,4 @@ dss_add_test(NAME hir/test_hir_lowering_c_subset SOURCES test_hir_lowering_c_sub
 dss_add_test(NAME hir/test_hir_lowering_toy   SOURCES test_hir_lowering_toy.cpp)
 dss_add_test(NAME hir/test_hir_lowering_generic   SOURCES test_hir_lowering_generic.cpp)
 dss_add_test(NAME hir/test_hir_lowering_tsql  SOURCES test_hir_lowering_tsql.cpp)
+dss_add_test(NAME hir/test_hir_lowering_multi_lang SOURCES test_hir_lowering_multi_lang.cpp)
