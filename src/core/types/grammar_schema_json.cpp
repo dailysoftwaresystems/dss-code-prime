@@ -2021,6 +2021,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "a ternary group requires a 'middle' separator lexeme");
                     continue;
                 }
+                // A group is either grouped-postfix (endsAt) OR ternary (middle),
+                // never both — the two payloads are mutually exclusive by arity
+                // (grouped is postfix-only, middle is ternary-only, each rejected
+                // on the wrong arity above), so a single group can't reach here
+                // carrying both. Assert to catch a future producer that bypasses
+                // those arity gates.
+                if (endsAtId.valid() && middleId.valid()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "a group cannot be both grouped-postfix ('endsAt') and "
+                              "ternary ('middle')");
+                    continue;
+                }
                 OperatorTable::Entry entry{precedence, assoc, std::nullopt, std::nullopt};
                 if (endsAtId.valid()) {
                     entry.grouped = OperatorTable::GroupedPostfix{

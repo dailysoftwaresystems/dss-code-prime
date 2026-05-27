@@ -18,10 +18,13 @@
 //
 // The variant covers the c-subset literal surface (bool / signed / unsigned /
 // floating / string). A char literal is stored as its decoded codepoint in the
-// `uint64_t` arm with `core = Char`; a string literal's decoded bytes (escapes
-// resolved, NOT NUL-terminated — the NUL is implied by the Array<Char,N+1>
-// type) live in the `std::string` arm with `core = Char` and an Array type on
-// the node. 128-bit integers remain additive when a language needs them.
+// `uint64_t` arm; a string literal's decoded bytes (escapes resolved, NOT
+// NUL-terminated — the NUL is implied by the Array<Char,N+1> type) live in the
+// `std::string` arm. Both carry `core = Char`, so disambiguate char vs string
+// by the VARIANT ARM (`uint64_t` vs `std::string`) — NOT by `core` (which is
+// redundant pool-level metadata mirroring the node's `typeId`; the node's type,
+// Char vs Array<Char,N+1>, is the real authority). 128-bit integers remain
+// additive when a language needs them.
 
 namespace dss {
 

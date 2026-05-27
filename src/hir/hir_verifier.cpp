@@ -133,6 +133,19 @@ void HirVerifier::checkNodeArity(DiagnosticReporter& reporter) const {
             continue;
         }
 
+        // SeqExpr: the result (last child) must be a value-yielding expression —
+        // it supplies the SeqExpr's type. A statement in result position is
+        // malformed (the arity check below separately enforces ≥1 child).
+        if (kind == HirKind::SeqExpr && count >= 1) {
+            HirNodeId const result = hir_.children(id).back();
+            if (!requiresValidType(hir_.kind(result))) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("SeqExpr #{} result child (last) is not a "
+                                     "value-yielding expression", id.v),
+                         sourceMap_);
+            }
+        }
+
         ChildArity const a = childArity(kind);
         bool const ok = count >= a.min && (a.max == kUnboundedArity || count <= a.max);
         if (!ok) {

@@ -455,6 +455,41 @@ TEST(HirLoweringCSubset, EmptyCharLiteralFailsLoud) {
     EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
 }
 
+TEST(HirLoweringCSubset, MultiCharCharLiteralFailsLoud) {
+    // `'ab'` — a multi-character char body must fail loud, not silently take one
+    // byte. (Symmetric to the empty case; the one a user hits by accident.)
+    SemanticModel model = analyzeCSubset("char f() { return 'ab'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
+}
+
+TEST(HirLoweringCSubset, LoweredSeqExprRoundTrips) {
+    // A REAL lowering-produced SeqExpr (from `x++` in value position) must
+    // survive the .dsshir emit→parse→verify round-trip — the seam where the
+    // synthetic-temp `%sN` handle fallback meets the text writer.
+    SemanticModel model = analyzeCSubset("int f(int x) { return x++; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    std::vector<std::string> names = symbolNames(model);
+    HirTextContext ctx;
+    ctx.interner    = &model.lattice().interner();
+    ctx.symbolNames = &names;
+    DiagnosticReporter er;
+    std::string const out = emitHir(res->hir, ctx, er);
+    EXPECT_NE(out.find("seq "), std::string::npos) << "expected a seq expr in:\n" << out;
+
+    DiagnosticReporter pr;
+    auto parsed = parseHir(out, CompilationUnitId{1}, pr);
+    std::string diags;
+    for (auto const& d : pr.all()) diags += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
+    EXPECT_TRUE(parsed->ok) << "lowered SeqExpr did not round-trip/verify\n" << diags;
+}
+
 TEST(HirLoweringCSubset, StringLiteralLowersToCharArray) {
     // `"hello"` — coalesced body, decoded bytes in the pool, typed Array<Char,6>
     // (5 chars + implied NUL).

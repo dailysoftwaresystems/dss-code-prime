@@ -745,6 +745,23 @@ TEST(Tokenizer, UnterminatedBlockCommentEmitsDiagnostic) {
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedComment);
 }
 
+TEST(Tokenizer, UnterminatedCoalescedStringEmitsDiagnostic) {
+    // A `"`-opened string with no closing quote. The coalesce-body path scans
+    // the body to EOF, emits ONE StringLiteral token, leaves the mode open, and
+    // the post-loop handler reports P_UnterminatedString. (New coalesce-path
+    // EOF branch — must not be silently swallowed.)
+    auto h      = loadCSubset("\"abc");
+    auto result = lex(h);
+    bool sawUnterminated = false;
+    for (auto const& d : result.diags)
+        if (d.code == DiagnosticCode::P_UnterminatedString) { sawUnterminated = true; break; }
+    EXPECT_TRUE(sawUnterminated) << "unterminated coalesced string must report P_UnterminatedString";
+    // Body is one coalesced token, not per-byte: [StringStart, StringLiteral].
+    EXPECT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("StringStart"));
+    EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("StringLiteral"));
+}
+
 TEST(Tokenizer, TsqlSingleStringDoubledDelimiterEscape) {
     // SQL string with a doubled single-quote — `'a''b'` represents the
     // literal `a'b`. Token breakdown:

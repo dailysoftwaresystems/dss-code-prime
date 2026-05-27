@@ -397,24 +397,20 @@ struct Lowerer {
         // form (hoisting the store out would be wrong inside a loop condition).
         // Covers compound assignment too (`(x += 1)` reads, applies the op, writes).
         if (e.target == "Assign") {
-            NodeId lhsN2{}, rhsN2{};
-            for (NodeId c : visible(node)) {
-                if (isToken(c)) continue;
-                if (!lhsN2.valid()) lhsN2 = c; else if (!rhsN2.valid()) rhsN2 = c;
-            }
-            auto lv = lhsN2.valid() ? classifyLvalue(lhsN2) : std::nullopt;
-            if (!lv || !rhsN2.valid())
+            // lhsN / rhsN were already extracted by the scan above.
+            auto lv = lhsN.valid() ? classifyLvalue(lhsN) : std::nullopt;
+            if (!lv || !rhsN.valid())
                 return exprError(node, "assignment sub-expression needs an lvalue and a value");
             HirNodeId stored;
             if (e.compoundBase.empty()) {
-                stored = lowerExpr(rhsN2).id;                       // plain `=`
+                stored = lowerExpr(rhsN).id;                        // plain `=`
             } else {
                 auto op = coreOpFromName(e.compoundBase);           // `OP=`
                 if (!op || arityOf(*op) != HirOpArity::Binary)
                     return exprError(node, std::format("compound base op '{}' is not binary",
                                                        e.compoundBase));
                 stored = builder.addParent(HirKind::BinaryOp,
-                                           std::array{lvRead(*lv), lowerExpr(rhsN2).id},
+                                           std::array{lvRead(*lv), lowerExpr(rhsN).id},
                                            lv->type, encodeOp(*op));
             }
             std::vector<HirNodeId> stmts = lv->prep;

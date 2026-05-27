@@ -195,6 +195,49 @@ TEST(ParserCSubsetSmoke, TernaryIsRightAssociative) {
     EXPECT_GT(second - (innerIndent + 1), 4u) << "inner ternaryExpr should be indented (nested)";
 }
 
+TEST(ParserCSubsetSmoke, TernaryBindsLooserThanAssignmentRhs) {
+    // `x = a ? b : c` → `x = (a ? b : c)`: ternary (prec 16) binds tighter than
+    // the assignment RHS (prec 15), so the `=`'s RHS is the whole ternary.
+    auto h = loadAndTokenize("int main() { x = a ? b : c; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    const NodeId assign = findFirstNodeWithRule(t, "binaryExpr");
+    ASSERT_NE(assign, NodeId{});
+    const std::string printed = prettyPrintSubtree(t, assign);
+    // The binaryExpr (`=`) must contain a nested ternaryExpr (its RHS).
+    EXPECT_NE(printed.find("tok:\"=\""), std::string::npos);
+    EXPECT_NE(printed.find("ternaryExpr"), std::string::npos)
+        << "the `=` RHS must be the ternary:\n" << printed;
+}
+
+TEST(ParserCSubsetSmoke, TernaryAsCallArgument) {
+    // `f(a ? b : c)` — ternary nested as an operand (call arg) exercises the
+    // climb re-entry inside the argList body.
+    auto h = loadAndTokenize("int main() { f(a ? b : c); }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    EXPECT_FALSE(result.tree.diagnostics().hasErrors());
+    EXPECT_NE(findFirstNodeWithRule(result.tree, "ternaryExpr"), NodeId{});
+}
+
+TEST(ParserCSubsetSmoke, TernaryMissingColonRecovers) {
+    // `a ? b ;` — missing `:` separator. The walker emits P_MissingRequiredChild
+    // + an Error leaf (HasError on root), and recovers without hanging.
+    auto h = loadAndTokenize("int main() { a ? b ; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_TRUE(t.diagnostics().hasErrors());
+    bool sawMissing = false;
+    for (auto const& d : t.diagnostics().all())
+        if (d.code == DiagnosticCode::P_MissingRequiredChild) { sawMissing = true; break; }
+    EXPECT_TRUE(sawMissing) << "missing ':' must emit P_MissingRequiredChild";
+}
+
 TEST(ParserCSubsetSmoke, FunctionCallParsesAsPostfix) {
     auto h = loadAndTokenize("int main() { f(a, b); }");
     Parser p{h.src, h.schema, std::move(h.stream)};
