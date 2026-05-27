@@ -146,6 +146,55 @@ TEST(ParserCSubsetSmoke, FunctionBodyExpressionIsPrecedenceCorrect) {
     EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
 }
 
+TEST(ParserCSubsetSmoke, TernaryParsesAsMixfix) {
+    auto h = loadAndTokenize("int main() { a ? b : c; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    const std::string_view expected =
+        "rule:expression\n"
+        "  rule:ternaryExpr\n"
+        "    rule:operand\n"
+        "      tok:\"a\"\n"
+        "    tok:\"?\"\n"
+        "    rule:operand\n"
+        "      tok:\"b\"\n"
+        "    tok:\":\"\n"
+        "    rule:operand\n"
+        "      tok:\"c\"\n";
+    EXPECT_EQ(prettyPrintSubtree(t, expr), expected);
+}
+
+TEST(ParserCSubsetSmoke, TernaryIsRightAssociative) {
+    // `a ? b : c ? d : e` → a ? b : (c ? d : e): the else branch nests.
+    auto h = loadAndTokenize("int main() { a ? b : c ? d : e; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    const NodeId expr = findFirstNodeWithRule(t, "expression");
+    ASSERT_NE(expr, NodeId{});
+    // The OUTER ternary's else child (last visible) is itself a ternaryExpr.
+    const std::string printed = prettyPrintSubtree(t, expr);
+    // Two ternaryExpr levels, the inner nested under the outer's else.
+    const auto first = printed.find("ternaryExpr");
+    const auto second = printed.find("ternaryExpr", first + 1);
+    ASSERT_NE(first, std::string::npos);
+    ASSERT_NE(second, std::string::npos)
+        << "right-assoc must nest a second ternaryExpr in the else branch:\n" << printed;
+    // The inner ternary is more deeply indented (nested), confirming it's the else child.
+    const auto innerIndent = printed.rfind("\n", second) ;
+    EXPECT_GT(second - (innerIndent + 1), 4u) << "inner ternaryExpr should be indented (nested)";
+}
+
 TEST(ParserCSubsetSmoke, FunctionCallParsesAsPostfix) {
     auto h = loadAndTokenize("int main() { f(a, b); }");
     Parser p{h.src, h.schema, std::move(h.stream)};

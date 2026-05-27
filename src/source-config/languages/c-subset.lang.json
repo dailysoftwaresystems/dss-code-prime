@@ -75,6 +75,7 @@
     "*":  [{ "kind": "StarOp"   }],
     "/":  [{ "kind": "SlashOp"  }],
     "!":  [{ "kind": "BangOp"   }],
+    "?":  [{ "kind": "QuestionOp" }],
 
     "==": [{ "kind": "EqEqOp" }],
     "!=": [{ "kind": "NotEqOp" }],
@@ -110,6 +111,7 @@
   "operators": {
     "groups": [
       { "precedence": 15, "associativity": "right",                      "operators": ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] },
+      { "precedence": 16, "associativity": "right", "arity": "ternary",   "operators": ["?"], "middle": ":"                       },
       { "precedence": 20, "associativity": "left",                       "operators": ["||"]                                   },
       { "precedence": 25, "associativity": "left",                       "operators": ["&&"]                                   },
       { "precedence": 30, "associativity": "left",                       "operators": ["|"]                                    },
@@ -382,7 +384,8 @@
         "wrapperRules": {
           "binary":  "binaryExpr",
           "unary":   "unaryExpr",
-          "postfix": "postfixExpr"
+          "postfix": "postfixExpr",
+          "ternary": "ternaryExpr"
         }
       }
     },
@@ -498,6 +501,7 @@
     "binaryExprRule":  "binaryExpr",
     "unaryExprRule":   "unaryExpr",
     "postfixExprRule": "postfixExpr",
+    "ternaryExprRule": "ternaryExpr",
     "operandRule":     "operand",
 
     "binaryOps": [

@@ -376,6 +376,24 @@ TEST(HirLoweringCSubset, IncludeDirectiveIsSkippedNotFailed) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
 }
 
+TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
+    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else].
+    SemanticModel model = analyzeCSubset("int f(int x) { return x ? 1 : 2; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ret  = res->hir.children(body)[0];
+    HirNodeId tern = *res->hir.returnValue(ret);
+    ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
+    auto kids = res->hir.children(tern);
+    ASSERT_EQ(kids.size(), 3u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Ref);       // cond: x
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);   // then: 1
+    EXPECT_EQ(res->hir.kind(kids[2]), HirKind::Literal);   // else: 2
+}
+
 TEST(HirLoweringCSubset, PointerDerefAndAddressOfLower) {
     // `*p = x` (deref-assign through a pointer) and `p = &x` (address-of into a
     // pointer) lower with correct Ptr / pointee result types.

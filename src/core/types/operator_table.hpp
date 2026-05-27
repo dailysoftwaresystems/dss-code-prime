@@ -39,6 +39,8 @@ enum class OperatorArity : std::uint8_t {
     Infix,
     Prefix,
     Postfix,
+    Ternary,   // mixfix `cond ? then : else` — appears in infix position, gathers
+               // a middle clause (to the `:` separator) + a right operand
 };
 
 [[nodiscard]] constexpr std::string_view operatorArityName(OperatorArity a) noexcept {
@@ -46,6 +48,7 @@ enum class OperatorArity : std::uint8_t {
         case OperatorArity::Infix:   return "Infix";
         case OperatorArity::Prefix:  return "Prefix";
         case OperatorArity::Postfix: return "Postfix";
+        case OperatorArity::Ternary: return "Ternary";
     }
     std::unreachable();
 }
@@ -89,6 +92,9 @@ public:
         // `f(args)` or `a[i]`; the walker parses `bodyRule` (when
         // valid) until the `endsAt` closer.
         std::optional<GroupedPostfix>  grouped{};
+        // Ternary (mixfix) only: the separator token between the middle and
+        // right operands (C's `:`). Absent for non-ternary entries.
+        std::optional<SchemaTokenId>   ternaryMiddle{};
     };
 
     OperatorTable()                                = default;
@@ -145,7 +151,7 @@ static_assert(sizeof(OperatorAssoc) == 1,
               "OperatorAssoc must remain 1 byte to keep Entry compact");
 static_assert(sizeof(OperatorArity) == 1,
               "OperatorArity must remain 1 byte to keep the packed key narrow");
-static_assert(static_cast<std::uint8_t>(OperatorArity::Postfix) < 4,
+static_assert(static_cast<std::uint8_t>(OperatorArity::Ternary) < 4,
               "OperatorArity must fit in 2 bits for the key-packing scheme");
 static_assert(std::is_trivially_copyable_v<OperatorTable::Entry>,
               "OperatorTable::Entry must be trivially copyable");

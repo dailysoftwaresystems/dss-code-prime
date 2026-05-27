@@ -163,7 +163,8 @@ struct Lowerer {
         if (tree().kind(n) != NodeKind::Internal) return false;
         std::uint32_t const r = tree().rule(n).v;
         return r == cfg.binaryExprRule.v || r == cfg.unaryExprRule.v
-            || r == cfg.postfixExprRule.v || r == cfg.operandRule.v;
+            || r == cfg.postfixExprRule.v || r == cfg.operandRule.v
+            || (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v);
     }
     [[nodiscard]] TypeId boolType() { return interner.primitive(TypeKind::Bool); }
     [[nodiscard]] TypeId typeAtOr(NodeId n, TypeId fallback) const {
@@ -246,6 +247,8 @@ struct Lowerer {
             if (r == cfg.binaryExprRule.v)  return lowerBinary(node);
             if (r == cfg.unaryExprRule.v)   return lowerUnary(node);
             if (r == cfg.postfixExprRule.v) return lowerPostfix(node);
+            if (cfg.ternaryExprRule.valid() && r == cfg.ternaryExprRule.v)
+                return lowerTernary(node);
             // Unknown wrapper (e.g. an `expression` node): descend through a
             // single meaningful child.
             NodeId only = soleMeaningfulChild(node);
@@ -473,6 +476,25 @@ struct Lowerer {
         TypeId const result = (*op == HirOpKind::Not) ? boolType() : operand.type;
         return {track(builder.addParent(HirKind::UnaryOp, std::array{operand.id},
                                         result, encodeOp(*op)), node), result};
+    }
+
+    // `cond ? then : else` → a Ternary node. The wrapper holds
+    // [cond, `?`, then, `:`, else]; the three operands are the visible non-token
+    // children. Result type is the then-branch's (C requires then/else to be
+    // compatible; the semantic phase already checked, and prefers a node type
+    // when it set one).
+    E lowerTernary(NodeId node) {
+        std::vector<NodeId> operands;
+        for (NodeId c : visible(node)) if (!isToken(c)) operands.push_back(c);
+        if (operands.size() != 3) {
+            unsupported(node, "malformed ternary expression (expected cond, then, else)");
+            return {errorNode(node), InvalidType};
+        }
+        E cond = lowerExpr(operands[0]);
+        E thenE = lowerExpr(operands[1]);
+        E elseE = lowerExpr(operands[2]);
+        TypeId const result = typeAtOr(node, thenE.type.valid() ? thenE.type : elseE.type);
+        return {track(builder.makeTernary(cond.id, thenE.id, elseE.id, result), node), result};
     }
 
     E lowerPostfix(NodeId node) {

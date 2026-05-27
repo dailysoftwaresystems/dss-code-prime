@@ -79,6 +79,7 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId      binaryExprRule{};   std::string binaryExprRuleName;
     RuleId      unaryExprRule{};    std::string unaryExprRuleName;
     RuleId      postfixExprRule{};  std::string postfixExprRuleName;
+    RuleId      ternaryExprRule{};  std::string ternaryExprRuleName;  // optional (mixfix `?:`)
     RuleId      operandRule{};      std::string operandRuleName;
 
     // Operator-token dispatch for each Pratt wrapper.

@@ -83,14 +83,20 @@ struct DSS_EXPORT ExprWrapperRules {
     RuleId binary;
     RuleId unary;
     RuleId postfix;
+    // OPTIONAL fourth wrapper — the mixfix `ternary` rule (`cond ? then : else`).
+    // Invalid for languages without a ternary; when valid it must be distinct
+    // from the other three. Kept optional so the three required wrappers (the
+    // valid() contract) are unaffected by a language that has no ternary.
+    RuleId ternary;
 
-    // All three RuleIds are valid AND pairwise-distinct. The walker
+    // The three REQUIRED RuleIds are valid AND pairwise-distinct. The walker
     // tags frames by RuleId; a duplicate id would collide silently
     // (e.g. both `binary` and `unary` interned to the same name and
     // RuleId — Pratt frames meant for two different climb shapes
     // would land in one bucket). The loader rejects duplicates up
     // front (see `C_MissingWrapperRules` in grammar_schema_json.cpp);
-    // this predicate is the runtime safety net.
+    // this predicate is the runtime safety net. `ternary` is optional and not
+    // part of this contract (checked separately by the loader when present).
     [[nodiscard]] bool valid() const noexcept {
         return binary.valid() && unary.valid() && postfix.valid()
             && binary.v != unary.v

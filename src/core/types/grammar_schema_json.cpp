@@ -624,13 +624,28 @@ void collectReferences(json const& body,
                     // is a typo. Use C_UnknownShape (matches the expr-body
                     // unknown-key check a few lines above) — C_MissingWrapperRules
                     // is reserved for "block/field absent or empty".
+                    // Optional `ternary` wrapper (mixfix `?:`). When present it
+                    // must be a non-empty string distinct from the other three.
+                    const auto nt = wrapperName("ternary");
+                    if (wr.contains("ternary")) {
+                        if (nt.empty()) {
+                            c.emit(DiagnosticCode::C_MissingWrapperRules,
+                                   std::format("{}/ternary", wrPath),
+                                   "'wrapperRules.ternary' (optional) must be a non-empty "
+                                   "string naming the ternary wrapper rule when present");
+                        } else if (nt == nb || nt == nu || nt == np) {
+                            c.emit(DiagnosticCode::C_DuplicateWrapperRules, wrPath,
+                                   std::format("'wrapperRules.ternary' must name a rule distinct "
+                                               "from binary/unary/postfix (got '{}')", nt));
+                        }
+                    }
                     for (auto const& [k, _] : wr.items()) {
-                        if (k != "binary" && k != "unary" && k != "postfix") {
+                        if (k != "binary" && k != "unary" && k != "postfix" && k != "ternary") {
                             c.emit(DiagnosticCode::C_UnknownShape,
                                    std::format("{}/{}", wrPath, k),
                                    std::format("unknown 'wrapperRules' field '{}' "
-                                               "— expected 'binary', 'unary', or "
-                                               "'postfix'", k));
+                                               "— expected 'binary', 'unary', "
+                                               "'postfix', or 'ternary'", k));
                         }
                     }
                 }
@@ -1875,9 +1890,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     if      (a == "infix")   arity = OperatorArity::Infix;
                     else if (a == "prefix")  arity = OperatorArity::Prefix;
                     else if (a == "postfix") arity = OperatorArity::Postfix;
+                    else if (a == "ternary") arity = OperatorArity::Ternary;
                     else {
                         coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
-                                  std::format("unknown arity '{}' (expected infix|prefix|postfix)", a));
+                                  std::format("unknown arity '{}' (expected infix|prefix|postfix|ternary)", a));
                         continue;
                     }
                 }
@@ -1971,11 +1987,46 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     const auto rname = g.at("bodyRule").get<std::string>();
                     bodyRuleId = data.rules->intern(rname);
                 }
-                OperatorTable::Entry entry{precedence, assoc, std::nullopt};
+                // Ternary `middle` separator (C's `:`). Required for ternary
+                // arity, forbidden otherwise.
+                SchemaTokenId middleId{};
+                if (g.contains("middle")) {
+                    if (arity != OperatorArity::Ternary) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'middle' is only valid on a ternary group");
+                        continue;
+                    }
+                    if (!g.at("middle").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'middle' must be a string lexeme");
+                        continue;
+                    }
+                    const auto mid = g.at("middle").get<std::string>();
+                    auto midIt = data.lexemeTable.find(mid);
+                    if (midIt == data.lexemeTable.end() || midIt->second.empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("'middle' lexeme '{}' is not declared in 'tokens'", mid));
+                        continue;
+                    }
+                    if (midIt->second.size() != 1) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("'middle' lexeme '{}' has multiple meanings; "
+                                              "ambiguous separators are unsupported", mid));
+                        continue;
+                    }
+                    middleId = midIt->second[0].id;
+                }
+                if (arity == OperatorArity::Ternary && !middleId.valid()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "a ternary group requires a 'middle' separator lexeme");
+                    continue;
+                }
+                OperatorTable::Entry entry{precedence, assoc, std::nullopt, std::nullopt};
                 if (endsAtId.valid()) {
                     entry.grouped = OperatorTable::GroupedPostfix{
                         endsAtId, bodyRuleId};
                 }
+                if (middleId.valid()) entry.ternaryMiddle = middleId;
 
                 for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
                     json const& op = g.at("operators")[j];
@@ -2332,7 +2383,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     if (!exprBody.contains("wrapperRules")) return;
                     json const& wr = exprBody.at("wrapperRules");
                     if (!wr.is_object()) return;
-                    for (auto const* key : {"binary", "unary", "postfix"}) {
+                    for (auto const* key : {"binary", "unary", "postfix", "ternary"}) {
                         if (wr.contains(key) && wr.at(key).is_string()) {
                             const auto name = wr.at(key).get<std::string>();
                             if (!name.empty()) wrapperNames.push_back(name);
@@ -2391,6 +2442,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         if (std::string{key} == "binary")       pack.binary  = rid;
                         else if (std::string{key} == "unary")   pack.unary   = rid;
                         else /* postfix */                       pack.postfix = rid;
+                    }
+                    // Optional ternary wrapper (mixfix `?:`).
+                    if (wr.contains("ternary") && wr.at("ternary").is_string()) {
+                        const auto n = wr.at("ternary").get<std::string>();
+                        if (!n.empty()) pack.ternary = data.rules->intern(n);
                     }
                     const auto ownerRid = data.rules->intern(shapeName);
                     data.exprWrapperRules.emplace(ownerRid.v, pack);
@@ -4078,6 +4134,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("binaryExprRule",  cfg.binaryExprRule,  cfg.binaryExprRuleName);
             readExprRule("unaryExprRule",   cfg.unaryExprRule,   cfg.unaryExprRuleName);
             readExprRule("postfixExprRule", cfg.postfixExprRule, cfg.postfixExprRuleName);
+            readExprRule("ternaryExprRule", cfg.ternaryExprRule, cfg.ternaryExprRuleName);
             readExprRule("operandRule",     cfg.operandRule,     cfg.operandRuleName);
 
             // ── operator dispatch tables: [{ token, target, compoundBase? }] ──
