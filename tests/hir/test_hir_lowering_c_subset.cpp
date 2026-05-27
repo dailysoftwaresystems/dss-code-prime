@@ -310,13 +310,70 @@ TEST(HirLoweringCSubset, IntegerOverflowReported) {
     EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
 }
 
-TEST(HirLoweringCSubset, StringLiteralIsDeferred) {
-    // c-subset has no string type; a string-literal operand must fail loud.
-    SemanticModel model = analyzeCSubset("int f() { return \"x\"; }");
+TEST(HirLoweringCSubset, CharLiteralLowersToCharValue) {
+    // `'a'` — coalesced body token, decoded to a Char codepoint.
+    SemanticModel model = analyzeCSubset("char f() { return 'a'; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value));
+    EXPECT_EQ(std::get<std::uint64_t>(v.value), static_cast<std::uint64_t>('a'));
+}
+
+TEST(HirLoweringCSubset, CharEscapeLowersToControlCodepoint) {
+    SemanticModel model = analyzeCSubset("char f() { return '\\n'; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    EXPECT_EQ(std::get<std::uint64_t>(res->literalPool.at(0).value), 10u);  // '\n'
+}
+
+TEST(HirLoweringCSubset, EmptyCharLiteralFailsLoud) {
+    // `''` has no body char — fail loud, never a garbage codepoint.
+    SemanticModel model = analyzeCSubset("char f() { return ''; }");
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
+}
+
+TEST(HirLoweringCSubset, StringLiteralLowersToCharArray) {
+    // `"hello"` — coalesced body, decoded bytes in the pool, typed Array<Char,6>
+    // (5 chars + implied NUL).
+    SemanticModel model = analyzeCSubset("void f() { \"hello\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "hello");
+
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 6);                                  // "hello" + NUL
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
+}
+
+TEST(HirLoweringCSubset, StringEscapeDecodes) {
+    SemanticModel model = analyzeCSubset("void f() { \"a\\tb\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(res->literalPool.at(0).value), std::string("a\tb"));
 }
 
 // ── golden ────────────────────────────────────────────────────────────────

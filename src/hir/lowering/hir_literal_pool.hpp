@@ -4,6 +4,7 @@
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
 
 #include <cstdint>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -16,8 +17,11 @@
 // store HR7's reserved inline-`.dsshir`-value syntax and MIR/codegen read from.
 //
 // The variant covers the c-subset literal surface (bool / signed / unsigned /
-// floating). String/char encodings and 128-bit integers are additive when a
-// language needs them.
+// floating / string). A char literal is stored as its decoded codepoint in the
+// `uint64_t` arm with `core = Char`; a string literal's decoded bytes (escapes
+// resolved, NOT NUL-terminated — the NUL is implied by the Array<Char,N+1>
+// type) live in the `std::string` arm with `core = Char` and an Array type on
+// the node. 128-bit integers remain additive when a language needs them.
 
 namespace dss {
 
@@ -26,7 +30,7 @@ struct HirLiteralValue {
     // token); the lowering still emits the node + a diagnostic so analysis
     // continues. `core` records the decoded TypeKind for pool-level inspection
     // without consulting the interner (redundant with the node's typeId).
-    std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double> value;
+    std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string> value;
     TypeKind core = TypeKind::Void;
 };
 

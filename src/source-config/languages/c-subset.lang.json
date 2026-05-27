@@ -17,8 +17,8 @@
 
   "lexerModes": {
     "main":          { "tokens": "default" },
-    "string":        { "defaultToken": { "kind": "StringChar" } },
-    "charBody":      { "defaultToken": { "kind": "CharLiteral" } },
+    "string":        { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
+    "charBody":      { "defaultToken": { "kind": "CharLiteral",   "coalesce": true } },
     "line-comment":  {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -205,7 +205,7 @@
     },
 
     "includeDirective": {
-      "sequence": [ "HashOp", "IncludeKeyword", "StringStart" ]
+      "sequence": [ "HashOp", "IncludeKeyword", "StringStart", "StringLiteral" ]
     },
 
     "externDecl": {
@@ -391,11 +391,14 @@
         "Identifier",
         "IntLiteral",
         "FloatLiteral",
-        "StringStart",
-        "CharStart",
+        "stringLiteralExpr",
+        "charLiteralExpr",
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
     },
+
+    "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
+    "stringLiteralExpr": { "sequence": [ "StringStart", "StringLiteral" ] },
 
     "argList": {
       "optional": {
@@ -543,6 +546,9 @@
 
     "forClauseSeparator": "EndStatement",
     "caseLabelRule":      "caseLabel",
-    "caseDefaultToken":   "DefaultKeyword"
+    "caseDefaultToken":   "DefaultKeyword",
+
+    "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   },
+    "stringLiteral": { "startToken": "StringStart", "bodyToken": "StringLiteral" }
   }
 }

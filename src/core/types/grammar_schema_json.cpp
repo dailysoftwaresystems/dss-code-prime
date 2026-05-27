@@ -1729,6 +1729,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     if (dt.contains("flags")) {
                         spec.flags = parseFlagList(dt.at("flags"));
                     }
+                    // Optional `coalesce` flag (default false): emit ONE
+                    // in-grammar token for the whole body instead of one per
+                    // codepoint. A value-bearing literal mode (char / string)
+                    // sets this so `operand` can reference the body token and
+                    // the value can be decoded; comment-style modes leave it
+                    // false (per-codepoint, off-grammar, EmptySpace-skipped).
+                    if (dt.contains("coalesce")) {
+                        if (!dt.at("coalesce").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format("{}/defaultToken/coalesce", modePath),
+                                      "'defaultToken.coalesce' must be a boolean");
+                        } else {
+                            spec.coalesce = dt.at("coalesce").get<bool>();
+                        }
+                    }
                     defaultToken = spec;
                 }
             }
@@ -2419,7 +2434,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // owned set (single source of truth shared with
                 // `Parser::Impl` and `TreeBuilder`).
                 for (auto const& mode : data.lexerModes) {
-                    if (mode.defaultToken) {
+                    // A COALESCED body kind is in-grammar (one token, like
+                    // IntLiteral) — it must NOT join the off-grammar set, so
+                    // that `operand` can reference it and the schema cursor
+                    // advances through it normally.
+                    if (mode.defaultToken && !mode.defaultToken->coalesce) {
                         data.bodyDefaultTokenKinds.insert(
                             mode.defaultToken->kind);
                     }
@@ -4128,6 +4147,38 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 (void)resolveRuleField(hl, "caseLabelRule", "/hirLowering",
                                        cfg.caseLabelRule, cfg.caseLabelRuleName);
             }
+
+            // Char / string literal lowering blocks:
+            //   "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   }
+            //   "stringLiteral": { "startToken": "StringStart", "bodyToken": "StringLiteral" }
+            auto readBodyLiteral = [&](char const* key, SchemaTokenId& startId,
+                                       std::string& startName, SchemaTokenId& bodyId,
+                                       std::string& bodyName) {
+                if (!hl.contains(key)) return;
+                json const& bl = hl.at(key);
+                auto readField = [&](char const* f, SchemaTokenId& id, std::string& name) {
+                    if (!bl.contains(f) || !bl.at(f).is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  std::format("/hirLowering/{}/{}", key, f),
+                                  std::format("'{}.{}' is required and must be a token name", key, f));
+                        return;
+                    }
+                    name = bl.at(f).get<std::string>();
+                    (void)resolveToken(name, std::format("/hirLowering/{}/{}", key, f), id);
+                };
+                if (!bl.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              std::format("/hirLowering/{}", key),
+                              std::format("'{}' must be an object", key));
+                    return;
+                }
+                readField("startToken", startId, startName);
+                readField("bodyToken",  bodyId,  bodyName);
+            };
+            readBodyLiteral("charLiteral",   cfg.charStartToken,   cfg.charStartTokenName,
+                            cfg.charBodyToken,   cfg.charBodyTokenName);
+            readBodyLiteral("stringLiteral", cfg.stringStartToken, cfg.stringStartTokenName,
+                            cfg.stringBodyToken, cfg.stringBodyTokenName);
 
             data.hirLowering = std::move(cfg);
         }

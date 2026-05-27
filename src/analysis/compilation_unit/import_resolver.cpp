@@ -69,9 +69,10 @@ void reportDriver(DiagnosticReporter& reporter,
 }
 
 // Read the quoted filename of a `#include "..."`. The StringStart token spans
-// only the opening quote; the body is separate (off-grammar) StringChar tokens,
-// so the content is read from the source text between the quotes rather than
-// from the tree. Returns empty when the literal isn't a well-formed "...".
+// only the opening quote; the content is read from the source text between the
+// quotes (the path is a filename, not a decoded string value, so the raw bytes
+// are what we want — independent of how the body tokenizes). Returns empty when
+// the literal isn't a well-formed "...".
 [[nodiscard]] std::string extractQuotedFilename(Tree const& tree, NodeId stringStart) {
     std::string_view const src = tree.source().text();
     ByteOffset const open = tree.span(stringStart).start();

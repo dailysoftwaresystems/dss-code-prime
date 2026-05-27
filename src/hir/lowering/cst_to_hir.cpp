@@ -4,6 +4,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -266,7 +267,14 @@ struct Lowerer {
     }
 
     E lowerOperand(NodeId node) {
-        // operand = Identifier | <literal token> | ( expression )
+        // operand = Identifier | <literal token> | <char/string literal> | ( expression )
+        // A char/string literal materializes as a subtree [startToken, bodyToken]
+        // (the body is one COALESCED in-grammar token). Detect it BEFORE the
+        // generic internal-child descent, since that subtree isn't an expression.
+        if (NodeId chl = bodyLiteralNodeOf(node, cfg.charStartToken); chl.valid())
+            return lowerCharLiteral(chl);
+        if (NodeId sl = bodyLiteralNodeOf(node, cfg.stringStartToken); sl.valid())
+            return lowerStringLiteral(sl);
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) return lowerExpr(c);  // paren-wrapped
         }
@@ -283,6 +291,62 @@ struct Lowerer {
         }
         unsupported(node, "operand has no Identifier / literal / parenthesized child");
         return {errorNode(node), InvalidType};
+    }
+
+    // The child rule node of `operand` whose first visible child is `startTok`
+    // (a `charLiteralExpr` / `stringLiteralExpr` subtree), or invalid.
+    [[nodiscard]] NodeId bodyLiteralNodeOf(NodeId operand, SchemaTokenId startTok) {
+        if (!startTok.valid()) return {};
+        for (NodeId c : visible(operand)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            for (NodeId g : visible(c)) {
+                if (isToken(g) && tree().tokenKind(g).v == startTok.v) return c;
+                break;  // only the FIRST visible child decides
+            }
+        }
+        return {};
+    }
+
+    // The first visible child token of `node` whose kind is `k`, or invalid.
+    [[nodiscard]] NodeId childTokenOfKind(NodeId node, SchemaTokenId k) {
+        for (NodeId c : visible(node))
+            if (isToken(c) && tree().tokenKind(c).v == k.v) return c;
+        return {};
+    }
+
+    // `'a'` / `'\n'` → a Char-typed literal carrying the decoded codepoint.
+    E lowerCharLiteral(NodeId node) {
+        TypeId const type = interner.primitive(TypeKind::Char);
+        NodeId const bodyTok = childTokenOfKind(node, cfg.charBodyToken);
+        std::string_view const body = bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
+        auto cp = decodeCharLiteralBody(body);
+        if (!cp) {
+            unsupported(node, std::format("char literal '{}' is empty, multi-character, "
+                                          "or has an unsupported escape", body));
+            return {errorNode(node, type), type};
+        }
+        HirLiteralValue v;
+        v.core  = TypeKind::Char;
+        v.value = static_cast<std::uint64_t>(*cp);
+        return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+    }
+
+    // `"hello"` → an Array<Char, N+1> literal carrying the decoded bytes (NUL
+    // implied by the +1 length).
+    E lowerStringLiteral(NodeId node) {
+        NodeId const bodyTok = childTokenOfKind(node, cfg.stringBodyToken);
+        std::string_view const body = bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
+        auto bytes = decodeStringLiteralBody(body);
+        if (!bytes) {
+            unsupported(node, std::format("string literal \"{}\" has an unsupported escape", body));
+            return {errorNode(node), InvalidType};
+        }
+        TypeId const type = interner.array(interner.primitive(TypeKind::Char),
+                                           static_cast<std::int64_t>(bytes->size() + 1));
+        HirLiteralValue v;
+        v.core  = TypeKind::Char;
+        v.value = std::move(*bytes);
+        return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
     }
 
     E lowerLiteral(NodeId operandNode, NodeId tokenNode, SchemaTokenId tk, TypeId type) {

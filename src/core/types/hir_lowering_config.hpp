@@ -106,6 +106,18 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId        caseLabelRule{};     std::string caseLabelRuleName;
     SchemaTokenId caseDefaultToken{};  std::string caseDefaultTokenName;
 
+    // Char / string literal lowering. A value-bearing body literal materializes
+    // in an operand as a small subtree [startToken, bodyToken] where bodyToken
+    // is the COALESCED body (one in-grammar token; see DefaultTokenSpec.coalesce).
+    // The engine decodes the body token's text (C-family escapes) into the
+    // literal pool: a char → a Char codepoint, a string → its bytes typed
+    // Array<Char, N+1>. Both blocks optional; invalid ⇒ the language has no such
+    // literal.
+    SchemaTokenId charStartToken{};    std::string charStartTokenName;
+    SchemaTokenId charBodyToken{};     std::string charBodyTokenName;
+    SchemaTokenId stringStartToken{};  std::string stringStartTokenName;
+    SchemaTokenId stringBodyToken{};   std::string stringBodyTokenName;
+
     // True when the block carries no facets — the engine then does nothing.
     [[nodiscard]] bool empty() const noexcept {
         return ruleMappings.empty() && binaryOps.empty() && unaryOps.empty()
