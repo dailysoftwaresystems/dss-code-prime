@@ -390,7 +390,7 @@ Every numbered gap in [`v2-gap-catalog - tbd.md`](./v2-gap-catalog - tbd.md) has
 | 14 | Float literal suffixes (`1.0f`, `1e10`) — longest-match + suffix rules | ⏭ | §9 item — v3 candidate (numeric-style descriptor; no v2 target language needs it). |
 | 15 | Bitwise operators `&` `\|` `^` `~` `<<` `>>` | ✅ | Closed in PR0. Inherits gap #1's parser-phase precedence work. |
 | 16 | Compound assignment `+= -= *= /=` | 🟡 | §5.1 (PR1) — once the parser climbs precedence these slot in as right-assoc operators. **Tree-shape parent plan #6 (parser)**. |
-| 17 | Ternary `?:` (mixfix) | ⏭ | §9 item 1 — v3 candidate (`Prefix\|Infix\|Postfix` enum doesn't model mixfix). |
+| 17 | Ternary `?:` (mixfix) | ✅ | Closed 2026-05-28 (gap-closure G6): added `OperatorArity::Ternary` (4th arity) — the enum grew to model mixfix after all. |
 | 18 | Multi-char operator longest-match (`==` vs `=`) | ⏭ | **Parent plan #5 (tokenizer phase)** — schema declares the tokens; the tokenizer is responsible for longest-match disambiguation. |
 
 **Gaps from PR2b review (`v2-gap-catalog - tbd.md` §7, rows 19–22):**
