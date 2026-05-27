@@ -143,7 +143,7 @@ struct Lowerer {
             stack.pop_back();
             if (tree().kind(c) == NodeKind::Internal && deferred_.count(tree().rule(c).v) != 0)
                 return true;
-            for (NodeId g : tree().children(c)) stack.push_back(g);
+            for (NodeId g : visible(c)) stack.push_back(g);
         }
         return false;
     }

@@ -2990,12 +2990,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // declaration is still usable (just without arrays).
                         if (entry.contains("arraySuffix")) {
                             json const& as = entry.at("arraySuffix");
-                            if (!as.is_object() || !as.contains("rule")
-                                || !as.at("rule").is_string()) {
+                            if (!as.is_object()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/arraySuffix",
-                                          "'arraySuffix' must be an object with a "
-                                          "string 'rule'");
+                                          "'arraySuffix' must be an object");
+                            } else if (!as.contains("rule") || !as.at("rule").is_string()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/arraySuffix/rule",
+                                          "'arraySuffix.rule' is required and must be a "
+                                          "rule-name string");
                             } else {
                                 auto const rn = as.at("rule").get<std::string>();
                                 if (!data.rules->contains(rn)) {
