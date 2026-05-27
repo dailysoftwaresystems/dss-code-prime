@@ -456,5 +456,79 @@
       { "literal": "IntLiteral",   "core": "I32" },
       { "literal": "FloatLiteral", "core": "F64" }
     ]
+  },
+
+  "hirLowering": {
+    "ruleMappings": [
+      { "rule": "topLevelDecl", "hirKind": "Decl"        },
+      { "rule": "varDeclHead",  "hirKind": "VarDecl"     },
+      { "rule": "param",        "hirKind": "VarDecl"     },
+      { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
+      { "rule": "block",        "hirKind": "Block"       },
+      { "rule": "ifStmt",       "hirKind": "IfStmt"      },
+      { "rule": "whileStmt",    "hirKind": "WhileStmt"   },
+      { "rule": "doStmt",       "hirKind": "DoWhileStmt" },
+      { "rule": "forStmt",      "hirKind": "ForStmt"     },
+      { "rule": "switchStmt",   "hirKind": "SwitchStmt"  },
+      { "rule": "breakStmt",    "hirKind": "BreakStmt"   },
+      { "rule": "returnStmt",   "hirKind": "ReturnStmt"  },
+      { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
+    ],
+
+    "binaryExprRule":  "binaryExpr",
+    "unaryExprRule":   "unaryExpr",
+    "postfixExprRule": "postfixExpr",
+    "operandRule":     "operand",
+
+    "binaryOps": [
+      { "token": "PlusOp",   "target": "Add"    },
+      { "token": "MinusOp",  "target": "Sub"    },
+      { "token": "StarOp",   "target": "Mul"    },
+      { "token": "SlashOp",  "target": "Div"    },
+      { "token": "EqEqOp",   "target": "Eq"     },
+      { "token": "NotEqOp",  "target": "Ne"     },
+      { "token": "LtOp",     "target": "Lt"     },
+      { "token": "LtEqOp",   "target": "Le"     },
+      { "token": "GtOp",     "target": "Gt"     },
+      { "token": "GtEqOp",   "target": "Ge"     },
+      { "token": "AndAndOp", "target": "LogicalAnd" },
+      { "token": "OrOrOp",   "target": "LogicalOr"  },
+      { "token": "BitAndOp", "target": "BitAnd" },
+      { "token": "BitOrOp",  "target": "BitOr"  },
+      { "token": "BitXorOp", "target": "BitXor" },
+      { "token": "ShlOp",    "target": "Shl"    },
+      { "token": "ShrOp",    "target": "Shr"    },
+      { "token": "AssignOp", "target": "Assign" },
+
+      { "token": "PlusAssignOp",   "target": "Assign", "compoundBase": "Add"    },
+      { "token": "MinusAssignOp",  "target": "Assign", "compoundBase": "Sub"    },
+      { "token": "StarAssignOp",   "target": "Assign", "compoundBase": "Mul"    },
+      { "token": "SlashAssignOp",  "target": "Assign", "compoundBase": "Div"    },
+      { "token": "ModAssignOp",    "target": "Assign", "compoundBase": "Rem"    },
+      { "token": "BitAndAssignOp", "target": "Assign", "compoundBase": "BitAnd" },
+      { "token": "BitOrAssignOp",  "target": "Assign", "compoundBase": "BitOr"  },
+      { "token": "BitXorAssignOp", "target": "Assign", "compoundBase": "BitXor" },
+      { "token": "ShlAssignOp",    "target": "Assign", "compoundBase": "Shl"    },
+      { "token": "ShrAssignOp",    "target": "Assign", "compoundBase": "Shr"    }
+    ],
+
+    "unaryOps": [
+      { "token": "BangOp",   "target": "Not"       },
+      { "token": "TildeOp",  "target": "BitNot"    },
+      { "token": "MinusOp",  "target": "Neg"       },
+      { "token": "BitAndOp", "target": "AddressOf" },
+      { "token": "StarOp",   "target": "Deref"     }
+    ],
+
+    "postfixOps": [
+      { "token": "ParenOpen",   "target": "Call"  },
+      { "token": "BracketOpen", "target": "Index" }
+    ],
+
+    "forClauseSeparator": "EndStatement",
+    "caseLabelRule":      "caseLabel",
+    "caseDefaultToken":   "DefaultKeyword",
+
+    "deferredRules": ["arrayDeclSuffix"]
   }
 }

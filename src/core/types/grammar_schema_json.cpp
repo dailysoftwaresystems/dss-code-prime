@@ -3907,6 +3907,182 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // hirLowering ── per-language CST→HIR lowering config (plan 09 HR8; schema
+    // v4). Optional; absent ⇒ no lowering. Parsed LATE (after shapes/tokens
+    // interned) so rule/token references resolve here. HIR kind/op NAMES are
+    // stored raw (the `core` loader can't see the `hir` enums) and resolved by
+    // the lowering engine, which reports an unknown name as
+    // H_UnsupportedLoweringForKind.
+    if (doc.contains("hirLowering")) {
+        json const& hl = doc.at("hirLowering");
+        if (!hl.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering",
+                      "'hirLowering' must be an object");
+        } else {
+            HirLoweringConfig cfg;
+
+            // Resolve a required rule-name field on `obj` → RuleId + name.
+            auto resolveRuleField = [&](json const& obj, char const* key,
+                                        std::string const& path,
+                                        RuleId& outId, std::string& outName) -> bool {
+                if (!obj.contains(key) || !obj.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path + "/" + key,
+                              std::format("'{}' is required and must be a string", key));
+                    return false;
+                }
+                outName = obj.at(key).get<std::string>();
+                if (!data.rules->contains(outName)) {
+                    coll.emit(DiagnosticCode::C_UnknownShape, path + "/" + key,
+                              std::format("'{}' references unknown shape '{}'", key, outName));
+                    return false;
+                }
+                outId = data.rules->find(outName);
+                return true;
+            };
+            // Resolve a token-name string → SchemaTokenId (C_UnknownToken on miss).
+            auto resolveToken = [&](std::string const& name, std::string const& path,
+                                    SchemaTokenId& out) -> bool {
+                if (!data.schemaTokens->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownToken, path,
+                              std::format("references unknown token kind '{}'", name));
+                    return false;
+                }
+                out = data.schemaTokens->find(name);
+                return true;
+            };
+
+            // ── ruleMappings: [{ rule, hirKind }] ──
+            if (hl.contains("ruleMappings")) {
+                json const& arr = hl.at("ruleMappings");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/ruleMappings",
+                              "'hirLowering.ruleMappings' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/hirLowering/ruleMappings/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each 'ruleMappings' entry must be an object");
+                            continue;
+                        }
+                        HirRuleMapping m;
+                        if (!resolveRuleField(entry, "rule", path, m.rule, m.ruleName)) continue;
+                        if (!entry.contains("hirKind") || !entry.at("hirKind").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/hirKind",
+                                      "'hirKind' is required and must be a string");
+                            continue;
+                        }
+                        m.hirKind = entry.at("hirKind").get<std::string>();
+                        cfg.ruleMappings.push_back(std::move(m));
+                    }
+                }
+            }
+
+            // ── the four Pratt expression rule ids (optional strings) ──
+            auto readExprRule = [&](char const* key, RuleId& id, std::string& name) {
+                if (!hl.contains(key)) return;
+                (void)resolveRuleField(hl, key, "/hirLowering", id, name);
+            };
+            readExprRule("binaryExprRule",  cfg.binaryExprRule,  cfg.binaryExprRuleName);
+            readExprRule("unaryExprRule",   cfg.unaryExprRule,   cfg.unaryExprRuleName);
+            readExprRule("postfixExprRule", cfg.postfixExprRule, cfg.postfixExprRuleName);
+            readExprRule("operandRule",     cfg.operandRule,     cfg.operandRuleName);
+
+            // ── operator dispatch tables: [{ token, target, compoundBase? }] ──
+            auto readOps = [&](char const* key, std::vector<HirOperatorEntry>& out) {
+                if (!hl.contains(key)) return;
+                json const& arr = hl.at(key);
+                std::string const base = std::format("/hirLowering/{}", key);
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, base,
+                              std::format("'hirLowering.{}' must be an array", key));
+                    return;
+                }
+                for (std::size_t i = 0; i < arr.size(); ++i) {
+                    const auto path = std::format("{}/{}", base, i);
+                    json const& entry = arr[i];
+                    if (!entry.is_object()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                  "each operator entry must be an object");
+                        continue;
+                    }
+                    if (!entry.contains("token") || !entry.at("token").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField, path + "/token",
+                                  "'token' is required and must be a string");
+                        continue;
+                    }
+                    if (!entry.contains("target") || !entry.at("target").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField, path + "/target",
+                                  "'target' is required and must be a string");
+                        continue;
+                    }
+                    HirOperatorEntry e;
+                    e.tokenName = entry.at("token").get<std::string>();
+                    if (!resolveToken(e.tokenName, path + "/token", e.token)) continue;
+                    e.target = entry.at("target").get<std::string>();
+                    if (entry.contains("compoundBase")) {
+                        if (!entry.at("compoundBase").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path + "/compoundBase",
+                                      "'compoundBase' must be a string");
+                        } else {
+                            e.compoundBase = entry.at("compoundBase").get<std::string>();
+                        }
+                    }
+                    out.push_back(std::move(e));
+                }
+            };
+            readOps("binaryOps",  cfg.binaryOps);
+            readOps("unaryOps",   cfg.unaryOps);
+            readOps("postfixOps", cfg.postfixOps);
+
+            // ── structural specials ──
+            auto readTokenField = [&](char const* key, SchemaTokenId& id, std::string& name) {
+                if (!hl.contains(key)) return;
+                if (!hl.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              std::format("/hirLowering/{}", key),
+                              std::format("'{}' must be a string", key));
+                    return;
+                }
+                name = hl.at(key).get<std::string>();
+                (void)resolveToken(name, std::format("/hirLowering/{}", key), id);
+            };
+            if (hl.contains("deferredRules")) {
+                json const& arr = hl.at("deferredRules");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/deferredRules",
+                              "'hirLowering.deferredRules' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/hirLowering/deferredRules/{}", i);
+                        if (!arr[i].is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each 'deferredRules' entry must be a rule-name string");
+                            continue;
+                        }
+                        auto const name = arr[i].get<std::string>();
+                        if (!data.rules->contains(name)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'deferredRules' references unknown shape '{}'", name));
+                            continue;
+                        }
+                        cfg.deferredRules.push_back(data.rules->find(name));
+                    }
+                }
+            }
+
+            readTokenField("forClauseSeparator", cfg.forClauseSeparator, cfg.forClauseSeparatorName);
+            readTokenField("caseDefaultToken",   cfg.caseDefaultToken,   cfg.caseDefaultTokenName);
+            if (hl.contains("caseLabelRule")) {
+                (void)resolveRuleField(hl, "caseLabelRule", "/hirLowering",
+                                       cfg.caseLabelRule, cfg.caseLabelRuleName);
+            }
+
+            data.hirLowering = std::move(cfg);
+        }
+    }
+
     // Freeze interners — post-load, no further internment allowed.
     data.rules->freeze();
     data.schemaTokens->freeze();

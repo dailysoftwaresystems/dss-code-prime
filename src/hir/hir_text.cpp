@@ -1380,7 +1380,11 @@ private:
         if (kw == "continue") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
             return builder_.makeContinue(d, flags); }
         if (kw == "return") {
-            if (startsExpr()) { HirNodeId v = parseNode(); return builder_.makeReturn(v, flags); }
+            // A return value may carry inline attributes (`return @loc(...) expr`).
+            // A value-less `return` is always block-terminal (nothing may follow
+            // it — checkBlockTermination), so a leading `@` here unambiguously
+            // introduces an attributed value, never the next statement's attrs.
+            if (peekIs(Tk::At) || startsExpr()) { HirNodeId v = parseNode(); return builder_.makeReturn(v, flags); }
             return builder_.makeReturn(std::nullopt, flags);
         }
         if (kw == "expr") { HirNodeId e = parseNode(); return builder_.makeExprStmt(e, flags); }

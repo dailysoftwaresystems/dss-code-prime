@@ -400,6 +400,10 @@ SemanticConfig const& GrammarSchema::semantics() const noexcept {
     return d_.semantics;
 }
 
+HirLoweringConfig const& GrammarSchema::hirLowering() const noexcept {
+    return d_.hirLowering;
+}
+
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
                                        std::span<ScopeKind const> stack) const noexcept {
     // Walk the scope stack top-down so the innermost scope's rules win —

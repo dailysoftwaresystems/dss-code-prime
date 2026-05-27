@@ -142,6 +142,15 @@ enum class DiagnosticCode : std::uint16_t {
     // unknown-name cases for its top-level block. Absent field = valid
     // (empty profile list).
     C_UnknownArtifactProfile      = 0xC032,
+    // The `hirLowering` block (schema v4 facet, plan 09 HR8) is present but
+    // malformed: not an object, an entry with the wrong JSON type, an
+    // out-of-range child index, or a missing required sub-field. Mirrors
+    // C_InvalidSemantics. Dangling rule/token names use C_UnknownShape/
+    // C_UnknownToken; a missing required field uses C_MissingField. (An
+    // unknown HIR kind/op NAME is caught later, at lowering-engine
+    // construction — the schema loader in `core` cannot see the `hir`-layer
+    // enums — and reported as H_UnsupportedLoweringForKind.)
+    C_InvalidHirLowering          = 0xC033,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
@@ -240,6 +249,14 @@ enum class DiagnosticCode : std::uint16_t {
     //   intrinsic name. The text is internally inconsistent (a hand-edit that
     //   dropped a preamble entry, or a truncated file).
     H_TextUnknownName             = 0xF008,
+    // H_UnsupportedLoweringForKind: the CST→HIR lowering engine (plan 09 HR8)
+    //   reached a CST rule/construct it cannot lower — either the language's
+    //   `hirLowering` config has no mapping for it, the mapping names an
+    //   unknown HIR kind/op, or the construct is a known-deferred one (extern /
+    //   typedef-of-pointer / compound-assign / ++ / arrays / strings — owned by
+    //   a later plan). An `Error` HIR node is emitted as a recovery sentinel and
+    //   lowering continues (collect-all); never a silent skip or a miscompile.
+    H_UnsupportedLoweringForKind  = 0xF009,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

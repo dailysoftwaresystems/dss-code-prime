@@ -8,6 +8,7 @@
 #include "core/types/number_style.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/hir_lowering_config.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/schema_cursor.hpp"
@@ -299,6 +300,12 @@ struct DSS_EXPORT GrammarSchemaData {
     // language. Read-only after construction; the loader is the only
     // writer.
     SemanticConfig                                    semantics;
+
+    // Per-language CST→HIR lowering config (plan 09 HR8; schema v4
+    // `hirLowering` block). Default-constructed (empty) when the language
+    // omits the block — the lowering engine then produces nothing for it.
+    // Read-only after construction; the loader is the only writer.
+    HirLoweringConfig                                 hirLowering;
 };
 
 } // namespace detail
@@ -539,6 +546,11 @@ public:
     // for that language and the model produces no symbols/types/
     // diagnostics. Read-only; the loader is the only writer.
     [[nodiscard]] SemanticConfig const& semantics() const noexcept;
+
+    // Per-language CST→HIR lowering config (plan 09 HR8; schema v4
+    // `hirLowering`). Default-constructed (`empty()`) when the language omits
+    // the block. Read-only; the loader is the only writer.
+    [[nodiscard]] HirLoweringConfig const& hirLowering() const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

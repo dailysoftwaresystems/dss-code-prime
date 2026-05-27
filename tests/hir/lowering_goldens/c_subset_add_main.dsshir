@@ -1,0 +1,27 @@
+dsshir 1
+symbols {
+  %1 "add"
+  %2 "a"
+  %3 "b"
+  %4 "main"
+  %5 "x"
+}
+module "CSubset" {
+  function %1 : fn(i32, i32) -> i32 {
+    param %2 : i32
+    param %3 : i32
+    block {
+      return binop Add : i32 (ref %2 : i32, ref %3 : i32)
+    }
+  }
+  function %4 : fn() -> i32 {
+    block {
+      var %5 : i32 = call : i32 (ref %1 : fn(i32, i32) -> i32, lit #0 : i32, lit #1 : i32)
+      if (ref %5 : i32)
+        block {
+          assign ref %5 : i32 = binop Add : i32 (ref %5 : i32, lit #2 : i32)
+        }
+      return ref %5 : i32
+    }
+  }
+}

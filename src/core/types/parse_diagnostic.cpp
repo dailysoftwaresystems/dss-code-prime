@@ -70,6 +70,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_DuplicateWrapperRules:    return "C_DuplicateWrapperRules";
         case DiagnosticCode::C_InvalidSemantics:         return "C_InvalidSemantics";
         case DiagnosticCode::C_UnknownArtifactProfile:   return "C_UnknownArtifactProfile";
+        case DiagnosticCode::C_InvalidHirLowering:       return "C_InvalidHirLowering";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";
@@ -93,6 +94,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_TextMalformed:            return "H_TextMalformed";
         case DiagnosticCode::H_TextVersionMismatch:      return "H_TextVersionMismatch";
         case DiagnosticCode::H_TextUnknownName:          return "H_TextUnknownName";
+        case DiagnosticCode::H_UnsupportedLoweringForKind: return "H_UnsupportedLoweringForKind";
     }
     return "Unknown";
 }
