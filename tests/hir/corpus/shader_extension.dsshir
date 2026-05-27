@@ -1,0 +1,20 @@
+dsshir 1
+ext_kinds {
+  "ShaderOps::WorkgroupBarrier" lang "glsl"
+}
+intrinsics {
+  "math.sqrt" lang "glsl"
+}
+symbols {
+  %1 "vs"
+}
+module "glsl" {
+  @shader(stage vertex, builtin position)
+  function [shader] %1 : fn() -> void {
+    block {
+      expr intrinsic "math.sqrt" : f32 (lit #0 : f32)
+      ext_node [shader] "ShaderOps::WorkgroupBarrier"
+      return
+    }
+  }
+}

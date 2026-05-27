@@ -90,6 +90,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_VerifierFailure:          return "H_VerifierFailure";
         case DiagnosticCode::H_UnknownIntrinsic:         return "H_UnknownIntrinsic";
         case DiagnosticCode::H_ShaderViolation:          return "H_ShaderViolation";
+        case DiagnosticCode::H_TextMalformed:            return "H_TextMalformed";
+        case DiagnosticCode::H_TextVersionMismatch:      return "H_TextVersionMismatch";
+        case DiagnosticCode::H_TextUnknownName:          return "H_TextUnknownName";
     }
     return "Unknown";
 }

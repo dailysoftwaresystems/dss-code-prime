@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 production-critical. Without FFI we can't call libc → no `printf` → no useful binary. |
-| Predecessors  | ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (core type lattice). 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (`ExternFunction` / `ExternGlobal` nodes — HR1–HR6 ✅ 2026-05-26..27: the declarations landed at HR4 and the `FfiMetadata` / `HirFfiMap` side-table FFI ingestion populates is in place HR4–HR5). |
+| Predecessors  | ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (core type lattice). 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (`ExternFunction` / `ExternGlobal` nodes — HR1–HR7 ✅ 2026-05-26..27: the declarations landed at HR4 and the `FfiMetadata` / `HirFfiMap` side-table FFI ingestion populates is in place HR4–HR5, round-trip-serialized by HR7's `.dsshir` `@ffi(...)`; HR8–HR11 pending). |
 | Successors    | ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) LK6 consumes extern symbol declarations for import-table generation. |
 | Scope         | **Bounded.** FF1–FF6. v1 must read enough to declare libc / libSystem / msvcrt / kernel32 symbols. Full C++ name mangling (Itanium / MSVC) post-v1; C-style first. |
 

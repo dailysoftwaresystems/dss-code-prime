@@ -223,6 +223,23 @@ enum class DiagnosticCode : std::uint16_t {
     //   call, or a call to a non-shader (host) function. (Dynamic allocation is
     //   not yet expressible in HIR; the check lands when an alloc intrinsic does.)
     H_ShaderViolation             = 0xF005,
+    // H_TextMalformed: the `.dsshir` text-format parser (HR7) hit a token it did
+    //   not expect at the current position — an unknown keyword, a missing
+    //   delimiter, a bad integer/string, or a structurally malformed type/node.
+    //   The diagnostic's `actual` carries what was seen and `expected` what was
+    //   valid. One broad syntactic code (the analog of P_UnexpectedToken for the
+    //   hand-rolled HIR-text grammar) keeps the HIR-text band distinct from the
+    //   schema-driven source parser's P_* codes.
+    H_TextMalformed               = 0xF006,
+    // H_TextVersionMismatch: the `.dsshir` header's format-version integer is not
+    //   the version this build understands. Parsing stops — a newer/older layout
+    //   cannot be reconstructed safely.
+    H_TextVersionMismatch         = 0xF007,
+    // H_TextUnknownName: a body reference names something the preamble never
+    //   declared — a symbol handle (`%sN`), or an extension kind / operator /
+    //   intrinsic name. The text is internally inconsistent (a hand-edit that
+    //   dropped a preamble entry, or a truncated file).
+    H_TextUnknownName             = 0xF008,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

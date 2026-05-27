@@ -226,6 +226,13 @@ public:
 
     [[nodiscard]] HirModuleId id()   const noexcept { return arena_.id(); }
     [[nodiscard]] std::size_t size() const noexcept { return arena_.size(); }
+
+    // Set the module's source-language tag (the value frozen into `Hir` at
+    // `finish`). The default ctor leaves it empty; a consumer that learns the
+    // language only mid-build — e.g. the `.dsshir` parser, which reads the
+    // `module "lang"` header after it has already started a builder — sets it
+    // here before finishing. Not `[[nodiscard]]`: a plain mutator.
+    void setSourceLanguage(std::string lang) { sourceLanguage_ = std::move(lang); }
     // The build's extension-kind registry — register the kinds a lowering emits
     // beyond the core enum here; ownership transfers into the frozen Hir. NOT
     // `[[nodiscard]]`: this is a mutator getter used for chaining (e.g.

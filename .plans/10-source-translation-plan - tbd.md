@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1.x — first user likely c-subset → JS for a Web target. Reserved scope today; design lands now to keep HIR honest. |
-| Predecessors  | 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (the pivot layer — HR1–HR6 ✅ (HR1–HR5 2026-05-26, HR6 2026-05-27), incl. the `TranspileHint` / `HirTranspileMap` side-table this plan consumes; HR7–HR11 pending). ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (core type lattice). |
+| Predecessors  | 🟡 [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (the pivot layer — HR1–HR7 ✅ (HR1–HR5 2026-05-26, HR6–HR7 2026-05-27), incl. the `TranspileHint` / `HirTranspileMap` side-table this plan consumes — round-trip-serialized by HR7's `.dsshir` format; HR8–HR11 pending). ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (core type lattice). |
 | Successors    | Used by [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) for SPIR-V→DXIL/MSL/WGSL paths. Reserved consumer of [`19-hir-hw-reserved-plan`](./19-hir-hw-reserved-plan%20-%20tbd.md) for VHDL/Verilog emission. |
 | Scope         | **Bounded.** ST1 schema. ST2 HIR→HIR translator. ST3 target-CST builder. ST4 target-schema pretty-printer. ST5 shipped language-pair maps (at least one v1.x flagship). |
 
