@@ -574,7 +574,8 @@
         "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
       { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable" },
       { "rule": "enumDecl",    "name": 1, "kind": "type",
-        "fieldChildren": { "rule": "enumerator", "compositeKind": "enum" } },
+        "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
+                           "liftToEnclosingScope": true } },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "kindByChild": {

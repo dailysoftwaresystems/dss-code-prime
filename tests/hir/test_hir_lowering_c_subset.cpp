@@ -1721,3 +1721,29 @@ TEST(HirLoweringCSubset, D5_5_NonLiteralEnumeratorValueEmitsDiag) {
     EXPECT_TRUE(found)
         << "non-literal enumerator value must emit S_NonConstantEnumeratorValue";
 }
+
+// D5.5-FU4 + FU5: enum-typed program emits + re-parses cleanly (the
+// HIR text format `enum "E"` round-trip is locked in by parse re-verify).
+TEST(HirLoweringCSubset, D5_5_EnumHirTextRoundTrip) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C };\n"
+        "void f() { enum E e = A; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    std::vector<std::string> names = symbolNames(model);
+    HirTextContext ctx;
+    ctx.interner    = &model.lattice().interner();
+    ctx.symbolNames = &names;
+    ctx.literalPool = &res->literalPool;
+    DiagnosticReporter er;
+    std::string const out = emitHir(res->hir, ctx, er);
+    EXPECT_NE(out.find("enum"), std::string::npos);
+
+    DiagnosticReporter pr;
+    auto parsed = parseHir(out, CompilationUnitId{42}, pr);
+    EXPECT_TRUE(parsed->ok)
+        << "re-parsed enum program must verify cleanly";
+}

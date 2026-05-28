@@ -3229,6 +3229,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         // C_InvalidSemantics so res->ok is
                                         // false).
                                     }
+                                    // D5.5-FU2: optional `liftToEnclosingScope`
+                                    // flag controls C-classic enumerator
+                                    // visibility (only meaningful for
+                                    // `compositeKind: enum`; ignored
+                                    // otherwise but loader-validated).
+                                    if (fc.contains("liftToEnclosingScope")) {
+                                        if (!fc.at("liftToEnclosingScope").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/fieldChildren/liftToEnclosingScope",
+                                                      "'liftToEnclosingScope' must be a boolean");
+                                        } else {
+                                            fcd.liftToEnclosingScope =
+                                                fc.at("liftToEnclosingScope").get<bool>();
+                                        }
+                                    }
                                     rule.fieldChildren = std::move(fcd);
                                 }
                             }

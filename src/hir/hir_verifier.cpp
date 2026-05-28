@@ -62,6 +62,7 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     checkCallArguments(reporter);
     checkIntrinsicCalls(reporter);
     checkMemberAccess(reporter);
+    checkConstructAggregate(reporter);
     checkShaderRestrictions(reporter);
     //
     // A capped reporter (the global maxDiagnostics ceiling hit — here or in a
@@ -460,6 +461,107 @@ void HirVerifier::checkMemberAccess(DiagnosticReporter& reporter) const {
                      std::format("MemberAccess #{} field index {} is out of "
                                  "bounds for the base type's {} field(s)",
                                  id.v, fieldIndex, fields.size()),
+                     sourceMap_);
+        }
+    }
+}
+
+void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
+    // D5.4-FU1 + FU4: every ConstructAggregate's child count and types
+    // must match its declared result type's shape. The HIR lowering
+    // (`lowerBraceInit` / `lowerUnionBraceInit` / `synthZeroOrError`)
+    // produces well-formed aggregates by construction; this rule
+    // catches lowering BUGS and synthetic-IR misuse.
+    if (interner_ == nullptr) return;
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hir_.kind(id) != HirKind::ConstructAggregate) continue;
+        if (hasError(hir_.flags(id))) continue;
+        TypeId const aggTy = hir_.typeId(id);
+        if (!aggTy.valid()) continue;   // requiresValidType already flagged
+        TypeKind const kind = interner_->kind(aggTy);
+        auto kids = hir_.children(id);
+
+        if (kind == TypeKind::Struct) {
+            auto const fields = interner_->operands(aggTy);
+            if (kids.size() != fields.size()) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ConstructAggregate #{} (Struct): "
+                                     "expected {} children, got {}",
+                                     id.v, fields.size(), kids.size()),
+                         sourceMap_);
+                continue;
+            }
+            for (std::size_t k = 0; k < kids.size(); ++k) {
+                TypeId const childTy = hir_.typeId(kids[k]);
+                if (!childTy.valid()) continue;   // requiresValidType flagged
+                if (childTy.v != fields[k].v) {
+                    reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                             std::format("ConstructAggregate #{} (Struct) "
+                                         "child[{}] type {} doesn't match "
+                                         "field type {}",
+                                         id.v, k, childTy.v, fields[k].v),
+                             sourceMap_);
+                }
+            }
+        } else if (kind == TypeKind::Union) {
+            if (kids.size() != 1u) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ConstructAggregate #{} (Union): "
+                                     "expected exactly 1 child (the active "
+                                     "variant), got {}",
+                                     id.v, kids.size()),
+                         sourceMap_);
+                continue;
+            }
+            TypeId const childTy = hir_.typeId(kids[0]);
+            if (!childTy.valid()) continue;
+            auto const variants = interner_->operands(aggTy);
+            bool ok = false;
+            for (TypeId vty : variants) {
+                if (vty.v == childTy.v) { ok = true; break; }
+            }
+            if (!ok) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ConstructAggregate #{} (Union) child "
+                                     "type {} doesn't match any of the "
+                                     "{} declared variants",
+                                     id.v, childTy.v, variants.size()),
+                         sourceMap_);
+            }
+        } else if (kind == TypeKind::Array) {
+            auto const ops   = interner_->operands(aggTy);
+            auto const scals = interner_->scalars(aggTy);
+            if (ops.empty() || scals.empty()) continue;  // malformed type
+            std::size_t const len = static_cast<std::size_t>(scals[0]);
+            if (kids.size() != len) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ConstructAggregate #{} (Array): "
+                                     "expected {} children, got {}",
+                                     id.v, len, kids.size()),
+                         sourceMap_);
+                continue;
+            }
+            TypeId const elemTy = ops[0];
+            for (std::size_t k = 0; k < kids.size(); ++k) {
+                TypeId const childTy = hir_.typeId(kids[k]);
+                if (!childTy.valid()) continue;
+                if (childTy.v != elemTy.v) {
+                    reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                             std::format("ConstructAggregate #{} (Array) "
+                                         "child[{}] type {} doesn't match "
+                                         "element type {}",
+                                         id.v, k, childTy.v, elemTy.v),
+                             sourceMap_);
+                }
+            }
+        } else {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("ConstructAggregate #{} on non-aggregate "
+                                 "TypeKind ordinal {} (must be Struct, "
+                                 "Union, or Array)",
+                                 id.v, static_cast<unsigned>(kind)),
                      sourceMap_);
         }
     }

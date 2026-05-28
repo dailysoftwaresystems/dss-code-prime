@@ -947,7 +947,14 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             }
                                             erec.enumValue = value;
                                             nextValue = value + 1;
-                                            if (enclosingId.valid()) {
+                                            // D5.5-FU2: only also-bind to the
+                                            // enclosing scope when the config
+                                            // opts in (`liftToEnclosingScope:
+                                            // true`). C-style enums opt in;
+                                            // future Rust-style `E.A`-only
+                                            // schemas would leave it false.
+                                            if (enclosingId.valid()
+                                             && decl.fieldChildren->liftToEnclosingScope) {
                                                 SymbolId const prior =
                                                     s.scopes.bind(
                                                         enclosingId, erec.name, eSymId);

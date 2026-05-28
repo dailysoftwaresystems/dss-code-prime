@@ -116,6 +116,15 @@ private:
     // is covered too.
     void checkMemberAccess(DiagnosticReporter& reporter) const;
 
+    // D5.4-FU1 + FU4: every ConstructAggregate's child count and per-child
+    // types must match its declared result type's shape — Struct = N
+    // children, one per field, each child's type must equal the
+    // corresponding field's type; Union = exactly 1 child whose type
+    // matches one of the variant types; Array = `length` children, each
+    // typed as the element type. Catches HIR lowering bugs that would
+    // otherwise silently produce mis-shaped aggregates downstream.
+    void checkConstructAggregate(DiagnosticReporter& reporter) const;
+
     // Shader restrictions (HR6, plan §2.8): inside a `ShaderUsable` function's
     // subtree — no recursion (call-graph cycle), no indirect / function-pointer
     // call, no call to a non-shader (host) function. Each violation emits

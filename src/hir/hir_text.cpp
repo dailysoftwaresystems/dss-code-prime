@@ -402,10 +402,20 @@ private:
             case TypeKind::Struct: out_ += "struct "; out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
             case TypeKind::Union:  out_ += "union ";  out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
             // D5.5: enum is nominal-by-name; underlying TypeKind lives in
-            // scalars[0]. v1 emits just `enum "Name"`; the parser
-            // re-interns with the default underlying I32 (no v1 schema
-            // exposes the underlying selection to user code).
-            case TypeKind::Enum:   out_ += "enum ";   out_ += quote(in.name(t)); return;
+            // scalars[0]. Round-trip the underlying explicitly when it
+            // diverges from the default I32 (`enum "E" : kindOrdinal`);
+            // omit the suffix when underlying = I32 to keep the common
+            // form readable.
+            case TypeKind::Enum: {
+                out_ += "enum ";
+                out_ += quote(in.name(t));
+                auto sc = in.scalars(t);
+                if (!sc.empty() && static_cast<TypeKind>(sc[0]) != TypeKind::I32) {
+                    out_ += " : ";
+                    out_ += std::to_string(sc[0]);
+                }
+                return;
+            }
             case TypeKind::FnSig: {
                 out_ += "fn(";
                 args(in.fnParams(t));
@@ -1690,10 +1700,19 @@ private:
         if (kw == "union") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
             auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
             return interner_.unionType(name, ts); }
-        // D5.5: `enum "Name"` (no body — enumerator names live in the
-        // SemanticModel symbol table, not in the type record).
-        if (kw == "enum") { std::string name = takeStr();
-            return interner_.enumType(name, TypeKind::I32); }
+        // D5.5: `enum "Name"` with optional `: <underlyingOrdinal>`. Enumerator
+        // names live in the SemanticModel symbol table, not the type record;
+        // only the nominal name + underlying TypeKind round-trip here.
+        if (kw == "enum") {
+            std::string name = takeStr();
+            TypeKind underlying = TypeKind::I32;
+            if (accept(Tk::Colon)) {
+                std::uint64_t const ord = takeInt();
+                if (ord < static_cast<std::uint64_t>(TypeKind::Count_)) {
+                    underlying = static_cast<TypeKind>(ord);
+                }
+            }
+            return interner_.enumType(name, underlying); }
         if (kw == "fn") {
             expect(Tk::LParen, "'('"); auto params = parseTypeListUntil(Tk::RParen); expect(Tk::RParen, "')'");
             expect(Tk::Arrow, "'->'"); TypeId result = parseType();

@@ -1229,28 +1229,42 @@ struct Lowerer {
     // would be `Array` — a type-system corruption.
     [[nodiscard]] HirNodeId synthZeroOrError(NodeId at, TypeId type) {
         TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
-        if (core == TypeKind::Struct) {
-            auto const fields = interner.operands(type);
-            std::vector<HirNodeId> children;
-            children.reserve(fields.size());
-            for (TypeId ft : fields) children.push_back(synthZeroOrError(at, ft));
-            return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
-        }
-        if (core == TypeKind::Union) {
-            // C99 §6.7.8p18 + p21: a zero-initialized union has its
-            // FIRST named member zero-initialized (the "only the first
-            // named member of a union" current-object rule, combined
-            // with the zero-fill default). No overlap-zero across
-            // variants — the HIR aggregate emits exactly one child:
-            // the zero-fill of the first variant.
-            auto const variants = interner.operands(type);
-            if (variants.empty()) {
+        // D5.4-FU3 + D5.5-FU3: unified composite arm — Struct, Union
+        // and Enum all dispatch here. Per-kind child count: Struct =
+        // every field; Union = first variant only (C99 §6.7.8p18+p21);
+        // Enum = zero-as-underlying tagged with the enum's TypeId (so
+        // the zero literal carries the enum's nominal identity).
+        if (core == TypeKind::Struct || core == TypeKind::Union) {
+            auto const ops = interner.operands(type);
+            if (core == TypeKind::Union && ops.empty()) {
                 return reportedError(at,
                     "synthZero reached a malformed Union type "
                     "(no variants)");
             }
-            std::vector<HirNodeId> children{ synthZeroOrError(at, variants[0]) };
+            std::size_t const n =
+                (core == TypeKind::Union) ? std::size_t{1} : ops.size();
+            std::vector<HirNodeId> children;
+            children.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                children.push_back(synthZeroOrError(at, ops[i]));
+            }
             return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
+        }
+        if (core == TypeKind::Enum) {
+            // The enum's underlying is in scalars[0]; the zero literal
+            // is typed AS the enum (not as the raw underlying), so a
+            // downstream consumer comparing TypeIds keeps the nominal
+            // distinction.
+            auto const scals = interner.scalars(type);
+            TypeKind const underlying = !scals.empty()
+                ? static_cast<TypeKind>(scals[0])
+                : TypeKind::I32;
+            HirLiteralValue v;
+            v.core = underlying;
+            if (isFloatCore(underlying))       v.value = 0.0;
+            else if (isSignedCore(underlying)) v.value = std::int64_t{0};
+            else                               v.value = std::uint64_t{0};
+            return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
         }
         if (core == TypeKind::Array) {
             auto const ops   = interner.operands(type);
@@ -1299,6 +1313,46 @@ struct Lowerer {
         return cfg.braceInitListRule.valid()
             && tree().kind(n) == NodeKind::Internal
             && tree().rule(n).v == cfg.braceInitListRule.v;
+    }
+
+    // D5-FU3: peel wrapper-rule layers off `n` UNTIL reaching one of the
+    // recognized designator-leaf rules (designatedFieldRule /
+    // designatedIndexRule), or until no more sole-meaningful descents
+    // are possible. The c-subset grammar's `designator: alt[...]` parses
+    // to an auto-interned alt-wrapper whose rule isn't either leaf rule;
+    // callers that need to recognize a designator-leaf in initElement
+    // position use this peel rather than `peelToCore` (which over-peels
+    // through any single-child wrapper). Returns `{designatorCore, ruleIdValue}`
+    // where `ruleIdValue` is 0 if the result isn't internal.
+    [[nodiscard]] std::pair<NodeId, std::uint32_t>
+    peelToDesignatorLeaf(NodeId n) const {
+        NodeId cur = n;
+        while (tree().kind(cur) == NodeKind::Internal) {
+            std::uint32_t const rr = tree().rule(cur).v;
+            if (cfg.designatedFieldRule.valid() && rr == cfg.designatedFieldRule.v) break;
+            if (cfg.designatedIndexRule.valid() && rr == cfg.designatedIndexRule.v) break;
+            NodeId const only = soleMeaningfulChild(cur);
+            if (!only.valid()) break;
+            cur = only;
+        }
+        std::uint32_t const r = (tree().kind(cur) == NodeKind::Internal)
+                                    ? tree().rule(cur).v : std::uint32_t{0};
+        return {cur, r};
+    }
+
+    // D5-FU3: find the first identifier token (the schema's
+    // `sem.identifierToken`) among `parent`'s visible children. Returns
+    // an invalid NodeId when no such token exists. Used by every
+    // designator-name + lvalue path that needs to recover the name leaf
+    // without a full peel.
+    [[nodiscard]] NodeId firstIdentifierToken(NodeId parent) const {
+        if (!sem.identifierToken.valid()) return {};
+        for (NodeId t : visible(parent)) {
+            if (isToken(t) && tree().tokenKind(t).v == sem.identifierToken.v) {
+                return t;
+            }
+        }
+        return {};
     }
 
     // D5.3 cycle 1b consolidated brace-init-aware lowering. Used by every
@@ -1527,23 +1581,7 @@ struct Lowerer {
         for (NodeId c : visible(elem)) {
             if (isToken(c)) continue;
             if (tree().kind(c) != NodeKind::Internal) continue;
-            // Peel through `designator` alt-wrapper to reach the leaf
-            // designator-rule node (mirrors the struct/array path).
-            NodeId designatorCore = c;
-            while (tree().kind(designatorCore) == NodeKind::Internal) {
-                std::uint32_t const rr = tree().rule(designatorCore).v;
-                if (cfg.designatedFieldRule.valid()
-                 && rr == cfg.designatedFieldRule.v) break;
-                if (cfg.designatedIndexRule.valid()
-                 && rr == cfg.designatedIndexRule.v) break;
-                NodeId const only = soleMeaningfulChild(designatorCore);
-                if (!only.valid()) break;
-                designatorCore = only;
-            }
-            std::uint32_t const r =
-                (tree().kind(designatorCore) == NodeKind::Internal)
-                    ? tree().rule(designatorCore).v
-                    : std::uint32_t{0};
+            auto const [designatorCore, r] = peelToDesignatorLeaf(c);
             if (cfg.designatedFieldRule.valid()
              && r == cfg.designatedFieldRule.v) {
                 ++designatorCount;
@@ -1555,13 +1593,7 @@ struct Lowerer {
                     failed = true;
                     continue;
                 }
-                NodeId nameTok{};
-                for (NodeId tok : visible(designatorCore)) {
-                    if (!isToken(tok)) continue;
-                    if (tree().tokenKind(tok).v != sem.identifierToken.v) continue;
-                    nameTok = tok;
-                    break;
-                }
+                NodeId const nameTok = firstIdentifierToken(designatorCore);
                 if (!nameTok.valid()) {
                     reportedError(designatorCore,
                         "variant designator is missing its name");
@@ -1742,39 +1774,16 @@ struct Lowerer {
             for (NodeId c : visible(elem)) {
                 if (isToken(c)) continue;
                 if (tree().kind(c) != NodeKind::Internal) continue;
-                // A designator child may be wrapped in an auto-interned
-                // alt-wrapper (the c-subset grammar's `designator: alt[
-                // designatedField, designatedIndex]`); peel via
-                // `soleMeaningfulChild` until the rule matches one of
-                // the recognized designator-leaf rules.
-                NodeId designatorCore = c;
-                while (tree().kind(designatorCore) == NodeKind::Internal) {
-                    std::uint32_t const rr = tree().rule(designatorCore).v;
-                    if (cfg.designatedFieldRule.valid()
-                     && rr == cfg.designatedFieldRule.v) break;
-                    if (cfg.designatedIndexRule.valid()
-                     && rr == cfg.designatedIndexRule.v) break;
-                    NodeId const only = soleMeaningfulChild(designatorCore);
-                    if (!only.valid()) break;
-                    designatorCore = only;
-                }
-                std::uint32_t const r =
-                    (tree().kind(designatorCore) == NodeKind::Internal)
-                        ? tree().rule(designatorCore).v
-                        : std::uint32_t{0};
+                // D5-FU3 helper: peel through the auto-interned
+                // `designator` alt-wrapper to a designator leaf rule.
+                auto const [designatorCore, r] = peelToDesignatorLeaf(c);
                 if (cfg.designatedFieldRule.valid()
                  && r == cfg.designatedFieldRule.v) {
                     // Resolve `.name` against the CURRENT type's scope.
                     // For the first designator, current=contextType; for
                     // each subsequent step, current= the resolved
                     // field's type (descends per the C99 chain rule).
-                    NodeId nameTok{};
-                    for (NodeId tok : visible(designatorCore)) {
-                        if (!isToken(tok)) continue;
-                        if (tree().tokenKind(tok).v != sem.identifierToken.v) continue;
-                        nameTok = tok;
-                        break;
-                    }
+                    NodeId const nameTok = firstIdentifierToken(designatorCore);
                     if (!nameTok.valid()) {
                         reportedError(designatorCore,
                             "field designator missing name token");
