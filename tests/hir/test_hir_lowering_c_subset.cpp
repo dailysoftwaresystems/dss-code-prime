@@ -953,7 +953,10 @@ TEST(HirLoweringCSubset, D5_3_PositionalStructInit) {
 
 // SP3.c LANDED 2026-05-28: single-level field designator now resolves
 // via the TYPE-AWARE path (look up name in `compositeScopeFor(context)`
-// rather than the lexical scope Pass 2 stamps).
+// rather than the lexical scope Pass 2 stamps). Pins value ORDERING:
+// `.y = 7, .x = 3` must produce slot 0 = 3 (.x), slot 1 = 7 (.y).
+// A regression that swapped lexical-order resolution for declaration-
+// order would pass a count-only assertion silently.
 TEST(HirLoweringCSubset, D5_3_FieldDesignatorInit) {
     SemanticModel model = analyzeCSubset(
         "struct Point { int x; int y; };\n"
@@ -967,7 +970,63 @@ TEST(HirLoweringCSubset, D5_3_FieldDesignatorInit) {
     HirNodeId init = firstVarInitOfFn(res->hir, fn);
     ASSERT_TRUE(init.valid());
     EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
-    EXPECT_EQ(res->hir.children(init).size(), 2u);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // Slot 0 is .x = 3, slot 1 is .y = 7 (declaration order).
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    ASSERT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+    auto slot0Lit = res->literalPool.at(res->hir.payload(kids[0]));
+    auto slot1Lit = res->literalPool.at(res->hir.payload(kids[1]));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(slot0Lit.value));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(slot1Lit.value));
+    EXPECT_EQ(std::get<std::int64_t>(slot0Lit.value), 3);
+    EXPECT_EQ(std::get<std::int64_t>(slot1Lit.value), 7);
+}
+
+// C99 §6.7.8p19: a later designator OVERRIDES an earlier value at the
+// same subobject. `{.x = 1, .x = 2}` → slot 0 = 2 (last wins).
+TEST(HirLoweringCSubset, D5_3_LaterDesignatorOverridesEarlier) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.x = 1, .x = 2}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    auto slot0Lit = res->literalPool.at(res->hir.payload(kids[0]));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(slot0Lit.value));
+    EXPECT_EQ(std::get<std::int64_t>(slot0Lit.value), 2)
+        << "later .x = 2 must override earlier .x = 1 per C99 §6.7.8p19";
+}
+
+// Dot-chained designator coexists with a sibling brace-init under a
+// different outer slot. Exercises the InitSlot tree's nested-merge
+// substrate when a chained write and a positional write both land at
+// the same outer-aggregate level.
+TEST(HirLoweringCSubset, D5_3_DotChainedDesignatorWithSibling) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {.a.v = 1, .b = {.v = 9}}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
 }
 
 // Restored: zero-fill with designators

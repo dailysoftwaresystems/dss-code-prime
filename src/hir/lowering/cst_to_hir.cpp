@@ -1446,31 +1446,28 @@ struct Lowerer {
                                               HirFlags::Synthetic);
     }
 
-    // D5.3 cycle 1b: brace-init lowering. Takes a `braceInitList` CST
-    // node and a CONTEXT TYPE (the resolved type the brace-init must
-    // produce — a struct or array). Produces a positional
-    // `HirKind::ConstructAggregate` whose every slot is set: explicit
-    // elements at their chosen position, omitted slots zero-filled via
-    // `synthZeroOrError(fieldType)`. Supports:
+    // D5.3 brace-init lowering. Takes a `braceInitList` CST node and a
+    // CONTEXT TYPE (the resolved type the brace-init must produce — a
+    // struct or array). Produces a positional `HirKind::ConstructAggregate`
+    // whose every slot is set: explicit elements at their chosen
+    // position, omitted slots zero-filled via `synthZeroOrError(fieldType)`.
+    // Supports:
     //   • positional elements `{a, b, c}` with C99 §6.7.8 fill-cursor
     //   • single-level field designator `{.x = a, .y = b}`
+    //   • dot-chained field designator `{.a.v = 1}` (SP3 — type-aware
+    //     name lookup via `compositeScopeFor(currentType)` + cursor
+    //     descent into the resolved field's type)
     //   • index designator `{[2] = a}` with integer-literal indices
     //   • mixed positional / designator with cursor restart at the
     //     designated position (§6.7.8p17)
     //   • chained-brace nesting `{.outer = {.inner = a}}` via recursion
     //   • zero-fill omitted slots (§6.7.8p21)
     //
-    // Real-blocker substrate items remaining (anchored in plan 09
-    // §D5.3-cycle-1b and plan 08.5 §SP3 TypeId→declaring-symbol):
-    //   • dot-chained `.a.b = 1` — requires looking up the inner
-    //     designator name in the type-of-the-outer's struct scope.
-    //     That's a TypeId→declaring-symbol→scope substrate lookup the
-    //     interner can't currently express; same blocker as the field-
-    //     container-compat check (both fold into the same substrate
-    //     plan item SP3).
+    // Two real-blocker substrate items remaining:
     //   • index-designator `[expr] = ...` with non-literal indices —
     //     requires CST-side const-eval (HIR builder is write-only and
-    //     `const_eval` consumes HIR).
+    //     `const_eval` consumes HIR). Anchored at plan 12.5 §0.2 D6.
+    //     Locked-in by `D5_3_NonLiteralIndexDesignatorEmitsDiag`.
     //   • Union brace-init — distinct semantics from struct (one active
     //     member, no zero-fill across overlapping variants); deferred
     //     to plan 00 §0.2 D5.4 (Unions).
@@ -1515,11 +1512,10 @@ struct Lowerer {
         };
 
         // Root level of the InitSlot tree — one slot per top-level
-        // field/element. Dot-chained writes would descend into deeper
-        // sub-levels via writeInitSlotAt; cycle 1b accepts only single-
-        // designator paths so the path vector always has length 1, but
-        // the substrate is already tree-shaped for the §SP3 substrate
-        // lift that unblocks dot-chained.
+        // field/element. Single-designator writes have empty residual
+        // path (store directly at the slot); dot-chained writes have
+        // a non-empty residual that descends into the slot's `nested`
+        // sub-aggregate via `writeInitSlotAt`.
         std::vector<InitSlot> rootSlots(slotCount);
         for (std::uint32_t i = 0; i < slotCount; ++i)
             rootSlots[i].slotType = slotType(i);
@@ -1628,16 +1624,34 @@ struct Lowerer {
                     }
                     // Descend into the array element's type (so a
                     // subsequent designator can target a sub-position).
-                    if (designatorCurrentType.valid()
-                     && interner.kind(designatorCurrentType) == TypeKind::Array) {
-                        auto ops = interner.operands(designatorCurrentType);
-                        if (!ops.empty()) designatorCurrentType = ops[0];
-                    } else if (designatorCurrentType.valid()) {
+                    // Invalid current type (prior chain step landed on
+                    // an unresolved field) → fail LOUD; without this
+                    // arm the index would silently append to the path
+                    // and `writeInitSlotAt` would no-op past an empty
+                    // `nested`, dropping the init silently.
+                    if (!designatorCurrentType.valid()) {
+                        reportedError(designatorCore,
+                            "index designator on an unresolved or "
+                            "invalid prior-step type");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    if (interner.kind(designatorCurrentType)
+                        != TypeKind::Array) {
                         reportedError(designatorCore,
                             "index designator on a non-array type");
                         designatorFailed = true;
                         continue;
                     }
+                    auto ops = interner.operands(designatorCurrentType);
+                    if (ops.empty()) {
+                        reportedError(designatorCore,
+                            "index designator's array type has no "
+                            "element type");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    designatorCurrentType = ops[0];
                     designatorPath.push_back(
                         static_cast<std::uint32_t>(*idx));
                     continue;
@@ -1656,17 +1670,12 @@ struct Lowerer {
             std::uint32_t target = cursor;
             std::span<std::uint32_t const> residualPath;
             if (!designatorPath.empty()) {
-                std::uint32_t const idx = designatorPath[0];
-                if (idx >= slotCount) {
-                    reportedError(elem,
-                        "init element targets position out of aggregate range");
-                    continue;
-                }
-                target = idx;
+                target = designatorPath[0];
                 cursor = target;
                 residualPath = std::span<std::uint32_t const>{
-                    designatorPath.data() + 1, designatorPath.size() - 1};
-            } else if (target >= slotCount) {
+                    designatorPath}.subspan(1);
+            }
+            if (target >= slotCount) {
                 reportedError(elem,
                     "init element targets position out of aggregate range");
                 continue;
