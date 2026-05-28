@@ -230,6 +230,44 @@ TEST(MirLoweringCSubset, GlobalWithBinaryOpOnLiteralsFoldsToConstant) {
     EXPECT_EQ(m.moduleFuncCount(), 0u);
 }
 
+// HR cycle C end-to-end: `return a > b;` from an int-returning function
+// emits a Cast(Bool→int) in HIR, which MIR lowers as ZExt. Pins the full
+// HR-coercion + MIR-Cast-lowering chain.
+TEST(MirLoweringCSubset, ReturnBoolFromIntFnEmitsZExt) {
+    auto L = lowerCSubset(
+        "int gt(int a, int b) { return a > b; }");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg a, Arg b, ICmpSgt, ZExt, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 5u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::ICmpSgt);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::ZExt);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
+}
+
+// HR's implicit-coercion pass wraps `int g = (Bool literal);` in a Cast.
+// `tryConstFold`'s new Cast case folds through the cast and produces a
+// constant-init global — no `__module_init__` function synthesized.
+TEST(MirLoweringCSubset, GlobalWithCastedLiteralFoldsToConstant) {
+    // Use a comparison literal: `1 > 0` is Bool=true (1); declaring an int
+    // global from it goes through Cast(Bool→int) at HR time and must still
+    // fold cleanly via the Cast-aware const-fold.
+    auto L = lowerCSubset("int g = 1 > 0;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "Cast-wrapped constant init should fold, not route to __module_init__";
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    EXPECT_EQ(m.moduleFuncCount(), 0u);  // no init function synthesized
+}
+
 // `int g = -1;` — UnaryOp(Neg, Literal) folds to a constant-init global.
 // No init function is synthesized.
 TEST(MirLoweringCSubset, GlobalWithUnaryNegLiteralFoldsToConstant) {
@@ -590,7 +628,9 @@ TEST(MirLoweringCSubset, ForLoopLowersWithUpdateOnBackEdge) {
     EXPECT_EQ(m.blockSuccessors(update)[0], header);
 }
 
-// Review-fix I-5: logical `!x` lowers as `cmp eq operand, 0`.
+// Logical `!x` lowers as `cmp eq operand, 0` → Bool. Returning it from an
+// int-returning function adds an implicit `Cast(Bool→int)` from cycle C's
+// HR coercion pass (ZExt at MIR-time).
 TEST(MirLoweringCSubset, LogicalNotLowersToICmpEqZero) {
     auto L = lowerCSubset("int isz(int x) { return !x; }\n");
     ASSERT_TRUE(L.mir.ok)
@@ -598,12 +638,13 @@ TEST(MirLoweringCSubset, LogicalNotLowersToICmpEqZero) {
             ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // Instructions: Arg, Const(0), ICmpEq(arg, 0), Return.
-    ASSERT_EQ(m.blockInstCount(entry), 4u);
+    // Instructions: Arg, Const(0), ICmpEq(arg, 0), ZExt(bool→i32), Return.
+    ASSERT_EQ(m.blockInstCount(entry), 5u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Const);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::ICmpEq);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Return);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::ZExt);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
 }
 
 // Unary negation lowering (review-touched: cycle 1's mapBinaryOp also covers

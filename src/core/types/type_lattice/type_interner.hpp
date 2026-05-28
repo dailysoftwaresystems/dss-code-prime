@@ -85,6 +85,20 @@ public:
     [[nodiscard]] TypeId                   fnResult(TypeId id) const;
     [[nodiscard]] std::span<TypeId const>  fnParams(TypeId id) const;
 
+    // ── promotion / coercion (C99 "usual arithmetic conversions") ──
+    // The common arithmetic type two operands are coerced to before a binary
+    // op. Returns `InvalidType` for non-arithmetic operand pairs (pointers,
+    // structs, etc. — the caller decides whether that's a diagnostic or a
+    // pass-through). Algorithm follows C99 §6.3.1.8 in spirit:
+    //   - if either is floating-point, promote both to the wider floating
+    //     type;
+    //   - else apply integer promotions (Bool/Char/I8/U8/I16/U16 → I32);
+    //   - then equal types → same; same-signedness → wider rank;
+    //     cross-signedness → unsigned wins on equal rank, else the wider
+    //     rank's signedness.
+    // Pure type-level query; no constant evaluation, no diagnostics.
+    [[nodiscard]] TypeId commonType(TypeId a, TypeId b);
+
 private:
     TypeId internContent(TypeKind kind, TypeKindId extensionKind,
                          std::span<TypeId const> operands,

@@ -134,6 +134,67 @@ struct Lowerer {
         return MirOpcode::Invalid;
     }
 
+    // Map (sourceKind, targetKind) to the right MIR cast opcode. Categories:
+    // integer-to-integer (width + sign), integer↔float, float-to-float,
+    // integer↔pointer, pointer-to-pointer (Bitcast). Same-kind casts collapse
+    // to Bitcast (e.g. signed↔unsigned of the same width — no value change at
+    // the bit level). Returns `MirOpcode::Invalid` for unrecognized pairs.
+    [[nodiscard]] static MirOpcode mapCast(TypeKind from, TypeKind to) noexcept {
+        auto isInt = [](TypeKind k) noexcept {
+            return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
+                || k == TypeKind::I64 || k == TypeKind::I128
+                || k == TypeKind::U8  || k == TypeKind::U16 || k == TypeKind::U32
+                || k == TypeKind::U64 || k == TypeKind::U128
+                || k == TypeKind::Char || k == TypeKind::Byte || k == TypeKind::Bool;
+        };
+        auto isSignedInt = [](TypeKind k) noexcept {
+            return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
+                || k == TypeKind::I64 || k == TypeKind::I128 || k == TypeKind::Char;
+        };
+        auto isFloat = [](TypeKind k) noexcept {
+            return k == TypeKind::F16 || k == TypeKind::F32
+                || k == TypeKind::F64 || k == TypeKind::F128;
+        };
+        auto bitWidth = [](TypeKind k) noexcept -> int {
+            switch (k) {
+                case TypeKind::Bool: case TypeKind::I8: case TypeKind::U8:
+                case TypeKind::Char: case TypeKind::Byte:        return 8;
+                case TypeKind::I16:  case TypeKind::U16: case TypeKind::F16: return 16;
+                case TypeKind::I32:  case TypeKind::U32: case TypeKind::F32: return 32;
+                case TypeKind::I64:  case TypeKind::U64: case TypeKind::F64: return 64;
+                case TypeKind::I128: case TypeKind::U128: case TypeKind::F128: return 128;
+                default: return 0;
+            }
+        };
+        if (from == to) return MirOpcode::Bitcast;
+        if (isInt(from) && isInt(to)) {
+            int const fw = bitWidth(from);
+            int const tw = bitWidth(to);
+            if (fw == 0 || tw == 0) return MirOpcode::Invalid;
+            if (tw <  fw) return MirOpcode::Trunc;
+            if (tw == fw) return MirOpcode::Bitcast;
+            return isSignedInt(from) ? MirOpcode::SExt : MirOpcode::ZExt;
+        }
+        if (isFloat(from) && isFloat(to)) {
+            int const fw = bitWidth(from);
+            int const tw = bitWidth(to);
+            if (fw == 0 || tw == 0) return MirOpcode::Invalid;
+            if (tw <  fw) return MirOpcode::FPTrunc;
+            if (tw == fw) return MirOpcode::Bitcast;
+            return MirOpcode::FPExt;
+        }
+        if (isInt(from)   && isFloat(to)) {
+            return isSignedInt(from) ? MirOpcode::SIToFP : MirOpcode::UIToFP;
+        }
+        if (isFloat(from) && isInt(to)) {
+            return isSignedInt(to) ? MirOpcode::FPToSI : MirOpcode::FPToUI;
+        }
+        if (from == TypeKind::Ptr && isInt(to))   return MirOpcode::PtrToInt;
+        if (isInt(from)   && to == TypeKind::Ptr) return MirOpcode::IntToPtr;
+        if (from == TypeKind::Ptr && to == TypeKind::Ptr) return MirOpcode::Bitcast;
+        return MirOpcode::Invalid;
+    }
+
     // Lower a single HIR expression in the currently-open MIR block.
     // Returns the MirInstId that produces the value (`InvalidMirInst` on
     // error — caller decides whether to keep emitting). Recursive.
@@ -440,6 +501,35 @@ struct Lowerer {
                 if (!ptr.valid()) return InvalidMirInst;
                 std::array<MirInstId, 1> ops{ptr};
                 return mir.addInst(MirOpcode::Load, ops, t);
+            }
+            case HirKind::Cast: {
+                // children: [operand]. The HIR node's typeId is the target
+                // type; the operand's typeId is the source. Pick the MIR
+                // cast opcode from (sourceKind, targetKind). HIR has already
+                // validated the cast is well-typed; the verifier rejects
+                // illegal lattice transitions before we reach here.
+                auto kids = hir.children(node);
+                if (kids.size() != 1) {
+                    unsupported(node, "malformed Cast (expect 1 operand)");
+                    return InvalidMirInst;
+                }
+                MirInstId const operand = lowerExpr(kids[0]);
+                if (!operand.valid()) return InvalidMirInst;
+                TypeId const fromTy = hir.typeId(kids[0]);
+                TypeKind const fromK = fromTy.valid()
+                    ? interner.kind(fromTy) : TypeKind::Void;
+                TypeKind const toK   = t.valid()
+                    ? interner.kind(t) : TypeKind::Void;
+                MirOpcode const mop = mapCast(fromK, toK);
+                if (mop == MirOpcode::Invalid) {
+                    unsupported(node, std::format(
+                        "Cast from TypeKind {} to {} has no MIR opcode",
+                        static_cast<unsigned>(fromK),
+                        static_cast<unsigned>(toK)));
+                    return InvalidMirInst;
+                }
+                std::array<MirInstId, 1> ops{operand};
+                return mir.addInst(mop, ops, t);
             }
             case HirKind::SeqExpr: {
                 // Lower the side-effect statements in order, then lower the
@@ -1359,6 +1449,38 @@ struct Lowerer {
                 case HirOpKind::Ge: folded.value = std::int64_t{*av >= *bv}; return folded;
                 default: return std::nullopt;
             }
+        }
+        if (k == HirKind::Cast) {
+            // The implicit-conversion pass wraps narrowing/widening literal
+            // initializers in `Cast(literal, declaredType)`. Fold the inner
+            // constant, then re-tag the value to the target's core kind so
+            // a `long g = 1 + 2;` lands as a constant `3:i64` instead of
+            // synthesizing a __module_init__ store. Float casts and ptr
+            // casts route through the runtime path (the const-eval engine
+            // sub-plan owns those).
+            auto kids = hir.children(node);
+            if (kids.size() != 1) return std::nullopt;
+            auto inner = tryConstFold(kids[0]);
+            if (!inner.has_value()) return std::nullopt;
+            TypeId const targetTy = hir.typeId(node);
+            if (!targetTy.valid()) return std::nullopt;
+            TypeKind const toK = interner.kind(targetTy);
+            // Integer-to-integer cast: keep the int64 value, retag the core
+            // (the actual bit-width truncation is encoded by the global's
+            // TypeId — codegen narrows on load).
+            std::int64_t const* iv = std::get_if<std::int64_t>(&inner->value);
+            if (iv != nullptr
+                && (toK == TypeKind::Bool || toK == TypeKind::Char || toK == TypeKind::Byte
+                 || toK == TypeKind::I8   || toK == TypeKind::I16  || toK == TypeKind::I32
+                 || toK == TypeKind::I64  || toK == TypeKind::I128
+                 || toK == TypeKind::U8   || toK == TypeKind::U16  || toK == TypeKind::U32
+                 || toK == TypeKind::U64  || toK == TypeKind::U128)) {
+                MirLiteralValue folded;
+                folded.value = *iv;
+                folded.core  = toK;
+                return folded;
+            }
+            return std::nullopt;
         }
         return std::nullopt;
     }

@@ -118,8 +118,55 @@ struct Lowerer {
     std::unordered_map<std::uint32_t, TypeKind>    litCore_;     // SchemaTokenId.v → TypeKind
     std::unordered_map<std::uint32_t, bool>        deferred_;    // RuleId.v of explicitly-deferred rules
 
+    // The enclosing function's declared return type, threaded into `lowerReturn`
+    // so a `return expr;` whose `expr.type` differs from the declared type
+    // emits an implicit `Cast(expr → declaredType)`. Invalid outside any
+    // function body (top-level Module / global initializers).
+    TypeId currentReturnType_{};
+
     // The result of lowering an expression: the HIR node + its resolved type.
     struct E { HirNodeId id; TypeId type; };
+
+    // Coerce an expression to `target` by emitting a `Cast` when its type
+    // differs. Same-type, invalid-target (treat as a pass-through — the
+    // semantic phase has likely already flagged the mismatch), or invalid-
+    // source all pass through unchanged. Calling this is the single point
+    // where HR commits to an implicit-conversion site; the MIR-side `Cast`
+    // lowering (cycle C's mapCast) picks the right opcode from the
+    // (sourceKind, targetKind) pair. The emitted Cast is aliased to its
+    // OPERAND's source-map entry so diagnostics anchored at the synthetic
+    // Cast still locate to real source.
+    [[nodiscard]] E coerce(E child, TypeId target) {
+        if (!target.valid() || !child.type.valid()) return child;
+        if (child.type == target) return child;
+        // Pointers, structs, FnSig are not coerced implicitly; let the
+        // caller decide whether the mismatch is a diagnostic. Arithmetic
+        // (int + float kinds) is the implicit-conversion surface.
+        TypeKind const ck = interner.kind(child.type);
+        TypeKind const tk = interner.kind(target);
+        auto isArithmetic = [](TypeKind k) noexcept {
+            return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
+                || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32
+                || k == TypeKind::I64  || k == TypeKind::I128
+                || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
+                || k == TypeKind::U64  || k == TypeKind::U128
+                || k == TypeKind::F16  || k == TypeKind::F32
+                || k == TypeKind::F64  || k == TypeKind::F128;
+        };
+        if (!isArithmetic(ck) || !isArithmetic(tk)) return child;
+        HirNodeId const cast = builder.makeCast(child.id, target, HirFlags::Synthetic);
+        // Alias the synthetic Cast to its operand's pending span entry so
+        // diagnostics anchored at the Cast locate to real source. The
+        // operand may have multiple pending entries (rare — only when an
+        // earlier coerce already wrapped it); use the most recent (last).
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->first == child.id) {
+                spans.push_back({cast, it->second});
+                break;
+            }
+        }
+        return E{cast, target};
+    }
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
@@ -524,10 +571,22 @@ struct Lowerer {
             return exprError(callNode, "call has no callee child");
         }
         std::vector<HirNodeId> args;
+        // If the callee's typeId is a FnSig, coerce each arg to its declared
+        // param type. Variadic / unknown signatures pass through unchanged
+        // (the verifier owns the arity-vs-FnSig rule).
+        std::span<TypeId const> paramTypes{};
+        if (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig) {
+            paramTypes = interner.fnParams(calleeTy);
+        }
+        std::size_t argIdx = 0;
         if (cr.argsChild < vis.size()) {
             for (NodeId a : visible(vis[cr.argsChild])) {
                 if (isToken(a)) continue;                       // skip commas
-                args.push_back(lowerFlatExpr(a).id);
+                E const arg = lowerFlatExpr(a);
+                E const coerced = (argIdx < paramTypes.size())
+                                ? coerce(arg, paramTypes[argIdx]) : arg;
+                args.push_back(coerced.id);
+                ++argIdx;
             }
         }
         TypeId const result = (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig)
@@ -726,18 +785,35 @@ struct Lowerer {
     // type) stay identical. Does NOT handle `Assign` (an expression-position
     // store) — that is Pratt-only and resolved by the caller before this point.
     E combineBinary(NodeId anchor, HirOperatorEntry const& e, E lhs, E rhs) {
-        if (e.target == "LogicalAnd")
-            return {track(builder.makeLogicalAnd(lhs.id, rhs.id, boolType()), anchor), boolType()};
-        if (e.target == "LogicalOr")
-            return {track(builder.makeLogicalOr(lhs.id, rhs.id, boolType()), anchor), boolType()};
+        // LogicalAnd/Or: operands coerce to Bool (short-circuit semantics).
+        if (e.target == "LogicalAnd" || e.target == "LogicalOr") {
+            E const lb = coerce(lhs, boolType());
+            E const rb = coerce(rhs, boolType());
+            if (e.target == "LogicalAnd")
+                return {track(builder.makeLogicalAnd(lb.id, rb.id, boolType()), anchor), boolType()};
+            return {track(builder.makeLogicalOr(lb.id, rb.id, boolType()), anchor), boolType()};
+        }
         auto op = coreOpFromName(e.target);
         if (!op || arityOf(*op) != HirOpArity::Binary) {
             unsupported(anchor, std::format("binary target '{}' is not a core binary operator", e.target));
             return {errorNode(anchor), InvalidType};
         }
+        // C99 usual arithmetic conversions: both operands coerce to their
+        // common type before the op. The result type is that common type
+        // (or Bool for comparisons). `commonType` returns InvalidType for
+        // non-arithmetic operand pairs — fall back to the prior "first
+        // valid type wins" rule so non-arithmetic Refs (e.g. pointer +
+        // pointer comparisons) still lower without losing structure.
+        TypeId const common = interner.commonType(lhs.type, rhs.type);
+        E lc = lhs, rc = rhs;
+        if (common.valid()) {
+            lc = coerce(lhs, common);
+            rc = coerce(rhs, common);
+        }
         TypeId const result = isComparison(*op) ? boolType()
-                            : (lhs.type.valid() ? lhs.type : rhs.type);
-        return {track(builder.addParent(HirKind::BinaryOp, std::array{lhs.id, rhs.id},
+                            : (common.valid() ? common
+                                              : (lhs.type.valid() ? lhs.type : rhs.type));
+        return {track(builder.addParent(HirKind::BinaryOp, std::array{lc.id, rc.id},
                                         result, encodeOp(*op)), anchor), result};
     }
 
@@ -842,9 +918,20 @@ struct Lowerer {
             return {errorNode(node), InvalidType};
         }
         E cond = lowerExpr(operands[0]);
+        // Coerce cond to Bool (C99 + LLVM-style i1 discipline at the
+        // CondBr / Ternary boundary).
+        cond = coerce(cond, boolType());
         E thenE = lowerExpr(operands[1]);
         E elseE = lowerExpr(operands[2]);
-        TypeId const result = typeAtOr(node, thenE.type.valid() ? thenE.type : elseE.type);
+        // Coerce both arms to their common type (C99 conditional-expression
+        // type-balance rule). Falls back to the type-attribute-or-then.
+        TypeId const common = interner.commonType(thenE.type, elseE.type);
+        if (common.valid()) {
+            thenE = coerce(thenE, common);
+            elseE = coerce(elseE, common);
+        }
+        TypeId const result = common.valid() ? common
+                            : typeAtOr(node, thenE.type.valid() ? thenE.type : elseE.type);
         return {track(builder.makeTernary(cond.id, thenE.id, elseE.id, result), node), result};
     }
 
@@ -889,7 +976,21 @@ struct Lowerer {
         E base = lowerExpr(baseN);
         if (e.target == "Call") {
             std::vector<HirNodeId> args;
-            for (NodeId argN : argExpressions(rest)) args.push_back(lowerExpr(argN).id);
+            // Coerce each arg to its FnSig param type (when the callee's
+            // signature is known). Same discipline as the lowerFlatExpr's
+            // call arm above — single source of truth for arg-coercion.
+            std::span<TypeId const> paramTypes{};
+            if (base.type.valid() && interner.kind(base.type) == TypeKind::FnSig) {
+                paramTypes = interner.fnParams(base.type);
+            }
+            std::size_t argIdx = 0;
+            for (NodeId argN : argExpressions(rest)) {
+                E const arg = lowerExpr(argN);
+                E const coerced = (argIdx < paramTypes.size())
+                                ? coerce(arg, paramTypes[argIdx]) : arg;
+                args.push_back(coerced.id);
+                ++argIdx;
+            }
             // Prefer the semantic phase's resolved call type (it types call nodes);
             // fall back to the callee FnSig's result.
             TypeId inferred = InvalidType;
@@ -1050,6 +1151,8 @@ struct Lowerer {
         if (!lhsN.valid() || !rhsN.valid())  // malformed (parse-recovery) node — never abort
             return reportedError(binNode, "malformed assignment expression");
         E lhs = lowerExpr(lhsN), rhs = lowerExpr(rhsN);
+        // Assignment is asymmetric: rhs is coerced to lhs's type.
+        rhs = coerce(rhs, lhs.type);
         return track(builder.makeAssignStmt(lhs.id, rhs.id), binNode);
     }
 
@@ -1163,12 +1266,27 @@ struct Lowerer {
         auto lv = lhsN.valid() ? classifyLvalue(lhsN) : std::nullopt;
         if (!lv || !rhsN.valid() || !op || arityOf(*op) != HirOpArity::Binary)
             return reportedError(binNode, "compound assignment needs an lvalue and a binary base op");
-        HirNodeId rhs = lowerExpr(rhsN).id;
-        // lhs OP= rhs → lhs = (lhs OP rhs); the lvalue is read once + written once
-        // (a complex lvalue's address is bound in lv.prep, evaluated once).
-        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), rhs},
-                                                  lv->type, encodeOp(*op)), binNode);
-        return asStmt(*lv, lvWrite(*lv, value), binNode);
+        E rhs = lowerExpr(rhsN);
+        // C99 compound-assign spec: `a OP= b` ≡ `a = (T)((a) OP (b))` where
+        // T is the type of `a`, and OP is computed at the COMMON type of a
+        // and b (so a narrower-than-int operand is integer-promoted first).
+        // Implement that exactly: read lhs, coerce both to common, OP, then
+        // narrow result back to lhs's type for the store.
+        HirNodeId const lhsRead = lvRead(*lv);
+        TypeId const common = interner.commonType(lv->type, rhs.type);
+        E lhsE{lhsRead, lv->type};
+        E rhsE = rhs;
+        TypeId const opType = common.valid() ? common : lv->type;
+        if (common.valid()) {
+            lhsE = coerce(lhsE, common);
+            rhsE = coerce(rhsE, common);
+        }
+        HirNodeId const opResult = track(builder.addParent(
+            HirKind::BinaryOp, std::array{lhsE.id, rhsE.id}, opType,
+            encodeOp(*op)), binNode);
+        // Narrow back to lhs's type before the store (if different).
+        E const narrowed = coerce(E{opResult, opType}, lv->type);
+        return asStmt(*lv, lvWrite(*lv, narrowed.id), binNode);
     }
 
     // `x++` / `x--` in STATEMENT position → `x = x +/- 1` (the produced value is
@@ -1238,7 +1356,14 @@ struct Lowerer {
     HirNodeId lowerReturn(NodeId node) {
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
-            return track(builder.makeReturn(lowerExpr(c).id), node);
+            E const v = lowerExpr(c);
+            // Coerce the returned value to the enclosing function's declared
+            // return type. `currentReturnType_` is set by `lowerFunctionDecl`
+            // before walking the body; absent (Invalid) outside any function
+            // body or when the enclosing function's signature is malformed —
+            // in either case `coerce` is a no-op.
+            E const coerced = coerce(v, currentReturnType_);
+            return track(builder.makeReturn(coerced.id), node);
         }
         return track(builder.makeReturn(std::nullopt), node);
     }
@@ -1249,7 +1374,10 @@ struct Lowerer {
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
-            if (role == Role::Expr && !cond) cond = lowerExpr(c).id;
+            if (role == Role::Expr && !cond) {
+                E const condE = lowerExpr(c);
+                cond = coerce(condE, boolType()).id;
+            }
             else if (role == Role::Stmt)     bodies.push_back(lowerStmt(c));
         }
         HirNodeId condId = orError(cond, node, "if statement has no condition");
@@ -1265,7 +1393,10 @@ struct Lowerer {
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
-            if (role == Role::Expr && !cond)      cond = lowerExpr(c).id;
+            if (role == Role::Expr && !cond) {
+                E const condE = lowerExpr(c);
+                cond = coerce(condE, boolType()).id;
+            }
             else if (role == Role::Stmt && !body) body = lowerStmt(c);
         }
         HirNodeId condId = orError(cond, node, "loop has no condition");
@@ -1293,7 +1424,10 @@ struct Lowerer {
         std::optional<HirNodeId> init, cond, update;
         for (auto const& [s, c] : clauses) {
             if (s == 0)      init   = lowerForClause(c);
-            else if (s == 1) cond   = lowerExpr(c).id;
+            else if (s == 1) {
+                E const condE = lowerExpr(c);
+                cond = coerce(condE, boolType()).id;
+            }
             else if (s == 2) update = lowerForClause(c);
         }
         HirNodeId body = lowerStmt(bodyN);
@@ -1388,7 +1522,15 @@ struct Lowerer {
             if (decl && decl->arraySuffix && tree().kind(c) == NodeKind::Internal
                 && tree().rule(c).v == decl->arraySuffix->rule.v)
                 continue;
-            if (classify(c) == Role::Expr) { init = lowerExpr(c).id; break; }
+            if (classify(c) == Role::Expr) {
+                E const initE = lowerExpr(c);
+                // Coerce the initializer to the declared variable type so a
+                // narrower / wider literal becomes a typed `Cast(literal)`
+                // node instead of a silently-mistyped operand.
+                E const coerced = coerce(initE, type);
+                init = coerced.id;
+                break;
+            }
         }
         return asGlobal ? track(builder.makeGlobal(type, sym.v, init), node)
                         : track(builder.makeVarDecl(type, sym.v, init), node);
@@ -1459,9 +1601,16 @@ struct Lowerer {
         std::vector<HirNodeId> params;
         if (decl.paramsChild && *decl.paramsChild < vis.size())
             collectParams(vis[*decl.paramsChild], params);
+        // Set currentReturnType_ around the body so `lowerReturn` coerces
+        // each `return expr;` to the declared return type. Saved + restored
+        // around the call to handle nested functions if a future frontend
+        // emits them (today's grammars don't).
+        TypeId const savedReturn = currentReturnType_;
+        currentReturnType_ = sig.valid() ? interner.fnResult(sig) : InvalidType;
         HirNodeId body = (decl.bodyChild && *decl.bodyChild < vis.size())
                        ? lowerStmt(vis[*decl.bodyChild])
                        : track(builder.makeBlock({}), node);
+        currentReturnType_ = savedReturn;
         return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 
@@ -1497,7 +1646,10 @@ struct Lowerer {
         NodeId paramsNode = descend(discNode, disc.paramsPath);
         if (paramsNode.valid()) collectParams(paramsNode, params);
         NodeId bodyNode = descend(discNode, disc.bodyPath);
+        TypeId const savedReturn = currentReturnType_;
+        currentReturnType_ = sig.valid() ? interner.fnResult(sig) : InvalidType;
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
+        currentReturnType_ = savedReturn;
         return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 

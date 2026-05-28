@@ -630,8 +630,48 @@ TEST(HirLoweringCSubset, IncludeDirectiveIsSkippedNotFailed) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
 }
 
+// HR cycle C: an int-typed `return expr;` whose expr type is non-int (e.g.
+// a comparison that produces Bool) gets a `Cast(_, int)` wrapper inserted
+// by the coercion pass. Pins the return-type-threading + coerce mechanism.
+TEST(HirLoweringCSubset, ReturnOfBoolFromIntFunctionEmitsCast) {
+    SemanticModel model = analyzeCSubset(
+        "int gt(int a, int b) { return a > b; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ret  = res->hir.children(body)[0];
+    HirNodeId val  = *res->hir.returnValue(ret);
+    // The returned expression is now `Cast(BinaryOp(Gt, ...), int)`.
+    EXPECT_EQ(res->hir.kind(val), HirKind::Cast);
+    auto castKids = res->hir.children(val);
+    ASSERT_EQ(castKids.size(), 1u);
+    EXPECT_EQ(res->hir.kind(castKids[0]), HirKind::BinaryOp);
+}
+
+// HR cycle C: an `if` condition that's already Bool-typed (from a
+// comparison) does NOT get a redundant Cast — coerce(child, target) is
+// a no-op when child.type == target.
+TEST(HirLoweringCSubset, IfConditionAlreadyBoolStaysUncasted) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x) { if (x > 0) { return; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ifs  = res->hir.children(body)[0];
+    HirNodeId cond = res->hir.ifCondition(ifs);
+    // `x > 0` is already Bool — no Cast wrapper needed.
+    EXPECT_EQ(res->hir.kind(cond), HirKind::BinaryOp);
+}
+
 TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
-    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else].
+    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else]. With HR's
+    // implicit-coercion pass, the cond is wrapped in `Cast(_, Bool)` when
+    // its source type is non-Bool — matches the CondBr-expects-Bool
+    // discipline at the MIR boundary.
     SemanticModel model = analyzeCSubset("int f(int x) { return x ? 1 : 2; }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
@@ -643,7 +683,11 @@ TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
     ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
     auto kids = res->hir.children(tern);
     ASSERT_EQ(kids.size(), 3u);
-    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Ref);       // cond: x
+    // cond is now `Cast(Ref(x), Bool)` after the implicit-coercion pass.
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Cast);
+    auto castKids = res->hir.children(kids[0]);
+    ASSERT_EQ(castKids.size(), 1u);
+    EXPECT_EQ(res->hir.kind(castKids[0]), HirKind::Ref);   // cond's operand: x
     EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);   // then: 1
     EXPECT_EQ(res->hir.kind(kids[2]), HirKind::Literal);   // else: 2
 }
