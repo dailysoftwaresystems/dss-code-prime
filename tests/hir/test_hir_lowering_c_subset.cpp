@@ -56,6 +56,13 @@ namespace {
     return names;
 }
 
+[[nodiscard]] HirNodeId firstFunction(Hir const& hir) {
+    for (HirNodeId d : hir.moduleDecls(hir.root())) {
+        if (hir.kind(d) == HirKind::Function) return d;
+    }
+    return HirNodeId{};
+}
+
 } // namespace
 
 TEST(HirLoweringCSubset, EmptyVoidFunction) {
@@ -93,7 +100,7 @@ TEST(HirLoweringCSubset, ArithmeticAndParams) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    HirNodeId fn = res->hir.moduleDecls(res->hir.root())[0];
+    HirNodeId fn = firstFunction(res->hir);
     ASSERT_EQ(res->hir.kind(fn), HirKind::Function);
     EXPECT_EQ(res->hir.functionParams(fn).size(), 2u);          // a, b
     HirNodeId body = res->hir.functionBody(fn);
@@ -116,7 +123,7 @@ TEST(HirLoweringCSubset, ControlFlowAndAssignment) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    HirNodeId fn = res->hir.moduleDecls(res->hir.root())[0];
+    HirNodeId fn = firstFunction(res->hir);
     HirNodeId body = res->hir.functionBody(fn);
     auto stmts = res->hir.children(body);
     ASSERT_EQ(stmts.size(), 1u);
@@ -131,7 +138,7 @@ TEST(HirLoweringCSubset, ForLoop) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    HirNodeId fn = res->hir.moduleDecls(res->hir.root())[0];
+    HirNodeId fn = firstFunction(res->hir);
     HirNodeId body = res->hir.functionBody(fn);
     HirNodeId forS = res->hir.children(body)[0];
     ASSERT_EQ(res->hir.kind(forS), HirKind::ForStmt);
@@ -148,7 +155,7 @@ TEST(HirLoweringCSubset, SwitchGroupsFlatCases) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    HirNodeId fn = res->hir.moduleDecls(res->hir.root())[0];
+    HirNodeId fn = firstFunction(res->hir);
     HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
     ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
     auto arms = res->hir.switchArms(sw);
@@ -908,4 +915,111 @@ TEST(HirLoweringCSubset, GoldenRepresentativeProgram) {
     std::string diags;
     for (auto const& d : pr.all()) diags += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
     EXPECT_TRUE(parsed->ok) << "lowered .dsshir did not round-trip/verify\n" << diags;
+}
+
+// ── D5.3 cycle 1a: brace-init lowering ───────────────────────────────────
+//
+// Each test lowers a VarDecl whose initializer is a `braceInitList` and
+// pins that the lowered HIR contains a `ConstructAggregate` node with the
+// expected slot count and that the lowering reports clean (`res->ok`).
+
+namespace {
+[[nodiscard]] HirNodeId firstVarInitOfFn(Hir const& hir, HirNodeId fn) {
+    HirNodeId body = hir.functionBody(fn);
+    for (HirNodeId s : hir.children(body)) {
+        if (hir.kind(s) == HirKind::VarDecl) {
+            if (auto init = hir.varDeclInit(s)) return *init;
+        }
+    }
+    return HirNodeId{};
+}
+} // namespace
+
+TEST(HirLoweringCSubset, D5_3_PositionalStructInit) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {1, 2}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 2u);
+}
+
+TEST(HirLoweringCSubset, D5_3_FieldDesignatorInit) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.y = 7, .x = 3}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 2u);
+}
+
+TEST(HirLoweringCSubset, D5_3_ZeroFillsOmittedField) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.y = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // Both children are Literals: the omitted .x slot is synth-zero (0),
+    // the explicit .y slot is the literal 7.
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+}
+
+TEST(HirLoweringCSubset, D5_3_ChainedBraceNesting) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {.a = {.v = 1}, .b = {.v = 2}}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // Each outer slot is itself a ConstructAggregate (chained-brace).
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
+
+TEST(HirLoweringCSubset, D5_3_PositionalArrayInit) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[3] = {10, 20, 30}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 3u);
 }

@@ -1181,6 +1181,204 @@ struct Lowerer {
         return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
     }
 
+    // D5.3: synthetic zero-fill literal of `type`. For scalar types this is
+    // `0` / `0.0` / `false`. For aggregate types (`Struct`/`Union`/`Array`)
+    // this is a recursive `ConstructAggregate` whose every field/element is
+    // zero-fill — the C99 §6.7.8p21 default for omitted aggregate initializer
+    // elements. Used by `lowerBraceInit` to fill un-initialized slots before
+    // emitting the final aggregate. Synthetic ⇒ no source span.
+    [[nodiscard]] HirNodeId synthZero(TypeId type) {
+        TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
+        if (core == TypeKind::Struct || core == TypeKind::Union) {
+            auto const fields = interner.operands(type);
+            std::vector<HirNodeId> children;
+            children.reserve(fields.size());
+            for (TypeId ft : fields) children.push_back(synthZero(ft));
+            return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
+        }
+        if (core == TypeKind::Array) {
+            auto const ops   = interner.operands(type);
+            auto const scals = interner.scalars(type);
+            if (!ops.empty() && !scals.empty()) {
+                TypeId const elemT = ops[0];
+                auto   const len   = scals[0];
+                std::vector<HirNodeId> children;
+                children.reserve(static_cast<std::size_t>(len));
+                for (std::uint32_t i = 0; i < len; ++i) {
+                    children.push_back(synthZero(elemT));
+                }
+                return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
+            }
+            // Fall through to scalar (unbounded array sentinel etc.).
+        }
+        HirLiteralValue v;
+        v.core = core;
+        if (isFloatCore(core))       v.value = 0.0;
+        else if (isSignedCore(core)) v.value = std::int64_t{0};
+        else                         v.value = std::uint64_t{0};
+        return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+    }
+
+    // D5.3 cycle 1a: brace-init lowering. Takes a `braceInitList` CST
+    // node and a CONTEXT TYPE (the resolved type the brace-init must
+    // produce — a struct, union, or array). Produces a positional
+    // `HirKind::ConstructAggregate` whose every slot is set: explicit
+    // elements at their chosen position, omitted slots zero-filled via
+    // `synthZero(fieldType)`. Supports:
+    //   • positional elements `{a, b, c}` with C99 §6.7.8 fill-cursor
+    //   • single-level field designators `{.x = a, .y = b}`
+    //   • mixed positional / single-designator with cursor restart at
+    //     the designated position (§6.7.8p17)
+    //   • chained-brace nesting `{.outer = {.inner = a}}` via recursion
+    //   • zero-fill omitted slots (§6.7.8p21)
+    //
+    // Real-blocker substrate items deferred to cycle 1b (mapped: plan
+    // 12.6 §1b cluster — each needs distinct substrate work, NOT a
+    // cosmetic follow-up):
+    //   • dot-chained `.a.b = 1` — requires a mutable InitSlot tree
+    //     with merge semantics across multiple designator paths sharing
+    //     prefixes ("later overrides earlier" under partial sub-field
+    //     writes is its own design pass)
+    //   • index `[i] = e` — requires a CST-side const-eval path since
+    //     the HIR builder is write-only and `const_eval` consumes HIR
+    //   • compound-literal expression form `(T){...}` — needs
+    //     operand-dispatch wiring in `lowerOperand` + a type-prefix
+    //     resolution path
+    //   • the 3 non-VarDecl context sites (return / call-arg / assign
+    //     RHS) — each needs the calling code path to PUSH a context
+    //     type before lowering the expression; that's a per-site change
+    //     rather than a single hook
+    [[nodiscard]] HirNodeId lowerBraceInit(NodeId braceInitListNode,
+                                           TypeId contextType) {
+        if (!contextType.valid()) {
+            return reportedError(braceInitListNode,
+                "brace-init requires a known context type");
+        }
+        TypeKind const containerKind = interner.kind(contextType);
+        bool const isArray = (containerKind == TypeKind::Array);
+        bool const isStructOrUnion = (containerKind == TypeKind::Struct
+                                   || containerKind == TypeKind::Union);
+        if (!isArray && !isStructOrUnion) {
+            return reportedError(braceInitListNode,
+                "brace-init target type must be struct / union / array");
+        }
+        std::uint32_t slotCount = 0;
+        TypeId elemTypeForArray{};
+        if (isStructOrUnion) {
+            slotCount = static_cast<std::uint32_t>(
+                interner.operands(contextType).size());
+        } else {
+            auto const scals = interner.scalars(contextType);
+            auto const ops   = interner.operands(contextType);
+            if (!scals.empty()) slotCount = scals[0];
+            if (!ops.empty())   elemTypeForArray = ops[0];
+        }
+        if (slotCount == 0) {
+            return reportedError(braceInitListNode,
+                "brace-init target type has zero slots");
+        }
+        auto slotType = [&](std::uint32_t i) -> TypeId {
+            return isStructOrUnion
+                ? interner.operands(contextType)[i]
+                : elemTypeForArray;
+        };
+
+        std::vector<std::optional<HirNodeId>> slots(slotCount);
+
+        // Resolve a `designatedField` CST node → field index via D5.1's
+        // `SymbolRecord::fieldIndex` (same path MemberAccess uses).
+        auto resolveFieldDesignator = [&](NodeId dfNode)
+                -> std::optional<std::uint32_t> {
+            for (NodeId tok : visible(dfNode)) {
+                if (!isToken(tok)) continue;
+                if (tree().tokenKind(tok).v != sem.identifierToken.v) continue;
+                SymbolId const sym = model.symbolAt(tok);
+                if (!sym.valid()) return std::nullopt;
+                auto const* rec = model.recordFor(sym);
+                if (!rec) return std::nullopt;
+                return rec->fieldIndex;
+            }
+            return std::nullopt;
+        };
+
+        std::uint32_t cursor = 0;
+        for (NodeId elem : visible(braceInitListNode)) {
+            if (isToken(elem)) continue;
+            if (tree().kind(elem) != NodeKind::Internal) continue;
+            if (!cfg.initElementRule.valid()
+             || tree().rule(elem).v != cfg.initElementRule.v) continue;
+
+            std::optional<std::uint32_t> designated;
+            NodeId valueExprCst{};
+            for (NodeId c : visible(elem)) {
+                if (isToken(c)) continue;
+                if (tree().kind(c) != NodeKind::Internal) continue;
+                std::uint32_t const r = tree().rule(c).v;
+                if (cfg.designatedFieldRule.valid()
+                 && r == cfg.designatedFieldRule.v
+                 && !designated.has_value()) {
+                    designated = resolveFieldDesignator(c);
+                    continue;
+                }
+                if (cfg.designatedIndexRule.valid()
+                 && r == cfg.designatedIndexRule.v) {
+                    reportedError(c,
+                        "index-designator [i] = ... deferred to cycle 1b");
+                    continue;
+                }
+                valueExprCst = c;
+            }
+            if (!valueExprCst.valid()) continue;
+
+            std::uint32_t target = cursor;
+            if (designated.has_value()) {
+                target = *designated;
+                cursor = target;
+            }
+            if (target >= slotCount) {
+                reportedError(elem,
+                    "init element targets position out of aggregate range");
+                continue;
+            }
+            TypeId const valueTargetType = slotType(target);
+
+            // Detect nested braceInitList. Same over-peel concern as
+            // the VarDecl init detection — descend wrapper rules but
+            // stop AT braceInitList rather than peeling past it.
+            NodeId nestedCore = valueExprCst;
+            while (tree().kind(nestedCore) == NodeKind::Internal) {
+                if (cfg.braceInitListRule.valid()
+                 && tree().rule(nestedCore).v == cfg.braceInitListRule.v)
+                    break;
+                NodeId const only = soleMeaningfulChild(nestedCore);
+                if (!only.valid()) break;
+                nestedCore = only;
+            }
+            HirNodeId valueNode{};
+            if (cfg.braceInitListRule.valid()
+             && tree().kind(nestedCore) == NodeKind::Internal
+             && tree().rule(nestedCore).v == cfg.braceInitListRule.v) {
+                valueNode = lowerBraceInit(nestedCore, valueTargetType);
+            } else {
+                E const ve = lowerExpr(valueExprCst);
+                E const coerced = coerce(ve, valueTargetType);
+                valueNode = coerced.id;
+            }
+            slots[target] = valueNode;
+            cursor = target + 1;
+        }
+
+        std::vector<HirNodeId> children;
+        children.reserve(slotCount);
+        for (std::uint32_t i = 0; i < slotCount; ++i) {
+            children.push_back(slots[i].has_value()
+                                ? *slots[i]
+                                : synthZero(slotType(i)));
+        }
+        return builder.makeConstructAggregate(children, contextType,
+                                              HirFlags::Synthetic);
+    }
+
     // A fresh SymbolId for a lowering-synthesized temporary, minted above the
     // semantic symbol table so it can never collide with a source symbol. These
     // temps are self-contained (declared + referenced within one SeqExpr/Block),
@@ -1519,6 +1717,27 @@ struct Lowerer {
             if (decl && decl->arraySuffix && tree().kind(c) == NodeKind::Internal
                 && tree().rule(c).v == decl->arraySuffix->rule.v)
                 continue;
+            // D5.3: aggregate brace-init `int p[3] = {1,2,3}` /
+            // `struct Point p = {.x=1,.y=2}` — detect the braceInitList
+            // through the surrounding `initValue` alt wrapper. Can't use
+            // `peelToCore` directly because it over-peels through a
+            // braceInitList with a single element (its sole meaningful
+            // child becomes the lone initElement); manually peel
+            // wrapper-rules while stopping AT the braceInitList.
+            if (cfg.braceInitListRule.valid()) {
+                NodeId core = c;
+                while (tree().kind(core) == NodeKind::Internal) {
+                    if (tree().rule(core).v == cfg.braceInitListRule.v) break;
+                    NodeId const only = soleMeaningfulChild(core);
+                    if (!only.valid()) break;
+                    core = only;
+                }
+                if (tree().kind(core) == NodeKind::Internal
+                 && tree().rule(core).v == cfg.braceInitListRule.v) {
+                    init = lowerBraceInit(core, type);
+                    break;
+                }
+            }
             if (classify(c) == Role::Expr) {
                 E const initE = lowerExpr(c);
                 // Coerce the initializer to the declared variable type so a

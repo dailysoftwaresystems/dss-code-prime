@@ -476,9 +476,9 @@
             "designator",
             { "repeat": "designator" },
             "AssignOp",
-            "expression"
+            "initValue"
         ]},
-        "expression"
+        "initValue"
       ]
     },
 
