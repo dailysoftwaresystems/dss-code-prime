@@ -1392,14 +1392,15 @@ struct Lowerer {
                 initBySymbol[sym.v] = *initN;
             }
         }
-        EvalOptions opts;
-        opts.resolveConstSymbol = [&initBySymbol](SymbolId s)
+        EvalEnvironment env;
+        env.resolveConstSymbol = [&initBySymbol](SymbolId s)
                 -> std::optional<HirNodeId> {
             if (auto it = initBySymbol.find(s.v); it != initBySymbol.end()) {
                 return it->second;
             }
             return std::nullopt;
         };
+        EvalOptions opts;
         // MIR-globals matches runtime behaviour: a narrowing initializer
         // wraps modularly (the runtime path would wrap too). Refusing to
         // fold here would only lose an optimization; the value installed
@@ -1423,7 +1424,7 @@ struct Lowerer {
                 // The resolver covers Refs to sibling globals; literal /
                 // arithmetic / Cast paths still fold per CE1.
                 ConstEvalResult const r = evaluateConstant(
-                    hir, interner, literals, *initN, opts);
+                    hir, interner, literals, *initN, env, opts);
                 if (r.value.has_value()) {
                     MirLiteralValue lit;
                     lit.value = r.value->value;

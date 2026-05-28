@@ -252,7 +252,7 @@ TEST(ConstEval, CastFromI32ToI8WithOverflowWrapsWhenAllowed) {
     EvalOptions opts;
     opts.refuseOnOverflow = false;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
     EXPECT_EQ(res.value->core, TypeKind::I8);
@@ -269,7 +269,7 @@ TEST(ConstEval, CastFromI32ToI8WrapsNegativeViaSignExtension) {
     EvalOptions opts;
     opts.refuseOnOverflow = false;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), -1);
 }
@@ -305,7 +305,7 @@ TEST(ConstEval, CastFromI64MinToI32WrapsToZero) {
     EvalOptions opts;
     opts.refuseOnOverflow = false;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
 }
@@ -321,7 +321,7 @@ TEST(ConstEval, CastNegativeToUnsigned64RefusesEvenWithOverflowAllowed) {
     EvalOptions opts;
     opts.refuseOnOverflow = false;   // even permissive policy refuses here
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
 }
@@ -386,7 +386,7 @@ TEST(ConstEval, CastFromI32ToU8WrapsCorrectly) {
     EvalOptions opts;
     opts.refuseOnOverflow = false;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 44);
 }
@@ -588,7 +588,7 @@ TEST(ConstEval, FloatAddFoldsWithAllowFloat) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(add);
-    auto res = evaluateConstant(hir, r.interner, r.literals, add, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, add, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 3.5);
     EXPECT_EQ(res.value->core, TypeKind::F64);
@@ -603,7 +603,7 @@ TEST(ConstEval, FloatDivByZeroProducesInfNotFailure) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(div);
-    auto res = evaluateConstant(hir, r.interner, r.literals, div, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, div, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_TRUE(std::isinf(std::get<double>(res.value->value)));
 }
@@ -618,7 +618,7 @@ TEST(ConstEval, FloatNanPropagates) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(add);
-    auto res = evaluateConstant(hir, r.interner, r.literals, add, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, add, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_TRUE(std::isnan(std::get<double>(res.value->value)));
 }
@@ -633,7 +633,7 @@ TEST(ConstEval, FloatNanEqNanReturnsFalse) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(eq);
-    auto res = evaluateConstant(hir, r.interner, r.literals, eq, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, eq, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
     EXPECT_EQ(res.value->core, TypeKind::Bool);
@@ -648,7 +648,7 @@ TEST(ConstEval, MixedIntFloatBinaryOpPromotesToFloat) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(add);
-    auto res = evaluateConstant(hir, r.interner, r.literals, add, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, add, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 3.5);
 }
@@ -661,7 +661,7 @@ TEST(ConstEval, CastIntToFloat) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 7.0);
     EXPECT_EQ(res.value->core, TypeKind::F64);
@@ -676,7 +676,7 @@ TEST(ConstEval, CastFloatToIntTruncatesTowardZero) {
         EvalOptions opts;
         opts.allowFloat = true;
         Hir hir = r.finishWith(c);
-        auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
         ASSERT_TRUE(res.value.has_value()) << "for input " << in;
         EXPECT_EQ(std::get<std::int64_t>(res.value->value), expected) << "for input " << in;
     };
@@ -694,7 +694,7 @@ TEST(ConstEval, CastNanToIntRefuses) {
     opts.allowFloat       = true;
     opts.refuseOnOverflow = false;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
 }
@@ -708,7 +708,7 @@ TEST(ConstEval, CastFloatToBoolHandlesNaNAndInfAndZero) {
         EvalOptions opts;
         opts.allowFloat = true;
         Hir hir = r.finishWith(c);
-        auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
         ASSERT_TRUE(res.value.has_value()) << "for input " << in;
         EXPECT_EQ(std::get<std::int64_t>(res.value->value), expected) << "for input " << in;
     };
@@ -730,7 +730,7 @@ TEST(ConstEval, LogicalAndAcceptsFloatOperandsWhenAllowFloat) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(and_);
-    auto res = evaluateConstant(hir, r.interner, r.literals, and_, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, and_, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
     EXPECT_EQ(res.value->core, TypeKind::Bool);
@@ -745,7 +745,7 @@ TEST(ConstEval, CastFloatToIntOverflowRefuses) {
     opts.allowFloat       = true;
     opts.refuseOnOverflow = true;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
 }
@@ -758,7 +758,7 @@ TEST(ConstEval, UnaryNegOnFloat) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(neg);
-    auto res = evaluateConstant(hir, r.interner, r.literals, neg, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, neg, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), -3.14);
 }
@@ -774,7 +774,7 @@ TEST(ConstEval, BitNotOnFloatRefusesAsUnsupportedTypeKind) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(bn);
-    auto res = evaluateConstant(hir, r.interner, r.literals, bn, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, bn, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
 }
@@ -789,7 +789,7 @@ TEST(ConstEval, RemOnFloatRefusesAsUnsupportedTypeKind) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(rem);
-    auto res = evaluateConstant(hir, r.interner, r.literals, rem, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, rem, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
 }
@@ -807,7 +807,7 @@ TEST(ConstEval, FloatOrderedComparisonsFold) {
         EvalOptions opts;
         opts.allowFloat = true;
         Hir hir = rig.finishWith(cmp);
-        return evaluateConstant(hir, rig.interner, rig.literals, cmp, opts);
+        return evaluateConstant(hir, rig.interner, rig.literals, cmp, {}, opts);
     };
     auto truthy = [&](HirOpKind op, double l, double r) {
         auto res = run(op, l, r);
@@ -845,7 +845,7 @@ TEST(ConstEval, CastF64ToF32ActuallyNarrows) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(res.value->core, TypeKind::F32);
     double const stored   = std::get<double>(res.value->value);
@@ -863,29 +863,63 @@ TEST(ConstEval, CastIntToF32NarrowsViaFloat) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(res.value->core, TypeKind::F32);
     EXPECT_DOUBLE_EQ(std::get<double>(res.value->value),
                      static_cast<double>(static_cast<float>(16777217.0)));
 }
 
-// F16 / F128 have no host backing — refuse with UnsupportedTypeKind so
-// the engine never stores a `double` under a `core` that doesn't match.
-// Lifting either requires a soft-float helper (deferred — plan 12.5
-// closure §0.2). Today no consumer emits F16/F128 literals.
-TEST(ConstEval, CastF64ToF16RefusesAsUnsupportedTypeKind) {
+// F16 Cast (plan 12.5 §0.2 D1, closed): soft-float `narrowToHalf` rounds
+// to IEEE 754 binary16. Exact halves round-trip; non-exact values round
+// to nearest-even and re-widen to the closest double.
+TEST(ConstEval, CastF64ToF16ExactHalfRoundsTrips) {
     Rig r;
+    // 1.0 is exactly representable in binary16.
     HirNodeId const f = r.litFloat(1.0, r.f64T());
     HirNodeId const c = r.cast(f, r.interner.primitive(TypeKind::F16));
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
-    EXPECT_FALSE(res.value.has_value());
-    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(res.value->core, TypeKind::F16);
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 1.0);
 }
 
+TEST(ConstEval, CastF64ToF16NonExactRoundsAndDoesNotEqualSource) {
+    Rig r;
+    // 0.1 is not exactly representable in binary16; the round-trip
+    // produces a different stored bit pattern (~0.0999755859375).
+    HirNodeId const f = r.litFloat(0.1, r.f64T());
+    HirNodeId const c = r.cast(f, r.interner.primitive(TypeKind::F16));
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(res.value->core, TypeKind::F16);
+    double const stored = std::get<double>(res.value->value);
+    EXPECT_NE(stored, 0.1);   // narrowing happened
+    // Within one half-ULP of 0.1.
+    EXPECT_NEAR(stored, 0.1, 1.0 / 1024.0);
+}
+
+TEST(ConstEval, CastF64ToF16OverflowsToInfinity) {
+    Rig r;
+    HirNodeId const f = r.litFloat(1e10, r.f64T());   // way past F16 max (~65504)
+    HirNodeId const c = r.cast(f, r.interner.primitive(TypeKind::F16));
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_TRUE(std::isinf(std::get<double>(res.value->value)));
+}
+
+// F128 stays refused — no host backing AND no engine arithmetic on F128.
+// Plan 12.5 §0.2 D1b → mapped to plan 19 HR-HW reserved (first consumer
+// owns the soft-float / wider-than-int64 substrate).
 TEST(ConstEval, CastF64ToF128RefusesAsUnsupportedTypeKind) {
     Rig r;
     HirNodeId const f = r.litFloat(1.0, r.f64T());
@@ -893,9 +927,53 @@ TEST(ConstEval, CastF64ToF128RefusesAsUnsupportedTypeKind) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+// Plan 12.5 §0.2 D2 (closed): refuseOnLossyFloatConversion knob.
+// Int→F32 of a 24-bit-precise-or-bigger value loses bits; verifier
+// consumers opt in to refuse. Off-by-default codegen path keeps the
+// runtime-equivalent silent precision loss.
+TEST(ConstEval, CastIntToF32LossyRefusesWhenKnobOn) {
+    Rig r;
+    // 2^24 + 1 = 16777217 — exact in double + int64, NOT in float.
+    HirNodeId const lit = r.litInt(16777217, r.i64T());
+    HirNodeId const c   = r.cast(lit, r.f32T());
+    EvalOptions opts;
+    opts.allowFloat                  = true;
+    opts.refuseOnLossyFloatConversion = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::LossyFloatConversion);
+}
+
+TEST(ConstEval, CastIntToF32LosslessAcceptsWhenKnobOn) {
+    Rig r;
+    // 16777216 = 2^24 — exact in single + double + int64.
+    HirNodeId const lit = r.litInt(16777216, r.i64T());
+    HirNodeId const c   = r.cast(lit, r.f32T());
+    EvalOptions opts;
+    opts.allowFloat                  = true;
+    opts.refuseOnLossyFloatConversion = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 16777216.0);
+}
+
+TEST(ConstEval, CastIntToF32LossyAcceptsByDefault) {
+    Rig r;
+    HirNodeId const lit = r.litInt(16777217, r.i64T());
+    HirNodeId const c   = r.cast(lit, r.f32T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    // refuseOnLossyFloatConversion = false (default) — codegen-equivalent.
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+    ASSERT_TRUE(res.value.has_value());   // accepted with precision loss
 }
 
 // Float→int boundary at exactly 2^63. The naive
@@ -910,7 +988,7 @@ TEST(ConstEval, CastFloatToInt64AtPositiveBoundaryRefuses) {
     EvalOptions opts;
     opts.allowFloat = true;
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
 }
@@ -927,7 +1005,7 @@ TEST(ConstEval, CastFloatOutOfInt64RefusesEvenWithRefuseOnOverflowOff) {
     opts.allowFloat       = true;
     opts.refuseOnOverflow = false;   // knob OFF — but engine still refuses
     Hir hir = r.finishWith(c);
-    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
 }
@@ -943,7 +1021,7 @@ TEST(ConstEval, UnaryNegOnFloatHandlesNaNInfAndNegativeZero) {
         EvalOptions opts;
         opts.allowFloat = true;
         Hir hir = rig.finishWith(n);
-        return evaluateConstant(hir, rig.interner, rig.literals, n, opts);
+        return evaluateConstant(hir, rig.interner, rig.literals, n, {}, opts);
     };
     {
         auto res = neg(std::nan(""));
@@ -1058,7 +1136,7 @@ TEST(ConstEval, RefuseOnDivByZeroPolicyDisabledReportsNotAConstant) {
     EvalOptions opts;
     opts.refuseOnDivByZero = false;
     Hir hir = r.finishWith(div);
-    auto res = evaluateConstant(hir, r.interner, r.literals, div, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, div, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
 }
@@ -1083,13 +1161,13 @@ TEST(ConstEval, RefToConstSymbolFoldsViaResolver) {
     // separate Literal-42 HIR node.
     HirNodeId const aInit = r.litInt(42, r.intT());
     HirNodeId const bInit = r.builder.makeRef(r.intT(), /*sym=*/7);
-    EvalOptions opts;
-    opts.resolveConstSymbol = [&aInit](SymbolId s) -> std::optional<HirNodeId> {
+    EvalEnvironment env;
+    env.resolveConstSymbol = [&aInit](SymbolId s) -> std::optional<HirNodeId> {
         if (s.v == 7) return aInit;
         return std::nullopt;
     };
     Hir hir = r.finishWith(bInit);
-    auto res = evaluateConstant(hir, r.interner, r.literals, bInit, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, bInit, env);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 42);
 }
@@ -1101,14 +1179,14 @@ TEST(ConstEval, RefChainFoldsTransitivelyViaResolver) {
     HirNodeId const aInit = r.litInt(99, r.intT());
     HirNodeId const bInit = r.builder.makeRef(r.intT(), /*sym=*/1);   // a
     HirNodeId const cInit = r.builder.makeRef(r.intT(), /*sym=*/2);   // b
-    EvalOptions opts;
-    opts.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
+    EvalEnvironment env;
+    env.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
         if (s.v == 1) return aInit;
         if (s.v == 2) return bInit;
         return std::nullopt;
     };
     Hir hir = r.finishWith(cInit);
-    auto res = evaluateConstant(hir, r.interner, r.literals, cInit, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, cInit, env);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 99);
 }
@@ -1120,14 +1198,14 @@ TEST(ConstEval, RefCycleDoesNotInfiniteRecurseAndSurfacesNonConstant) {
     Rig r;
     HirNodeId const aInit = r.builder.makeRef(r.intT(), /*sym=*/2);   // a = b
     HirNodeId const bInit = r.builder.makeRef(r.intT(), /*sym=*/1);   // b = a
-    EvalOptions opts;
-    opts.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
+    EvalEnvironment env;
+    env.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
         if (s.v == 1) return aInit;
         if (s.v == 2) return bInit;
         return std::nullopt;
     };
     Hir hir = r.finishWith(aInit);
-    auto res = evaluateConstant(hir, r.interner, r.literals, aInit, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, aInit, env);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
     // Blame anchors at the USE site (the top-level Ref the caller passed),
@@ -1142,12 +1220,12 @@ TEST(ConstEval, RefCycleDoesNotInfiniteRecurseAndSurfacesNonConstant) {
 TEST(ConstEval, RefToNonConstantSymbolViaResolverFails) {
     Rig r;
     HirNodeId const ref = r.builder.makeRef(r.intT(), /*sym=*/42);
-    EvalOptions opts;
-    opts.resolveConstSymbol = [](SymbolId) -> std::optional<HirNodeId> {
+    EvalEnvironment env;
+    env.resolveConstSymbol = [](SymbolId) -> std::optional<HirNodeId> {
         return std::nullopt;   // every symbol is "not a constant"
     };
     Hir hir = r.finishWith(ref);
-    auto res = evaluateConstant(hir, r.interner, r.literals, ref, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, ref, env);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
 }
@@ -1161,13 +1239,13 @@ TEST(ConstEval, RefAndArithmeticCompose) {
     HirNodeId const refA  = r.builder.makeRef(r.intT(), /*sym=*/5);
     HirNodeId const fourLit = r.litInt(4, r.intT());
     HirNodeId const bInit = r.binary(HirOpKind::Add, refA, fourLit, r.intT()); // a+4 = 7
-    EvalOptions opts;
-    opts.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
+    EvalEnvironment env;
+    env.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
         if (s.v == 5) return aInit;
         return std::nullopt;
     };
     Hir hir = r.finishWith(bInit);
-    auto res = evaluateConstant(hir, r.interner, r.literals, bInit, opts);
+    auto res = evaluateConstant(hir, r.interner, r.literals, bInit, env);
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 7);
 }

@@ -5,6 +5,7 @@
 #include "hir/hir_op.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <unordered_set>
 
@@ -266,33 +267,173 @@ applyBinaryFloat(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& 
     }
 }
 
-// Float target descriptor: width in bits. Used by Cast to choose the
-// right host-precision narrowing AND to refuse precise-loss targets the
-// engine cannot represent (F16 / F128: no host type; values would
-// silently stay as `double`, breaking `HirLiteralValue::core` ↔ variant-
-// arm contract). F32 narrows via `static_cast<float>` round-trip;
-// F64 is identity. F16 / F128 refuse with `UnsupportedTypeKind` until
-// a host soft-float helper lands.
+// Float target descriptor: width in bits + how the engine narrows TO it.
+// F64 is identity, F32 narrows via host `static_cast<float>` round-trip,
+// F16 narrows via the soft-float `narrowToHalf` helper below (IEEE 754
+// binary16 — same round-to-nearest-even the runtime would apply). F128
+// has no host backing AND no engine arithmetic operates on it; refused
+// uniformly (plan 12.5 §0.2 D1b — mapped to plan 19 hir-hw-reserved
+// when an HDL consumer first needs wider-than-64-bit precision).
 [[nodiscard]] bool isFloatKind(TypeKind k) noexcept {
     return k == TypeKind::F16 || k == TypeKind::F32
         || k == TypeKind::F64 || k == TypeKind::F128;
 }
 
+// Soft-float narrow `double → IEEE 754 binary16 → double`. Produces the
+// closest representable half-precision value of `dv`, then widens back
+// to `double` (lossless since every half is exactly representable in
+// double). NaN / ±inf preserved; subnormals + ±0 + overflow-to-inf all
+// follow IEEE 754 round-to-nearest-even. Inlined here rather than
+// pulled into a library because the helper is one consumer (this Cast
+// quadrant) until a shader cycle introduces F16 arithmetic.
+[[nodiscard]] double narrowToHalf(double dv) noexcept {
+    // Strategy: go through host float first (binary32 is a superset of
+    // binary16 — exact half values round-trip; non-exact values get the
+    // intermediate single-precision rounding, then we round again from
+    // single to half. Double-rounding is acceptable here since the only
+    // round-to-nearest-even mismatch case requires a value exactly
+    // between two halves whose nearest single is exactly between two
+    // singles — that pre-image is empty for binary16/binary32).
+    float const fv = static_cast<float>(dv);
+    // Decompose binary32 bits.
+    std::uint32_t bits;
+    static_assert(sizeof(float) == sizeof(std::uint32_t));
+    std::memcpy(&bits, &fv, sizeof(bits));
+    std::uint32_t const sign     = (bits >> 31) & 0x1u;
+    std::uint32_t const exp32    = (bits >> 23) & 0xFFu;
+    std::uint32_t const mant32   =  bits        & 0x7FFFFFu;
+    std::uint16_t half;
+    if (exp32 == 0xFFu) {
+        // NaN / inf — preserve.
+        half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10) |
+            (mant32 != 0 ? (mant32 >> 13) | 0x200u : 0u));
+    } else if (exp32 == 0) {
+        // ±0 (and binary32 subnormals — already underflow in half).
+        half = static_cast<std::uint16_t>(sign << 15);
+    } else {
+        int const e = static_cast<int>(exp32) - 127 + 15;   // re-bias
+        if (e >= 0x1F) {
+            // Overflow → ±inf.
+            half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10));
+        } else if (e <= 0) {
+            // Subnormal half or underflow to zero. Shift mantissa with
+            // implicit leading 1, with round-to-nearest-even.
+            std::uint32_t const mant = mant32 | 0x800000u;   // implicit 1
+            int const shift = 14 - e;   // shift to align to half mantissa
+            if (shift >= 25) {
+                half = static_cast<std::uint16_t>(sign << 15);   // underflow
+            } else {
+                std::uint32_t const rounded = mant >> shift;
+                std::uint32_t const rem     = mant & ((1u << shift) - 1u);
+                std::uint32_t const half_lsb = 1u << (shift - 1);
+                std::uint32_t out = rounded;
+                if (rem > half_lsb || (rem == half_lsb && (rounded & 1u))) {
+                    out += 1;   // round-to-nearest-even
+                }
+                half = static_cast<std::uint16_t>((sign << 15) | (out & 0x3FFu));
+            }
+        } else {
+            // Normal half. Take top 10 mantissa bits with round-to-nearest-even
+            // on the discarded low bits.
+            std::uint32_t const mant = mant32;
+            std::uint32_t const rounded = mant >> 13;
+            std::uint32_t const rem     = mant & 0x1FFFu;
+            std::uint32_t const half_lsb = 0x1000u;
+            std::uint32_t out = rounded;
+            if (rem > half_lsb || (rem == half_lsb && (rounded & 1u))) {
+                out += 1;
+                if (out == 0x400u) {   // mantissa overflow → bump exponent
+                    out = 0;
+                    if (e + 1 >= 0x1F) {
+                        // Rounded into overflow → ±inf.
+                        half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10));
+                        goto done;
+                    }
+                    half = static_cast<std::uint16_t>(
+                        (sign << 15) | (static_cast<std::uint32_t>(e + 1) << 10));
+                    goto done;
+                }
+            }
+            half = static_cast<std::uint16_t>(
+                (sign << 15) | (static_cast<std::uint32_t>(e) << 10) | (out & 0x3FFu));
+        }
+    }
+done:
+    // Widen back to double via binary32 (exact; binary16 ⊂ binary32 ⊂ binary64).
+    std::uint32_t const wsign = (static_cast<std::uint32_t>(half) >> 15) & 0x1u;
+    std::uint32_t const wexp  = (static_cast<std::uint32_t>(half) >> 10) & 0x1Fu;
+    std::uint32_t const wmant =  static_cast<std::uint32_t>(half)        & 0x3FFu;
+    std::uint32_t wbits;
+    if (wexp == 0x1Fu) {
+        wbits = (wsign << 31) | (0xFFu << 23) | (wmant << 13);   // NaN / inf
+    } else if (wexp == 0) {
+        if (wmant == 0) {
+            wbits = wsign << 31;   // ±0
+        } else {
+            // Half-subnormal → binary32 normal. Find leading bit of mant.
+            std::uint32_t m = wmant;
+            int e = -1;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3FFu;   // drop the leading 1 we just landed on
+            wbits = (wsign << 31) |
+                    (static_cast<std::uint32_t>(127 - 14 + e + 1) << 23) |
+                    (m << 13);
+        }
+    } else {
+        wbits = (wsign << 31) |
+                (static_cast<std::uint32_t>(static_cast<int>(wexp) - 15 + 127) << 23) |
+                (wmant << 13);
+    }
+    float fout;
+    std::memcpy(&fout, &wbits, sizeof(fout));
+    return static_cast<double>(fout);
+}
+
 struct FloatKindInfo {
     int bits;        // 16 / 32 / 64 / 128
-    bool hostBacked; // true iff `double` storage carries an exact value
-                     // for this width — F32 + F64 are host-backed (with
-                     // F32 needing a narrowing round-trip); F16 + F128
-                     // are NOT (no host type, soft-float deferred).
+    bool hostBacked; // true iff Cast TO this width has an engine-supported
+                     // narrowing path: F16 (soft-float via narrowToHalf),
+                     // F32 (host static_cast<float>), F64 (identity).
+                     // F128 lacks a soft-float helper (no host backing +
+                     // no arithmetic consumer); refused with
+                     // UnsupportedTypeKind — plan 12.5 §0.2 D1b mapped
+                     // to plan 19 hir-hw-reserved.
 };
 [[nodiscard]] std::optional<FloatKindInfo> floatKindInfo(TypeKind k) noexcept {
     switch (k) {
-        case TypeKind::F16:  return FloatKindInfo{16,  false};
+        case TypeKind::F16:  return FloatKindInfo{16,  true};
         case TypeKind::F32:  return FloatKindInfo{32,  true};
         case TypeKind::F64:  return FloatKindInfo{64,  true};
         case TypeKind::F128: return FloatKindInfo{128, false};
         default: return std::nullopt;
     }
+}
+
+[[nodiscard]] double narrowToFloatWidth(double dv, int bits) noexcept {
+    switch (bits) {
+        case 16: return narrowToHalf(dv);
+        case 32: return static_cast<double>(static_cast<float>(dv));
+        default: return dv;   // F64: identity
+    }
+}
+
+// Lossy-conversion check for the integer→float Cast quadrant. Returns
+// true iff the int→double→target-float→back-to-int round-trip preserves
+// the original integer bits — i.e., NO precision loss happened in the
+// widening + narrowing pass. Verifier consumers opt into refusal via
+// `EvalOptions::refuseOnLossyFloatConversion` (plan 12.5 §0.2 D2,
+// mapped to plan 09 HIR verifier evolution).
+[[nodiscard]] bool intToFloatIsLossless(std::int64_t iv, int targetBits) noexcept {
+    double const widened = static_cast<double>(iv);
+    double const narrowed = narrowToFloatWidth(widened, targetBits);
+    // Re-tighten to int64 and check exact equality. `static_cast<int64_t>`
+    // from a double in [INT64_MIN, INT64_MAX] is well-defined; values
+    // outside that range can't appear here because `iv` came FROM int64.
+    if (!std::isfinite(narrowed)) return false;
+    if (narrowed < static_cast<double>(std::numeric_limits<std::int64_t>::min())
+     || narrowed >= 9223372036854775808.0)
+        return false;
+    return static_cast<std::int64_t>(narrowed) == iv;
 }
 
 // Integer target descriptor: width in bits + signedness. `Bool` is a
@@ -366,7 +507,7 @@ struct IntKindInfo {
 // `evaluateConstant` seeds an empty set.
 [[nodiscard]] ConstEvalResult
 evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
-         HirNodeId expr, EvalOptions const& options,
+         HirNodeId expr, EvalEnvironment const& env, EvalOptions const& options,
          std::unordered_set<std::uint32_t>& visitedSyms) {
     if (!expr.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     HirKind const k = hir.kind(expr);
@@ -379,20 +520,20 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         // resolver callback. Absent callback (CE1's behaviour) or absent
         // mapping → NotAConstantExpression. Cycle detection prevents
         // infinite recursion on `int a = b; int b = a;`-shape inputs.
-        if (!options.resolveConstSymbol) {
+        if (!env.resolveConstSymbol) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
         std::uint32_t const sym = hir.payload(expr);
         if (visitedSyms.contains(sym)) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        auto definingExpr = options.resolveConstSymbol(SymbolId{sym});
+        auto definingExpr = env.resolveConstSymbol(SymbolId{sym});
         if (!definingExpr.has_value() || !definingExpr->valid()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
         visitedSyms.insert(sym);
         ConstEvalResult inner = evalImpl(hir, interner, literals,
-                                         *definingExpr, options, visitedSyms);
+                                         *definingExpr, env, options, visitedSyms);
         visitedSyms.erase(sym);
         // On failure, re-blame at the Ref USE site rather than wherever
         // the definition tree's failure surfaced. The caller (a
@@ -409,7 +550,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         HirOpKind const op = decodeCoreOp(payload);
         auto kids = hir.children(expr);
         if (kids.size() != 1) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
+        ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
         if (!inner.value.has_value()) return inner;
         // Float operand routes through the float path (CE5) only when
         // `allowFloat` is opted in by the caller. Without the knob, a
@@ -450,9 +591,9 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         HirOpKind const op = decodeCoreOp(payload);
         auto kids = hir.children(expr);
         if (kids.size() != 2) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult a = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
+        ConstEvalResult a = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
         if (!a.value.has_value()) return a;
-        ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], options, visitedSyms);
+        ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], env, options, visitedSyms);
         if (!b.value.has_value()) return b;
         // CE5: float promotion. Per C99 UAC, if either operand is float
         // the other promotes to float and the op runs in IEEE 754. Without
@@ -559,7 +700,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         // Pointer / aggregate targets remain non-foldable.
         auto kids = hir.children(expr);
         if (kids.size() != 1) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
+        ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
         if (!inner.value.has_value()) return inner;
         TypeId const targetTy = hir.typeId(expr);
         if (!targetTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
@@ -595,12 +736,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             double const dv = *asDouble(*inner.value);
             HirLiteralValue folded;
             folded.core  = toK;
-            // F32 narrows via host `float` round-trip — this performs
-            // the IEEE 754 round-to-nearest-even rounding the runtime
-            // does. F64 is identity (already `double`).
-            folded.value = (info->bits == 32)
-                ? static_cast<double>(static_cast<float>(dv))
-                : dv;
+            folded.value = narrowToFloatWidth(dv, info->bits);
             return ok(std::move(folded));
         }
 
@@ -614,12 +750,14 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             }
             auto iv64 = asInt64(*inner.value);
             if (!iv64.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            if (options.refuseOnLossyFloatConversion
+             && !intToFloatIsLossless(*iv64, info->bits)) {
+                return fail(ConstEvalFailure::LossyFloatConversion, expr);
+            }
             double const widened = static_cast<double>(*iv64);
             HirLiteralValue folded;
             folded.core  = toK;
-            folded.value = (info->bits == 32)
-                ? static_cast<double>(static_cast<float>(widened))
-                : widened;
+            folded.value = narrowToFloatWidth(widened, info->bits);
             return ok(std::move(folded));
         }
 
@@ -725,7 +863,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         // combine. Result core is always Bool.
         auto kids = hir.children(expr);
         if (kids.size() != 2) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult a = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
+        ConstEvalResult a = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
         if (!a.value.has_value()) return a;
         // `asBool` handles both integer and float operands (the latter
         // only when `allowFloat` is on); NaN / ±inf evaluate to true per
@@ -741,7 +879,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             return ok(makeBoolLiteral(aIsTrue ? 1 : 0));
         }
         // No short-circuit; need `b` to determine the result.
-        ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], options, visitedSyms);
+        ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], env, options, visitedSyms);
         if (!b.value.has_value()) return b;
         auto bIsTrueOpt = asBool(*b.value, options.allowFloat);
         if (!bIsTrueOpt.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
@@ -764,7 +902,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         // discipline as BinaryOp's `commonType` retag above.
         auto kids = hir.children(expr);
         if (kids.size() != 3) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult cond = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
+        ConstEvalResult cond = evalImpl(hir, interner, literals, kids[0], env, options, visitedSyms);
         if (!cond.value.has_value()) return cond;
         // Cond truthiness via the shared `asBool` (CE5): accepts float
         // operands when `allowFloat` is on, applying the same NaN/inf →
@@ -773,7 +911,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         if (!condIsTrueOpt.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         HirNodeId const selected = *condIsTrueOpt ? kids[1] : kids[2];
         ConstEvalResult inner = evalImpl(hir, interner, literals,
-                                         selected, options, visitedSyms);
+                                         selected, env, options, visitedSyms);
         if (inner.value.has_value()) {
             TypeId const ternTy = hir.typeId(expr);
             if (ternTy.valid()) inner.value->core = interner.kind(ternTy);
@@ -789,9 +927,10 @@ ConstEvalResult evaluateConstant(Hir const& hir,
                                  TypeInterner& interner,
                                  HirLiteralPool const& literals,
                                  HirNodeId expr,
+                                 EvalEnvironment env,
                                  EvalOptions options) {
     std::unordered_set<std::uint32_t> visitedSyms;
-    return evalImpl(hir, interner, literals, expr, options, visitedSyms);
+    return evalImpl(hir, interner, literals, expr, env, options, visitedSyms);
 }
 
 } // namespace dss

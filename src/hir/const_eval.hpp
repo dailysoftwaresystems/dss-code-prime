@@ -56,15 +56,18 @@
 //     `<cmath>` IEEE 754 semantics (round-to-nearest-even rounding;
 //     NaN propagates; ±inf on overflow; comparisons against NaN return
 //     false — including `NaN == NaN`). Cast quadrants: int↔float (host
-//     conversion; F32 target performs the IEEE narrowing via a
-//     `static_cast<float>` round-trip), float→bool (`x != 0.0`,
-//     NaN/±inf → true), float→int (truncate toward zero; refuses with
-//     `Overflow` for NaN/±inf and for out-of-int64 truncated values —
-//     refusal is UNCONDITIONAL of `refuseOnOverflow` because the C99
-//     bit-pattern is implementation-defined; the wrap-knob applies only
-//     to the inner-range "fits int64 but not target" case), float→float
-//     (F32 narrows, F64 identity; F16 / F128 refuse with
-//     `UnsupportedTypeKind` — no host backing, soft-float deferred).
+//     conversion; F32 target narrows via `static_cast<float>` round-trip;
+//     F16 target narrows via the engine's soft-float `narrowToHalf`
+//     helper — IEEE 754 binary16, plan-12.5 §0.2 D1 closed),
+//     float→bool (`x != 0.0`, NaN/±inf → true), float→int (truncate
+//     toward zero; refuses with `Overflow` for NaN/±inf and for
+//     out-of-int64 truncated values — refusal is UNCONDITIONAL of
+//     `refuseOnOverflow` because the C99 bit-pattern is
+//     implementation-defined; the wrap-knob applies only to the
+//     inner-range "fits int64 but not target" case), float→float
+//     (F32 / F16 narrow, F64 identity; F128 refuses with
+//     `UnsupportedTypeKind` — no host backing AND no F128 arithmetic
+//     consumer today; plan-12.5 §0.2 D1b mapped to plan 19).
 //     Logical and Ternary cond accept floats too (via the shared
 //     `asBool(value, allowFloat)` helper). When `allowFloat=false`
 //     any float-involving operand refuses with `UnsupportedTypeKind`.
@@ -72,7 +75,11 @@
 //     Rem/Bitwise/Shift on float) surface `UnsupportedTypeKind` (the
 //     operator IS modelled by the engine; the type is wrong) — the
 //     `UnsupportedOperator` code is reserved for the genuine "engine
-//     doesn't fold this op yet" case.
+//     doesn't fold this op yet" case. `refuseOnLossyFloatConversion`
+//     (plan-12.5 §0.2 D2 closed) makes int→float Cast refuse with
+//     `LossyFloatConversion` when the value can't round-trip through
+//     the target precision — for verifier consumers that want
+//     "you're losing bits" diagnostics; off by default for codegen.
 
 namespace dss {
 
@@ -94,6 +101,9 @@ enum class ConstEvalFailure : std::uint8_t {
                                // future cycle alongside float folding)
     UnsupportedOperator,       // op not modelled at this CE level
     UnsupportedTypeKind,       // e.g. float folding when allowFloat=false
+    LossyFloatConversion,      // refuseOnLossyFloatConversion: int→double widening
+                               // didn't round-trip (≥2^53-ish), caller wants strict
+                               // (verifier-evolution consumer, plan-09 mapped item)
 };
 
 // Language-blind callback for `Ref`-to-constant-symbol resolution (CE2).
@@ -113,15 +123,32 @@ enum class ConstEvalFailure : std::uint8_t {
 using ConstSymbolResolver =
     std::function<std::optional<HirNodeId>(SymbolId)>;
 
-// Caller-controlled options. Policy knobs + (CE2) the optional symbol
-// resolver. The resolver default is an empty std::function — Ref-to-
-// symbol then surfaces `NotAConstantExpression` (CE1's behaviour).
-struct EvalOptions {
+// Caller-supplied environment — closure-carrying capabilities (resolvers)
+// the engine uses to descend into things outside the local subtree. Kept
+// SEPARATE from `EvalOptions` (policy bools) so the two structurally
+// different concerns don't tangle as more resolvers accrete (architecture-
+// review folded item D4 from plan 12.5 §0.2). When a second function-
+// typed field arrives (e.g. `resolveTypeLayout` for SizeOf folding,
+// tracked in plan 12 post-ML8), it joins here, not `EvalOptions`.
+struct EvalEnvironment {
     ConstSymbolResolver resolveConstSymbol{};   // CE2
-    bool allowFloat              = false;       // gates float folding (CE5)
-    bool refuseOnOverflow        = true;
-    bool refuseOnDivByZero       = true;
-    bool refuseOnShiftOutOfRange = true;
+};
+
+// Caller-controlled policy. Pure bool knobs — no closures, no environment.
+// Defaults are the "strictest sensible" choice; codegen consumers
+// (MIR-globals) relax `refuseOnOverflow` (runtime-equivalent wrap)
+// and opt `allowFloat` on; verifier consumers keep defaults.
+struct EvalOptions {
+    bool allowFloat                  = false;   // gates float folding (CE5)
+    bool refuseOnOverflow            = true;
+    bool refuseOnDivByZero           = true;
+    bool refuseOnShiftOutOfRange     = true;
+    // Plan 12.5 §0.2 D2 → mapped to plan 09 verifier evolution. When
+    // ON, `asDouble`'s int64/uint64 → double widening checks the
+    // round-trip; values that lose precision (≥2^53 magnitude) refuse
+    // with `LossyFloatConversion`. OFF by default — codegen consumers
+    // want runtime-equivalent silent precision loss.
+    bool refuseOnLossyFloatConversion = false;
 };
 
 struct ConstEvalResult {
@@ -140,6 +167,7 @@ evaluateConstant(Hir const& hir,
                  TypeInterner& interner,
                  HirLiteralPool const& literals,
                  HirNodeId expr,
-                 EvalOptions options = {});
+                 EvalEnvironment env     = {},
+                 EvalOptions     options = {});
 
 } // namespace dss
