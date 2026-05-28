@@ -1380,13 +1380,19 @@ struct Lowerer {
         return std::nullopt;
     }
 
-    // D5.3 cycle 1b InitSlot tree node. Each slot holds EITHER a direct
-    // value (positional element or leaf-of-designator-chain) OR a list
-    // of recursively-in-progress sub-slots. The flat slot vector that
-    // cycle 1a used IS the cycle 1b tree's root level — every level
-    // below the root is a sub-aggregate addressed by deeper designators.
-    // Used only inside `lowerBraceInit`; declared here as a helper type
-    // so its operations can be free-recursive member methods.
+    // D5.3 cycle 1b InitSlot tree node. The intended invariant is
+    // EITHER `value` set (direct element / leaf of a designator chain)
+    // OR `nested` populated (in-progress sub-aggregate addressed by
+    // deeper designators) OR neither (empty — flattens to
+    // `synthZeroOrError`). The xor is maintained by the helper methods
+    // (`writeInitSlotAt` clears `nested` when writing `value`;
+    // `initSlotAsAggregate` resets `value` when growing `nested`;
+    // `flattenInitSlot` reads `value` first). Do NOT mutate the fields
+    // directly — go through the helpers, or convert to
+    // `std::variant<monostate, HirNodeId, std::vector<InitSlot>>` if
+    // direct-mutation paths grow (the variant rewrite is the compile-
+    // checked form; cycle 1b chose the field form to keep diff size
+    // small for the substrate-only landing).
     struct InitSlot {
         std::optional<HirNodeId> value;
         std::vector<InitSlot>    nested;
@@ -1478,9 +1484,11 @@ struct Lowerer {
         bool const isArray = (containerKind == TypeKind::Array);
         bool const isStruct = (containerKind == TypeKind::Struct);
         if (containerKind == TypeKind::Union) {
+            // Internal anchor: union brace-init has distinct semantics
+            // (one active member; no zero-fill across overlapping
+            // variants); deferred to plan 00 §0.2 D5.4 (unions).
             return reportedError(braceInitListNode,
-                "union brace-init not supported in cycle 1b "
-                "(deferred to D5.4 — unions)");
+                "union brace-init is not yet supported");
         }
         if (!isArray && !isStruct) {
             return reportedError(braceInitListNode,
@@ -1568,19 +1576,44 @@ struct Lowerer {
             for (NodeId c : visible(elem)) {
                 if (isToken(c)) continue;
                 if (tree().kind(c) != NodeKind::Internal) continue;
-                std::uint32_t const r = tree().rule(c).v;
+                // A designator child may be wrapped: the c-subset
+                // grammar has `designator: alt[designatedField,
+                // designatedIndex]` which parses to an auto-interned
+                // alt-wrapper internal whose rule != designatedFieldRule
+                // / designatedIndexRule. Peel via `soleMeaningfulChild`
+                // descent until a recognized designator-leaf rule is
+                // reached. Without this, dot-chained `.a.b = 1`
+                // silently degraded to a positional element (the
+                // substrate-blocked diagnostic never fired).
+                NodeId designatorCore = c;
+                while (tree().kind(designatorCore) == NodeKind::Internal) {
+                    std::uint32_t const rr = tree().rule(designatorCore).v;
+                    if (cfg.designatedFieldRule.valid()
+                     && rr == cfg.designatedFieldRule.v) break;
+                    if (cfg.designatedIndexRule.valid()
+                     && rr == cfg.designatedIndexRule.v) break;
+                    NodeId const only = soleMeaningfulChild(designatorCore);
+                    if (!only.valid()) break;
+                    designatorCore = only;
+                }
+                std::uint32_t const r =
+                    (tree().kind(designatorCore) == NodeKind::Internal)
+                        ? tree().rule(designatorCore).v
+                        : std::uint32_t{0};
                 if (cfg.designatedFieldRule.valid()
                  && r == cfg.designatedFieldRule.v) {
                     ++designatorCount;
                     if (designatorCount > 1) {
-                        reportedError(c,
-                            "dot-chained field designator not yet "
-                            "supported (pending TypeId→struct-symbol "
-                            "substrate, plan 08.5 §SP3)");
+                        // Anchor: plan 08.5 §SP3 — TypeId→declaring-symbol
+                        // substrate enables `.b` lookup in field `.a`'s
+                        // type's scope; required for chained-resolution.
+                        reportedError(designatorCore,
+                            "dot-chained field designator is not yet "
+                            "supported");
                         designatorFailed = true;
                         continue;
                     }
-                    designated = resolveFieldDesignator(c);
+                    designated = resolveFieldDesignator(designatorCore);
                     if (designated.has_value() && *designated < 0)
                         designatorFailed = true;
                     continue;
@@ -1589,17 +1622,19 @@ struct Lowerer {
                  && r == cfg.designatedIndexRule.v) {
                     ++designatorCount;
                     if (designatorCount > 1) {
-                        reportedError(c,
-                            "chained index designator not yet supported");
+                        reportedError(designatorCore,
+                            "chained index designator is not yet supported");
                         designatorFailed = true;
                         continue;
                     }
-                    auto idx = resolveIndexDesignatorLiteral(c);
+                    // Anchor: arbitrary const-expression indices need
+                    // CST-side const-eval (HIR builder is write-only and
+                    // const_eval consumes HIR); integer-literal indices
+                    // already handled.
+                    auto idx = resolveIndexDesignatorLiteral(designatorCore);
                     if (!idx.has_value()) {
-                        reportedError(c,
-                            "index designator must be an integer literal "
-                            "(arbitrary const-expression indices require "
-                            "CST-side const-eval, plan 09 §D5.3-cycle-1b)");
+                        reportedError(designatorCore,
+                            "index designator must be an integer literal");
                         designatorFailed = true;
                         continue;
                     }
