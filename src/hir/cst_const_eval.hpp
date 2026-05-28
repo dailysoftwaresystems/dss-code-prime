@@ -48,10 +48,14 @@ class Tree;
 //   - semantic-time scope-chain walking (read `tree.text(identTok)`),
 //   - frozen-SemanticModel lookup (`model.symbolAt(identTok)`).
 // The engine guarantees `identTok` is a token CST node. Closure-
-// carrying state goes through the std::function capture. Cycle safety:
-// the engine tracks a per-call visited-name set keyed on identifier
-// text so `const int a = b; const int b = a;` surfaces
-// `NotAConstantExpression` at the second encounter.
+// carrying state goes through the std::function capture. Cycle
+// safety: the engine tracks a per-call visited-set keyed on the
+// RESOLVED init-expression NodeId (NOT on identifier text — text-
+// keyed detection produces false-positive cycles under shadowing
+// because the same name can refer to different symbols across
+// scopes). `const int a = b; const int b = a;` still surfaces
+// `NotAConstantExpression` at the second encounter because both
+// arms revisit the same init-NodeId.
 using CstSymbolInitResolver =
     std::function<std::optional<NodeId>(NodeId)>;
 

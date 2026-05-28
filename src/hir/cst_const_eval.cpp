@@ -356,7 +356,11 @@ findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
     // NOT the type / name / params / body / array-suffix. The full
     // role-skip list closes the latent bug where a `const`-qualified
     // function decl's `funcDefTail` body would have been mistaken
-    // for the init expression.
+    // for the init expression. **Maintainer note**: adding any new
+    // positional-child role to `DeclarationRule` (a future
+    // `templateParamsChild`, `attributesChild`, `qualifiersChild`,
+    // …) MUST extend this skip list — otherwise the first Internal
+    // child under that new role becomes a silent false-positive init.
     RuleId const arraySufRule = decl.arraySuffix.has_value()
         ? decl.arraySuffix->rule : RuleId{};
     auto positional = [&](std::optional<std::uint32_t> pos, std::uint32_t i) {
