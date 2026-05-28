@@ -3193,6 +3193,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     FieldChildrenDescriptor fcd;
                                     fcd.rule     = data.rules->find(rn);
                                     fcd.ruleName = rn;
+                                    // D5.4: optional `compositeKind` discriminates
+                                    // struct (default) vs union for Pass 1.5
+                                    // type-interning.
+                                    if (fc.contains("compositeKind")) {
+                                        if (!fc.at("compositeKind").is_string()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/fieldChildren/compositeKind",
+                                                      "'compositeKind' must be a string "
+                                                      "'struct' or 'union'");
+                                        } else {
+                                            auto k = fc.at("compositeKind").get<std::string>();
+                                            if (k == "struct") {
+                                                fcd.compositeKind = CompositeKind::Struct;
+                                            } else if (k == "union") {
+                                                fcd.compositeKind = CompositeKind::Union;
+                                            } else {
+                                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                          path + "/fieldChildren/compositeKind",
+                                                          std::format("'compositeKind' must be "
+                                                                      "'struct' or 'union' (got '{}')",
+                                                                      k));
+                                            }
+                                        }
+                                    }
                                     rule.fieldChildren = std::move(fcd);
                                 }
                             }

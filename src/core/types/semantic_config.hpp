@@ -108,22 +108,25 @@ struct DSS_EXPORT ArraySuffix {
     std::optional<std::uint32_t> lengthChild;   // visible-child index of the length expr
 };
 
-// D5.1: a composite-type-introducing declaration. When a declaration carries
-// `fieldChildren`, Pass 1.5 walks the scope it opened, collects every minted
-// symbol whose declaring rule == `rule` (in declaration order, via each field's
-// `SymbolRecord::fieldIndex`), and composes a `TypeKind::Struct` lattice type
-// over their resolved types. The struct symbol's `type` is set to the resulting
-// `interner.structType(name, fieldTypes)`. Generic facet — works for any
-// language with field-bearing record types (D5.4 unions add a second variant
-// via `unionVariant: true` on a parallel descriptor).
+// D5.1 / D5.4: a composite-type-introducing declaration. When a declaration
+// carries `fieldChildren`, Pass 1.5 walks the scope it opened, collects every
+// minted symbol whose declaring rule == `rule` (in declaration order, via each
+// field's `SymbolRecord::fieldIndex`), and composes either a `TypeKind::Struct`
+// or `TypeKind::Union` lattice type (per `compositeKind`) over their resolved
+// types. The composite symbol's `type` is set to the result. Generic facet —
+// works for any language with field-bearing record / variant types.
+//
+// `compositeKind` controls struct-vs-union interning (default = `Struct`).
 //
 // The facet ONLY makes sense paired with a `scopes` entry for the same rule
-// (so fields bind into the struct's inner scope, not the enclosing one). The
-// loader rejects a `fieldChildren` whose declaration rule is not also in
+// (so fields bind into the composite's inner scope, not the enclosing one).
+// The loader rejects a `fieldChildren` whose declaration rule is not also in
 // `scopes` via `C_InvalidSemantics`.
+enum class CompositeKind : std::uint8_t { Struct, Union };
 struct DSS_EXPORT FieldChildrenDescriptor {
-    RuleId      rule{};      // the field-declaration rule (e.g. structField)
-    std::string ruleName;    // source spelling, for diagnostics
+    RuleId        rule{};                          // the field-declaration rule
+    std::string   ruleName;                        // source spelling, for diagnostics
+    CompositeKind compositeKind = CompositeKind::Struct;
 };
 
 struct DSS_EXPORT DeclarationRule {

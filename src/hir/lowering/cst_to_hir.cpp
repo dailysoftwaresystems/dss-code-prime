@@ -1229,11 +1229,25 @@ struct Lowerer {
     // would be `Array` — a type-system corruption.
     [[nodiscard]] HirNodeId synthZeroOrError(NodeId at, TypeId type) {
         TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
-        if (core == TypeKind::Struct || core == TypeKind::Union) {
+        if (core == TypeKind::Struct) {
             auto const fields = interner.operands(type);
             std::vector<HirNodeId> children;
             children.reserve(fields.size());
             for (TypeId ft : fields) children.push_back(synthZeroOrError(at, ft));
+            return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
+        }
+        if (core == TypeKind::Union) {
+            // C99 §6.7.8p10: a zero-initialized union has its FIRST member
+            // zero-initialized; no overlap-zero across variants. The HIR
+            // aggregate emits exactly one child: the zero-fill of the
+            // first variant.
+            auto const variants = interner.operands(type);
+            if (variants.empty()) {
+                return reportedError(at,
+                    "synthZero reached a malformed Union type "
+                    "(no variants)");
+            }
+            std::vector<HirNodeId> children{ synthZeroOrError(at, variants[0]) };
             return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
         }
         if (core == TypeKind::Array) {
@@ -1446,6 +1460,163 @@ struct Lowerer {
                                               HirFlags::Synthetic);
     }
 
+    // D5.4: union brace-init lowering. Unions hold exactly ONE active
+    // variant at a time; their brace-init must therefore initialize
+    // exactly one of the declared variants. C99 §6.7.8p9 / p17:
+    //   • positional `{ expr }` → initializes the FIRST variant.
+    //   • designator `{ .name = expr }` → initializes the named
+    //     variant. With no other variants zero-filled (overlapping
+    //     storage; only the chosen variant is live).
+    //   • multiple elements → diagnostic. The grammar's brace-init
+    //     allows N elements; the SEMANTICS for unions cap at 1.
+    // Result: a 1-child `ConstructAggregate(value, contextType)`.
+    // Empty `{}` produces the same shape as `synthZeroOrError(union)`
+    // (first-variant zero-fill).
+    [[nodiscard]] HirNodeId lowerUnionBraceInit(NodeId braceInitListNode,
+                                                TypeId contextType) {
+        auto const variants = interner.operands(contextType);
+        if (variants.empty()) {
+            return reportedError(braceInitListNode,
+                "union brace-init target has no variants");
+        }
+        // Collect all initElement children up front so we can diagnose
+        // multi-element forms before lowering anything.
+        std::vector<NodeId> elements;
+        for (NodeId c : visible(braceInitListNode)) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (cfg.initElementRule.valid()
+             && tree().rule(c).v == cfg.initElementRule.v) {
+                elements.push_back(c);
+            }
+        }
+        if (elements.empty()) {
+            // Empty `{}` — default-initialize the first variant per
+            // §6.7.8p10 (overlap with synthZeroOrError's union path).
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        if (elements.size() > 1) {
+            reportedError(braceInitListNode,
+                "union brace-init must initialize at most one variant");
+            // Continue: lower only the FIRST element so the rest of the
+            // pipeline sees a well-typed aggregate, but res->ok is false.
+        }
+        NodeId const elem = elements[0];
+
+        // Walk the initElement: find an optional `designatedField`
+        // (designators decide WHICH variant); the value expression is
+        // the trailing non-designator non-token child. Index designators
+        // are nonsensical for unions (variants are name-indexed only).
+        std::optional<std::uint32_t> targetVariant;
+        bool failed = false;
+        NodeId valueExprCst{};
+        for (NodeId c : visible(elem)) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            // Peel through `designator` alt-wrapper to reach the leaf
+            // designator-rule node (mirrors the struct/array path).
+            NodeId designatorCore = c;
+            while (tree().kind(designatorCore) == NodeKind::Internal) {
+                std::uint32_t const rr = tree().rule(designatorCore).v;
+                if (cfg.designatedFieldRule.valid()
+                 && rr == cfg.designatedFieldRule.v) break;
+                if (cfg.designatedIndexRule.valid()
+                 && rr == cfg.designatedIndexRule.v) break;
+                NodeId const only = soleMeaningfulChild(designatorCore);
+                if (!only.valid()) break;
+                designatorCore = only;
+            }
+            std::uint32_t const r =
+                (tree().kind(designatorCore) == NodeKind::Internal)
+                    ? tree().rule(designatorCore).v
+                    : std::uint32_t{0};
+            if (cfg.designatedFieldRule.valid()
+             && r == cfg.designatedFieldRule.v) {
+                NodeId nameTok{};
+                for (NodeId tok : visible(designatorCore)) {
+                    if (!isToken(tok)) continue;
+                    if (tree().tokenKind(tok).v != sem.identifierToken.v) continue;
+                    nameTok = tok;
+                    break;
+                }
+                if (!nameTok.valid()) {
+                    reportedError(designatorCore,
+                        "union field designator missing name token");
+                    failed = true;
+                    continue;
+                }
+                ScopeId const unionScope =
+                    model.compositeScopeFor(contextType);
+                if (!unionScope.valid()) {
+                    reportedError(designatorCore,
+                        "union brace-init designator's container has no "
+                        "variant scope");
+                    failed = true;
+                    continue;
+                }
+                std::string const name{tree().text(nameTok)};
+                auto const& scope = model.scopeRecord(unionScope);
+                auto sit = scope.bindings.find(name);
+                if (sit == scope.bindings.end()) {
+                    reportedError(designatorCore,
+                        "field designator names a variant that doesn't "
+                        "belong to the target union type");
+                    failed = true;
+                    continue;
+                }
+                auto const* rec = model.recordFor(sit->second);
+                if (rec == nullptr || rec->kind != DeclarationKind::Variable) {
+                    reportedError(designatorCore,
+                        "union field designator resolved to a non-field "
+                        "symbol");
+                    failed = true;
+                    continue;
+                }
+                if (rec->fieldIndex >= variants.size()) {
+                    reportedError(designatorCore,
+                        "union variant index out of range");
+                    failed = true;
+                    continue;
+                }
+                targetVariant = rec->fieldIndex;
+                continue;
+            }
+            if (cfg.designatedIndexRule.valid()
+             && r == cfg.designatedIndexRule.v) {
+                reportedError(designatorCore,
+                    "index designators are not meaningful on union types");
+                failed = true;
+                continue;
+            }
+            valueExprCst = c;
+        }
+        if (failed) {
+            // Still emit a structurally-valid (first-variant zero-fill)
+            // aggregate so downstream lowering doesn't cascade. res->ok
+            // is already false via reportedError.
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        if (!valueExprCst.valid()) {
+            // `union U u = { };` — already handled at the empty-list
+            // check above; reaching here implies a malformed initElement.
+            reportedError(elem, "union init element has no value expression");
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        std::uint32_t const variant = targetVariant.value_or(0);
+        TypeId const variantType = variants[variant];
+        HirNodeId const valueNode =
+            lowerExprOrBraceInit(valueExprCst, variantType);
+
+        // Union HIR shape: a 1-child ConstructAggregate whose single
+        // child is the chosen variant's value. The variant index is
+        // implicit-by-type (the value's HIR type identifies WHICH
+        // variant); a future explicit-tag substrate can layer an
+        // index attribute when codegen needs it.
+        std::vector<HirNodeId> children{ valueNode };
+        return builder.makeConstructAggregate(children, contextType,
+                                              HirFlags::Synthetic);
+    }
+
     // D5.3 brace-init lowering. Takes a `braceInitList` CST node and a
     // CONTEXT TYPE (the resolved type the brace-init must produce — a
     // struct or array). Produces a positional `HirKind::ConstructAggregate`
@@ -1478,18 +1649,20 @@ struct Lowerer {
                 "brace-init requires a known context type");
         }
         TypeKind const containerKind = interner.kind(contextType);
-        bool const isArray = (containerKind == TypeKind::Array);
+        bool const isArray  = (containerKind == TypeKind::Array);
         bool const isStruct = (containerKind == TypeKind::Struct);
-        if (containerKind == TypeKind::Union) {
-            // Internal anchor: union brace-init has distinct semantics
-            // (one active member; no zero-fill across overlapping
-            // variants); deferred to plan 00 §0.2 D5.4 (unions).
+        bool const isUnion  = (containerKind == TypeKind::Union);
+        if (!isArray && !isStruct && !isUnion) {
             return reportedError(braceInitListNode,
-                "union brace-init is not yet supported");
+                "brace-init target type must be struct, union, or array");
         }
-        if (!isArray && !isStruct) {
-            return reportedError(braceInitListNode,
-                "brace-init target type must be struct or array");
+        // D5.4: union brace-init has distinct semantics from struct —
+        // at most ONE element, initializing exactly one variant.
+        // Positional → first variant; designator → that variant. No
+        // zero-fill across overlapping variants. Route to a dedicated
+        // path; the rest of this function handles struct + array.
+        if (isUnion) {
+            return lowerUnionBraceInit(braceInitListNode, contextType);
         }
         std::uint32_t slotCount = 0;
         TypeId elemTypeForArray{};

@@ -165,6 +165,7 @@
     { "word": "const",   "kind": "ConstKeyword"   },
     { "word": "typedef", "kind": "TypedefKeyword" },
     { "word": "struct",  "kind": "StructKeyword"  },
+    { "word": "union",   "kind": "UnionKeyword"   },
 
     { "word": "if",      "kind": "IfKeyword"      },
     { "word": "else",    "kind": "ElseKeyword"    },
@@ -189,6 +190,7 @@
         "includeDirective",
         "typedefDecl",
         "structDecl",
+        "unionDecl",
         "topLevelDecl",
         "externDecl"
       ]
@@ -210,6 +212,24 @@
 
     "structTypeRef": {
       "sequence": [ "StructKeyword", "Identifier" ]
+    },
+
+    "unionDecl": {
+      "sequence": [
+        "UnionKeyword", "Identifier",
+        "BlockOpen",
+        { "repeat": "unionField" },
+        "BlockClose",
+        "EndStatement"
+      ]
+    },
+
+    "unionField": {
+      "sequence": [ "typeRefAllowingStruct", "Identifier", "EndStatement" ]
+    },
+
+    "unionTypeRef": {
+      "sequence": [ "UnionKeyword", "Identifier" ]
     },
 
     "memberFollower": {
@@ -295,7 +315,7 @@
     },
 
     "typeBaseAllowingStruct": {
-      "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "structTypeRef" ]
+      "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "structTypeRef", "unionTypeRef" ]
     },
 
     "typeRefAllowingStruct": {
@@ -522,6 +542,9 @@
       { "rule": "structDecl",  "name": 1, "kind": "type",
         "fieldChildren": { "rule": "structField" } },
       { "rule": "structField", "name": 1, "type": 0, "kind": "variable" },
+      { "rule": "unionDecl",   "name": 1, "kind": "type",
+        "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
+      { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "kindByChild": {
           "childPath": [3, 0],
@@ -532,7 +555,8 @@
     ],
     "references": [
       { "rule": "operand" },
-      { "rule": "structTypeRef", "nameMatch": "lastIdentifier" }
+      { "rule": "structTypeRef", "nameMatch": "lastIdentifier" },
+      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier" }
     ],
     "memberAccesses": [
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
@@ -540,7 +564,7 @@
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
-    "scopes": [ "block", "funcDefTail", "structDecl" ],
+    "scopes": [ "block", "funcDefTail", "structDecl", "unionDecl" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
       { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },
@@ -582,6 +606,7 @@
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
       { "rule": "structDecl",   "hirKind": "TypeDecl"    },
+      { "rule": "unionDecl",    "hirKind": "TypeDecl"    },
       { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },

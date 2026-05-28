@@ -834,12 +834,18 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 fieldTypes.reserve(fields.size());
                                 for (auto const& [_idx, t] : fields)
                                     fieldTypes.push_back(t);
-                                TypeId const structTy =
-                                    s.lattice.interner().structType(
+                                // D5.4: struct vs union dispatch is config-
+                                // driven via FieldChildrenDescriptor::compositeKind.
+                                TypeId const compositeTy =
+                                    (decl.fieldChildren->compositeKind
+                                     == CompositeKind::Union)
+                                    ? s.lattice.interner().unionType(
+                                        srec.name, fieldTypes)
+                                    : s.lattice.interner().structType(
                                         srec.name, fieldTypes);
-                                srec.type = structTy;
-                                s.nodeToType.set(resolved.node, structTy);
-                                s.compositeScopeByType[structTy.v] = srec.structScope;
+                                srec.type = compositeTy;
+                                s.nodeToType.set(resolved.node, compositeTy);
+                                s.compositeScopeByType[compositeTy.v] = srec.structScope;
                             }
                         }
                     } else if (effectiveKind == DeclarationKind::Function) {

@@ -1371,3 +1371,131 @@ TEST(HirLoweringCSubset, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
         << "lowering must fail when a non-literal index designator "
            "appears (substrate-blocked path)";
 }
+
+// ── D5.4 unions ──────────────────────────────────────────────────────
+
+// `union U u;` declares + types via the same Pass 1.5 path as struct;
+// the difference is `compositeKind: "union"` in the c-subset config →
+// `interner.unionType(...)`. Empty init zero-fills the FIRST variant.
+TEST(HirLoweringCSubset, D5_4_UnionDeclLowersToTypeDecl) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::TypeDecl);
+}
+
+// Positional union brace-init `{ 5 }` initializes the FIRST variant.
+// Aggregate is 1-child (NOT 2 — unions are not zero-fill-all).
+TEST(HirLoweringCSubset, D5_4_UnionPositionalInit) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { 5 }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 1u)
+        << "union aggregate must have exactly 1 child (the active variant)";
+}
+
+// Designated union brace-init `{ .c = 'a' }` initializes the named
+// variant — second variant (index 1), not first.
+TEST(HirLoweringCSubset, D5_4_UnionDesignatedInit) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { .c = 'a' }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 1u);
+    // The child's HIR type identifies the chosen variant — Char here.
+    // (We don't read the type interner from the test directly; the
+    // child being Literal is enough to confirm the chosen variant's
+    // value was lowered.)
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+}
+
+// Empty `{}` union init zero-fills the FIRST variant (1-child aggregate).
+TEST(HirLoweringCSubset, D5_4_UnionEmptyBrace) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = {}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 1u);
+}
+
+// Multi-element union brace-init MUST emit a diagnostic.
+TEST(HirLoweringCSubset, D5_4_UnionMultiElementEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { 1, 2 }; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("at most one variant") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "multi-element union init must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
+
+// Unknown union variant name → diagnostic.
+TEST(HirLoweringCSubset, D5_4_UnionUnknownVariantEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { .bogus = 1 }; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("doesn't belong") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "unknown union variant must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
+
+// Index designator on a union is nonsensical → diagnostic.
+TEST(HirLoweringCSubset, D5_4_UnionIndexDesignatorEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { [0] = 1 }; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("not meaningful on union") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "index designator on union must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
