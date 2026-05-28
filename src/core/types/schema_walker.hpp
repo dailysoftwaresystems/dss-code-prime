@@ -147,11 +147,13 @@ public:
         Snapshot(GrammarSchema const*       schemaPtr,
                  SchemaCursor               cursor,
                  std::vector<SchemaCursor>  cursorStack,
+                 std::vector<bool>          wrapFrameFlags,
                  bool                       cursorDesynced) noexcept;
 
         GrammarSchema const*       schemaPtr_;
         SchemaCursor               cursor_;
         std::vector<SchemaCursor>  cursorStack_;
+        std::vector<bool>          wrapFrameFlags_;
         bool                       cursorDesynced_;
     };
 
@@ -170,6 +172,18 @@ private:
     DesyncCallback                       onDesync_;
     SchemaCursor                         cursor_{};
     std::vector<SchemaCursor>            cursorStack_;
+    // Parallel-to-`cursorStack_` per-frame "this frame is a Pratt
+    // auto-interned wrapper rule" flag. Pushed by `enterRule` (true
+    // iff `schema_->isAutoInternedWrapperRule(rule)`); popped by
+    // `leaveRule`. Read by `noteDesync_` to suppress the desync latch
+    // while the IMMEDIATE current frame is a wrap — wrapper rules
+    // have no body in the position graph, so cursor advances inside
+    // them (the `pushOperatorToken` advance after `wrapLastChildExpr-
+    // Frame`) are structural-only and don't represent a real grammar
+    // mismatch. Nested non-wrap frames inside a wrap (followers /
+    // grouped postfix bodies) still desync normally because their
+    // top-of-stack flag is `false`. Plan 05 post-close sub-cycle B.
+    std::vector<bool>                    wrapFrameFlags_;
     bool                                 cursorDesynced_ = false;
 };
 

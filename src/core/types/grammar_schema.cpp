@@ -374,6 +374,10 @@ bool GrammarSchema::isExprRule(RuleId rule) const noexcept {
     return it->second.isExpr;
 }
 
+bool GrammarSchema::isAutoInternedWrapperRule(RuleId rule) const noexcept {
+    return d_.wrapperRuleIds.contains(rule.v);
+}
+
 RuleId GrammarSchema::exprAtom(RuleId rule) const noexcept {
     auto it = d_.compiledRules.find(rule.v);
     if (it == d_.compiledRules.end()) return RuleId{};

@@ -141,6 +141,91 @@ TEST(ParserSpeculation, SpeculativeAltAcceptsTokenLeafBranches) {
                         DiagnosticCode::P_BacktrackFailed), 0u);
 }
 
+// Speculative alt whose rule-branches contain an `expr`-shape rule
+// that itself uses postfix operators (the Pratt walker's
+// `wrapLastChildExprFrame` path). Closes plan 05 sub-cycle B (the
+// 2026-05-28 sibling of sub-cycle A): the SchemaWalker's
+// `cursorDesynced_` latch used to fire as a false positive when the
+// Pratt walker wrapped an operand inside an auto-interned wrapper
+// rule (binary / unary / postfix / ternary). The wrapper has no
+// positions in the schema's graph, so the subsequent operator-token
+// advance landed on an invalid cursor — a structural-only "desync"
+// the latch incorrectly counted as a real grammar mismatch. In
+// speculative parsing the outer probe read the latch as "wrong
+// branch" and bailed with `P_BacktrackFailed`. The fix (Fix B): the
+// walker recognizes auto-interned wrapper rules via
+// `GrammarSchema::isAutoInternedWrapperRule` and suppresses the
+// latch while any ancestor frame is a wrap, fixing the latch's
+// behavioral contract ("real grammar mismatch ONLY"). Empirical
+// reproducer at c-subset level: `(f(a))` fails (✗) without the fix,
+// passes (✓) with it. This synthetic test pins the substrate
+// behavior in isolation from any specific language schema.
+constexpr std::string_view kSpecOverExprPostfix = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "SpecExprPostfix", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "(":  [{ "kind": "LParen" }],
+    ")":  [{ "kind": "RParen" }],
+    "[":  [{ "kind": "LBracket" }],
+    "]":  [{ "kind": "RBracket" }],
+    ";":  [{ "kind": "Semi" }],
+    "I":  [{ "kind": "AtomTok" }]
+  },
+  "operators": {
+    "groups": [
+      { "precedence": 100, "arity": "postfix", "operators": ["("], "endsAt": ")" }
+    ]
+  },
+  "shapes": {
+    "root":    { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":    { "sequence": [ "primary", "Semi" ] },
+    "primary": { "alt": ["AtomTok", "parenExpr"], "speculative": true },
+    "parenExpr": {
+      "sequence": [ "LParen", "expression", "RParen" ]
+    },
+    "expression": {
+      "expr": {
+        "atom": "primary",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr"
+        }
+      }
+    }
+  }
+})JSON";
+
+TEST(ParserSpeculation, SpeculativeAltSurvivesInnerPostfixWrap) {
+    auto loaded = GrammarSchema::loadFromText(kSpecOverExprPostfix);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    // `(I());` — outer `primary` speculative alt picks `parenExpr`; the
+    // inner expression `I()` exercises the Pratt walker's postfix-wrap
+    // (operand `I` followed by the postfix call `()`). Pre-fix, this
+    // tripped the outer probe's `isDesynced` check via the wrap-induced
+    // false-positive latch. Post-fix, the parse completes cleanly.
+    auto src = SourceBuffer::fromString("(I());", "<spec>");
+    Tokenizer tk{src, *loaded};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, *loaded, std::move(stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "speculative alt with inner postfix-wrap must NOT desync-fail";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "the Pratt walker's wrap must not be seen as a wrong branch";
+    EXPECT_EQ(countNodesByRule(t, "parenExpr"), 1u)
+        << "outer `parenExpr` branch must commit";
+    EXPECT_EQ(countNodesByRule(t, "postfixExpr"), 1u)
+        << "inner postfix-wrap must materialize as a postfixExpr frame";
+}
+
 TEST(ParserSpeculation, SpeculativeAltMixesTokenLeafAndRuleBranches) {
     // `A B ;` mixes: first `primary` takes the token-leaf branch (A);
     // second `primary` takes the rule branch (B Semi). Confirms both

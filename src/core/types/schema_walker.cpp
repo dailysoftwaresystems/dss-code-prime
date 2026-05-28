@@ -37,6 +37,18 @@ void SchemaWalker::enterRule(RuleId rule) {
         if (routed.valid()) savedParent = routed;
     }
     cursorStack_.push_back(savedParent);
+    // Per-frame wrap flag (plan 05 sub-cycle B): the Pratt walker's
+    // `wrapLastChildExprFrame` enters auto-interned wrapper rules
+    // (binary / unary / postfix / ternary) for structural reparenting.
+    // These wrappers have no body in the schema's position graph —
+    // they exist only for tree shape — so the subsequent operator-
+    // token `advance` lands on an invalid cursor and would fire a
+    // false-positive `cursorDesynced_` latch trip. Recording "this
+    // frame is a wrap" here lets `noteDesync_` suppress that trip
+    // while the immediate frame is a wrap. Nested non-wrap frames
+    // inside the wrap (follower rules, grouped postfix bodies) push
+    // `false` and desync normally.
+    wrapFrameFlags_.push_back(schema_->isAutoInternedWrapperRule(rule));
     cursor_ = schema_->enterRule(rule);
     // enterRule on a registered rule always returns a valid cursor.
     // No valid→invalid transition possible here, so no desync check.
@@ -51,6 +63,15 @@ void SchemaWalker::leaveRule(SourceSpan span,
     }
     SchemaCursor savedParent = cursorStack_.back();
     cursorStack_.pop_back();
+    // NOTE: the wrap-flag pop is INTENTIONALLY deferred until after
+    // `noteDesync_` below. The leave-route may trip a valid→invalid
+    // cursor transition that, while occurring DURING the leave of a
+    // wrap frame, is structurally caused BY the wrap (the schema's
+    // routeToRuleLeaf doesn't model wrappers, so leaving one back to
+    // the parent's "after wrap" position has no valid graph edge).
+    // Keeping the flag in `wrapFrameFlags_` through `noteDesync_` lets
+    // the suppression check see the wrap that's responsible. The pop
+    // happens at the SINGLE post-noteDesync exit below.
     if (!savedParent.valid()) {
         // The parent was pushed invalid via routeToRuleLeaf when no
         // route through AltChoice positions led to the entered rule
@@ -59,11 +80,13 @@ void SchemaWalker::leaveRule(SourceSpan span,
         // skip schema_->leaveRule on invalid input to avoid double-
         // emission.
         cursor_ = SchemaCursor{};
+        if (!wrapFrameFlags_.empty()) wrapFrameFlags_.pop_back();
         return;
     }
     const bool wasValid = savedParent.valid();
     cursor_ = schema_->leaveRule(savedParent);
     noteDesync_(wasValid, cursor_.valid(), span, rule);
+    if (!wrapFrameFlags_.empty()) wrapFrameFlags_.pop_back();
 }
 
 bool SchemaWalker::advance(SchemaTokenId tok, SourceSpan span,
@@ -120,14 +143,17 @@ RuleId SchemaWalker::slotRuleRef() const noexcept {
 SchemaWalker::Snapshot::Snapshot(GrammarSchema const*      schemaPtr,
                                  SchemaCursor              cursor,
                                  std::vector<SchemaCursor> cursorStack,
+                                 std::vector<bool>         wrapFrameFlags,
                                  bool                      cursorDesynced) noexcept
     : schemaPtr_(schemaPtr)
     , cursor_(cursor)
     , cursorStack_(std::move(cursorStack))
+    , wrapFrameFlags_(std::move(wrapFrameFlags))
     , cursorDesynced_(cursorDesynced) {}
 
 SchemaWalker::Snapshot SchemaWalker::snapshot() const {
-    return Snapshot{schema_.get(), cursor_, cursorStack_, cursorDesynced_};
+    return Snapshot{schema_.get(), cursor_, cursorStack_, wrapFrameFlags_,
+                    cursorDesynced_};
 }
 
 void SchemaWalker::restore(Snapshot snap) {
@@ -136,9 +162,10 @@ void SchemaWalker::restore(Snapshot snap) {
               "different walker (schema pointer mismatch) — restoring "
               "would index the wrong schema's position table");
     }
-    cursor_         = snap.cursor_;
-    cursorStack_    = std::move(snap.cursorStack_);
-    cursorDesynced_ = snap.cursorDesynced_;
+    cursor_          = snap.cursor_;
+    cursorStack_     = std::move(snap.cursorStack_);
+    wrapFrameFlags_  = std::move(snap.wrapFrameFlags_);
+    cursorDesynced_  = snap.cursorDesynced_;
 }
 
 void SchemaWalker::noteDesync_(bool wasValid, bool nowValid,
@@ -146,6 +173,21 @@ void SchemaWalker::noteDesync_(bool wasValid, bool nowValid,
                                std::optional<RuleId> rule) noexcept {
     if (cursorDesynced_) return;
     if (!(wasValid && !nowValid)) return;
+    // Plan 05 sub-cycle B: suppress the latch while ANY ancestor frame
+    // is a Pratt auto-interned wrapper rule. Wrapper rules have NO
+    // positions in the schema's graph (the loader skips them in
+    // `validateOperatorBodyRules`) — they exist only for tree shape.
+    // Cursor advances inside a wrap's body — including those that
+    // occur AFTER opening real-grammar follower rules under the wrap
+    // (whose cursor traversal still inherits the wrap's invalid-graph
+    // context) — are structural noise, not real grammar mismatches.
+    // The latch's contract is "real grammar mismatch ONLY"; wrap-
+    // induced cursor invalidation is a false positive. Scope is "any
+    // ancestor wrap on the stack" so the suppression covers the
+    // entire window from wrap-open to wrap-close.
+    for (bool isWrap : wrapFrameFlags_) {
+        if (isWrap) return;
+    }
     cursorDesynced_ = true;
     if (!onDesync_) return;
     // Callback contract is no-throw (see header). A throwing callback
