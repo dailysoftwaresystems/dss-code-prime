@@ -28,8 +28,8 @@
 //   - parenthesized expressions (a wrapper-shape special case)
 //   - UnaryOp (cfg.unaryExprRule + token in cfg.unaryOps)
 //   - BinaryOp (cfg.binaryExprRule + token in cfg.binaryOps)
-//   - LogicalAnd / LogicalOr (operator name is "And" / "Or" — short-
-//     circuit semantics matching the HIR walker)
+//   - LogicalAnd / LogicalOr (operator-target name is "LogicalAnd"
+//     / "LogicalOr" — short-circuit semantics matching the HIR walker)
 //   - Ternary (cfg.ternaryExprRule when present)
 //   - identifier Ref (when `resolveSymbolInit` is supplied — recurses
 //     into the symbol's CST init expression with cycle detection)

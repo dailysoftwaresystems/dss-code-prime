@@ -1463,14 +1463,22 @@ struct Lowerer {
                     return kids[*dr.initChild];
                 }
                 // Role-based discovery (mirrors semantic-side resolver):
-                // the init is the Internal child that is not the type,
-                // name, or array-suffix child.
+                // the init is the Internal child that is not the
+                // type / name / params / body / array-suffix child.
+                // The full skip list closes the latent bug where a
+                // `const`-qualified function decl's `funcDefTail`
+                // body would have been returned as the init.
                 RuleId const arraySufRule = dr.arraySuffix.has_value()
                     ? dr.arraySuffix->rule : RuleId{};
+                auto positional = [&](std::optional<std::uint32_t> pos, std::uint32_t i) {
+                    return pos.has_value() && *pos == i;
+                };
                 for (std::uint32_t i = 0; i < kids.size(); ++i) {
                     if (tree().kind(kids[i]) != NodeKind::Internal) continue;
-                    if (dr.typeChild.has_value() && *dr.typeChild == i) continue;
-                    if (dr.nameChild.has_value() && *dr.nameChild == i) continue;
+                    if (positional(dr.typeChild,   i)) continue;
+                    if (positional(dr.nameChild,   i)) continue;
+                    if (positional(dr.paramsChild, i)) continue;
+                    if (positional(dr.bodyChild,   i)) continue;
                     if (arraySufRule.valid() && tree().rule(kids[i]) == arraySufRule) continue;
                     return kids[i];
                 }

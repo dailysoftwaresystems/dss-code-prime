@@ -532,19 +532,21 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
         return kids[*decl.initChild];
     }
     // Fall back to role-based discovery: the init is the Internal
-    // child that is NOT the type child, NOT the array-suffix child,
-    // and NOT at the name-child position. Mirrors the HIR-lowering
-    // walker's strategy at `lowerVarLike` (which scans for an
-    // expression-role child) but is config-driven via the same
-    // `typeChild` / `nameChild` / `arraySuffix` descriptors.
-    std::optional<std::uint32_t> typePos = decl.typeChild;
-    std::optional<std::uint32_t> namePos = decl.nameChild;
+    // child that is NOT the type / name / params / body / array-
+    // suffix child. The complete skip list closes the latent bug
+    // where a `const`-qualified function decl's `funcDefTail` body
+    // would have been returned as the "init expression".
     RuleId const arraySufRule = decl.arraySuffix.has_value()
         ? decl.arraySuffix->rule : RuleId{};
+    auto positional = [&](std::optional<std::uint32_t> pos, std::uint32_t i) {
+        return pos.has_value() && *pos == i;
+    };
     for (std::uint32_t i = 0; i < kids.size(); ++i) {
         if (tree.kind(kids[i]) != NodeKind::Internal) continue;
-        if (typePos.has_value() && *typePos == i) continue;
-        if (namePos.has_value() && *namePos == i) continue;
+        if (positional(decl.typeChild,   i)) continue;
+        if (positional(decl.nameChild,   i)) continue;
+        if (positional(decl.paramsChild, i)) continue;
+        if (positional(decl.bodyChild,   i)) continue;
         if (arraySufRule.valid() && tree.rule(kids[i]) == arraySufRule) continue;
         return kids[i];
     }

@@ -6,6 +6,7 @@
 #include "hir/const_eval_arith.hpp"
 #include "hir/hir_op.hpp"
 
+#include <cassert>
 #include <string>
 #include <unordered_set>
 
@@ -62,14 +63,20 @@ opEntryFor(std::vector<HirOperatorEntry> const& table, SchemaTokenId tok) {
     return nullptr;
 }
 
-// Internal recursive impl. `visitedNames` carries the per-call cycle-
-// detection set for `Ref`-style identifier resolution.
+// Internal recursive impl. `visitedInitNodes` carries the per-call
+// cycle-detection set, keyed on the RESOLVED init-expression NodeId
+// (NOT on identifier text — text-keyed detection produces
+// false-positive cycles under shadowing: outer `const X=1; const Y=X+1;`
+// + inner `const X=Y;` would trigger a fake cycle on the outer X
+// when evaluating the inner X's init. Keying on init-expression
+// identity sidesteps shadowing because each distinct symbol
+// declaration has its own init NodeId.).
 [[nodiscard]] ConstEvalResult
-evalImpl(NodeId                                expr,
-         CstEvalContext const&                 ctx,
-         CstEvalEnvironment const&             env,
-         EvalOptions const&                    options,
-         std::unordered_set<std::string> &     visitedNames) {
+evalImpl(NodeId                              expr,
+         CstEvalContext const&               ctx,
+         CstEvalEnvironment const&           env,
+         EvalOptions const&                  options,
+         std::unordered_set<std::uint32_t> & visitedInitNodes) {
     if (!expr.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     Tree const& tree = ctx.tree;
     HirLoweringConfig const& cfg = ctx.schema.hirLowering();
@@ -95,22 +102,22 @@ evalImpl(NodeId                                expr,
         }
         // Identifier-Ref path: if the caller supplied a resolver,
         // pass the identifier-token NodeId and recurse into the
-        // resolved init expression. Cycle-safety uses identifier
-        // text (stable across CST traversals) so a chain like
-        // `const a = b; const b = a;` surfaces NotAConstantExpression
-        // at the second encounter.
+        // resolved init expression. Cycle detection is keyed on the
+        // RESOLVED init-NodeId (not on identifier text) — shadowing
+        // means the same name can refer to different symbols across
+        // scopes; text-keying would false-positive a cycle on
+        // legitimate cross-scope ref chains.
         if (env.resolveSymbolInit) {
-            std::string const name{tree.text(expr)};
-            if (visitedNames.contains(name)) {
-                return fail(ConstEvalFailure::NotAConstantExpression, expr);
-            }
             auto initExpr = env.resolveSymbolInit(expr);
             if (!initExpr.has_value() || !initExpr->valid()) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
-            visitedNames.insert(name);
-            ConstEvalResult inner = evalImpl(*initExpr, ctx, env, options, visitedNames);
-            visitedNames.erase(name);
+            if (visitedInitNodes.contains(initExpr->v)) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            visitedInitNodes.insert(initExpr->v);
+            ConstEvalResult inner = evalImpl(*initExpr, ctx, env, options, visitedInitNodes);
+            visitedInitNodes.erase(initExpr->v);
             if (!inner.value.has_value()) inner.blamedNode = HirNodeId{expr.v};
             return inner;
         }
@@ -149,7 +156,7 @@ evalImpl(NodeId                                expr,
         // rhs until lhs's truthiness is known. Matches the HIR walker's
         // C99 semantics exactly.
         if (e->target == "LogicalAnd" || e->target == "LogicalOr") {
-            ConstEvalResult a = evalImpl(lhsN, ctx, env, options, visitedNames);
+            ConstEvalResult a = evalImpl(lhsN, ctx, env, options, visitedInitNodes);
             if (!a.value.has_value()) return a;
             auto aIsTrueOpt = asBool(*a.value, options.allowFloat);
             if (!aIsTrueOpt.has_value()) {
@@ -159,7 +166,7 @@ evalImpl(NodeId                                expr,
             bool const isAnd = (e->target == "LogicalAnd");
             bool const shortCircuits = isAnd ? !aIsTrue : aIsTrue;
             if (shortCircuits) return ok(makeBoolLiteral(aIsTrue ? 1 : 0));
-            ConstEvalResult b = evalImpl(rhsN, ctx, env, options, visitedNames);
+            ConstEvalResult b = evalImpl(rhsN, ctx, env, options, visitedInitNodes);
             if (!b.value.has_value()) return b;
             auto bIsTrueOpt = asBool(*b.value, options.allowFloat);
             if (!bIsTrueOpt.has_value()) {
@@ -172,9 +179,9 @@ evalImpl(NodeId                                expr,
         if (!opK.has_value()) {
             return fail(ConstEvalFailure::UnsupportedOperator, expr);
         }
-        ConstEvalResult a = evalImpl(lhsN, ctx, env, options, visitedNames);
+        ConstEvalResult a = evalImpl(lhsN, ctx, env, options, visitedInitNodes);
         if (!a.value.has_value()) return a;
-        ConstEvalResult b = evalImpl(rhsN, ctx, env, options, visitedNames);
+        ConstEvalResult b = evalImpl(rhsN, ctx, env, options, visitedInitNodes);
         if (!b.value.has_value()) return b;
         bool const eitherFloat = isFloatValue(*a.value) || isFloatValue(*b.value);
         if (eitherFloat) {
@@ -230,7 +237,7 @@ evalImpl(NodeId                                expr,
         if (!opK.has_value()) {
             return fail(ConstEvalFailure::UnsupportedOperator, expr);
         }
-        ConstEvalResult inner = evalImpl(operandN, ctx, env, options, visitedNames);
+        ConstEvalResult inner = evalImpl(operandN, ctx, env, options, visitedInitNodes);
         if (!inner.value.has_value()) return inner;
         if (isFloatValue(*inner.value)) {
             if (!options.allowFloat) {
@@ -266,14 +273,14 @@ evalImpl(NodeId                                expr,
         if (!condN.valid() || !thenN.valid() || !elseN.valid()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        ConstEvalResult cond = evalImpl(condN, ctx, env, options, visitedNames);
+        ConstEvalResult cond = evalImpl(condN, ctx, env, options, visitedInitNodes);
         if (!cond.value.has_value()) return cond;
         auto condTrueOpt = asBool(*cond.value, options.allowFloat);
         if (!condTrueOpt.has_value()) {
             return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         }
         NodeId const selected = *condTrueOpt ? thenN : elseN;
-        return evalImpl(selected, ctx, env, options, visitedNames);
+        return evalImpl(selected, ctx, env, options, visitedInitNodes);
     }
 
     // Wrapper rule: any internal node with exactly one meaningful child
@@ -289,7 +296,7 @@ evalImpl(NodeId                                expr,
         }
     }
     if (internalCount == 1) {
-        return evalImpl(onlyInternal, ctx, env, options, visitedNames);
+        return evalImpl(onlyInternal, ctx, env, options, visitedInitNodes);
     }
     // Zero internals: a single token-leaf wrapper (e.g. an `operand`
     // rule whose sole content is an integer-literal token or an
@@ -306,7 +313,7 @@ evalImpl(NodeId                                expr,
             }
         }
         if (tokCount == 1) {
-            return evalImpl(onlyTok, ctx, env, options, visitedNames);
+            return evalImpl(onlyTok, ctx, env, options, visitedInitNodes);
         }
     }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
@@ -318,8 +325,8 @@ ConstEvalResult evaluateConstantCst(NodeId               expr,
                                     CstEvalContext const& ctx,
                                     CstEvalEnvironment   env,
                                     EvalOptions          options) {
-    std::unordered_set<std::string> visitedNames;
-    return evalImpl(expr, ctx, env, options, visitedNames);
+    std::unordered_set<std::uint32_t> visitedInitNodes;
+    return evalImpl(expr, ctx, env, options, visitedInitNodes);
 }
 
 } // namespace dss

@@ -99,8 +99,10 @@ asBool(HirLiteralValue const& v, bool allowFloat) noexcept {
     return *iv != 0;
 }
 
-// Fold a UnaryOp(Neg/BitNot) on an integer operand. Unary `+` is identity
-// at the value level; no v1 frontend emits it as a UnaryOp.
+// Fold a UnaryOp(Neg / BitNot / Not) on an integer operand. `Not`
+// (logical negation) re-tags the result core to Bool per C99 §6.5.3.3p5.
+// Unary `+` is identity at the value level; no v1 frontend emits it
+// as a UnaryOp.
 [[nodiscard]] inline std::optional<HirLiteralValue>
 applyUnaryInt(HirOpKind op, HirLiteralValue const& inner) {
     auto iv64 = asInt64(inner);

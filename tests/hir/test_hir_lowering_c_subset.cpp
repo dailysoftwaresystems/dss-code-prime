@@ -1377,6 +1377,23 @@ TEST(HirLoweringCSubset, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
 // LogicalAnd/Or, and `const`-bound identifier refs at all 3 consumer
 // sites: array length, enumerator value, and index designator.
 
+// Helper: extract the Array length from a VAR symbol's declared type
+// via the TypeInterner. Returns -1 if the symbol isn't found or its
+// type isn't an Array; the caller asserts the expected length.
+static std::int64_t arrayLengthOfVar(SemanticModel const& model,
+                                     std::string_view name) {
+    auto const& interner = model.lattice().interner();
+    for (auto const& sym : model.symbols()) {
+        if (sym.name != name) continue;
+        if (!sym.type.valid()) return -1;
+        if (interner.kind(sym.type) != TypeKind::Array) return -1;
+        auto scals = interner.scalars(sym.type);
+        if (scals.empty()) return -1;
+        return scals[0];
+    }
+    return -1;
+}
+
 // Array-length const-expr fold: `int a[1+2];` produces Array<int, 3>.
 // Previously the hand-rolled "literal-only" check refused anything but
 // a single integer literal token; the new engine folds the BinaryOp.
@@ -1385,6 +1402,7 @@ TEST(HirLoweringCSubset, CstConstEval_ArrayLengthConstExpr) {
         "void f() { int xs[1+2]; }\n");
     ASSERT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
 }
 
 // Array-length with `const`-bound identifier ref. The resolver walks
@@ -1397,6 +1415,85 @@ TEST(HirLoweringCSubset, CstConstEval_ArrayLengthConstRef) {
         "void f() { int xs[N + 1]; }\n");
     ASSERT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 4);
+}
+
+// UnaryOp fold: `-(-3)` → 3. Pins the UnaryExprRule branch
+// (previously test-coverage gap).
+TEST(HirLoweringCSubset, CstConstEval_UnaryFolds) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[-(-3)]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+}
+
+// LogicalAnd short-circuit: `1 && 2` is 1; combine with arithmetic to
+// land on a non-trivial length. Pins the LogicalAnd/Or branch.
+TEST(HirLoweringCSubset, CstConstEval_LogicalAndFolds) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[(1 && 2) + 4]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 5);
+}
+
+// LogicalOr short-circuit: `1 || (some_runtime)` should fold to 1
+// regardless of the rhs being non-foldable. The rhs is a mutable
+// reference that would refuse to fold if reached.
+TEST(HirLoweringCSubset, CstConstEval_LogicalOrShortCircuits) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int n = 1; int xs[(1 || n) + 2]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+}
+
+// Cycle detection: `const int a = b + 0; const int b = a + 0;` is a
+// genuine cycle. The engine refuses with NotAConstantExpression at
+// the second encounter; caller emits S_NonConstantArrayLength.
+TEST(HirLoweringCSubset, CstConstEval_CycleRefuses) {
+    SemanticModel model = analyzeCSubset(
+        "const int a = b + 0;\n"
+        "const int b = a + 0;\n"
+        "void f() { int xs[a + 1]; }\n");
+    bool found = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "cyclic const-init chain must refuse to fold";
+}
+
+// Cross-scope ref chain (no shadowing): outer module consts referenced
+// from a function body. Two-deep const-ref chain. The engine resolves
+// `xs[N + 1]` → folds N (which is itself `M+1`=3) → fold to 4.
+TEST(HirLoweringCSubset, CstConstEval_TransitiveConstRef) {
+    SemanticModel model = analyzeCSubset(
+        "const int M = 2;\n"
+        "const int N = M + 1;\n"
+        "void f() { int xs[N + 1]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 4);
+}
+
+// Division by zero in a const-expr: `int xs[1/0];` — the engine
+// refuses with DivisionByZero (caller maps to S_NonConstantArrayLength
+// since array length doesn't have a dedicated div-by-zero diagnostic).
+TEST(HirLoweringCSubset, CstConstEval_DivByZeroRefuses) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[1/0]; }\n");
+    bool found = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "div-by-zero in const-expr must refuse to fold";
 }
 
 // Index designator const-expr fold: `{[1+1] = 7}` lowers to the same
