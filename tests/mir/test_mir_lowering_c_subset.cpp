@@ -950,6 +950,67 @@ TEST(MirLoweringCSubset, BreakInsideSwitchArmTargetsSwitchExit) {
     EXPECT_EQ(joinCount, 1u);
 }
 
+// ─── ML2 cycle 5: multi-function modules + forward-reference calls ────────
+
+// A two-function module produces two MirFuncs with isolated per-function
+// state (each gets its own entry block, allocas, SSA values). Pins the
+// per-function context-reset discipline added in cycle 3b — pre-3b, the
+// symbolToValue map would leak between functions.
+TEST(MirLoweringCSubset, MultipleFunctionsEachGetIsolatedMirFunc) {
+    auto L = lowerCSubset(
+        "int add(int a, int b) { return a + b; }\n"
+        "int sub(int a, int b) { return a - b; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    MirFuncId const f0 = m.funcAt(0);
+    MirFuncId const f1 = m.funcAt(1);
+    EXPECT_NE(f0, f1);
+    // Each function's entry block has [Arg, Arg, op, Return] — 4 insts.
+    for (MirFuncId fn : {f0, f1}) {
+        MirBlockId const entry = m.funcEntry(fn);
+        EXPECT_EQ(m.blockMarker(entry), StructCfMarker::EntryBlock);
+        ASSERT_EQ(m.blockInstCount(entry), 4u);
+        EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
+        EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Arg);
+    }
+    // First function uses Add; second uses Sub — proving the lowerings
+    // didn't cross-pollute (e.g., second function reusing first's
+    // residual symbolToValue from before the per-fn clear).
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(m.funcEntry(f0), 2)), MirOpcode::Add);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(m.funcEntry(f1), 2)), MirOpcode::Sub);
+}
+
+// Forward reference: caller declared BEFORE callee. The function-symbols
+// pre-pass collects symbols from all module-level Functions before the
+// main lowering walk so a Ref-to-function from an earlier function
+// resolves to a real GlobalAddr. Without the pre-pass, this would fail
+// loud with "Ref to unbound symbol".
+TEST(MirLoweringCSubset, ForwardReferenceCallResolvesViaPrePass) {
+    auto L = lowerCSubset(
+        "int caller(int x) { return callee(x); }\n"   // forward-refs callee
+        "int callee(int x) { return x; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const caller = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(caller);
+    // Inside `caller`: Arg, GlobalAddr(callee), Call, Return.
+    ASSERT_GE(m.blockInstCount(entry), 4u);
+    bool sawGlobalAddr = false;
+    bool sawCall = false;
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirOpcode const op = m.instOpcode(m.blockInstAt(entry, i));
+        if (op == MirOpcode::GlobalAddr) sawGlobalAddr = true;
+        if (op == MirOpcode::Call) sawCall = true;
+    }
+    EXPECT_TRUE(sawGlobalAddr) << "forward-referenced callee should resolve "
+                                  "via GlobalAddr from the pre-pass";
+    EXPECT_TRUE(sawCall);
+}
+
 // VarDecl without an initializer still emits the alloca but no store —
 // reads before assignment will Load whatever the alloca's uninitialized
 // memory holds (which is HIR-policy-defined; MIR doesn't auto-init).
