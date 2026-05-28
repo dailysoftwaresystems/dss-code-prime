@@ -6,6 +6,7 @@
 
 #include <array>
 #include <format>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -763,7 +764,20 @@ struct Lowerer {
     // Anchor: provided for diagnostic spans when zeroLiteralOf hits a
     // malformed type. The HIR ConstructAggregate node IS the natural
     // span; passed in so the helper can emit `unsupported(at, ...)`.
-    [[nodiscard]] MirLiteralValue zeroLiteralOf(HirNodeId at, TypeId type) {
+    // Recursive zero-literal builder. For Union, the optional
+    // `activeUnionVariant` selects which variant the seed is typed
+    // against — this matters because the subsequent InsertValue chain
+    // writes a value whose type IS the active variant, so the seed's
+    // slot must match. Without an active variant supplied, the helper
+    // falls back to `variants[0]` per C99 §6.7.8p18+p21 (union default-
+    // init). `activeUnionVariant` is ignored for non-Union types.
+    // Diagnostics are emitted via `unsupported(at, ...)`; the caller
+    // MUST snapshot `reporter.errorCount()` and bail if it grew —
+    // diagnostic emission does NOT abort recursion (we want a single
+    // top-level error rather than a cascade).
+    [[nodiscard]] MirLiteralValue zeroLiteralOf(
+            HirNodeId at, TypeId type,
+            std::optional<TypeId> activeUnionVariant = std::nullopt) {
         TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
         MirLiteralValue lv;
         lv.core = core;
@@ -776,9 +790,8 @@ struct Lowerer {
             return lv;
         }
         if (core == TypeKind::Union) {
-            // C99 §6.7.8p18+p21: union zero-init = first-variant zero.
-            // Empty variants = malformed Union type; fail LOUD instead
-            // of producing a 0-field aggregate that lies about its type.
+            // C99 §6.7.8p18+p21: union zero-init = active-variant zero
+            // (or variants[0] if no active variant is supplied).
             auto const variants = interner.operands(type);
             if (variants.empty()) {
                 unsupported(at, "zeroLiteralOf reached a Union type with "
@@ -787,8 +800,33 @@ struct Lowerer {
                 lv.value = MirAggregateValue{};
                 return lv;
             }
+            TypeId variantTy = variants[0];
+            if (activeUnionVariant.has_value()) {
+                TypeId const requested = *activeUnionVariant;
+                if (!requested.valid()) {
+                    unsupported(at, "zeroLiteralOf received an invalid "
+                                    "active-variant TypeId for a Union "
+                                    "(HIR verifier should have flagged)");
+                    lv.value = MirAggregateValue{};
+                    return lv;
+                }
+                bool matched = false;
+                for (TypeId v : variants) {
+                    if (v == requested) { matched = true; break; }
+                }
+                if (!matched) {
+                    unsupported(at, std::format(
+                        "zeroLiteralOf active-variant TypeId {} is not "
+                        "among the Union's declared variants — variant "
+                        "identity is broken upstream",
+                        requested.v));
+                    lv.value = MirAggregateValue{};
+                    return lv;
+                }
+                variantTy = requested;
+            }
             MirAggregateValue agg;
-            agg.fields.push_back(zeroLiteralOf(at, variants[0]));
+            agg.fields.push_back(zeroLiteralOf(at, variantTy));
             lv.value = std::move(agg);
             return lv;
         }
@@ -835,7 +873,7 @@ struct Lowerer {
             unsupported(at, std::format(
                 "zeroLiteralOf cannot zero a {} (TypeKind ordinal {}) — "
                 "not a legitimate runtime-aggregate child kind",
-                interner.kind(type) == TypeKind::Void ? "Void" : "extension/fn-sig type",
+                core == TypeKind::Void ? "Void" : "extension/fn-sig type",
                 static_cast<unsigned>(core)));
             lv.value = std::uint64_t{0};
         }
@@ -850,32 +888,10 @@ struct Lowerer {
     //      MIR optimizer (not yet built) could fold a fully-constant
     //      chain back to a single Const.
     // Either way, the result is an SSA value of the aggregate type.
-    // ML2 cycle 6 review fix-up: union zero seed must match the ACTIVE
-    // variant's type so the subsequent InsertValue's child type aligns
-    // with the slot. Otherwise `union U { int i; char c; }; u = { .c = 'x' };`
-    // would seed with a zero `int` (variants[0]) and then InsertValue
-    // a `char` over it — slot-type / child-type mismatch, variant
-    // identity erased. The HIR child's type IS the variant identifier.
-    [[nodiscard]] MirLiteralValue zeroLiteralOfUnionWithChild(
-            HirNodeId at, TypeId unionTy, TypeId activeVariantTy) {
-        MirLiteralValue lv;
-        lv.core = TypeKind::Union;
-        MirAggregateValue agg;
-        if (activeVariantTy.valid()) {
-            agg.fields.push_back(zeroLiteralOf(at, activeVariantTy));
-        } else {
-            // Fall back to first variant if HIR didn't propagate the
-            // child's type (defensive — should never fire when the HIR
-            // verifier is run before MIR lowering).
-            auto const variants = interner.operands(unionTy);
-            if (!variants.empty()) {
-                agg.fields.push_back(zeroLiteralOf(at, variants[0]));
-            }
-        }
-        lv.value = std::move(agg);
-        return lv;
-    }
-
+    // Union: the HIR child's TYPE identifies the active variant; pass
+    // it to zeroLiteralOf so the seed's slot matches the InsertValue's
+    // child type — otherwise variant identity is erased between seed
+    // and chain.
     [[nodiscard]] MirInstId lowerConstructAggregate(HirNodeId node, TypeId aggTy) {
         if (!aggTy.valid()) {
             unsupported(node, "ConstructAggregate with invalid result type "
@@ -886,9 +902,9 @@ struct Lowerer {
         // function-body ConstructAggregate doesn't need the MIR-globals
         // sibling-resolver — a `Ref` to a fold-able global silently
         // falls back to the runtime InsertValue chain here, which a
-        // future optimizer can re-fold. (Verified parity with MIR-
-        // globals options at line ~1543 in this file; the env-shape is
-        // the deliberate divergence.)
+        // future optimizer can re-fold. The HIR semantic pre-pass has
+        // already resolved symbol Refs into their HIR literal values,
+        // so no const-symbol callback is needed here.
         EvalEnvironment emptyEnv;
         EvalOptions     evalOpts;
         evalOpts.allowFloat      = config.globalsAllowFloat;
@@ -898,17 +914,20 @@ struct Lowerer {
         if (folded.value.has_value()) {
             return mir.addConst(toMirLiteral(*folded.value), aggTy);
         }
-        // Fall back to the InsertValue chain. Build the zero base
-        // matching the aggregate's shape so the result is type-coherent
-        // even before the first InsertValue.
+        // Fall back to the InsertValue chain. Snapshot the error count
+        // so we can refuse to emit a malformed seed → chain if
+        // zeroLiteralOf diagnosed anything (closes the silent-failure
+        // gap where unsupported() reported but the bogus literal
+        // still flowed into addConst + InsertValue).
+        std::size_t const errorsBefore = reporter.errorCount();
         auto kids = hir.children(node);
         TypeKind const aggCore = interner.kind(aggTy);
-        // Union review fix-up: the HIR child's TYPE identifies which
-        // variant is active; the seed's slot must match so the
-        // subsequent InsertValue's child type aligns.
-        MirLiteralValue baseLit = (aggCore == TypeKind::Union && !kids.empty())
-            ? zeroLiteralOfUnionWithChild(node, aggTy, hir.typeId(kids[0]))
-            : zeroLiteralOf(node, aggTy);
+        std::optional<TypeId> activeVariant;
+        if (aggCore == TypeKind::Union && !kids.empty()) {
+            activeVariant = hir.typeId(kids[0]);
+        }
+        MirLiteralValue baseLit = zeroLiteralOf(node, aggTy, activeVariant);
+        if (reporter.errorCount() != errorsBefore) return InvalidMirInst;
         MirInstId acc = mir.addConst(std::move(baseLit), aggTy);
         if (!acc.valid()) return InvalidMirInst;
         TypeId const i32 = interner.primitive(TypeKind::I32);
