@@ -234,12 +234,110 @@ TEST(ConstEval, RefuseOnDivByZeroPolicyDisabledReportsNotAConstant) {
 }
 
 TEST(ConstEval, NonFoldableKindReturnsNotAConstantExpression) {
-    // A Ref to a non-constant symbol is not foldable (CE2 will add the
-    // const-symbol-table callback). For CE1 it surfaces the NotAConstant
-    // failure code.
+    // A Ref WITHOUT a resolver callback is not foldable. (CE2's callback
+    // is opt-in: callers that don't set EvalOptions::resolveConstSymbol
+    // get CE1's pure-literal behaviour.)
     Rig r;
     HirNodeId const ref = r.builder.makeRef(r.intT(), /*sym=*/1);
     auto res = eval(r, ref);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+}
+
+// CE2: a Ref to a constant-bound symbol resolves through the resolver
+// callback. The engine recurses into the defining expression and folds.
+TEST(ConstEval, RefToConstSymbolFoldsViaResolver) {
+    Rig r;
+    // Setup: imagine `const int a = 42; int b = a;`. We build `b`'s init
+    // as a Ref to symbol 7 (`a`), and the resolver maps symbol 7 to a
+    // separate Literal-42 HIR node.
+    HirNodeId const aInit = r.litInt(42, r.intT());
+    HirNodeId const bInit = r.builder.makeRef(r.intT(), /*sym=*/7);
+    EvalOptions opts;
+    opts.resolveConstSymbol = [&aInit](SymbolId s) -> std::optional<HirNodeId> {
+        if (s.v == 7) return aInit;
+        return std::nullopt;
+    };
+    Hir hir = r.finishWith(bInit);
+    auto res = evaluateConstant(hir, r.interner, r.literals, bInit, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 42);
+}
+
+// CE2: transitive resolution — `a = 1; b = a; c = b;`. Each level
+// resolves through the callback; the chain folds end-to-end.
+TEST(ConstEval, RefChainFoldsTransitivelyViaResolver) {
+    Rig r;
+    HirNodeId const aInit = r.litInt(99, r.intT());
+    HirNodeId const bInit = r.builder.makeRef(r.intT(), /*sym=*/1);   // a
+    HirNodeId const cInit = r.builder.makeRef(r.intT(), /*sym=*/2);   // b
+    EvalOptions opts;
+    opts.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
+        if (s.v == 1) return aInit;
+        if (s.v == 2) return bInit;
+        return std::nullopt;
+    };
+    Hir hir = r.finishWith(cInit);
+    auto res = evaluateConstant(hir, r.interner, r.literals, cInit, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 99);
+}
+
+// CE2: cycle detection — `a = b; b = a;` doesn't infinite-recurse.
+// Engine tracks visited symbols and surfaces NotAConstantExpression at
+// the cycle-closing Ref.
+TEST(ConstEval, RefCycleDoesNotInfiniteRecurseAndSurfacesNonConstant) {
+    Rig r;
+    HirNodeId const aInit = r.builder.makeRef(r.intT(), /*sym=*/2);   // a = b
+    HirNodeId const bInit = r.builder.makeRef(r.intT(), /*sym=*/1);   // b = a
+    EvalOptions opts;
+    opts.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
+        if (s.v == 1) return aInit;
+        if (s.v == 2) return bInit;
+        return std::nullopt;
+    };
+    Hir hir = r.finishWith(aInit);
+    auto res = evaluateConstant(hir, r.interner, r.literals, aInit, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+    // Blame anchors at the USE site (the top-level Ref the caller passed),
+    // not at some node inside the cycle's interior tree. The use site is
+    // what the caller has source-span context for.
+    EXPECT_EQ(res.blamedNode, aInit);
+}
+
+// CE2: resolver returns nullopt → engine reports NotAConstantExpression
+// (not, e.g., UnsupportedOperator). Caller's "symbol isn't constant"
+// fallback routes to runtime-init / per-language diagnostic.
+TEST(ConstEval, RefToNonConstantSymbolViaResolverFails) {
+    Rig r;
+    HirNodeId const ref = r.builder.makeRef(r.intT(), /*sym=*/42);
+    EvalOptions opts;
+    opts.resolveConstSymbol = [](SymbolId) -> std::optional<HirNodeId> {
+        return std::nullopt;   // every symbol is "not a constant"
+    };
+    Hir hir = r.finishWith(ref);
+    auto res = evaluateConstant(hir, r.interner, r.literals, ref, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+}
+
+// CE2 + CE1 compose: `int a = 1 + 2; int b = a + 1;` folds end-to-end.
+TEST(ConstEval, RefAndArithmeticCompose) {
+    Rig r;
+    HirNodeId const one  = r.litInt(1, r.intT());
+    HirNodeId const two  = r.litInt(2, r.intT());
+    HirNodeId const aInit = r.binary(HirOpKind::Add, one, two, r.intT());   // 3
+    HirNodeId const refA  = r.builder.makeRef(r.intT(), /*sym=*/5);
+    HirNodeId const fourLit = r.litInt(4, r.intT());
+    HirNodeId const bInit = r.binary(HirOpKind::Add, refA, fourLit, r.intT()); // a+4 = 7
+    EvalOptions opts;
+    opts.resolveConstSymbol = [&](SymbolId s) -> std::optional<HirNodeId> {
+        if (s.v == 5) return aInit;
+        return std::nullopt;
+    };
+    Hir hir = r.finishWith(bInit);
+    auto res = evaluateConstant(hir, r.interner, r.literals, bInit, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 7);
 }

@@ -249,6 +249,31 @@ TEST(MirLoweringCSubset, ReturnBoolFromIntFnEmitsZExt) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
 }
 
+// CE2 wire-up: `int a = 1; int b = a;` folds end-to-end. `b`'s init is a
+// `Ref(a)`; the const-eval engine's resolver callback looks up `a`'s
+// init in the globals pre-pass table and folds it to `1`, so `b` lands
+// as a constant-init global too — no `__module_init__` synthesized.
+TEST(MirLoweringCSubset, GlobalCrossReferenceFoldsViaConstEvalResolver) {
+    auto L = lowerCSubset(
+        "int a = 1;\n"
+        "int b = a;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 2u);
+    // Both globals have constant initializers. No init function synthesized.
+    MirGlobalId const ga = m.globalAt(0);
+    MirGlobalId const gb = m.globalAt(1);
+    EXPECT_NE(m.globalInitLiteralIndex(ga), UINT32_MAX);
+    EXPECT_NE(m.globalInitLiteralIndex(gb), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(ga).valid());
+    EXPECT_FALSE(m.globalInitFunc(gb).valid());
+    EXPECT_EQ(m.moduleFuncCount(), 0u);
+    // Both literals carry value 1.
+    EXPECT_EQ(std::get<std::int64_t>(m.literalValue(m.globalInitLiteralIndex(ga)).value), 1);
+    EXPECT_EQ(std::get<std::int64_t>(m.literalValue(m.globalInitLiteralIndex(gb)).value), 1);
+}
+
 // HR's implicit-coercion pass wraps `int g = (Bool literal);` in a Cast.
 // `tryConstFold`'s new Cast case folds through the cast and produces a
 // constant-init global — no `__module_init__` function synthesized.

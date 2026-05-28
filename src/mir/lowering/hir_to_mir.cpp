@@ -1372,18 +1372,44 @@ struct Lowerer {
     // Classify each module-level global into pendingGlobals. Called after
     // `collectGlobals` (so `globalSymbols` is already populated for any
     // function body that refers to globals during lowering).
+    //
+    // CE2 wire-up: a Ref to ANOTHER module global resolves transitively
+    // via a per-call resolver closure. `int a = 1; int b = a;` folds to
+    // `b = 1` (both as constant-init globals). The resolver is keyed on
+    // a pre-pass map from `SymbolId.v` to the global's HIR init
+    // expression — engine cycle-safety handles `a = b; b = a;` style
+    // pathologies.
     void classifyGlobals(HirNodeId moduleNode) {
+        // Pre-pass: build symbol → init-expr map for ALL globals first,
+        // so a global initializer that forward-references a later global
+        // still resolves.
+        std::unordered_map<std::uint32_t, HirNodeId> initBySymbol;
+        for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+            if (hir.kind(decl) != HirKind::Global) continue;
+            SymbolId const sym = hir.globalSymbol(decl);
+            if (!sym.valid()) continue;
+            if (auto initN = hir.globalInit(decl); initN.has_value()) {
+                initBySymbol[sym.v] = *initN;
+            }
+        }
+        EvalOptions opts;
+        opts.resolveConstSymbol = [&initBySymbol](SymbolId s)
+                -> std::optional<HirNodeId> {
+            if (auto it = initBySymbol.find(s.v); it != initBySymbol.end()) {
+                return it->second;
+            }
+            return std::nullopt;
+        };
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             if (hir.kind(decl) != HirKind::Global) continue;
             PendingGlobal pg;
             pg.symbol = hir.globalSymbol(decl);
             pg.type   = hir.globalType(decl);
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
-                // Delegate to the shared const-eval engine (plan 12.5 CE1).
-                // Engine returns a HirLiteralValue; copy field-by-field into
-                // the MIR pool's variant (structurally identical, same core).
+                // The resolver covers Refs to sibling globals; literal /
+                // arithmetic / Cast paths still fold per CE1.
                 ConstEvalResult const r = evaluateConstant(
-                    hir, interner, literals, *initN);
+                    hir, interner, literals, *initN, opts);
                 if (r.value.has_value()) {
                     MirLiteralValue lit;
                     lit.value = r.value->value;

@@ -6,6 +6,7 @@
 #include "hir/hir_literal_pool.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 
 // Shared constants-evaluation engine (plan 12.5 CE1). Computes the compile-
@@ -32,9 +33,10 @@
 //     fold per the EvalOptions policy.
 //   - HirKind::Cast — narrowing/widening integer cast; retags the value
 //     to the target's core kind.
-// CE2–CE5 in plan 12.5 will extend: Ref-to-constant-symbol resolution
-// (via a callback), short-circuit LogicalAnd/Or/Ternary, allowFloat with
-// IEEE 754 policy.
+// CE2 extends with `Ref`-to-constant-symbol resolution via a caller-
+// supplied callback (`EvalOptions::resolveConstSymbol`). CE3–CE5 in plan
+// 12.5 will add: short-circuit LogicalAnd/Or/Ternary, allowFloat with
+// IEEE 754 policy, full Cast-fold-with-commonType integration.
 
 namespace dss {
 
@@ -54,9 +56,29 @@ enum class ConstEvalFailure : std::uint8_t {
     UnsupportedTypeKind,       // e.g. float folding when allowFloat=false
 };
 
-// Caller-controlled policy knobs.
+// Language-blind callback for `Ref`-to-constant-symbol resolution (CE2).
+// Given a referenced symbol, return its DEFINING HIR initializer
+// expression (e.g. the `1` in `int a = 1;`) so the engine can recurse
+// and fold transitively. Return `nullopt` when the symbol is NOT a
+// compile-time constant (e.g. a function parameter, a mutable local) —
+// the engine surfaces `NotAConstantExpression` blamed at the Ref node.
+//
+// The callback carries any caller state via the closure (D5.5 enum
+// context, MIR-globals' pendingGlobals table, future verifier state)
+// without templating the engine or leaking opaque user-data pointers.
+//
+// Cycle safety: the engine tracks a per-call visited-symbols set so a
+// chain like `int a = b; int b = a;` surfaces `NotAConstantExpression`
+// at the second encounter rather than infinite-recursing.
+using ConstSymbolResolver =
+    std::function<std::optional<HirNodeId>(SymbolId)>;
+
+// Caller-controlled options. Policy knobs + (CE2) the optional symbol
+// resolver. The resolver default is an empty std::function — Ref-to-
+// symbol then surfaces `NotAConstantExpression` (CE1's behaviour).
 struct EvalOptions {
-    bool allowFloat              = false;  // CE5 opens this gate
+    ConstSymbolResolver resolveConstSymbol{};   // CE2
+    bool allowFloat              = false;       // CE5 opens this gate
     bool refuseOnOverflow        = true;
     bool refuseOnDivByZero       = true;
     bool refuseOnShiftOutOfRange = true;

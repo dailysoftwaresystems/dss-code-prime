@@ -4,6 +4,8 @@
 #include "hir/hir.hpp"
 #include "hir/hir_op.hpp"
 
+#include <unordered_set>
+
 namespace dss {
 
 namespace {
@@ -111,18 +113,48 @@ applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
         || k == TypeKind::U64  || k == TypeKind::U128;
 }
 
-} // namespace
-
-ConstEvalResult evaluateConstant(Hir const& hir,
-                                 TypeInterner& interner,
-                                 HirLiteralPool const& literals,
-                                 HirNodeId expr,
-                                 EvalOptions options) {
+// Internal recursive impl. `visitedSyms` carries the per-call cycle-
+// detection set (CE2): any `Ref(sym)` resolution checks containment
+// before descending into the symbol's defining expression. The public
+// `evaluateConstant` seeds an empty set.
+[[nodiscard]] ConstEvalResult
+evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
+         HirNodeId expr, EvalOptions const& options,
+         std::unordered_set<std::uint32_t>& visitedSyms) {
     if (!expr.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     HirKind const k = hir.kind(expr);
     if (k == HirKind::Literal) {
         std::uint32_t const idx = hir.payload(expr);
         return ok(literals.at(idx));
+    }
+    if (k == HirKind::Ref) {
+        // CE2: resolve a Ref to a constant-bound symbol via the caller's
+        // resolver callback. Absent callback (CE1's behaviour) or absent
+        // mapping → NotAConstantExpression. Cycle detection prevents
+        // infinite recursion on `int a = b; int b = a;`-shape inputs.
+        if (!options.resolveConstSymbol) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        std::uint32_t const sym = hir.payload(expr);
+        if (visitedSyms.contains(sym)) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto definingExpr = options.resolveConstSymbol(SymbolId{sym});
+        if (!definingExpr.has_value() || !definingExpr->valid()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        visitedSyms.insert(sym);
+        ConstEvalResult inner = evalImpl(hir, interner, literals,
+                                         *definingExpr, options, visitedSyms);
+        visitedSyms.erase(sym);
+        // On failure, re-blame at the Ref USE site rather than wherever
+        // the definition tree's failure surfaced. The caller (a
+        // diagnostic emitter) has the use-site span available; the
+        // definition-tree's node may live in an entirely different
+        // module decl and carry no helpful context. On success, blame
+        // stays default (no anchor needed).
+        if (!inner.value.has_value()) inner.blamedNode = expr;
+        return inner;
     }
     if (k == HirKind::UnaryOp) {
         std::uint32_t const payload = hir.payload(expr);
@@ -130,7 +162,7 @@ ConstEvalResult evaluateConstant(Hir const& hir,
         HirOpKind const op = decodeCoreOp(payload);
         auto kids = hir.children(expr);
         if (kids.size() != 1) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult inner = evaluateConstant(hir, interner, literals, kids[0], options);
+        ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
         if (!inner.value.has_value()) return inner;
         if (auto folded = applyUnaryInt(op, *inner.value); folded.has_value()) {
             return ok(std::move(*folded));
@@ -143,9 +175,9 @@ ConstEvalResult evaluateConstant(Hir const& hir,
         HirOpKind const op = decodeCoreOp(payload);
         auto kids = hir.children(expr);
         if (kids.size() != 2) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult a = evaluateConstant(hir, interner, literals, kids[0], options);
+        ConstEvalResult a = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
         if (!a.value.has_value()) return a;
-        ConstEvalResult b = evaluateConstant(hir, interner, literals, kids[1], options);
+        ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], options, visitedSyms);
         if (!b.value.has_value()) return b;
         ConstEvalFailure why = ConstEvalFailure::None;
         if (auto folded = applyBinaryInt(op, *a.value, *b.value, options, why);
@@ -163,7 +195,7 @@ ConstEvalResult evaluateConstant(Hir const& hir,
         // CE3/CE5 land.
         auto kids = hir.children(expr);
         if (kids.size() != 1) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        ConstEvalResult inner = evaluateConstant(hir, interner, literals, kids[0], options);
+        ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
         if (!inner.value.has_value()) return inner;
         TypeId const targetTy = hir.typeId(expr);
         if (!targetTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
@@ -177,6 +209,17 @@ ConstEvalResult evaluateConstant(Hir const& hir,
         return ok(std::move(folded));
     }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
+}
+
+} // namespace
+
+ConstEvalResult evaluateConstant(Hir const& hir,
+                                 TypeInterner& interner,
+                                 HirLiteralPool const& literals,
+                                 HirNodeId expr,
+                                 EvalOptions options) {
+    std::unordered_set<std::uint32_t> visitedSyms;
+    return evalImpl(hir, interner, literals, expr, options, visitedSyms);
 }
 
 } // namespace dss
