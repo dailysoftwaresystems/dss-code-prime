@@ -653,6 +653,53 @@ MirInstId MirBuilder::addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags f
     return appendInst_(pod, {}, /*terminates=*/false);
 }
 
+// D5.6: first-class aggregate ops. Each path element is interned as a
+// Const MirInst of type I32 carrying the index value; the resulting
+// operand vector is `[aggregate, idx0, idx1, ...]` (Gep-shaped).
+namespace {
+[[noreturn]] void requireAggregatePath_(char const* what) {
+    std::fprintf(stderr,
+                 "dss::MirBuilder fatal: %s: path must have at least one index\n",
+                 what);
+    std::abort();
+}
+} // namespace
+
+MirInstId MirBuilder::addExtractValue(MirInstId aggregate,
+                                       std::span<std::uint32_t const> path,
+                                       TypeId resultType, TypeId indexType,
+                                       MirInstFlags flags) {
+    if (path.empty()) requireAggregatePath_("addExtractValue");
+    std::vector<MirInstId> operands;
+    operands.reserve(1 + path.size());
+    operands.push_back(aggregate);
+    for (std::uint32_t idx : path) {
+        MirLiteralValue lv;
+        lv.value = static_cast<std::int64_t>(idx);
+        lv.core  = TypeKind::I32;
+        operands.push_back(addConst(std::move(lv), indexType));
+    }
+    return addInst(MirOpcode::ExtractValue, operands, resultType, 0, flags);
+}
+
+MirInstId MirBuilder::addInsertValue(MirInstId aggregate, MirInstId value,
+                                      std::span<std::uint32_t const> path,
+                                      TypeId resultType, TypeId indexType,
+                                      MirInstFlags flags) {
+    if (path.empty()) requireAggregatePath_("addInsertValue");
+    std::vector<MirInstId> operands;
+    operands.reserve(2 + path.size());
+    operands.push_back(aggregate);
+    operands.push_back(value);
+    for (std::uint32_t idx : path) {
+        MirLiteralValue lv;
+        lv.value = static_cast<std::int64_t>(idx);
+        lv.core  = TypeKind::I32;
+        operands.push_back(addConst(std::move(lv), indexType));
+    }
+    return addInst(MirOpcode::InsertValue, operands, resultType, 0, flags);
+}
+
 MirInstId MirBuilder::addPhi(TypeId resultType, std::span<MirPhiIncoming const> incomings,
                              MirInstFlags flags) {
     if (!resultType.valid()) requireValueType_("addPhi");

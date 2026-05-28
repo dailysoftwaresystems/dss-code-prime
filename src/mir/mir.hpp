@@ -296,6 +296,20 @@ public:
     MirInstId addConst(MirLiteralValue value, TypeId type, MirInstFlags flags = MirInstFlags::None);
     MirInstId addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags flags = MirInstFlags::None);
 
+    // D5.6: aggregate field/element read + write (first-class, no memory).
+    // `path` is the field-index chain (length 1 for direct read of a top-
+    // level field; >1 for nested). `indexType` is the interner's i32
+    // TypeId (MirBuilder doesn't carry a TypeInterner — the caller, who
+    // does, provides it). Result type is the element's type for
+    // ExtractValue, the aggregate's type for InsertValue.
+    MirInstId addExtractValue(MirInstId aggregate, std::span<std::uint32_t const> path,
+                              TypeId resultType, TypeId indexType,
+                              MirInstFlags flags = MirInstFlags::None);
+    MirInstId addInsertValue(MirInstId aggregate, MirInstId value,
+                             std::span<std::uint32_t const> path,
+                             TypeId resultType, TypeId indexType,
+                             MirInstFlags flags = MirInstFlags::None);
+
     // Phi at the current block. By convention phis sit at the block head (a
     // verifier-checked rule in ML3, not enforced here). Incomings may be supplied
     // now and/or appended later via `addPhiIncoming` (loop back-edges); all are

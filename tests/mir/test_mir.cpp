@@ -730,3 +730,104 @@ TEST(MirDeathTest, DirectCtorGlobalArenaTagMismatchAborts) {
                            {}, {}, {}, MirLiteralPool{}),
                  "module-tag mismatch");
 }
+
+// ── D5.6: first-class aggregate read/write ────────────────────────────
+
+// `addExtractValue(agg, {1})` produces an ExtractValue inst with
+// operands [agg, idx0] where idx0 is a Const i32 with value 1. The
+// result has the supplied resultType.
+TEST(Mir, ExtractValueProducesGepShapedOperands) {
+    MirBuilder b;
+    constexpr TypeId kStruct{4};   // stand-in for a struct TypeId
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kStruct);
+    std::array<std::uint32_t, 1> path{1};
+    MirInstId const xv = b.addExtractValue(arg, path, kI32, kI32);
+    b.addReturn(xv);
+    Mir m = std::move(b).finish();
+
+    EXPECT_EQ(m.instOpcode(xv), MirOpcode::ExtractValue);
+    EXPECT_EQ(m.instType(xv).v, kI32.v);
+    auto const ops = m.instOperands(xv);
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(ops[0], arg);
+    EXPECT_EQ(m.instOpcode(ops[1]), MirOpcode::Const);
+    EXPECT_EQ(m.instType(ops[1]).v, kI32.v);
+    (void)f;
+}
+
+// `addInsertValue(agg, value, {0})` produces operands [agg, value, idx0]
+// and returns a value of the aggregate's type.
+TEST(Mir, InsertValueProducesGepShapedOperands) {
+    MirBuilder b;
+    constexpr TypeId kStruct{4};
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kStruct);
+    MirInstId const v   = b.addConst(intLit(7), kI32);
+    std::array<std::uint32_t, 1> path{0};
+    MirInstId const iv = b.addInsertValue(arg, v, path, kStruct, kI32);
+    b.addReturn(iv);
+    Mir m = std::move(b).finish();
+
+    EXPECT_EQ(m.instOpcode(iv), MirOpcode::InsertValue);
+    EXPECT_EQ(m.instType(iv).v, kStruct.v);
+    auto const ops = m.instOperands(iv);
+    ASSERT_EQ(ops.size(), 3u);   // [agg, value, idx0]
+    EXPECT_EQ(ops[0], arg);
+    EXPECT_EQ(ops[1], v);
+    EXPECT_EQ(m.instOpcode(ops[2]), MirOpcode::Const);
+    (void)f;
+}
+
+// Nested extract: path {0, 2} produces operands [agg, idx0=0, idx1=2].
+TEST(Mir, ExtractValueSupportsNestedPath) {
+    MirBuilder b;
+    constexpr TypeId kStruct{4};
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kStruct);
+    std::array<std::uint32_t, 2> path{0, 2};
+    MirInstId const xv = b.addExtractValue(arg, path, kI32, kI32);
+    b.addReturn(xv);
+    Mir m = std::move(b).finish();
+
+    auto const ops = m.instOperands(xv);
+    ASSERT_EQ(ops.size(), 3u);
+    EXPECT_EQ(ops[0], arg);
+    // ops[1] = Const 0, ops[2] = Const 2.
+    EXPECT_EQ(m.instOpcode(ops[1]), MirOpcode::Const);
+    EXPECT_EQ(m.instOpcode(ops[2]), MirOpcode::Const);
+    (void)f;
+}
+
+// Empty path is a builder error (would mean "extract whole aggregate"
+// which is just the aggregate value — a caller bug to spell).
+TEST(MirDeathTest, ExtractValueRejectsEmptyPath) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kI32);
+    EXPECT_DEATH(
+        (void)b.addExtractValue(arg, std::span<std::uint32_t const>{}, kI32, kI32),
+        "at least one index");
+}
+
+// addInst direct path also rejects too-few operands for the new opcodes.
+TEST(MirDeathTest, ExtractValueRejectsSingleOperand) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kI32);
+    std::array<MirInstId, 1> ops{arg};
+    EXPECT_DEATH((void)b.addInst(MirOpcode::ExtractValue, ops, kI32),
+                 "extractvalue");
+}

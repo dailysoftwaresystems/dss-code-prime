@@ -47,6 +47,18 @@ enum class MirOpcode : std::uint16_t {
     FCmpUeq, FCmpUne, FCmpUlt, FCmpUle, FCmpUgt, FCmpUge,
     // ── memory ──
     Alloca, Load, Store, Gep,
+    // ── first-class aggregates (D5.6) ──
+    // ExtractValue: read a field/element FROM an aggregate VALUE by
+    // statically-known index. operands = [aggregate]; scalars[0..N) =
+    // the field-index path (length 1 for direct, >1 for nested).
+    // Result = the element's type. Distinct from `Load` — operates on
+    // an in-register aggregate value, not memory.
+    ExtractValue,
+    // InsertValue: produce a NEW aggregate VALUE by replacing one
+    // field/element of `aggregate` with `value`. operands = [aggregate,
+    // value]; scalars[0..N) = the field-index path. Result = the
+    // aggregate's type (same shape, one slot replaced).
+    InsertValue,
     // ── casts ──
     Trunc, SExt, ZExt, FPTrunc, FPExt, Bitcast,
     IntToPtr, PtrToInt, FPToSI, FPToUI, SIToFP, UIToFP,
@@ -187,6 +199,17 @@ struct MirOpcodeInfo {
         case MirOpcode::Load:   return {1, 1, 0, 0, R::Value, false, false, false, "load"};
         case MirOpcode::Store:  return {2, 2, 0, 0, R::None,  false, true,  false, "store"};
         case MirOpcode::Gep:    return {1, N, 0, 0, R::Value, false, false, false, "gep"};
+        // D5.6: first-class aggregate read/write. Operand layout
+        // matches Gep's convention — indices ride as MirInstId
+        // operands (Const-typed integers), not as a separate scalar
+        // span; this keeps a single uniform "instructions reference
+        // other instructions" model across the IR.
+        //   ExtractValue: [aggregate, idx0, idx1, ...]; minOperands=2.
+        //   InsertValue:  [aggregate, value, idx0, idx1, ...]; minOperands=3.
+        // Result is a value (the element's type / the aggregate's type
+        // respectively), no side effect, not a terminator.
+        case MirOpcode::ExtractValue: return {2, N, 0, 0, R::Value, false, false, false, "extractvalue"};
+        case MirOpcode::InsertValue:  return {3, N, 0, 0, R::Value, false, false, false, "insertvalue"};
 
         // casts (operand → result type).
         case MirOpcode::Trunc:    return {1, 1, 0, 0, R::Value, false, false, false, "trunc"};
