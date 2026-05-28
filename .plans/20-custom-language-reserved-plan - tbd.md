@@ -12,6 +12,7 @@
 | Predecessors  | ⏳ v1 ship per [`07-production-readiness-plan`](./07-production-readiness-plan%20-%20tbd.md). ⏳ Schema v3 (per [`06-artifact-profile-plan`](./06-artifact-profile-plan%20-%20tbd.md) + lattice extension support). ⏳ Mature C++/C# language configs (post-v1 work). |
 | Successors    | First-class user of [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) (the same-source CPU+GPU goal). |
 | Scope         | **Unspecified.** Design lands when triggered. |
+| Mapped from elsewhere | **Schema-driven `allowFloat`** (from plan [12.5 §0.2 D3](./12.5-const-eval-plan%20-%20tbd.md)): if the custom language adopts non-IEEE float semantics (decimal float, fixed-point, saturating arithmetic), the `EvalOptions::allowFloat` knob — today opted in unconditionally by MIR-globals because every v1 shipped language is IEEE 754 — must become per-schema in `HirLoweringConfig`. The custom-language cycle that introduces non-IEEE semantics owns the substrate change. Until then no v1 schema needs it. |
 
 ---
 

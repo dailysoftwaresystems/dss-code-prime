@@ -186,6 +186,10 @@ Round-trippable. Disassembler round-trip test pins encoding (see [`13-assembler-
 | ML7 | Calling-convention + stack frame materialization | SysV AMD64, Microsoft x64, AAPCS64, Microsoft ARM64. Prologue/epilogue. |
 | ML8 | LIR text format + verifier + round-trip          | `.dsslir` per-target; verifier validates; disasm round-trip pins. |
 
+### Post-ML8 substrate items mapped here
+
+- **`EvalOptions` env/policy split** (from plan [12.5 §0.2 D4](./12.5-const-eval-plan%20-%20tbd.md)): when SizeOf / type-layout queries land alongside MIR's type-layout substrate, `const_eval`'s `EvalOptions` gets a second function-typed field (`resolveTypeLayout`). At that point the closure-carrying environment is extracted to a sibling `EvalEnvironment` struct (policy bools stay in `EvalOptions`); this avoids the config-object antipattern called out by plan 12.5 CE5's architecture review.
+
 Substrate tier (5-agent review) for ML1, ML3, ML5, ML6 — touch substrate / cross-cutting algorithm contracts.
 
 ---
