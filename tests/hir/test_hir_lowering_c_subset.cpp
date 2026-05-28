@@ -1023,3 +1023,68 @@ TEST(HirLoweringCSubset, D5_3_PositionalArrayInit) {
     EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
     EXPECT_EQ(res->hir.children(init).size(), 3u);
 }
+
+// Under-filled array: explicit elements at slots 0..k-1, synth-zero at k..N-1.
+TEST(HirLoweringCSubset, D5_3_ArrayUnderfillZeroFillsTail) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[5] = {1, 2}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 5u);
+    for (auto k : kids) EXPECT_EQ(res->hir.kind(k), HirKind::Literal);
+}
+
+// C99 §6.7.8p17: a designator restarts the fill cursor at the designated
+// position; the immediately following positional element resumes from
+// `designated + 1`. This pins the two cursor assignments in lowerBraceInit.
+TEST(HirLoweringCSubset, D5_3_CursorRestartAfterDesignator) {
+    SemanticModel model = analyzeCSubset(
+        "struct Trip { int a; int b; int c; };\n"
+        "void f() { struct Trip t = {.b = 9, 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 3u);
+    // Slot 0 (.a) zero-fill, slot 1 (.b) = 9, slot 2 (.c) = 7 (cursor restart).
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+    EXPECT_EQ(res->hir.kind(kids[2]), HirKind::Literal);
+}
+
+// Empty brace `T x = {};` — fully zero-fills via synthZero recursion. The
+// existing zero-fill test only exercises synthZero on scalar fields; this
+// hits the recursive aggregate-arm (struct of struct).
+TEST(HirLoweringCSubset, D5_3_EmptyBraceZeroFillsNestedAggregate) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
