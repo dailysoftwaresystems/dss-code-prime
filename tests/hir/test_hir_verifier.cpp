@@ -981,6 +981,40 @@ TEST(HirVerifier, CallWithUntypedCalleeDoesNotFireArgRule) {
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 1u);
 }
 
+// D5.1 cycle 4: MemberAccess's payload (field index) must be in bounds for
+// the base's struct type. A direct-builder MemberAccess with an off-by-one
+// fieldIndex fires the new verifier rule.
+TEST(HirVerifier, MemberAccessOutOfBoundsFieldIndexFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    // struct Point { I32 x; I32 y; }  ⇒ 2 fields.
+    std::array<TypeId, 2> fields{i32, i32};
+    TypeId const point = ti.structType("Point", fields);
+    HirBuilder b{"c-subset"};
+    // Hand-build `MemberAccess(Ref<Point>, payload=5)` — clearly out of bounds.
+    HirNodeId const base = b.makeRef(point, /*symbol=*/1);
+    HirNodeId const access = b.makeMemberAccess(base, /*fieldIndex=*/5, i32);
+    Hir h = std::move(b).finish(access);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_GE(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+// D5.1 cycle 4: MemberAccess's base must be a Struct/Union (the arrow form's
+// Deref is what makes this hold for `ptr->x` paths). A MemberAccess directly
+// over a non-composite-typed base fires the rule.
+TEST(HirVerifier, MemberAccessOnNonCompositeFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c-subset"};
+    HirNodeId const base = b.makeRef(i32, /*symbol=*/1);  // base is I32, not struct
+    HirNodeId const access = b.makeMemberAccess(base, /*fieldIndex=*/0, i32);
+    Hir h = std::move(b).finish(access);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_GE(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
 TEST(HirVerifier, ShaderMutualRecursionFires) {
     // shadeA (#1) calls #2; shadeB (#2) calls #1 — both ShaderUsable.
     TypeInterner ti = makeInterner();

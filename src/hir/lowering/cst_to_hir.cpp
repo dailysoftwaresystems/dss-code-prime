@@ -911,6 +911,81 @@ struct Lowerer {
             TypeId const result = typeAtOr(node, inferred);
             return {track(builder.makeIndex(base.id, idx, result), node), result};
         }
+        // D5.1: `obj.field` and `ptr->field`. The semantic phase (Pass 2)
+        // already resolved the field's SymbolId (via the `memberAccesses`
+        // facet) and propagated its type to both the field-name leaf and
+        // the postfixExpr node. We read fieldIndex off the field's
+        // SymbolRecord (Pass 1 stamped it as the field's declaration-order
+        // ordinal in its struct scope). The arrow form is desugared at HIR
+        // level: `p->x` = `MemberAccess(Deref(p), idx)` — one HIR kind
+        // handles both forms, downstream MIR sees uniform GEP-after-load
+        // patterns.
+        if (e.target == "MemberAccess" || e.target == "MemberAccessThruPtr") {
+            // Locate the field-name token inside the follower subtree
+            // (c-subset's `memberFollower = {sequence: [Identifier]}`). Robust
+            // against a future schema that wraps the name (e.g. bracketed
+            // identifiers): scan for a real token first, fall back to the
+            // first visible child if the follower is all Internal.
+            NodeId followerN = rest.empty() ? NodeId{} : rest.front();
+            NodeId fieldNameN{};
+            if (followerN.valid()) {
+                for (NodeId c : visible(followerN)) {
+                    if (isToken(c)) { fieldNameN = c; break; }
+                    if (!fieldNameN.valid()) fieldNameN = c;
+                }
+            }
+            if (!fieldNameN.valid()) {
+                return exprError(node, "member access has no field-name leaf");
+            }
+            SymbolId const fieldSym = model.symbolAt(fieldNameN);
+            if (!fieldSym.valid()) {
+                return exprError(node, "member access field did not resolve "
+                                       "to a symbol (semantic phase miss)");
+            }
+            auto const* frec = model.recordFor(fieldSym);
+            if (frec == nullptr) {
+                return exprError(node, "member access field SymbolId has no record");
+            }
+            // Defensive: the resolved symbol must be a field of a composite
+            // type. Pass 2's member-access path always binds to a field
+            // (struct-scope lookup), but a future Pass-2 recovery path that
+            // falls back to enclosing-scope lookup could mis-bind to a
+            // non-field symbol whose `fieldIndex` is just declaration-order
+            // noise. Catch it here rather than emitting a structurally-valid
+            // but semantically-wrong MemberAccess with a bogus index.
+            if (!frec->scope.valid()
+                || frec->kind != DeclarationKind::Variable) {
+                return exprError(node, "member access resolved to a non-field "
+                                       "symbol (semantic-phase mis-binding)");
+            }
+            std::uint32_t const fieldIndex = frec->fieldIndex;
+            // Field type: prefer the semantic-phase-propagated type on the
+            // field-name node; fall back to the symbol record's type.
+            TypeId fieldType = model.typeAt(fieldNameN);
+            if (!fieldType.valid()) fieldType = frec->type;
+            HirNodeId object = base.id;
+            if (e.target == "MemberAccessThruPtr") {
+                // Arrow form: dereference the LHS pointer first. The Deref's
+                // result type is the pointee type (Struct) — read from the
+                // interner via the base's Ptr operand.
+                TypeId pointeeType = InvalidType;
+                if (base.type.valid()
+                    && interner.kind(base.type) == TypeKind::Ptr
+                    && !interner.operands(base.type).empty()) {
+                    pointeeType = interner.operands(base.type)[0];
+                }
+                // Pass 2 also emitted S_NotAPointer if base.type wasn't a
+                // pointer, but we still need a type here for the Deref node
+                // to be HIR-verifier-valid (it requires a valid type). If
+                // pointee is invalid, leave it InvalidType — the verifier's
+                // requiresValidType rule will surface H_TypeUnresolved.
+                object = track(builder.makeDeref(base.id, pointeeType,
+                                                 HirFlags::Synthetic), node);
+            }
+            return {track(builder.makeMemberAccess(object, fieldIndex,
+                                                   fieldType), node),
+                    fieldType};
+        }
         return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
     }
 

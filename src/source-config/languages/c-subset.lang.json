@@ -600,7 +600,9 @@
       { "token": "ParenOpen",    "target": "Call"    },
       { "token": "BracketOpen",  "target": "Index"   },
       { "token": "PlusPlusOp",   "target": "PostInc" },
-      { "token": "MinusMinusOp", "target": "PostDec" }
+      { "token": "MinusMinusOp", "target": "PostDec" },
+      { "token": "DotOp",        "target": "MemberAccess"       },
+      { "token": "ArrowOp",      "target": "MemberAccessThruPtr"}
     ],
 
     "forClauseSeparator": "EndStatement",

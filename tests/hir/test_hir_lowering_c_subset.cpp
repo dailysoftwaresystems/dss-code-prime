@@ -209,9 +209,8 @@ TEST(HirLoweringCSubset, StructDeclarationLowersToTypeDecl) {
 
 // D5.1: a struct used as a pointer-typed parameter + member access via `->`
 // resolves the field SymbolId AND propagates the field's type to the
-// member-access node. The `MemberAccess` HIR-lowering pass is still owed in a
-// later D5.1 cycle, so this test pins the SEMANTIC resolution (the binding
-// the lowering will consume).
+// member-access node. Pins the SEMANTIC layer (Pass 1.5 struct composition +
+// Pass 2 field-symbol binding + type propagation).
 TEST(HirLoweringCSubset, StructFieldAccessResolvesSemantically) {
     SemanticModel model = analyzeCSubset(
         "struct Point { int x; int y; };\n"
@@ -268,6 +267,84 @@ TEST(HirLoweringCSubset, StructFieldAccessResolvesSemantically) {
     TypeId accessType = model.typeAt(parent);
     ASSERT_TRUE(accessType.valid()) << "member-access node has no type";
     EXPECT_EQ(interner.kind(accessType), TypeKind::I32);
+}
+
+// D5.1 cycle 4: the `MemberAccess` HIR-lowering branch in lowerPostfix. A `.`
+// access lowers to a plain `HirKind::MemberAccess` with the field's payload =
+// fieldIndex. An arrow `->` access is desugared at HIR level to
+// `MemberAccess(Deref(p), idx)` -- same HirKind handles both forms; MIR sees
+// uniform GEP-after-load patterns.
+TEST(HirLoweringCSubset, MemberAccessLowersToHirMemberAccess) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "int get_y(struct Point *p) { return p->y; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 2u);   // struct Point, function get_y
+    HirNodeId const fn = decls[1];
+    ASSERT_EQ(res->hir.kind(fn), HirKind::Function);
+    HirNodeId const body = res->hir.functionBody(fn);
+    // body = Block of [ReturnStmt(MemberAccess(Deref(Ref(p)), 1))]
+    auto stmts = res->hir.children(body);
+    ASSERT_EQ(stmts.size(), 1u);
+    HirNodeId const ret = stmts[0];
+    ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
+    auto const retVal = res->hir.returnValue(ret);
+    ASSERT_TRUE(retVal.has_value());
+    HirNodeId const access = *retVal;
+    ASSERT_EQ(res->hir.kind(access), HirKind::MemberAccess);
+    // Field 'y' is the SECOND field (index 1) of Point.
+    EXPECT_EQ(res->hir.payload(access), 1u);
+    // The MemberAccess's result type is the field type (I32).
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(res->hir.typeId(access)), TypeKind::I32);
+    // Arrow form: the access's single child is a Deref of the original LHS.
+    auto kids = res->hir.children(access);
+    ASSERT_EQ(kids.size(), 1u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Deref);
+    // The Deref's result type is the pointee (struct Point).
+    EXPECT_EQ(interner.kind(res->hir.typeId(kids[0])), TypeKind::Struct);
+}
+
+// D5.1 cycle 4 review fix: the DOT form goes through a different lowering
+// path than ARROW (no Deref synthesis). The previous test only exercised
+// arrow; this one pins the dot path's structural shape.
+TEST(HirLoweringCSubset, DotMemberAccessLowersWithoutDeref) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "int by_value(struct Point s) { return s.x; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 2u);
+    HirNodeId const fn = decls[1];
+    HirNodeId const body = res->hir.functionBody(fn);
+    auto stmts = res->hir.children(body);
+    ASSERT_EQ(stmts.size(), 1u);
+    HirNodeId const ret = stmts[0];
+    auto const retVal = res->hir.returnValue(ret);
+    ASSERT_TRUE(retVal.has_value());
+    HirNodeId const access = *retVal;
+    ASSERT_EQ(res->hir.kind(access), HirKind::MemberAccess);
+    EXPECT_EQ(res->hir.payload(access), 0u);  // x is field 0
+    // Dot form: child is the LHS DIRECTLY, no Deref wrapping.
+    auto kids = res->hir.children(access);
+    ASSERT_EQ(kids.size(), 1u);
+    EXPECT_NE(res->hir.kind(kids[0]), HirKind::Deref);
+    // The LHS's type is the struct directly (not Ptr<Struct>).
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(res->hir.typeId(kids[0])), TypeKind::Struct);
 }
 
 TEST(HirLoweringCSubset, ExternFunctionAndGlobal) {

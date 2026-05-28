@@ -61,6 +61,7 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     checkReturnCompleteness(reporter);
     checkCallArguments(reporter);
     checkIntrinsicCalls(reporter);
+    checkMemberAccess(reporter);
     checkShaderRestrictions(reporter);
     //
     // A capped reporter (the global maxDiagnostics ceiling hit — here or in a
@@ -415,6 +416,51 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
                                      id.v, a, args[a].v, a),
                          sourceMap_);
             }
+        }
+    }
+}
+
+void HirVerifier::checkMemberAccess(DiagnosticReporter& reporter) const {
+    // D5.1: every MemberAccess's payload (field index) must be in bounds
+    // for the base's struct/union type. Interner-gated -- we decode the
+    // field count via `operands(baseType)`. The HIR-lowering reads the
+    // field's `SymbolRecord::fieldIndex` (set by Pass 1 to the field's
+    // declaration-order ordinal), so this check catches HIR-lowering
+    // bugs OR direct-builder synthetic-IR misuse (a hand-fabricated
+    // MemberAccess with an off-by-one field index).
+    if (interner_ == nullptr) return;
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hir_.kind(id) != HirKind::MemberAccess) continue;
+        if (hasError(hir_.flags(id))) continue;
+
+        auto kids = hir_.children(id);
+        if (kids.empty()) continue;                       // arity rule flags this
+        TypeId const baseType = hir_.typeId(kids.front());
+        if (!baseType.valid()) continue;                   // cascade suppression
+
+        // The base must be a composite (Struct/Union) — for arrow form,
+        // the HIR-lowering already inserted a Deref, so the MemberAccess
+        // always sees the composite, never a Ptr. If we somehow see a
+        // non-composite here, fail loud: the lowering is broken.
+        TypeKind const bk = interner_->kind(baseType);
+        if (bk != TypeKind::Struct && bk != TypeKind::Union) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("MemberAccess #{} base type is not a struct "
+                                 "or union (TypeKind ordinal {})",
+                                 id.v, static_cast<unsigned>(bk)),
+                     sourceMap_);
+            continue;
+        }
+        auto const fields = interner_->operands(baseType);
+        std::uint32_t const fieldIndex = hir_.payload(id);
+        if (fieldIndex >= fields.size()) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("MemberAccess #{} field index {} is out of "
+                                 "bounds for the base type's {} field(s)",
+                                 id.v, fieldIndex, fields.size()),
+                     sourceMap_);
         }
     }
 }
