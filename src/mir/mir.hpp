@@ -267,6 +267,14 @@ public:
     MirInstId addReturn(std::optional<MirInstId> value = std::nullopt);
     MirInstId addUnreachable();
 
+    // ── introspection (read-only on the in-progress build) ──
+    // True iff the currently-open block has been sealed (i.e. one of the
+    // terminator builders has run on it). Lowerings that synthesize an
+    // implicit terminator (e.g. ML2's implicit-void-return on a `void f() {}`
+    // body that didn't write its own return) read this to decide whether to
+    // emit one. Returns false when no block is open.
+    [[nodiscard]] bool openBlockHasTerminator() const noexcept;
+
     // Freeze. Flushes pending phi incomings, validates the open function/block are
     // closed, and hands over the immutable module. Single-use; consumes *this.
     [[nodiscard]] Mir finish() &&;

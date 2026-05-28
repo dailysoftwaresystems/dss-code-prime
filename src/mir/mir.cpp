@@ -690,6 +690,14 @@ MirInstId MirBuilder::addUnreachable() {
     return id;
 }
 
+bool MirBuilder::openBlockHasTerminator() const noexcept {
+    // No open block ⇒ no terminator to ask about; conservative false. A
+    // sealed block's state is `BlockState::Sealed` — the block-state vector
+    // is indexed by block .v (slot 0 is the sentinel).
+    if (!openBlock_.valid()) return false;
+    return blockState_[openBlock_.v] == BlockState::Sealed;
+}
+
 Mir MirBuilder::finish() && {
     closeFunction_();  // closes the open block + function (validates termination / ≥1 block)
 
