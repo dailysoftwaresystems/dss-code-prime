@@ -1524,38 +1524,10 @@ struct Lowerer {
         for (std::uint32_t i = 0; i < slotCount; ++i)
             rootSlots[i].slotType = slotType(i);
 
-        // Field-designator resolver: D5.1 SymbolRecord::fieldIndex,
-        // mirroring MemberAccess's defensive `scope.valid()+kind==Var`
-        // guard against semantic-phase mis-binding.
-        // Tri-state: nullopt = no designator name; -1 = failed + emitted;
-        // ≥0 = resolved index.
-        auto resolveFieldDesignator = [&](NodeId dfNode)
-                -> std::optional<std::int64_t> {
-            NodeId nameTok{};
-            for (NodeId tok : visible(dfNode)) {
-                if (!isToken(tok)) continue;
-                if (tree().tokenKind(tok).v != sem.identifierToken.v) continue;
-                nameTok = tok;
-                break;
-            }
-            if (!nameTok.valid()) return std::nullopt;
-            SymbolId const sym = model.symbolAt(nameTok);
-            if (!sym.valid()) {
-                reportedError(dfNode,
-                    "field designator did not resolve to a symbol "
-                    "(semantic phase miss)");
-                return std::int64_t{-1};
-            }
-            auto const* rec = model.recordFor(sym);
-            if (rec == nullptr || !rec->scope.valid()
-                || rec->kind != DeclarationKind::Variable) {
-                reportedError(dfNode,
-                    "field designator resolved to a non-field symbol "
-                    "(semantic-phase mis-binding)");
-                return std::int64_t{-1};
-            }
-            return static_cast<std::int64_t>(rec->fieldIndex);
-        };
+        // SP3.c: type-aware field-designator resolution is now inlined
+        // into the initElement-walk loop below — the resolver threads a
+        // `designatorCurrentType` cursor through each chained step so
+        // `.a.b = 1` resolves `.b` in field `.a`'s type's scope.
 
         std::uint32_t cursor = 0;
         for (NodeId elem : visible(braceInitListNode)) {
@@ -1564,27 +1536,24 @@ struct Lowerer {
             if (!cfg.initElementRule.valid()
              || tree().rule(elem).v != cfg.initElementRule.v) continue;
 
-            // Walk the initElement's children, collecting:
-            //   • a SINGLE designator (cycle 1b: dot-chained not yet
-            //     supported pending §SP3; second-and-later designator
-            //     children are flagged as a substrate-blocked error).
-            //   • the trailing value expression / brace-init.
-            std::optional<std::int64_t> designated;
+            // SP3.c: walk the initElement's children collecting a FULL
+            // designator path (single OR dot-chained). At each step we
+            // descend into the type that the previous step pointed to,
+            // so a chain like `.a.v = 1` resolves `.v` in field `.a`'s
+            // struct scope (the InitSlot tree's `nested` substrate is
+            // what makes the multi-step write semantically right).
+            std::vector<std::uint32_t> designatorPath;
+            TypeId designatorCurrentType = contextType;
             bool designatorFailed = false;
-            int designatorCount = 0;
             NodeId valueExprCst{};
             for (NodeId c : visible(elem)) {
                 if (isToken(c)) continue;
                 if (tree().kind(c) != NodeKind::Internal) continue;
-                // A designator child may be wrapped: the c-subset
-                // grammar has `designator: alt[designatedField,
-                // designatedIndex]` which parses to an auto-interned
-                // alt-wrapper internal whose rule != designatedFieldRule
-                // / designatedIndexRule. Peel via `soleMeaningfulChild`
-                // descent until a recognized designator-leaf rule is
-                // reached. Without this, dot-chained `.a.b = 1`
-                // silently degraded to a positional element (the
-                // substrate-blocked diagnostic never fired).
+                // A designator child may be wrapped in an auto-interned
+                // alt-wrapper (the c-subset grammar's `designator: alt[
+                // designatedField, designatedIndex]`); peel via
+                // `soleMeaningfulChild` until the rule matches one of
+                // the recognized designator-leaf rules.
                 NodeId designatorCore = c;
                 while (tree().kind(designatorCore) == NodeKind::Internal) {
                     std::uint32_t const rr = tree().rule(designatorCore).v;
@@ -1602,35 +1571,54 @@ struct Lowerer {
                         : std::uint32_t{0};
                 if (cfg.designatedFieldRule.valid()
                  && r == cfg.designatedFieldRule.v) {
-                    ++designatorCount;
-                    if (designatorCount > 1) {
-                        // Anchor: plan 08.5 §SP3 — TypeId→declaring-symbol
-                        // substrate enables `.b` lookup in field `.a`'s
-                        // type's scope; required for chained-resolution.
+                    // Resolve `.name` against the CURRENT type's scope.
+                    // For the first designator, current=contextType; for
+                    // each subsequent step, current= the resolved
+                    // field's type (descends per the C99 chain rule).
+                    NodeId nameTok{};
+                    for (NodeId tok : visible(designatorCore)) {
+                        if (!isToken(tok)) continue;
+                        if (tree().tokenKind(tok).v != sem.identifierToken.v) continue;
+                        nameTok = tok;
+                        break;
+                    }
+                    if (!nameTok.valid()) {
                         reportedError(designatorCore,
-                            "dot-chained field designator is not yet "
-                            "supported");
+                            "field designator missing name token");
                         designatorFailed = true;
                         continue;
                     }
-                    designated = resolveFieldDesignator(designatorCore);
-                    if (designated.has_value() && *designated < 0)
+                    ScopeId const structScope =
+                        model.compositeScopeFor(designatorCurrentType);
+                    if (!structScope.valid()) {
+                        reportedError(designatorCore,
+                            "field designator's container is not a struct");
                         designatorFailed = true;
+                        continue;
+                    }
+                    std::string const name{tree().text(nameTok)};
+                    auto const& scope = model.scopeRecord(structScope);
+                    auto sit = scope.bindings.find(name);
+                    if (sit == scope.bindings.end()) {
+                        reportedError(designatorCore,
+                            "field designator names a field that doesn't "
+                            "belong to the target struct type");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    auto const* rec = model.recordFor(sit->second);
+                    if (rec == nullptr || rec->kind != DeclarationKind::Variable) {
+                        reportedError(designatorCore,
+                            "field designator resolved to a non-field symbol");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    designatorPath.push_back(rec->fieldIndex);
+                    designatorCurrentType = rec->type;
                     continue;
                 }
                 if (cfg.designatedIndexRule.valid()
                  && r == cfg.designatedIndexRule.v) {
-                    ++designatorCount;
-                    if (designatorCount > 1) {
-                        reportedError(designatorCore,
-                            "chained index designator is not yet supported");
-                        designatorFailed = true;
-                        continue;
-                    }
-                    // Anchor: arbitrary const-expression indices need
-                    // CST-side const-eval (HIR builder is write-only and
-                    // const_eval consumes HIR); integer-literal indices
-                    // already handled.
                     auto idx = resolveIndexDesignatorLiteral(designatorCore);
                     if (!idx.has_value()) {
                         reportedError(designatorCore,
@@ -1638,7 +1626,20 @@ struct Lowerer {
                         designatorFailed = true;
                         continue;
                     }
-                    designated = *idx;
+                    // Descend into the array element's type (so a
+                    // subsequent designator can target a sub-position).
+                    if (designatorCurrentType.valid()
+                     && interner.kind(designatorCurrentType) == TypeKind::Array) {
+                        auto ops = interner.operands(designatorCurrentType);
+                        if (!ops.empty()) designatorCurrentType = ops[0];
+                    } else if (designatorCurrentType.valid()) {
+                        reportedError(designatorCore,
+                            "index designator on a non-array type");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    designatorPath.push_back(
+                        static_cast<std::uint32_t>(*idx));
                     continue;
                 }
                 valueExprCst = c;
@@ -1650,33 +1651,41 @@ struct Lowerer {
                 continue;
             }
 
+            // Determine the OUTER target slot index + the residual path
+            // for nested writes.
             std::uint32_t target = cursor;
-            if (designated.has_value()) {
-                std::int64_t const idx = *designated;
-                if (idx < 0 || static_cast<std::uint64_t>(idx) >= slotCount) {
+            std::span<std::uint32_t const> residualPath;
+            if (!designatorPath.empty()) {
+                std::uint32_t const idx = designatorPath[0];
+                if (idx >= slotCount) {
                     reportedError(elem,
                         "init element targets position out of aggregate range");
                     continue;
                 }
-                target = static_cast<std::uint32_t>(idx);
+                target = idx;
                 cursor = target;
+                residualPath = std::span<std::uint32_t const>{
+                    designatorPath.data() + 1, designatorPath.size() - 1};
             } else if (target >= slotCount) {
                 reportedError(elem,
                     "init element targets position out of aggregate range");
                 continue;
             }
-            TypeId const valueTargetType = rootSlots[target].slotType;
+            // The value's target type is the slot's type AFTER following
+            // the designator path. When no path, slotType(target).
+            TypeId const valueTargetType =
+                designatorPath.empty() ? rootSlots[target].slotType
+                                       : designatorCurrentType;
 
             HirNodeId const valueNode =
                 lowerExprOrBraceInit(valueExprCst, valueTargetType);
 
-            // Cycle 1b accepts only single-level designators (root-level
-            // slot index) — `writeInitSlotAt` with an empty residual
-            // path stores directly at the slot. When dot-chained lands
-            // post-SP3, the residual path will be the rest of the
-            // designator chain after the first step.
-            writeInitSlotAt(rootSlots[target],
-                            std::span<std::uint32_t const>{}, valueNode);
+            // `writeInitSlotAt(slot, residualPath, value)` writes value
+            // at the slot reachable from `slot` by the residual path;
+            // single-level designators have an empty residual, while
+            // dot-chained designators have a non-empty residual that
+            // descends into nested sub-aggregates.
+            writeInitSlotAt(rootSlots[target], residualPath, valueNode);
             cursor = target + 1;
         }
 

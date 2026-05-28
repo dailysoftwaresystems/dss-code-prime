@@ -44,4 +44,11 @@ std::span<NodeId const> SemanticModel::usesOf(SymbolId symbol) const noexcept {
     return std::span<NodeId const>{it->second};
 }
 
+ScopeId SemanticModel::compositeScopeFor(TypeId type) const noexcept {
+    if (!type.valid()) return InvalidScope;
+    auto it = compositeScopeByType_.find(type.v);
+    if (it == compositeScopeByType_.end()) return InvalidScope;
+    return it->second;
+}
+
 } // namespace dss

@@ -99,7 +99,8 @@ public:
                   UnitAttribute<SymbolId>                nodeToSymbol,
                   UnitAttribute<TypeId>                  nodeToType,
                   DiagnosticReporter                     diagnostics,
-                  std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol) noexcept
+                  std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
+                  std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -107,7 +108,8 @@ public:
           nodeToSymbol_(std::move(nodeToSymbol)),
           nodeToType_(std::move(nodeToType)),
           diagnostics_(std::move(diagnostics)),
-          usesBySymbol_(std::move(usesBySymbol)) {}
+          usesBySymbol_(std::move(usesBySymbol)),
+          compositeScopeByType_(std::move(compositeScopeByType)) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -149,6 +151,17 @@ public:
     // Powers LSP references / rename.
     [[nodiscard]] std::span<NodeId const> usesOf(SymbolId symbol) const noexcept;
 
+    // SP3.a: TypeId→declaring-struct-scope substrate. Composite types
+    // (struct/union) carry an associated inner scope holding their
+    // field symbols (populated by Pass 1.5 when the struct's TypeId is
+    // interned). Returns `InvalidScope` for non-composite types or for
+    // composites whose scope didn't get populated (semantic-phase
+    // failure). Used by D5.3 designator-position name resolution
+    // (look up `.x` in the struct's scope derived from the context
+    // type, not the lexical scope) and by future MemberAccess refactors
+    // that want a uniform substrate.
+    [[nodiscard]] ScopeId compositeScopeFor(TypeId type) const noexcept;
+
     // The full attributes — convenient for tooling / forEach iteration.
     [[nodiscard]] UnitAttribute<SymbolId> const& nodeToSymbol() const noexcept { return nodeToSymbol_; }
     [[nodiscard]] UnitAttribute<TypeId>   const& nodeToType()   const noexcept { return nodeToType_; }
@@ -163,6 +176,10 @@ private:
     DiagnosticReporter                     diagnostics_;
     // SymbolId.v → its USE-site NodeIds. Built once during analyze().
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol_;
+    // SP3.a: composite-TypeId.v → declaring-struct-scope. Populated by
+    // Pass 1.5 when a struct's TypeId is interned (see
+    // `compositeScopeByType` in semantic_analyzer.cpp's EngineState).
+    std::unordered_map<std::uint32_t, ScopeId>             compositeScopeByType_;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

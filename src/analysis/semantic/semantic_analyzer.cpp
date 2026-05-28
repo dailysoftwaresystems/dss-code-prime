@@ -1712,6 +1712,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
         std::move(s.nodeToType),
         std::move(s.reporter),
         std::move(s.usesBySymbol),
+        std::move(s.compositeScopeByType),
     };
 }
 

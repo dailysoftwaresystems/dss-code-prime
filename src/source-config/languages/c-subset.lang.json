@@ -531,7 +531,8 @@
         } }
     ],
     "references": [
-      { "rule": "operand" }
+      { "rule": "operand" },
+      { "rule": "structTypeRef", "nameMatch": "lastIdentifier" }
     ],
     "memberAccesses": [
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,

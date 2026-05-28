@@ -951,37 +951,83 @@ TEST(HirLoweringCSubset, D5_3_PositionalStructInit) {
     EXPECT_EQ(res->hir.children(init).size(), 2u);
 }
 
-// HONEST RECLASSIFICATION 2026-05-28: field-designator name resolution
-// is ALSO substrate-blocked (same SP3 root as compound-literal type
-// resolution + dot-chained). Pass 2 only stamps `symbolAt` on identifier
-// references inside `references` rules (operand); the identifier under
-// `designatedField` is not in operand position, so `model.symbolAt`
-// returns invalid. Cycle 1a tests "passed" because the parser's
-// `designator` alt-wrapper made the rule check silently miss + degrade
-// to positional, and the cycle-1a tests only verified structural count.
-// With the cycle-1b designator alt-wrapper peel correctly identifying
-// designators, the substrate gap is now SURFACED.
-//
-// Lock-in: each `{.x = ...}` test below MUST emit the
-// "did not resolve to a symbol" diagnostic until SP3 lands. When SP3
-// stamps types on type-position references + designator identifiers,
-// invert each test to assert the original semantic intent.
-TEST(HirLoweringCSubset, D5_3_FieldDesignatorSubstrateBlocked) {
+// SP3.c LANDED 2026-05-28: single-level field designator now resolves
+// via the TYPE-AWARE path (look up name in `compositeScopeFor(context)`
+// rather than the lexical scope Pass 2 stamps).
+TEST(HirLoweringCSubset, D5_3_FieldDesignatorInit) {
     SemanticModel model = analyzeCSubset(
         "struct Point { int x; int y; };\n"
         "void f() { struct Point p = {.y = 7, .x = 3}; }\n");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 2u);
+}
+
+// Restored: zero-fill with designators
+TEST(HirLoweringCSubset, D5_3_ZeroFillsOmittedField) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.y = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+}
+
+// Restored: chained-brace with field designators
+TEST(HirLoweringCSubset, D5_3_ChainedBraceNesting) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {.a = {.v = 1}, .b = {.v = 2}}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
+
+// Lock-in: field designator naming a NON-EXISTENT field emits a
+// diagnostic that the field doesn't belong to the target struct.
+TEST(HirLoweringCSubset, D5_3_UnknownFieldDesignatorEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.bogus = 7}; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
     bool found = false;
     for (auto const& d : r.all()) {
-        if (d.actual.find("did not resolve to a symbol") != std::string::npos) {
+        if (d.actual.find("doesn't belong") != std::string::npos) {
             found = true; break;
         }
     }
-    EXPECT_TRUE(found)
-        << "field designator MUST emit the SP3-substrate-blocked "
-           "diagnostic (Pass 2 doesn't stamp designator identifiers)";
+    EXPECT_TRUE(found) << "unknown field designator must be diagnosed";
+    EXPECT_FALSE(res->ok);
 }
 
 TEST(HirLoweringCSubset, D5_3_OmittedFieldZeroFillStructureWithoutDesignator) {
@@ -1063,11 +1109,7 @@ TEST(HirLoweringCSubset, D5_3_ArrayUnderfillZeroFillsTail) {
 
 // C99 §6.7.8p17: a designator restarts the fill cursor at the designated
 // position; the immediately following positional element resumes from
-// `designated + 1`. This is exercised here with INDEX designators (which
-// don't depend on the SP3-blocked designator-identifier stamping):
-// `int xs[5] = {[1] = 9, 7}` places 9 at slot 1 and 7 at slot 2 (cursor
-// restart). When SP3 lifts the field-designator blocker, an analogous
-// struct-form test should land alongside this one.
+// `designated + 1`. Exercised here with INDEX designators (array).
 TEST(HirLoweringCSubset, D5_3_CursorRestartAfterIndexDesignator) {
     SemanticModel model = analyzeCSubset(
         "void f() { int xs[5] = {[1] = 9, 7}; }\n");
@@ -1082,6 +1124,28 @@ TEST(HirLoweringCSubset, D5_3_CursorRestartAfterIndexDesignator) {
     EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
     auto kids = res->hir.children(init);
     ASSERT_EQ(kids.size(), 5u);
+    for (auto k : kids) EXPECT_EQ(res->hir.kind(k), HirKind::Literal);
+}
+
+// Same C99 §6.7.8p17 invariant exercised with FIELD designators
+// (struct) — now that SP3.c lifted the field-designator substrate
+// blocker. `{.b = 9, 7}` puts 9 at .b (slot 1), then the positional 7
+// at slot 2 (.c) per cursor restart.
+TEST(HirLoweringCSubset, D5_3_CursorRestartAfterFieldDesignator) {
+    SemanticModel model = analyzeCSubset(
+        "struct Trip { int a; int b; int c; };\n"
+        "void f() { struct Trip t = {.b = 9, 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 3u);
     for (auto k : kids) EXPECT_EQ(res->hir.kind(k), HirKind::Literal);
 }
 
@@ -1149,29 +1213,32 @@ TEST(HirLoweringCSubset, D5_3_MultiIndexDesignatorWithCursorJump) {
     for (auto k : kids) EXPECT_EQ(res->hir.kind(k), HirKind::Literal);
 }
 
-// 1b.1 substrate-blocked regression test: dot-chained `.a.b = 1` MUST
-// emit the SP3-substrate-blocked diagnostic — silent fall-through to a
-// positional element would be a miscompile. Pins the designator-peel
-// fix (without it, the inner `designator` alt-wrapper rule meant the
-// designatorCount check never tripped past 1).
-TEST(HirLoweringCSubset, D5_3_DotChainedDesignatorEmitsSubstrateDiag) {
+// SP3.c LANDED 2026-05-28: dot-chained `.a.v = 1` now resolves via the
+// type-aware designator walker that threads a current-type cursor
+// through each step. The InitSlot tree's `nested` substrate (sleeping
+// since cycle 1b) makes the multi-step write semantically right (.a
+// becomes a sub-aggregate; .v inside it is the explicit value; the
+// rest of .a + the entire .b zero-fill).
+TEST(HirLoweringCSubset, D5_3_DotChainedDesignator) {
     SemanticModel model = analyzeCSubset(
         "struct Inner { int v; };\n"
         "struct Outer { struct Inner a; struct Inner b; };\n"
         "void f() { struct Outer o = {.a.v = 1}; }\n");
-    if (model.hasErrors()) return;   // tolerate semantic-phase rejection too
+    ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    bool found = false;
-    for (auto const& d : r.all()) {
-        if (d.actual.find("dot-chained") != std::string::npos) {
-            found = true; break;
-        }
-    }
-    EXPECT_TRUE(found)
-        << "dot-chained `.a.b = 1` MUST emit the substrate-blocked "
-           "diagnostic; silent fall-through to a positional element "
-           "would be a miscompile";
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // .a is a sub-aggregate (the dot-chained write created it).
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    // .b is the synth-zero sub-aggregate (omitted).
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
 }
 
 // 1b.4: ordinary `return 7;` still coerces — the return-site refactor
@@ -1195,25 +1262,29 @@ TEST(HirLoweringCSubset, D5_3_OrdinaryReturnStillCoerces) {
 // inverted to assert `res->ok && children.size() == 2`. The strict form
 // matters: a `found || res->ok` short-circuit would let a future
 // regression silently set ok=true with InvalidType and still pass.
-TEST(HirLoweringCSubset, D5_3_CompoundLiteralFailsLoudPendingSubstrate) {
+// SP3.b LANDED 2026-05-28: with `structTypeRef` added to the c-subset
+// `references` config (with `nameMatch: "lastIdentifier"`), Pass 2
+// resolves the struct's Identifier + stamps `nodeToType` on it; the
+// recursive `resolveStampedTypeBelow` then finds the stamp and the
+// compound-literal lowers cleanly.
+TEST(HirLoweringCSubset, D5_3_CompoundLiteralInVarDeclInit) {
     SemanticModel model = analyzeCSubset(
         "struct Point { int x; int y; };\n"
         "void f() { struct Point p = (struct Point){.x = 1, .y = 2}; }\n");
-    if (model.hasErrors()) return;   // tolerate semantic-phase rejection too
+    if (model.hasErrors()) {
+        for (auto const& d : model.diagnostics().all())
+            ADD_FAILURE() << diagnosticCodeName(d.code) << " actual=" << d.actual;
+        return;
+    }
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    bool found = false;
-    for (auto const& d : r.all()) {
-        if (d.actual.find("type-ref did not resolve") != std::string::npos) {
-            found = true; break;
-        }
-    }
-    EXPECT_TRUE(found)
-        << "compound literal type-ref MUST emit the SP3-substrate-blocked "
-           "diagnostic; silent ok=true with InvalidType would be a "
-           "regression the looser `found || ok` form would have missed";
-    EXPECT_FALSE(res->ok)
-        << "until SP3 stamps types on typeRef nodes, lowering MUST fail";
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 2u);
 }
 
 // Substrate-blocked: non-literal index designator (e.g. `[n] = 7`)
