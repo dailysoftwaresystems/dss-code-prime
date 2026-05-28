@@ -1283,3 +1283,87 @@ TEST(MirLoweringCSubset, VarDeclWithoutInitOnlyAllocas) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Const);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Store);
 }
+
+// ── ML2 cycle 6: ConstructAggregate lowering ──────────────────────────
+
+namespace {
+// Find the opcodes used by the first function's entry block in
+// `lowerCSubset`-ordered. Order-preserving so consumers can assert
+// "Const before InsertValue, InsertValue before Store" etc.
+[[nodiscard]] std::vector<MirOpcode> entryOpcodes(Mir const& m) {
+    std::vector<MirOpcode> out;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    auto const n = m.blockInstCount(entry);
+    out.reserve(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        out.push_back(m.instOpcode(m.blockInstAt(entry, i)));
+    }
+    return out;
+}
+[[nodiscard]] std::size_t countOpcode(std::vector<MirOpcode> const& ops, MirOpcode k) {
+    return static_cast<std::size_t>(std::count(ops.begin(), ops.end(), k));
+}
+} // namespace
+
+// All-constant `struct Point p = {1, 2}` const-folds to a single
+// Const(MirAggregateValue) — no InsertValue chain needed because the
+// const-eval engine handles the whole aggregate at HIR→MIR time.
+TEST(MirLoweringCSubset, ConstructAggregateAllConstFoldsToConst) {
+    auto L = lowerCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {1, 2}; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty()
+              ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty()
+              ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = entryOpcodes(L.mir.mir);
+    // Should contain at least one Const (the folded aggregate) + the
+    // VarDecl's Alloca + Store. NO InsertValue (folded inline).
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u);
+    EXPECT_GE(countOpcode(ops, MirOpcode::Const),  1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "all-constant ConstructAggregate must const-fold to a single "
+           "Const, not an InsertValue chain";
+}
+
+// Mixed-runtime children force the InsertValue chain path. A struct
+// containing a parameter (`a`) cannot const-fold — must produce
+// `Const(zero) + InsertValue chain`.
+TEST(MirLoweringCSubset, ConstructAggregateWithRuntimeChildUsesInsertValueChain) {
+    auto L = lowerCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f(int a) { struct Point p = {a, 2}; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty()
+              ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = entryOpcodes(L.mir.mir);
+    EXPECT_GE(countOpcode(ops, MirOpcode::InsertValue), 2u)
+        << "ConstructAggregate with runtime children must emit one "
+           "InsertValue per slot (2 fields = 2 InsertValue ops)";
+    EXPECT_GE(countOpcode(ops, MirOpcode::Const),  1u)
+        << "the chain must start from a Const(zero-aggregate) base";
+}
+
+// Union ConstructAggregate has a 1-child shape — verify the chain
+// produces a single InsertValue at index 0 when the runtime path is
+// taken (parameter-based variant value).
+TEST(MirLoweringCSubset, ConstructAggregateUnionRuntimeUsesOneInsertValue) {
+    auto L = lowerCSubset(
+        "union U { int i; char c; };\n"
+        "void f(int a) { union U u = { a }; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty()
+              ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = entryOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 1u)
+        << "union ConstructAggregate has exactly 1 child → 1 InsertValue";
+}

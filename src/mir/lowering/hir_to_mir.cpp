@@ -561,6 +561,18 @@ struct Lowerer {
                 }
                 return lowerExpr(hir.seqExprResult(node));
             }
+            case HirKind::ConstructAggregate: {
+                // ML2 cycle 6: lower an aggregate constructor to a chain
+                // of MIR InsertValue starting from a synth-zero base.
+                // The HIR producer (lowerBraceInit + synthZeroOrError)
+                // guarantees every slot of the aggregate has a child —
+                // explicit value or zero-fill. Children are lowered as
+                // ordinary expressions and inserted at their positional
+                // index. Result is an SSA value of the aggregate type,
+                // suitable for Store-into-alloca at the VarDecl site or
+                // any other consumer.
+                return lowerConstructAggregate(node, t);
+            }
             default: break;
         }
         unsupported(node,
@@ -737,6 +749,107 @@ struct Lowerer {
         lit.core  = TypeKind::I32;
         TypeId const i32 = interner.primitive(TypeKind::I32);
         return mir.addConst(std::move(lit), i32);
+    }
+
+    // ML2 cycle 6: build a zero MirLiteralValue matching `type`'s shape.
+    // Recurses into Struct/Union/Array to produce a nested
+    // MirAggregateValue; scalar leaves get a typed zero. Used to seed
+    // the `InsertValue` chain in `lowerConstructAggregate` so the
+    // initial base carries the right type and shape for downstream
+    // verifiers / consumers (the optimizer can later fold trivially-
+    // zero leaves back into the Const if every child was zero).
+    [[nodiscard]] MirLiteralValue zeroLiteralOf(TypeId type) {
+        TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
+        MirLiteralValue lv;
+        lv.core = core;
+        if (core == TypeKind::Struct) {
+            auto const fields = interner.operands(type);
+            MirAggregateValue agg;
+            agg.fields.reserve(fields.size());
+            for (TypeId ft : fields) agg.fields.push_back(zeroLiteralOf(ft));
+            lv.value = std::move(agg);
+            return lv;
+        }
+        if (core == TypeKind::Union) {
+            // C99 §6.7.8p18+p21: union zero-init = first-variant zero.
+            auto const variants = interner.operands(type);
+            MirAggregateValue agg;
+            if (!variants.empty()) {
+                agg.fields.push_back(zeroLiteralOf(variants[0]));
+            }
+            lv.value = std::move(agg);
+            return lv;
+        }
+        if (core == TypeKind::Array) {
+            auto const ops   = interner.operands(type);
+            auto const scals = interner.scalars(type);
+            MirAggregateValue agg;
+            if (!ops.empty() && !scals.empty()) {
+                agg.fields.reserve(static_cast<std::size_t>(scals[0]));
+                for (std::int64_t i = 0; i < scals[0]; ++i) {
+                    agg.fields.push_back(zeroLiteralOf(ops[0]));
+                }
+            }
+            lv.value = std::move(agg);
+            return lv;
+        }
+        // Scalar leaf — pick the typed zero from the core's arm.
+        if (core == TypeKind::F16 || core == TypeKind::F32
+         || core == TypeKind::F64 || core == TypeKind::F128) {
+            lv.value = 0.0;
+        } else if (core == TypeKind::Bool) {
+            lv.value = false;
+        } else if (core == TypeKind::I8 || core == TypeKind::I16
+                || core == TypeKind::I32 || core == TypeKind::I64
+                || core == TypeKind::I128) {
+            lv.value = std::int64_t{0};
+        } else {
+            lv.value = std::uint64_t{0};
+        }
+        return lv;
+    }
+
+    // ML2 cycle 6: lower a HIR ConstructAggregate to MIR. Strategy:
+    //   1. If the whole subtree const-folds (every child is a literal
+    //      / fold-able expr), emit ONE `Const(MirAggregateValue, ty)`.
+    //   2. Otherwise, emit a `Const(zero, ty)` base + chain of
+    //      `InsertValue(prev, child, [i])` for each child. The optimizer
+    //      can fold a fully-constant chain back to a single Const.
+    // Either way, the result is an SSA value of the aggregate type.
+    [[nodiscard]] MirInstId lowerConstructAggregate(HirNodeId node, TypeId aggTy) {
+        if (!aggTy.valid()) {
+            unsupported(node, "ConstructAggregate with invalid result type "
+                              "(HIR verifier should have flagged)");
+            return InvalidMirInst;
+        }
+        // Try the constant-fold path first.
+        EvalEnvironment emptyEnv;
+        EvalOptions     evalOpts;
+        evalOpts.allowFloat      = config.globalsAllowFloat;
+        evalOpts.refuseOnOverflow = false;
+        ConstEvalResult const folded = evaluateConstant(
+            hir, interner, literals, node, emptyEnv, evalOpts);
+        if (folded.value.has_value()) {
+            return mir.addConst(toMirLiteral(*folded.value), aggTy);
+        }
+        // Fall back to the InsertValue chain. Build the zero base
+        // matching the aggregate's shape so the result is type-coherent
+        // even before the first InsertValue.
+        MirInstId acc = mir.addConst(zeroLiteralOf(aggTy), aggTy);
+        if (!acc.valid()) return InvalidMirInst;
+        TypeId const i32 = interner.primitive(TypeKind::I32);
+        auto kids = hir.children(node);
+        // Union ConstructAggregate carries exactly one child (the active
+        // variant); insert it at index 0. Struct = N children → insert
+        // at each slot. Array = same as Struct positionally.
+        for (std::size_t i = 0; i < kids.size(); ++i) {
+            MirInstId const v = lowerExpr(kids[i]);
+            if (!v.valid()) return InvalidMirInst;
+            std::uint32_t const idx[1] = { static_cast<std::uint32_t>(i) };
+            acc = mir.addInsertValue(acc, v, idx, aggTy, i32);
+            if (!acc.valid()) return InvalidMirInst;
+        }
+        return acc;
     }
 
     // Recursively collect into `out` the set of `SymbolId.v`s whose lvalue
