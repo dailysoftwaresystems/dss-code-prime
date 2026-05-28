@@ -968,7 +968,32 @@ struct Parser::Impl {
                                      peek, expected);
                 }
 
-                // Try each candidate branch in declaration order.
+                // Token-leaf branch route (mirror of the non-speculative
+                // path at lines 1012-1020). A token-leaf alt branch
+                // consumes EXACTLY one token at the alt position — there
+                // is no internal failure mode that would warrant
+                // speculation (the only outcome is "this token matches
+                // the branch's token kind, advance" — the next step's
+                // failure happens at the alt's PARENT scope, not inside
+                // the branch). So token-leaf branches participate
+                // unconditionally in speculative alts; speculation only
+                // matters for rule branches whose body may fail mid-
+                // parse. Without this route, an alt like operand's
+                // `[Identifier, IntLiteral, ..., compoundLiteralExpr,
+                // parenExpr]` rejects every token-leaf primary
+                // (P_BacktrackFailed even on `int x = 5;`) when the
+                // alt is marked speculative.
+                const SchemaCursor afterAdvance =
+                    schema->advance(walker.cursor(), tokKind);
+                if (afterAdvance.valid()) {
+                    const Token tok = tokens.advance();
+                    builder->pushToken(tok);
+                    walker.advance(tokKind, tok.span,
+                                   std::optional<RuleId>{builder->currentRule()});
+                    return StepOutcome::Continue;
+                }
+
+                // Try each candidate RULE branch in declaration order.
                 // First success commits and falls through to the
                 // next outer iteration; full failure emits one
                 // P_BacktrackFailed + consumes for forward progress.

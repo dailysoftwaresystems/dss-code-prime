@@ -90,6 +90,78 @@ struct SpecHarness {
 
 } // namespace
 
+// Speculative alt with MIXED token-leaf + rule branches. Closes the gap
+// found 2026-05-28: prior to the fix, the speculative AltChoice handler
+// only tried RULE candidates (via `candidateBranches`), silently skipping
+// token-leaf branches — so an alt like `[AKind, ruleStartingWithB]`
+// marked speculative would refuse to parse a bare `A`, even though
+// `AKind` is the trivial first-branch match. The fix adds a token-leaf
+// `schema->advance` probe BEFORE the rule-scan, mirroring the
+// non-speculative path's order. This is the substrate enabler for
+// schemas whose expression-atom alt mixes token primaries (Identifier /
+// IntLiteral / etc.) with rule primaries (compoundLiteralExpr /
+// parenExpr) and needs `speculative: true` for the rule-branch
+// disambiguation.
+constexpr std::string_view kMixedTokenAndRuleSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "MixSpec", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":    { "sequence": [{ "repeat": "primary" }] },
+    "primary": { "alt": ["AKind", "ruleB"], "speculative": true },
+    "ruleB":   { "sequence": ["BKind", "Semi"] }
+  }
+})JSON";
+
+TEST(ParserSpeculation, SpeculativeAltAcceptsTokenLeafBranches) {
+    // `A` alone exercises the token-leaf route inside the speculative
+    // alt. Pre-fix: candidateBranches returns empty (no rule starts
+    // with AKind), so the loop falls through to P_BacktrackFailed.
+    // Post-fix: schema->advance(cursor, AKind) succeeds at the
+    // token-leaf branch, advancing cleanly.
+    auto loaded = GrammarSchema::loadFromText(kMixedTokenAndRuleSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto src = SourceBuffer::fromString("A", "<mix>");
+    Tokenizer tk{src, *loaded};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, *loaded, std::move(stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "speculative alt must accept token-leaf branches";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u);
+}
+
+TEST(ParserSpeculation, SpeculativeAltMixesTokenLeafAndRuleBranches) {
+    // `A B ;` mixes: first `primary` takes the token-leaf branch (A);
+    // second `primary` takes the rule branch (B Semi). Confirms both
+    // routes coexist inside one speculative alt without interference.
+    auto loaded = GrammarSchema::loadFromText(kMixedTokenAndRuleSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto src = SourceBuffer::fromString("A B ;", "<mix>");
+    Tokenizer tk{src, *loaded};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, *loaded, std::move(stream)};
+    auto result = std::move(p).parse();
+    auto const& t = result.tree;
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(t, "primary"), 2u)
+        << "two `primary` frames — one for token-leaf A, one for ruleB";
+    EXPECT_EQ(countNodesByRule(t, "ruleB"), 1u)
+        << "second primary commits the ruleB branch";
+}
+
 TEST(ParserSpeculation, CommitsCaseAOnFirstBranchInput) {
     auto h = loadAndTokenize("A B ;");
     Parser p{h.src, h.schema, std::move(h.stream)};
