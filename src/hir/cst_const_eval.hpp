@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/number_decode.hpp"
 #include "hir/const_eval.hpp"
+#include "hir/hir_literal_pool.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -85,5 +86,29 @@ evaluateConstantCst(NodeId               expr,
                     CstEvalContext const& ctx,
                     CstEvalEnvironment   env     = {},
                     EvalOptions          options = {});
+
+// Bridge a folded `HirLiteralValue` into a plain `int64_t`. Handles
+// the three numeric variant arms (int64 / uint64 / bool); returns
+// nullopt for non-numeric arms or for unsigned values that exceed
+// int64's positive range. Shared by all 3 consumer callsites (array
+// length, enumerator value, index designator) — was the byte-for-byte
+// repeated post-fold extraction in each.
+[[nodiscard]] DSS_EXPORT std::optional<std::int64_t>
+asInt64Bridge(HirLiteralValue const& v) noexcept;
+
+// Find the init-expression CST node inside a declaration rule node.
+// Tries `DeclarationRule.initChild` (explicit positional index) first;
+// falls back to role-based discovery — the init is the Internal child
+// that is NOT the type / name / params / body / array-suffix. Shared
+// by every CST-side Ref resolver (semantic-side scope walker AND
+// HIR-lowering's frozen-model lookup). Callers must already have
+// confirmed isConst / tree match.
+//
+// Forward-declared `DeclarationRule` is included via core/types; the
+// helper definition resolves it from the loaded schema.
+struct DeclarationRule;
+[[nodiscard]] DSS_EXPORT std::optional<NodeId>
+findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
+                   NodeId declRuleNode);
 
 } // namespace dss

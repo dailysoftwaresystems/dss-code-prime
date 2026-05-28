@@ -523,34 +523,8 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     if (rec.tree.v != tree.id().v) return std::nullopt;
     auto declIt = s.idx().declByRule.find(tree.rule(rec.declRuleNode).v);
     if (declIt == s.idx().declByRule.end()) return std::nullopt;
-    DeclarationRule const& decl = cfg.declarations[declIt->second];
-    auto kids = visibleChildren(tree, rec.declRuleNode);
-    // Explicit `initChild` config wins when present (covers languages
-    // that pin the init's positional slot).
-    if (decl.initChild.has_value()) {
-        if (*decl.initChild >= kids.size()) return std::nullopt;
-        return kids[*decl.initChild];
-    }
-    // Fall back to role-based discovery: the init is the Internal
-    // child that is NOT the type / name / params / body / array-
-    // suffix child. The complete skip list closes the latent bug
-    // where a `const`-qualified function decl's `funcDefTail` body
-    // would have been returned as the "init expression".
-    RuleId const arraySufRule = decl.arraySuffix.has_value()
-        ? decl.arraySuffix->rule : RuleId{};
-    auto positional = [&](std::optional<std::uint32_t> pos, std::uint32_t i) {
-        return pos.has_value() && *pos == i;
-    };
-    for (std::uint32_t i = 0; i < kids.size(); ++i) {
-        if (tree.kind(kids[i]) != NodeKind::Internal) continue;
-        if (positional(decl.typeChild,   i)) continue;
-        if (positional(decl.nameChild,   i)) continue;
-        if (positional(decl.paramsChild, i)) continue;
-        if (positional(decl.bodyChild,   i)) continue;
-        if (arraySufRule.valid() && tree.rule(kids[i]) == arraySufRule) continue;
-        return kids[i];
-    }
-    return std::nullopt;
+    return findInitExprInDecl(tree, cfg.declarations[declIt->second],
+                              rec.declRuleNode);
 }
 
 [[nodiscard]] std::optional<std::int64_t>
@@ -569,22 +543,7 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     }
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env);
     if (!r.value.has_value()) return std::nullopt;
-    auto iv = std::get_if<std::int64_t>(&r.value->value);
-    if (iv == nullptr) {
-        // Folded to a non-int-arm (uint64 in range, bool). Bridge via
-        // the shared asInt64 helper — same pattern the HIR walker uses.
-        if (auto p = std::get_if<std::uint64_t>(&r.value->value)) {
-            if (*p > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-                return std::nullopt;
-            }
-            return static_cast<std::int64_t>(*p);
-        }
-        if (auto p = std::get_if<bool>(&r.value->value)) {
-            return *p ? std::int64_t{1} : std::int64_t{0};
-        }
-        return std::nullopt;
-    }
-    return *iv;
+    return asInt64Bridge(*r.value);
 }
 
 // SE-arrays: if `decl` configures an array declarator suffix and a node of that

@@ -2,11 +2,13 @@
 
 #include "core/types/grammar_schema.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/semantic_config.hpp"
 #include "core/types/tree.hpp"
 #include "hir/const_eval_arith.hpp"
 #include "hir/hir_op.hpp"
 
 #include <cassert>
+#include <limits>
 #include <string>
 #include <unordered_set>
 
@@ -108,6 +110,10 @@ evalImpl(NodeId                              expr,
         // scopes; text-keying would false-positive a cycle on
         // legitimate cross-scope ref chains.
         if (env.resolveSymbolInit) {
+            // Engine contract: the resolver receives a token-kind
+            // identifier NodeId. Pin it in debug; release-builds skip
+            // the check (the engine only reaches here on Token kind).
+            assert(tree.kind(expr) == NodeKind::Token);
             auto initExpr = env.resolveSymbolInit(expr);
             if (!initExpr.has_value() || !initExpr->valid()) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
@@ -327,6 +333,45 @@ ConstEvalResult evaluateConstantCst(NodeId               expr,
                                     EvalOptions          options) {
     std::unordered_set<std::uint32_t> visitedInitNodes;
     return evalImpl(expr, ctx, env, options, visitedInitNodes);
+}
+
+std::optional<std::int64_t> asInt64Bridge(HirLiteralValue const& v) noexcept {
+    return detail::asInt64(v);
+}
+
+std::optional<NodeId>
+findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
+                   NodeId declRuleNode) {
+    if (!declRuleNode.valid()) return std::nullopt;
+    std::vector<NodeId> kids;
+    for (auto const& child : tree.children(declRuleNode)) {
+        if (!isEmptySpace(tree.flags(child))) kids.push_back(child);
+    }
+    // Explicit positional `initChild` wins when configured.
+    if (decl.initChild.has_value()) {
+        if (*decl.initChild >= kids.size()) return std::nullopt;
+        return kids[*decl.initChild];
+    }
+    // Role-based fallback: the init is the Internal child that is
+    // NOT the type / name / params / body / array-suffix. The full
+    // role-skip list closes the latent bug where a `const`-qualified
+    // function decl's `funcDefTail` body would have been mistaken
+    // for the init expression.
+    RuleId const arraySufRule = decl.arraySuffix.has_value()
+        ? decl.arraySuffix->rule : RuleId{};
+    auto positional = [&](std::optional<std::uint32_t> pos, std::uint32_t i) {
+        return pos.has_value() && *pos == i;
+    };
+    for (std::uint32_t i = 0; i < kids.size(); ++i) {
+        if (tree.kind(kids[i]) != NodeKind::Internal) continue;
+        if (positional(decl.typeChild,   i)) continue;
+        if (positional(decl.nameChild,   i)) continue;
+        if (positional(decl.paramsChild, i)) continue;
+        if (positional(decl.bodyChild,   i)) continue;
+        if (arraySufRule.valid() && tree.rule(kids[i]) == arraySufRule) continue;
+        return kids[i];
+    }
+    return std::nullopt;
 }
 
 } // namespace dss

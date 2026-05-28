@@ -1443,10 +1443,10 @@ struct Lowerer {
         }
         CstEvalContext ctx{tree(), tree().schema(), intLits, numberStyle};
         // Ref resolution: name → symbol via `symbolAt(identTok)` →
-        // SymbolRecord. Only `isConst` symbols are foldable; mutable
-        // refs refuse. The DeclarationRule's `initChild` (already
-        // config-driven) gives the visible-child index of the init
-        // expression in the symbol's decl rule node.
+        // SymbolRecord. Only `isConst` symbols are foldable. The
+        // shared `findInitExprInDecl` helper (in the engine library)
+        // handles initChild + role-based discovery in one place,
+        // keeping this site and the semantic-side resolver in lockstep.
         CstEvalEnvironment env;
         env.resolveSymbolInit = [this](NodeId identTok) -> std::optional<NodeId> {
             SymbolId const sym = model.symbolAt(identTok);
@@ -1456,49 +1456,15 @@ struct Lowerer {
             if (!rec->declRuleNode.valid()) return std::nullopt;
             if (rec->tree.v != tree().id().v) return std::nullopt;
             for (auto const& dr : sem.declarations) {
-                if (dr.rule.v != tree().rule(rec->declRuleNode).v) continue;
-                auto kids = visible(rec->declRuleNode);
-                if (dr.initChild.has_value()) {
-                    if (*dr.initChild >= kids.size()) return std::nullopt;
-                    return kids[*dr.initChild];
+                if (dr.rule.v == tree().rule(rec->declRuleNode).v) {
+                    return findInitExprInDecl(tree(), dr, rec->declRuleNode);
                 }
-                // Role-based discovery (mirrors semantic-side resolver):
-                // the init is the Internal child that is not the
-                // type / name / params / body / array-suffix child.
-                // The full skip list closes the latent bug where a
-                // `const`-qualified function decl's `funcDefTail`
-                // body would have been returned as the init.
-                RuleId const arraySufRule = dr.arraySuffix.has_value()
-                    ? dr.arraySuffix->rule : RuleId{};
-                auto positional = [&](std::optional<std::uint32_t> pos, std::uint32_t i) {
-                    return pos.has_value() && *pos == i;
-                };
-                for (std::uint32_t i = 0; i < kids.size(); ++i) {
-                    if (tree().kind(kids[i]) != NodeKind::Internal) continue;
-                    if (positional(dr.typeChild,   i)) continue;
-                    if (positional(dr.nameChild,   i)) continue;
-                    if (positional(dr.paramsChild, i)) continue;
-                    if (positional(dr.bodyChild,   i)) continue;
-                    if (arraySufRule.valid() && tree().rule(kids[i]) == arraySufRule) continue;
-                    return kids[i];
-                }
-                return std::nullopt;
             }
             return std::nullopt;
         };
         ConstEvalResult const r = evaluateConstantCst(exprChild, ctx, env);
         if (!r.value.has_value()) return std::nullopt;
-        if (auto p = std::get_if<std::int64_t>(&r.value->value)) return *p;
-        if (auto p = std::get_if<std::uint64_t>(&r.value->value)) {
-            if (*p > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-                return std::nullopt;
-            }
-            return static_cast<std::int64_t>(*p);
-        }
-        if (auto p = std::get_if<bool>(&r.value->value)) {
-            return *p ? std::int64_t{1} : std::int64_t{0};
-        }
-        return std::nullopt;
+        return asInt64Bridge(*r.value);
     }
 
     // D5.3 cycle 1b InitSlot tree node. The intended invariant is
