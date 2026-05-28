@@ -3117,6 +3117,39 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D5.1: optional `fieldChildren` descriptor — declares
+                        // this declaration as a composite-type introducer.
+                        //   "fieldChildren": { "rule": "structField" }
+                        // Pass 1.5 collects the named field-rule symbols in the
+                        // declaration's scope (in fieldIndex order) and
+                        // composes `interner.structType(name, fieldTypes)`.
+                        if (entry.contains("fieldChildren")) {
+                            json const& fc = entry.at("fieldChildren");
+                            if (!fc.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/fieldChildren",
+                                          "'fieldChildren' must be an object");
+                            } else if (!fc.contains("rule") || !fc.at("rule").is_string()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/fieldChildren/rule",
+                                          "'fieldChildren.rule' is required and must "
+                                          "be a rule-name string");
+                            } else {
+                                auto const rn = fc.at("rule").get<std::string>();
+                                if (!data.rules->contains(rn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/fieldChildren/rule",
+                                              std::format("'fieldChildren.rule' references "
+                                                          "unknown shape '{}'", rn));
+                                } else {
+                                    FieldChildrenDescriptor fcd;
+                                    fcd.rule     = data.rules->find(rn);
+                                    fcd.ruleName = rn;
+                                    rule.fieldChildren = std::move(fcd);
+                                }
+                            }
+                        }
+
                         // D8: optional `warnIfUnused` flag (default false).
                         // A non-bool value is the same C_InvalidSemantics
                         // discipline used for other declaration sub-fields.
@@ -3406,6 +3439,75 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
                         cfg.references.push_back(std::move(rule));
+                    }
+                }
+            }
+
+            // ── memberAccesses (D5.1) ──
+            // Each entry names a member-access rule (`obj.field` or
+            // `ptr->field`), the visible-child indices of LHS + name, and
+            // whether the form dereferences first. The engine reads only
+            // these — there is no per-language member-access C++ branch.
+            if (sem.contains("memberAccesses")) {
+                json const& arr = sem.at("memberAccesses");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/memberAccesses",
+                              "'semantics.memberAccesses' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/memberAccesses/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'memberAccesses' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        MemberAccessRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'memberAccesses[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+                        auto readReqUint = [&](char const* key, std::uint32_t& out) -> bool {
+                            if (!entry.contains(key) || !entry.at(key).is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/" + key,
+                                          std::format("'{}' is required and must be a "
+                                                      "non-negative integer", key));
+                                return false;
+                            }
+                            auto v = entry.at(key).get<std::int64_t>();
+                            if (v < 0 || v > std::numeric_limits<std::int32_t>::max()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/" + key,
+                                          std::format("'{}' visible-child index out of range", key));
+                                return false;
+                            }
+                            out = static_cast<std::uint32_t>(v);
+                            return true;
+                        };
+                        bool ok = readReqUint("lhsChild",  rule.lhsChild)
+                              &&  readReqUint("nameChild", rule.nameChild);
+                        if (!ok) continue;
+                        if (entry.contains("dereferences")) {
+                            if (!entry.at("dereferences").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/dereferences",
+                                          "'dereferences' must be a boolean");
+                            } else {
+                                rule.dereferences = entry.at("dereferences").get<bool>();
+                            }
+                        }
+                        cfg.memberAccesses.push_back(std::move(rule));
                     }
                 }
             }

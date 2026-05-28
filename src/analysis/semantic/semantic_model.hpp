@@ -70,6 +70,22 @@ struct DSS_EXPORT SymbolRecord {
     // analysis, a symbol with this flag set AND an empty use-set emits
     // S_UnusedVariable (a WARNING) at `declRuleNode`'s span.
     bool            warnIfUnused = false;
+    // D5.1: field ordinal within the enclosing composite-type declaration
+    // (struct/union). Set on EVERY minted symbol by Pass 1 to its declaration-
+    // order index in its declaring scope; meaningful only for field symbols
+    // (the inner declarations of a composite-type rule with `fieldChildren`)
+    // and read at HIR-lowering time as the `MemberAccess.payload` field index.
+    // For all other symbols (Variable/Function/Type/Table outside a composite
+    // scope) it is harmless 0-or-positional noise — follows the established
+    // SymbolRecord precedent for kind-specific fields (`isConst`,
+    // `warnIfUnused`, `variadicBuiltin`).
+    std::uint32_t   fieldIndex = 0;
+    // D5.1: the inner scope holding this symbol's fields, set by Pass 1 on a
+    // Type-kind symbol minted from a declaration with `fieldChildren`. Pass 2's
+    // member-access resolution reads this to look up `field` in `obj.field`:
+    // TypeId → struct symbol → `structScope` → name lookup. `InvalidScope`
+    // (default) for every non-composite symbol.
+    ScopeId         structScope{};
 };
 
 class DSS_EXPORT SemanticModel {

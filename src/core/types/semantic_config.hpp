@@ -108,6 +108,24 @@ struct DSS_EXPORT ArraySuffix {
     std::optional<std::uint32_t> lengthChild;   // visible-child index of the length expr
 };
 
+// D5.1: a composite-type-introducing declaration. When a declaration carries
+// `fieldChildren`, Pass 1.5 walks the scope it opened, collects every minted
+// symbol whose declaring rule == `rule` (in declaration order, via each field's
+// `SymbolRecord::fieldIndex`), and composes a `TypeKind::Struct` lattice type
+// over their resolved types. The struct symbol's `type` is set to the resulting
+// `interner.structType(name, fieldTypes)`. Generic facet — works for any
+// language with field-bearing record types (D5.4 unions add a second variant
+// via `unionVariant: true` on a parallel descriptor).
+//
+// The facet ONLY makes sense paired with a `scopes` entry for the same rule
+// (so fields bind into the struct's inner scope, not the enclosing one). The
+// loader rejects a `fieldChildren` whose declaration rule is not also in
+// `scopes` via `C_InvalidSemantics`.
+struct DSS_EXPORT FieldChildrenDescriptor {
+    RuleId      rule{};      // the field-declaration rule (e.g. structField)
+    std::string ruleName;    // source spelling, for diagnostics
+};
+
 struct DSS_EXPORT DeclarationRule {
     // The rule (resolved to RuleId) whose subtree introduces the decl.
     RuleId          rule{};
@@ -146,6 +164,12 @@ struct DSS_EXPORT DeclarationRule {
     // the engine matches it by rule within the declaration subtree rather than
     // via `typeShapes`. `nullopt` ⇒ this declaration form has no array syntax.
     std::optional<ArraySuffix> arraySuffix;
+    // D5.1: optional composite-type collection. When set, Pass 1.5 composes the
+    // declaration's `kind: type` symbol's TypeId via `interner.structType(name,
+    // fieldTypes)` from the field-symbols minted in this declaration's scope.
+    // `kind` must be `Type` and the rule must also appear in `scopes`. Generic
+    // across record-bearing languages.
+    std::optional<FieldChildrenDescriptor> fieldChildren;
     // Source-text name of the declared rule, retained for diagnostics.
     std::string     ruleName;
 };
@@ -198,6 +222,28 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     std::vector<TypeKind> paramCores;
     TypeKind              resultCore = TypeKind::Void;
     bool                  variadic   = false;
+};
+
+// D5.1: a member-access expression rule. When Pass 2 sees a node with this
+// rule, it (a) resolves the LHS subtree (the object) to its expression type via
+// `typeAt`, (b) follows the LHS type — through one `Ptr` indirection if
+// `dereferences == true` (the arrow form `p->x`) — to its `TypeKind::Struct`
+// pointee, (c) looks up the RHS field-name identifier in the struct symbol's
+// inner scope, (d) records the resolved field symbol on the field-name node
+// via `nodeToSymbol_` and the field's type on the member-access node via
+// `nodeToType_`. The HIR lowering reads the field's `SymbolRecord::fieldIndex`
+// to produce a `MemberAccess` node with the right payload.
+//
+// `lhsChild` / `nameChild` are visible-child indices. The arrow form is
+// modelled as a *distinct* `MemberAccessRule` entry (`dereferences: true`) so
+// the schema declares both `p->x` and `p.x` shapes if the language has both;
+// the engine never special-cases either at parse time.
+struct DSS_EXPORT MemberAccessRule {
+    RuleId        rule{};
+    std::uint32_t lhsChild  = 0;       // visible-child index of the object subtree
+    std::uint32_t nameChild = 0;       // visible-child index of the field-name token
+    bool          dereferences = false; // true ⇒ `p->x` (deref the LHS pointer first)
+    std::string   ruleName;
 };
 
 // Identifier-use recognition. The named rule (whose RuleId the loader
@@ -311,6 +357,10 @@ struct DSS_EXPORT LiteralTypeMapping {
 struct DSS_EXPORT SemanticConfig {
     std::vector<DeclarationRule>    declarations;
     std::vector<ReferenceRule>      references;
+    // D5.1: member-access expression rules (`obj.field` and `ptr->field`). Pass 2
+    // resolves each to its field's SymbolId + type. Empty ⇒ the language has no
+    // member-access surface (toy / tsql currently).
+    std::vector<MemberAccessRule>   memberAccesses;
     std::vector<ScopeRule>          scopes;        // rules that open a fresh lexical scope
     std::vector<BuiltinTypeMapping> builtinTypes;
     std::vector<TypeShapeRule>      typeShapes;
