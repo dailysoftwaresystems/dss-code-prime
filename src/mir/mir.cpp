@@ -37,12 +37,14 @@ namespace {
 // `!id().valid()` instead of the std-lib's "valid but unspecified" — the same
 // fail-loud-on-use-after-move discipline as `Hir`.
 void resetMovedFrom_(Mir::InstArena& inst, Mir::BlockArena& block, Mir::FuncArena& func,
+                     Mir::GlobalArena& global,
                      std::vector<MirBlockId>& instBlock, std::vector<MirInstId>& operandPool,
                      std::vector<MirPhiIncoming>& phiPool, std::vector<MirBlockId>& succPool,
                      MirLiteralPool& literalPool) noexcept {
-    inst  = Mir::InstArena{};
-    block = Mir::BlockArena{};
-    func  = Mir::FuncArena{};
+    inst   = Mir::InstArena{};
+    block  = Mir::BlockArena{};
+    func   = Mir::FuncArena{};
+    global = Mir::GlobalArena{};
     instBlock.clear();
     operandPool.clear();
     phiPool.clear();
@@ -55,26 +57,31 @@ void resetMovedFrom_(Mir::InstArena& inst, Mir::BlockArena& block, Mir::FuncAren
 // ── Mir ───────────────────────────────────────────────────────────────────────
 
 Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
+         GlobalArena globalArena,
          std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
          std::vector<MirPhiIncoming> phiPool, std::vector<MirBlockId> succPool,
          MirLiteralPool literalPool) noexcept
     : instArena_(std::move(instArena)),
       blockArena_(std::move(blockArena)),
       funcArena_(std::move(funcArena)),
+      globalArena_(std::move(globalArena)),
       instBlock_(std::move(instBlock)),
       operandPool_(std::move(operandPool)),
       phiPool_(std::move(phiPool)),
       succPool_(std::move(succPool)),
       literalPool_(std::move(literalPool)) {
-    // The three arenas are tagged by ONE module id (the cross-tier guard relies
+    // The four arenas are tagged by ONE module id (the cross-tier guard relies
     // on it: a MirBlockId and a MirInstId of the same module share the tag). A
     // direct (non-builder) ctor that mismatched them would let an id from one
     // tier validate against another tier's tag silently. Catch it at the boundary.
-    if (instArena_.id() != blockArena_.id() || instArena_.id() != funcArena_.id()) {
+    if (instArena_.id() != blockArena_.id() || instArena_.id() != funcArena_.id()
+        || instArena_.id() != globalArena_.id()) {
         std::fprintf(stderr,
-                     "dss::Mir fatal: arena module-tag mismatch (inst=%u, block=%u, func=%u) "
-                     "— all three MIR arenas must share one MirModuleId\n",
-                     instArena_.id().v, blockArena_.id().v, funcArena_.id().v);
+                     "dss::Mir fatal: arena module-tag mismatch (inst=%u, block=%u, "
+                     "func=%u, global=%u) — all four MIR arenas must share one "
+                     "MirModuleId\n",
+                     instArena_.id().v, blockArena_.id().v, funcArena_.id().v,
+                     globalArena_.id().v);
         std::abort();
     }
     // `instBlock_` is the parallel inst→block array; it must align 1:1 with the
@@ -93,12 +100,14 @@ Mir::Mir(Mir&& other) noexcept
     : instArena_(std::move(other.instArena_)),
       blockArena_(std::move(other.blockArena_)),
       funcArena_(std::move(other.funcArena_)),
+      globalArena_(std::move(other.globalArena_)),
       instBlock_(std::move(other.instBlock_)),
       operandPool_(std::move(other.operandPool_)),
       phiPool_(std::move(other.phiPool_)),
       succPool_(std::move(other.succPool_)),
       literalPool_(std::move(other.literalPool_)) {
-    resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_, other.instBlock_,
+    resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
+                    other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_);
 }
 
@@ -107,12 +116,14 @@ Mir& Mir::operator=(Mir&& other) noexcept {
     instArena_   = std::move(other.instArena_);
     blockArena_  = std::move(other.blockArena_);
     funcArena_   = std::move(other.funcArena_);
+    globalArena_ = std::move(other.globalArena_);
     instBlock_   = std::move(other.instBlock_);
     operandPool_ = std::move(other.operandPool_);
     phiPool_     = std::move(other.phiPool_);
     succPool_    = std::move(other.succPool_);
     literalPool_ = std::move(other.literalPool_);
-    resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_, other.instBlock_,
+    resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
+                    other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_);
     return *this;
 }
@@ -269,6 +280,22 @@ MirFuncId Mir::funcAt(std::uint32_t i) const {
     return MirFuncId{i + 1, id().v};  // real funcs start at arena slot 1
 }
 
+std::size_t Mir::moduleGlobalCount() const noexcept {
+    std::size_t const n = globalArena_.nodeCount();
+    return n == 0 ? 0 : n - 1;
+}
+
+MirGlobalId Mir::globalAt(std::uint32_t i) const {
+    if (i >= moduleGlobalCount()) {
+        std::fprintf(stderr,
+                     "dss::Mir fatal: globalAt: index %u out of range (module has %zu "
+                     "globals)\n",
+                     i, moduleGlobalCount());
+        std::abort();
+    }
+    return MirGlobalId{i + 1, id().v};
+}
+
 // ── MirBuilder ──────────────────────────────────────────────────────────────
 
 MirModuleId MirBuilder::nextModuleId() noexcept {
@@ -285,7 +312,8 @@ MirModuleId MirBuilder::nextModuleId() noexcept {
 MirBuilder::MirBuilder() : MirBuilder(nextModuleId()) {}
 
 MirBuilder::MirBuilder(MirModuleId tag)
-    : moduleId_(tag), instArena_(tag), blockArena_(tag), funcArena_(tag) {
+    : moduleId_(tag), instArena_(tag), blockArena_(tag), funcArena_(tag),
+      globalArena_(tag) {
     // Slot 0 mirrors the arenas' slot-0 sentinels so a block .v keys
     // `blockState_` and an inst .v keys `instBlock_` directly.
     blockState_.push_back(BlockState::Sealed);
@@ -355,6 +383,37 @@ MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol) {
     MirFuncId const id = funcArena_.addNode(f);
     openFunc_ = id;
     return id;
+}
+
+MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
+                                  std::uint32_t initLiteralIndex,
+                                  MirFuncId initFunc) {
+    if (!type.valid()) {
+        std::fputs("dss::MirBuilder fatal: addGlobal: type TypeId must be valid\n",
+                   stderr);
+        std::abort();
+    }
+    if (!symbol.valid()) {
+        std::fputs("dss::MirBuilder fatal: addGlobal: symbol must be valid (a "
+                   "globals table without a stable name has no codegen anchor)\n",
+                   stderr);
+        std::abort();
+    }
+    if (initLiteralIndex != UINT32_MAX && initFunc.valid()) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: addGlobal: initLiteralIndex (%u) and "
+                     "initFunc (id=%u) are mutually exclusive — a global is either "
+                     "constant-init, function-init, or zero-init\n",
+                     initLiteralIndex, initFunc.v);
+        std::abort();
+    }
+    if (initFunc.valid()) checkSameModule_(initFunc.arenaTag, "addGlobal initFunc");
+    detail::MirGlobal g;
+    g.type             = type;
+    g.symbol           = symbol.v;
+    g.initLiteralIndex = initLiteralIndex;
+    g.initFunc         = initFunc;
+    return globalArena_.addNode(g);
 }
 
 MirBlockId MirBuilder::createBlock(StructCfMarker marker) {
@@ -750,8 +809,37 @@ Mir MirBuilder::finish() && {
                                            requireBlock(inc.pred, "phi predecessor"); }
     for (MirBlockId s : succPool_)         requireBlock(s, "successor");
 
+    // Globals carry two cross-arena references: `initFunc` (a MirFuncId)
+    // and `initLiteralIndex` (an index into the literal pool). Sweep both
+    // at the freeze boundary — same fail-loud-on-dangling discipline as
+    // the operand/phi/succ pools above.
+    std::size_t const funcSlots    = funcArena_.size();
+    std::size_t const literalSlots = literalPool_.size();
+    for (std::uint32_t slot = 1; slot < globalArena_.size(); ++slot) {
+        MirGlobalId const gid{slot, moduleId_.v};
+        detail::MirGlobal const& g = globalArena_.at(gid);
+        if (g.initFunc.valid()
+            && (g.initFunc.v == 0 || g.initFunc.v >= funcSlots)) {
+            std::fprintf(stderr,
+                         "dss::MirBuilder fatal: finish: global MirGlobalId=%u "
+                         "initFunc references non-existent function %u (module "
+                         "has %zu function slots)\n",
+                         slot, g.initFunc.v, funcSlots);
+            std::abort();
+        }
+        if (g.initLiteralIndex != UINT32_MAX
+            && g.initLiteralIndex >= literalSlots) {
+            std::fprintf(stderr,
+                         "dss::MirBuilder fatal: finish: global MirGlobalId=%u "
+                         "initLiteralIndex %u exceeds literal-pool size %zu\n",
+                         slot, g.initLiteralIndex, literalSlots);
+            std::abort();
+        }
+    }
+
     return Mir{std::move(instArena_).finish(), std::move(blockArena_).finish(),
-               std::move(funcArena_).finish(), std::move(instBlock_),
+               std::move(funcArena_).finish(), std::move(globalArena_).finish(),
+               std::move(instBlock_),
                std::move(operandPool_), std::move(phiPool_), std::move(succPool_),
                std::move(literalPool_)};
 }

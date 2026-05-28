@@ -40,7 +40,108 @@ TEST(Mir, DefaultModuleIsEmpty) {
     EXPECT_TRUE(m.empty());
     EXPECT_EQ(m.instCount(), 0u);
     EXPECT_EQ(m.moduleFuncCount(), 0u);
+    EXPECT_EQ(m.moduleGlobalCount(), 0u);
     EXPECT_FALSE(m.id().valid());
+}
+
+// Globals arena round-trip: three globals (constant-init, function-init, and
+// zero-init) survive build-once-freeze with the right accessor values.
+TEST(Mir, BuildsAndReadsModuleGlobals) {
+    MirBuilder b;
+    // This substrate test exercises function-init + zero-init globals, which
+    // is enough to pin the addGlobal builder shape; constant-init via the
+    // literal pool is exercised by the ML2-globals lowering tests in the
+    // mir_lowering_c_subset binary.
+    // First, build a synthetic init function whose body just returns.
+    MirFuncId const init = b.addFunction(kFnSig, SymbolId{100});
+    MirBlockId const ie  = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(ie);
+    b.addReturn();
+    // Function-init global referencing `init`.
+    MirGlobalId const g1 = b.addGlobal(kI32, SymbolId{10}, UINT32_MAX, init);
+    // Zero-init global (no literal, no init func).
+    MirGlobalId const g2 = b.addGlobal(kI32, SymbolId{11});
+    EXPECT_NE(g1, g2);
+
+    Mir m = std::move(b).finish();
+    ASSERT_EQ(m.moduleGlobalCount(), 2u);
+    EXPECT_EQ(m.globalAt(0), g1);
+    EXPECT_EQ(m.globalAt(1), g2);
+    EXPECT_EQ(m.globalType(g1).v, kI32.v);
+    EXPECT_EQ(m.globalSymbol(g1).v, 10u);
+    EXPECT_EQ(m.globalInitLiteralIndex(g1), UINT32_MAX);
+    EXPECT_EQ(m.globalInitFunc(g1), init);
+    EXPECT_EQ(m.globalType(g2).v, kI32.v);
+    EXPECT_EQ(m.globalSymbol(g2).v, 11u);
+    EXPECT_EQ(m.globalInitLiteralIndex(g2), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g2).valid());
+}
+
+// Aborts: mutually-exclusive init shapes for a single global.
+TEST(MirDeathTest, AddGlobalRejectsBothInitShapes) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MirBuilder b;
+    MirFuncId const init = b.addFunction(kFnSig, SymbolId{1});
+    MirBlockId const ie  = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(ie);
+    b.addReturn();
+    EXPECT_DEATH({ (void)b.addGlobal(kI32, SymbolId{2}, /*lit=*/0, /*func=*/init); },
+                 "mutually exclusive");
+}
+
+// Aborts: invalid symbol on a global (globals must have a stable name for
+// codegen — anonymous module storage has no anchor).
+TEST(MirDeathTest, AddGlobalRejectsInvalidSymbol) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MirBuilder b;
+    EXPECT_DEATH({ (void)b.addGlobal(kI32, SymbolId{}); }, "symbol must be valid");
+}
+
+namespace {
+
+// Helper for the freeze-boundary death tests below — the {comma-in-init-list}
+// inside the macro body trips EXPECT_DEATH's two-arg parser.
+[[noreturn]] void buildAndFinishWithDanglingInitFunc() {
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{1});
+    MirBlockId const e = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e);
+    b.addReturn();
+    MirFuncId const dangling{99, b.id().v};   // slot 99 — past the arena
+    (void)b.addGlobal(kI32, SymbolId{5}, UINT32_MAX, dangling);
+    (void)std::move(b).finish();
+    std::abort();   // unreached — finish() aborts first
+}
+
+[[noreturn]] void buildAndFinishWithDanglingLiteralIndex() {
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{1});
+    MirBlockId const e = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e);
+    b.addReturn();
+    (void)b.addGlobal(kI32, SymbolId{5}, /*lit=*/12345, /*func=*/{});
+    (void)std::move(b).finish();
+    std::abort();
+}
+
+} // namespace
+
+// Aborts at finish(): a global whose initFunc references a non-existent
+// function slot. Pins the freeze-boundary sweep over the globals arena
+// (cross-arena dangling references are the load-bearing invariant the
+// existing operand/phi/succ sweeps document; globals now share that gate).
+TEST(MirDeathTest, FinishRejectsDanglingGlobalInitFunc) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(buildAndFinishWithDanglingInitFunc(),
+                 "initFunc references non-existent function");
+}
+
+// Aborts at finish(): a global whose initLiteralIndex points past the
+// literal pool. Pins the second half of the freeze-boundary sweep.
+TEST(MirDeathTest, FinishRejectsDanglingGlobalInitLiteralIndex) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(buildAndFinishWithDanglingLiteralIndex(),
+                 "initLiteralIndex");
 }
 
 TEST(Mir, ModuleIdsAreMonotonicAndValid) {
@@ -578,30 +679,54 @@ TEST(MirDeathTest, BranchToNonexistentBlockAborts) {
 
 TEST(MirDeathTest, DirectCtorArenaTagMismatchAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    substrate::ArenaBuilder<detail::MirInst,  MirInstId,  MirModuleId> ib{MirModuleId{1}};
-    substrate::ArenaBuilder<detail::MirBlock, MirBlockId, MirModuleId> bb{MirModuleId{2}};
-    substrate::ArenaBuilder<detail::MirFunc,  MirFuncId,  MirModuleId> fb{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirInst,   MirInstId,   MirModuleId> ib{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirBlock,  MirBlockId,  MirModuleId> bb{MirModuleId{2}};
+    substrate::ArenaBuilder<detail::MirFunc,   MirFuncId,   MirModuleId> fb{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirGlobal, MirGlobalId, MirModuleId> gb{MirModuleId{1}};
     auto ia = std::move(ib).finish();
     auto ba = std::move(bb).finish();
     auto fa = std::move(fb).finish();
+    auto ga = std::move(gb).finish();
     std::vector<MirBlockId> instBlock{InvalidMirBlock};  // size 1 == ia.nodeCount()
     // Function-call ctor form keeps every comma inside parens (so neither the
     // EXPECT_DEATH macro nor a braced-init-list splits the arguments).
-    EXPECT_DEATH((void)Mir(std::move(ia), std::move(ba), std::move(fa), std::move(instBlock),
+    EXPECT_DEATH((void)Mir(std::move(ia), std::move(ba), std::move(fa), std::move(ga),
+                           std::move(instBlock),
                            {}, {}, {}, MirLiteralPool{}),
                  "module-tag mismatch");
 }
 
 TEST(MirDeathTest, DirectCtorInstBlockSizeMismatchAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    substrate::ArenaBuilder<detail::MirInst,  MirInstId,  MirModuleId> ib{MirModuleId{1}};
-    substrate::ArenaBuilder<detail::MirBlock, MirBlockId, MirModuleId> bb{MirModuleId{1}};
-    substrate::ArenaBuilder<detail::MirFunc,  MirFuncId,  MirModuleId> fb{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirInst,   MirInstId,   MirModuleId> ib{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirBlock,  MirBlockId,  MirModuleId> bb{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirFunc,   MirFuncId,   MirModuleId> fb{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirGlobal, MirGlobalId, MirModuleId> gb{MirModuleId{1}};
     auto ia = std::move(ib).finish();
     auto ba = std::move(bb).finish();
     auto fa = std::move(fb).finish();
+    auto ga = std::move(gb).finish();
     std::vector<MirBlockId> instBlock{};  // size 0 ≠ ia.nodeCount() (1)
-    EXPECT_DEATH((void)Mir(std::move(ia), std::move(ba), std::move(fa), std::move(instBlock),
+    EXPECT_DEATH((void)Mir(std::move(ia), std::move(ba), std::move(fa), std::move(ga),
+                           std::move(instBlock),
                            {}, {}, {}, MirLiteralPool{}),
                  "size mismatch");
+}
+
+// New: a 4th-arena module-tag mismatch (globals arena) aborts identically.
+TEST(MirDeathTest, DirectCtorGlobalArenaTagMismatchAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    substrate::ArenaBuilder<detail::MirInst,   MirInstId,   MirModuleId> ib{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirBlock,  MirBlockId,  MirModuleId> bb{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirFunc,   MirFuncId,   MirModuleId> fb{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirGlobal, MirGlobalId, MirModuleId> gb{MirModuleId{2}};
+    auto ia = std::move(ib).finish();
+    auto ba = std::move(bb).finish();
+    auto fa = std::move(fb).finish();
+    auto ga = std::move(gb).finish();
+    std::vector<MirBlockId> instBlock{InvalidMirBlock};
+    EXPECT_DEATH((void)Mir(std::move(ia), std::move(ba), std::move(fa), std::move(ga),
+                           std::move(instBlock),
+                           {}, {}, {}, MirLiteralPool{}),
+                 "module-tag mismatch");
 }

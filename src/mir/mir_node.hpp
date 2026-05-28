@@ -8,11 +8,11 @@
 #include <cstdint>
 #include <type_traits>
 
-// MIR storage PODs (ML1). The MIR module is three dense arenas — instructions,
-// basic blocks, functions — all tagged by one `MirModuleId` (the cross-module
-// guard), dogfooding the SP1 substrate exactly as HIR does. The PODs live in
-// `detail/` so consumers go through `Mir`'s accessors; several fields are
-// pool offsets that are meaningless in isolation.
+// MIR storage PODs (ML1). The MIR module is four dense arenas — instructions,
+// basic blocks, functions, and module-level globals — all tagged by one
+// `MirModuleId` (the cross-module guard), dogfooding the SP1 substrate exactly
+// as HIR does. The PODs live in `detail/` so consumers go through `Mir`'s
+// accessors; several fields are pool offsets that are meaningless in isolation.
 //
 // Topology (per plan 12 §2.2):
 //   function  → a contiguous range of blocks  [blockStart, blockStart+blockCount)
@@ -161,15 +161,43 @@ struct MirFunc {
 static_assert(sizeof(MirFunc) <= 32, "detail::MirFunc grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirFunc>);
 
+// ── global POD ──────────────────────────────────────────────────────────────────
+//
+// A module-level storage cell. `type` is the declared variable type (the same
+// lattice TypeId everything else uses); `symbol` is the declared `SymbolId.v`
+// (lookup key for `GlobalAddr`). Initialization shape (mutually exclusive):
+//   - `initLiteralIndex != UINT32_MAX`: constant initializer — index into the
+//     module's `MirLiteralPool`. The literal's value is the global's initial
+//     state at module load.
+//   - `initFunc.valid()`: non-constant initializer — `initFunc` is a synthesized
+//     `__module_init__` MirFunc whose body stores into this global as part of
+//     module load. (Plan 12's ML2-globals cycle uses fold-first/fall-back-to-
+//     init-function policy: the constant case is the common path.)
+//   - Both UINT32_MAX / Invalid: declared with no initializer (zero-init by
+//     C language convention; the runtime decides the zero pattern).
+// Deliberate divergence from `MirBlock`'s `uint32_t func` field: `initFunc`
+// here is a full `MirFuncId` (with arena tag) — globals are written + read
+// across multiple lowering passes, so preserving provenance through the
+// strong-id form is worth the 4 extra bytes vs. a raw u32. POD is 28B (no
+// trailing pad), well under the 32B static_assert ceiling.
+struct MirGlobal {
+    TypeId        type             = InvalidType;       // 8
+    std::uint32_t symbol           = 0;                 // 4  — declared SymbolId.v
+    std::uint32_t initLiteralIndex = UINT32_MAX;        // 4  — into MirLiteralPool
+    MirFuncId     initFunc{};                           // 8  — module-init function id (strong)
+};
+static_assert(sizeof(MirGlobal) <= 32, "detail::MirGlobal grew unexpectedly — review layout");
+static_assert(std::is_trivially_copyable_v<MirGlobal>);
+
 } // namespace detail
 
 } // namespace dss
 
-// Cross-arena guard wording (the SH3 / SP1 discipline) for the three MIR arenas.
+// Cross-arena guard wording (the SH3 / SP1 discipline) for the four MIR arenas.
 // The primary `ArenaNames` template is a must-specialize tripwire (arena_tag.hpp),
 // so these are mandatory before instantiating any ArenaContainer / ArenaAttribute
-// over a MIR id. All three share `MirModuleId` as the arena tag — one module, one
-// tag, three element-id spaces — and each names its own element so a fatal
+// over a MIR id. All four share `MirModuleId` as the arena tag — one module, one
+// tag, four element-id spaces — and each names its own element so a fatal
 // message identifies which tier's guard fired.
 namespace dss::substrate {
 
@@ -195,6 +223,14 @@ struct ArenaNames<MirFuncId, MirModuleId> {
     static constexpr char const* element   = "MirFuncId";
     static constexpr char const* tag       = "MirModuleId";
     static constexpr char const* access    = "Mir::func";
+};
+
+template <>
+struct ArenaNames<MirGlobalId, MirModuleId> {
+    static constexpr char const* attribute = "MirGlobalAttribute";
+    static constexpr char const* element   = "MirGlobalId";
+    static constexpr char const* tag       = "MirModuleId";
+    static constexpr char const* access    = "Mir::global";
 };
 
 } // namespace dss::substrate

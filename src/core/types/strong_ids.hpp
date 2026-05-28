@@ -119,6 +119,7 @@ DSS_ARENA_ID(HirNodeId);
 DSS_ARENA_ID(MirInstId);
 DSS_ARENA_ID(MirBlockId);
 DSS_ARENA_ID(MirFuncId);
+DSS_ARENA_ID(MirGlobalId);
 
 #undef DSS_STRONG_ID
 #undef DSS_ARENA_ID
@@ -147,6 +148,7 @@ inline constexpr MirModuleId     InvalidMirModule{};
 inline constexpr MirInstId       InvalidMirInst{};
 inline constexpr MirBlockId      InvalidMirBlock{};
 inline constexpr MirFuncId       InvalidMirFunc{};
+inline constexpr MirGlobalId     InvalidMirGlobal{};
 
 } // namespace dss
 
@@ -182,5 +184,6 @@ DSS_HASH_ID(MirModuleId);
 DSS_HASH_ID(MirInstId);
 DSS_HASH_ID(MirBlockId);
 DSS_HASH_ID(MirFuncId);
+DSS_HASH_ID(MirGlobalId);
 
 #undef DSS_HASH_ID

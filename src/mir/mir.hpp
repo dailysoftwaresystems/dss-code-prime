@@ -16,11 +16,12 @@
 #include <utility>
 #include <vector>
 
-// `Mir` (ML1) — the frozen, immutable mid-level IR module: three dense arenas
-// (instructions, basic blocks, functions) all tagged by one `MirModuleId`, plus
-// module-owned pools for the genuinely non-contiguous lists (operands, phi
-// incomings, CFG successors) and the literal pool. Dogfoods the SP1 substrate
-// exactly as `Hir` does. Built by `MirBuilder`, frozen by `finish()`.
+// `Mir` (ML1) — the frozen, immutable mid-level IR module: four dense arenas
+// (instructions, basic blocks, functions, and module-level globals) all tagged
+// by one `MirModuleId`, plus module-owned pools for the genuinely non-contiguous
+// lists (operands, phi incomings, CFG successors) and the literal pool.
+// Dogfoods the SP1 substrate exactly as `Hir` does. Built by `MirBuilder`,
+// frozen by `finish()`.
 //
 // `Mir` satisfies the substrate `Arena` concept via its INSTRUCTION tier (the
 // fused-value entity, and the most-annotated one), so `MirAttribute<T>` binds to
@@ -38,9 +39,10 @@ namespace dss {
 
 class DSS_EXPORT Mir {
 public:
-    using InstArena  = substrate::ArenaContainer<detail::MirInst,  MirInstId,  MirModuleId>;
-    using BlockArena = substrate::ArenaContainer<detail::MirBlock, MirBlockId, MirModuleId>;
-    using FuncArena  = substrate::ArenaContainer<detail::MirFunc,  MirFuncId,  MirModuleId>;
+    using InstArena   = substrate::ArenaContainer<detail::MirInst,   MirInstId,   MirModuleId>;
+    using BlockArena  = substrate::ArenaContainer<detail::MirBlock,  MirBlockId,  MirModuleId>;
+    using FuncArena   = substrate::ArenaContainer<detail::MirFunc,   MirFuncId,   MirModuleId>;
+    using GlobalArena = substrate::ArenaContainer<detail::MirGlobal, MirGlobalId, MirModuleId>;
 
     // Substrate `Arena` concept surface: the instruction tier (so
     // `MirAttribute<T>` = `ArenaAttribute<Mir, T>` keys on `MirInstId`).
@@ -51,6 +53,7 @@ public:
     Mir() noexcept = default;
 
     Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
+        GlobalArena globalArena,
         std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
         std::vector<MirPhiIncoming> phiPool, std::vector<MirBlockId> succPool,
         MirLiteralPool literalPool) noexcept;
@@ -75,11 +78,14 @@ public:
     [[nodiscard]] bool        empty()      const noexcept { return instArena_.empty(); }
     [[nodiscard]] std::size_t instCount()  const noexcept { return nodeCount(); }
     [[nodiscard]] std::size_t blockCount() const noexcept { return blockArena_.nodeCount(); }
-    [[nodiscard]] std::size_t funcCount()  const noexcept { return funcArena_.nodeCount(); }
+    [[nodiscard]] std::size_t funcCount()   const noexcept { return funcArena_.nodeCount(); }
+    [[nodiscard]] std::size_t globalCount() const noexcept { return globalArena_.nodeCount(); }
 
-    // Sibling arenas, for binding `MirBlockAttribute<T>` / `MirFuncAttribute<T>`.
-    [[nodiscard]] BlockArena const& blockArena() const noexcept { return blockArena_; }
-    [[nodiscard]] FuncArena const&  funcArena()  const noexcept { return funcArena_; }
+    // Sibling arenas, for binding `MirBlockAttribute<T>` / `MirFuncAttribute<T>`
+    // / `MirGlobalAttribute<T>`.
+    [[nodiscard]] BlockArena  const& blockArena()  const noexcept { return blockArena_; }
+    [[nodiscard]] FuncArena   const& funcArena()   const noexcept { return funcArena_; }
+    [[nodiscard]] GlobalArena const& globalArena() const noexcept { return globalArena_; }
 
     // ── instruction accessors (bounds- + cross-module-checked via arena .at) ──
     [[nodiscard]] MirOpcode     instOpcode(MirInstId id)  const { return instArena_.at(id).opcode; }
@@ -140,11 +146,33 @@ public:
     // The entry block (the function's first block). Aborts on a blockless function.
     [[nodiscard]] MirBlockId funcEntry(MirFuncId id) const;
 
+    // ── global accessors ──
+    [[nodiscard]] TypeId   globalType(MirGlobalId id) const {
+        return globalArena_.at(id).type;
+    }
+    [[nodiscard]] SymbolId globalSymbol(MirGlobalId id) const {
+        return SymbolId{globalArena_.at(id).symbol};
+    }
+    // The constant initializer's `MirLiteralPool` index (`UINT32_MAX` when the
+    // global has none — either zero-init or initialized by an init function).
+    [[nodiscard]] std::uint32_t globalInitLiteralIndex(MirGlobalId id) const {
+        return globalArena_.at(id).initLiteralIndex;
+    }
+    // The module-init function id that initializes this global at module load,
+    // or `InvalidMirFunc` for constant-init or zero-init globals.
+    [[nodiscard]] MirFuncId globalInitFunc(MirGlobalId id) const {
+        return globalArena_.at(id).initFunc;
+    }
+
     // ── module-level iteration ──
     // The number of real functions and the i-th one (0-based; maps to arena slot
     // i+1, the slot-0 sentinel excluded).
     [[nodiscard]] std::size_t moduleFuncCount() const noexcept;
     [[nodiscard]] MirFuncId   funcAt(std::uint32_t i) const;
+    // The number of real globals and the i-th one (0-based, slot-0 sentinel
+    // excluded — same discipline as `moduleFuncCount` / `funcAt`).
+    [[nodiscard]] std::size_t moduleGlobalCount() const noexcept;
+    [[nodiscard]] MirGlobalId globalAt(std::uint32_t i) const;
 
     // ── literals ──
     [[nodiscard]] MirLiteralValue const& literalValue(std::uint32_t index) const {
@@ -156,6 +184,7 @@ private:
     InstArena                   instArena_;
     BlockArena                  blockArena_;
     FuncArena                   funcArena_;
+    GlobalArena                 globalArena_;
     // Parallel to the instruction arena (indexed by inst .v; slot 0 is the
     // sentinel): the block each instruction belongs to. The MIR analog of HIR's
     // `parentOf_` — kept out of the POD to hold the 24-byte scan density.
@@ -180,6 +209,8 @@ template <class T>
 using MirAttribute = substrate::ArenaAttribute<Mir, T>;
 template <class T>
 using MirBlockAttribute = substrate::ArenaAttribute<Mir::BlockArena, T>;
+template <class T>
+using MirGlobalAttribute = substrate::ArenaAttribute<Mir::GlobalArena, T>;
 template <class T>
 using MirFuncAttribute = substrate::ArenaAttribute<Mir::FuncArena, T>;
 
@@ -214,6 +245,20 @@ public:
     // block be terminated and the function have ≥1 block). `signature` is the
     // FnSig TypeId; `symbol` the declared SymbolId.
     MirFuncId addFunction(TypeId signature, SymbolId symbol);
+
+    // ── global storage ──
+    // Append a module-level global to the globals arena. Module-level only — has
+    // no lifecycle dependency on the open function / block; can be called at any
+    // point before `finish()`. Initialization shape (mutually exclusive):
+    //   - `initLiteralIndex != UINT32_MAX` and `initFunc == InvalidMirFunc`:
+    //     constant initializer; the literal at that index is the initial state.
+    //   - `initLiteralIndex == UINT32_MAX` and `initFunc.valid()`: a synthesized
+    //     module-init function writes the initial state at module load.
+    //   - both unset: zero-init (C-style file-scope default).
+    // Aborts on a no-symbol or no-type call; aborts on the both-set combination.
+    MirGlobalId addGlobal(TypeId type, SymbolId symbol,
+                          std::uint32_t initLiteralIndex = UINT32_MAX,
+                          MirFuncId     initFunc         = {});
 
     // Reserve a basic block in the current function WITHOUT opening it, returning
     // its id so terminators can target it before it is filled (forward branches).
@@ -324,9 +369,10 @@ private:
     enum class BlockState : std::uint8_t { Created, Open, Sealed };
 
     MirModuleId moduleId_;
-    substrate::ArenaBuilder<detail::MirInst,  MirInstId,  MirModuleId> instArena_;
-    substrate::ArenaBuilder<detail::MirBlock, MirBlockId, MirModuleId> blockArena_;
-    substrate::ArenaBuilder<detail::MirFunc,  MirFuncId,  MirModuleId> funcArena_;
+    substrate::ArenaBuilder<detail::MirInst,   MirInstId,   MirModuleId> instArena_;
+    substrate::ArenaBuilder<detail::MirBlock,  MirBlockId,  MirModuleId> blockArena_;
+    substrate::ArenaBuilder<detail::MirFunc,   MirFuncId,   MirModuleId> funcArena_;
+    substrate::ArenaBuilder<detail::MirGlobal, MirGlobalId, MirModuleId> globalArena_;
     std::vector<MirBlockId>     instBlock_;    // grows in lockstep with the inst arena
     std::vector<MirInstId>      operandPool_;
     std::vector<MirPhiIncoming> phiPool_;
