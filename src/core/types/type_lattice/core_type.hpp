@@ -27,6 +27,12 @@ enum class TypeKind : std::uint16_t {
     Void,
     // ── aggregates ──
     Struct, Union, Tuple, Array, Slice,
+    // ── enumeration (nominal int-compatible) ──
+    // D5.5: a named set of integer constants. Distinct nominal identity
+    // (two enums with the same underlying type don't compare equal), but
+    // int-compatible at all arithmetic / cast sites. Variants are the
+    // enumerator symbols (each constant is a value of this enum).
+    Enum,
     // ── SIMD ──
     Vector, Matrix,
     // ── indirection ──

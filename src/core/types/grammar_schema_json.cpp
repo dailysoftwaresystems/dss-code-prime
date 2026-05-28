@@ -3194,14 +3194,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     // is REQUIRED when `fieldChildren` is
                                     // present. Defaulting silently to
                                     // Struct would let a future union-
-                                    // bearing schema mis-type its
-                                    // composites with no signal.
+                                    // or enum-bearing schema mis-type
+                                    // its composites with no signal.
                                     coll.emit(DiagnosticCode::C_MissingField,
                                               path + "/fieldChildren/compositeKind",
                                               "'fieldChildren.compositeKind' is required and "
-                                              "must be 'struct' or 'union' — explicit declaration "
-                                              "guards against silently mis-interning a future "
-                                              "composite type");
+                                              "must be 'struct', 'union' or 'enum' — explicit "
+                                              "declaration guards against silently mis-interning "
+                                              "a future composite type");
                                 } else if (!fc.at("compositeKind").is_string()) {
                                     coll.emit(DiagnosticCode::C_InvalidSemantics,
                                               path + "/fieldChildren/compositeKind",
@@ -3216,11 +3216,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         fcd.compositeKind = CompositeKind::Struct;
                                     } else if (k == "union") {
                                         fcd.compositeKind = CompositeKind::Union;
+                                    } else if (k == "enum") {
+                                        fcd.compositeKind = CompositeKind::Enum;
                                     } else {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
                                                   path + "/fieldChildren/compositeKind",
-                                                  std::format("'compositeKind' must be 'struct' "
-                                                              "or 'union' (got '{}')", k));
+                                                  std::format("'compositeKind' must be 'struct', "
+                                                              "'union' or 'enum' (got '{}')", k));
                                         // Keep loading; the default Struct
                                         // is the safer fallback for an
                                         // unrecognized value (still emits

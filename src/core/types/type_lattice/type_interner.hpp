@@ -64,6 +64,11 @@ public:
     // struct/union: nominal name + operands=[fields/variants...].
     TypeId structType(std::string_view name, std::span<TypeId const> fields);
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
+    // enum: nominal name + scalars=[(int)underlyingTypeKind]. Variants
+    // are NOT stored as operands (each enumerator is a Variable symbol
+    // with the enum TypeId; the enum type itself is int-compatible).
+    TypeId enumType(std::string_view name,
+                    TypeKind underlying = TypeKind::I32);
     // fnSig: operands=[result, params...], scalars=[(int)cc].
     TypeId fnSig(std::span<TypeId const> params, TypeId result, CallConv cc);
     // extension: kind = TypeKind::Extension, extensionKind = `kind`, nominal name,

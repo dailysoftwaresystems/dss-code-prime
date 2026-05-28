@@ -816,13 +816,20 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             std::vector<std::pair<std::uint32_t, TypeId>> fields;
                             auto const& scope = s.scopes.scopes()[srec.structScope.v];
                             bool anyInvalid = false;
+                            // D5.5: enum members have NO declared type
+                            // (they're typed BY the enum type Pass 1.5
+                            // is about to mint); skip the "field's type
+                            // must be resolved" gate for enum.
+                            bool const requireFieldTypes =
+                                decl.fieldChildren->compositeKind
+                                != CompositeKind::Enum;
                             for (auto const& [_name, fieldSymId] : scope.bindings) {
                                 SymbolRecord const& frec = s.symbols.at(fieldSymId);
                                 if (!frec.declRuleNode.valid()
                                     || frec.tree.v != tree.id().v) continue;
                                 if (tree.rule(frec.declRuleNode)
                                     != decl.fieldChildren->rule) continue;
-                                if (!frec.type.valid()) {
+                                if (requireFieldTypes && !frec.type.valid()) {
                                     anyInvalid = true;
                                     break;
                                 }
@@ -834,15 +841,75 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 fieldTypes.reserve(fields.size());
                                 for (auto const& [_idx, t] : fields)
                                     fieldTypes.push_back(t);
-                                // D5.4: struct vs union dispatch is config-
-                                // driven via FieldChildrenDescriptor::compositeKind.
-                                TypeId const compositeTy =
-                                    (decl.fieldChildren->compositeKind
-                                     == CompositeKind::Union)
-                                    ? s.lattice.interner().unionType(
-                                        srec.name, fieldTypes)
-                                    : s.lattice.interner().structType(
+                                // D5.4 / D5.5: struct vs union vs enum
+                                // dispatch is config-driven via
+                                // FieldChildrenDescriptor::compositeKind.
+                                CompositeKind const ck =
+                                    decl.fieldChildren->compositeKind;
+                                TypeId compositeTy;
+                                if (ck == CompositeKind::Union) {
+                                    compositeTy = s.lattice.interner().unionType(
                                         srec.name, fieldTypes);
+                                } else if (ck == CompositeKind::Enum) {
+                                    // D5.5: enum type carries no field-
+                                    // operands — only its nominal name +
+                                    // underlying TypeKind (I32 in v1).
+                                    // Pass 1 already set each enumerator's
+                                    // SymbolRecord with the unresolved
+                                    // type; we now SET each enumerator's
+                                    // type to the enum type AND lift the
+                                    // bindings to the enclosing scope so
+                                    // C-classic `enum E { A }` makes `A`
+                                    // visible without `E.A`.
+                                    compositeTy = s.lattice.interner().enumType(
+                                        srec.name, TypeKind::I32);
+                                    if (srec.structScope.valid()) {
+                                        auto const enclosingId =
+                                            s.scopes.scopes()[srec.structScope.v].parent;
+                                        // Take a snapshot of bindings to
+                                        // avoid mutating the map while
+                                        // iterating.
+                                        std::vector<std::pair<std::string, SymbolId>>
+                                            innerBindings(
+                                                s.scopes.scopes()[srec.structScope.v]
+                                                    .bindings.begin(),
+                                                s.scopes.scopes()[srec.structScope.v]
+                                                    .bindings.end());
+                                        for (auto const& [name, eSymId]
+                                             : innerBindings) {
+                                            SymbolRecord& erec =
+                                                s.symbols.at(eSymId);
+                                            if (!erec.declRuleNode.valid()
+                                                || erec.tree.v != tree.id().v)
+                                                continue;
+                                            if (tree.rule(erec.declRuleNode)
+                                                != decl.fieldChildren->rule)
+                                                continue;
+                                            erec.type = compositeTy;
+                                            if (enclosingId.valid()) {
+                                                // Lift: also bind to the
+                                                // enclosing scope. If the
+                                                // name is already taken
+                                                // there, emit S_Redeclared.
+                                                SymbolId const prior =
+                                                    s.scopes.bind(
+                                                        enclosingId, name, eSymId);
+                                                if (prior.valid()) {
+                                                    ParseDiagnostic d2;
+                                                    d2.code     = DiagnosticCode::S_RedeclaredSymbol;
+                                                    d2.severity = DiagnosticSeverity::Error;
+                                                    d2.buffer   = tree.source().id();
+                                                    d2.span     = tree.span(erec.declRuleNode);
+                                                    d2.actual   = name;
+                                                    s.reporter.report(std::move(d2));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    compositeTy = s.lattice.interner().structType(
+                                        srec.name, fieldTypes);
+                                }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);
                                 s.compositeScopeByType[compositeTy.v] = srec.structScope;

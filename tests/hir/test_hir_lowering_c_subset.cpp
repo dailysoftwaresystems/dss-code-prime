@@ -1598,3 +1598,55 @@ TEST(HirLoweringCSubset, D5_4_UnionMemberAccess) {
     auto res = lowerToHir(model, r);
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 }
+
+// ── D5.5 enums ───────────────────────────────────────────────────────
+
+// `enum E { A, B, C };` declares a TypeDecl. The enum type is nominal-
+// by-name; enumerators are Variable symbols with the enum type, bound
+// in the enum's inner scope (accessed as `E.A` via MemberAccess).
+TEST(HirLoweringCSubset, D5_5_EnumDeclLowersToTypeDecl) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C };\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::TypeDecl);
+}
+
+// C-classic enumerator visibility: `enum E { A, B }` makes `A` and `B`
+// visible directly in the enclosing scope (Pass 1.5 lifts the
+// enumerator bindings from the enum's inner scope to the parent).
+// `enum E e = A;` resolves `A` against the enclosing scope.
+TEST(HirLoweringCSubset, D5_5_EnumValueUseViaBareName) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C };\n"
+        "void f() { enum E e = A; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// Enum with trailing comma + multi-enumerator parse cleanly.
+TEST(HirLoweringCSubset, D5_5_EnumTrailingCommaParses) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C, };\n");
+    ASSERT_FALSE(model.hasErrors());
+}
+
+// Enum with explicit-value enumerators parses cleanly (semantic
+// const-eval of the explicit value is a future-work item; for v1 the
+// declaration and use sites work but the explicit-value computation is
+// not yet exposed to const-eval).
+TEST(HirLoweringCSubset, D5_5_EnumExplicitValueParses) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A = 1, B = 5, C };\n");
+    ASSERT_FALSE(model.hasErrors());
+}

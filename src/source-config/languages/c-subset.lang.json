@@ -166,6 +166,7 @@
     { "word": "typedef", "kind": "TypedefKeyword" },
     { "word": "struct",  "kind": "StructKeyword"  },
     { "word": "union",   "kind": "UnionKeyword"   },
+    { "word": "enum",    "kind": "EnumKeyword"    },
 
     { "word": "if",      "kind": "IfKeyword"      },
     { "word": "else",    "kind": "ElseKeyword"    },
@@ -191,6 +192,7 @@
         "typedefDecl",
         "structDecl",
         "unionDecl",
+        "enumDecl",
         "topLevelDecl",
         "externDecl"
       ]
@@ -230,6 +232,32 @@
 
     "unionTypeRef": {
       "sequence": [ "UnionKeyword", "Identifier" ]
+    },
+
+    "enumDecl": {
+      "sequence": [
+        "EnumKeyword", "Identifier",
+        "BlockOpen",
+        { "optional": {
+            "sequence": [
+              "enumerator",
+              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
+            ]
+        }},
+        "BlockClose",
+        "EndStatement"
+      ]
+    },
+
+    "enumerator": {
+      "sequence": [
+        "Identifier",
+        { "optional": { "sequence": [ "AssignOp", "expression" ] } }
+      ]
+    },
+
+    "enumTypeRef": {
+      "sequence": [ "EnumKeyword", "Identifier" ]
     },
 
     "memberFollower": {
@@ -315,7 +343,7 @@
     },
 
     "typeBaseAllowingStruct": {
-      "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "structTypeRef", "unionTypeRef" ]
+      "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
     },
 
     "typeRefAllowingStruct": {
@@ -545,6 +573,9 @@
       { "rule": "unionDecl",   "name": 1, "kind": "type",
         "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
       { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable" },
+      { "rule": "enumDecl",    "name": 1, "kind": "type",
+        "fieldChildren": { "rule": "enumerator", "compositeKind": "enum" } },
+      { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "kindByChild": {
           "childPath": [3, 0],
@@ -556,7 +587,8 @@
     "references": [
       { "rule": "operand" },
       { "rule": "structTypeRef", "nameMatch": "lastIdentifier" },
-      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier" }
+      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier" },
+      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier" }
     ],
     "memberAccesses": [
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
@@ -564,7 +596,7 @@
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
-    "scopes": [ "block", "funcDefTail", "structDecl", "unionDecl" ],
+    "scopes": [ "block", "funcDefTail", "structDecl", "unionDecl", "enumDecl" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
       { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },
@@ -607,6 +639,7 @@
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
       { "rule": "structDecl",   "hirKind": "TypeDecl"    },
       { "rule": "unionDecl",    "hirKind": "TypeDecl"    },
+      { "rule": "enumDecl",     "hirKind": "TypeDecl"    },
       { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },

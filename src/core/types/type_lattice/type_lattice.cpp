@@ -184,6 +184,14 @@ TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> va
     return internContent(TypeKind::Union, {}, variants, {}, names_.intern(name));
 }
 
+TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
+    // scalars=[(int)underlying]; no operands (enumerator symbols carry
+    // the enum's TypeId individually as Variables; the enum type itself
+    // is identified nominally by name + tagged with its underlying type).
+    std::array<std::int64_t, 1> const sc{static_cast<std::int64_t>(underlying)};
+    return internContent(TypeKind::Enum, {}, {}, sc, names_.intern(name));
+}
+
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc) {
     // operands = [result, params...] so the result is recoverable at a fixed
     // position; scalars = [(int)cc].

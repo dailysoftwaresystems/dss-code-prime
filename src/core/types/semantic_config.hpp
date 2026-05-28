@@ -122,7 +122,7 @@ struct DSS_EXPORT ArraySuffix {
 // (so fields bind into the composite's inner scope, not the enclosing one).
 // The loader rejects a `fieldChildren` whose declaration rule is not also in
 // `scopes` via `C_InvalidSemantics`.
-enum class CompositeKind : std::uint8_t { Struct, Union };
+enum class CompositeKind : std::uint8_t { Struct, Union, Enum };
 struct DSS_EXPORT FieldChildrenDescriptor {
     RuleId        rule{};                          // the field-declaration rule
     std::string   ruleName;                        // source spelling, for diagnostics
