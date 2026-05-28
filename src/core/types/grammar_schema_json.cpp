@@ -3498,6 +3498,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         bool ok = readReqUint("lhsChild",  rule.lhsChild)
                               &&  readReqUint("nameChild", rule.nameChild);
                         if (!ok) continue;
+                        if (rule.lhsChild == rule.nameChild) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      path,
+                                      std::format("'memberAccesses[{}]': "
+                                                  "lhsChild and nameChild must "
+                                                  "be distinct visible-child "
+                                                  "indices (got {})",
+                                                  i, rule.lhsChild));
+                            continue;
+                        }
                         if (entry.contains("dereferences")) {
                             if (!entry.at("dereferences").is_boolean()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -3539,6 +3549,44 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         scopeRule.ruleName = name;
                         cfg.scopes.push_back(std::move(scopeRule));
                     }
+                }
+            }
+
+            // ── D5.1: cross-field validation for `fieldChildren` ──
+            // The header docstring promises that a declaration carrying
+            // `fieldChildren` must (a) also appear in `scopes` (so fields
+            // bind into the struct's own scope, not the enclosing one),
+            // and (b) declare `kind: type`. Pass 1 silently no-ops a
+            // misconfigured fieldChildren (via the `here != current` gate)
+            // and Pass 1.5 silently leaves the struct type unresolved —
+            // exactly the kind of "documented invariant, unenforced"
+            // anti-pattern the project rejects. Validate here, before
+            // analysis ever runs.
+            for (std::size_t i = 0; i < cfg.declarations.size(); ++i) {
+                auto const& d = cfg.declarations[i];
+                if (!d.fieldChildren.has_value()) continue;
+                const auto path = std::format("/semantics/declarations/{}", i);
+                if (d.kind != DeclarationKind::Type) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/fieldChildren",
+                              std::format("declaration '{}' carries "
+                                          "'fieldChildren' but its 'kind' is "
+                                          "not 'type' — a composite-type "
+                                          "introducer must declare kind:type",
+                                          d.ruleName));
+                }
+                bool inScopes = false;
+                for (auto const& sc : cfg.scopes) {
+                    if (sc.rule.v == d.rule.v) { inScopes = true; break; }
+                }
+                if (!inScopes) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/fieldChildren",
+                              std::format("declaration '{}' carries "
+                                          "'fieldChildren' but its rule is "
+                                          "not in 'scopes' — fields must bind "
+                                          "into the struct's own scope",
+                                          d.ruleName));
                 }
             }
 

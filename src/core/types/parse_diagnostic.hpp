@@ -193,6 +193,17 @@ enum class DiagnosticCode : std::uint16_t {
     // wrap to a negative length). Distinct from S_NonConstantArrayLength (which
     // is "not a constant at all"); kept separate so the message matches reality.
     S_ArrayLengthOutOfRange       = 0xE00C,
+    // D5.1: a `.` or `->` member access whose LHS resolves to a non-composite
+    // type (not a TypeKind::Struct / Union). Distinct from S_TypeMismatch so
+    // downstream LSP/fixits/error-recovery can match the specific shape
+    // (parallels S_NotCallable). Emitted by the member-access resolution.
+    S_NotAComposite               = 0xE00D,
+    // D5.1: a `->` member access whose LHS resolves to a non-pointer type.
+    // Distinct from S_TypeMismatch (and from S_NotAComposite) so downstream
+    // can disambiguate the two arrow-form failure modes — the LHS isn't a
+    // pointer at all (here), vs. the LHS IS Ptr<T> but T isn't composite
+    // (S_NotAComposite).
+    S_NotAPointer                 = 0xE00E,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
