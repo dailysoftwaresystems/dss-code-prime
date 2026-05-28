@@ -127,13 +127,16 @@ struct DSS_EXPORT FieldChildrenDescriptor {
     RuleId        rule{};                          // the field-declaration rule
     std::string   ruleName;                        // source spelling, for diagnostics
     CompositeKind compositeKind = CompositeKind::Struct;
-    // D5.5-FU2: when `compositeKind == Enum`, controls whether the
-    // enumerator names are also bound in the enclosing scope (C-classic
-    // visibility — `enum E { A } ... A`). False ⇒ Rust-style `E.A`
-    // only. Default true ONLY when the c-subset-style schema opts in
-    // explicitly via the loader's `liftToEnclosingScope: true` key;
-    // the C++ default here is `false` so a new enum-bearing schema
-    // doesn't silently leak names without declaring intent.
+    // D5.5-FU2: ONLY meaningful when `compositeKind == Enum` — for
+    // Struct/Union this field is loader-validated but ignored by Pass
+    // 1.5 (no enclosing-scope republication makes sense for fields /
+    // variants). When true, the enumerator names are ALSO bound in the
+    // enclosing scope (C-classic visibility — `enum E { A } ... A`).
+    // C++ default is `false` (the safer Rust-style `E.A`-only) so a
+    // new enum-bearing schema must explicitly opt in via the loader's
+    // `liftToEnclosingScope: true` key; a schema that forgets the
+    // flag fails LOUD at the use site with an undefined-name
+    // diagnostic, rather than silently leaking names.
     bool          liftToEnclosingScope = false;
 };
 

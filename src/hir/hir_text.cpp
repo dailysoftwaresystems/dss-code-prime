@@ -405,7 +405,9 @@ private:
             // scalars[0]. Round-trip the underlying explicitly when it
             // diverges from the default I32 (`enum "E" : kindOrdinal`);
             // omit the suffix when underlying = I32 to keep the common
-            // form readable.
+            // form readable. Parser defaults to I32 when the suffix is
+            // absent — emission elision MUST stay in lockstep with the
+            // parser default for round-trip correctness.
             case TypeKind::Enum: {
                 out_ += "enum ";
                 out_ += quote(in.name(t));

@@ -533,7 +533,17 @@ void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
         } else if (kind == TypeKind::Array) {
             auto const ops   = interner_->operands(aggTy);
             auto const scals = interner_->scalars(aggTy);
-            if (ops.empty() || scals.empty()) continue;  // malformed type
+            if (ops.empty() || scals.empty()) {
+                // Malformed Array type reaching the verifier IS the
+                // lowering bug this rule was added to catch — diagnose,
+                // don't silently skip.
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ConstructAggregate #{} (Array) on a "
+                                     "malformed Array type (missing element "
+                                     "type or length scalar)", id.v),
+                         sourceMap_);
+                continue;
+            }
             std::size_t const len = static_cast<std::size_t>(scals[0]);
             if (kids.size() != len) {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,

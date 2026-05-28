@@ -1722,6 +1722,64 @@ TEST(HirLoweringCSubset, D5_5_NonLiteralEnumeratorValueEmitsDiag) {
         << "non-literal enumerator value must emit S_NonConstantEnumeratorValue";
 }
 
+// D5.5-FU2: prove the `liftToEnclosingScope` gate is wired by toggling
+// the c-subset config's flag to `false` and verifying `A` no longer
+// resolves at the use site. Pins the otherwise-test-untouched
+// opt-OUT branch — without this, removing the `&&
+// decl.fieldChildren->liftToEnclosingScope` guard would silently
+// keep all tests green.
+TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
+    // Read the shipped c-subset config text and flip the enumDecl's
+    // `liftToEnclosingScope` from true to false. The rest of the
+    // schema (incl. `compositeKind: "enum"`) stays untouched.
+    fs::path here = fs::current_path();
+    fs::path schemaPath;
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        fs::path const cand = here / "src" / "source-config" / "languages" / "c-subset.lang.json";
+        if (fs::exists(cand)) { schemaPath = cand; break; }
+        fs::path const par = here.parent_path();
+        if (par == here) break;
+        here = par;
+    }
+    ASSERT_FALSE(schemaPath.empty()) << "cannot locate c-subset.lang.json";
+    std::ifstream in{schemaPath, std::ios::binary};
+    ASSERT_TRUE(in.is_open()) << "cannot open " << schemaPath.string();
+    std::ostringstream buf; buf << in.rdbuf();
+    std::string text = std::move(buf).str();
+    std::string const target =
+        "\"compositeKind\": \"enum\",\n"
+        "                           \"liftToEnclosingScope\": true";
+    auto const pos = text.find(target);
+    ASSERT_NE(pos, std::string::npos)
+        << "c-subset config no longer carries the expected enum lift flag";
+    text.replace(pos, target.size(),
+        "\"compositeKind\": \"enum\",\n"
+        "                           \"liftToEnclosingScope\": false");
+
+    auto loaded = GrammarSchema::loadFromText(text, "<c-subset-no-lift>");
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "" : loaded.error()[0].message);
+
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(
+        "enum E { A, B, C };\n"
+        "void f() { enum E e = A; }\n",
+        "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    SemanticModel model = analyze(cu);
+
+    bool foundUndecl = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_UndeclaredIdentifier && d.actual == "A") {
+            foundUndecl = true; break;
+        }
+    }
+    EXPECT_TRUE(foundUndecl)
+        << "with liftToEnclosingScope=false, bare-name `A` MUST emit "
+           "S_UndeclaredIdentifier — the gate's opt-out branch is otherwise "
+           "test-untouched";
+}
+
 // D5.5-FU4 + FU5: enum-typed program emits + re-parses cleanly (the
 // HIR text format `enum "E"` round-trip is locked in by parse re-verify).
 TEST(HirLoweringCSubset, D5_5_EnumHirTextRoundTrip) {

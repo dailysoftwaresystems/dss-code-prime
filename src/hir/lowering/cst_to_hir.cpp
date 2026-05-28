@@ -1254,11 +1254,17 @@ struct Lowerer {
             // The enum's underlying is in scalars[0]; the zero literal
             // is typed AS the enum (not as the raw underlying), so a
             // downstream consumer comparing TypeIds keeps the nominal
-            // distinction.
+            // distinction. Empty scalars = malformed enum type → fail
+            // loud (symmetric with the Union arm's malformed-variants
+            // check; missed in the first FU3 cut, surfaced by the
+            // silent-failure review).
             auto const scals = interner.scalars(type);
-            TypeKind const underlying = !scals.empty()
-                ? static_cast<TypeKind>(scals[0])
-                : TypeKind::I32;
+            if (scals.empty()) {
+                return reportedError(at,
+                    "synthZero reached a malformed Enum type "
+                    "(no underlying scalar)");
+            }
+            TypeKind const underlying = static_cast<TypeKind>(scals[0]);
             HirLiteralValue v;
             v.core = underlying;
             if (isFloatCore(underlying))       v.value = 0.0;
