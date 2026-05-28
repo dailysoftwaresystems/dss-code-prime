@@ -1367,3 +1367,103 @@ TEST(MirLoweringCSubset, ConstructAggregateUnionRuntimeUsesOneInsertValue) {
     EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 1u)
         << "union ConstructAggregate has exactly 1 child → 1 InsertValue";
 }
+
+// Variant-aware union seed (review fix-up lock-in): `.c = 'x'` is
+// variant-1 (char), not variant-0 (int). The seed Const's slot[0] type
+// must match the active variant's type so the InsertValue's child
+// type aligns — otherwise variant identity is silently erased.
+TEST(MirLoweringCSubset, ConstructAggregateUnionNonZeroVariantRuntimeOk) {
+    auto L = lowerCSubset(
+        "union U { int i; char c; };\n"
+        "void f(char x) { union U u = { .c = x }; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+              ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty()
+              ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR-lowering must accept a non-zero-variant union init "
+           "(seed's slot type must match active variant): "
+        << (L.mirReporter.all().empty()
+              ? "" : L.mirReporter.all()[0].actual);
+}
+
+// Array ConstructAggregate with runtime children exercises the
+// zeroLiteralOf Array arm + positional indexing.
+TEST(MirLoweringCSubset, ConstructAggregateArrayRuntimeUsesChain) {
+    auto L = lowerCSubset(
+        "void f(int a) { int xs[3] = {a, 2, 3}; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty()
+              ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = entryOpcodes(L.mir.mir);
+    EXPECT_GE(countOpcode(ops, MirOpcode::InsertValue), 3u)
+        << "array ConstructAggregate with N runtime children emits N "
+           "InsertValues (one per positional slot)";
+}
+
+// Chain TOPOLOGY: the runtime-chain test only COUNTS InsertValues —
+// it doesn't verify each InsertValue threads through the previous.
+// A regression that emitted N parallel InsertValue(zeroBase, v_i, [i])
+// would silently drop all but the last field. This test reads each
+// InsertValue's first operand and asserts the chain shape.
+TEST(MirLoweringCSubset, ConstructAggregateChainTopology) {
+    auto L = lowerCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f(int a, int b) { struct Point p = {a, b}; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // Collect insertvalue instructions in block order.
+    std::vector<MirInstId> chain;
+    MirInstId seedConst{};
+    auto const n = m.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        MirInstId const ix = m.blockInstAt(entry, i);
+        MirOpcode const op = m.instOpcode(ix);
+        if (op == MirOpcode::InsertValue) {
+            chain.push_back(ix);
+        } else if (op == MirOpcode::Const && !seedConst.valid()
+                   && chain.empty() && m.instType(ix).valid()) {
+            // First Const before the chain begins — candidate seed.
+            // (There may be other Consts before, e.g. for the index
+            // path; we want the one passed as InsertValue's first
+            // operand, which we verify below.)
+        }
+    }
+    ASSERT_GE(chain.size(), 2u);
+    // The first InsertValue's first operand IS the seed Const.
+    MirInstId const firstAggOperand = m.instOperands(chain[0])[0];
+    EXPECT_EQ(m.instOpcode(firstAggOperand), MirOpcode::Const)
+        << "InsertValue chain's seed must be a Const(zero-aggregate)";
+    // Each subsequent InsertValue's first operand IS the previous one
+    // — the chain threads through, NOT parallel writes against the seed.
+    for (std::size_t i = 1; i < chain.size(); ++i) {
+        MirInstId const prevOperand = m.instOperands(chain[i])[0];
+        EXPECT_EQ(prevOperand, chain[i - 1])
+            << "InsertValue[" << i << "].operand(0) must be InsertValue["
+            << (i - 1) << "] — chain must thread";
+    }
+}
+
+// Nested aggregate `{{1,2}, {3,4}}` exercises zeroLiteralOf's Struct
+// recursion + the const-fold path on a non-trivial shape. Fully
+// const → 1 Const, no InsertValue.
+TEST(MirLoweringCSubset, ConstructAggregateNestedAllConstFolds) {
+    auto L = lowerCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {{1}, {2}}; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty()
+              ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = entryOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
+        << "fully-const nested aggregate must const-fold to a single "
+           "Const(nested MirAggregateValue), not a chain";
+}
