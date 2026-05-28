@@ -156,13 +156,13 @@ TEST(MirLoweringCSubset, VoidFunctionWithEmptyBodyGetsImplicitReturn) {
 // landed Call lowering; the abort-resilience invariant is independent of
 // which construct is currently unsupported.
 TEST(MirLoweringCSubset, UnsupportedConstructEmitsDiagnosticWithoutAbort) {
-    // Index expressions (`a[i]`) lower to HIR cleanly (HR8/HR9) but are
-    // not lowered to MIR by this lowering. This test pins the abort-
-    // resilience invariant: ok=false, diagnostic surfaced, MIR still
-    // walkable — the lowering must NEVER abort the process on an
-    // unsupported construct.
+    // `switch` statements lower to HIR cleanly but the SwitchStmt/CaseArm
+    // statement family is not yet lowered to MIR (separate cycle).  This
+    // test pins the abort-resilience invariant: ok=false, diagnostic
+    // surfaced, MIR still walkable — the lowering must NEVER abort the
+    // process on an unsupported construct.
     auto L = lowerCSubset(
-        "int f(int* a) { return a[0]; }\n");
+        "int f(int x) { switch (x) { case 1: return 1; } return 0; }\n");
     ASSERT_FALSE(L.model.hasErrors());
     ASSERT_TRUE(L.hir->ok);
     EXPECT_FALSE(L.mir.ok);
@@ -627,6 +627,126 @@ TEST(MirLoweringCSubset, AssignThroughDerefStoresIntoPointerWithoutExtraLoad) {
     ASSERT_EQ(ops.size(), 2u);
     EXPECT_EQ(ops[0], argV) << "Store value operand should be v (the Arg)";
     EXPECT_EQ(ops[1], argP) << "Store ptr operand should be p (the Arg, not a Load)";
+}
+
+// ─── ML2 cycle 3c: MemberAccess + Index + SeqExpr ─────────────────────────
+
+// `p->x` lowers in HIR to `(*p).x` ≡ `MemberAccess(Deref(Ref(p)), field=0)`.
+// MIR lowers Deref's lvalue-address to the pointer rvalue (no double-load),
+// then GEPs into the field with `[ptr, const-0, const-fieldIdx]`, then
+// Loads the field. The Store side of `p->x = v` follows the same path
+// (verified by the symmetric assign test below).
+TEST(MirLoweringCSubset, MemberAccessReadEmitsGepThenLoad) {
+    auto L = lowerCSubset(
+        "struct Point { int x; int y; };\n"
+        "int read_x(struct Point* p) { return p->x; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg p, Const 0, Const 0(field), Gep, Load, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 6u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Const);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Const);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Gep);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Load);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Return);
+    // The GEP's operand[0] IS the Arg p (no Load — Deref's lvalue-address
+    // returns the pointer rvalue directly).
+    auto gepOps = m.instOperands(m.blockInstAt(entry, 3));
+    ASSERT_EQ(gepOps.size(), 3u);
+    EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0));
+}
+
+// Symmetric write: `p->y = v` lowers to GEP-then-Store, with the value
+// operand being the Arg v and the ptr operand the GEP result.
+TEST(MirLoweringCSubset, MemberAccessAssignEmitsGepThenStore) {
+    auto L = lowerCSubset(
+        "struct Point { int x; int y; };\n"
+        "void set_y(struct Point* p, int v) { p->y = v; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg p, Arg v, Const 0, Const 1(field=y), Gep, Store, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 7u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Gep);
+    MirInstId const storeI = m.blockInstAt(entry, 5);
+    EXPECT_EQ(m.instOpcode(storeI), MirOpcode::Store);
+    auto ops = m.instOperands(storeI);
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(ops[0], m.blockInstAt(entry, 1)) << "Store value should be Arg v";
+    EXPECT_EQ(ops[1], m.blockInstAt(entry, 4)) << "Store ptr should be Gep";
+}
+
+// `p[i]` over a POINTER base: GEP carries `[ptr, idx]` (no leading 0 —
+// the pointer is already at the element-pointer layer). Pins the
+// pointer-vs-array discrimination in `lowerLvalueAddress`'s Index path.
+TEST(MirLoweringCSubset, IndexOverPointerEmitsTwoOperandGepThenLoad) {
+    auto L = lowerCSubset(
+        "int f(int* a, int i) { return a[i]; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg a, Arg i, Gep(a, i), Load, Return]  — no Const-0 prefix.
+    ASSERT_EQ(m.blockInstCount(entry), 5u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Arg);
+    MirInstId const gep = m.blockInstAt(entry, 2);
+    EXPECT_EQ(m.instOpcode(gep), MirOpcode::Gep);
+    auto gepOps = m.instOperands(gep);
+    ASSERT_EQ(gepOps.size(), 2u);
+    EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0));
+    EXPECT_EQ(gepOps[1], m.blockInstAt(entry, 1));
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Load);
+}
+
+// `&p->x` exercises AddressOf delegating to `lowerLvalueAddress` for the
+// new MemberAccess shape — the address-of operator returns the GEP result
+// directly, no extra instructions, no Load on the value side.
+TEST(MirLoweringCSubset, AddressOfMemberAccessReturnsGepDirectly) {
+    auto L = lowerCSubset(
+        "struct Point { int x; int y; };\n"
+        "int* addr_x(struct Point* p) { return &p->x; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg p, Const 0, Const 0(field), Gep, Return(gep)]   — NO Load.
+    ASSERT_EQ(m.blockInstCount(entry), 5u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Gep);
+    MirInstId const ret = m.blockInstAt(entry, 4);
+    EXPECT_EQ(m.instOpcode(ret), MirOpcode::Return);
+    auto retOps = m.instOperands(ret);
+    ASSERT_EQ(retOps.size(), 1u);
+    EXPECT_EQ(retOps[0], m.blockInstAt(entry, 3))
+        << "Return value should be the Gep result, not a Load";
+}
+
+// SeqExpr: a value-yielding expression that bundles side-effect statements
+// + a result expression. HR8 emits these for assignment-as-expression and
+// compound-assign in c-subset. `x = 5` as an rvalue is the canonical case:
+// the AssignStmt becomes a SeqExpr whose tail loads the new value.
+TEST(MirLoweringCSubset, SeqExprLowersStmtsThenYieldsResult) {
+    auto L = lowerCSubset(
+        "int f() { int x = 1; return (x = 5) + 1; }");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Alloca x, Const 1, Store(1→x), Const 5, Store(5→x), Load x,
+    //  Const 1, Add, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 9u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Alloca);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Store);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Store);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 7)), MirOpcode::Add);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 8)), MirOpcode::Return);
 }
 
 // VarDecl without an initializer still emits the alloca but no store —

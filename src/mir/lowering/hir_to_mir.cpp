@@ -364,49 +364,17 @@ struct Lowerer {
                 return mir.addInst(mop, operands, t);
             }
             case HirKind::AddressOf: {
-                // children: [operand]. Two lvalue shapes lower here:
-                //   - Ref to an addressable local → return the local's alloca
-                //     directly (no extra instruction; the alloca IS the
-                //     address). Param-AddressOf works because the entry-block
-                //     slot-promotion pre-pass already produced an alloca for
-                //     any param whose address is taken.
-                //   - Deref(ptr) → return `ptr` (the address-of-dereference
-                //     cancels by construction).
-                // Other lvalue shapes (MemberAccess/Index/…) are unsupported
-                // at this lowering tier.
+                // children: [lvalue-operand]. The address of any supported
+                // lvalue IS the pointer that `lowerLvalueAddress` produces;
+                // factor through that helper so the two paths stay in sync
+                // (cycle 3c added MemberAccess + Index lvalues — `&p.x` and
+                // `&arr[i]` work because of that single delegation).
                 auto kids = hir.children(node);
                 if (kids.size() != 1) {
                     unsupported(node, "malformed AddressOf (expect 1 operand)");
                     return InvalidMirInst;
                 }
-                HirNodeId const inner = kids[0];
-                HirKind   const ik    = hir.kind(inner);
-                if (ik == HirKind::Ref) {
-                    std::uint32_t const sym = hir.payload(inner);
-                    if (auto it = addressableLocal.find(sym);
-                        it != addressableLocal.end()) {
-                        return it->second;
-                    }
-                    unsupported(node, std::format(
-                        "AddressOf(Ref) of non-addressable symbol {} (param "
-                        "slot-promotion pre-pass missed this — internal bug)",
-                        sym));
-                    return InvalidMirInst;
-                }
-                if (ik == HirKind::Deref) {
-                    // & * p  ≡  p — just lower p.
-                    auto innerKids = hir.children(inner);
-                    if (innerKids.size() != 1) {
-                        unsupported(node, "malformed Deref under AddressOf");
-                        return InvalidMirInst;
-                    }
-                    return lowerExpr(innerKids[0]);
-                }
-                unsupported(node, std::format(
-                    "AddressOf operand kind ordinal {} not supported by this "
-                    "lowering (only Ref-to-addressable-local or Deref)",
-                    static_cast<unsigned>(ik)));
-                return InvalidMirInst;
+                return lowerLvalueAddress(kids[0]);
             }
             case HirKind::Deref: {
                 // children: [pointer]. Lower the pointer expression, then
@@ -421,6 +389,24 @@ struct Lowerer {
                 if (!ptr.valid()) return InvalidMirInst;
                 std::array<MirInstId, 1> ops{ptr};
                 return mir.addInst(MirOpcode::Load, ops, t);
+            }
+            case HirKind::MemberAccess:
+            case HirKind::Index: {
+                // Rvalue read of an lvalue: compute the field/element
+                // address via the shared lvalue path, then emit `Load`.
+                MirInstId const ptr = lowerLvalueAddress(node);
+                if (!ptr.valid()) return InvalidMirInst;
+                std::array<MirInstId, 1> ops{ptr};
+                return mir.addInst(MirOpcode::Load, ops, t);
+            }
+            case HirKind::SeqExpr: {
+                // Lower the side-effect statements in order, then lower the
+                // result expression. The result's value IS the SeqExpr's
+                // value; the typeId on the SeqExpr equals the result's type.
+                for (HirNodeId stmt : hir.seqExprStmts(node)) {
+                    if (!lowerStmt(stmt)) return InvalidMirInst;
+                }
+                return lowerExpr(hir.seqExprResult(node));
             }
             default: break;
         }
@@ -453,14 +439,17 @@ struct Lowerer {
     // (interned on demand). Aborts via diagnostic on a duplicate registration
     // (HIR verifier disallows redeclaration; a duplicate here is an internal
     // bug). Returns the alloca's MirInstId, or `InvalidMirInst` on error.
-    [[nodiscard]] MirInstId allocaForLocal(SymbolId sym, TypeId ty) {
+    [[nodiscard]] MirInstId allocaForLocal(SymbolId sym, TypeId ty,
+                                           HirNodeId anchor) {
         // Enforce the documented EITHER/OR invariant at the bind site: a
         // symbol must not already live in `symbolToValue` (SSA) when we
         // give it a storage slot, nor be double-allocated. The HIR verifier
         // owns the no-redeclaration rule; this is the load-bearing local
-        // assertion that catches any future invariant-break loud.
+        // assertion that catches any future invariant-break loud. `anchor`
+        // is the HIR node responsible for the binding (a VarDecl or a
+        // function-param VarDecl) so failure diagnostics can carry a span.
         if (addressableLocal.contains(sym.v) || symbolToValue.contains(sym.v)) {
-            unsupported(HirNodeId{}, std::format(
+            unsupported(anchor, std::format(
                 "duplicate slot/SSA binding for symbol {} (internal bug — HIR "
                 "verifier should have rejected the redeclaration, or the param "
                 "slot-promotion pre-pass over-classified)", sym.v));
@@ -475,8 +464,12 @@ struct Lowerer {
     // Resolve the ADDRESS of an lvalue expression — the pointer value a
     // `Store` should write into (or an `AddressOf` should yield directly).
     // Distinct from `lowerExpr` which produces the RVALUE of the lvalue
-    // (`Load(ptr)`). Cycle 3b supports two lvalue shapes — `Ref(addressable-
-    // local)` and `Deref(ptr)`. Returns `InvalidMirInst` on failure.
+    // (`Load(ptr)`). Supported lvalue shapes:
+    //   - `Ref(sym)` where sym is an addressable local → the local's alloca.
+    //   - `Deref(ptr)` → the lowered pointer (no double-load).
+    //   - `MemberAccess(base, .field)` → `GEP(addressOf(base), const-field)`.
+    //   - `Index(base, idxExpr)` → `GEP(addressOf(base), idxValue)`.
+    // Returns `InvalidMirInst` on failure.
     [[nodiscard]] MirInstId lowerLvalueAddress(HirNodeId node) {
         HirKind const k = hir.kind(node);
         if (k == HirKind::Ref) {
@@ -486,8 +479,8 @@ struct Lowerer {
                 return it->second;
             }
             unsupported(node, std::format(
-                "assignment to symbol {} which has no storage slot "
-                "(non-addressable param or unbound)", sym));
+                "symbol {} has no storage slot (non-addressable param or "
+                "unbound) — required by lvalue use", sym));
             return InvalidMirInst;
         }
         if (k == HirKind::Deref) {
@@ -498,25 +491,132 @@ struct Lowerer {
             }
             return lowerExpr(kids[0]);
         }
+        if (k == HirKind::MemberAccess) {
+            auto kids = hir.children(node);
+            if (kids.size() != 1) {
+                unsupported(node, "malformed MemberAccess (expect 1 child)");
+                return InvalidMirInst;
+            }
+            MirInstId const basePtr = lowerLvalueAddress(kids[0]);
+            if (!basePtr.valid()) return InvalidMirInst;
+            // GEP carries indices as operands. For a struct field, the
+            // canonical shape is [basePtr, const-0, const-fieldIndex] —
+            // the leading 0 walks "through" the pointer to the struct,
+            // the fieldIndex picks the field. The HIR node's typeId is
+            // the field's type; the GEP result is `pointer(fieldType)`.
+            std::uint32_t const fieldIdx = hir.payload(node);
+            TypeId const fieldTy = hir.typeId(node);
+            if (!fieldTy.valid()) {
+                unsupported(node, "MemberAccess with invalid field type "
+                                   "(HIR verifier should have flagged)");
+                return InvalidMirInst;
+            }
+            MirInstId const zero    = constInt(0);
+            MirInstId const fieldK  = constInt(fieldIdx);
+            if (!zero.valid() || !fieldK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 3> ops{basePtr, zero, fieldK};
+            return mir.addInst(MirOpcode::Gep, ops, interner.pointer(fieldTy));
+        }
+        if (k == HirKind::Index) {
+            auto kids = hir.children(node);
+            if (kids.size() != 2) {
+                unsupported(node, "malformed Index (expect 2 children)");
+                return InvalidMirInst;
+            }
+            // Pointer-base vs array/struct-base distinction:
+            //   - pointer base (e.g. `int* p; p[i]`): the base's RVALUE is
+            //     the pointer; GEP takes `[ptr, idx]`. We must NOT ask for
+            //     the lvalue address — the pointer may be a pure-SSA Arg.
+            //   - array/struct base (e.g. `int a[N]; a[i]`): we need the
+            //     lvalue ADDRESS so GEP can index into the storage with
+            //     `[basePtr, 0, idx]`.
+            TypeId const baseTy = hir.typeId(kids[0]);
+            TypeKind const baseKind = baseTy.valid()
+                ? interner.kind(baseTy) : TypeKind::Void;
+            TypeId const elemTy = hir.typeId(node);
+            if (!elemTy.valid()) {
+                unsupported(node, "Index with invalid element type");
+                return InvalidMirInst;
+            }
+            TypeId const resTy = interner.pointer(elemTy);
+            MirInstId const idx = lowerExpr(kids[1]);
+            if (!idx.valid()) return InvalidMirInst;
+            if (baseKind == TypeKind::Ptr) {
+                MirInstId const basePtr = lowerExpr(kids[0]);
+                if (!basePtr.valid()) return InvalidMirInst;
+                std::array<MirInstId, 2> ops{basePtr, idx};
+                return mir.addInst(MirOpcode::Gep, ops, resTy);
+            }
+            MirInstId const basePtr = lowerLvalueAddress(kids[0]);
+            if (!basePtr.valid()) return InvalidMirInst;
+            MirInstId const zero = constInt(0);
+            if (!zero.valid()) return InvalidMirInst;
+            std::array<MirInstId, 3> ops{basePtr, zero, idx};
+            return mir.addInst(MirOpcode::Gep, ops, resTy);
+        }
         unsupported(node, std::format(
-            "assignment target kind ordinal {} not supported by this "
-            "lowering (only Ref-to-addressable-local or Deref)",
+            "lvalue kind ordinal {} not supported by this lowering "
+            "(only Ref-to-addressable-local, Deref, MemberAccess, Index)",
             static_cast<unsigned>(k)));
         return InvalidMirInst;
     }
 
-    // Recursively collect into `out` the set of `SymbolId.v`s that appear as
-    // `AddressOf(Ref(sym))` anywhere under `node`. Drives entry-block slot-
-    // promotion for params (a param whose address is taken must live in
-    // memory, not as a pure SSA `Arg` value). Walks every child; HIR is
-    // already verified well-formed before this pass.
+    // Emit a 32-bit integer constant for use as a GEP index operand or
+    // similar inline scalar. The MIR has no built-in "integer constant
+    // index" facility — every index in a GEP is just another MirInstId,
+    // and these are usually `Const` instructions sourced from the MIR
+    // literal pool. Returns `InvalidMirInst` if interning fails.
+    [[nodiscard]] MirInstId constInt(std::int64_t v) {
+        MirLiteralValue lit;
+        lit.value = v;
+        lit.core  = TypeKind::I32;
+        TypeId const i32 = interner.primitive(TypeKind::I32);
+        return mir.addConst(std::move(lit), i32);
+    }
+
+    // Recursively collect into `out` the set of `SymbolId.v`s whose lvalue
+    // address is needed somewhere under `node` — i.e. symbols that must be
+    // slot-backed rather than pure-SSA. Drives entry-block slot-promotion
+    // for params. Three shapes contribute:
+    //   - `AddressOf(Ref(sym))` — explicit `&sym`.
+    //   - `MemberAccess(Ref(sym), …)` — `sym.field` needs `sym`'s address
+    //     so GEP can index into its storage. (Conversely `(*p).field`
+    //     never needs the addressable form because Deref's lvalue is the
+    //     pointer rvalue.)
+    //   - `Index(Ref(sym), …)` when sym's type is NOT a pointer —
+    //     indexing an array/aggregate local needs the array's address;
+    //     indexing through a pointer (`p[i]`) does not.
+    // Walks every child; HIR is already verified well-formed before this
+    // pass, so all referenced types are valid.
     void collectAddressTakenSymbols(HirNodeId node,
                                     std::unordered_set<std::uint32_t>& out) {
         if (!node.valid()) return;
-        if (hir.kind(node) == HirKind::AddressOf) {
+        HirKind const k = hir.kind(node);
+        auto refSymOf = [&](HirNodeId child) -> std::optional<std::uint32_t> {
+            if (hir.kind(child) != HirKind::Ref) return std::nullopt;
+            return hir.payload(child);
+        };
+        if (k == HirKind::AddressOf) {
             auto kids = hir.children(node);
-            if (kids.size() == 1 && hir.kind(kids[0]) == HirKind::Ref) {
-                out.insert(hir.payload(kids[0]));
+            if (kids.size() == 1) {
+                if (auto s = refSymOf(kids[0]); s.has_value()) out.insert(*s);
+            }
+        } else if (k == HirKind::MemberAccess) {
+            auto kids = hir.children(node);
+            if (kids.size() == 1) {
+                if (auto s = refSymOf(kids[0]); s.has_value()) out.insert(*s);
+            }
+        } else if (k == HirKind::Index) {
+            auto kids = hir.children(node);
+            if (kids.size() == 2) {
+                if (auto s = refSymOf(kids[0]); s.has_value()) {
+                    // Only register if the base is NOT a pointer (pointer
+                    // indexing uses the rvalue, not the storage).
+                    TypeId const baseTy = hir.typeId(kids[0]);
+                    TypeKind const baseKind = baseTy.valid()
+                        ? interner.kind(baseTy) : TypeKind::Void;
+                    if (baseKind != TypeKind::Ptr) out.insert(*s);
+                }
             }
         }
         for (HirNodeId child : hir.children(node)) {
@@ -565,7 +665,7 @@ struct Lowerer {
                                        "(HIR verifier should have flagged)");
                     return false;
                 }
-                MirInstId const alloca = allocaForLocal(sym, ty);
+                MirInstId const alloca = allocaForLocal(sym, ty, node);
                 if (!alloca.valid()) return false;
                 if (auto initN = hir.varDeclInit(node); initN.has_value()) {
                     MirInstId const initVal = lowerExpr(*initN);
@@ -860,7 +960,7 @@ struct Lowerer {
             TypeId const ty = paramTypes[i];
             MirInstId const arg = mir.addArg(static_cast<std::uint32_t>(i), ty);
             if (addressTaken.contains(sym.v)) {
-                MirInstId const slot = allocaForLocal(sym, ty);
+                MirInstId const slot = allocaForLocal(sym, ty, p);
                 if (!slot.valid()) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
