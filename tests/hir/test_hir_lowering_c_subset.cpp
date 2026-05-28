@@ -312,6 +312,91 @@ TEST(HirLoweringCSubset, MemberAccessLowersToHirMemberAccess) {
     EXPECT_EQ(interner.kind(res->hir.typeId(kids[0])), TypeKind::Struct);
 }
 
+// D5.2 cycle 1: adding `Identifier` to `typeBase` lets typedef'd / struct-tag
+// names work bare in type position at top level. The engine's `resolveTypeNode`
+// already resolved Identifier-in-type-position via the SE5 alias path
+// (Type-kind symbol → its `.type`); this cycle's contribution is the schema
+// change that lets the parser accept the form. Block-scope alias (`{ Foo x; }`)
+// is intentionally deferred — it collides with `exprStmt` at the statement
+// alt and needs speculative-alt support (later cycle).
+//
+// **Known C divergence**: c-subset has a single identifier namespace (no
+// separate "tag namespace"), and `resolveTypeNode`'s alias lookup doesn't
+// distinguish typedef-minted Type symbols from struct-tag Type symbols.
+// Consequence: after `struct Foo { ... };` alone (no typedef), `Foo x;` ALSO
+// lowers cleanly — i.e. every struct tag is implicitly usable as a bare type
+// name. Real C requires `struct Foo` or an explicit typedef. The two tests
+// below pin both shapes honestly.
+TEST(HirLoweringCSubset, TypedefStructAliasAtTopLevel) {
+    // The alias name must differ from the struct tag because the single
+    // identifier namespace rejects same-name redeclaration. See the negative
+    // test `TypedefSameNameAsTagRedeclaresInSingleNamespace` below.
+    SemanticModel model = analyzeCSubset(
+        "struct Foo { int x; };\n"
+        "typedef struct Foo FooT;\n"
+        "FooT origin;\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 3u);   // struct Foo, typedef FooT, origin
+    // The third decl is the Global `origin`; its type should be the same
+    // composed Struct as the struct decl produced.
+    HirNodeId const origin = decls[2];
+    ASSERT_EQ(res->hir.kind(origin), HirKind::Global);
+    TypeId const originType = res->hir.globalType(origin);
+    ASSERT_TRUE(originType.valid());
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(originType), TypeKind::Struct);
+    EXPECT_EQ(interner.name(originType), "Foo");
+}
+
+// D5.2 cycle 1 (review-fix): pin the bare-struct-tag-as-type-name behavior
+// that falls out of the schema change. Without a typedef, `Foo x;` ALSO
+// works — the resolveTypeNode SE5 alias path doesn't distinguish struct
+// tags from typedef'd Type symbols. Documented as a known C divergence; this
+// test pins it so a future cycle that separates the namespaces fails loud.
+TEST(HirLoweringCSubset, BareStructTagUsableAsTypeName) {
+    SemanticModel model = analyzeCSubset(
+        "struct Foo { int x; };\n"
+        "Foo bare;\n");                  // no typedef
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 2u);   // struct Foo, bare
+    HirNodeId const bare = decls[1];
+    ASSERT_EQ(res->hir.kind(bare), HirKind::Global);
+    TypeId const bareType = res->hir.globalType(bare);
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(bareType), TypeKind::Struct);
+    EXPECT_EQ(interner.name(bareType), "Foo");
+}
+
+// D5.2 cycle 1 (review-fix): pin the negative — same-name typedef of a
+// struct tag fires S_RedeclaredSymbol (single namespace). Catches any
+// future cycle that mistakenly relaxes the same-scope dup check.
+TEST(HirLoweringCSubset, TypedefSameNameAsTagRedeclaresInSingleNamespace) {
+    SemanticModel model = analyzeCSubset(
+        "struct Foo { int x; };\n"
+        "typedef struct Foo Foo;\n");    // same name as the tag — collides
+    EXPECT_TRUE(model.hasErrors());
+    bool sawRedecl = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_RedeclaredSymbol) { sawRedecl = true; break; }
+    }
+    EXPECT_TRUE(sawRedecl)
+        << "expected S_RedeclaredSymbol on `typedef struct Foo Foo;`";
+}
+
 // D5.1 cycle 4 review fix: the DOT form goes through a different lowering
 // path than ARROW (no Deref synthesis). The previous test only exercised
 // arrow; this one pins the dot path's structural shape.

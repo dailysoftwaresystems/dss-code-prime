@@ -280,7 +280,7 @@
       ]
     },
 
-    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword" ] },
+    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "Identifier" ] },
 
     "typeRef": {
       "sequence": [
