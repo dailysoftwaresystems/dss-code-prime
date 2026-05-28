@@ -1499,3 +1499,102 @@ TEST(HirLoweringCSubset, D5_4_UnionIndexDesignatorEmitsDiag) {
     EXPECT_TRUE(found) << "index designator on union must be diagnosed";
     EXPECT_FALSE(res->ok);
 }
+
+// Chained designator `{.a.b = 1}` on a union must be diagnosed (variant
+// access has no sub-position semantics in C99). Lock-in for the
+// silent-failure-hunter HIGH finding.
+TEST(HirLoweringCSubset, D5_4_UnionChainedDesignatorEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "union U { struct Inner a; int i; };\n"
+        "void f() { union U u = { .a.v = 1 }; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("chained designator on a union") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "chained designator on union must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
+
+// Union nested inside a struct: the recursive InitSlot path lands on
+// the union's `lowerUnionBraceInit` correctly + omitted struct slots
+// containing unions zero-fill via the corrected `synthZeroOrError`
+// Union arm (1-child first-variant).
+TEST(HirLoweringCSubset, D5_4_UnionNestedInStruct) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "struct S { union U u; int x; };\n"
+        "void f() { struct S s = { .u = { .c = 'a' }, .x = 7 }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // Outer slot 0 is the union → 1-child ConstructAggregate.
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(kids[0]).size(), 1u);
+    // Outer slot 1 is .x = 7 → Literal.
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+}
+
+// Union zero-filled by the containing struct's missing-field path: the
+// `synthZeroOrError(unionTy)` produces a 1-child aggregate (not N).
+TEST(HirLoweringCSubset, D5_4_UnionZeroFilledByContainingStruct) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "struct S { int x; union U u; };\n"
+        "void f() { struct S s = { .x = 1 }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // Slot 0 = .x = 1 (Literal). Slot 1 = synth-zero union → 1-child agg.
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    ASSERT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(kids[1]).size(), 1u);
+}
+
+// Compound literal of union type: `(union U){.c='a'}` exercises
+// lowerCompoundLiteral → lowerBraceInit → lowerUnionBraceInit chain.
+TEST(HirLoweringCSubset, D5_4_UnionCompoundLiteral) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = (union U){ .c = 'a' }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 1u);
+}
+
+// Member access on a union: `u.c` must resolve via the existing
+// MemberAccess path (same `compositeScopeByType` substrate that
+// structs use).
+TEST(HirLoweringCSubset, D5_4_UnionMemberAccess) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { .c = 'a' }; char x = u.c; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}

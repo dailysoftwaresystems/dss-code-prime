@@ -3189,33 +3189,43 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                               path + "/fieldChildren/rule",
                                               std::format("'fieldChildren.rule' references "
                                                           "unknown shape '{}'", rn));
+                                } else if (!fc.contains("compositeKind")) {
+                                    // D5.4 gap-closure: `compositeKind`
+                                    // is REQUIRED when `fieldChildren` is
+                                    // present. Defaulting silently to
+                                    // Struct would let a future union-
+                                    // bearing schema mis-type its
+                                    // composites with no signal.
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/fieldChildren/compositeKind",
+                                              "'fieldChildren.compositeKind' is required and "
+                                              "must be 'struct' or 'union' — explicit declaration "
+                                              "guards against silently mis-interning a future "
+                                              "composite type");
+                                } else if (!fc.at("compositeKind").is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/fieldChildren/compositeKind",
+                                              "'compositeKind' must be a string "
+                                              "'struct' or 'union'");
                                 } else {
+                                    auto const k = fc.at("compositeKind").get<std::string>();
                                     FieldChildrenDescriptor fcd;
                                     fcd.rule     = data.rules->find(rn);
                                     fcd.ruleName = rn;
-                                    // D5.4: optional `compositeKind` discriminates
-                                    // struct (default) vs union for Pass 1.5
-                                    // type-interning.
-                                    if (fc.contains("compositeKind")) {
-                                        if (!fc.at("compositeKind").is_string()) {
-                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                      path + "/fieldChildren/compositeKind",
-                                                      "'compositeKind' must be a string "
-                                                      "'struct' or 'union'");
-                                        } else {
-                                            auto k = fc.at("compositeKind").get<std::string>();
-                                            if (k == "struct") {
-                                                fcd.compositeKind = CompositeKind::Struct;
-                                            } else if (k == "union") {
-                                                fcd.compositeKind = CompositeKind::Union;
-                                            } else {
-                                                coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                          path + "/fieldChildren/compositeKind",
-                                                          std::format("'compositeKind' must be "
-                                                                      "'struct' or 'union' (got '{}')",
-                                                                      k));
-                                            }
-                                        }
+                                    if (k == "struct") {
+                                        fcd.compositeKind = CompositeKind::Struct;
+                                    } else if (k == "union") {
+                                        fcd.compositeKind = CompositeKind::Union;
+                                    } else {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/fieldChildren/compositeKind",
+                                                  std::format("'compositeKind' must be 'struct' "
+                                                              "or 'union' (got '{}')", k));
+                                        // Keep loading; the default Struct
+                                        // is the safer fallback for an
+                                        // unrecognized value (still emits
+                                        // C_InvalidSemantics so res->ok is
+                                        // false).
                                     }
                                     rule.fieldChildren = std::move(fcd);
                                 }

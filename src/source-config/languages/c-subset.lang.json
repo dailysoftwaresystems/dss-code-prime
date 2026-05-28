@@ -540,7 +540,7 @@
         } },
       { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" },
       { "rule": "structDecl",  "name": 1, "kind": "type",
-        "fieldChildren": { "rule": "structField" } },
+        "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
       { "rule": "structField", "name": 1, "type": 0, "kind": "variable" },
       { "rule": "unionDecl",   "name": 1, "kind": "type",
         "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },

@@ -1237,10 +1237,12 @@ struct Lowerer {
             return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
         }
         if (core == TypeKind::Union) {
-            // C99 §6.7.8p10: a zero-initialized union has its FIRST member
-            // zero-initialized; no overlap-zero across variants. The HIR
-            // aggregate emits exactly one child: the zero-fill of the
-            // first variant.
+            // C99 §6.7.8p18 + p21: a zero-initialized union has its
+            // FIRST named member zero-initialized (the "only the first
+            // named member of a union" current-object rule, combined
+            // with the zero-fill default). No overlap-zero across
+            // variants — the HIR aggregate emits exactly one child:
+            // the zero-fill of the first variant.
             auto const variants = interner.operands(type);
             if (variants.empty()) {
                 return reportedError(at,
@@ -1462,16 +1464,21 @@ struct Lowerer {
 
     // D5.4: union brace-init lowering. Unions hold exactly ONE active
     // variant at a time; their brace-init must therefore initialize
-    // exactly one of the declared variants. C99 §6.7.8p9 / p17:
+    // exactly one of the declared variants. C99 §6.7.8p17–p18 (the
+    // current-object framework + the "only the first named member of
+    // a union" rule for no-designator initializers):
     //   • positional `{ expr }` → initializes the FIRST variant.
     //   • designator `{ .name = expr }` → initializes the named
     //     variant. With no other variants zero-filled (overlapping
     //     storage; only the chosen variant is live).
     //   • multiple elements → diagnostic. The grammar's brace-init
     //     allows N elements; the SEMANTICS for unions cap at 1.
+    //   • chained designators `{.a.b = ...}` → diagnostic. Variant
+    //     access has no sub-position semantics in C99; chained dot
+    //     would walk INTO the chosen variant and is not yet supported.
     // Result: a 1-child `ConstructAggregate(value, contextType)`.
     // Empty `{}` produces the same shape as `synthZeroOrError(union)`
-    // (first-variant zero-fill).
+    // (first-variant zero-fill per C99 §6.7.8p21).
     [[nodiscard]] HirNodeId lowerUnionBraceInit(NodeId braceInitListNode,
                                                 TypeId contextType) {
         auto const variants = interner.operands(contextType);
@@ -1498,8 +1505,11 @@ struct Lowerer {
         if (elements.size() > 1) {
             reportedError(braceInitListNode,
                 "union brace-init must initialize at most one variant");
-            // Continue: lower only the FIRST element so the rest of the
-            // pipeline sees a well-typed aggregate, but res->ok is false.
+            // Take the structurally-valid zero-fill path so the
+            // pipeline downstream sees a typed aggregate without
+            // having to discriminate "really succeeded" from
+            // "succeeded with diagnostics". res->ok is already false.
+            return synthZeroOrError(braceInitListNode, contextType);
         }
         NodeId const elem = elements[0];
 
@@ -1507,8 +1517,12 @@ struct Lowerer {
         // (designators decide WHICH variant); the value expression is
         // the trailing non-designator non-token child. Index designators
         // are nonsensical for unions (variants are name-indexed only).
+        // Multiple designators in one element (chained `.a.b = ...`)
+        // would walk INTO the chosen variant — diagnose, don't silently
+        // last-win on the leaf.
         std::optional<std::uint32_t> targetVariant;
         bool failed = false;
+        int designatorCount = 0;
         NodeId valueExprCst{};
         for (NodeId c : visible(elem)) {
             if (isToken(c)) continue;
@@ -1532,6 +1546,15 @@ struct Lowerer {
                     : std::uint32_t{0};
             if (cfg.designatedFieldRule.valid()
              && r == cfg.designatedFieldRule.v) {
+                ++designatorCount;
+                if (designatorCount > 1) {
+                    reportedError(designatorCore,
+                        "chained designator on a union is not supported "
+                        "(a union initializer must select exactly one "
+                        "variant)");
+                    failed = true;
+                    continue;
+                }
                 NodeId nameTok{};
                 for (NodeId tok : visible(designatorCore)) {
                     if (!isToken(tok)) continue;
@@ -1541,7 +1564,7 @@ struct Lowerer {
                 }
                 if (!nameTok.valid()) {
                     reportedError(designatorCore,
-                        "union field designator missing name token");
+                        "variant designator is missing its name");
                     failed = true;
                     continue;
                 }
@@ -1549,8 +1572,8 @@ struct Lowerer {
                     model.compositeScopeFor(contextType);
                 if (!unionScope.valid()) {
                     reportedError(designatorCore,
-                        "union brace-init designator's container has no "
-                        "variant scope");
+                        "could not resolve members of the target union "
+                        "type");
                     failed = true;
                     continue;
                 }
@@ -1559,15 +1582,15 @@ struct Lowerer {
                 auto sit = scope.bindings.find(name);
                 if (sit == scope.bindings.end()) {
                     reportedError(designatorCore,
-                        "field designator names a variant that doesn't "
-                        "belong to the target union type");
+                        "designator names a variant that doesn't belong "
+                        "to the target union type");
                     failed = true;
                     continue;
                 }
                 auto const* rec = model.recordFor(sit->second);
                 if (rec == nullptr || rec->kind != DeclarationKind::Variable) {
                     reportedError(designatorCore,
-                        "union field designator resolved to a non-field "
+                        "variant designator resolved to a non-variant "
                         "symbol");
                     failed = true;
                     continue;
@@ -1583,6 +1606,7 @@ struct Lowerer {
             }
             if (cfg.designatedIndexRule.valid()
              && r == cfg.designatedIndexRule.v) {
+                ++designatorCount;
                 reportedError(designatorCore,
                     "index designators are not meaningful on union types");
                 failed = true;
@@ -1634,14 +1658,14 @@ struct Lowerer {
     //   • chained-brace nesting `{.outer = {.inner = a}}` via recursion
     //   • zero-fill omitted slots (§6.7.8p21)
     //
-    // Two real-blocker substrate items remaining:
+    // One real-blocker substrate item remaining:
     //   • index-designator `[expr] = ...` with non-literal indices —
     //     requires CST-side const-eval (HIR builder is write-only and
     //     `const_eval` consumes HIR). Anchored at plan 12.5 §0.2 D6.
     //     Locked-in by `D5_3_NonLiteralIndexDesignatorEmitsDiag`.
-    //   • Union brace-init — distinct semantics from struct (one active
-    //     member, no zero-fill across overlapping variants); deferred
-    //     to plan 00 §0.2 D5.4 (Unions).
+    //
+    // Union brace-init is routed to `lowerUnionBraceInit` above
+    // (separate semantics — one active variant). D5.4 ✅.
     [[nodiscard]] HirNodeId lowerBraceInit(NodeId braceInitListNode,
                                            TypeId contextType) {
         if (!contextType.valid()) {
