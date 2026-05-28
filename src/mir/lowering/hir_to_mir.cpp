@@ -1400,6 +1400,13 @@ struct Lowerer {
             }
             return std::nullopt;
         };
+        // MIR-globals matches runtime behaviour: a narrowing initializer
+        // wraps modularly (the runtime path would wrap too). Refusing to
+        // fold here would only lose an optimization; the value installed
+        // at module load is identical either way. D5.5 enum-bounds will
+        // flip this back to `true` to surface the overflow as a verifier
+        // diagnostic — same engine, different policy per consumer.
+        opts.refuseOnOverflow = false;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             if (hir.kind(decl) != HirKind::Global) continue;
             PendingGlobal pg;

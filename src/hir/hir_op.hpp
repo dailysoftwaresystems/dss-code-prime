@@ -87,6 +87,19 @@ enum class HirOpArity : std::uint8_t { Unary, Binary };
     return HirOpArity::Binary;  // unreachable for a well-formed core op
 }
 
+// True iff `op` is one of the six C-style comparison operators
+// (Eq/Ne/Lt/Le/Gt/Ge). Comparison ops always produce a Bool result
+// regardless of operand types — callers that need to tag a result kind
+// (HR lowering's `combineBinary`, MIR's `mapBinaryOp`, the constants-
+// evaluation engine's BinaryOp branch) all use this predicate. One
+// source of truth so a hypothetical future `Spaceship`/`Cmp` op
+// doesn't get accidentally tagged at one site but missed at another.
+[[nodiscard]] constexpr bool isComparison(HirOpKind op) noexcept {
+    return op == HirOpKind::Eq || op == HirOpKind::Ne
+        || op == HirOpKind::Lt || op == HirOpKind::Le
+        || op == HirOpKind::Gt || op == HirOpKind::Ge;
+}
+
 // ── payload codec ────────────────────────────────────────────────────────────
 //
 // A node `payload` carrying an operator is split by the [0,256) / >=256 line,

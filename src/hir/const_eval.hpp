@@ -24,19 +24,26 @@
 // trivial field-by-field copy into a `MirLiteralValue` (the two pools
 // are structurally identical).
 //
-// CE1 coverage (parity with ML2's previous inline `tryConstFold`):
-//   - HirKind::Literal — direct map from HirLiteralPool.
+// Coverage today (CE1 + CE2 + CE3):
+//   - HirKind::Literal — direct map from HirLiteralPool. Pulls bool /
+//     int64 / uint64 variant arms uniformly via the `asInt64` bridge.
+//   - HirKind::Ref (CE2) — resolves through `EvalOptions::resolveConstSymbol`
+//     with stack-discipline visited-symbols cycle safety.
 //   - HirKind::UnaryOp(Neg/BitNot) — integer literal in, integer out.
 //   - HirKind::BinaryOp — integer arithmetic (Add/Sub/Mul/Div/Rem),
 //     bitwise (BitAnd/Or/Xor), shifts (Shl/Shr), comparisons (Eq/Ne/
 //     Lt/Le/Gt/Ge). Div-by-zero and out-of-range shift counts refuse to
-//     fold per the EvalOptions policy.
-//   - HirKind::Cast — narrowing/widening integer cast; retags the value
-//     to the target's core kind.
-// CE2 extends with `Ref`-to-constant-symbol resolution via a caller-
-// supplied callback (`EvalOptions::resolveConstSymbol`). CE3–CE5 in plan
-// 12.5 will add: short-circuit LogicalAnd/Or/Ternary, allowFloat with
-// IEEE 754 policy, full Cast-fold-with-commonType integration.
+//     fold per the EvalOptions policy. Result core is the C99-UAC
+//     `commonType` of the operands (or Bool for comparisons; or the
+//     promoted LHS for shifts per C99 §6.5.7p3) (CE3).
+//   - HirKind::Cast (CE3) — target-type-aware integer truncate/extend.
+//     Refuses with `Overflow` when the value doesn't fit AND
+//     `refuseOnOverflow=true` (D5.5 verifier path); wraps modularly
+//     otherwise (MIR-globals path, matches runtime). Cast-to-Bool folds
+//     to `N != 0`. Cast to unsigned-≥64 from a negative source refuses
+//     regardless of the knob (the int64 arm cannot reconcile signedness).
+// CE4–CE5 in plan 12.5 will add: short-circuit LogicalAnd/Or/Ternary,
+// allowFloat with IEEE 754 policy.
 
 namespace dss {
 
@@ -51,7 +58,11 @@ enum class ConstEvalFailure : std::uint8_t {
     NotAConstantExpression,    // expression contains non-foldable kinds
     DivisionByZero,            // refuseOnDivByZero (default true)
     ShiftCountOutOfRange,      // refuseOnShiftOutOfRange (default true)
-    Overflow,                  // refuseOnOverflow (CE1: not detected yet)
+    Overflow,                  // refuseOnOverflow: value computed but does
+                               // not fit the target type (CE3: detected on
+                               // narrowing Cast and on negative-to-unsigned-
+                               // ≥64; arithmetic overflow deferred to a
+                               // future cycle alongside float folding)
     UnsupportedOperator,       // op not modelled at this CE level
     UnsupportedTypeKind,       // e.g. float folding when allowFloat=false
 };

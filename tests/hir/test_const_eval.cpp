@@ -199,6 +199,212 @@ TEST(ConstEval, CastFromIntegerLiteralRetagsCoreKind) {
     EXPECT_EQ(res.value->core, TypeKind::I64);
 }
 
+// CE3: Cast to a SMALLER signed integer with a fitting value succeeds
+// without invoking the wrap path.
+TEST(ConstEval, CastFromI32ToI8WithFittingValueSucceeds) {
+    Rig r;
+    HirNodeId const lit = r.litInt(42, r.intT());
+    HirNodeId const c   = r.cast(lit, r.interner.primitive(TypeKind::I8));
+    auto res = eval(r, c);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 42);
+    EXPECT_EQ(res.value->core, TypeKind::I8);
+}
+
+// CE3: Cast overflow with `refuseOnOverflow=true` (default) surfaces the
+// Overflow failure code. D5.5 enum-bounds will pick this path.
+TEST(ConstEval, CastFromI32ToI8WithOverflowRefusesByDefault) {
+    Rig r;
+    HirNodeId const lit = r.litInt(256, r.intT());   // outside [-128, 127]
+    HirNodeId const c   = r.cast(lit, r.interner.primitive(TypeKind::I8));
+    auto res = eval(r, c);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
+    EXPECT_EQ(res.blamedNode, c);
+}
+
+// CE3: Cast overflow with `refuseOnOverflow=false` wraps modularly. The
+// MIR-globals path uses this to keep folding when the runtime would
+// produce a wrapped value anyway.
+TEST(ConstEval, CastFromI32ToI8WithOverflowWrapsWhenAllowed) {
+    Rig r;
+    HirNodeId const lit = r.litInt(257, r.intT());   // 257 & 0xFF = 1
+    HirNodeId const c   = r.cast(lit, r.interner.primitive(TypeKind::I8));
+    EvalOptions opts;
+    opts.refuseOnOverflow = false;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
+    EXPECT_EQ(res.value->core, TypeKind::I8);
+}
+
+// CE3: negative value wraps under signed-target narrowing (sign extension
+// from the truncated bits).
+TEST(ConstEval, CastFromI32ToI8WrapsNegativeViaSignExtension) {
+    Rig r;
+    // -1 fits in I8 directly — pick a value that needs wrap+sign-extend.
+    // 257 wraps to 1 (above); -257 wraps to -1 via sign-extension.
+    HirNodeId const lit = r.litInt(-257, r.intT());
+    HirNodeId const c   = r.cast(lit, r.interner.primitive(TypeKind::I8));
+    EvalOptions opts;
+    opts.refuseOnOverflow = false;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), -1);
+}
+
+// CE3: Cast to Bool — `N != 0`.
+TEST(ConstEval, CastNonZeroIntToBoolProducesOne) {
+    Rig r;
+    HirNodeId const lit = r.litInt(7, r.intT());
+    HirNodeId const c   = r.cast(lit, r.boolT());
+    auto res = eval(r, c);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
+    EXPECT_EQ(res.value->core, TypeKind::Bool);
+}
+
+TEST(ConstEval, CastZeroIntToBoolProducesZero) {
+    Rig r;
+    HirNodeId const lit = r.litInt(0, r.intT());
+    HirNodeId const c   = r.cast(lit, r.boolT());
+    auto res = eval(r, c);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
+}
+
+// CE3: INT64_MIN → I32 boundary. The wrap path's `(masked & signBit) != 0`
+// predicate would mis-trigger sign-extension if the mask computation were
+// off by a bit. The low 32 bits of INT64_MIN are all zero, so the wrap
+// should yield exactly 0 (not -1, not a partially-extended value).
+TEST(ConstEval, CastFromI64MinToI32WrapsToZero) {
+    Rig r;
+    HirNodeId const lit = r.litInt(std::numeric_limits<std::int64_t>::min(), r.i64T());
+    HirNodeId const c   = r.cast(lit, r.intT());
+    EvalOptions opts;
+    opts.refuseOnOverflow = false;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
+}
+
+// CE3 silent-failure-hunter F1: Cast to U64 with a negative source refuses
+// regardless of the `refuseOnOverflow` knob. The int64 storage arm can't
+// reconcile signedness with downstream signed arithmetic; the engine
+// refuses loudly rather than producing a wrong-typed fold.
+TEST(ConstEval, CastNegativeToUnsigned64RefusesEvenWithOverflowAllowed) {
+    Rig r;
+    HirNodeId const lit = r.litInt(-1, r.i64T());
+    HirNodeId const c   = r.cast(lit, r.interner.primitive(TypeKind::U64));
+    EvalOptions opts;
+    opts.refuseOnOverflow = false;   // even permissive policy refuses here
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
+}
+
+// CE3 silent-failure-hunter F3: uint64-arm literal flows through the
+// asInt64 bridge — a `char c = 'A';`-shaped value (decoded into uint64
+// arm) folds correctly rather than rejecting as "not an integer literal".
+TEST(ConstEval, Uint64ArmLiteralFoldsThroughAsInt64) {
+    Rig r;
+    HirLiteralValue lv;
+    lv.value = std::uint64_t{65};   // 'A'
+    lv.core  = TypeKind::Char;
+    HirNodeId const lit = r.builder.makeLiteral(
+        r.interner.primitive(TypeKind::Char), r.literals.add(lv));
+    HirNodeId const c   = r.cast(lit, r.intT());
+    auto res = eval(r, c);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 65);
+    EXPECT_EQ(res.value->core, TypeKind::I32);
+}
+
+// CE3 silent-failure-hunter F3 (Bool arm): a bool-arm literal (from
+// `.dsshir` round-trip or future bool-keyword frontends) folds via
+// `asInt64`'s bool branch — `true` → 1, `false` → 0.
+TEST(ConstEval, BoolArmLiteralFoldsThroughAsInt64) {
+    Rig r;
+    HirLiteralValue lv;
+    lv.value = true;
+    lv.core  = TypeKind::Bool;
+    HirNodeId const lit = r.builder.makeLiteral(r.boolT(), r.literals.add(lv));
+    HirNodeId const c   = r.cast(lit, r.intT());
+    auto res = eval(r, c);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
+    EXPECT_EQ(res.value->core, TypeKind::I32);
+}
+
+// CE3 correctness F1: shift result core is the PROMOTED LEFT operand
+// only (C99 §6.5.7p3) — the shift count's type does not contribute.
+TEST(ConstEval, ShiftResultCoreIsPromotedLeftOperand) {
+    Rig r;
+    // LHS is I8 literal; RHS is I32 shift count. C99: result core = I32
+    // (promoted I8), not commonType(I8, I32) — both happen to be I32
+    // here, but the SOURCE OF THE TYPE must be the LHS-only promotion.
+    HirLiteralValue lvA; lvA.value = std::int64_t{1}; lvA.core = TypeKind::I8;
+    HirLiteralValue lvB; lvB.value = std::int64_t{2}; lvB.core = TypeKind::I32;
+    HirNodeId const litA = r.builder.makeLiteral(
+        r.interner.primitive(TypeKind::I8), r.literals.add(lvA));
+    HirNodeId const litB = r.builder.makeLiteral(r.intT(), r.literals.add(lvB));
+    HirNodeId const shl = r.binary(HirOpKind::Shl, litA, litB, r.intT());
+    auto res = eval(r, shl);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 4);
+    EXPECT_EQ(res.value->core, TypeKind::I32);  // promoted I8, not commonType
+}
+
+// CE3: Cast to unsigned narrows correctly (wrap policy).
+TEST(ConstEval, CastFromI32ToU8WrapsCorrectly) {
+    Rig r;
+    HirNodeId const lit = r.litInt(300, r.intT());   // 300 & 0xFF = 44
+    HirNodeId const c   = r.cast(lit, r.interner.primitive(TypeKind::U8));
+    EvalOptions opts;
+    opts.refuseOnOverflow = false;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 44);
+}
+
+// CE3: comparison ops always result in Bool core regardless of operand
+// types (re-pin against the previous CE1 behaviour where the result
+// inherited LHS's core).
+TEST(ConstEval, ComparisonResultCoreIsAlwaysBool) {
+    Rig r;
+    HirNodeId const a = r.litInt(5, r.intT());
+    HirNodeId const b = r.litInt(3, r.intT());
+    HirNodeId const gt = r.binary(HirOpKind::Gt, a, b, r.boolT());
+    auto res = eval(r, gt);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(res.value->core, TypeKind::Bool);
+}
+
+// CE3: mixed-width BinaryOp folds with the COMMON type's core (C99 UAC),
+// not LHS's core. `I8 + I32 → I32` after integer promotion.
+TEST(ConstEval, BinaryOpMixedWidthResultCoreIsCommonType) {
+    Rig r;
+    // Build literals with different cores. Note the literal's `core`
+    // field is what the engine reads (not the typeId — we test the
+    // engine in isolation).
+    HirLiteralValue lvA; lvA.value = std::int64_t{10}; lvA.core = TypeKind::I8;
+    HirLiteralValue lvB; lvB.value = std::int64_t{20}; lvB.core = TypeKind::I32;
+    HirNodeId const litA = r.builder.makeLiteral(
+        r.interner.primitive(TypeKind::I8),  r.literals.add(lvA));
+    HirNodeId const litB = r.builder.makeLiteral(r.intT(), r.literals.add(lvB));
+    HirNodeId const sum = r.binary(HirOpKind::Add, litA, litB, r.intT());
+    auto res = eval(r, sum);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 30);
+    // C99 UAC: rank-<int promotes to int. Common(I8, I32) = I32.
+    EXPECT_EQ(res.value->core, TypeKind::I32);
+}
+
 TEST(ConstEval, CastOfFoldedBinaryFolds) {
     // The end-to-end case from the substrate-PR: `int g = 1 > 0;` lowers to
     // Cast(BinaryOp(Gt, 1, 0), int). Engine folds the inner comparison to

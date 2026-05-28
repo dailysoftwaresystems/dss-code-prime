@@ -33,6 +33,27 @@ struct HirLiteralValue {
     // token); the lowering still emits the node + a diagnostic so analysis
     // continues. `core` records the decoded TypeKind for pool-level inspection
     // without consulting the interner (redundant with the node's typeId).
+    //
+    // Variant-arm contract by `core`:
+    //   - `core == Bool`: held in the `std::int64_t` arm with value 0 or 1.
+    //     The native `bool` arm is reserved for source-decoded `true`/`false`
+    //     tokens at lowering time AND for round-tripped `.dsshir` text;
+    //     anything that flows through the constants-evaluation engine
+    //     normalizes to `int64_t` 0/1 so comparison results and integer
+    //     values share one arithmetic representation. Consumers reading
+    //     bool values MUST handle both arms (use `asInt64` in `const_eval`).
+    //   - `core` ∈ signed integer kinds (I8..I64, Char with codepoint
+    //     semantics): held in `std::int64_t`.
+    //   - `core` ∈ unsigned integer kinds (U8..U64, Byte): held in
+    //     `std::uint64_t` at source-decode time; the const-eval engine
+    //     may also produce values in `std::int64_t` after arithmetic.
+    //     Consumers MUST accept either arm for unsigned cores.
+    //   - `core` ∈ float kinds (F16..F128): held in `double`.
+    //   - `core == Char` with a STRING literal: held in `std::string`
+    //     (the node's typeId is Array<Char,N+1>; disambiguate char-vs-
+    //     string by the variant arm, NOT by `core` which is identical
+    //     in both cases).
+    //   - `core == Void`: held as `std::monostate` (decode failure).
     std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string> value;
     TypeKind core = TypeKind::Void;
 };

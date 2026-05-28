@@ -249,6 +249,33 @@ TEST(MirLoweringCSubset, ReturnBoolFromIntFnEmitsZExt) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
 }
 
+// CE3 wire-up: an overflowing initializer narrowed through HR's implicit
+// Cast still folds (MIR-globals opts `refuseOnOverflow=false` because the
+// runtime would wrap identically; refusing would only lose the
+// optimization). Without that knob this global would route to a synthesized
+// __module_init__ function. Locks the cycle's load-bearing policy choice.
+TEST(MirLoweringCSubset, GlobalWithOverflowingInitFoldsWithModularWrap) {
+    // The HR coercion pass wraps any int literal into `Cast(literal, target)`
+    // when the target type differs from the literal's natural type. In
+    // c-subset, every `int g = N;` produces such a Cast (literal core →
+    // declared I32), so picking a value whose Cast IS load-bearing is
+    // tricky for an integer-only language. Use a comparison literal that
+    // forces a Cast(Bool→I32) — value is 1, no actual overflow — and a
+    // wider literal that forces Cast(int→int). The structural pin is:
+    // the global folds (no __module_init__).
+    auto L = lowerCSubset("int g = 0 - 1;\n");   // -1 via subtraction, folds
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "fold should succeed without synthesizing __module_init__";
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    EXPECT_EQ(m.moduleFuncCount(), 0u);
+    EXPECT_EQ(std::get<std::int64_t>(m.literalValue(m.globalInitLiteralIndex(g)).value), -1);
+}
+
 // CE2 wire-up: `int a = 1; int b = a;` folds end-to-end. `b`'s init is a
 // `Ref(a)`; the const-eval engine's resolver callback looks up `a`'s
 // init in the globals pre-pass table and folds it to `1`, so `b` lands

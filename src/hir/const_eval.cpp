@@ -4,6 +4,7 @@
 #include "hir/hir.hpp"
 #include "hir/hir_op.hpp"
 
+#include <limits>
 #include <unordered_set>
 
 namespace dss {
@@ -18,12 +19,40 @@ namespace {
     return ConstEvalResult{.value{std::move(v)}, .failure = ConstEvalFailure::None, .blamedNode{}};
 }
 
+// Pull an integer-typed `HirLiteralValue` into a common `int64_t` arithmetic
+// representation, regardless of which of the three numeric variant arms it
+// arrived on (`int64_t` / `uint64_t` / `bool`). The unsigned arm is the
+// natural arrival for `unsigned int`, `char`, and any source-decoded
+// unsigned literal (per `cst_to_hir.cpp`); the bool arm arrives from
+// round-tripped `.dsshir` text. Without this bridge, the engine silently
+// rejects every unsigned/bool literal as "not an integer" — a real
+// production gap (a `char c = 'A';` global would never fold).
+//
+// Returns nullopt only when:
+//   - the value is genuinely non-numeric (`monostate` / `string` / `double`),
+//   - or an unsigned value exceeds `int64_t`'s positive range (would
+//     misrepresent as negative on signed-arithmetic paths).
+// Float values are explicitly NOT pulled here — float folding is CE5.
+[[nodiscard]] std::optional<std::int64_t>
+asInt64(HirLiteralValue const& v) noexcept {
+    if (auto p = std::get_if<std::int64_t>(&v.value)) return *p;
+    if (auto p = std::get_if<std::uint64_t>(&v.value)) {
+        if (*p > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            return std::nullopt;   // out-of-int64-range; caller refuses with Overflow
+        }
+        return static_cast<std::int64_t>(*p);
+    }
+    if (auto p = std::get_if<bool>(&v.value)) return *p ? std::int64_t{1} : std::int64_t{0};
+    return std::nullopt;
+}
+
 // Fold a HirKind::UnaryOp(Neg/BitNot) of an already-folded integer operand.
 // `inner` is the operand's value (known to be an integer literal here).
 [[nodiscard]] std::optional<HirLiteralValue>
 applyUnaryInt(HirOpKind op, HirLiteralValue const& inner) {
-    std::int64_t const* iv = std::get_if<std::int64_t>(&inner.value);
-    if (iv == nullptr) return std::nullopt;
+    auto iv64 = asInt64(inner);
+    if (!iv64.has_value()) return std::nullopt;
+    std::int64_t const* iv = &*iv64;
     HirLiteralValue folded = inner;
     switch (op) {
         case HirOpKind::Neg:    folded.value = -(*iv);    return folded;
@@ -40,9 +69,11 @@ applyUnaryInt(HirOpKind op, HirLiteralValue const& inner) {
 [[nodiscard]] std::optional<HirLiteralValue>
 applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
                EvalOptions const& opts, ConstEvalFailure& outFailure) {
-    std::int64_t const* av = std::get_if<std::int64_t>(&a.value);
-    std::int64_t const* bv = std::get_if<std::int64_t>(&b.value);
-    if (av == nullptr || bv == nullptr) return std::nullopt;
+    auto av64 = asInt64(a);
+    auto bv64 = asInt64(b);
+    if (!av64.has_value() || !bv64.has_value()) return std::nullopt;
+    std::int64_t const* av = &*av64;
+    std::int64_t const* bv = &*bv64;
     HirLiteralValue folded = a;   // inherit core/type from lhs side
     switch (op) {
         case HirOpKind::Add:    folded.value = *av + *bv;  return folded;
@@ -105,12 +136,69 @@ applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
     }
 }
 
-[[nodiscard]] bool isIntegerKind(TypeKind k) noexcept {
-    return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
-        || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32
-        || k == TypeKind::I64  || k == TypeKind::I128
-        || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
-        || k == TypeKind::U64  || k == TypeKind::U128;
+// Integer target descriptor: width in bits + signedness. `Bool` is a
+// special case (1-bit unsigned; truthiness rules apply). `Char` is a
+// 32-bit unsigned Unicode codepoint. `Byte` is 8-bit unsigned.
+// `I128`/`U128` are listed but values that overflow 64-bit storage are
+// not representable in the engine's `int64_t` arm — those folds refuse.
+struct IntKindInfo {
+    int  bits;
+    bool isSigned;
+};
+[[nodiscard]] std::optional<IntKindInfo> intKindInfo(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::Bool: return IntKindInfo{1,   false};  // truthiness
+        case TypeKind::I8:   return IntKindInfo{8,   true};
+        case TypeKind::U8:   return IntKindInfo{8,   false};
+        case TypeKind::Byte: return IntKindInfo{8,   false};
+        case TypeKind::I16:  return IntKindInfo{16,  true};
+        case TypeKind::U16:  return IntKindInfo{16,  false};
+        case TypeKind::I32:  return IntKindInfo{32,  true};
+        case TypeKind::U32:  return IntKindInfo{32,  false};
+        case TypeKind::Char: return IntKindInfo{32,  false};
+        case TypeKind::I64:  return IntKindInfo{64,  true};
+        case TypeKind::U64:  return IntKindInfo{64,  false};
+        case TypeKind::I128: return IntKindInfo{128, true};
+        case TypeKind::U128: return IntKindInfo{128, false};
+        default: return std::nullopt;
+    }
+}
+
+// Range check: does `v` (held as int64) fit in the target's representable
+// range? `bits` is the target width; `isSigned` is the target's signedness.
+// 64-bit signed targets always accept; 64-bit unsigned accepts non-negative.
+// Wider-than-64 targets always accept (any int64 fits). For width < 64,
+// computes the inclusive [lo, hi] range and tests.
+[[nodiscard]] bool valueFitsInIntTarget(std::int64_t v, IntKindInfo target) noexcept {
+    if (target.bits >= 64) {
+        if (!target.isSigned) return v >= 0;   // u64+: must be non-negative
+        return true;
+    }
+    if (target.isSigned) {
+        std::int64_t const lo = -(std::int64_t{1} << (target.bits - 1));
+        std::int64_t const hi =  (std::int64_t{1} << (target.bits - 1)) - 1;
+        return v >= lo && v <= hi;
+    }
+    std::int64_t const hi = (target.bits < 63)
+        ? (std::int64_t{1} << target.bits) - 1
+        : std::numeric_limits<std::int64_t>::max();
+    return v >= 0 && v <= hi;
+}
+
+// Modular truncation: mask `v` to the target's `bits` width, then sign-
+// extend if the target is signed. C99 unsigned-integer conversion is
+// well-defined modular wrap; the signed-overflow case is UB but every
+// real compiler emits the bit-equivalent wrap — match that here so the
+// fold result is what runtime would observe.
+[[nodiscard]] std::int64_t wrapToIntTarget(std::int64_t v, IntKindInfo target) noexcept {
+    if (target.bits >= 64) return v;   // no narrowing
+    std::uint64_t const mask = (std::uint64_t{1} << target.bits) - 1;
+    std::uint64_t       masked = static_cast<std::uint64_t>(v) & mask;
+    if (target.isSigned) {
+        std::uint64_t const signBit = std::uint64_t{1} << (target.bits - 1);
+        if ((masked & signBit) != 0) masked |= ~mask;   // sign-extend
+    }
+    return static_cast<std::int64_t>(masked);
 }
 
 // Internal recursive impl. `visitedSyms` carries the per-call cycle-
@@ -182,17 +270,56 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         ConstEvalFailure why = ConstEvalFailure::None;
         if (auto folded = applyBinaryInt(op, *a.value, *b.value, options, why);
             folded.has_value()) {
+            // CE3: tag the folded value's core per C99 binary-op semantics.
+            // Three cases:
+            //   - Comparison ops (Eq/Ne/Lt/Le/Gt/Ge): result is Bool
+            //     regardless of operand types (force-override; applyBinaryInt
+            //     inherited LHS's core which is wrong for the cmp case).
+            //   - Shift ops (Shl/Shr) (C99 §6.5.7p3): result type is the
+            //     PROMOTED LEFT operand only; the shift count's type does
+            //     not contribute. `commonType(lhs, lhs)` realizes the
+            //     left-operand integer promotion uniformly.
+            //   - All other arithmetic / bitwise: result is the C99-UAC
+            //     common type of both operands.
+            // Type source is the HIR node's typeId (the authoritative
+            // record), not the literal's `core` mirror — folded recursion
+            // results may have re-tagged cores that diverge from the
+            // declared type tree.
+            TypeId const aTy = hir.typeId(kids[0]);
+            TypeId const bTy = hir.typeId(kids[1]);
+            bool const isShift = (op == HirOpKind::Shl || op == HirOpKind::Shr);
+            if (isComparison(op)) {
+                folded->core = TypeKind::Bool;
+            } else if (isShift) {
+                TypeId const promoted = interner.commonType(aTy, aTy);
+                if (promoted.valid()) folded->core = interner.kind(promoted);
+            } else if (TypeId const common = interner.commonType(aTy, bTy);
+                       common.valid()) {
+                folded->core = interner.kind(common);
+            }
+            // Else (commonType InvalidType on a non-arithmetic operand
+            // pair that nonetheless folded via int64 arithmetic — an
+            // unlikely-but-possible substrate inconsistency): leave the
+            // LHS-inherited core in place. applyBinaryInt's success
+            // requires both arms to pull through `asInt64`, so this
+            // path indicates the types disagree with the values; a
+            // downstream verifier will catch the cross-tier mismatch.
             return ok(std::move(*folded));
         }
         if (why != ConstEvalFailure::None) return fail(why, expr);
         return fail(ConstEvalFailure::UnsupportedOperator, expr);
     }
     if (k == HirKind::Cast) {
-        // Integer cast: fold the inner value, retag the core kind to the
-        // target's. Width semantics (truncation / extension) are encoded
-        // by the literal-bearing site's TypeId; codegen handles the
-        // actual narrowing on load. Float and pointer casts fail until
-        // CE3/CE5 land.
+        // Target-type-aware integer cast (CE3). Fold the inner value,
+        // then either retag (target accepts the value as-is) or wrap
+        // (modular truncation per `EvalOptions::refuseOnOverflow`).
+        //
+        // Cast-to-Bool special case: `Cast(N, Bool)` folds to `N != 0`
+        // matching C semantics — common HR pattern from cond-site coercion.
+        //
+        // Float casts route through here too (when CE5 enables them);
+        // for now any non-integer source / target fails as
+        // UnsupportedTypeKind so callers know to wait on float folding.
         auto kids = hir.children(expr);
         if (kids.size() != 1) return fail(ConstEvalFailure::NotAConstantExpression, expr);
         ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
@@ -200,12 +327,42 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         TypeId const targetTy = hir.typeId(expr);
         if (!targetTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
         TypeKind const toK = interner.kind(targetTy);
-        if (!isIntegerKind(toK)) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        std::int64_t const* iv = std::get_if<std::int64_t>(&inner.value->value);
-        if (iv == nullptr) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        auto target = intKindInfo(toK);
+        if (!target.has_value()) {
+            // Non-integer target (float / pointer / aggregate) — out of
+            // CE3's scope. CE5 will open the float arm.
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+        auto iv64 = asInt64(*inner.value);
+        if (!iv64.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        std::int64_t const iv = *iv64;
         HirLiteralValue folded;
-        folded.value = *iv;
-        folded.core  = toK;
+        folded.core = toK;
+        if (toK == TypeKind::Bool) {
+            folded.value = std::int64_t{iv != 0 ? 1 : 0};
+            return ok(std::move(folded));
+        }
+        // Cast to unsigned target ≥64 bits with a negative source value:
+        // the int64 storage arm cannot reconcile signedness with downstream
+        // signed-arithmetic paths (`applyBinaryInt` reads via int64), so the
+        // engine refuses regardless of the `refuseOnOverflow` knob. Callers
+        // route through the runtime path which handles the bit-pattern wrap
+        // correctly. (When CE5 opens the uint64 arm for arithmetic, this
+        // restriction can lift.)
+        if (target->bits >= 64 && !target->isSigned && iv < 0) {
+            return fail(ConstEvalFailure::Overflow, expr);
+        }
+        if (valueFitsInIntTarget(iv, *target)) {
+            folded.value = iv;
+            return ok(std::move(folded));
+        }
+        // Value overflows the target. Knob-controlled policy: refuse with
+        // `Overflow` (D5.5 enum-bounds verifier path) OR wrap modularly
+        // (MIR-globals / runtime-matched path).
+        if (options.refuseOnOverflow) {
+            return fail(ConstEvalFailure::Overflow, expr);
+        }
+        folded.value = wrapToIntTarget(iv, *target);
         return ok(std::move(folded));
     }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);

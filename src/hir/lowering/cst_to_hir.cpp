@@ -51,13 +51,10 @@ namespace {
     return std::nullopt;
 }
 
-[[nodiscard]] bool isComparison(HirOpKind op) noexcept {
-    switch (op) {
-        case HirOpKind::Eq: case HirOpKind::Ne: case HirOpKind::Lt:
-        case HirOpKind::Le: case HirOpKind::Gt: case HirOpKind::Ge: return true;
-        default: return false;
-    }
-}
+// `isComparison` lives in `hir/hir_op.hpp` — one source of truth across HR
+// lowering's `combineBinary`, MIR's `mapBinaryOp`, and the constants-eval
+// engine's BinaryOp branch. A new comparison-shaped op (e.g. `Spaceship`)
+// would otherwise need updates in all three sites.
 
 // decodeInteger lives in core/types/number_decode.hpp — shared with the
 // semantic phase so a literal's text is interpreted identically everywhere.
