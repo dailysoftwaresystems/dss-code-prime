@@ -19,6 +19,18 @@ namespace {
     return ConstEvalResult{.value{std::move(v)}, .failure = ConstEvalFailure::None, .blamedNode{}};
 }
 
+// Build a Bool-cored literal carrying `n != 0` per C99 truthiness. The
+// engine's normalization rule (documented in `hir_literal_pool.hpp`) is
+// that `core == Bool` implies the int64 arm holding 0 or 1; this helper
+// is the single source of truth for that rule across Cast-to-Bool,
+// LogicalAnd/Or short-circuit, and LogicalAnd/Or combine paths.
+[[nodiscard]] HirLiteralValue makeBoolLiteral(std::int64_t n) {
+    HirLiteralValue v;
+    v.core  = TypeKind::Bool;
+    v.value = std::int64_t{(n != 0) ? 1 : 0};
+    return v;
+}
+
 // Pull an integer-typed `HirLiteralValue` into a common `int64_t` arithmetic
 // representation, regardless of which of the three numeric variant arms it
 // arrived on (`int64_t` / `uint64_t` / `bool`). The unsigned arm is the
@@ -252,6 +264,12 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         if (kids.size() != 1) return fail(ConstEvalFailure::NotAConstantExpression, expr);
         ConstEvalResult inner = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
         if (!inner.value.has_value()) return inner;
+        // Distinguish "value isn't an integer" from "operator isn't modelled"
+        // at the caller so failure codes match the other int-only fold sites
+        // (LogicalAnd/Or/Ternary cond) which surface `UnsupportedTypeKind`.
+        if (!asInt64(*inner.value).has_value()) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
         if (auto folded = applyUnaryInt(op, *inner.value); folded.has_value()) {
             return ok(std::move(*folded));
         }
@@ -267,6 +285,13 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         if (!a.value.has_value()) return a;
         ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], options, visitedSyms);
         if (!b.value.has_value()) return b;
+        // Same distinction as UnaryOp: a non-integer operand surfaces
+        // `UnsupportedTypeKind` consistent with LogicalAnd/Or/Ternary;
+        // applyBinaryInt's nullopt is reserved for "operator not yet
+        // modelled" (UnsupportedOperator) and policy refusals.
+        if (!asInt64(*a.value).has_value() || !asInt64(*b.value).has_value()) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
         ConstEvalFailure why = ConstEvalFailure::None;
         if (auto folded = applyBinaryInt(op, *a.value, *b.value, options, why);
             folded.has_value()) {
@@ -336,12 +361,11 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         auto iv64 = asInt64(*inner.value);
         if (!iv64.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         std::int64_t const iv = *iv64;
+        if (toK == TypeKind::Bool) {
+            return ok(makeBoolLiteral(iv));
+        }
         HirLiteralValue folded;
         folded.core = toK;
-        if (toK == TypeKind::Bool) {
-            folded.value = std::int64_t{iv != 0 ? 1 : 0};
-            return ok(std::move(folded));
-        }
         // Cast to unsigned target ≥64 bits with a negative source value:
         // the int64 storage arm cannot reconcile signedness with downstream
         // signed-arithmetic paths (`applyBinaryInt` reads via int64), so the
@@ -364,6 +388,65 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         }
         folded.value = wrapToIntTarget(iv, *target);
         return ok(std::move(folded));
+    }
+    if (k == HirKind::LogicalAnd || k == HirKind::LogicalOr) {
+        // C99 short-circuit semantics: evaluate `a` first. If `a` already
+        // determines the result (`0 && unfoldable` is unambiguously
+        // false; `1 || unfoldable` is unambiguously true), the engine
+        // MUST NOT recurse into `b` — otherwise a non-foldable `b`
+        // would spuriously fail the whole fold. Once `a` doesn't short-
+        // circuit, the result depends on `b`; recurse into `b` and
+        // combine. Result core is always Bool.
+        auto kids = hir.children(expr);
+        if (kids.size() != 2) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        ConstEvalResult a = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
+        if (!a.value.has_value()) return a;
+        auto av64 = asInt64(*a.value);
+        if (!av64.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        bool const aIsTrue = (*av64 != 0);
+        bool const isAnd   = (k == HirKind::LogicalAnd);
+        // && short-circuits when `a` is false; || short-circuits when `a`
+        // is true. Either way the determined value IS `aIsTrue`.
+        bool const shortCircuits = isAnd ? !aIsTrue : aIsTrue;
+        if (shortCircuits) {
+            return ok(makeBoolLiteral(aIsTrue ? 1 : 0));
+        }
+        // No short-circuit; need `b` to determine the result.
+        ConstEvalResult b = evalImpl(hir, interner, literals, kids[1], options, visitedSyms);
+        if (!b.value.has_value()) return b;
+        auto bv64 = asInt64(*b.value);
+        if (!bv64.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        return ok(makeBoolLiteral(*bv64));
+    }
+    if (k == HirKind::Ternary) {
+        // children: [cond, then, else]. Fold cond first; recurse into ONLY
+        // the selected arm. The unselected arm may be non-constant — a
+        // legitimate compile-time-known choice between a constant and a
+        // computation (`cond ? known : maybe_runtime`) should still fold
+        // when cond and the chosen arm are both constants. The selected
+        // arm's failure propagates verbatim (we return the inner result;
+        // `blamedNode` retains the arm's anchor).
+        //
+        // Result core: the SELECTED arm's `core` may be narrower than
+        // the Ternary's declared `typeId` (e.g. `cond ? (int8)5 : 1000`
+        // where the Ternary type is I32). Re-tag the folded core from
+        // the Ternary node's typeId so `core` mirrors the authoritative
+        // type record (per the `hir_literal_pool.hpp` contract). Same
+        // discipline as BinaryOp's `commonType` retag above.
+        auto kids = hir.children(expr);
+        if (kids.size() != 3) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        ConstEvalResult cond = evalImpl(hir, interner, literals, kids[0], options, visitedSyms);
+        if (!cond.value.has_value()) return cond;
+        auto cv64 = asInt64(*cond.value);
+        if (!cv64.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        HirNodeId const selected = (*cv64 != 0) ? kids[1] : kids[2];
+        ConstEvalResult inner = evalImpl(hir, interner, literals,
+                                         selected, options, visitedSyms);
+        if (inner.value.has_value()) {
+            TypeId const ternTy = hir.typeId(expr);
+            if (ternTy.valid()) inner.value->core = interner.kind(ternTy);
+        }
+        return inner;
     }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
 }

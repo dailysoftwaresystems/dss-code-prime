@@ -42,8 +42,16 @@
 //     otherwise (MIR-globals path, matches runtime). Cast-to-Bool folds
 //     to `N != 0`. Cast to unsigned-≥64 from a negative source refuses
 //     regardless of the knob (the int64 arm cannot reconcile signedness).
-// CE4–CE5 in plan 12.5 will add: short-circuit LogicalAnd/Or/Ternary,
-// allowFloat with IEEE 754 policy.
+//   - HirKind::LogicalAnd / HirKind::LogicalOr (CE4) — C99 short-circuit:
+//     `0 && x` folds to 0 regardless of whether `x` is foldable;
+//     `1 || x` folds to 1 likewise. Without short-circuit
+//     `(non_const && x)` correctly reports `x` as non-foldable. Result
+//     core is always Bool.
+//   - HirKind::Ternary (CE4) — fold cond, then recurse only into the
+//     SELECTED arm. `cond ? const : non_const` still folds when cond
+//     is true. The selected arm's failure propagates verbatim with its
+//     own blame anchor.
+// CE5 in plan 12.5 will add: allowFloat + IEEE 754 policy.
 
 namespace dss {
 

@@ -49,6 +49,15 @@ struct Rig {
     HirNodeId cast(HirNodeId operand, TypeId targetTy) {
         return builder.makeCast(operand, targetTy);
     }
+    HirNodeId logAnd(HirNodeId l, HirNodeId r) {
+        return builder.makeLogicalAnd(l, r, boolT());
+    }
+    HirNodeId logOr(HirNodeId l, HirNodeId r) {
+        return builder.makeLogicalOr(l, r, boolT());
+    }
+    HirNodeId ternary(HirNodeId c, HirNodeId t, HirNodeId e, TypeId resultTy) {
+        return builder.makeTernary(c, t, e, resultTy);
+    }
     [[nodiscard]] Hir finishWith(HirNodeId expr) {
         // HirBuilder::finish() accepts any built HirNodeId as the root for
         // ad-hoc unit tests like these (its only invariant is that the root
@@ -387,6 +396,189 @@ TEST(ConstEval, ComparisonResultCoreIsAlwaysBool) {
 
 // CE3: mixed-width BinaryOp folds with the COMMON type's core (C99 UAC),
 // not LHS's core. `I8 + I32 → I32` after integer promotion.
+// ─── CE4: short-circuit folding ───────────────────────────────────────────
+
+TEST(ConstEval, LogicalAndOfTrueAndFalseFolds) {
+    Rig r;
+    HirNodeId const a = r.litInt(1, r.intT());
+    HirNodeId const b = r.litInt(0, r.intT());
+    HirNodeId const and_ = r.logAnd(a, b);
+    auto res = eval(r, and_);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
+    EXPECT_EQ(res.value->core, TypeKind::Bool);
+}
+
+TEST(ConstEval, LogicalAndOfTwoNonZeroFoldsToTrue) {
+    Rig r;
+    HirNodeId const a = r.litInt(5, r.intT());
+    HirNodeId const b = r.litInt(7, r.intT());
+    HirNodeId const and_ = r.logAnd(a, b);
+    auto res = eval(r, and_);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
+    EXPECT_EQ(res.value->core, TypeKind::Bool);
+}
+
+// CE4 load-bearing: short-circuit means `0 && unfoldable` is foldable
+// (the engine MUST NOT recurse into the right operand once the left
+// determines the result). Build a definitely-unfoldable right operand
+// (a Ref with no resolver) and verify the whole expression still folds.
+TEST(ConstEval, LogicalAndShortCircuitsOnFalseLeft) {
+    Rig r;
+    HirNodeId const zero    = r.litInt(0, r.intT());
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const and_    = r.logAnd(zero, dangling);
+    auto res = eval(r, and_);
+    ASSERT_TRUE(res.value.has_value()) << "0 && unfoldable must short-circuit";
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
+}
+
+TEST(ConstEval, LogicalAndDoesNotShortCircuitOnTrueLeftAndFailsIfRightUnfoldable) {
+    Rig r;
+    HirNodeId const one      = r.litInt(1, r.intT());
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const and_     = r.logAnd(one, dangling);
+    auto res = eval(r, and_);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+}
+
+TEST(ConstEval, LogicalOrShortCircuitsOnTrueLeft) {
+    Rig r;
+    HirNodeId const one      = r.litInt(1, r.intT());
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const or_      = r.logOr(one, dangling);
+    auto res = eval(r, or_);
+    ASSERT_TRUE(res.value.has_value()) << "1 || unfoldable must short-circuit";
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
+}
+
+TEST(ConstEval, LogicalOrOfTwoZerosFoldsToFalse) {
+    Rig r;
+    HirNodeId const a   = r.litInt(0, r.intT());
+    HirNodeId const b   = r.litInt(0, r.intT());
+    HirNodeId const or_ = r.logOr(a, b);
+    auto res = eval(r, or_);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
+}
+
+// CE4 ternary: cond folds to true → recurse only into THEN. Else can be
+// non-constant without poisoning the fold.
+TEST(ConstEval, TernaryWithTrueCondFoldsToThenArmEvenIfElseUnfoldable) {
+    Rig r;
+    HirNodeId const cond     = r.litInt(1, r.intT());
+    HirNodeId const then_    = r.litInt(42, r.intT());
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const tern = r.ternary(cond, then_, dangling, r.intT());
+    auto res = eval(r, tern);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 42);
+}
+
+TEST(ConstEval, TernaryWithFalseCondFoldsToElseArmEvenIfThenUnfoldable) {
+    Rig r;
+    HirNodeId const cond     = r.litInt(0, r.intT());
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const else_    = r.litInt(7, r.intT());
+    HirNodeId const tern = r.ternary(cond, dangling, else_, r.intT());
+    auto res = eval(r, tern);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 7);
+}
+
+// Selected-arm failure propagates verbatim — diagnostic anchors at the
+// arm's blamed node, NOT at the Ternary use site (per the user's
+// "propagate" choice on the clarifying question).
+TEST(ConstEval, TernaryFailurePropagatesFromSelectedArm) {
+    Rig r;
+    HirNodeId const cond     = r.litInt(1, r.intT());
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const else_    = r.litInt(7, r.intT());
+    HirNodeId const tern = r.ternary(cond, dangling, else_, r.intT());
+    auto res = eval(r, tern);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+    // Failure is blamed at the arm (dangling Ref), not at the Ternary.
+    EXPECT_EQ(res.blamedNode, dangling);
+}
+
+// CE4: non-foldable cond → not foldable (the engine can't pick an arm
+// without knowing the cond's value).
+TEST(ConstEval, TernaryWithUnfoldableCondFails) {
+    Rig r;
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const a    = r.litInt(1, r.intT());
+    HirNodeId const b    = r.litInt(2, r.intT());
+    HirNodeId const tern = r.ternary(dangling, a, b, r.intT());
+    auto res = eval(r, tern);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+    // Blame anchors at the cond (the dangling Ref), not at the Ternary.
+    EXPECT_EQ(res.blamedNode, dangling);
+}
+
+// CE4 LHS-first evaluation: a non-foldable LHS surfaces failure blamed
+// at the LHS (NOT at the AND/OR node). A future refactor that tried to
+// "peek at RHS first for short-circuit" would silently violate this.
+TEST(ConstEval, LogicalAndWithUnfoldableLeftFails) {
+    Rig r;
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const one      = r.litInt(1, r.intT());
+    HirNodeId const and_     = r.logAnd(dangling, one);
+    auto res = eval(r, and_);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+    EXPECT_EQ(res.blamedNode, dangling);
+}
+
+TEST(ConstEval, LogicalOrWithUnfoldableLeftFails) {
+    Rig r;
+    HirNodeId const dangling = r.builder.makeRef(r.intT(), /*sym=*/9999);
+    HirNodeId const zero     = r.litInt(0, r.intT());
+    HirNodeId const or_      = r.logOr(dangling, zero);
+    auto res = eval(r, or_);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::NotAConstantExpression);
+    EXPECT_EQ(res.blamedNode, dangling);
+}
+
+// CE4 OR truth-table gap: false-LHS + true-RHS exercises the
+// no-short-circuit fallthrough that the other OR tests miss.
+TEST(ConstEval, LogicalOrOfFalseAndTrueFoldsToTrue) {
+    Rig r;
+    HirNodeId const a   = r.litInt(0, r.intT());
+    HirNodeId const b   = r.litInt(1, r.intT());
+    HirNodeId const or_ = r.logOr(a, b);
+    auto res = eval(r, or_);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
+    EXPECT_EQ(res.value->core, TypeKind::Bool);
+}
+
+// CE4 Ternary core re-tag: a narrower-than-Ternary arm core must NOT
+// leak into the folded value's core. The Ternary node's declared
+// typeId is authoritative.
+TEST(ConstEval, TernaryArmCoreIsRetaggedToTernaryDeclaredType) {
+    Rig r;
+    HirNodeId const cond = r.litInt(1, r.intT());
+    // Build a then-arm whose literal core is I8 (narrower than the
+    // Ternary's declared I32 result type).
+    HirLiteralValue thenLv;
+    thenLv.value = std::int64_t{5};
+    thenLv.core  = TypeKind::I8;
+    HirNodeId const thenLit = r.builder.makeLiteral(
+        r.interner.primitive(TypeKind::I8), r.literals.add(thenLv));
+    HirNodeId const elseLit = r.litInt(9, r.intT());
+    HirNodeId const tern = r.ternary(cond, thenLit, elseLit, r.intT());
+    auto res = eval(r, tern);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 5);
+    // Result core MUST be the Ternary's declared I32, not the arm's I8.
+    EXPECT_EQ(res.value->core, TypeKind::I32);
+}
+
 TEST(ConstEval, BinaryOpMixedWidthResultCoreIsCommonType) {
     Rig r;
     // Build literals with different cores. Note the literal's `core`

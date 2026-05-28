@@ -249,6 +249,46 @@ TEST(MirLoweringCSubset, ReturnBoolFromIntFnEmitsZExt) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
 }
 
+// CE4 end-to-end: a ternary initializer folds when cond + selected arm
+// both fold (the unselected arm doesn't need to fold). `int g = 1 ? 7 : x;`
+// — even if `x` were non-constant, cond=true picks the then-arm and the
+// global lands as a constant-init literal `7`. Pins the short-circuit
+// recursion in the const-eval engine end-to-end through MIR-globals.
+TEST(MirLoweringCSubset, GlobalWithTernaryInitFoldsToSelectedArm) {
+    auto L = lowerCSubset("int g = 1 ? 7 : 9;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    EXPECT_EQ(m.moduleFuncCount(), 0u);
+    EXPECT_EQ(std::get<std::int64_t>(m.literalValue(m.globalInitLiteralIndex(g)).value), 7);
+}
+
+// CE4: short-circuit semantics through MIR-globals end-to-end. The RHS
+// `1 / 0` is genuinely non-foldable (div-by-zero — even with the
+// permissive MIR policy `refuseOnOverflow=false`, div-by-zero still
+// reports `NotAConstantExpression`). Without short-circuit the global
+// would route to `__module_init__`. With short-circuit, `0 && _` folds
+// to 0 unconditionally — this is the test that actually distinguishes
+// the two implementations end-to-end.
+TEST(MirLoweringCSubset, GlobalWithLogicalAndShortCircuitsPastDivByZero) {
+    auto L = lowerCSubset("int g = 0 && (1 / 0);\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "fold must succeed via short-circuit; without it the RHS "
+           "div-by-zero would route the global to __module_init__";
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    EXPECT_EQ(m.moduleFuncCount(), 0u);
+    EXPECT_EQ(std::get<std::int64_t>(m.literalValue(m.globalInitLiteralIndex(g)).value), 0);
+}
+
 // CE3 wire-up: an overflowing initializer narrowed through HR's implicit
 // Cast still folds (MIR-globals opts `refuseOnOverflow=false` because the
 // runtime would wrap identically; refusing would only lose the
