@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| Status        | ⏳ **planned.** v1 production-critical. |
+| Status        | 🟡 **in progress.** v1 production-critical. **ML1 ✅ done 2026-05-27** (`feature/mir-lir`): MIR skeleton + minimal builder — three arenas (inst/block/func) under one `MirModuleId`, **fused value model** (`MirValueId = MirInstId`; a non-void inst IS its SSA value), phi nodes, **closed `MirOpcode` enum + `opcodeInfo()` descriptor table** (single source of truth, `-Wswitch-enum` latched; carries operand arity **and CFG successor arity** so terminator builders + verifier consume the same table; `MirResultRule{None,Value,Optional}` for void-callee calls; value-origin opcodes `Arg`/`Const`/`GlobalAddr` so a `Call` callee is uniformly operand[0]), `StructCfMarker` block field (ML2 stamps; never an instruction), operand/phi/succ pools (control-flow kept off operands → type-safe + O(1) CFG), `instBlock` reverse-lookup (the MIR `parentOf_`), `MirLiteralPool` (mirrors `HirLiteralPool`), `MirAttribute`/`MirBlockAttribute`/`MirFuncAttribute`. **Build-once-freeze** (optimizer rebuilds functionally; CU-scoped TypeIds survive). **create-then-fill builder** (`createBlock`+`beginBlock`) — required for forward branches; phi incomings backpatched + flushed at `finish()`; **finish-time freeze sweep** validates every pooled id references a real inst/block. 6-perspective substrate review + fix-everything pass; 87/87 ctest. ML2–ML8 ⏳. |
 | Predecessors  | ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (arena reuse). ✅ [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (input — HR1–HR11 ✅ 2026-05-26..28 (HR8 = config-driven CST→HIR lowering on c-subset, incl. a `HirLiteralPool` of decoded literal values MIR reads; HR9 enriched toy into a typed language + un-deferred arrays → `Array<T,N>` types MIR will lower; HR10 added tsql-subset lowering), HR11 ✅ done 2026-05-28 (multi-language CU lowering) — plan 09 complete; HR7's `.dsshir` text format is the sibling-discipline reference for ML4's `.dssir` / ML8's `.dsslir` round-trip). |
 | Successors    | ⏳ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) consumes LIR. ⏳ Optimizer phase (master §10) operates on MIR. ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) consumes assembled bytes + relocations. ⏳ [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) reuses MIR for shader optimization. ⏳ [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) consumes MIR with structured-CF markers. |
 | Scope         | **Bounded.** ML1–ML4 MIR. ML5–ML8 LIR. |
@@ -85,6 +85,8 @@ Every MIR `BasicBlock` carries a `StructCfMarker` tag (one of: `LoopHeader`, `Lo
 
 WASM lowering (`18-wasm-plan`) consumes these markers directly to produce `block`/`loop`/`if`/`br_if` without ever running Relooper.
 
+> **Single-role today, bitset if needed.** ML1 stores **one** `StructCfMarker` per block (a `uint8` field). A block can in principle play two structural roles at once (e.g. a `LoopExit` that is also an `IfJoin`). If a real consumer ever needs that, the field becomes a small bitset *without changing the POD layout* (it is already a full `uint8`). Kept single-role until a consumer forces it — no speculative multi-role modelling now.
+
 ### 2.4 MIR text format `.dssir`
 
 ```
@@ -103,11 +105,23 @@ Round-trippable, verifier-validated on load. Used as golden-test fixtures + as t
 
 - Every SSA value defined exactly once.
 - Every use dominated by its definition.
-- Every block has exactly one terminator.
-- Every `phi` has exactly one operand per predecessor.
-- Structured-CF markers form a consistent tree (every `IfThen` has a matching `IfElse`/`IfJoin`; every `LoopHeader` has a matching `LoopLatch`/`LoopExit`).
-- Type-consistency on every instruction.
+- Every block has exactly one terminator (the last instruction; ML1 builder seals this, ML3 re-checks the frozen module).
+- Every `phi` has exactly one operand per predecessor, and each `phi` incoming `pred` is an actual CFG predecessor of the phi's block.
+- Structured-CF markers form a consistent tree (every `IfThen` has a matching `IfElse`/`IfJoin`; every `LoopHeader` has a matching `LoopLatch`/`LoopExit`). Each function has **exactly one `EntryBlock`** and it is the function's first block; `ExitBlock`s terminate in `Return`/`Unreachable`.
+- Type-consistency on every instruction, including the **terminator-specific** checks ML1 deliberately deferred (see below): a `CondBr` condition is `Bool`/i1; a `Return`'s value-presence and type match the function's `FnSig` return (void ⇒ no value).
+- **Opcode-shape conformance**: operand count within `[min,max]`, **CFG successor count within `[min,max]`** (`Br`=1, `CondBr`=2, `Switch`≥1 (cases+default), `Return`/`Unreachable`=0), and the result-type rule (`None`/`Value`/`Optional`) honored — all three read from the ML1 `opcodeInfo()` descriptor (successor arity added to the table in ML1 alongside operand arity, so terminator builders + verifier consume the same single source of truth and never drift). The ML1 builder asserts operand and successor counts at construction; the ML3 verifier re-checks this on any frozen module (including the direct-`Mir`-ctor path the builder doesn't own).
+- **Payload validity**: a `Const`'s `payload` is a valid `MirLiteralPool` index (**ML1: enforced by construction** — `addConst` is the only path to a `Const` and always uses the pool's returned index; `addInst` rejects the `Const` opcode); an `IntrinsicCall`'s intrinsic id is registered (deferred to ML3 — MIR doesn't have its own intrinsic registry yet); an `Arg` index is within the function's parameter count (deferred to ML3 — needs `FnSig` decode via the `TypeInterner`, which the `mir` lib deliberately doesn't link).
+- No `TypeKind::Extension` types survive into MIR (all language-extension types resolved to the core lattice at the HIR→MIR boundary — ML2's invariant, re-asserted here).
 - `I_*` diagnostic codes.
+
+> **ML1→ML3 deferral note (honest triage).** The ML1 skeleton (done 2026-05-27) enforces every *structural* invariant that can be checked without a downstream layer — at construction time:
+> - one terminator per block, operand-count bounds, result-type rule, **CFG successor-count vs opcode** (all four via the `opcodeInfo()` single-source descriptor);
+> - every pooled id references a real inst/block (finish-time freeze sweep);
+> - branch targets belong to the open function;
+> - `Const.payload` is a valid literal-pool index (only path is `addConst`; `addInst` rejects the `Const` opcode);
+> - `instBlock_` lockstep with the instruction arena; one `MirModuleId` across all three arenas.
+>
+> The remaining checks above genuinely need a downstream layer and so are ML3's job (not deferred for convenience, deferred because the layer doesn't exist yet): SSA use-dominated-by-def (dominator tree), terminator type-matching (`TypeInterner` to read `FnSig`/Bool — the `mir` lib doesn't link the interner), phi-incoming-pred ⊆ CFG-predecessors (predecessor adjacency = `MirCfg`), single/first `EntryBlock` (markers populated by ML2), `Arg`-index ≤ parameter count and `IntrinsicCall`-id registered (interner / future MIR intrinsic registry), no `TypeKind::Extension` in MIR (interner). The ML3 verifier also re-runs the ML1 builder-time checks on the frozen module so a direct-`Mir`-ctor construction path is covered the same way.
 
 ### 2.6 LIR shape
 
@@ -163,7 +177,7 @@ Round-trippable. Disassembler round-trip test pins encoding (see [`13-assembler-
 
 | PR  | Title                                            | Scope |
 |-----|--------------------------------------------------|-------|
-| ML1 | MIR types, value/inst/block PODs, IDs            | Skeleton. Strong IDs (`MirValueId`, `MirBlockId`, `MirInstId`, `MirFuncId`). Arena via `08.5` SP1. **Ships `MirAttribute<T>` typedef** as `substrate::ArenaAttribute<MirArena, T>` mirroring the `NodeAttribute<T>` / `HirAttribute<T>` pattern. |
+| ML1 ✅ | MIR types, value/inst/block PODs, IDs            | **Done 2026-05-27** (`feature/mir-lir`). Strong IDs (`MirModuleId` tag + `MirInstId`/`MirBlockId`/`MirFuncId` arena ids; `MirValueId = MirInstId` alias per the fused model). Arena via `08.5` SP1 — three arenas under one module tag. **Ships `MirAttribute<T>`** as `substrate::ArenaAttribute<Mir, T>` (+ `MirBlockAttribute`/`MirFuncAttribute` on the sibling arenas) mirroring `NodeAttribute<T>` / `HirAttribute<T>`. Closed `MirOpcode` + `opcodeInfo()` table, `MirLiteralPool`, `instBlock` reverse-lookup, create-then-fill `MirBuilder` (forward branches), finish-time freeze validation. 6-perspective review; 87/87 ctest. |
 | ML2 | HIR→MIR lowering                                 | Walk HIR structured CF; emit SSA values + blocks; stamp `StructCfMarker` tags. Phi-node generation at join points. |
 | ML3 | MIR verifier + dominator-tree analysis           | All structural invariants + dominator-tree as a separate analysis result; `I_*` codes. |
 | ML4 | MIR text format + roundtrip                      | `.dssir` parser + emitter; verifier validates on load. |

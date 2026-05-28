@@ -5,6 +5,7 @@ add_subdirectory(analysis/compilation_unit)
 add_subdirectory(analysis/semantic)
 add_subdirectory(hir)
 add_subdirectory(hir/lowering)
+add_subdirectory(mir)
 add_subdirectory(lsp)
 add_subdirectory(gen)
 add_subdirectory(program)
@@ -19,6 +20,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:analysis_semantic>
     $<TARGET_OBJECTS:hir>
     $<TARGET_OBJECTS:hir_lowering>
+    $<TARGET_OBJECTS:mir>
     $<TARGET_OBJECTS:lsp>
     $<TARGET_OBJECTS:gen>
     $<TARGET_OBJECTS:program>)
