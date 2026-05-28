@@ -1576,7 +1576,20 @@ struct Lowerer {
                                        "(the lattice has no Array type yet)");
         std::optional<HirNodeId> init;
         RuleId const skip = decl.arraySuffix ? decl.arraySuffix->rule : RuleId{};
-        for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) { init = lowerExpr(c).id; break; }
+        for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) {
+            // Coerce the initializer to the declared variable type — the same
+            // discipline `lowerVarLike` applies for local VarDecls. Without
+            // this, a module global declared `int g = 1.7 + 2.5;` lands with
+            // an F64-typed init under an I32 global (mismatch), and downstream
+            // const-eval (plan 12.5) folds the float arithmetic but skips the
+            // narrowing the runtime would perform. Language-blind: `coerce`
+            // checks arithmetic kinds via the lattice and is a no-op when
+            // already at target type.
+            E const initE   = lowerExpr(c);
+            E const coerced = coerce(initE, type);
+            init = coerced.id;
+            break;
+        }
         return track(builder.makeGlobal(type, sym.v, init), node);
     }
 

@@ -378,6 +378,35 @@ TEST(MirLoweringCSubset, GlobalWithUnaryNegLiteralFoldsToConstant) {
     EXPECT_EQ(m.moduleFuncCount(), 0u);
 }
 
+// CE5 wire-up: a float-typed initializer expression folds end-to-end.
+// `int g = 1.7 + 2.5;` is parsed as two F64 FloatLiterals; HR's
+// commonType-driven coercion runs the BinaryOp in F64, then
+// `lowerTopLevel`'s coerce wraps the result in Cast(F64→I32) for the
+// declared int target; CE5's engine folds the float add (4.2) and the
+// float→int truncation (toward zero → 4), so the global lands as a
+// constant-init — no `__module_init__` synthesized. Locks the
+// load-bearing CE5 contract MIR-globals depends on: `allowFloat=true`
+// makes float-arithmetic globals fold instead of degrading to
+// runtime-init.
+TEST(MirLoweringCSubset, GlobalWithFloatArithmeticInitializerFoldsThroughCastToInt) {
+    auto L = lowerCSubset("int g = 1.7 + 2.5;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "float-arithmetic initializer must fold via CE5 — no __module_init__";
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    EXPECT_EQ(m.moduleFuncCount(), 0u);
+    // 1.7 + 2.5 = 4.2; Cast(F64→I32) truncates toward zero → 4.
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit.value))
+        << "HR coerce must wrap F64 init in Cast(F64→I32) for int target; "
+           "CE5 must fold through that Cast";
+    EXPECT_EQ(std::get<std::int64_t>(lit.value), 4);
+}
+
 // A function writing to a module global lowers the write as
 // `GlobalAddr(sym) → Store(rhs, addr)`. Pins the lvalue-side of the
 // new globals resolution.
