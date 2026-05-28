@@ -918,6 +918,36 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         }
         return inner;
     }
+    if (k == HirKind::ConstructAggregate) {
+        // D5.3: fold a struct / union / array aggregate construction.
+        // The node's children are the POSITIONAL element expressions
+        // (designators and zero-fills already normalized at HIR-
+        // lowering time per HIR's positional discipline). Each child
+        // must fold independently; the engine assembles their values
+        // into a recursive `HirAggregateValue` arm of `HirLiteralValue`.
+        // The first failing child propagates verbatim (failure code +
+        // blame anchor stays at the child that didn't fold), so
+        // MIR-globals' classify path can route a partially-non-constant
+        // aggregate to runtime-init while surfacing the precise refusal
+        // reason to consumers. `core` is read from the aggregate's
+        // TypeId (Struct / Union / Array — the result-type tag the
+        // engine's discipline requires).
+        TypeId const aggTy = hir.typeId(expr);
+        if (!aggTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        auto kids = hir.children(expr);
+        HirAggregateValue agg;
+        agg.fields.reserve(kids.size());
+        for (HirNodeId child : kids) {
+            ConstEvalResult fr = evalImpl(hir, interner, literals, child,
+                                          env, options, visitedSyms);
+            if (!fr.value.has_value()) return fr;   // propagate failure verbatim
+            agg.fields.push_back(std::move(*fr.value));
+        }
+        HirLiteralValue folded;
+        folded.core  = interner.kind(aggTy);
+        folded.value = std::move(agg);
+        return ok(std::move(folded));
+    }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
 }
 

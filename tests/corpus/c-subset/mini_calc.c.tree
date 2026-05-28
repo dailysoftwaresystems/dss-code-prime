@@ -26,9 +26,10 @@ rule:root
       rule:topLevelDeclTail
         rule:varDeclTail
           tok:"="
-          rule:expression
-            rule:operand
-              tok:"0"
+          rule:initValue
+            rule:expression
+              rule:operand
+                tok:"0"
           tok:";"
   rule:topLevel
     rule:topLevelDecl
@@ -266,9 +267,10 @@ rule:root
                       tok:"int"
                   tok:"total"
                   tok:"="
-                  rule:expression
-                    rule:operand
-                      tok:"0"
+                  rule:initValue
+                    rule:expression
+                      rule:operand
+                        tok:"0"
                 tok:";"
             rule:statement
               rule:varDecl
@@ -278,9 +280,10 @@ rule:root
                       tok:"int"
                   tok:"i"
                   tok:"="
-                  rule:expression
-                    rule:operand
-                      tok:"0"
+                  rule:initValue
+                    rule:expression
+                      rule:operand
+                        tok:"0"
                 tok:";"
             rule:statement
               rule:whileStmt
@@ -554,9 +557,10 @@ rule:root
                       tok:"int"
                   tok:"count"
                   tok:"="
-                  rule:expression
-                    rule:operand
-                      tok:"0"
+                  rule:initValue
+                    rule:expression
+                      rule:operand
+                        tok:"0"
                 tok:";"
             rule:statement
               rule:varDecl
@@ -566,9 +570,10 @@ rule:root
                       tok:"int"
                   tok:"v"
                   tok:"="
-                  rule:expression
-                    rule:operand
-                      tok:"value"
+                  rule:initValue
+                    rule:expression
+                      rule:operand
+                        tok:"value"
                 tok:";"
             rule:statement
               rule:whileStmt
@@ -592,15 +597,16 @@ rule:root
                         rule:expression
                           rule:binaryExpr
                             rule:operand
-                              tok:"("
-                              rule:expression
-                                rule:binaryExpr
-                                  rule:operand
-                                    tok:"v"
-                                  tok:"&"
-                                  rule:operand
-                                    tok:"1"
-                              tok:")"
+                              rule:parenExpr
+                                tok:"("
+                                rule:expression
+                                  rule:binaryExpr
+                                    rule:operand
+                                      tok:"v"
+                                    tok:"&"
+                                    rule:operand
+                                      tok:"1"
+                                tok:")"
                             tok:"!="
                             rule:operand
                               tok:"0"
@@ -835,13 +841,14 @@ rule:root
                       tok:"int"
                   tok:"s"
                   tok:"="
-                  rule:expression
-                    rule:binaryExpr
-                      rule:operand
-                        tok:"a"
-                      tok:"+"
-                      rule:operand
-                        tok:"b"
+                  rule:initValue
+                    rule:expression
+                      rule:binaryExpr
+                        rule:operand
+                          tok:"a"
+                        tok:"+"
+                        rule:operand
+                          tok:"b"
                 tok:";"
             rule:statement
               rule:ifStmt
@@ -940,27 +947,28 @@ rule:root
                       tok:"int"
                   tok:"t1"
                   tok:"="
-                  rule:expression
-                    rule:binaryExpr
-                      rule:postfixExpr
-                        rule:operand
-                          tok:"square"
-                        tok:"("
-                        rule:argList
-                          rule:expression
-                            rule:operand
-                              tok:"a"
-                        tok:")"
-                      tok:"+"
-                      rule:postfixExpr
-                        rule:operand
-                          tok:"square"
-                        tok:"("
-                        rule:argList
-                          rule:expression
-                            rule:operand
-                              tok:"b"
-                        tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:binaryExpr
+                        rule:postfixExpr
+                          rule:operand
+                            tok:"square"
+                          tok:"("
+                          rule:argList
+                            rule:expression
+                              rule:operand
+                                tok:"a"
+                          tok:")"
+                        tok:"+"
+                        rule:postfixExpr
+                          rule:operand
+                            tok:"square"
+                          tok:"("
+                          rule:argList
+                            rule:expression
+                              rule:operand
+                                tok:"b"
+                          tok:")"
                 tok:";"
             rule:statement
               rule:varDecl
@@ -970,27 +978,28 @@ rule:root
                       tok:"int"
                   tok:"t2"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"add"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"t1"
-                        tok:","
-                        rule:expression
-                          rule:postfixExpr
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"add"
+                        tok:"("
+                        rule:argList
+                          rule:expression
                             rule:operand
-                              tok:"square"
-                            tok:"("
-                            rule:argList
-                              rule:expression
-                                rule:operand
-                                  tok:"c"
-                            tok:")"
-                      tok:")"
+                              tok:"t1"
+                          tok:","
+                          rule:expression
+                            rule:postfixExpr
+                              rule:operand
+                                tok:"square"
+                              tok:"("
+                              rule:argList
+                                rule:expression
+                                  rule:operand
+                                    tok:"c"
+                              tok:")"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:varDecl
@@ -1000,16 +1009,17 @@ rule:root
                       tok:"int"
                   tok:"t3"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"bit_count"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"t2"
-                      tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"bit_count"
+                        tok:"("
+                        rule:argList
+                          rule:expression
+                            rule:operand
+                              tok:"t2"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:exprStmt
@@ -1070,20 +1080,21 @@ rule:root
                       tok:"int"
                   tok:"sum"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"sum_array"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"arr"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"10"
-                      tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"sum_array"
+                        tok:"("
+                        rule:argList
+                          rule:expression
+                            rule:operand
+                              tok:"arr"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"10"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:exprStmt
@@ -1109,38 +1120,39 @@ rule:root
                       tok:"int"
                   tok:"m"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"max3"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"sum"
-                        tok:","
-                        rule:expression
-                          rule:postfixExpr
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"max3"
+                        tok:"("
+                        rule:argList
+                          rule:expression
                             rule:operand
-                              tok:"fact"
-                            tok:"("
-                            rule:argList
-                              rule:expression
-                                rule:operand
-                                  tok:"5"
-                            tok:")"
-                        tok:","
-                        rule:expression
-                          rule:postfixExpr
-                            rule:operand
-                              tok:"fib"
-                            tok:"("
-                            rule:argList
-                              rule:expression
-                                rule:operand
-                                  tok:"8"
-                            tok:")"
-                      tok:")"
+                              tok:"sum"
+                          tok:","
+                          rule:expression
+                            rule:postfixExpr
+                              rule:operand
+                                tok:"fact"
+                              tok:"("
+                              rule:argList
+                                rule:expression
+                                  rule:operand
+                                    tok:"5"
+                              tok:")"
+                          tok:","
+                          rule:expression
+                            rule:postfixExpr
+                              rule:operand
+                                tok:"fib"
+                              tok:"("
+                              rule:argList
+                                rule:expression
+                                  rule:operand
+                                    tok:"8"
+                              tok:")"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:varDecl
@@ -1150,24 +1162,25 @@ rule:root
                       tok:"int"
                   tok:"c"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"clamp"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"m"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"0"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"100"
-                      tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"clamp"
+                        tok:"("
+                        rule:argList
+                          rule:expression
+                            rule:operand
+                              tok:"m"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"0"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"100"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:varDecl
@@ -1177,24 +1190,25 @@ rule:root
                       tok:"int"
                   tok:"s"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"saturating_add"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"c"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"50"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"200"
-                      tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"saturating_add"
+                        tok:"("
+                        rule:argList
+                          rule:expression
+                            rule:operand
+                              tok:"c"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"50"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"200"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:returnStmt

@@ -28,6 +28,26 @@
 
 namespace dss {
 
+struct HirLiteralValue;
+
+// Aggregate literal: a struct / union / array constant value, recursively
+// composed of field/element `HirLiteralValue`s in positional declaration
+// order. Produced by the const-eval engine (plan 12.5) when folding a
+// `HirKind::ConstructAggregate` whose every child folds to a constant.
+// MIR-globals reads this to materialize an aggregate `constInit` (D5.3
+// closes the prior "aggregate globals always route to runtime-init"
+// gap). The recursive shape mirrors the HIR `ConstructAggregate` tree
+// exactly — nested aggregates are nested `HirAggregateValue`s.
+//
+// LWG 2596 makes `std::vector<HirLiteralValue>` legal even though
+// `HirLiteralValue` is incomplete at the wrapper-struct point: vector
+// accepts incomplete element types so long as the element type is
+// complete before any vector member is instantiated, which it is by
+// the time anything constructs or reads an aggregate value.
+struct HirAggregateValue {
+    std::vector<HirLiteralValue> fields;
+};
+
 struct HirLiteralValue {
     // `monostate` = a literal whose value could not be decoded (a malformed
     // token); the lowering still emits the node + a diagnostic so analysis
@@ -53,8 +73,14 @@ struct HirLiteralValue {
     //     (the node's typeId is Array<Char,N+1>; disambiguate char-vs-
     //     string by the variant arm, NOT by `core` which is identical
     //     in both cases).
+    //   - `core` ∈ {Struct, Union, Array}: held in the `HirAggregateValue`
+    //     arm — the recursive `fields` vector carries each element's
+    //     own `HirLiteralValue`, positional declaration order, all
+    //     elements present (omitted struct fields are zero-filled at
+    //     lowering time; HIR's positional discipline holds). D5.3.
     //   - `core == Void`: held as `std::monostate` (decode failure).
-    std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string> value;
+    std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string,
+                 HirAggregateValue> value;
     TypeKind core = TypeKind::Void;
 };
 

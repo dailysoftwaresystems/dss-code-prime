@@ -268,10 +268,12 @@
     "varDeclTail": {
       "sequence": [
         { "optional": "arrayDeclSuffix" },
-        { "optional": { "sequence": [ "AssignOp", "expression" ] } },
+        { "optional": { "sequence": [ "AssignOp", "initValue" ] } },
         "EndStatement"
       ]
     },
+
+    "initValue": { "alt": [ "braceInitList", "expression" ] },
 
     "arrayDeclSuffix": {
       "sequence": [
@@ -310,7 +312,7 @@
         "typeRefAllowingStruct",
         "Identifier",
         { "optional": "arrayDeclSuffix" },
-        { "optional": { "sequence": [ "AssignOp", "expression" ] } }
+        { "optional": { "sequence": [ "AssignOp", "initValue" ] } }
       ]
     },
 
@@ -442,9 +444,47 @@
         "FloatLiteral",
         "stringLiteralExpr",
         "charLiteralExpr",
-        { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
+        "compoundLiteralExpr",
+        "parenExpr"
+      ],
+      "speculative": true,
+      "lookahead": 8
+    },
+
+    "parenExpr": { "sequence": [ "ParenOpen", "expression", "ParenClose" ] },
+
+    "compoundLiteralExpr": {
+      "sequence": [ "ParenOpen", "typeRefAllowingStruct", "ParenClose", "braceInitList" ]
+    },
+
+    "braceInitList": {
+      "sequence": [
+        "BlockOpen",
+        { "optional": {
+            "sequence": [
+              "initElement",
+              { "repeat": { "sequence": [ "Comma", { "optional": "initElement" } ] } }
+            ]
+        }},
+        "BlockClose"
       ]
     },
+
+    "initElement": {
+      "alt": [
+        { "sequence": [
+            "designator",
+            { "repeat": "designator" },
+            "AssignOp",
+            "expression"
+        ]},
+        "expression"
+      ]
+    },
+
+    "designator": { "alt": [ "designatedField", "designatedIndex" ] },
+    "designatedField": { "sequence": [ "DotOp", "Identifier" ] },
+    "designatedIndex": { "sequence": [ "BracketOpen", "expression", "BracketClose" ] },
 
     "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
     "stringLiteralExpr": { "sequence": [ "StringStart", "StringLiteral" ] },
@@ -559,6 +599,12 @@
     "postfixExprRule": "postfixExpr",
     "ternaryExprRule": "ternaryExpr",
     "operandRule":     "operand",
+
+    "braceInitListRule":   "braceInitList",
+    "initElementRule":     "initElement",
+    "designatedFieldRule": "designatedField",
+    "designatedIndexRule": "designatedIndex",
+    "compoundLiteralRule": "compoundLiteralExpr",
 
     "globalsConstEval": { "allowFloat": true },
 

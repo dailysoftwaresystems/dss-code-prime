@@ -835,32 +835,37 @@ TEST(ParserCSubsetSmoke, ParenWrappedPostfixChainNests) {
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
 
-    // The outer `expression` contains an `operand` for the paren
-    // group; the inner `expression` (under the paren `operand`)
-    // contains the chained postfixExpr structure.
+    // The outer `expression` contains an `operand` whose body is the
+    // named `parenExpr` rule (extracted from the prior anonymous
+    // `(expression)` sequence when c-subset's `operand` became
+    // `speculative: true` for D5.3 — speculative-alt rule-branches
+    // must be named so `candidateBranches` enumerates them). The
+    // inner `expression` (under `parenExpr`) contains the chained
+    // postfixExpr structure.
     const NodeId outerExpr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(outerExpr, NodeId{});
     constexpr std::string_view kExpected =
         "rule:expression\n"
         "  rule:operand\n"
-        "    tok:\"(\"\n"
-        "    rule:expression\n"
-        "      rule:postfixExpr\n"
+        "    rule:parenExpr\n"
+        "      tok:\"(\"\n"
+        "      rule:expression\n"
         "        rule:postfixExpr\n"
-        "          rule:operand\n"
-        "            tok:\"f\"\n"
-        "          tok:\"(\"\n"
-        "          rule:argList\n"
-        "            rule:expression\n"
-        "              rule:operand\n"
-        "                tok:\"a\"\n"
-        "          tok:\")\"\n"
-        "        tok:\"[\"\n"
-        "        rule:expression\n"
-        "          rule:operand\n"
-        "            tok:\"i\"\n"
-        "        tok:\"]\"\n"
-        "    tok:\")\"\n";
+        "          rule:postfixExpr\n"
+        "            rule:operand\n"
+        "              tok:\"f\"\n"
+        "            tok:\"(\"\n"
+        "            rule:argList\n"
+        "              rule:expression\n"
+        "                rule:operand\n"
+        "                  tok:\"a\"\n"
+        "            tok:\")\"\n"
+        "          tok:\"[\"\n"
+        "          rule:expression\n"
+        "            rule:operand\n"
+        "              tok:\"i\"\n"
+        "          tok:\"]\"\n"
+        "      tok:\")\"\n";
     EXPECT_EQ(prettyPrintSubtree(t, outerExpr), kExpected);
 }
 
@@ -932,20 +937,24 @@ TEST(ParserCSubsetSmoke, ParenGroupingForcesOuterPrecedence) {
     ASSERT_NE(expr, NodeId{});
 
     // Outer is `* c`; LHS of `*` is the parenthesized `(a + b)` which
-    // descends through `operand → ( expression ) → binaryExpr[a,+,b]`.
+    // descends through `operand → parenExpr → ( expression ) →
+    // binaryExpr[a,+,b]`. (`parenExpr` is the named rule the operand
+    // alt routes to under `speculative: true` — the engine's rule-
+    // branch enumeration requires named rules, not inline sequences.)
     const std::string_view expected =
         "rule:expression\n"
         "  rule:binaryExpr\n"
         "    rule:operand\n"
-        "      tok:\"(\"\n"
-        "      rule:expression\n"
-        "        rule:binaryExpr\n"
-        "          rule:operand\n"
-        "            tok:\"a\"\n"
-        "          tok:\"+\"\n"
-        "          rule:operand\n"
-        "            tok:\"b\"\n"
-        "      tok:\")\"\n"
+        "      rule:parenExpr\n"
+        "        tok:\"(\"\n"
+        "        rule:expression\n"
+        "          rule:binaryExpr\n"
+        "            rule:operand\n"
+        "              tok:\"a\"\n"
+        "            tok:\"+\"\n"
+        "            rule:operand\n"
+        "              tok:\"b\"\n"
+        "        tok:\")\"\n"
         "    tok:\"*\"\n"
         "    rule:operand\n"
         "      tok:\"c\"\n";

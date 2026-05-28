@@ -19,13 +19,26 @@
 
 namespace dss {
 
+struct MirLiteralValue;
+
+// Aggregate literal: mirror of `HirAggregateValue` on the MIR side.
+// Produced by MIR-globals when the HIR const-eval folds an aggregate
+// `ConstructAggregate` (D5.3) — module-scope `struct Point p = {1, 2};`
+// lands as a const-init rather than degrading to a runtime-init
+// `__module_init__` synthesis. The recursive shape mirrors the HIR side.
+struct MirAggregateValue {
+    std::vector<MirLiteralValue> fields;
+};
+
 struct MirLiteralValue {
     // `monostate` = a literal whose value is unknown (carried so a malformed
     // source still lowers + diagnoses). `core` is a denormalized hint enabling
     // pool-level inspection without consulting the interner; the Const
     // instruction's typeId is the authority — disambiguate char vs string by the
-    // VARIANT ARM (uint64 vs string), never by `core`.
-    std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string> value;
+    // VARIANT ARM (uint64 vs string), never by `core`. D5.3 adds the
+    // `MirAggregateValue` arm for `core` ∈ {Struct, Union, Array}.
+    std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string,
+                 MirAggregateValue> value;
     TypeKind core = TypeKind::Void;
 };
 

@@ -16,6 +16,28 @@ namespace dss {
 
 namespace {
 
+// HIR→MIR literal value conversion. The two pools' value variants are
+// structurally parallel — scalar arms (monostate / bool / int64 / uint64 /
+// double / string) copy verbatim; the aggregate arm (`HirAggregateValue`
+// → `MirAggregateValue`, D5.3) recurses field-by-field so a folded
+// aggregate `constInit` carries the same shape on the MIR side.
+[[nodiscard]] MirLiteralValue toMirLiteral(HirLiteralValue const& src) {
+    MirLiteralValue dst;
+    dst.core = src.core;
+    std::visit([&](auto const& arm) {
+        using T = std::decay_t<decltype(arm)>;
+        if constexpr (std::is_same_v<T, HirAggregateValue>) {
+            MirAggregateValue agg;
+            agg.fields.reserve(arm.fields.size());
+            for (auto const& f : arm.fields) agg.fields.push_back(toMirLiteral(f));
+            dst.value = std::move(agg);
+        } else {
+            dst.value = arm;
+        }
+    }, src.value);
+    return dst;
+}
+
 // One transient per `lowerToMir` call. The HirLowering analog is `Lowerer`
 // in cst_to_hir.cpp; this is much smaller because MIR is structurally
 // simpler than CST (no schema-driven shape dispatch, no per-language
@@ -211,10 +233,7 @@ struct Lowerer {
                 // and emit a Const instruction.
                 std::uint32_t const idx = hir.payload(node);
                 HirLiteralValue const& src = literals.at(idx);
-                MirLiteralValue dst;
-                dst.value = src.value;
-                dst.core  = src.core;
-                return mir.addConst(std::move(dst), t);
+                return mir.addConst(toMirLiteral(src), t);
             }
             case HirKind::Ref: {
                 // Resolution order:
@@ -1426,10 +1445,7 @@ struct Lowerer {
                 ConstEvalResult const r = evaluateConstant(
                     hir, interner, literals, *initN, env, opts);
                 if (r.value.has_value()) {
-                    MirLiteralValue lit;
-                    lit.value = r.value->value;
-                    lit.core  = r.value->core;
-                    pg.constInit = std::move(lit);
+                    pg.constInit = toMirLiteral(*r.value);
                 } else {
                     pg.runtimeInit = *initN;
                 }

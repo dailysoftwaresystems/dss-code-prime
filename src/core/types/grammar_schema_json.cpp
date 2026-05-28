@@ -4459,6 +4459,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("operandRule",     cfg.operandRule,     cfg.operandRuleName);
             readExprRule("flatExprRule",     cfg.flatExprRule,     cfg.flatExprRuleName);
             readExprRule("flatBinaryOpRule", cfg.flatBinaryOpRule, cfg.flatBinaryOpRuleName);
+            // D5.3 brace-init + designated-initializer + compound-
+            // literal rule ids. Each optional — absent ⇒ language has
+            // no such form; the engine simply never matches.
+            readExprRule("braceInitListRule",   cfg.braceInitListRule,   cfg.braceInitListRuleName);
+            readExprRule("initElementRule",     cfg.initElementRule,     cfg.initElementRuleName);
+            readExprRule("designatedFieldRule", cfg.designatedFieldRule, cfg.designatedFieldRuleName);
+            readExprRule("designatedIndexRule", cfg.designatedIndexRule, cfg.designatedIndexRuleName);
+            readExprRule("compoundLiteralRule", cfg.compoundLiteralRule, cfg.compoundLiteralRuleName);
 
             // ── HR10: extensionKinds [{ name, lang }] ──
             if (hl.contains("extensionKinds")) {
