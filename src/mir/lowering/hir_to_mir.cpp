@@ -3,11 +3,13 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "hir/hir_op.hpp"
 
+#include <array>
 #include <format>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -20,14 +22,22 @@ namespace {
 struct Lowerer {
     Hir const&            hir;
     HirLiteralPool const& literals;
-    TypeInterner const&   interner;
+    TypeInterner&         interner;
     DiagnosticReporter&   reporter;
     HirSourceMap const*   sourceMap;   // optional — diagnostics carry spans when bound
     MirBuilder            mir;
-    // Within one function: HIR param/var `SymbolId.v` → MirInstId producer.
-    // Addressable locals (var-with-storage, assignment targets, AddressOf) are
-    // tracked in plan 12 D5/ML2-prelude — see `.plans/12-mir-lir` blocker list.
+    // Within one function: HIR `SymbolId.v` → SSA value producer. Used for
+    // params that are NOT address-taken (those stay as raw `Arg` instructions);
+    // an entry is set iff the symbol resolves as a plain rvalue. A symbol is
+    // EITHER in `symbolToValue` (SSA-only) OR in `addressableLocal` (slot-
+    // backed), never both — `Ref` lookup checks alloca first and falls back.
     std::unordered_map<std::uint32_t, MirInstId> symbolToValue;
+    // HIR `SymbolId.v` → its entry-block `Alloca` instruction. Populated by
+    // `VarDecl` lowering (every body-local var gets a slot) and by the param
+    // slot-promotion pre-pass (params whose address is taken via `AddressOf`).
+    // `Ref` reads emit `Load(alloca)`; `AssignStmt` writes emit `Store(value,
+    // alloca)`; `AddressOf(Ref(sym))` returns the alloca itself.
+    std::unordered_map<std::uint32_t, MirInstId> addressableLocal;
     // Set of module-level function symbols. A pre-pass populates this so a
     // direct `Call` whose callee is a `Ref` to a forward-declared function
     // resolves cleanly. The actual MirFuncId is irrelevant during lowering —
@@ -116,16 +126,23 @@ struct Lowerer {
             }
             case HirKind::Ref: {
                 // Resolution order:
-                //   1. Local SSA value (param / var-with-init scalar) — return
-                //      its already-emitted MirInstId.
-                //   2. Module function — emit `GlobalAddr` to the symbol. The
+                //   1. Addressable local (slot-backed: body-VarDecl or address-
+                //      taken param) — emit `Load(alloca)`; the value's type IS
+                //      the HIR node's type (`t`), which is the pointee type.
+                //   2. Local SSA value (param NOT address-taken / pure-SSA
+                //      temporary) — return its already-emitted MirInstId.
+                //   3. Module function — emit `GlobalAddr` to the symbol. The
                 //      result type IS the FnSig (matching HIR's convention
                 //      where Ref-to-function's typeId is the FnSig directly);
                 //      MIR's Call accepts that uniformly.
-                //   3. Anything else (globals/externs/storage-bearing locals)
-                //      → unbound at this lowering tier; see plan 12 D5 / ML2-
-                //      prelude (addressable locals) and plan 11 FFI (externs).
+                //   4. Anything else (globals/externs) → unbound at this
+                //      lowering tier; see plan 12 (globals) / plan 11 (FFI).
                 std::uint32_t const sym = hir.payload(node);
+                if (auto it = addressableLocal.find(sym);
+                    it != addressableLocal.end()) {
+                    std::array<MirInstId, 1> ops{it->second};
+                    return mir.addInst(MirOpcode::Load, ops, t);
+                }
                 if (auto it = symbolToValue.find(sym); it != symbolToValue.end()) {
                     return it->second;
                 }
@@ -134,7 +151,8 @@ struct Lowerer {
                 }
                 unsupported(node,
                     std::format("HIR Ref to unbound symbol {} (not a local "
-                                "SSA value and not a module function)", sym));
+                                "SSA value, addressable local, or module "
+                                "function)", sym));
                 return InvalidMirInst;
             }
             case HirKind::UnaryOp: {
@@ -345,6 +363,65 @@ struct Lowerer {
                 std::array<MirInstId, 2> operands{lhs, rhs};
                 return mir.addInst(mop, operands, t);
             }
+            case HirKind::AddressOf: {
+                // children: [operand]. Two lvalue shapes lower here:
+                //   - Ref to an addressable local → return the local's alloca
+                //     directly (no extra instruction; the alloca IS the
+                //     address). Param-AddressOf works because the entry-block
+                //     slot-promotion pre-pass already produced an alloca for
+                //     any param whose address is taken.
+                //   - Deref(ptr) → return `ptr` (the address-of-dereference
+                //     cancels by construction).
+                // Other lvalue shapes (MemberAccess/Index/…) are unsupported
+                // at this lowering tier.
+                auto kids = hir.children(node);
+                if (kids.size() != 1) {
+                    unsupported(node, "malformed AddressOf (expect 1 operand)");
+                    return InvalidMirInst;
+                }
+                HirNodeId const inner = kids[0];
+                HirKind   const ik    = hir.kind(inner);
+                if (ik == HirKind::Ref) {
+                    std::uint32_t const sym = hir.payload(inner);
+                    if (auto it = addressableLocal.find(sym);
+                        it != addressableLocal.end()) {
+                        return it->second;
+                    }
+                    unsupported(node, std::format(
+                        "AddressOf(Ref) of non-addressable symbol {} (param "
+                        "slot-promotion pre-pass missed this — internal bug)",
+                        sym));
+                    return InvalidMirInst;
+                }
+                if (ik == HirKind::Deref) {
+                    // & * p  ≡  p — just lower p.
+                    auto innerKids = hir.children(inner);
+                    if (innerKids.size() != 1) {
+                        unsupported(node, "malformed Deref under AddressOf");
+                        return InvalidMirInst;
+                    }
+                    return lowerExpr(innerKids[0]);
+                }
+                unsupported(node, std::format(
+                    "AddressOf operand kind ordinal {} not supported by this "
+                    "lowering (only Ref-to-addressable-local or Deref)",
+                    static_cast<unsigned>(ik)));
+                return InvalidMirInst;
+            }
+            case HirKind::Deref: {
+                // children: [pointer]. Lower the pointer expression, then
+                // emit `Load(ptr)` with the HIR node's type as the result
+                // (which is the pointee — HIR already resolved it).
+                auto kids = hir.children(node);
+                if (kids.size() != 1) {
+                    unsupported(node, "malformed Deref (expect 1 operand)");
+                    return InvalidMirInst;
+                }
+                MirInstId const ptr = lowerExpr(kids[0]);
+                if (!ptr.valid()) return InvalidMirInst;
+                std::array<MirInstId, 1> ops{ptr};
+                return mir.addInst(MirOpcode::Load, ops, t);
+            }
             default: break;
         }
         unsupported(node,
@@ -368,6 +445,82 @@ struct Lowerer {
         if (mir.isBlockUnopened(b)) {
             mir.beginBlock(b);
             mir.addUnreachable();
+        }
+    }
+
+    // Materialize an `Alloca` slot for `sym` of declared type `ty` and
+    // register it in `addressableLocal`. The slot's MIR type is `ptr<ty>`
+    // (interned on demand). Aborts via diagnostic on a duplicate registration
+    // (HIR verifier disallows redeclaration; a duplicate here is an internal
+    // bug). Returns the alloca's MirInstId, or `InvalidMirInst` on error.
+    [[nodiscard]] MirInstId allocaForLocal(SymbolId sym, TypeId ty) {
+        // Enforce the documented EITHER/OR invariant at the bind site: a
+        // symbol must not already live in `symbolToValue` (SSA) when we
+        // give it a storage slot, nor be double-allocated. The HIR verifier
+        // owns the no-redeclaration rule; this is the load-bearing local
+        // assertion that catches any future invariant-break loud.
+        if (addressableLocal.contains(sym.v) || symbolToValue.contains(sym.v)) {
+            unsupported(HirNodeId{}, std::format(
+                "duplicate slot/SSA binding for symbol {} (internal bug — HIR "
+                "verifier should have rejected the redeclaration, or the param "
+                "slot-promotion pre-pass over-classified)", sym.v));
+            return InvalidMirInst;
+        }
+        TypeId const ptrTy = interner.pointer(ty);
+        MirInstId const a = mir.addInst(MirOpcode::Alloca, {}, ptrTy);
+        addressableLocal[sym.v] = a;
+        return a;
+    }
+
+    // Resolve the ADDRESS of an lvalue expression — the pointer value a
+    // `Store` should write into (or an `AddressOf` should yield directly).
+    // Distinct from `lowerExpr` which produces the RVALUE of the lvalue
+    // (`Load(ptr)`). Cycle 3b supports two lvalue shapes — `Ref(addressable-
+    // local)` and `Deref(ptr)`. Returns `InvalidMirInst` on failure.
+    [[nodiscard]] MirInstId lowerLvalueAddress(HirNodeId node) {
+        HirKind const k = hir.kind(node);
+        if (k == HirKind::Ref) {
+            std::uint32_t const sym = hir.payload(node);
+            if (auto it = addressableLocal.find(sym);
+                it != addressableLocal.end()) {
+                return it->second;
+            }
+            unsupported(node, std::format(
+                "assignment to symbol {} which has no storage slot "
+                "(non-addressable param or unbound)", sym));
+            return InvalidMirInst;
+        }
+        if (k == HirKind::Deref) {
+            auto kids = hir.children(node);
+            if (kids.size() != 1) {
+                unsupported(node, "malformed Deref as lvalue");
+                return InvalidMirInst;
+            }
+            return lowerExpr(kids[0]);
+        }
+        unsupported(node, std::format(
+            "assignment target kind ordinal {} not supported by this "
+            "lowering (only Ref-to-addressable-local or Deref)",
+            static_cast<unsigned>(k)));
+        return InvalidMirInst;
+    }
+
+    // Recursively collect into `out` the set of `SymbolId.v`s that appear as
+    // `AddressOf(Ref(sym))` anywhere under `node`. Drives entry-block slot-
+    // promotion for params (a param whose address is taken must live in
+    // memory, not as a pure SSA `Arg` value). Walks every child; HIR is
+    // already verified well-formed before this pass.
+    void collectAddressTakenSymbols(HirNodeId node,
+                                    std::unordered_set<std::uint32_t>& out) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::AddressOf) {
+            auto kids = hir.children(node);
+            if (kids.size() == 1 && hir.kind(kids[0]) == HirKind::Ref) {
+                out.insert(hir.payload(kids[0]));
+            }
+        }
+        for (HirNodeId child : hir.children(node)) {
+            collectAddressTakenSymbols(child, out);
         }
     }
 
@@ -398,6 +551,46 @@ struct Lowerer {
                 HirNodeId const expr = hir.exprStmtExpr(node);
                 MirInstId const v = lowerExpr(expr);
                 return v.valid();
+            }
+            case HirKind::VarDecl: {
+                // Allocate the local's slot on the current block. The declared
+                // type drives the alloca's pointer result type via the lattice.
+                // If the var has an initializer, evaluate it and store into
+                // the slot. Body-locals are slot-backed: reads emit
+                // `Load(alloca)`, writes emit `Store(value, alloca)`.
+                TypeId   const ty  = hir.varDeclType(node);
+                SymbolId const sym = hir.varDeclSymbol(node);
+                if (!ty.valid() || !sym.valid()) {
+                    unsupported(node, "VarDecl with invalid type/symbol "
+                                       "(HIR verifier should have flagged)");
+                    return false;
+                }
+                MirInstId const alloca = allocaForLocal(sym, ty);
+                if (!alloca.valid()) return false;
+                if (auto initN = hir.varDeclInit(node); initN.has_value()) {
+                    MirInstId const initVal = lowerExpr(*initN);
+                    if (!initVal.valid()) return false;
+                    std::array<MirInstId, 2> ops{initVal, alloca};
+                    mir.addInst(MirOpcode::Store, ops);
+                }
+                return true;
+            }
+            case HirKind::AssignStmt: {
+                // Lower the rhs first (its evaluation order is HIR-fixed), then
+                // resolve the lhs's storage and emit `Store(rhs, ptr)`. Two
+                // lvalue shapes lower here:
+                //   - `Ref(sym)` where sym is an addressable local → store
+                //     into its alloca.
+                //   - `Deref(ptr)` → store into the lowered pointer.
+                HirNodeId const targetN = hir.assignTarget(node);
+                HirNodeId const valueN  = hir.assignValue(node);
+                MirInstId const rhs = lowerExpr(valueN);
+                if (!rhs.valid()) return false;
+                MirInstId const ptr = lowerLvalueAddress(targetN);
+                if (!ptr.valid()) return false;
+                std::array<MirInstId, 2> ops{rhs, ptr};
+                mir.addInst(MirOpcode::Store, ops);
+                return true;
             }
             case HirKind::IfStmt: {
                 // Diamond: entry → CondBr(cond, then, else?), then → Br(join),
@@ -635,12 +828,30 @@ struct Lowerer {
             return false;
         }
 
+        // Per-function context reset: each function owns its own SSA/alloca
+        // bindings — entries from the previous function are stale.
+        symbolToValue.clear();
+        addressableLocal.clear();
+
+        // Pre-pass: scan the body to find params (and locals) whose address
+        // is taken. Address-taken params must live in memory (alloca-backed),
+        // not as pure SSA `Arg` values — otherwise the address would be
+        // undefined. Body locals always get a slot at their `VarDecl`, so
+        // the pre-pass result is only consulted for the param loop below.
+        HirNodeId const body = hir.functionBody(node);
+        std::unordered_set<std::uint32_t> addressTaken;
+        collectAddressTakenSymbols(body, addressTaken);
+
         // From here on a block is open — any return-false MUST seal it.
         mir.addFunction(signature, symbol);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 
-        // Params: one `Arg` instruction per param, in declaration order.
+        // Params: one `Arg` instruction per param, in declaration order. If
+        // the param's address is ever taken in the body, ALSO allocate a slot
+        // and store the arg into it — every read of that symbol then goes
+        // through `Load(alloca)`. Otherwise the param stays in the pure-SSA
+        // `symbolToValue` map.
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
             // A param is a VarDecl whose typeId carries the param's type;
@@ -648,10 +859,19 @@ struct Lowerer {
             SymbolId const sym = hir.varDeclSymbol(p);
             TypeId const ty = paramTypes[i];
             MirInstId const arg = mir.addArg(static_cast<std::uint32_t>(i), ty);
-            symbolToValue[sym.v] = arg;
+            if (addressTaken.contains(sym.v)) {
+                MirInstId const slot = allocaForLocal(sym, ty);
+                if (!slot.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                std::array<MirInstId, 2> ops{arg, slot};
+                mir.addInst(MirOpcode::Store, ops);
+            } else {
+                symbolToValue[sym.v] = arg;
+            }
         }
         // Body: a single Block of statements.
-        HirNodeId const body = hir.functionBody(node);
         if (!lowerStmt(body)) {
             // Failed mid-body — seal the block so finish() can complete and
             // the caller sees the actual diagnostic instead of an abort.
@@ -754,11 +974,11 @@ struct Lowerer {
 
 HirToMirResult lowerToMir(Hir const&             hir,
                           HirLiteralPool const&  literals,
-                          TypeInterner const&    interner,
+                          TypeInterner&          interner,
                           DiagnosticReporter&    reporter,
                           HirSourceMap const*    sourceMap) {
     std::size_t const errorsBefore = reporter.errorCount();
-    Lowerer lwr{hir, literals, interner, reporter, sourceMap, MirBuilder{}, {}, {}};
+    Lowerer lwr{hir, literals, interner, reporter, sourceMap, MirBuilder{}, {}, {}, {}};
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();

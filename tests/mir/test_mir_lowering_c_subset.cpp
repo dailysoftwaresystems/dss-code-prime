@@ -156,8 +156,13 @@ TEST(MirLoweringCSubset, VoidFunctionWithEmptyBodyGetsImplicitReturn) {
 // landed Call lowering; the abort-resilience invariant is independent of
 // which construct is currently unsupported.
 TEST(MirLoweringCSubset, UnsupportedConstructEmitsDiagnosticWithoutAbort) {
+    // Index expressions (`a[i]`) lower to HIR cleanly (HR8/HR9) but are
+    // not lowered to MIR by this lowering. This test pins the abort-
+    // resilience invariant: ok=false, diagnostic surfaced, MIR still
+    // walkable — the lowering must NEVER abort the process on an
+    // unsupported construct.
     auto L = lowerCSubset(
-        "void f() { int x = 5; }\n");  // VarDecl-with-init: lvalue-alloca sub-cycle
+        "int f(int* a) { return a[0]; }\n");
     ASSERT_FALSE(L.model.hasErrors());
     ASSERT_TRUE(L.hir->ok);
     EXPECT_FALSE(L.mir.ok);
@@ -497,4 +502,145 @@ TEST(MirLoweringCSubset, SignedDivisionLowersToSDiv) {
     // [arg0, arg1, SDiv, return]
     ASSERT_EQ(m.blockInstCount(entry), 4u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::SDiv);
+}
+
+// ─── ML2 cycle 3b: lvalue-via-alloca ──────────────────────────────────────
+
+// Body-local VarDecl with initializer lowers to Alloca + Store. The local's
+// later read site (here `return x;`) becomes a Load against the slot.
+TEST(MirLoweringCSubset, VarDeclWithInitLowersToAllocaPlusStore) {
+    auto L = lowerCSubset("int f() { int x = 5; return x; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Alloca, Const 5, Store(const,alloca), Load(alloca), Return(load)]
+    ASSERT_EQ(m.blockInstCount(entry), 5u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Alloca);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Const);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Store);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Load);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Return);
+}
+
+// AssignStmt to a body-local lowers to Store(rhs, alloca). The Ref-as-lvalue
+// produces no extra load on the assignment side.
+TEST(MirLoweringCSubset, AssignStmtLowersToStore) {
+    auto L = lowerCSubset(
+        "int f() { int x = 1; x = 2; return x; }");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Alloca x, Const 1, Store(1→x), Const 2, Store(2→x), Load x, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 7u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Alloca);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Store);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 4)), MirOpcode::Store);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
+}
+
+// AddressOf of a body-local returns the alloca directly (no extra MIR
+// instruction). Followed by a deref it should round-trip — this verifies
+// both sides of the lvalue model.
+TEST(MirLoweringCSubset, AddressOfLocalReturnsAllocaDirectly) {
+    auto L = lowerCSubset(
+        "int f() { int x = 1; int* p = &x; return *p; }");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Alloca x, Const 1, Store, Alloca p, Store(allocaX→p), Load p, Load *p, Return]
+    // The AddressOf(x) does NOT add an instruction — it reuses alloca x.
+    ASSERT_EQ(m.blockInstCount(entry), 8u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Alloca);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Alloca);
+    // Slot 4 stores alloca-x into the p slot — verify the value operand IS
+    // the first alloca (proving AddressOf returned the alloca, not a copy).
+    MirInstId const storeP = m.blockInstAt(entry, 4);
+    EXPECT_EQ(m.instOpcode(storeP), MirOpcode::Store);
+    auto storeOps = m.instOperands(storeP);
+    ASSERT_EQ(storeOps.size(), 2u);
+    EXPECT_EQ(storeOps[0], m.blockInstAt(entry, 0))
+        << "Store value operand should BE the alloca-x (AddressOf returns "
+           "the alloca directly, no copy)";
+}
+
+// AddressOf of a PARAM forces entry-block slot-promotion. The pre-pass
+// detects `&p` in the body and emits Arg + Alloca + Store for that param
+// on entry, so reads of the param thereafter go through Load(alloca).
+TEST(MirLoweringCSubset, AddressOfParamPromotesItToSlot) {
+    auto L = lowerCSubset(
+        "int f(int p) { int* q = &p; return *q; }");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg, Alloca p, Store(arg→p), Alloca q, Store(allocaP→q), Load q, Load *q, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 8u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Alloca);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Store);
+    // The Store-to-paramSlot's value operand IS the Arg.
+    auto storeOps = m.instOperands(m.blockInstAt(entry, 2));
+    ASSERT_EQ(storeOps.size(), 2u);
+    EXPECT_EQ(storeOps[0], m.blockInstAt(entry, 0));
+    EXPECT_EQ(storeOps[1], m.blockInstAt(entry, 1));
+}
+
+// A param whose address is NEVER taken stays as a pure SSA `Arg` — the
+// pre-pass does not slot-promote it, preserving the cycle-1 canonical form
+// for the common case. This is the negative-control for the prior test.
+TEST(MirLoweringCSubset, ParamWithoutAddressOfStaysAsArg) {
+    auto L = lowerCSubset("int id(int x) { return x; }");
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg, Return(arg)] — no Alloca, no Store, no Load.
+    ASSERT_EQ(m.blockInstCount(entry), 2u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Return);
+}
+
+// Assignment THROUGH a pointer (`*p = v`) lowers to `Store(v, p)` with the
+// pointer operand being the Arg directly — NOT a Load(p). This pins the
+// lvalue model's contract: `lowerLvalueAddress(Deref(p))` returns the
+// pointer value, not a load of the pointee.
+TEST(MirLoweringCSubset, AssignThroughDerefStoresIntoPointerWithoutExtraLoad) {
+    auto L = lowerCSubset("void f(int* p, int v) { *p = v; }");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg p, Arg v, Store(v→p), Return] — no Load of p's pointee anywhere.
+    ASSERT_EQ(m.blockInstCount(entry), 4u);
+    MirInstId const argP   = m.blockInstAt(entry, 0);
+    MirInstId const argV   = m.blockInstAt(entry, 1);
+    MirInstId const storeI = m.blockInstAt(entry, 2);
+    EXPECT_EQ(m.instOpcode(argP),   MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(argV),   MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(storeI), MirOpcode::Store);
+    auto ops = m.instOperands(storeI);
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(ops[0], argV) << "Store value operand should be v (the Arg)";
+    EXPECT_EQ(ops[1], argP) << "Store ptr operand should be p (the Arg, not a Load)";
+}
+
+// VarDecl without an initializer still emits the alloca but no store —
+// reads before assignment will Load whatever the alloca's uninitialized
+// memory holds (which is HIR-policy-defined; MIR doesn't auto-init).
+TEST(MirLoweringCSubset, VarDeclWithoutInitOnlyAllocas) {
+    auto L = lowerCSubset(
+        "int f() { int x; x = 7; return x; }");
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Alloca x, Const 7, Store, Load, Return] — only ONE Store (no init).
+    ASSERT_EQ(m.blockInstCount(entry), 5u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Alloca);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Const);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Store);
 }

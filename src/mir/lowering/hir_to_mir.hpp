@@ -34,12 +34,15 @@ struct DSS_EXPORT HirToMirResult {
 // that owns the decoded values for HIR `Literal` nodes (ML2 copies the
 // entries it lowers into the new MirLiteralPool). `interner` is the CU's
 // type interner — ML2 reads from it to pick signed-vs-unsigned MIR opcodes
-// and to decode FnSig results. Diagnostics (H_UnsupportedLoweringForKind
-// for not-yet-supported HirKinds) are emitted into `reporter`.
+// and to decode FnSig results, AND mints new pointer types for addressable-
+// local `Alloca` results (lvalue-via-alloca model). Same convention as HIR
+// lowering, which also takes the interner by non-const reference.
+// Diagnostics (H_UnsupportedLoweringForKind for not-yet-supported HirKinds)
+// are emitted into `reporter`.
 [[nodiscard]] DSS_EXPORT HirToMirResult
 lowerToMir(Hir const&             hir,
            HirLiteralPool const&  literals,
-           TypeInterner const&    interner,
+           TypeInterner&          interner,
            DiagnosticReporter&    reporter,
            HirSourceMap const*    sourceMap = nullptr);
 
