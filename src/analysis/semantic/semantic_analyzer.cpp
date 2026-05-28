@@ -74,8 +74,11 @@ struct SchemaIndexes {
     NumberStyle const*    numberStyle = nullptr;  // its numeric-literal style (may be null)
     std::unordered_map<std::uint32_t, std::size_t> declByRule;
     std::unordered_map<std::uint32_t, std::size_t> refByRule;
-    // D5.1: member-access rules (`obj.field` and `ptr->field`).
-    std::unordered_map<std::uint32_t, std::size_t> memberAccessByRule;
+    // D5.1: member-access rules (`obj.field` and `ptr->field`). Multi-entry
+    // per rule when multiple shapes share the same rule (e.g. c-subset's
+    // single `postfixExpr` covers BOTH `.` and `->`); each is distinguished
+    // by `MemberAccessRule.operatorToken`, just like `assignByRule`.
+    std::unordered_map<std::uint32_t, std::vector<std::size_t>> memberAccessByRule;
     std::unordered_map<std::uint32_t, std::size_t> typeShapeByRule;
     std::unordered_map<std::uint32_t, bool>        scopeByRule;
     // Multiple assignment entries may share one rule (e.g. c-subset's
@@ -323,7 +326,7 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
         idx.refByRule[cfg.references[i].rule.v] = i;
     }
     for (std::size_t i = 0; i < cfg.memberAccesses.size(); ++i) {
-        idx.memberAccessByRule[cfg.memberAccesses[i].rule.v] = i;
+        idx.memberAccessByRule[cfg.memberAccesses[i].rule.v].push_back(i);
     }
     for (std::size_t i = 0; i < cfg.typeShapes.size(); ++i) {
         idx.typeShapeByRule[cfg.typeShapes[i].rule.v] = i;
@@ -1020,17 +1023,37 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // resolves identifier USES against the LEXICAL scope chain; this one
         // resolves field-names against a struct's STRUCT scope — orthogonal.
         auto maIt = s.idx().memberAccessByRule.find(rule.v);
-        if (maIt != s.idx().memberAccessByRule.end()) {
-            auto const& ma = cfg.memberAccesses[maIt->second];
+        // Pick the matching entry by operator-token (mirrors `assignByRule`'s
+        // discipline: multiple entries per rule are distinguished by which
+        // operator token — `.` vs `->` — is present in the node). Ungated
+        // entries match unconditionally and must be the sole entry for the
+        // rule. Returns null when no entry's operator-token matches: the node
+        // is structurally a member-access-rule node but carries a different
+        // operator (e.g. c-subset's `postfixExpr` with `++`/`(`/`[`).
+        MemberAccessRule const* const ma = [&]() -> MemberAccessRule const* {
+            if (maIt == s.idx().memberAccessByRule.end()) return nullptr;
+            for (std::size_t midx : maIt->second) {
+                auto const& cand = cfg.memberAccesses[midx];
+                if (!cand.operatorToken.has_value()) return &cand;  // ungated
+                for (auto kid : tree.children(node)) {
+                    if (tree.kind(kid) == NodeKind::Token
+                        && tree.tokenKind(kid) == *cand.operatorToken) {
+                        return &cand;
+                    }
+                }
+            }
+            return nullptr;
+        }();
+        if (ma != nullptr) {
             auto kids = visibleChildren(tree, node);
-            if (ma.lhsChild < kids.size() && ma.nameChild < kids.size()) {
-                NodeId const lhsNode  = kids[ma.lhsChild];
-                NodeId const nameNode = kids[ma.nameChild];
+            if (ma->lhsChild < kids.size() && ma->nameChild < kids.size()) {
+                NodeId const lhsNode  = kids[ma->lhsChild];
+                NodeId const nameNode = kids[ma->nameChild];
                 TypeId lhsType = s.typeAt(lhsNode);
                 if (lhsType.valid()) {
                     TypeId effectiveType = lhsType;
                     bool   typeOk = true;
-                    if (ma.dereferences) {
+                    if (ma->dereferences) {
                         // Arrow form: `p->x` is sugar for `(*p).x`. The LHS
                         // must be `Ptr<Struct>`; one indirection only. If the
                         // LHS isn't even a pointer, emit S_NotAPointer; the
@@ -1071,7 +1094,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             // the LHS itself was non-composite (`.x` form) or
                             // the LHS was Ptr<T> but T is non-composite (`->x`
                             // form — review F5).
-                            d.actual   = ma.dereferences
+                            d.actual   = ma->dereferences
                                 ? "arrow operator '->' pointee is not a "
                                   "composite type"
                                 : "member access '.' requires a composite-"

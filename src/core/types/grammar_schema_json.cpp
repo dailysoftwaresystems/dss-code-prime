@@ -1162,20 +1162,39 @@ void validateOperatorBodyRules(GrammarSchemaData& data, Collector& coll) {
         // Postfix is the only arity that carries `bodyRule`, so iterate
         // just that slice — O(N) in the declared-token count, trivial
         // at load time.
-        bool referenced = false;
-        for (std::uint32_t t = 1; t < data.schemaTokens->size() && !referenced; ++t) {
+        bool referencedAsBody     = false;
+        bool referencedAsFollower = false;
+        for (std::uint32_t t = 1;
+             t < data.schemaTokens->size()
+             && !(referencedAsBody || referencedAsFollower);
+             ++t) {
             const SchemaTokenId tid{t};
             const auto entry = data.operators.lookup(tid, OperatorArity::Postfix);
-            if (entry && entry->grouped
-                && entry->grouped->bodyRule.v == rule.v) {
-                referenced = true;
+            if (!entry) continue;
+            if (entry->grouped && entry->grouped->bodyRule.v == rule.v) {
+                referencedAsBody = true;
+            }
+            // D5.1: `followerRule` also references a rule that must be
+            // declared — same audit gap that `bodyRule` had. The loader
+            // interns the name at operator-load time (shapes haven't been
+            // compiled yet); the real "shape exists" check is here.
+            if (entry->followerRule.has_value()
+                && entry->followerRule->v == rule.v) {
+                referencedAsFollower = true;
             }
         }
-        if (referenced) {
+        if (referencedAsBody) {
             coll.emit(DiagnosticCode::C_UnknownShape,
                       "/operators/groups",
                       std::format("postfix operator group references "
                                   "'bodyRule' = '{}' but no shape with "
+                                  "that name is declared", name));
+        }
+        if (referencedAsFollower) {
+            coll.emit(DiagnosticCode::C_UnknownShape,
+                      "/operators/groups",
+                      std::format("postfix operator group references "
+                                  "'followerRule' = '{}' but no shape with "
                                   "that name is declared", name));
         }
     }
@@ -1987,6 +2006,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     const auto rname = g.at("bodyRule").get<std::string>();
                     bodyRuleId = data.rules->intern(rname);
                 }
+                // D5.1: `followerRule` — a postfix operator followed by
+                // exactly one occurrence of a named rule shape (e.g. `.field`
+                // is `DotOp` + a `memberFollower` rule). No closer; the rule's
+                // own shape terminates the body. Mutually exclusive with the
+                // `endsAt`/`bodyRule` (grouped) form — postfix forms are
+                // either bracketed-body OR single-rule-follower OR bare (`++`).
+                RuleId followerRuleId{};
+                if (g.contains("followerRule")) {
+                    if (arity != OperatorArity::Postfix) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'followerRule' is only valid on a postfix group");
+                        continue;
+                    }
+                    if (endsAtId.valid() || bodyRuleId.valid()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'followerRule' is mutually exclusive with "
+                                  "'endsAt'/'bodyRule' (grouped postfix)");
+                        continue;
+                    }
+                    if (!g.at("followerRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'followerRule' must be a string rule name");
+                        continue;
+                    }
+                    const auto rname = g.at("followerRule").get<std::string>();
+                    followerRuleId = data.rules->intern(rname);
+                }
                 // Ternary `middle` separator (C's `:`). Required for ternary
                 // arity, forbidden otherwise.
                 SchemaTokenId middleId{};
@@ -2033,11 +2079,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "ternary ('middle')");
                     continue;
                 }
-                OperatorTable::Entry entry{precedence, assoc, std::nullopt, std::nullopt};
+                OperatorTable::Entry entry{precedence, assoc,
+                                           std::nullopt, std::nullopt, std::nullopt};
                 if (endsAtId.valid()) {
                     entry.grouped = OperatorTable::GroupedPostfix{
                         endsAtId, bodyRuleId};
                 }
+                if (followerRuleId.valid()) entry.followerRule = followerRuleId;
                 if (middleId.valid()) entry.ternaryMiddle = middleId;
 
                 for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
@@ -3515,6 +3563,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           "'dereferences' must be a boolean");
                             } else {
                                 rule.dereferences = entry.at("dereferences").get<bool>();
+                            }
+                        }
+                        // Optional gating token kind. Same discipline as
+                        // `AssignmentRule.operatorToken`: multiple entries
+                        // sharing a `rule` are distinguished by which operator
+                        // token (`.` vs `->`) appears in the node.
+                        if (entry.contains("operatorToken")) {
+                            if (!entry.at("operatorToken").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/operatorToken",
+                                          "'operatorToken' must be a string");
+                            } else {
+                                auto const tk = entry.at("operatorToken").get<std::string>();
+                                if (!data.schemaTokens->contains(tk)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              path + "/operatorToken",
+                                              std::format("'memberAccesses[{}].operatorToken' "
+                                                          "references unknown token kind '{}'",
+                                                          i, tk));
+                                } else {
+                                    rule.operatorToken = data.schemaTokens->find(tk);
+                                }
                             }
                         }
                         cfg.memberAccesses.push_back(std::move(rule));

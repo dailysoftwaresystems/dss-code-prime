@@ -1328,6 +1328,25 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
                 I.commitWalkerSnap(snap);
                 return;
             }
+            if (postfix->followerRule.has_value()) {
+                // D5.1: follower-rule postfix — operator + exactly one
+                // occurrence of a named rule (e.g. `.field` is `DotOp` +
+                // `memberFollower` wrapping `Identifier`). No closer; the
+                // rule's own shape terminates the body. Mutually exclusive
+                // with `grouped` (loader enforces).
+                RuleId const fr = *postfix->followerRule;
+                if (I.schema->isExprRule(fr)) {
+                    I.prattWalker->walkExpression(
+                        *I.outer, fr,
+                        I.schema->exprMinPrecedence(fr));
+                } else {
+                    const std::size_t bodyDepth = I.frames.size();
+                    I.openExprFrame(fr);
+                    I.parseUntilFrameDepth(bodyDepth);
+                }
+                I.closeFrameOnce();
+                continue;
+            }
             if (postfix->grouped) {
                 auto const& gp = *postfix->grouped;
                 // Type-level invariant pinned at the deref site: the

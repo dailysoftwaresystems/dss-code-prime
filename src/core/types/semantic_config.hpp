@@ -243,6 +243,14 @@ struct DSS_EXPORT MemberAccessRule {
     std::uint32_t lhsChild  = 0;       // visible-child index of the object subtree
     std::uint32_t nameChild = 0;       // visible-child index of the field-name token
     bool          dereferences = false; // true ⇒ `p->x` (deref the LHS pointer first)
+    // Optional gating token kind — when multiple entries share the same `rule`
+    // (e.g. c-subset's `postfixExpr` covers both `.` and `->` shapes), each
+    // entry is distinguished by the operator token present in the node's
+    // visible children. Pass 2 picks the FIRST matching entry. Parallels
+    // `AssignmentRule.operatorToken` and `CallRule.operatorToken`. An ungated
+    // entry (no `operatorToken`) matches every node of its rule, so when an
+    // ungated entry is present it must be the SOLE entry for that rule.
+    std::optional<SchemaTokenId> operatorToken;
     std::string   ruleName;
 };
 
