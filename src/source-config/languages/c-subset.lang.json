@@ -560,6 +560,9 @@
     "ternaryExprRule": "ternaryExpr",
     "operandRule":     "operand",
 
+    "globalsConstEval": { "allowFloat": true },
+
+
     "binaryOps": [
       { "token": "PlusOp",   "target": "Add"    },
       { "token": "MinusOp",  "target": "Sub"    },

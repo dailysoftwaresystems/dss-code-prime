@@ -195,6 +195,22 @@ struct DSS_EXPORT HirLoweringConfig {
     // unresolved core Ref. Empty ⇒ refs lower to core `Ref` (typed languages).
     std::string   refExtensionKind;   // e.g. "TSQL::Name"
 
+    // Per-language MIR-globals const-evaluation policy. The shared
+    // const-eval engine (plan 12.5) supports a float-folding gate via
+    // its `allowFloat` knob; today every v1 schema is IEEE 754 so the
+    // engine ran with `allowFloat=true` unconditionally inside
+    // MIR-globals. Plan 12.5 §0.2 D3 closed: the policy is now per-
+    // schema (JSON-declared, NOT C++-coded — config-driven), so a
+    // future schema with non-IEEE float semantics (decimal float,
+    // fixed-point, saturating arithmetic) declares `allowFloat: false`
+    // and the engine refuses to fold its float arithmetic at module-
+    // load time. The MIR-globals caller reads this struct off the
+    // owning schema and threads it into `EvalOptions`.
+    struct GlobalsConstEval {
+        bool allowFloat = true;
+    };
+    GlobalsConstEval globalsConstEval{};
+
     // True when the block carries no facets — the engine then does nothing.
     [[nodiscard]] bool empty() const noexcept {
         return ruleMappings.empty() && binaryOps.empty() && unaryOps.empty()

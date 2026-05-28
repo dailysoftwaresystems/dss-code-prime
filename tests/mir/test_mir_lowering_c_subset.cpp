@@ -47,9 +47,15 @@ struct Lowered {
     // Cycle 3a wires the HirSourceMap so MIR diagnostics carry source spans
     // (mirroring HirVerifier's `&sourceMap` plumbing). The pointer is bound
     // through `hir->sourceMap` which CstToHirResult always populates.
+    // Plan 12.5 §0.2 D3 closed: schema declares MIR-globals const-eval
+    // policy; the test driver reads it off the loaded schema and passes
+    // the resolved knob through. No per-language C++ — the policy lives
+    // in `c-subset.lang.json`.
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
-                                    &hir->sourceMap);
+                                    &hir->sourceMap, mirCfg);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),

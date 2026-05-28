@@ -30,6 +30,18 @@ struct DSS_EXPORT HirToMirResult {
     bool ok = true;
 };
 
+// Caller-supplied policy carried INTO MIR lowering. Currently one field —
+// the MIR-globals const-evaluation `allowFloat` knob, threaded from the
+// owning language schema's `hirLowering.globalsConstEval.allowFloat`
+// (plan 12.5 §0.2 D3, closed). Defaults match v1's all-IEEE corpus so an
+// absent config gives identical behaviour to CE5. The CU integration
+// reads the schema(s) and passes the resolved policy in; multi-language
+// CUs conservatively AND each schema's knob (any `false` ⇒ module-wide
+// `false`) until per-Global routing lands in plan 20.
+struct DSS_EXPORT MirLoweringConfig {
+    bool globalsAllowFloat = true;
+};
+
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool
 // that owns the decoded values for HIR `Literal` nodes (ML2 copies the
 // entries it lowers into the new MirLiteralPool). `interner` is the CU's
@@ -40,10 +52,11 @@ struct DSS_EXPORT HirToMirResult {
 // Diagnostics (H_UnsupportedLoweringForKind for not-yet-supported HirKinds)
 // are emitted into `reporter`.
 [[nodiscard]] DSS_EXPORT HirToMirResult
-lowerToMir(Hir const&             hir,
-           HirLiteralPool const&  literals,
-           TypeInterner&          interner,
-           DiagnosticReporter&    reporter,
-           HirSourceMap const*    sourceMap = nullptr);
+lowerToMir(Hir const&               hir,
+           HirLiteralPool const&    literals,
+           TypeInterner&            interner,
+           DiagnosticReporter&      reporter,
+           HirSourceMap const*      sourceMap = nullptr,
+           MirLoweringConfig const& config    = {});
 
 } // namespace dss

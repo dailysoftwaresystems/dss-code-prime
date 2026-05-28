@@ -4516,6 +4516,31 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── plan-12.5 §0.2 D3: globalsConstEval { allowFloat: bool } —
+            // per-schema MIR-globals const-evaluation policy. Default is
+            // IEEE 754 (allowFloat=true); a non-IEEE-float language
+            // declares `false` and the engine refuses to fold its float
+            // arithmetic into module-init literals. JSON-declared, NOT
+            // C++-coded — config-driven discipline (no schema.name()
+            // branches anywhere downstream). ──
+            if (hl.contains("globalsConstEval")) {
+                json const& gce = hl.at("globalsConstEval");
+                if (!gce.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/hirLowering/globalsConstEval",
+                              "'globalsConstEval' must be an object");
+                } else if (gce.contains("allowFloat")) {
+                    if (!gce.at("allowFloat").is_boolean()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  "/hirLowering/globalsConstEval/allowFloat",
+                                  "'allowFloat' must be a boolean");
+                    } else {
+                        cfg.globalsConstEval.allowFloat =
+                            gce.at("allowFloat").get<bool>();
+                    }
+                }
+            }
+
             // ── HR10: refExtensionKind (string) — name refs lower to this
             // extension kind instead of a core Ref (SQL relational names). ──
             if (hl.contains("refExtensionKind")) {

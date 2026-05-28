@@ -21,12 +21,13 @@ namespace {
 // simpler than CST (no schema-driven shape dispatch, no per-language
 // vocabulary).
 struct Lowerer {
-    Hir const&            hir;
-    HirLiteralPool const& literals;
-    TypeInterner&         interner;
-    DiagnosticReporter&   reporter;
-    HirSourceMap const*   sourceMap;   // optional — diagnostics carry spans when bound
-    MirBuilder            mir;
+    Hir const&               hir;
+    HirLiteralPool const&    literals;
+    TypeInterner&            interner;
+    DiagnosticReporter&      reporter;
+    HirSourceMap const*      sourceMap;   // optional — diagnostics carry spans when bound
+    MirLoweringConfig const& config;      // schema-driven knobs (plan 12.5 §0.2 D3)
+    MirBuilder               mir;
     // Within one function: HIR `SymbolId.v` → SSA value producer. Used for
     // params that are NOT address-taken (those stay as raw `Arg` instructions);
     // an entry is set iff the symbol resolves as a plain rvalue. A symbol is
@@ -1408,13 +1409,12 @@ struct Lowerer {
         // flip this back to `true` to surface the overflow as a verifier
         // diagnostic — same engine, different policy per consumer.
         opts.refuseOnOverflow = false;
-        // CE5: MIR-globals also opts into float folding. A `float g = 1.5 + 2.0;`
-        // initializer folds to constant `3.5` instead of synthesizing a
-        // `__module_init__` runtime path. Same runtime-equivalence argument as
-        // `refuseOnOverflow=false` — IEEE 754 host arithmetic produces the
-        // same bits the runtime would compute; refusing would only lose an
-        // optimization.
-        opts.allowFloat = true;
+        // Plan 12.5 §0.2 D3 closed: float folding is now schema-driven.
+        // Every v1 schema is IEEE 754 (default `true`); a non-IEEE-float
+        // schema (decimal float, fixed-point, saturating) declares
+        // `hirLowering.globalsConstEval.allowFloat: false` and the
+        // engine refuses to fold its float arithmetic at module-load.
+        opts.allowFloat = config.globalsAllowFloat;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             if (hir.kind(decl) != HirKind::Global) continue;
             PendingGlobal pg;
@@ -1586,14 +1586,15 @@ struct Lowerer {
 
 } // namespace
 
-HirToMirResult lowerToMir(Hir const&             hir,
-                          HirLiteralPool const&  literals,
-                          TypeInterner&          interner,
-                          DiagnosticReporter&    reporter,
-                          HirSourceMap const*    sourceMap) {
+HirToMirResult lowerToMir(Hir const&               hir,
+                          HirLiteralPool const&    literals,
+                          TypeInterner&            interner,
+                          DiagnosticReporter&      reporter,
+                          HirSourceMap const*      sourceMap,
+                          MirLoweringConfig const& config) {
     std::size_t const errorsBefore = reporter.errorCount();
-    Lowerer lwr{hir, literals, interner, reporter, sourceMap, MirBuilder{},
-                {}, {}, {}, {}, {}, {}};
+    Lowerer lwr{hir, literals, interner, reporter, sourceMap, config,
+                MirBuilder{}, {}, {}, {}, {}, {}, {}};
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
