@@ -274,6 +274,12 @@ public:
     // body that didn't write its own return) read this to decide whether to
     // emit one. Returns false when no block is open.
     [[nodiscard]] bool openBlockHasTerminator() const noexcept;
+    // True iff `block` is in the `Created` state — reserved by `createBlock`
+    // but not yet opened with `beginBlock`. Lowerings recovering from an
+    // inner-error path use this to find forward-created blocks they never
+    // reached (the MirBuilder's "every created block must be filled +
+    // terminated by finish()" invariant otherwise aborts).
+    [[nodiscard]] bool isBlockUnopened(MirBlockId block) const noexcept;
 
     // Freeze. Flushes pending phi incomings, validates the open function/block are
     // closed, and hands over the immutable module. Single-use; consumes *this.

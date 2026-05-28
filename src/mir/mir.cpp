@@ -698,6 +698,14 @@ bool MirBuilder::openBlockHasTerminator() const noexcept {
     return blockState_[openBlock_.v] == BlockState::Sealed;
 }
 
+bool MirBuilder::isBlockUnopened(MirBlockId block) const noexcept {
+    // An invalid id has no state; conservatively false. A valid id outside
+    // the block-state range is a structural bug — return false rather than
+    // OOB-read; the next `beginBlock`/`at` call surfaces it loudly.
+    if (!block.valid() || block.v >= blockState_.size()) return false;
+    return blockState_[block.v] == BlockState::Created;
+}
+
 Mir MirBuilder::finish() && {
     closeFunction_();  // closes the open block + function (validates termination / ≥1 block)
 

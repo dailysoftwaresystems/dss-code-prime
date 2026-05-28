@@ -113,6 +113,54 @@ struct Lowerer {
                 }
                 return it->second;
             }
+            case HirKind::UnaryOp: {
+                std::uint32_t const payload = hir.payload(node);
+                if (!isCoreOp(payload)) {
+                    unsupported("extension UnaryOp (post-v1)");
+                    return InvalidMirInst;
+                }
+                HirOpKind const op = decodeCoreOp(payload);
+                auto kids = hir.children(node);
+                if (kids.size() != 1) {
+                    unsupported("malformed UnaryOp (verifier should have flagged)");
+                    return InvalidMirInst;
+                }
+                MirInstId const operand = lowerExpr(kids[0]);
+                if (!operand.valid()) return InvalidMirInst;
+                TypeId const operandType = hir.typeId(kids[0]);
+                TypeKind const tk = operandType.valid()
+                    ? interner.kind(operandType) : TypeKind::Void;
+                bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
+                                   || tk == TypeKind::F64 || tk == TypeKind::F128);
+                MirOpcode mop = MirOpcode::Invalid;
+                switch (op) {
+                    case HirOpKind::Neg:    mop = isFloat ? MirOpcode::FNeg : MirOpcode::Neg; break;
+                    case HirOpKind::BitNot: mop = MirOpcode::Not; break;
+                    case HirOpKind::Not: {
+                        // Logical not: MIR has no dedicated opcode. Lower as
+                        // `cmp eq operand, 0`. Policy-neutral on Bool-vs-I1
+                        // — any `==` already produces whatever type the
+                        // result-type rule says, so this is symmetric with
+                        // the cycle-1 BinaryOp Eq path. (Review I-5)
+                        MirLiteralValue zero;
+                        if (isFloat) { zero.value = 0.0; }
+                        else { zero.value = std::int64_t{0}; }
+                        zero.core = tk;
+                        MirInstId const zeroConst = mir.addConst(std::move(zero),
+                                                                  operandType);
+                        std::array<MirInstId, 2> ops2{operand, zeroConst};
+                        return mir.addInst(
+                            isFloat ? MirOpcode::FCmpOeq : MirOpcode::ICmpEq,
+                            ops2, t);
+                    }
+                    default:
+                        unsupported(std::format("UnaryOp '{}' not yet "
+                                                "supported", opName(op)));
+                        return InvalidMirInst;
+                }
+                std::array<MirInstId, 1> operands{operand};
+                return mir.addInst(mop, operands, t);
+            }
             case HirKind::BinaryOp: {
                 std::uint32_t const payload = hir.payload(node);
                 if (!isCoreOp(payload)) {
@@ -151,6 +199,24 @@ struct Lowerer {
         return InvalidMirInst;
     }
 
+    // Error-recovery helper: every forward-`createBlock`'d block in a
+    // control-flow lowering MUST be filled+terminated before the function
+    // closes, or `MirBuilder::finish()` aborts. When an inner lowering
+    // fails mid-CF, the parent has already created exit/join/update blocks
+    // it can no longer reach. This helper begins each such block (idempotent
+    // if it's already been opened+sealed) and writes `Unreachable`. Skip on
+    // invalid id (block was never created for this path, e.g. else-less If).
+    void sealCreatedAsUnreachable(MirBlockId b) {
+        if (!b.valid()) return;
+        // Only open if the block is still in the Created state (i.e. the
+        // error path never reached its `beginBlock`); if a path already
+        // begun + sealed it, this is a no-op.
+        if (mir.isBlockUnopened(b)) {
+            mir.beginBlock(b);
+            mir.addUnreachable();
+        }
+    }
+
     // Lower a single HIR statement in the currently-open MIR block.
     // Returns true on success, false on a hard error (caller bails).
     bool lowerStmt(HirNodeId node) {
@@ -171,6 +237,216 @@ struct Lowerer {
                 } else {
                     mir.addReturn();
                 }
+                return true;
+            }
+            case HirKind::ExprStmt: {
+                // Discard the value; emit for side effects. ML2 cycle 2 covers
+                // pure expressions only — assignment-as-statement comes in a
+                // later cycle alongside the lvalue-via-alloca model.
+                HirNodeId const expr = hir.exprStmtExpr(node);
+                MirInstId const v = lowerExpr(expr);
+                return v.valid();
+            }
+            case HirKind::IfStmt: {
+                // Diamond: entry → CondBr(cond, then, else?), then → Br(join),
+                // else → Br(join), join is the continuation. If a branch
+                // returns or otherwise seals, we skip its Br(join). If BOTH
+                // branches seal, no join is needed — the if is a terminator-
+                // shaped statement (e.g. `if (x) return a; else return b;`).
+                HirNodeId const condN = hir.ifCondition(node);
+                HirNodeId const thenN = hir.ifThen(node);
+                auto const elseN = hir.ifElse(node);
+
+                MirInstId const cond = lowerExpr(condN);
+                if (!cond.valid()) return false;
+
+                MirBlockId const thenBB = mir.createBlock(StructCfMarker::IfThen);
+                MirBlockId const elseBB = elseN.has_value()
+                    ? mir.createBlock(StructCfMarker::IfElse)
+                    : MirBlockId{};
+                // Join block is created lazily — only if at least one branch
+                // doesn't seal itself.
+                MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+                MirBlockId const falseTarget = elseN.has_value() ? elseBB : joinBB;
+                mir.addCondBr(cond, thenBB, falseTarget);
+
+                bool joinReached = false;
+
+                mir.beginBlock(thenBB);
+                if (!lowerStmt(thenN)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(elseBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;
+                }
+                if (!mir.openBlockHasTerminator()) {
+                    mir.addBr(joinBB);
+                    joinReached = true;
+                }
+
+                if (elseN.has_value()) {
+                    mir.beginBlock(elseBB);
+                    if (!lowerStmt(*elseN)) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(joinBB);
+                        return false;
+                    }
+                    if (!mir.openBlockHasTerminator()) {
+                        mir.addBr(joinBB);
+                        joinReached = true;
+                    }
+                } else {
+                    // No else: the false edge of CondBr targets joinBB
+                    // directly, which counts as "reaching" join.
+                    joinReached = true;
+                }
+
+                // Open the join block iff at least one path needs it. If
+                // neither path falls through (both returned/unreachable),
+                // the join block is unreferenced — seal it with Unreachable
+                // so finish() doesn't abort on a created-but-unfilled block.
+                mir.beginBlock(joinBB);
+                if (!joinReached) {
+                    mir.addUnreachable();
+                }
+                return true;
+            }
+            case HirKind::WhileStmt: {
+                // header: CondBr(cond, body, exit)
+                // body:   …; Br(header)
+                // exit:   continuation
+                HirNodeId const condN = *hir.loopCondition(node);
+                HirNodeId const bodyN = hir.loopBody(node);
+
+                MirBlockId const header = mir.createBlock(StructCfMarker::LoopHeader);
+                MirBlockId const body   = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const exit   = mir.createBlock(StructCfMarker::LoopExit);
+
+                mir.addBr(header);
+
+                mir.beginBlock(header);
+                MirInstId const cond = lowerExpr(condN);
+                if (!cond.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(body);
+                    sealCreatedAsUnreachable(exit);
+                    return false;
+                }
+                mir.addCondBr(cond, body, exit);
+
+                mir.beginBlock(body);
+                if (!lowerStmt(bodyN)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(exit);
+                    return false;
+                }
+                if (!mir.openBlockHasTerminator()) mir.addBr(header);
+
+                mir.beginBlock(exit);
+                return true;
+            }
+            case HirKind::DoWhileStmt: {
+                // body:   …; CondBr(cond, body, exit)
+                // exit:   continuation
+                HirNodeId const bodyN = hir.loopBody(node);
+                HirNodeId const condN = *hir.loopCondition(node);
+
+                MirBlockId const body = mir.createBlock(StructCfMarker::LoopHeader);
+                MirBlockId const exit = mir.createBlock(StructCfMarker::LoopExit);
+
+                mir.addBr(body);
+
+                mir.beginBlock(body);
+                if (!lowerStmt(bodyN)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(exit);
+                    return false;
+                }
+                if (!mir.openBlockHasTerminator()) {
+                    MirInstId const cond = lowerExpr(condN);
+                    if (!cond.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(exit);
+                        return false;
+                    }
+                    mir.addCondBr(cond, body, exit);
+                }
+
+                mir.beginBlock(exit);
+                return true;
+            }
+            case HirKind::ForStmt: {
+                // C-style for: shape is `init?; cond?; update?; body`. Lower as
+                // a while-with-init-prefix-and-update-suffix-on-back-edge:
+                //   entry: <init?>; Br(header)
+                //   header: <cond? CondBr(body, exit) : Br(body)>
+                //   body:   <body>; (if not sealed) Br(update_or_header)
+                //   update: <update>; Br(header)   -- created only when update present
+                //   exit:   continuation
+                // Update lives on the continue-target so `continue` runs the
+                // step before re-testing the condition (matches C semantics);
+                // ML2 cycle 2 doesn't yet expose break/continue but the block
+                // layout is the right one.
+                auto const initN   = hir.forInit(node);
+                auto const condN   = hir.loopCondition(node);  // optional
+                auto const updateN = hir.forUpdate(node);
+                HirNodeId const bodyN = hir.loopBody(node);
+
+                if (initN.has_value()) {
+                    if (!lowerStmt(*initN)) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        return false;
+                    }
+                }
+
+                MirBlockId const header = mir.createBlock(StructCfMarker::LoopHeader);
+                MirBlockId const body   = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const update = updateN.has_value()
+                    ? mir.createBlock(StructCfMarker::LoopLatch)
+                    : MirBlockId{};
+                MirBlockId const exit   = mir.createBlock(StructCfMarker::LoopExit);
+                MirBlockId const backTarget = updateN.has_value() ? update : header;
+
+                mir.addBr(header);
+
+                mir.beginBlock(header);
+                if (condN.has_value()) {
+                    MirInstId const cond = lowerExpr(*condN);
+                    if (!cond.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(body);
+                        sealCreatedAsUnreachable(update);
+                        sealCreatedAsUnreachable(exit);
+                        return false;
+                    }
+                    mir.addCondBr(cond, body, exit);
+                } else {
+                    mir.addBr(body);  // for(;;) — infinite loop
+                }
+
+                mir.beginBlock(body);
+                if (!lowerStmt(bodyN)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(update);
+                    sealCreatedAsUnreachable(exit);
+                    return false;
+                }
+                if (!mir.openBlockHasTerminator()) mir.addBr(backTarget);
+
+                if (updateN.has_value()) {
+                    mir.beginBlock(update);
+                    // The update is an expression evaluated for its side
+                    // effects (the value is discarded), same shape as ExprStmt.
+                    MirInstId const u = lowerExpr(*updateN);
+                    if (!u.valid()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(exit);
+                        return false;
+                    }
+                    mir.addBr(header);
+                }
+
+                mir.beginBlock(exit);
                 return true;
             }
             default: break;
@@ -229,7 +505,9 @@ struct Lowerer {
         if (!lowerStmt(body)) {
             // Failed mid-body — seal the block so finish() can complete and
             // the caller sees the actual diagnostic instead of an abort.
-            mir.addUnreachable();
+            // Inner error paths may have already sealed (e.g. an If/While
+            // catch); `openBlockHasTerminator` makes this idempotent.
+            if (!mir.openBlockHasTerminator()) mir.addUnreachable();
             return false;
         }
         // Implicit-void-return synthesis (review-fix). Source like
