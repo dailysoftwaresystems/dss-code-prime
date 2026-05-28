@@ -204,6 +204,12 @@ enum class DiagnosticCode : std::uint16_t {
     // pointer at all (here), vs. the LHS IS Ptr<T> but T isn't composite
     // (S_NotAComposite).
     S_NotAPointer                 = 0xE00E,
+    // D5.5: an enumerator's explicit `= expr` is not a constant integer
+    // literal. v1 accepts integer-literal explicit values; arbitrary
+    // const-expressions require CST-side const-eval (plan 12.5 §0.2 D6).
+    // Implicit (no `= expr`) enumerators auto-increment from the prior;
+    // this diagnostic is reserved for the explicit-non-literal case.
+    S_NonConstantEnumeratorValue  = 0xE00F,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

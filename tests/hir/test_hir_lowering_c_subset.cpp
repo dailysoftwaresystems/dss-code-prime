@@ -1641,12 +1641,83 @@ TEST(HirLoweringCSubset, D5_5_EnumTrailingCommaParses) {
     ASSERT_FALSE(model.hasErrors());
 }
 
-// Enum with explicit-value enumerators parses cleanly (semantic
-// const-eval of the explicit value is a future-work item; for v1 the
-// declaration and use sites work but the explicit-value computation is
-// not yet exposed to const-eval).
-TEST(HirLoweringCSubset, D5_5_EnumExplicitValueParses) {
+// Enumerator values: implicit auto-increment + explicit integer-literal
+// + auto-increment from explicit. C99 §6.7.2.2. Verifies that Pass 1.5
+// actually COMPUTES the values (not just parses them).
+TEST(HirLoweringCSubset, D5_5_EnumValuesComputed) {
     SemanticModel model = analyzeCSubset(
-        "enum E { A = 1, B = 5, C };\n");
+        "enum E { A, B, C = 5, D };\n");
     ASSERT_FALSE(model.hasErrors());
+    // Look up each enumerator's value in the symbol table.
+    auto findEnumerator = [&](std::string const& name) -> SymbolRecord const* {
+        for (auto const& s : model.symbols()) {
+            if (s.name == name) return &s;
+        }
+        return nullptr;
+    };
+    auto const* a = findEnumerator("A");
+    auto const* b = findEnumerator("B");
+    auto const* c = findEnumerator("C");
+    auto const* d = findEnumerator("D");
+    ASSERT_NE(a, nullptr); ASSERT_NE(b, nullptr);
+    ASSERT_NE(c, nullptr); ASSERT_NE(d, nullptr);
+    EXPECT_EQ(a->enumValue, 0) << "A implicit → 0";
+    EXPECT_EQ(b->enumValue, 1) << "B implicit → A + 1 = 1";
+    EXPECT_EQ(c->enumValue, 5) << "C explicit = 5";
+    EXPECT_EQ(d->enumValue, 6) << "D implicit → C + 1 = 6";
+}
+
+// Enumerator type identity: each enumerator must be typed as the enum
+// (not as the underlying int). A regression that left enumerators
+// typed as I32 would pass count-only assertions but break downstream
+// type-equivalence checks.
+TEST(HirLoweringCSubset, D5_5_EnumeratorTypedAsEnum) {
+    SemanticModel model = analyzeCSubset("enum E { A };\n");
+    ASSERT_FALSE(model.hasErrors());
+    auto& interner = model.lattice().interner();
+    TypeId const enumTy = interner.enumType("E", TypeKind::I32);
+    // The enumerator A must carry the enum TypeId, not raw I32.
+    SymbolRecord const* a = nullptr;
+    for (auto const& s : model.symbols())
+        if (s.name == "A") { a = &s; break; }
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->type.v, enumTy.v)
+        << "enumerator must be typed as the enum, not the underlying int";
+    EXPECT_NE(a->type.v, interner.primitive(TypeKind::I32).v)
+        << "enumerator MUST NOT carry the raw I32 TypeId";
+}
+
+// Lift-to-enclosing collision: `int A; enum E { A };` must emit
+// S_RedeclaredSymbol pointing at the enumerator decl. Locks the
+// otherwise-test-untouched diagnostic branch.
+TEST(HirLoweringCSubset, D5_5_EnumeratorCollidesWithEnclosingName) {
+    SemanticModel model = analyzeCSubset(
+        "int A = 7;\n"
+        "enum E { A };\n");
+    bool foundRedecl = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_RedeclaredSymbol && d.actual == "A") {
+            foundRedecl = true; break;
+        }
+    }
+    EXPECT_TRUE(foundRedecl)
+        << "lifting enumerator name into a scope that already binds it "
+           "must emit S_RedeclaredSymbol";
+}
+
+// Non-literal explicit value emits S_NonConstantEnumeratorValue. v1
+// accepts integer-literal explicit values only; arbitrary const-exprs
+// require CST-side const-eval (plan 12.5 §0.2 D6).
+TEST(HirLoweringCSubset, D5_5_NonLiteralEnumeratorValueEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "int n = 5;\n"
+        "enum E { A = n };\n");
+    bool found = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NonConstantEnumeratorValue) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "non-literal enumerator value must emit S_NonConstantEnumeratorValue";
 }

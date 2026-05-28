@@ -86,6 +86,12 @@ struct DSS_EXPORT SymbolRecord {
     // TypeId → struct symbol → `structScope` → name lookup. `InvalidScope`
     // (default) for every non-composite symbol.
     ScopeId         structScope{};
+    // D5.5: the integer value of an enumerator constant. Set by Pass 1.5
+    // when the symbol is bound under a `compositeKind: "enum"` decl —
+    // explicit `= N` literal indices override the running counter;
+    // missing initializer = previous + 1 (C99 §6.7.2.2). Meaningful only
+    // for symbols whose `type.kind == Enum`; harmless 0 elsewhere.
+    std::int64_t    enumValue = 0;
 };
 
 class DSS_EXPORT SemanticModel {

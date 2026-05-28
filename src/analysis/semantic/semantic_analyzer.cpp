@@ -854,53 +854,110 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
                                     // underlying TypeKind (I32 in v1).
-                                    // Pass 1 already set each enumerator's
-                                    // SymbolRecord with the unresolved
-                                    // type; we now SET each enumerator's
-                                    // type to the enum type AND lift the
-                                    // bindings to the enclosing scope so
-                                    // C-classic `enum E { A }` makes `A`
-                                    // visible without `E.A`.
+                                    // Pass 1 created each enumerator's
+                                    // SymbolRecord with type still invalid;
+                                    // we now SET each enumerator's type to
+                                    // the enum type, COMPUTE its integer
+                                    // value (C99 §6.7.2.2: explicit `= N`
+                                    // overrides the running counter; missing
+                                    // initializer = previous + 1), AND
+                                    // also-bind the enumerator name to the
+                                    // enclosing scope (NOT a lift — original
+                                    // binding stays in the inner scope; this
+                                    // is a republication) so C-classic
+                                    // `enum E { A } ... A` works.
                                     compositeTy = s.lattice.interner().enumType(
                                         srec.name, TypeKind::I32);
                                     if (srec.structScope.valid()) {
                                         auto const enclosingId =
                                             s.scopes.scopes()[srec.structScope.v].parent;
-                                        // Take a snapshot of bindings to
-                                        // avoid mutating the map while
-                                        // iterating.
-                                        std::vector<std::pair<std::string, SymbolId>>
-                                            innerBindings(
-                                                s.scopes.scopes()[srec.structScope.v]
-                                                    .bindings.begin(),
-                                                s.scopes.scopes()[srec.structScope.v]
-                                                    .bindings.end());
-                                        for (auto const& [name, eSymId]
-                                             : innerBindings) {
-                                            SymbolRecord& erec =
-                                                s.symbols.at(eSymId);
-                                            if (!erec.declRuleNode.valid()
-                                                || erec.tree.v != tree.id().v)
+                                        // Collect enumerators in fieldIndex
+                                        // order so the running counter
+                                        // matches source declaration order.
+                                        std::vector<std::pair<std::uint32_t, SymbolId>> ordered;
+                                        for (auto const& [_n, eSymId]
+                                             : s.scopes.scopes()[srec.structScope.v].bindings) {
+                                            SymbolRecord const& er = s.symbols.at(eSymId);
+                                            if (!er.declRuleNode.valid()
+                                                || er.tree.v != tree.id().v)
                                                 continue;
-                                            if (tree.rule(erec.declRuleNode)
+                                            if (tree.rule(er.declRuleNode)
                                                 != decl.fieldChildren->rule)
                                                 continue;
+                                            ordered.emplace_back(er.fieldIndex, eSymId);
+                                        }
+                                        std::sort(ordered.begin(), ordered.end());
+                                        std::int64_t nextValue = 0;
+                                        for (auto const& [_idx, eSymId] : ordered) {
+                                            SymbolRecord& erec =
+                                                s.symbols.at(eSymId);
                                             erec.type = compositeTy;
+                                            // Parse the optional `= expr` to
+                                            // recover an explicit integer
+                                            // literal. v1 accepts integer-
+                                            // literal explicit values; non-
+                                            // literal expressions emit
+                                            // S_NonConstantEnumeratorValue
+                                            // (same substrate gap as D5.3's
+                                            // non-literal index designator —
+                                            // mapped to plan 12.5 §0.2 D6).
+                                            std::int64_t value = nextValue;
+                                            bool hadExplicit = false;
+                                            bool explicitFailed = false;
+                                            auto eKids = visibleChildren(tree, erec.declRuleNode);
+                                            for (NodeId c : eKids) {
+                                                if (tree.kind(c) != NodeKind::Internal) continue;
+                                                // The optional `expression`
+                                                // child (only present when
+                                                // the enumerator had `= expr`).
+                                                hadExplicit = true;
+                                                // Walk to leaf integer literal.
+                                                NodeId cur = c;
+                                                while (tree.kind(cur) == NodeKind::Internal) {
+                                                    auto kids2 = visibleChildren(tree, cur);
+                                                    if (kids2.size() != 1) { cur = NodeId{}; break; }
+                                                    cur = kids2[0];
+                                                }
+                                                if (!cur.valid() || tree.kind(cur) != NodeKind::Token) {
+                                                    explicitFailed = true;
+                                                    break;
+                                                }
+                                                auto tkk = tree.tokenKind(cur);
+                                                auto litIt = s.idx().literalTypeIds.find(tkk.v);
+                                                if (litIt == s.idx().literalTypeIds.end()) {
+                                                    explicitFailed = true;
+                                                    break;
+                                                }
+                                                auto iv = decodeInteger(
+                                                    tree.text(cur), s.idx().numberStyle);
+                                                if (!iv) {
+                                                    explicitFailed = true;
+                                                    break;
+                                                }
+                                                value = static_cast<std::int64_t>(*iv);
+                                            }
+                                            if (hadExplicit && explicitFailed) {
+                                                ParseDiagnostic d2;
+                                                d2.code = DiagnosticCode::S_NonConstantEnumeratorValue;
+                                                d2.severity = DiagnosticSeverity::Error;
+                                                d2.buffer = tree.source().id();
+                                                d2.span = tree.span(erec.declRuleNode);
+                                                d2.actual = erec.name;
+                                                s.reporter.report(std::move(d2));
+                                            }
+                                            erec.enumValue = value;
+                                            nextValue = value + 1;
                                             if (enclosingId.valid()) {
-                                                // Lift: also bind to the
-                                                // enclosing scope. If the
-                                                // name is already taken
-                                                // there, emit S_Redeclared.
                                                 SymbolId const prior =
                                                     s.scopes.bind(
-                                                        enclosingId, name, eSymId);
+                                                        enclosingId, erec.name, eSymId);
                                                 if (prior.valid()) {
                                                     ParseDiagnostic d2;
                                                     d2.code     = DiagnosticCode::S_RedeclaredSymbol;
                                                     d2.severity = DiagnosticSeverity::Error;
                                                     d2.buffer   = tree.source().id();
                                                     d2.span     = tree.span(erec.declRuleNode);
-                                                    d2.actual   = name;
+                                                    d2.actual   = erec.name;
                                                     s.reporter.report(std::move(d2));
                                                 }
                                             }
