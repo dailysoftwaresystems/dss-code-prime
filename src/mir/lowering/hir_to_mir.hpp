@@ -5,7 +5,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"
-#include "hir/lowering/hir_literal_pool.hpp"
+#include "hir/hir_literal_pool.hpp"
 #include "mir/mir.hpp"
 
 #include <memory>

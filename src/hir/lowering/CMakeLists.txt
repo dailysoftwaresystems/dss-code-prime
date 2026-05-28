@@ -1,6 +1,5 @@
 add_library(hir_lowering OBJECT
     cst_to_hir.cpp
-    hir_literal_pool.cpp
 )
 
 target_include_directories(hir_lowering PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)

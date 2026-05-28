@@ -1,6 +1,7 @@
 #include "mir/lowering/hir_to_mir.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "hir/const_eval.hpp"
 #include "hir/hir_op.hpp"
 
 #include <array>
@@ -1355,135 +1356,6 @@ struct Lowerer {
         }
     }
 
-    // Try to constant-fold a HIR expression into a `MirLiteralValue`. Returns
-    // `nullopt` when the expression isn't statically foldable — the caller
-    // falls back to lowering the initializer as instructions in the module-
-    // init function. Supported folding surface:
-    //   - `Literal` — direct mapping into MirLiteralValue.
-    //   - `UnaryOp(Neg/BitNot/Plus)` over an integer Literal — negation /
-    //     bitwise-NOT / identity applied in place. (Float-Neg is left to the
-    //     init-function path because runtime FP semantics differ from
-    //     bit-flip.) The unary cases are common in real C code (`int x = -1;`)
-    //     and need zero substrate beyond the variant arithmetic.
-    // BinaryOp folding requires a constants-evaluation engine (overflow,
-    // promotion, division-by-zero policy) — out of scope for this cycle;
-    // those inits route through the init function correctly.
-    [[nodiscard]] std::optional<MirLiteralValue>
-    tryConstFold(HirNodeId node) const {
-        if (!node.valid()) return std::nullopt;
-        HirKind const k = hir.kind(node);
-        if (k == HirKind::Literal) {
-            std::uint32_t const idx = hir.payload(node);
-            HirLiteralValue const& src = literals.at(idx);
-            MirLiteralValue dst;
-            dst.value = src.value;
-            dst.core  = src.core;
-            return dst;
-        }
-        if (k == HirKind::UnaryOp) {
-            std::uint32_t const payload = hir.payload(node);
-            if (!isCoreOp(payload)) return std::nullopt;
-            HirOpKind const op = decodeCoreOp(payload);
-            auto kids = hir.children(node);
-            if (kids.size() != 1) return std::nullopt;
-            auto inner = tryConstFold(kids[0]);
-            if (!inner.has_value()) return std::nullopt;
-            // Only integer-typed literals fold here (float-Neg is left
-            // for the init-function path — bit-flip ≠ FP negate).
-            std::int64_t const* iv = std::get_if<std::int64_t>(&inner->value);
-            if (iv == nullptr) return std::nullopt;
-            MirLiteralValue folded = *inner;
-            switch (op) {
-                case HirOpKind::Neg:    folded.value = -(*iv);    return folded;
-                case HirOpKind::BitNot: folded.value = ~(*iv);    return folded;
-                // Unary `+` is identity at the value level.
-                default: return std::nullopt;
-            }
-        }
-        if (k == HirKind::BinaryOp) {
-            std::uint32_t const payload = hir.payload(node);
-            if (!isCoreOp(payload)) return std::nullopt;
-            HirOpKind const op = decodeCoreOp(payload);
-            auto kids = hir.children(node);
-            if (kids.size() != 2) return std::nullopt;
-            auto a = tryConstFold(kids[0]);
-            auto b = tryConstFold(kids[1]);
-            if (!a.has_value() || !b.has_value()) return std::nullopt;
-            // Integer-only folding (float arithmetic + sign-overflow are
-            // policy concerns better owned by a shared constants-evaluation
-            // engine — out of this cycle's scope, deferred to the v1
-            // optimizer's const-fold pass).
-            std::int64_t const* av = std::get_if<std::int64_t>(&a->value);
-            std::int64_t const* bv = std::get_if<std::int64_t>(&b->value);
-            if (av == nullptr || bv == nullptr) return std::nullopt;
-            MirLiteralValue folded = *a;
-            switch (op) {
-                case HirOpKind::Add:    folded.value = *av + *bv;  return folded;
-                case HirOpKind::Sub:    folded.value = *av - *bv;  return folded;
-                case HirOpKind::Mul:    folded.value = *av * *bv;  return folded;
-                case HirOpKind::Div:
-                    if (*bv == 0) return std::nullopt;  // UB — refuse to fold
-                    folded.value = *av / *bv; return folded;
-                case HirOpKind::Rem:
-                    if (*bv == 0) return std::nullopt;
-                    folded.value = *av % *bv; return folded;
-                case HirOpKind::BitAnd: folded.value = *av & *bv;  return folded;
-                case HirOpKind::BitOr:  folded.value = *av | *bv;  return folded;
-                case HirOpKind::BitXor: folded.value = *av ^ *bv;  return folded;
-                case HirOpKind::Shl: {
-                    if (*bv < 0 || *bv >= 64) return std::nullopt;  // UB
-                    folded.value = static_cast<std::int64_t>(
-                        static_cast<std::uint64_t>(*av) << *bv);
-                    return folded;
-                }
-                case HirOpKind::Shr: {
-                    if (*bv < 0 || *bv >= 64) return std::nullopt;
-                    folded.value = *av >> *bv;  // arith shift on signed
-                    return folded;
-                }
-                case HirOpKind::Eq: folded.value = std::int64_t{*av == *bv}; return folded;
-                case HirOpKind::Ne: folded.value = std::int64_t{*av != *bv}; return folded;
-                case HirOpKind::Lt: folded.value = std::int64_t{*av <  *bv}; return folded;
-                case HirOpKind::Le: folded.value = std::int64_t{*av <= *bv}; return folded;
-                case HirOpKind::Gt: folded.value = std::int64_t{*av >  *bv}; return folded;
-                case HirOpKind::Ge: folded.value = std::int64_t{*av >= *bv}; return folded;
-                default: return std::nullopt;
-            }
-        }
-        if (k == HirKind::Cast) {
-            // The implicit-conversion pass wraps narrowing/widening literal
-            // initializers in `Cast(literal, declaredType)`. Fold the inner
-            // constant, then re-tag the value to the target's core kind so
-            // a `long g = 1 + 2;` lands as a constant `3:i64` instead of
-            // synthesizing a __module_init__ store. Float casts and ptr
-            // casts route through the runtime path (the const-eval engine
-            // sub-plan owns those).
-            auto kids = hir.children(node);
-            if (kids.size() != 1) return std::nullopt;
-            auto inner = tryConstFold(kids[0]);
-            if (!inner.has_value()) return std::nullopt;
-            TypeId const targetTy = hir.typeId(node);
-            if (!targetTy.valid()) return std::nullopt;
-            TypeKind const toK = interner.kind(targetTy);
-            // Integer-to-integer cast: keep the int64 value, retag the core
-            // (the actual bit-width truncation is encoded by the global's
-            // TypeId — codegen narrows on load).
-            std::int64_t const* iv = std::get_if<std::int64_t>(&inner->value);
-            if (iv != nullptr
-                && (toK == TypeKind::Bool || toK == TypeKind::Char || toK == TypeKind::Byte
-                 || toK == TypeKind::I8   || toK == TypeKind::I16  || toK == TypeKind::I32
-                 || toK == TypeKind::I64  || toK == TypeKind::I128
-                 || toK == TypeKind::U8   || toK == TypeKind::U16  || toK == TypeKind::U32
-                 || toK == TypeKind::U64  || toK == TypeKind::U128)) {
-                MirLiteralValue folded;
-                folded.value = *iv;
-                folded.core  = toK;
-                return folded;
-            }
-            return std::nullopt;
-        }
-        return std::nullopt;
-    }
 
     // Per-global emission record built during the pre-pass and consumed by
     // `emitGlobals_` after all functions are lowered.
@@ -1507,8 +1379,16 @@ struct Lowerer {
             pg.symbol = hir.globalSymbol(decl);
             pg.type   = hir.globalType(decl);
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
-                if (auto folded = tryConstFold(*initN); folded.has_value()) {
-                    pg.constInit = std::move(*folded);
+                // Delegate to the shared const-eval engine (plan 12.5 CE1).
+                // Engine returns a HirLiteralValue; copy field-by-field into
+                // the MIR pool's variant (structurally identical, same core).
+                ConstEvalResult const r = evaluateConstant(
+                    hir, interner, literals, *initN);
+                if (r.value.has_value()) {
+                    MirLiteralValue lit;
+                    lit.value = r.value->value;
+                    lit.core  = r.value->core;
+                    pg.constInit = std::move(lit);
                 } else {
                     pg.runtimeInit = *initN;
                 }
