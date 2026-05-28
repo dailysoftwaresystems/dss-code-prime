@@ -12,6 +12,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
+#include <limits>
 #include <variant>
 
 using namespace dss;
@@ -38,6 +40,14 @@ struct Rig {
         lv.core  = interner.kind(ty);
         return builder.makeLiteral(ty, literals.add(lv));
     }
+    HirNodeId litFloat(double v, TypeId ty) {
+        HirLiteralValue lv;
+        lv.value = v;
+        lv.core  = interner.kind(ty);
+        return builder.makeLiteral(ty, literals.add(lv));
+    }
+    TypeId f64T() { return interner.primitive(TypeKind::F64); }
+    TypeId f32T() { return interner.primitive(TypeKind::F32); }
     HirNodeId unary(HirOpKind op, HirNodeId operand, TypeId resultTy) {
         return builder.addParent(HirKind::UnaryOp, std::array{operand},
                                  resultTy, encodeOp(op));
@@ -555,6 +565,428 @@ TEST(ConstEval, LogicalOrOfFalseAndTrueFoldsToTrue) {
     ASSERT_TRUE(res.value.has_value());
     EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
     EXPECT_EQ(res.value->core, TypeKind::Bool);
+}
+
+// ─── CE5: allowFloat + IEEE 754 policy ────────────────────────────────────
+
+// Without `allowFloat`, the engine refuses any float-touching expression.
+TEST(ConstEval, FloatRefusedWhenAllowFloatOff) {
+    Rig r;
+    HirNodeId const a = r.litFloat(1.5, r.f64T());
+    HirNodeId const b = r.litFloat(2.5, r.f64T());
+    HirNodeId const add = r.binary(HirOpKind::Add, a, b, r.f64T());
+    auto res = eval(r, add);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+TEST(ConstEval, FloatAddFoldsWithAllowFloat) {
+    Rig r;
+    HirNodeId const a = r.litFloat(1.5, r.f64T());
+    HirNodeId const b = r.litFloat(2.0, r.f64T());
+    HirNodeId const add = r.binary(HirOpKind::Add, a, b, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(add);
+    auto res = evaluateConstant(hir, r.interner, r.literals, add, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 3.5);
+    EXPECT_EQ(res.value->core, TypeKind::F64);
+}
+
+// IEEE 754 div-by-zero is well-defined (±inf), unlike integer div-by-zero.
+TEST(ConstEval, FloatDivByZeroProducesInfNotFailure) {
+    Rig r;
+    HirNodeId const a = r.litFloat(1.0, r.f64T());
+    HirNodeId const b = r.litFloat(0.0, r.f64T());
+    HirNodeId const div = r.binary(HirOpKind::Div, a, b, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(div);
+    auto res = evaluateConstant(hir, r.interner, r.literals, div, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_TRUE(std::isinf(std::get<double>(res.value->value)));
+}
+
+// NaN propagates through arithmetic.
+TEST(ConstEval, FloatNanPropagates) {
+    Rig r;
+    double const nan = std::nan("");
+    HirNodeId const a = r.litFloat(nan, r.f64T());
+    HirNodeId const b = r.litFloat(1.0, r.f64T());
+    HirNodeId const add = r.binary(HirOpKind::Add, a, b, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(add);
+    auto res = evaluateConstant(hir, r.interner, r.literals, add, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_TRUE(std::isnan(std::get<double>(res.value->value)));
+}
+
+// NaN comparison returns false (unordered) per IEEE 754 — even `nan == nan`.
+TEST(ConstEval, FloatNanEqNanReturnsFalse) {
+    Rig r;
+    double const nan = std::nan("");
+    HirNodeId const a = r.litFloat(nan, r.f64T());
+    HirNodeId const b = r.litFloat(nan, r.f64T());
+    HirNodeId const eq = r.binary(HirOpKind::Eq, a, b, r.boolT());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(eq);
+    auto res = evaluateConstant(hir, r.interner, r.literals, eq, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
+    EXPECT_EQ(res.value->core, TypeKind::Bool);
+}
+
+// Mixed int + float operand promotes to float per C99 UAC.
+TEST(ConstEval, MixedIntFloatBinaryOpPromotesToFloat) {
+    Rig r;
+    HirNodeId const a = r.litInt(2, r.intT());
+    HirNodeId const b = r.litFloat(1.5, r.f64T());
+    HirNodeId const add = r.binary(HirOpKind::Add, a, b, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(add);
+    auto res = evaluateConstant(hir, r.interner, r.literals, add, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 3.5);
+}
+
+// Int → Float cast.
+TEST(ConstEval, CastIntToFloat) {
+    Rig r;
+    HirNodeId const i = r.litInt(7, r.intT());
+    HirNodeId const c = r.cast(i, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), 7.0);
+    EXPECT_EQ(res.value->core, TypeKind::F64);
+}
+
+// Float → Int cast: truncate toward zero (C99 §6.3.1.4).
+TEST(ConstEval, CastFloatToIntTruncatesTowardZero) {
+    auto check = [](double in, std::int64_t expected) {
+        Rig r;
+        HirNodeId const f = r.litFloat(in, r.f64T());
+        HirNodeId const c = r.cast(f, r.intT());
+        EvalOptions opts;
+        opts.allowFloat = true;
+        Hir hir = r.finishWith(c);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+        ASSERT_TRUE(res.value.has_value()) << "for input " << in;
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), expected) << "for input " << in;
+    };
+    check(3.7,  3);
+    check(-3.7, -3);   // truncate toward zero, not floor
+    check(0.0,  0);
+}
+
+// Float → Int Cast with NaN refuses regardless of the overflow knob.
+TEST(ConstEval, CastNanToIntRefuses) {
+    Rig r;
+    HirNodeId const f = r.litFloat(std::nan(""), r.f64T());
+    HirNodeId const c = r.cast(f, r.intT());
+    EvalOptions opts;
+    opts.allowFloat       = true;
+    opts.refuseOnOverflow = false;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
+}
+
+// Float → Bool: nonzero (incl. NaN/inf) → true; ±0 → false.
+TEST(ConstEval, CastFloatToBoolHandlesNaNAndInfAndZero) {
+    auto check = [](double in, std::int64_t expected) {
+        Rig r;
+        HirNodeId const f = r.litFloat(in, r.f64T());
+        HirNodeId const c = r.cast(f, r.boolT());
+        EvalOptions opts;
+        opts.allowFloat = true;
+        Hir hir = r.finishWith(c);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+        ASSERT_TRUE(res.value.has_value()) << "for input " << in;
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), expected) << "for input " << in;
+    };
+    check(0.0,                            0);
+    check(-0.0,                           0);
+    check(0.1,                            1);
+    check(-3.14,                          1);
+    check(std::nan(""),                   1);    // NaN truthy
+    check(std::numeric_limits<double>::infinity(),  1);
+    check(-std::numeric_limits<double>::infinity(), 1);
+}
+
+// LogicalAnd with float operands (via asBool) — gated on allowFloat.
+TEST(ConstEval, LogicalAndAcceptsFloatOperandsWhenAllowFloat) {
+    Rig r;
+    HirNodeId const a = r.litFloat(0.0, r.f64T());
+    HirNodeId const b = r.litFloat(1.5, r.f64T());
+    HirNodeId const and_ = r.logAnd(a, b);
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(and_);
+    auto res = evaluateConstant(hir, r.interner, r.literals, and_, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
+    EXPECT_EQ(res.value->core, TypeKind::Bool);
+}
+
+// Float Cast overflow with refuseOnOverflow=true.
+TEST(ConstEval, CastFloatToIntOverflowRefuses) {
+    Rig r;
+    HirNodeId const f = r.litFloat(1e20, r.f64T());   // way bigger than int64
+    HirNodeId const c = r.cast(f, r.intT());
+    EvalOptions opts;
+    opts.allowFloat       = true;
+    opts.refuseOnOverflow = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
+}
+
+// Unary negation on float.
+TEST(ConstEval, UnaryNegOnFloat) {
+    Rig r;
+    HirNodeId const f = r.litFloat(3.14, r.f64T());
+    HirNodeId const neg = r.unary(HirOpKind::Neg, f, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(neg);
+    auto res = evaluateConstant(hir, r.interner, r.literals, neg, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value), -3.14);
+}
+
+// BitNot on float is C99-undefined — refuses with `UnsupportedTypeKind`
+// (the operator IS modelled by the engine for int operands; the type is
+// wrong, not the op). `UnsupportedOperator` would mis-signal "engine
+// doesn't fold this op yet" and confuse verifier diagnostics.
+TEST(ConstEval, BitNotOnFloatRefusesAsUnsupportedTypeKind) {
+    Rig r;
+    HirNodeId const f = r.litFloat(3.14, r.f64T());
+    HirNodeId const bn = r.unary(HirOpKind::BitNot, f, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(bn);
+    auto res = evaluateConstant(hir, r.interner, r.literals, bn, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+// Rem on float is C99-undefined — same UnsupportedTypeKind contract as
+// BitNot above (covers the applyBinaryFloat side of the helper pair).
+TEST(ConstEval, RemOnFloatRefusesAsUnsupportedTypeKind) {
+    Rig r;
+    HirNodeId const a   = r.litFloat(3.14, r.f64T());
+    HirNodeId const b   = r.litFloat(2.0,  r.f64T());
+    HirNodeId const rem = r.binary(HirOpKind::Rem, a, b, r.f64T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(rem);
+    auto res = evaluateConstant(hir, r.interner, r.literals, rem, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+// IEEE 754 ordered comparisons: < ≤ > ≥ produce defined results for
+// non-NaN operands AND unordered (false) when either operand is NaN.
+// Covers the float-comparison branches of applyBinaryFloat that the
+// initial CE5 tests pinned only for Eq/Ne.
+TEST(ConstEval, FloatOrderedComparisonsFold) {
+    auto run = [](HirOpKind op, double l, double r) {
+        Rig rig;
+        HirNodeId const a   = rig.litFloat(l, rig.f64T());
+        HirNodeId const b   = rig.litFloat(r, rig.f64T());
+        HirNodeId const cmp = rig.binary(op, a, b, rig.boolT());
+        EvalOptions opts;
+        opts.allowFloat = true;
+        Hir hir = rig.finishWith(cmp);
+        return evaluateConstant(hir, rig.interner, rig.literals, cmp, opts);
+    };
+    auto truthy = [&](HirOpKind op, double l, double r) {
+        auto res = run(op, l, r);
+        EXPECT_TRUE(res.value.has_value());
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), 1);
+        EXPECT_EQ(res.value->core, TypeKind::Bool);
+    };
+    auto falsy = [&](HirOpKind op, double l, double r) {
+        auto res = run(op, l, r);
+        EXPECT_TRUE(res.value.has_value());
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), 0);
+        EXPECT_EQ(res.value->core, TypeKind::Bool);
+    };
+    truthy(HirOpKind::Lt, 1.0, 2.0); falsy(HirOpKind::Lt, 2.0, 1.0);
+    truthy(HirOpKind::Le, 2.0, 2.0); falsy(HirOpKind::Le, 3.0, 2.0);
+    truthy(HirOpKind::Gt, 2.0, 1.0); falsy(HirOpKind::Gt, 1.0, 2.0);
+    truthy(HirOpKind::Ge, 2.0, 2.0); falsy(HirOpKind::Ge, 1.0, 2.0);
+    // NaN unordered: ALL four ordered comparisons return false.
+    double const nan = std::nan("");
+    falsy(HirOpKind::Lt, nan, 1.0); falsy(HirOpKind::Lt, 1.0, nan);
+    falsy(HirOpKind::Le, nan, 1.0); falsy(HirOpKind::Le, 1.0, nan);
+    falsy(HirOpKind::Gt, nan, 1.0); falsy(HirOpKind::Gt, 1.0, nan);
+    falsy(HirOpKind::Ge, nan, 1.0); falsy(HirOpKind::Ge, 1.0, nan);
+}
+
+// F32 target: the host narrows via `static_cast<float>` round-trip so the
+// stored double matches the runtime's IEEE single-precision value. Test
+// pins a value (0.1) that is NOT exactly representable in either single
+// or double and verifies the engine's result matches the host's single
+// rounding (not the input double's bits).
+TEST(ConstEval, CastF64ToF32ActuallyNarrows) {
+    Rig r;
+    HirNodeId const f = r.litFloat(0.1, r.f64T());
+    HirNodeId const c = r.cast(f, r.f32T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(res.value->core, TypeKind::F32);
+    double const stored   = std::get<double>(res.value->value);
+    double const expected = static_cast<double>(static_cast<float>(0.1));
+    EXPECT_DOUBLE_EQ(stored, expected);
+    EXPECT_NE(stored, 0.1);   // narrowing actually happened
+}
+
+// F32 target from int source: same narrowing discipline.
+TEST(ConstEval, CastIntToF32NarrowsViaFloat) {
+    Rig r;
+    // 16777217 = 2^24 + 1 — exact in double but NOT in float (loses LSB).
+    HirNodeId const lit = r.litInt(16777217, r.i64T());
+    HirNodeId const c   = r.cast(lit, r.f32T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(res.value->core, TypeKind::F32);
+    EXPECT_DOUBLE_EQ(std::get<double>(res.value->value),
+                     static_cast<double>(static_cast<float>(16777217.0)));
+}
+
+// F16 / F128 have no host backing — refuse with UnsupportedTypeKind so
+// the engine never stores a `double` under a `core` that doesn't match.
+// Lifting either requires a soft-float helper (deferred — plan 12.5
+// closure §0.2). Today no consumer emits F16/F128 literals.
+TEST(ConstEval, CastF64ToF16RefusesAsUnsupportedTypeKind) {
+    Rig r;
+    HirNodeId const f = r.litFloat(1.0, r.f64T());
+    HirNodeId const c = r.cast(f, r.interner.primitive(TypeKind::F16));
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+TEST(ConstEval, CastF64ToF128RefusesAsUnsupportedTypeKind) {
+    Rig r;
+    HirNodeId const f = r.litFloat(1.0, r.f64T());
+    HirNodeId const c = r.cast(f, r.interner.primitive(TypeKind::F128));
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+// Float→int boundary at exactly 2^63. The naive
+// `truncated > static_cast<double>(INT64_MAX)` would compare against
+// 2^63 (INT64_MAX rounds UP on conversion to double) and miss
+// `truncated == 2^63` — a value that subsequently undefined-behaves
+// when cast to int64_t. Engine must refuse at this exact boundary.
+TEST(ConstEval, CastFloatToInt64AtPositiveBoundaryRefuses) {
+    Rig r;
+    HirNodeId const f = r.litFloat(9223372036854775808.0, r.f64T());   // 2^63
+    HirNodeId const c = r.cast(f, r.interner.primitive(TypeKind::I64));
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
+}
+
+// Float→int out-of-int64: refuses UNCONDITIONALLY of refuseOnOverflow.
+// The C99 §6.3.1.4 bit-pattern is implementation-defined when the
+// truncated value doesn't fit the destination integer type, and the
+// engine has no portable wrap to emulate. Same policy as NaN/inf above.
+TEST(ConstEval, CastFloatOutOfInt64RefusesEvenWithRefuseOnOverflowOff) {
+    Rig r;
+    HirNodeId const f = r.litFloat(1e30, r.f64T());   // way beyond int64
+    HirNodeId const c = r.cast(f, r.intT());
+    EvalOptions opts;
+    opts.allowFloat       = true;
+    opts.refuseOnOverflow = false;   // knob OFF — but engine still refuses
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, opts);
+    EXPECT_FALSE(res.value.has_value());
+    EXPECT_EQ(res.failure, ConstEvalFailure::Overflow);
+}
+
+// Unary negation on float covers IEEE corners: NaN stays NaN with sign
+// flipped (still NaN by value), ±inf flips sign, -0.0 → +0.0. None of
+// these should refuse; the engine must just call host `-x`.
+TEST(ConstEval, UnaryNegOnFloatHandlesNaNInfAndNegativeZero) {
+    auto neg = [](double v) {
+        Rig rig;
+        HirNodeId const f = rig.litFloat(v, rig.f64T());
+        HirNodeId const n = rig.unary(HirOpKind::Neg, f, rig.f64T());
+        EvalOptions opts;
+        opts.allowFloat = true;
+        Hir hir = rig.finishWith(n);
+        return evaluateConstant(hir, rig.interner, rig.literals, n, opts);
+    };
+    {
+        auto res = neg(std::nan(""));
+        ASSERT_TRUE(res.value.has_value());
+        EXPECT_TRUE(std::isnan(std::get<double>(res.value->value)));
+    }
+    {
+        auto res = neg(std::numeric_limits<double>::infinity());
+        ASSERT_TRUE(res.value.has_value());
+        EXPECT_DOUBLE_EQ(std::get<double>(res.value->value),
+                         -std::numeric_limits<double>::infinity());
+    }
+    {
+        auto res = neg(-0.0);
+        ASSERT_TRUE(res.value.has_value());
+        double const out = std::get<double>(res.value->value);
+        EXPECT_DOUBLE_EQ(out, 0.0);
+        EXPECT_FALSE(std::signbit(out));   // -(-0) == +0 per IEEE
+    }
+}
+
+// Cast Byte / Char source-and-target: these are integer kinds (8-bit
+// unsigned and 32-bit Unicode codepoint respectively) so they go
+// through the int→int path. Pin them so the Cast acceptance matrix
+// explicitly covers them — closes the architecture-review gap noted
+// in plan 12.5 closure.
+TEST(ConstEval, CastIntToByteAndCharFolds) {
+    Rig r;
+    // 0x41 ('A') fits both Byte and Char.
+    HirNodeId const lit = r.litInt(0x41, r.intT());
+    HirNodeId const cb  = r.cast(lit, r.interner.primitive(TypeKind::Byte));
+    auto resB = eval(r, cb);
+    ASSERT_TRUE(resB.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(resB.value->value), 0x41);
+    EXPECT_EQ(resB.value->core, TypeKind::Byte);
+    // Char target via a fresh rig.
+    Rig r2;
+    HirNodeId const lit2 = r2.litInt(0x41, r2.intT());
+    HirNodeId const cc   = r2.cast(lit2, r2.interner.primitive(TypeKind::Char));
+    auto resC = eval(r2, cc);
+    ASSERT_TRUE(resC.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(resC.value->value), 0x41);
+    EXPECT_EQ(resC.value->core, TypeKind::Char);
 }
 
 // CE4 Ternary core re-tag: a narrower-than-Ternary arm core must NOT

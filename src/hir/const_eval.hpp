@@ -51,7 +51,28 @@
 //     SELECTED arm. `cond ? const : non_const` still folds when cond
 //     is true. The selected arm's failure propagates verbatim with its
 //     own blame anchor.
-// CE5 in plan 12.5 will add: allowFloat + IEEE 754 policy.
+//   - Float folding (CE5) — gated by `EvalOptions::allowFloat`. Floats
+//     route through `applyUnaryFloat` / `applyBinaryFloat` using host
+//     `<cmath>` IEEE 754 semantics (round-to-nearest-even rounding;
+//     NaN propagates; ±inf on overflow; comparisons against NaN return
+//     false — including `NaN == NaN`). Cast quadrants: int↔float (host
+//     conversion; F32 target performs the IEEE narrowing via a
+//     `static_cast<float>` round-trip), float→bool (`x != 0.0`,
+//     NaN/±inf → true), float→int (truncate toward zero; refuses with
+//     `Overflow` for NaN/±inf and for out-of-int64 truncated values —
+//     refusal is UNCONDITIONAL of `refuseOnOverflow` because the C99
+//     bit-pattern is implementation-defined; the wrap-knob applies only
+//     to the inner-range "fits int64 but not target" case), float→float
+//     (F32 narrows, F64 identity; F16 / F128 refuse with
+//     `UnsupportedTypeKind` — no host backing, soft-float deferred).
+//     Logical and Ternary cond accept floats too (via the shared
+//     `asBool(value, allowFloat)` helper). When `allowFloat=false`
+//     any float-involving operand refuses with `UnsupportedTypeKind`.
+//     C99-undefined operator+float combinations (BitNot/Not on float,
+//     Rem/Bitwise/Shift on float) surface `UnsupportedTypeKind` (the
+//     operator IS modelled by the engine; the type is wrong) — the
+//     `UnsupportedOperator` code is reserved for the genuine "engine
+//     doesn't fold this op yet" case.
 
 namespace dss {
 
@@ -97,7 +118,7 @@ using ConstSymbolResolver =
 // symbol then surfaces `NotAConstantExpression` (CE1's behaviour).
 struct EvalOptions {
     ConstSymbolResolver resolveConstSymbol{};   // CE2
-    bool allowFloat              = false;       // CE5 opens this gate
+    bool allowFloat              = false;       // gates float folding (CE5)
     bool refuseOnOverflow        = true;
     bool refuseOnDivByZero       = true;
     bool refuseOnShiftOutOfRange = true;

@@ -1407,6 +1407,13 @@ struct Lowerer {
         // flip this back to `true` to surface the overflow as a verifier
         // diagnostic — same engine, different policy per consumer.
         opts.refuseOnOverflow = false;
+        // CE5: MIR-globals also opts into float folding. A `float g = 1.5 + 2.0;`
+        // initializer folds to constant `3.5` instead of synthesizing a
+        // `__module_init__` runtime path. Same runtime-equivalence argument as
+        // `refuseOnOverflow=false` — IEEE 754 host arithmetic produces the
+        // same bits the runtime would compute; refusing would only lose an
+        // optimization.
+        opts.allowFloat = true;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             if (hir.kind(decl) != HirKind::Global) continue;
             PendingGlobal pg;
