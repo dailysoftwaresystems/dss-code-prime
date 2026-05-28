@@ -36,8 +36,8 @@
   "lexerModes": {
     "main":            { "tokens": "default" },
     "bracket-id":      { "defaultToken": { "kind": "BracketIdChar" } },
-    "single-string":   { "defaultToken": { "kind": "StringChar" } },
-    "unicode-string":  { "defaultToken": { "kind": "StringChar" } },
+    "single-string":   { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
+    "unicode-string":  { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
     "line-comment":    {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -272,13 +272,16 @@
       "alt": [
         "nameOrCall",
         "IntLiteral",
-        "StringStart",
-        "UnicodeStringStart",
+        "stringLitExpr",
+        "uniStringLitExpr",
         "NullKw",
         { "sequence": [ "MinusOp", "operand" ] },
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
     },
+
+    "stringLitExpr":    { "sequence": [ "StringStart",        "StringLiteral" ] },
+    "uniStringLitExpr": { "sequence": [ "UnicodeStringStart", "StringLiteral" ] },
 
     "nameOrCall": {
       "alt": [ "callExpr", "qualifiedName" ],
@@ -311,7 +314,8 @@
       { "rule": "columnDecl", "name": 0, "type": 1, "kind": "variable" }
     ],
     "references": [
-      { "rule": "qualifiedName", "nameMatch": "lastIdentifier" }
+      { "rule": "qualifiedName", "nameMatch": "lastIdentifier",
+        "hardParents": ["tableRef", "insertStmt", "updateStmt", "deleteStmt"] }
     ],
     "scopes": [ "createTableStmt" ],
     "callRules": [
@@ -327,6 +331,105 @@
     ],
     "literalTypes": [
       { "literal": "IntLiteral", "core": "I32" }
+    ]
+  },
+
+  "hirLowering": {
+    "extensionKinds": [
+      { "name": "TSQL::Select",      "lang": "TsqlSubset" },
+      { "name": "TSQL::Insert",      "lang": "TsqlSubset" },
+      { "name": "TSQL::Update",      "lang": "TsqlSubset" },
+      { "name": "TSQL::Delete",      "lang": "TsqlSubset" },
+      { "name": "TSQL::CreateTable", "lang": "TsqlSubset" },
+      { "name": "TSQL::Projection",  "lang": "TsqlSubset" },
+      { "name": "TSQL::Star",        "lang": "TsqlSubset" },
+      { "name": "TSQL::ValueList",   "lang": "TsqlSubset" },
+      { "name": "TSQL::ColumnList",  "lang": "TsqlSubset" },
+      { "name": "TSQL::AssignList",  "lang": "TsqlSubset" },
+      { "name": "TSQL::Assignment",  "lang": "TsqlSubset" },
+      { "name": "TSQL::Columns",     "lang": "TsqlSubset" },
+      { "name": "TSQL::Null",        "lang": "TsqlSubset" },
+      { "name": "TSQL::Name",        "lang": "TsqlSubset" }
+    ],
+
+    "refExtensionKind": "TSQL::Name",
+
+    "flatExprRule":     "expression",
+    "flatBinaryOpRule": "binaryOp",
+    "operandRule":      "operand",
+
+    "stringLiteral":          { "startToken": "StringStart", "bodyToken": "StringLiteral" },
+    "unicodeStringStartToken": "UnicodeStringStart",
+    "stringDoubledDelimiter":  true,
+
+    "nullLiteral": { "token": "NullKw", "hirKind": "TSQL::Null" },
+
+    "binaryOps": [
+      { "token": "PlusOp",   "target": "Add" },
+      { "token": "MinusOp",  "target": "Sub" },
+      { "token": "StarOp",   "target": "Mul" },
+      { "token": "SlashOp",  "target": "Div" },
+      { "token": "ModOp",    "target": "Rem" },
+      { "token": "EqOp",     "target": "Eq"  },
+      { "token": "NotEqOp",  "target": "Ne"  },
+      { "token": "NotEqOp2", "target": "Ne"  },
+      { "token": "LtOp",     "target": "Lt"  },
+      { "token": "GtOp",     "target": "Gt"  },
+      { "token": "LtEqOp",   "target": "Le"  },
+      { "token": "GtEqOp",   "target": "Ge"  }
+    ],
+    "unaryOps": [
+      { "token": "MinusOp", "target": "Neg" }
+    ],
+
+    "ruleMappings": [
+      { "rule": "selectStmt", "hirKind": "TSQL::Select", "childGathering": [
+        { "match": { "rule": "selectList" },                    "lower": "ext",      "role": "projection" },
+        { "match": { "rule": "tableRef" },                      "lower": "ref",      "role": "from" },
+        { "match": { "rule": "whereClause" }, "optional": true, "lower": "flatExpr", "role": "where" }
+      ] },
+      { "rule": "selectStar",     "hirKind": "TSQL::Star",      "childGathering": [] },
+      { "rule": "selectItemList", "hirKind": "TSQL::Projection", "childGathering": [
+        { "match": { "rule": "selectItem" }, "list": true, "lower": "flatExpr", "role": "items" }
+      ] },
+
+      { "rule": "insertStmt", "hirKind": "TSQL::Insert", "childGathering": [
+        { "match": { "rule": "qualifiedName" },               "lower": "ref", "role": "target" },
+        { "match": { "rule": "columnList" }, "optional": true, "lower": "ext", "role": "columns" },
+        { "match": { "rule": "valueList" },                   "lower": "ext", "role": "values" }
+      ] },
+      { "rule": "columnList", "hirKind": "TSQL::ColumnList", "childGathering": [
+        { "match": { "rule": "nameAtom" }, "list": true, "lower": "ref", "role": "columns" }
+      ] },
+      { "rule": "valueList", "hirKind": "TSQL::ValueList", "childGathering": [
+        { "match": { "rule": "expression" }, "list": true, "lower": "flatExpr", "role": "values" }
+      ] },
+
+      { "rule": "updateStmt", "hirKind": "TSQL::Update", "childGathering": [
+        { "match": { "rule": "qualifiedName" },                 "lower": "ref",      "role": "target" },
+        { "match": { "rule": "assignList" },                    "lower": "ext",      "role": "assignments" },
+        { "match": { "rule": "whereClause" }, "optional": true, "lower": "flatExpr", "role": "where" }
+      ] },
+      { "rule": "assignList", "hirKind": "TSQL::AssignList", "childGathering": [
+        { "match": { "rule": "assignment" }, "list": true, "lower": "ext", "role": "assignments" }
+      ] },
+      { "rule": "assignment", "hirKind": "TSQL::Assignment", "childGathering": [
+        { "match": { "rule": "nameAtom" },    "lower": "ref",      "role": "target" },
+        { "match": { "rule": "expression" },  "lower": "flatExpr", "role": "value" }
+      ] },
+
+      { "rule": "deleteStmt", "hirKind": "TSQL::Delete", "childGathering": [
+        { "match": { "rule": "qualifiedName" },                 "lower": "ref",      "role": "target" },
+        { "match": { "rule": "whereClause" }, "optional": true, "lower": "flatExpr", "role": "where" }
+      ] },
+
+      { "rule": "createTableStmt", "hirKind": "TSQL::CreateTable", "childGathering": [
+        { "match": { "rule": "qualifiedName" },  "lower": "ref", "role": "name" },
+        { "match": { "rule": "columnDeclList" }, "lower": "ext", "role": "columns" }
+      ] },
+      { "rule": "columnDeclList", "hirKind": "TSQL::Columns", "childGathering": [
+        { "match": { "rule": "columnDecl" }, "list": true, "lower": "varDecl", "role": "columns" }
+      ] }
     ]
   }
 }

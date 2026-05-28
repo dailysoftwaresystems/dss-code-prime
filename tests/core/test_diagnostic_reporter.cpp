@@ -104,6 +104,19 @@ TEST(Reporter, RuleContextIsPartOfDedupKey) {
     EXPECT_EQ(r.all().size(), 2u);
 }
 
+TEST(Reporter, ActualIsPartOfDedupKey) {
+    // Diagnostics sharing (code, buffer, span, rule) but carrying DIFFERENT
+    // `actual` detail convey distinct information (e.g. two different missing
+    // files, or two different HIR nodes with no source span) and must NOT be
+    // collapsed. True duplicates (identical `actual`) still dedup — see
+    // DedupesIdenticalInWindow above.
+    DiagnosticReporter r;
+    BufferId b{1};
+    r.report(makeDiag(DiagnosticCode::D_FileNotFound, DiagnosticSeverity::Error, b, 0, 0, "a.h"));
+    r.report(makeDiag(DiagnosticCode::D_FileNotFound, DiagnosticSeverity::Error, b, 0, 0, "b.h"));
+    EXPECT_EQ(r.all().size(), 2u);
+}
+
 TEST(Reporter, PerCodeCapCoalescesSilently) {
     DiagnosticReporter::Config cfg;
     cfg.maxPerCode = 3;

@@ -154,7 +154,8 @@ void checkGoldenTree(Tree const& t, fs::path const& goldenPath) {
     }
     std::ostringstream buf;
     buf << in.rdbuf();
-    const std::string expected = std::move(buf).str();
+    std::string expected = std::move(buf).str();
+    std::erase(expected, '\r');   // CRLF→LF: compare is line-ending agnostic (Windows autocrlf)
     EXPECT_EQ(actual, expected)
         << "tree shape diverged from " << goldenPath.filename().string()
         << " — if the change is intentional, re-run with "

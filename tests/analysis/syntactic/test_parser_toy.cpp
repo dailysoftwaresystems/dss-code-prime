@@ -103,7 +103,7 @@ TEST(ParserToy, LexerDiagnosticsFoldedIntoTree) {
     auto loaded = GrammarSchema::loadShipped("toy");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
-    auto src = SourceBuffer::fromString("var x = @;", "<toy>");
+    auto src = SourceBuffer::fromString("var x : int = @;", "<toy>");
     Tokenizer tk{src, schema};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     Parser p{src, schema, std::move(stream), {}, std::move(lexDiags)};
@@ -120,7 +120,7 @@ TEST(ParserToy, NullLexerDiagsDoesNotFoldLexerErrors) {
     // diagnostics in the discarded tokenizer reporter — they do NOT appear
     // in the Tree. Backward-compat for existing callers (LSP, tests). The
     // parser still emits its own P_NoAlternativeMatched at the `@`.
-    auto h = loadAndTokenize("var x = @;");   // discards lexer diags
+    auto h = loadAndTokenize("var x : int = @;");   // discards lexer diags
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
 
@@ -134,42 +134,44 @@ TEST(ParserToy, NullLexerDiagsDoesNotFoldLexerErrors) {
 // ── happy paths ─────────────────────────────────────────────────────────
 
 TEST(ParserToy, HappyPath_SingleVarDecl) {
-    auto h = loadAndTokenize("var x = y;");
+    auto h = loadAndTokenize("var x : int = y;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
     // Shape pin: root contains exactly one statement frame.
-    EXPECT_EQ(countChildRule(t, t.root(), "statement"), 1u);
+    EXPECT_EQ(countChildRule(t, t.root(), "topLevel"), 1u);
     expectExactCodes(t.diagnostics().all(), {});
 }
 
-TEST(ParserToy, HappyPath_SingleExprStmt) {
-    auto h = loadAndTokenize("y;");
+TEST(ParserToy, HappyPath_FuncDef) {
+    // The other top-level form; its body exercises a block, an expression
+    // statement, and a return.
+    auto h = loadAndTokenize("func f() -> int { x; return y; }");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_EQ(countChildRule(t, t.root(), "statement"), 1u);
+    EXPECT_EQ(countChildRule(t, t.root(), "topLevel"), 1u);
     expectExactCodes(t.diagnostics().all(), {});
 }
 
 TEST(ParserToy, HappyPath_MultipleStatements) {
-    auto h = loadAndTokenize("var x = a; y; var w = b;");
+    auto h = loadAndTokenize("var x : int = a; var w : int = b; func f() -> void { x; }");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_EQ(countChildRule(t, t.root(), "statement"), 3u)
-        << "three statement frames expected (varDecl, exprStmt, varDecl)";
+    EXPECT_EQ(countChildRule(t, t.root(), "topLevel"), 3u)
+        << "three top-level frames expected (two var globals, one funcDef)";
     expectExactCodes(t.diagnostics().all(), {});
 }
 
 TEST(ParserToy, HappyPath_EmptySource) {
-    // Toy root is `repeat statement`: nullable, so empty source must
+    // Toy root is `repeat topLevel`: nullable, so empty source must
     // parse cleanly with the root present but childless.
     auto h = loadAndTokenize("");
     Parser p{h.src, h.schema, std::move(h.stream)};
@@ -177,7 +179,7 @@ TEST(ParserToy, HappyPath_EmptySource) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_EQ(countChildRule(t, t.root(), "statement"), 0u);
+    EXPECT_EQ(countChildRule(t, t.root(), "topLevel"), 0u);
     expectExactCodes(t.diagnostics().all(), {});
 }
 
@@ -190,7 +192,7 @@ TEST(ParserToy, BrokenPath_UnknownTokenInExpressionPosition) {
     // the cursor's expected set — so the parser intercepts with
     // `pushError` (emitting P_UnexpectedToken) before the builder's
     // pushToken would have synthesized its own P_UnknownToken.
-    auto h = loadAndTokenize("var x = @;");
+    auto h = loadAndTokenize("var x : int = @;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -223,7 +225,7 @@ TEST(ParserToy, BrokenPath_PrematureEofMidRule) {
 }
 
 TEST(ParserToy, BrokenPath_TokenNotInAnyFirstSet) {
-    // `;` at top level isn't in FIRST(statement). Parser emits
+    // `;` at top level isn't in FIRST(topLevel). Parser emits
     // exactly one P_NoAlternativeMatched and consumes — no
     // P_UnexpectedToken should fire (that's a TokenLeaf mismatch
     // signal, not an AltChoice signal).
@@ -253,12 +255,12 @@ TEST(ParserToy, RuleLeafSkipNullable_DoesNotConsumeTokens) {
 TEST(ParserToy, NullableBranchNegativePin_DoesNotFireOnFirstMatch) {
     // When the AltChoice union DOES contain peek, the parser must
     // dispatch into the matching branch — NOT take the nullable
-    // skip. `var x = y;` exercises the repeat's `innerStart` branch
-    // (statement RuleLeaf) and must produce a statement frame.
-    auto h = loadAndTokenize("var x = y;");
+    // skip. `var x : int = y;` exercises the repeat's `innerStart`
+    // branch (topLevel RuleLeaf) and must produce a top-level frame.
+    auto h = loadAndTokenize("var x : int = y;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
-    EXPECT_GE(countChildRule(result.tree, result.tree.root(), "statement"), 1u)
+    EXPECT_GE(countChildRule(result.tree, result.tree.root(), "topLevel"), 1u)
         << "non-empty input must take the body branch, not the skip";
     expectExactCodes(result.tree.diagnostics().all(), {});
 }
@@ -270,13 +272,13 @@ TEST(ParserToy, TriviaInteriorWhitespacePreservedAtAllSlots) {
     // VarKeyword (TokenLeaf), Identifier (TokenLeaf), AssignmentOp
     // (TokenLeaf), expression (RuleLeaf entry), and EndCommand
     // (TokenLeaf). Each trivia push must not affect dispatch state.
-    auto h = loadAndTokenize("var   x  =   y ;");
+    auto h = loadAndTokenize("var   x  :  int  =   y ;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_EQ(countChildRule(t, t.root(), "statement"), 1u);
+    EXPECT_EQ(countChildRule(t, t.root(), "topLevel"), 1u);
     expectExactCodes(t.diagnostics().all(), {});
 }
 
@@ -285,13 +287,13 @@ TEST(ParserToy, LeadingAndTrailingTrivia) {
     // after final statement. Pinned because the drain bypasses the
     // walker and a regression there could mis-align iteration 0's
     // watchdog seed.
-    auto h = loadAndTokenize("\n\n  var x = y;\n\n  ");
+    auto h = loadAndTokenize("\n\n  var x : int = y;\n\n  ");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_EQ(countChildRule(t, t.root(), "statement"), 1u);
+    EXPECT_EQ(countChildRule(t, t.root(), "topLevel"), 1u);
     expectExactCodes(t.diagnostics().all(), {});
 }
 
@@ -305,7 +307,7 @@ TEST(ParserToy, AllTriviaSource) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_EQ(countChildRule(t, t.root(), "statement"), 0u);
+    EXPECT_EQ(countChildRule(t, t.root(), "topLevel"), 0u);
     expectExactCodes(t.diagnostics().all(), {});
 }
 

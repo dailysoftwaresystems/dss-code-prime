@@ -65,7 +65,7 @@ public:
     struct Config {
         std::size_t       maxDiagnostics = 1000;   // hard cap; overflow emits P_TooManyDiagnostics + stops
         std::size_t       maxPerCode     = 50;     // per-code cap; coalesces beyond this
-        std::size_t       dedupWindow    = 4;      // identical (code, buffer, span) within this many recent diags is dropped
+        std::size_t       dedupWindow    = 4;      // identical (code, buffer, span, rule, actual) within this many recent diags is dropped
         DiagnosticPolicy  policy{};
     };
 
@@ -129,7 +129,7 @@ private:
     Config                                  cfg_{};
     std::vector<ParseDiagnostic>            all_;
     std::unordered_map<DiagnosticCode, std::size_t> perCode_;
-    std::deque<std::uint64_t>               recent_;      // hash of (code, buffer, span) sliding window
+    std::deque<std::uint64_t>               recent_;      // hash of (code, buffer, span, rule, actual) sliding window
     bool                                    hitCap_ = false;
 };
 

@@ -60,17 +60,25 @@ struct DSS_EXPORT ResolutionContext {
     // The trees built so far. An include-following resolver appends to this via
     // `loadFile`; index-based access stays valid across that growth, but a
     // `Tree const&` / span into an element does NOT (see loadFile).
+    //
+    // HR11/CU5: a multi-language CU runs ONE resolver per distinct schema (each
+    // bound to its language via `chooseResolver`). A resolver processes only the
+    // trees whose own schema matches its own — it reads the per-tree schema from
+    // `Tree::schema()`, never a single CU-wide schema (which no longer lives on
+    // the context). So the resolver's rule/token id lookups are always against
+    // the same schema that produced the tree it's looking at.
     std::vector<Tree>&                     trees;
-    GrammarSchema const&                   schema;
     DiagnosticReporter&                    diagnostics;
     std::span<std::filesystem::path const> includeDirs;
 
-    // Load + tokenize + parse `path`, append its Tree to `trees` (deduplicating
-    // by weakly-canonical path), and return the resulting tree's TreeId. Sets
-    // `ok` false (and returns InvalidTree) when the file can't be read.
-    // MUST NOT be called while holding a reference/span into `trees` — it may
-    // reallocate the vector.
-    std::function<TreeId(std::filesystem::path const&, bool& ok)> loadFile;
+    // Load + tokenize + parse `path` UNDER `schema` (the including tree's
+    // language — an `#include` in a c-subset file loads another c-subset file),
+    // append its Tree to `trees` (deduplicating by weakly-canonical path), and
+    // return the resulting tree's TreeId. Sets `ok` false (and returns
+    // InvalidTree) when the file can't be read. MUST NOT be called while holding
+    // a reference/span into `trees` — it may reallocate the vector.
+    std::function<TreeId(std::filesystem::path const&, bool& ok,
+                         std::shared_ptr<GrammarSchema const> schema)> loadFile;
 
     // Output: the resolved cross-tree edges. Resolvers append; never cleared.
     std::vector<CrossTreeRef>&             crossRefs;
@@ -89,8 +97,11 @@ public:
 // Build the resolver from a schema's config-driven `imports` block. Always
 // returns a non-null resolver — a schema with no `imports` block (or
 // `strategy: "none"`) gets one that produces no cross-refs. NO dispatch on the
-// language name: behavior comes entirely from `schema.imports()`.
+// language name: behavior comes entirely from `schema->imports()`. The resolver
+// holds `schema` (shared, kept alive for its lifetime) so that — in a
+// multi-language CU — it both looks up rule/token ids against the right schema
+// AND processes only the trees built from that schema (HR11/CU5).
 [[nodiscard]] DSS_EXPORT std::unique_ptr<ImportResolver>
-chooseResolver(GrammarSchema const& schema);
+chooseResolver(std::shared_ptr<GrammarSchema const> schema);
 
 } // namespace dss

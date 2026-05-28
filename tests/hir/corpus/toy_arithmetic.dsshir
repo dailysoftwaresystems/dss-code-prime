@@ -1,0 +1,13 @@
+dsshir 1
+symbols {
+  %1 "main"
+  %2 "x"
+}
+module "toy" {
+  function %1 : fn() -> i64 {
+    block {
+      var %2 : i64 = binop Add : i64 (lit #0 : i64, lit #1 : i64)
+      return ref %2 : i64
+    }
+  }
+}

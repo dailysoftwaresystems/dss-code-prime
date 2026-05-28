@@ -97,6 +97,16 @@ enum class UnterminatedFlavor : std::uint8_t {
 struct DSS_EXPORT DefaultTokenSpec {
     SchemaTokenId kind;
     NodeFlags     flags = NodeFlags::None;
+    // When true, the body mode emits ONE token of `kind` spanning the whole
+    // literal body (between the opener and the close delimiter) instead of one
+    // token per codepoint — the same single-token model `IntLiteral` uses. The
+    // mode keeps all its escape / endsAt / unterminated logic; only emission
+    // granularity changes. A coalesced kind is IN-grammar (the loader does NOT
+    // add it to `bodyDefaultTokenKinds`), so a shape's `operand` can reference
+    // it and the literal's value can be decoded. `false` = per-codepoint
+    // emission (the off-grammar comment/string-char behavior). Set per body
+    // mode that backs a value-bearing literal (char / string).
+    bool          coalesce = false;
 };
 
 // Metadata for a single named lexer mode. Construct via `make(name, id,

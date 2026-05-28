@@ -95,6 +95,19 @@ struct DSS_EXPORT KindDiscriminator {
     std::vector<std::uint32_t> bodyPath;
 };
 
+// SE-arrays (HR9): a C-style declarator suffix (e.g. `int a[10]`). When a
+// declaration configures one and a node of `rule` appears in its subtree, the
+// declared type is wrapped as Array<base, length>, where `length` is the
+// constant integer in the suffix's visible child at `lengthChild`. A missing or
+// non-constant length fails loud (S_NonConstantArrayLength); an out-of-range one
+// is S_ArrayLengthOutOfRange — never a silent pointer decay. Nested in an
+// `optional` (like `kindByChild`) so the off state can't carry stray fields.
+struct DSS_EXPORT ArraySuffix {
+    RuleId                       rule{};        // the suffix shape rule
+    std::string                  ruleName;      // source spelling, for diagnostics
+    std::optional<std::uint32_t> lengthChild;   // visible-child index of the length expr
+};
+
 struct DSS_EXPORT DeclarationRule {
     // The rule (resolved to RuleId) whose subtree introduces the decl.
     RuleId          rule{};
@@ -128,6 +141,11 @@ struct DSS_EXPORT DeclarationRule {
     // pass 1 and uses the resulting effective kind / params / body
     // instead of the static fields above.
     std::optional<KindDiscriminator> kindByChild;
+    // SE-arrays (HR9): optional C-style declarator suffix (e.g. `int a[10]`).
+    // The suffix is a sibling of the type (not a type-position constructor), so
+    // the engine matches it by rule within the declaration subtree rather than
+    // via `typeShapes`. `nullopt` ⇒ this declaration form has no array syntax.
+    std::optional<ArraySuffix> arraySuffix;
     // Source-text name of the declared rule, retained for diagnostics.
     std::string     ruleName;
 };
@@ -190,6 +208,19 @@ struct DSS_EXPORT ReferenceRule {
     RuleId          rule{};
     NameMatchMode   nameMatch = NameMatchMode::Self;
     std::string     ruleName;
+    // Positional control over the "unresolved is an error" decision, for
+    // languages where the SAME reference rule appears both in must-resolve and
+    // bind-late positions. T-SQL's `qualifiedName` is a TABLE reference under
+    // `tableRef` / the DML-statement target (must resolve — a missing table is an
+    // error) but a relational COLUMN reference inside an expression (binds
+    // against the FROM relation, which this frontend does not model — unresolved
+    // is NOT an error). When `hardParents` is non-empty, an unresolved reference
+    // emits S_UndeclaredIdentifier ONLY when its parent node's rule is in the
+    // list; elsewhere it stays soft (sym 0, name recoverable from provenance).
+    // Empty (the default) ⇒ hard everywhere (c-subset / toy lexical resolution).
+    // A resolvable name always binds regardless of position.
+    std::vector<RuleId>      hardParents;
+    std::vector<std::string> hardParentNames;   // source names, for diagnostics
 };
 
 // Source built-in type name → lattice type mapping. Used during
@@ -307,6 +338,13 @@ struct DSS_EXPORT SemanticConfig {
     // the bracketed text from the source slice (brackets stripped). Absent
     // (InvalidSchemaToken) for languages with no bracket-id syntax.
     std::optional<SchemaTokenId>    bracketIdentifierToken;
+    // SE-pointers (G5): a token whose occurrence in a type-position subtree
+    // wraps the resolved type one level in `Ptr<…>` (C's `int *p` / `int **p`
+    // declarator stars). The engine counts these tokens within a type node and
+    // applies that many `Ptr` constructors — a declarator-DEPTH model. Absent
+    // (InvalidSchemaToken) for languages with no pointer declarator. Full C
+    // declarators (function pointers, arrays-of-pointers) stay future surface.
+    std::optional<SchemaTokenId>    pointerToken;
 };
 
 } // namespace dss

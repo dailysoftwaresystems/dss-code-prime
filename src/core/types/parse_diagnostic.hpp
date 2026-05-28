@@ -28,6 +28,7 @@ enum class DiagnosticSeverity : std::uint8_t {
 //   P_*    parse-time / tree-builder
 //   C_*    config-load (GrammarSchema)
 //   S_*    semantic (later)
+//   H_*    HIR verifier / lowering (plan 09)
 //   I_*    IR-gen   (later)
 //
 // Values are stable across versions — they appear in user-facing output
@@ -141,6 +142,15 @@ enum class DiagnosticCode : std::uint16_t {
     // unknown-name cases for its top-level block. Absent field = valid
     // (empty profile list).
     C_UnknownArtifactProfile      = 0xC032,
+    // The `hirLowering` block (schema v4 facet, plan 09 HR8) is present but
+    // malformed: not an object, an entry with the wrong JSON type, an
+    // out-of-range child index, or a missing required sub-field. Mirrors
+    // C_InvalidSemantics. Dangling rule/token names use C_UnknownShape/
+    // C_UnknownToken; a missing required field uses C_MissingField. (An
+    // unknown HIR kind/op NAME is caught later, at lowering-engine
+    // construction — the schema loader in `core` cannot see the `hir`-layer
+    // enums — and reported as H_UnsupportedLoweringForKind.)
+    C_InvalidHirLowering          = 0xC033,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
@@ -172,6 +182,17 @@ enum class DiagnosticCode : std::uint16_t {
     // dead-store / write-only detection requires dataflow and stays with the
     // optimizer phase (registry D9).
     S_UnusedVariable              = 0xE00A,
+    // An array declarator suffix (`int a[N]`) whose length `N` is absent or is
+    // not a compile-time constant integer literal. The engine refuses to guess
+    // (e.g. silently decay to a pointer or assume length 0); the declaration's
+    // type stays unresolved so downstream phases fail loud rather than
+    // miscompile. Config-driven via DeclarationRule::arraySuffixRule.
+    S_NonConstantArrayLength      = 0xE00B,
+    // An array declarator whose length IS a constant integer literal but is too
+    // large to represent as the signed length the type lattice stores (it would
+    // wrap to a negative length). Distinct from S_NonConstantArrayLength (which
+    // is "not a constant at all"); kept separate so the message matches reality.
+    S_ArrayLengthOutOfRange       = 0xE00C,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -190,6 +211,68 @@ enum class DiagnosticCode : std::uint16_t {
     // the target, so the driver does not treat them as build-fatal here.
     D_UnresolvedImport            = 0xD004,
     D_UnresolvedReference         = 0xD005,
+    // HR11/CU5: in a MULTI-language CU, `addFile`'s path extension matched no
+    // registered source language's `fileExtensions` — fail loud rather than
+    // silently parse the file under the primary grammar. (A single-language CU
+    // always routes to its one schema, so this never fires there.)
+    D_UnknownFileExtension        = 0xD006,
+
+    // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
+    // as the letter `H`, see diagnosticCodePrefix) ──
+    // Emitted by the language-agnostic HIR verifier (`src/hir/hir_verifier`) and
+    // (later) the CST→HIR lowering. Reserved for verifier-/lowering-time
+    // failures only — config-load errors in a `hirLowering` block use the C_*
+    // band (plan §4 Q8). Append, never renumber.
+    // H_TypeUnresolved: an expression / TypeRef / VarDecl node whose `typeId` is
+    //   not valid() — i.e. lowering/semantic analysis failed to resolve its type.
+    //   A node already flagged `HirFlags::HasError` is skipped (cascade
+    //   suppression), so this fires only on a genuinely untyped, non-error node.
+    H_TypeUnresolved              = 0xF001,
+    // H_InvalidBreak: a BreakStmt/ContinueStmt whose nesting index does not name
+    //   an enclosing loop/switch — index out of range, or a ContinueStmt whose
+    //   resolved target is a switch (continue can only target a loop).
+    H_InvalidBreak                = 0xF002,
+    // H_VerifierFailure: a node violates a structural invariant — HR3 uses it for
+    //   a wrong child-arity for the node's kind (e.g. a BinaryOp with 1 child, a
+    //   ForStmt whose child count disagrees with its clause-presence mask). HR6
+    //   extends it to: a statement after an unconditional terminator in a Block
+    //   (dead code), a non-void function body that may fall through without
+    //   returning, and a Call whose argument count/types disagree with the
+    //   callee's FnSig.
+    H_VerifierFailure             = 0xF003,
+    // H_UnknownIntrinsic: an IntrinsicCall whose payload (intrinsic id) does not
+    //   resolve to an intrinsic registered in the module's HirIntrinsicRegistry.
+    H_UnknownIntrinsic            = 0xF004,
+    // H_ShaderViolation: a node inside a `ShaderUsable`-flagged function subtree
+    //   violates a shader restriction — recursion, an indirect / function-pointer
+    //   call, or a call to a non-shader (host) function. (Dynamic allocation is
+    //   not yet expressible in HIR; the check lands when an alloc intrinsic does.)
+    H_ShaderViolation             = 0xF005,
+    // H_TextMalformed: the `.dsshir` text-format parser (HR7) hit a token it did
+    //   not expect at the current position — an unknown keyword, a missing
+    //   delimiter, a bad integer/string, or a structurally malformed type/node.
+    //   The diagnostic's `actual` carries what was seen and `expected` what was
+    //   valid. One broad syntactic code (the analog of P_UnexpectedToken for the
+    //   hand-rolled HIR-text grammar) keeps the HIR-text band distinct from the
+    //   schema-driven source parser's P_* codes.
+    H_TextMalformed               = 0xF006,
+    // H_TextVersionMismatch: the `.dsshir` header's format-version integer is not
+    //   the version this build understands. Parsing stops — a newer/older layout
+    //   cannot be reconstructed safely.
+    H_TextVersionMismatch         = 0xF007,
+    // H_TextUnknownName: a body reference names something the preamble never
+    //   declared — a symbol handle (`%sN`), or an extension kind / operator /
+    //   intrinsic name. The text is internally inconsistent (a hand-edit that
+    //   dropped a preamble entry, or a truncated file).
+    H_TextUnknownName             = 0xF008,
+    // H_UnsupportedLoweringForKind: the CST→HIR lowering engine (plan 09 HR8)
+    //   reached a CST rule/construct it cannot lower — either the language's
+    //   `hirLowering` config has no mapping for it, the mapping names an
+    //   unknown HIR kind/op, or the construct is a known-deferred one (extern /
+    //   typedef-of-pointer / compound-assign / ++ / arrays / strings — owned by
+    //   a later plan). An `Error` HIR node is emitted as a recovery sentinel and
+    //   lowering continues (collect-all); never a silent skip or a miscompile.
+    H_UnsupportedLoweringForKind  = 0xF009,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

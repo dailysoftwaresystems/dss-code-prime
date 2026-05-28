@@ -3,6 +3,7 @@
 #include "core/types/lexer_mode.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/char_decode.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/string_style.hpp"
 #include "core/types/token.hpp"
@@ -34,10 +35,16 @@ using dss::tests::tokenizeShipped;
 namespace {
 
 // Pull body-mode tokens of `bodyKind` until the body pops.
-void drainBody(TreeBuilder& b, TokenStream& s, SchemaTokenId bodyKind) {
-    while (!s.isAtEnd() && s.peek().schemaKind.v == bodyKind.v) {
-        b.pushToken(s.advance());
-    }
+// HR10 — the SQL string body modes COALESCE: the whole body is ONE
+// in-grammar `StringLiteral` token (the close delimiter is consumed on
+// mode-pop, not emitted). The pins below assert that single-token
+// granularity directly on the stream, far clearer than rebuilding a tree
+// by hand. The body span is the RAW (undecoded) bytes the lowering later
+// decodes (escapes / doubled-delimiter resolved in char_decode.hpp).
+std::vector<Token> collectTokens(TokenStream& s) {
+    std::vector<Token> out;
+    while (!s.isAtEnd()) out.push_back(s.advance());
+    return out;
 }
 
 } // namespace
@@ -241,56 +248,28 @@ TEST(TsqlSubset, SelectFromQualifiedThreePartName) {
 }
 
 TEST(TsqlSubset, SelectWithUnicodeLiteralOpener) {
-    // The N' opener pushes unicode-string mode; the tokenizer emits
-    // one StringChar per body codepoint plus a final StringChar
-    // covering the closing `'`. Body tokens land as siblings of the
-    // opener inside `operand`. The contract is structural — operator
-    // shape, not prettyPrint identity.
+    // The N' opener pushes unicode-string mode; the body coalesces (HR10)
+    // into ONE StringLiteral token spanning the raw body `hello`. The
+    // closing `'` is consumed on mode-pop, not emitted.
     auto h = tokenizeShipped("tsql-subset", "SELECT N'hello' FROM t;");
     ASSERT_NE(h.schema, nullptr);
     const auto unicodeStartKind = h.schema->schemaTokens().find("UnicodeStringStart");
-    const auto stringCharKind   = h.schema->schemaTokens().find("StringChar");
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        pushNext(b, h.stream);
-        {
-            auto list  = b.open(h.schema->rules().find("selectList"));
-            auto items = b.open(h.schema->rules().find("selectItemList"));
-            auto item  = b.open(h.schema->rules().find("selectItem"));
-            auto expr  = b.open(h.schema->rules().find("expression"));
-            auto opr   = b.open(h.schema->rules().find("operand"));
-            // Opener + 5 body chars + 1 close emission = 7 leaves
-            // under `operand`.
-            b.pushToken(h.stream.advance());
-            drainBody(b, h.stream, stringCharKind);
-        }
-        drainWhitespace(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
-    EXPECT_TRUE(t.diagnostics().all().empty());
+    const auto stringLitKind    = h.schema->schemaTokens().find("StringLiteral");
+    const auto tokens = collectTokens(h.stream);
 
-    // Pin the opener landed at an `operand` position and the body
-    // produced 6 StringChar leaves (5 body codepoints + 1 endsAt close).
-    std::size_t unicodeOpeners = 0;
-    std::size_t stringChars    = 0;
-    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
-        const NodeId id{i};
-        if (t.kind(id) != NodeKind::Token) continue;
-        if (t.tokenKind(id).v == unicodeStartKind.v) ++unicodeOpeners;
-        if (t.tokenKind(id).v == stringCharKind.v)   ++stringChars;
+    std::size_t unicodeOpeners = 0, bodies = 0;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].schemaKind.v == unicodeStartKind.v) {
+            ++unicodeOpeners;
+            ASSERT_LT(i + 1, tokens.size());
+            EXPECT_EQ(tokens[i + 1].schemaKind.v, stringLitKind.v)
+                << "opener must be followed by ONE coalesced body token";
+            EXPECT_EQ(h.src->slice(tokens[i + 1].span), "hello");
+            ++bodies;
+        }
     }
     EXPECT_EQ(unicodeOpeners, 1u);
-    EXPECT_EQ(stringChars,    6u) << "5 body chars + 1 endsAt close";
+    EXPECT_EQ(bodies, 1u);
 }
 
 TEST(TsqlSubset, SelectWithBracketIdentifier) {
@@ -746,156 +725,76 @@ TEST(TsqlSubset, SchemaIdsAreDistinctPerLoad) {
 // ── Body-mode E2E pins ───────────────────────────────────────────────────
 
 TEST(TsqlSubset, DoubledDelimiterEscapeInsideSingleString) {
-    // `'it''s'` represents the literal `it's` — the doubled `''` is a
-    // single StringChar escape, not the end-of-string + start-of-new.
-    // The body-mode branch order (doubled-delim before endsAt) is what
-    // makes this work; under a regression, `''` would close + reopen.
+    // `'it''s'` represents the literal `it's` — the doubled `''` is an
+    // embedded delimiter, not end-of-string + start-of-new. The coalesce
+    // path keeps `''` raw in the body span (branch order: doubled-delim
+    // before endsAt); the lowering's decoder collapses it to one `'`.
+    // Under a regression, `''` would close + reopen and the body would end
+    // at `it`.
     auto h = tokenizeShipped("tsql-subset", "SELECT 'it''s' FROM t;");
     ASSERT_NE(h.schema, nullptr);
     const auto stringStartKind = h.schema->schemaTokens().find("StringStart");
-    const auto stringCharKind  = h.schema->schemaTokens().find("StringChar");
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        pushNext(b, h.stream);
-        {
-            auto list  = b.open(h.schema->rules().find("selectList"));
-            auto items = b.open(h.schema->rules().find("selectItemList"));
-            auto item  = b.open(h.schema->rules().find("selectItem"));
-            auto expr  = b.open(h.schema->rules().find("expression"));
-            auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());
-            drainBody(b, h.stream, stringCharKind);
-        }
-        drainWhitespace(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
-    EXPECT_TRUE(t.diagnostics().all().empty());
+    const auto stringLitKind   = h.schema->schemaTokens().find("StringLiteral");
+    const auto tokens = collectTokens(h.stream);
 
-    // The body emits: 'i', 't', "''" (one doubled-delim StringChar
-    // spanning 2 bytes), 's', then "'" close. That's 1 opener + 5 body
-    // chars = 6 tokens with StringChar kind covering the body and close.
-    std::size_t openers   = 0;
-    std::size_t bodyChars = 0;
-    std::size_t doubledDelimSpans = 0;
-    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
-        const NodeId id{i};
-        if (t.kind(id) != NodeKind::Token) continue;
-        if (t.tokenKind(id).v == stringStartKind.v) ++openers;
-        if (t.tokenKind(id).v == stringCharKind.v) {
-            ++bodyChars;
-            if (t.span(id).length() == 2) ++doubledDelimSpans;
-        }
+    std::size_t openers = 0, bodies = 0;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].schemaKind.v != stringStartKind.v) continue;
+        ++openers;
+        ASSERT_LT(i + 1, tokens.size());
+        EXPECT_EQ(tokens[i + 1].schemaKind.v, stringLitKind.v);
+        const auto body = h.src->slice(tokens[i + 1].span);
+        EXPECT_EQ(body, "it''s") << "doubled-delim kept raw in the body span";
+        EXPECT_EQ(decodeDoubledDelimiterBody(body, '\''), "it's")
+            << "decoder collapses the doubled `''` to one `'`";
+        ++bodies;
     }
     EXPECT_EQ(openers, 1u);
-    EXPECT_EQ(bodyChars, 5u) << "'i', 't', \"''\", 's', \"'\" close = 5";
-    EXPECT_EQ(doubledDelimSpans, 1u)
-        << "exactly one body char must span 2 bytes — the `''` escape";
+    EXPECT_EQ(bodies, 1u);
 }
 
 TEST(TsqlSubset, EmptyStringLiteralOpensAndImmediatelyCloses) {
-    // `''` is the empty SQL string. The body mode opens on the first
-    // `'` then immediately matches endsAt on the next char and pops.
-    // The close emission covers the closing `'`, so the body produces
-    // exactly 1 token (the close).
+    // `''` is the empty SQL string. The body mode opens on the first `'`,
+    // immediately matches endsAt on the next, and pops. The coalesce path
+    // still emits ONE body token — a zero-width StringLiteral — so the
+    // operand has a literal to lower (decodes to the empty string).
     auto h = tokenizeShipped("tsql-subset", "SELECT '' FROM t;");
     ASSERT_NE(h.schema, nullptr);
     const auto stringStartKind = h.schema->schemaTokens().find("StringStart");
-    const auto stringCharKind  = h.schema->schemaTokens().find("StringChar");
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        pushNext(b, h.stream);
-        {
-            auto list  = b.open(h.schema->rules().find("selectList"));
-            auto items = b.open(h.schema->rules().find("selectItemList"));
-            auto item  = b.open(h.schema->rules().find("selectItem"));
-            auto expr  = b.open(h.schema->rules().find("expression"));
-            auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());
-            drainBody(b, h.stream, stringCharKind);
-        }
-        drainWhitespace(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
-    EXPECT_TRUE(t.diagnostics().all().empty());
+    const auto stringLitKind   = h.schema->schemaTokens().find("StringLiteral");
+    const auto tokens = collectTokens(h.stream);
 
-    std::size_t openers   = 0;
-    std::size_t bodyChars = 0;
-    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
-        const NodeId id{i};
-        if (t.kind(id) != NodeKind::Token) continue;
-        if (t.tokenKind(id).v == stringStartKind.v) ++openers;
-        if (t.tokenKind(id).v == stringCharKind.v) ++bodyChars;
+    std::size_t openers = 0, bodies = 0;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].schemaKind.v != stringStartKind.v) continue;
+        ++openers;
+        ASSERT_LT(i + 1, tokens.size());
+        EXPECT_EQ(tokens[i + 1].schemaKind.v, stringLitKind.v);
+        EXPECT_EQ(tokens[i + 1].span.length(), 0u) << "empty body is zero-width";
+        ++bodies;
     }
     EXPECT_EQ(openers, 1u);
-    EXPECT_EQ(bodyChars, 1u) << "empty body emits ONLY the close char";
+    EXPECT_EQ(bodies, 1u);
 }
 
 TEST(TsqlSubset, UnicodeStringBodyAcceptsMultiByteUTF8) {
-    // The tokenizer's body-mode default emission consumes one CODEPOINT
-    // per token via UTF-8 lead-byte length detection. `héllo` is 5
-    // codepoints but 6 bytes (é = 0xC3 0xA9). Each codepoint becomes
-    // exactly one StringChar leaf; the é leaf spans 2 bytes.
+    // The coalesced body captures raw bytes, so multi-byte UTF-8 passes
+    // through verbatim. `héllo` is 5 codepoints but 6 bytes (é = 0xC3 0xA9),
+    // so the one coalesced StringLiteral body spans 6 bytes.
     auto h = tokenizeShipped("tsql-subset", "SELECT N'h\xC3\xA9llo' FROM t;");
     ASSERT_NE(h.schema, nullptr);
-    const auto stringCharKind  = h.schema->schemaTokens().find("StringChar");
-    TreeBuilder b{h.src, h.schema};
-    {
-        auto root = b.open(h.schema->rules().find("root"));
-        auto stmt = b.open(h.schema->rules().find("statement"));
-        auto sel  = b.open(h.schema->rules().find("selectStmt"));
-        pushNext(b, h.stream);
-        {
-            auto list  = b.open(h.schema->rules().find("selectList"));
-            auto items = b.open(h.schema->rules().find("selectItemList"));
-            auto item  = b.open(h.schema->rules().find("selectItem"));
-            auto expr  = b.open(h.schema->rules().find("expression"));
-            auto opr   = b.open(h.schema->rules().find("operand"));
-            b.pushToken(h.stream.advance());
-            drainBody(b, h.stream, stringCharKind);
-        }
-        drainWhitespace(b, h.stream);
-        pushNext(b, h.stream);
-        {
-            auto qn = b.open(h.schema->rules().find("qualifiedName"));
-            auto na = b.open(h.schema->rules().find("nameAtom"));
-            b.pushToken(h.stream.advance());
-        }
-        b.pushToken(h.stream.advance());
-    }
-    Tree t = std::move(b).finish();
-    EXPECT_TRUE(t.diagnostics().all().empty());
+    const auto unicodeStartKind = h.schema->schemaTokens().find("UnicodeStringStart");
+    const auto stringLitKind    = h.schema->schemaTokens().find("StringLiteral");
+    const auto tokens = collectTokens(h.stream);
 
-    // 5 body codepoints (h é l l o) + 1 close = 6 StringChar leaves.
-    // Exactly one of them must span 2 bytes (the é).
-    std::size_t bodyChars = 0;
-    std::size_t twoByteChars = 0;
-    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
-        const NodeId id{i};
-        if (t.kind(id) != NodeKind::Token) continue;
-        if (t.tokenKind(id).v != stringCharKind.v) continue;
-        ++bodyChars;
-        if (t.span(id).length() == 2) ++twoByteChars;
+    std::size_t bodies = 0;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].schemaKind.v != unicodeStartKind.v) continue;
+        ASSERT_LT(i + 1, tokens.size());
+        EXPECT_EQ(tokens[i + 1].schemaKind.v, stringLitKind.v);
+        EXPECT_EQ(tokens[i + 1].span.length(), 6u) << "héllo = 6 raw bytes";
+        EXPECT_EQ(h.src->slice(tokens[i + 1].span), "h\xC3\xA9llo");
+        ++bodies;
     }
-    EXPECT_EQ(bodyChars, 6u)    << "h, é, l, l, o, close = 6";
-    EXPECT_EQ(twoByteChars, 1u) << "exactly one StringChar spans 2 bytes (é)";
+    EXPECT_EQ(bodies, 1u);
 }

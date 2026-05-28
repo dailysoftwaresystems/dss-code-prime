@@ -80,10 +80,10 @@ struct Harness {
 // ── sync-token recovery ─────────────────────────────────────────────────
 
 // Panic-mode scans past the bad `@` until `;` (a declared sync token)
-// then resumes parsing — the FOLLOWING `var y = z;` MUST appear in
+// then resumes parsing — the FOLLOWING `var y : int = z;` MUST appear in
 // the tree.
 TEST(ParserRecovery, ScansToSyncTokenAndResumes) {
-    auto h = loadShipped("toy", "var x = @ noise more; var y = z;");
+    auto h = loadShipped("toy", "var x : int = @ noise more; var y : int = z;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -91,10 +91,10 @@ TEST(ParserRecovery, ScansToSyncTokenAndResumes) {
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_TRUE(t.diagnostics().hasErrors());
 
-    // After resync, the second `var y = z;` must have produced a
+    // After resync, the second `var y : int = z;` must have produced a
     // statement frame. Two statements total (one broken, one clean).
     std::size_t stmtCount = 0;
-    const auto stmtRule = t.schema().rules().find("statement");
+    const auto stmtRule = t.schema().rules().find("topLevel");
     ASSERT_TRUE(stmtRule.valid());
     for (auto c : t.children(t.root())) {
         if (t.kind(c) == NodeKind::Internal
@@ -111,14 +111,14 @@ TEST(ParserRecovery, ScansToSyncTokenAndResumes) {
 // at root, the repeat[statement] loop would just exit on the first
 // non-stmt-FIRST token rather than dispatching to recovery.
 TEST(ParserRecovery, BadTokensBeforeSyncDoNotPreventNextStmt) {
-    auto h = loadShipped("toy", "var x = @ noise more; var y = z;");
+    auto h = loadShipped("toy", "var x : int = @ noise more; var y : int = z;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
     EXPECT_TRUE(t.diagnostics().hasErrors());
 
-    const auto stmtRule = t.schema().rules().find("statement");
+    const auto stmtRule = t.schema().rules().find("topLevel");
     ASSERT_TRUE(stmtRule.valid());
     bool sawCleanStmt = false;
     for (auto c : t.children(t.root())) {
@@ -128,7 +128,7 @@ TEST(ParserRecovery, BadTokensBeforeSyncDoNotPreventNextStmt) {
         }
     }
     EXPECT_TRUE(sawCleanStmt)
-        << "expected the post-sync `var y = z;` to parse error-free";
+        << "expected the post-sync `var y : int = z;` to parse error-free";
 }
 
 // ── diagnostic shape ────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ TEST(ParserRecovery, BadTokensBeforeSyncDoNotPreventNextStmt) {
 // one entry, formatted with single quotes (renderer-ready prose:
 // downstream `appendExpectedActual` does `expected 'X' or 'Y' — got 'Z'`).
 TEST(ParserRecovery, EmittedDiagnosticHasExpectedListPopulated) {
-    auto h = loadShipped("toy", "var x = @;");
+    auto h = loadShipped("toy", "var x : int = @;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -160,7 +160,7 @@ TEST(ParserRecovery, EmittedDiagnosticHasExpectedListPopulated) {
 // `actual` carries the real source bytes for the bad token, quoted —
 // not a raw integer kind id.
 TEST(ParserRecovery, EmittedDiagnosticActualIsQuotedLexeme) {
-    auto h = loadShipped("toy", "var x = @;");
+    auto h = loadShipped("toy", "var x : int = @;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -182,7 +182,7 @@ TEST(ParserRecovery, EmittedDiagnosticActualIsQuotedLexeme) {
 // codes (P_UnknownToken, P_SchemaCursorDesync) are not "cascade"
 // symptoms and excluded from the count.
 TEST(ParserRecovery, SingleErrorCascadeBoundedAtThreeX) {
-    auto h = loadShipped("toy", "var x = @ noise more stuff; var y = z;");
+    auto h = loadShipped("toy", "var x : int = @ noise more stuff; var y : int = z;");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& diags = result.tree.diagnostics().all();
@@ -248,7 +248,7 @@ TEST(ParserRecovery, SyncScanRespectsMaxCap) {
 // cursor's nullable-tail logic, but both must produce errored trees
 // that include the broken statement structurally.
 TEST(ParserRecovery, BothStrategiesCompleteOnBrokenInput) {
-    const std::string source = "var x = @ noise more;";
+    const std::string source = "var x : int = @ noise more;";
     {
         auto h = loadShipped("toy", source);
         ParserConfig cfg;
@@ -271,7 +271,7 @@ TEST(ParserRecovery, BothStrategiesCompleteOnBrokenInput) {
 // or `}` after the broken `@`. Recovery must terminate cleanly at
 // EOF without scanning past the cap and without hanging.
 TEST(ParserRecovery, PanicModeTerminatesAtEofWithNoSyncToken) {
-    auto h = loadShipped("toy", "var x = @ @ @ @");
+    auto h = loadShipped("toy", "var x : int = @ @ @ @");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;

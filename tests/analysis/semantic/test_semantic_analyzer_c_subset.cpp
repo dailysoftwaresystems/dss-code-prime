@@ -44,6 +44,140 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     EXPECT_EQ(model.lattice().interner().kind(xRec->type), TypeKind::I32);
 }
 
+// SE-arrays (HR9): a `[N]` declarator suffix folds the element type into
+// Array<elem, N>. `int a[10];` mints a symbol typed Array<I32, 10> — the
+// constant length comes from a semantic-time literal eval, config-driven via
+// the `varDeclHead` declaration's `arraySuffix` descriptor.
+TEST(SemanticAnalyzerCSubset, ArrayDeclaratorTypedAsArray) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int a[10]; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    }
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 10);
+    ASSERT_EQ(ti.operands(aRec->type).size(), 1u);
+    EXPECT_EQ(ti.kind(ti.operands(aRec->type)[0]), TypeKind::I32);
+}
+
+// SE-arrays: a non-constant length (`int a[n]`) must fail loud rather than
+// guess. The engine emits S_NonConstantArrayLength and leaves the type
+// unresolved (no silent pointer decay, no assumed length).
+TEST(SemanticAnalyzerCSubset, NonConstantArrayLengthEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(int n) { int a[n]; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+}
+
+// SE-arrays: an empty-bracket declarator (`int a[]`) has no length — a DIFFERENT
+// path from `[n]` (the length node lands on the `]` token, not an identifier).
+// Must also fail loud.
+TEST(SemanticAnalyzerCSubset, EmptyArrayLengthEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", { "int main() { int a[]; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+}
+
+// SE-arrays: a non-decimal length exercises the shared decodeInteger through the
+// NEW semantic consumer — `0x10` must decode to 16 (radix handling), not be
+// rejected as non-constant.
+TEST(SemanticAnalyzerCSubset, HexArrayLengthDecodes) {
+    auto cu = buildShippedUnit("c-subset", { "int main() { int a[0x10]; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 16);
+}
+
+// SE-arrays: a constant length that decodes but exceeds the signed length the
+// lattice stores must NOT wrap to a negative length — fail loud with the
+// dedicated S_ArrayLengthOutOfRange (regression for a silent sign-flip).
+TEST(SemanticAnalyzerCSubset, OutOfRangeArrayLengthEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int a[0xFFFFFFFFFFFFFFFF]; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u);
+}
+
+// SE-pointers (G5): `int *p` declarator → Ptr<I32>; `int **pp` → Ptr<Ptr<I32>>.
+// The declarator stars wrap the base type one level each (declarator-depth).
+TEST(SemanticAnalyzerCSubset, PointerDeclaratorTypedAsPtr) {
+    auto cu = buildShippedUnit("c-subset", {
+        "void f() { int *p; int **pp; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* p = nullptr;
+    SymbolRecord const* pp = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "p")  p  = &model.symbols()[i];
+        if (model.symbols()[i].name == "pp") pp = &model.symbols()[i];
+    }
+    ASSERT_NE(p, nullptr);
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(p->type)[0]), TypeKind::I32);
+    ASSERT_NE(pp, nullptr);
+    ASSERT_EQ(ti.kind(pp->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(pp->type)[0]), TypeKind::Ptr);          // Ptr<Ptr<I32>>
+    EXPECT_EQ(ti.kind(ti.operands(ti.operands(pp->type)[0])[0]), TypeKind::I32);
+}
+
+// SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
+TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
+    auto cu = buildShippedUnit("c-subset", { "void f(int *p) {}\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* f = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "f") f = &model.symbols()[i];
+    ASSERT_NE(f, nullptr);
+    ASSERT_EQ(ti.kind(f->type), TypeKind::FnSig);
+    auto params = ti.fnParams(f->type);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(ti.kind(params[0]), TypeKind::Ptr);
+}
+
+// SE-arrays: a GLOBAL array (`int g[10];`) — the suffix nests under
+// `topLevelDecl → varDeclTail → arrayDeclSuffix`, exercising applyArraySuffix's
+// descendant scan. Must type as Array<I32,10> just like the local case.
+TEST(SemanticAnalyzerCSubset, GlobalArrayDeclaratorTypedAsArray) {
+    auto cu = buildShippedUnit("c-subset", { "int g[10];\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* gRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "g") gRec = &model.symbols()[i];
+    ASSERT_NE(gRec, nullptr);
+    ASSERT_EQ(ti.kind(gRec->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(gRec->type)[0], 10);
+    EXPECT_EQ(ti.kind(ti.operands(gRec->type)[0]), TypeKind::I32);
+}
+
 // `int x;` in two DIFFERENT blocks is NOT a redecl — c-subset's
 // `block` is declared as a scope opener in the language semantics, so
 // each nested block produces its own ScopeId and same-name decls are

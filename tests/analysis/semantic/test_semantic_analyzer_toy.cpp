@@ -24,7 +24,7 @@ static_assert( std::is_move_constructible_v<SemanticModel>);
 // in expressions because every right-hand-side ident becomes a use
 // against the same scope).
 TEST(SemanticAnalyzerToy, SingleVarDeclMintsOneSymbol) {
-    auto cu = buildShippedUnit("toy", {"var x = x;"});
+    auto cu = buildShippedUnit("toy", {"var x : int = x;"});
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
     // One variable symbol minted; no S_RedeclaredSymbol.
@@ -42,7 +42,7 @@ TEST(SemanticAnalyzerToy, SingleVarDeclMintsOneSymbol) {
 // with a RelatedLocation pointing at the original.
 TEST(SemanticAnalyzerToy, RedeclarationEmitsS_RedeclaredSymbol) {
     auto cu = buildShippedUnit("toy", {
-        "var x = y; var x = z;",
+        "var x : int = y; var x : int = z;",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
@@ -64,7 +64,7 @@ TEST(SemanticAnalyzerToy, RedeclarationEmitsS_RedeclaredSymbol) {
 // resolves cleanly.
 TEST(SemanticAnalyzerToy, ForwardReferenceResolves) {
     auto cu = buildShippedUnit("toy", {
-        "var x = y; var y = x;",
+        "var x : int = y; var y : int = x;",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
@@ -78,7 +78,7 @@ TEST(SemanticAnalyzerToy, ForwardReferenceResolves) {
 // other names). We use a corpus with exactly one undeclared use.
 TEST(SemanticAnalyzerToy, UndeclaredUseEmitsExactlyOne) {
     auto cu = buildShippedUnit("toy", {
-        "var x = x; ghost;",
+        "var x : int = x; var g : int = ghost;",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
@@ -99,8 +99,8 @@ TEST(SemanticAnalyzerToy, UndeclaredUseEmitsExactlyOne) {
 // negative cross-file-visibility guard for a language with no imports.
 TEST(SemanticAnalyzerToy, MultiTreeSymbolsAreIsolatedWithoutImports) {
     auto cu = buildShippedUnit("toy", {
-        "var a = a;",        // tree 0 declares `a`
-        "var b = a;",        // tree 1 uses `a` — must NOT resolve cross-tree
+        "var a : int = a;",        // tree 0 declares `a`
+        "var b : int = a;",        // tree 1 uses `a` — must NOT resolve cross-tree
     });
     assertNoBuilderErrors(*cu);
     // No import edges between unrelated toy files.
@@ -129,7 +129,7 @@ TEST(SemanticAnalyzerToy, EmptyCuIsClean) {
 // The bound NodeId-keyed UnitAttribute aborts when handed a NodeId from
 // a different CompilationUnit — this is the SE1 cross-CU guard.
 TEST(SemanticAnalyzerToyDeathTest, ForeignNodeIdAborts) {
-    auto cu = buildShippedUnit("toy", {"var x = x;"});
+    auto cu = buildShippedUnit("toy", {"var x : int = x;"});
     auto model = analyze(cu);
     // A NodeId tagged with a TreeId that doesn't belong to this CU's
     // trees triggers the UnitAttribute crossUnitFatal path.

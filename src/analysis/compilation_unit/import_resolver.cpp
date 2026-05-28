@@ -69,9 +69,10 @@ void reportDriver(DiagnosticReporter& reporter,
 }
 
 // Read the quoted filename of a `#include "..."`. The StringStart token spans
-// only the opening quote; the body is separate (off-grammar) StringChar tokens,
-// so the content is read from the source text between the quotes rather than
-// from the tree. Returns empty when the literal isn't a well-formed "...".
+// only the opening quote; the content is read from the source text between the
+// quotes (the path is a filename, not a decoded string value, so the raw bytes
+// are what we want — independent of how the body tokenizes). Returns empty when
+// the literal isn't a well-formed "...".
 [[nodiscard]] std::string extractQuotedFilename(Tree const& tree, NodeId stringStart) {
     std::string_view const src = tree.source().text();
     ByteOffset const open = tree.span(stringStart).start();
@@ -149,7 +150,8 @@ void reportDriver(DiagnosticReporter& reporter,
 
 class ConfigDrivenImportResolver final : public ImportResolver {
 public:
-    explicit ConfigDrivenImportResolver(ImportConfig config) : config_(std::move(config)) {}
+    ConfigDrivenImportResolver(std::shared_ptr<GrammarSchema const> schema, ImportConfig config)
+        : schema_(std::move(schema)), config_(std::move(config)) {}
 
     void resolve(ResolutionContext& context) const override {
         switch (config_.strategy) {
@@ -160,11 +162,19 @@ public:
     }
 
 private:
+    // True iff `tree` was built from THIS resolver's schema. In a multi-language
+    // CU each resolver processes only its own language's trees (a c-subset
+    // resolver's `directiveRule` RuleId means nothing in a tsql tree), so every
+    // tree-iterating pass below gates on this. Homogeneous CU: always true.
+    [[nodiscard]] bool owns(Tree const& tree) const {
+        return tree.schema().schemaId() == schema_->schemaId();
+    }
+
     // include-following: follow each `directiveRule` node's `pathToken` literal.
     void resolveIncludeFollowing(ResolutionContext& context) const {
-        RuleId const includeRule = context.schema.rules().find(config_.directiveRule);
+        RuleId const includeRule = schema_->rules().find(config_.directiveRule);
         if (!includeRule.valid()) return;
-        SchemaTokenId const stringKind = context.schema.schemaTokens().find(config_.pathToken);
+        SchemaTokenId const stringKind = schema_->schemaTokens().find(config_.pathToken);
 
         struct Edge { TreeId source; NodeId node; SourceSpan span; TreeId target; };
         std::vector<Edge> edges;
@@ -181,6 +191,7 @@ private:
             fs::path includingDir;
             {
                 Tree const& tree = context.trees[index];
+                if (!owns(tree)) { ++index; continue; }   // another language's tree
                 sourceTree   = tree.id();
                 sourceBuffer = tree.source().id();
                 includingDir = fs::path(std::string(tree.source().name())).parent_path();
@@ -208,7 +219,7 @@ private:
                 if (!resolved) { unresolved(); continue; }
 
                 bool ok = false;
-                TreeId const target = context.loadFile(*resolved, ok);
+                TreeId const target = context.loadFile(*resolved, ok, schema_);
                 if (!ok) { unresolved(); continue; }
                 edges.push_back({sourceTree, directive.node, directive.span, target});
             }
@@ -225,7 +236,7 @@ private:
     // name-matching: a `nameRule` in a `referenceParents` position resolved to a
     // `nameRule` under a `definitionRule` of the same name in ANOTHER tree.
     void resolveNameMatching(ResolutionContext& context) const {
-        GrammarSchema const& schema = context.schema;
+        GrammarSchema const& schema = *schema_;
         RuleId const qualifiedNameRule = schema.rules().find(config_.nameRule);
         if (!qualifiedNameRule.valid()) return;
         RuleId const createRule    = schema.rules().find(config_.definitionRule);
@@ -261,9 +272,12 @@ private:
             });
         };
 
-        // Pass 1 — definitions: each definition node's name. First wins.
+        // Pass 1 — definitions: each definition node's name. First wins. Only
+        // this language's trees (a definition is matched against same-language
+        // references; cross-language linkage is the FFI plan's job — HR11 defers).
         std::unordered_map<std::string, std::pair<TreeId, NodeId>> definitions;
         for (Tree const& tree : context.trees) {
+            if (!owns(tree)) continue;
             forEachQualifiedName(tree, [&](NodeId node, RuleId parentRule) {
                 if (parentRule != createRule) return;
                 std::string name = lastIdentifierText(tree, node, identifierKind, bracketKind, caseSensitive);
@@ -275,6 +289,7 @@ private:
         // in ANOTHER tree become cross-refs; no definition anywhere is a
         // D_UnresolvedReference; a same-tree match is intra-file (skip).
         for (Tree const& tree : context.trees) {
+            if (!owns(tree)) continue;
             BufferId const buffer = tree.source().id();
             forEachQualifiedName(tree, [&](NodeId node, RuleId parentRule) {
                 if (!isTablePosition(parentRule)) return;
@@ -294,13 +309,15 @@ private:
         }
     }
 
-    ImportConfig config_;
+    std::shared_ptr<GrammarSchema const> schema_;
+    ImportConfig                         config_;
 };
 
 } // namespace
 
-std::unique_ptr<ImportResolver> chooseResolver(GrammarSchema const& schema) {
-    return std::make_unique<ConfigDrivenImportResolver>(schema.imports());
+std::unique_ptr<ImportResolver> chooseResolver(std::shared_ptr<GrammarSchema const> schema) {
+    ImportConfig config = schema->imports();
+    return std::make_unique<ConfigDrivenImportResolver>(std::move(schema), std::move(config));
 }
 
 } // namespace dss

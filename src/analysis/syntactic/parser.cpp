@@ -1200,6 +1200,7 @@ struct PrattRules {
     RuleId binary;
     RuleId unary;
     RuleId postfix;
+    RuleId ternary;   // optional (invalid when the language has no `?:`)
 };
 
 // Push trivia tokens through the builder until peek is meaningful.
@@ -1276,13 +1277,21 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             kind, OperatorArity::Infix);
         const auto postfix = I.schema->operatorTable().lookup(
             kind, OperatorArity::Postfix);
+        const auto ternary = I.schema->operatorTable().lookup(
+            kind, OperatorArity::Ternary);
 
         const bool postfixInClimb =
             postfix && postfix->precedence >= minPrec;
         const bool infixInClimb =
             infix && infix->precedence >= minPrec;
+        // A ternary operator only participates when the schema also declared a
+        // `wrapperRules.ternary` rule to wrap it; without one the `?` falls
+        // through and the parent surfaces a parse error (rather than silently
+        // dropping it).
+        const bool ternaryInClimb =
+            ternary && ternary->precedence >= minPrec && rules.ternary.valid();
 
-        if (!postfixInClimb && !infixInClimb) {
+        if (!postfixInClimb && !infixInClimb && !ternaryInClimb) {
             I.commitWalkerSnap(snap);
             return;
         }
@@ -1381,6 +1390,48 @@ void parseExpressionAt(Parser::Impl& I, PrattRules const& rules,
             continue;
         }
 
+        // Ternary (mixfix `cond ? then : else`). Like infix, it gathers the
+        // already-built primary as its condition via rollback-replay, then
+        // parses the middle clause (to the `:` separator) and the else operand.
+        // The middle parses at minPrec 0 — between `?` and `:` anything binds
+        // (assignment, even a nested ternary); the climb naturally stops at `:`
+        // (which carries no operator-table entry). The else parses at the
+        // ternary's own precedence → right-associative (`a?b:c?d:e` = a?b:(c?d:e)).
+        if (ternaryInClimb) {
+            I.rollbackForWalker(snap);
+            snap = I.snapForWalker();
+            I.openExprFrame(rules.ternary);
+            parseExpressionAt(I, rules, ternary->precedence + 1);   // condition
+            pumpTrivia(I);
+            if (!I.pushOperatorToken()) {                            // `?`
+                I.emitParserError(DiagnosticCode::P_PrematureEndOfInput, peek.span,
+                                  "expression ended before ternary '?'");
+                I.closeFrameOnce();
+                I.commitWalkerSnap(snap);
+                return;
+            }
+            parseExpressionAt(I, rules, 0);                          // then (middle)
+            pumpTrivia(I);
+            Token const& midPeek = I.tokens.peek();
+            const SchemaTokenId midKind =
+                effectiveKind(midPeek, I.identifierKind, I.errorKind);
+            if (!ternary->ternaryMiddle || midKind.v != ternary->ternaryMiddle->v) {
+                // Missing `:`. Emit a diagnostic + an Error leaf so HasError
+                // propagates through the ternary wrapper; don't consume midPeek
+                // (parent recovery resumes from it).
+                I.emitParserError(DiagnosticCode::P_MissingRequiredChild, midPeek.span,
+                                  "ternary expression is missing its ':' separator");
+                I.builder->pushErrorNode(midPeek.span);
+                I.closeFrameOnce();
+                I.commitWalkerSnap(snap);
+                return;
+            }
+            (void)I.pushOperatorToken();                             // `:`
+            parseExpressionAt(I, rules, ternary->precedence);        // else
+            I.closeFrameOnce();
+            continue;
+        }
+
         // Infix path keeps the right-recursive rollback-replay: roll
         // back to before the primary was built, open the binary
         // wrapper, and rebuild the primary inside it. Re-snap to the
@@ -1434,6 +1485,7 @@ void DefaultPrattWalker::walkExpression(Parser& parser,
         .binary  = wrapperPack.binary,
         .unary   = wrapperPack.unary,
         .postfix = wrapperPack.postfix,
+        .ternary = wrapperPack.ternary,   // invalid unless the schema declared one
     };
     if (!rules.atom.valid()) {
         fatal("dss::DefaultPrattWalker::walkExpression: exprRule's "

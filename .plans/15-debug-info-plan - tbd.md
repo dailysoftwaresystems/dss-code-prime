@@ -51,7 +51,7 @@ src/debuginfo/
 Every node carries the originating `SourceSpan`:
 
 - **CST**: already carries via `Token::span` + `Node::span`.
-- **HIR**: `HirAttribute<SourceSpan>` populated during CST→HIR (per `09-hir-plan` §2.6).
+- **HIR**: `HirSourceMap` (`HirAttribute<HirSourceLoc>` — bundles `BufferId` + `SourceSpan`) populated during CST→HIR (HR5 ✅ 2026-05-26; per `09-hir-plan` §2.6).
 - **MIR**: `MirAttribute<SourceSpan>` populated during HIR→MIR (per `12-mir-lir-plan`).
 - **LIR**: `LirAttribute<SourceSpan>` populated during MIR→LIR.
 - **Bytes**: assembler emits `(byte_offset → LirInstId)` map (per `13-assembler-plan` §2.8).

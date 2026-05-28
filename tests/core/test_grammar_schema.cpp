@@ -350,13 +350,25 @@ TEST(GrammarSchema, ExprShapeAccessorsOnCSubset) {
 }
 
 // Wrapper rules `binaryExpr` / `unaryExpr` / `postfixExpr` MUST NOT be
-// auto-interned in schemas that don't use any `expr` shape. The toy
-// grammar's `expression` rule is `sequence`-shaped (not `expr`); a
-// regression that unconditionally interns the wrappers would inflate
-// every shipped grammar's RuleInterner and silently change RuleId
-// numbering.
+// auto-interned in schemas that don't use any `expr` shape; a regression that
+// unconditionally interns the wrappers would inflate every shipped grammar's
+// RuleInterner and silently change RuleId numbering. Pinned against a synthetic
+// non-expr grammar (the shipped toy grammar gained an `expr` shape at HR9).
 TEST(GrammarSchema, WrapperRulesAbsentInNonExprSchema) {
-    auto result = GrammarSchema::loadShipped("toy");
+    constexpr char const* kNonExprSchema = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "NonExpr", "version": "0.0.1", "fileExtensions": [".ne"] },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "keywords": [ { "word": "go", "kind": "GoKw" } ],
+      "shapes": {
+        "root": { "sequence": [ { "repeat": "stmt" } ] },
+        "stmt": { "sequence": [ "GoKw", "Identifier", "Semi" ] }
+      }
+    })JSON";
+    auto result = GrammarSchema::loadFromText(kNonExprSchema);
     ASSERT_TRUE(result.has_value());
     auto const& schema = **result;
 
@@ -2899,4 +2911,64 @@ TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
         EXPECT_EQ(p[0], "script");
         EXPECT_EQ(p[1], "sproc");
     }
+}
+
+// ── HR10: hirLowering fail-loud config validation ──────────────────────────
+
+// `refExtensionKind` naming a kind absent from `extensionKinds` → loud at LOAD
+// (C_InvalidHirLowering), so the engine's extKind() lookup stays total.
+TEST(GrammarSchema, HirLoweringRefExtensionKindUndeclaredReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "hirLowering": {
+        "extensionKinds": [ { "name": "X::Foo", "lang": "X" } ],
+        "refExtensionKind": "X::Bar"
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidHirLowering));
+}
+
+// `nullLiteral.hirKind` naming an undeclared extension kind → C_InvalidHirLowering.
+TEST(GrammarSchema, HirLoweringNullExtensionKindUndeclaredReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "hirLowering": {
+        "extensionKinds": [ { "name": "X::Foo", "lang": "X" } ],
+        "nullLiteral": { "token": "Semi", "hirKind": "X::Bar" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidHirLowering));
+}
+
+// An unknown `childGathering` lower verb (not expr/flatExpr/ext/ref/varDecl) →
+// C_InvalidHirLowering at LOAD, the counterpart to the unreachable lowerSlot
+// default. Guards the closed ChildLower verb set.
+TEST(GrammarSchema, HirLoweringUnknownChildLowerVerbReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "hirLowering": {
+        "extensionKinds": [ { "name": "X::Foo", "lang": "X" } ],
+        "ruleMappings": [
+          { "rule": "root", "hirKind": "X::Foo", "childGathering": [
+            { "match": { "rule": "root" }, "lower": "bogusVerb", "role": "x" }
+          ] }
+        ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidHirLowering));
 }

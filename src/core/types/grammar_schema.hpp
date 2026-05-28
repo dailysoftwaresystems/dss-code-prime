@@ -8,6 +8,7 @@
 #include "core/types/number_style.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/hir_lowering_config.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/schema_cursor.hpp"
@@ -82,14 +83,20 @@ struct DSS_EXPORT ExprWrapperRules {
     RuleId binary;
     RuleId unary;
     RuleId postfix;
+    // OPTIONAL fourth wrapper — the mixfix `ternary` rule (`cond ? then : else`).
+    // Invalid for languages without a ternary; when valid it must be distinct
+    // from the other three. Kept optional so the three required wrappers (the
+    // valid() contract) are unaffected by a language that has no ternary.
+    RuleId ternary;
 
-    // All three RuleIds are valid AND pairwise-distinct. The walker
+    // The three REQUIRED RuleIds are valid AND pairwise-distinct. The walker
     // tags frames by RuleId; a duplicate id would collide silently
     // (e.g. both `binary` and `unary` interned to the same name and
     // RuleId — Pratt frames meant for two different climb shapes
     // would land in one bucket). The loader rejects duplicates up
     // front (see `C_MissingWrapperRules` in grammar_schema_json.cpp);
-    // this predicate is the runtime safety net.
+    // this predicate is the runtime safety net. `ternary` is optional and not
+    // part of this contract (checked separately by the loader when present).
     [[nodiscard]] bool valid() const noexcept {
         return binary.valid() && unary.valid() && postfix.valid()
             && binary.v != unary.v
@@ -299,6 +306,12 @@ struct DSS_EXPORT GrammarSchemaData {
     // language. Read-only after construction; the loader is the only
     // writer.
     SemanticConfig                                    semantics;
+
+    // Per-language CST→HIR lowering config (plan 09 HR8; schema v4
+    // `hirLowering` block). Default-constructed (empty) when the language
+    // omits the block — the lowering engine then produces nothing for it.
+    // Read-only after construction; the loader is the only writer.
+    HirLoweringConfig                                 hirLowering;
 };
 
 } // namespace detail
@@ -539,6 +552,11 @@ public:
     // for that language and the model produces no symbols/types/
     // diagnostics. Read-only; the loader is the only writer.
     [[nodiscard]] SemanticConfig const& semantics() const noexcept;
+
+    // Per-language CST→HIR lowering config (plan 09 HR8; schema v4
+    // `hirLowering`). Default-constructed (`empty()`) when the language omits
+    // the block. Read-only; the loader is the only writer.
+    [[nodiscard]] HirLoweringConfig const& hirLowering() const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

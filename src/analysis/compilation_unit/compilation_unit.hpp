@@ -71,16 +71,24 @@ public:
 
     [[nodiscard]] CompilationUnitId              id()                const noexcept;
 
-    // Homogeneous-case schema accessor (every Tree in the CU shares this
-    // schema in CU1-CU4). CU5 (v1.1) introduces per-Tree schemas for
-    // multi-language CUs; this accessor stays valid as a same-schema
-    // convenience and degrades to "first tree's schema" semantics there.
+    // Homogeneous-case schema accessor (every Tree in the CU shares this schema
+    // in CU1-CU4). In a multi-language CU (HR11/CU5) this returns the PRIMARY —
+    // the builder's first registered schema (`schemas_[0]`), NOT necessarily any
+    // particular tree's schema. For language-accurate work use per-`Tree::schema()`
+    // or `compositeSourceLanguage()`; the per-phase engines all dispatch on
+    // `tree.schema()`, never this accessor.
     [[nodiscard]] GrammarSchema const&           schema()            const noexcept;
 
     // Frozen after construction. Span's data pointer is stable for the
     // CU's lifetime — UnitBuilder seals the vector at `finish()` and the
     // CU exposes no post-construction mutator (L1).
     [[nodiscard]] std::span<Tree const>          trees()             const noexcept;
+
+    // HR11: the CU's DISTINCT per-tree source-language names joined in tree
+    // order ("CSubset+TsqlSubset"); a homogeneous CU yields its one name. A
+    // best-effort informational label for downstream module / type-lattice
+    // `sourceLanguage` tags — purely descriptive, never a dispatch key.
+    [[nodiscard]] std::string                    compositeSourceLanguage() const;
 
     // Driver-level diagnostics (file-not-found, schema-load forwarding,
     // ...). Empty in CU1 — the first D_* codes land in CU2.
@@ -113,7 +121,22 @@ private:
 // CU2 adds addFile / addInMemory.
 class DSS_EXPORT UnitBuilder {
 public:
+    // Single-language builder: the one schema is the CU's primary (the
+    // `CompilationUnit::schema()` convenience) AND the only entry in the schema
+    // registry, so `addFile` always routes to it. Every CU1-CU4 caller uses this.
     explicit UnitBuilder(std::shared_ptr<GrammarSchema const> schema);
+
+    // Multi-language builder (HR11/CU5): `schemas` is the registry `addFile`
+    // routes against by file extension; `schemas[0]` is the CU's primary. Must
+    // be non-empty.
+    explicit UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas);
+
+    // Register an additional source language so `addFile` can route a path to it
+    // by matching the extension against each registered schema's `fileExtensions`
+    // (first registered match wins). NOT required for the explicit-schema
+    // `addInMemory` overload — that auto-registers its schema at parse. Aborts
+    // after finish().
+    void registerSchema(std::shared_ptr<GrammarSchema const> schema);
 
     ~UnitBuilder();  // out-of-line: an inline (implicit) dtor is not emitted
                      // into the DLL under -fno-keep-inline-dllexport, leaving
@@ -144,8 +167,16 @@ public:
 
     // In-memory variant of addFile: `label` names the buffer for
     // diagnostics (e.g. a URI or synthetic name). No deduplication —
-    // in-memory sources are explicit. Aborts if called after finish().
+    // in-memory sources are explicit. Uses the CU's primary schema. Aborts
+    // if called after finish().
     void addInMemory(std::string source, std::string label);
+
+    // Multi-language in-memory variant (HR11/CU5): parse `source` under an
+    // explicit `schema` (an in-memory buffer has no extension to route by, so
+    // the language is named directly). `schema` need not be in the registry.
+    // Aborts if called after finish().
+    void addInMemory(std::string source, std::string label,
+                     std::shared_ptr<GrammarSchema const> schema);
 
     // Declare a directory the c-subset import resolver searches for
     // `#include "x.h"` targets (in addition to the including file's own
@@ -161,18 +192,28 @@ public:
 
 private:
     // Shared tail of addFile/addInMemory: tokenize → parse (folding lexer
-    // diagnostics into the Tree) → addTree. `src` must be non-null. Returns
-    // the appended Tree's id.
-    TreeId parseAndAdd_(std::shared_ptr<SourceBuffer> src);
+    // diagnostics into the Tree) UNDER `schema` → addTree. `src`/`schema` must
+    // be non-null. Returns the appended Tree's id.
+    TreeId parseAndAdd_(std::shared_ptr<SourceBuffer> src,
+                        std::shared_ptr<GrammarSchema const> schema);
 
-    // Load + parse `path`, deduplicating by weakly-canonical path against
-    // files already added (via addFile or a prior include). Returns the
+    // Load + parse `path` under `schema`, deduplicating by weakly-canonical path
+    // against files already added (via addFile or a prior include). Returns the
     // resulting Tree's id; sets `ok` false (InvalidTree) when unreadable. This
     // backs the import resolver's include-following in finish().
-    TreeId loadAndAdd_(std::filesystem::path const& path, bool& ok);
+    TreeId loadAndAdd_(std::filesystem::path const& path, bool& ok,
+                       std::shared_ptr<GrammarSchema const> schema);
+
+    // Resolve `path`'s source language by matching its extension against each
+    // registered schema's `fileExtensions` (first match wins). Returns null on
+    // no match (empty/unknown extension); `addFile` applies the single-schema
+    // fall-through or emits `D_UnknownFileExtension`.
+    [[nodiscard]] std::shared_ptr<GrammarSchema const>
+    schemaForPath_(std::filesystem::path const& path) const;
 
     CompilationUnitId                    id_;
-    std::shared_ptr<GrammarSchema const> schema_;
+    std::shared_ptr<GrammarSchema const> schema_;        // primary (= schemas_[0])
+    std::vector<std::shared_ptr<GrammarSchema const>> schemas_;  // registry, by extension
     std::vector<Tree>                    trees_;
     DiagnosticReporter                   driverDiagnostics_;
     std::unordered_set<std::string>      seenPaths_;   // weakly-canonical, for addFile dedup

@@ -111,13 +111,13 @@ TEST(LspServerE2E, DidChangeRepublishesWithMonotonicVersions) {
 TEST(LspServerE2E, DidOpenPublishesDiagnosticsForToySource) {
     LspTestHarness h;
     h.push(lspInitialize(1));
-    // "1 + 2;" — toy grammar declares no numberStyle, so the tokenizer
-    // rejects `1` and `2` as illegal characters (P_IllegalChar). The
-    // parser then sees those Error tokens and emits P_NoAlternativeMatched
-    // when scanning for a statement starter. Both flavors land in the
-    // published-diagnostics array (F4: LSP now threads tokenizer
-    // diagnostics into the Parser).
-    h.push(lspDidOpen("file:///hello.toy", 1, "1 + 2;"));
+    // "@ + 2;" — `@` is not a declared toy lexeme, so the tokenizer
+    // rejects it as an illegal character (P_IllegalChar) and emits an
+    // Error token. The parser then sees that Error token at top level
+    // and emits P_NoAlternativeMatched when scanning for a topLevel
+    // starter (func/var). Both flavors land in the published-diagnostics
+    // array (F4: LSP now threads tokenizer diagnostics into the Parser).
+    h.push(lspDidOpen("file:///hello.toy", 1, "@ + 2;"));
     h.push(lspShutdown(2));
     h.push(std::string{lspExit});
     EXPECT_EQ(h.runUntilExit(), 0);

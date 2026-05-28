@@ -599,6 +599,72 @@ TokenizeResult Tokenizer::tokenize() && {
             StringStyle const* style = topFrame.style;
             std::string_view suffix{topFrame.dynamicSuffix};
 
+            // Coalesced body: emit ONE in-grammar token spanning the whole body
+            // (the same single-token model `IntLiteral` uses), then consume the
+            // close delimiter without a token and pop the frame. Reuses the same
+            // doubled-delimiter / endsAt / char-escape resolution as the
+            // per-codepoint path below — only the emission granularity differs.
+            // `start` is the first body byte (the opener was emitted last
+            // iteration); the token spans [start, close-start) = the raw body,
+            // which the lowering decodes (escapes resolved there, like ints).
+            if (bodyToken.coalesce && style) {
+                if (style->escapeKind == EscapeKind::Char && style->escapeChar == 0) {
+                    tokenizerFatal("StringStyle escapeKind=Char with escapeChar=0 — schema bug");
+                }
+                bool sawClose = false;
+                std::size_t closeLen = 0;
+                while (!r.isAtEnd()) {
+                    // doubled-delimiter escape: `''` is a literal delimiter, part of the body
+                    if (style->escapeKind == EscapeKind::DoubledDelimiter
+                        && r.remaining().size() >= 2 * style->endsAt.size()
+                        && r.remaining().substr(0, style->endsAt.size()) == style->endsAt
+                        && r.remaining().substr(style->endsAt.size(), style->endsAt.size()) == style->endsAt) {
+                        r.advance(2 * style->endsAt.size());
+                        continue;
+                    }
+                    // close delimiter?
+                    if (const auto n = matchEndsAt(r, style->endsAt, suffix,
+                                                   style->endsAtLongestMatch);
+                        n > 0) {
+                        sawClose = true;
+                        closeLen = n;
+                        break;
+                    }
+                    // char escape: lead byte + next codepoint are part of the body
+                    if (style->escapeKind == EscapeKind::Char
+                        && static_cast<unsigned char>(r.peek())
+                               == static_cast<unsigned char>(style->escapeChar)) {
+                        r.advance(1);
+                        if (r.isAtEnd()) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::P_InvalidEscape;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = source_->id();
+                            d.span     = SourceSpan::of(start, static_cast<ByteOffset>(r.position()));
+                            d.actual   = "escape lead at end of source";
+                            reporter_->report(std::move(d));
+                            break;
+                        }
+                        r.advance(codepointByteCount(r.peek()));
+                        continue;
+                    }
+                    // ordinary body codepoint
+                    r.advance(codepointByteCount(r.peek()));
+                }
+                // One token for the whole body (possibly empty, e.g. `""`).
+                emit(CoreTokenKind::Operator, bodyToken.kind, bodyToken.flags);
+                if (sawClose) {
+                    r.advance(closeLen);           // consume close delimiter (no token)
+                    if (frames.size() <= 1) {
+                        tokenizerFatal("frame stack underflow at coalesced endsAt");
+                    }
+                    frames.pop_back();
+                }
+                // else: EOF before close — frame stays open; the post-loop
+                // unterminated-body logic emits P_UnterminatedString/Comment.
+                continue;
+            }
+
             if (style) {
                 // 1. Doubled-delimiter escape: `''` inside a SQL
                 //    string is a literal `'`, NOT the end of the body.

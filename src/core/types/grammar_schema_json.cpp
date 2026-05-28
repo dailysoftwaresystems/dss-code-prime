@@ -624,13 +624,28 @@ void collectReferences(json const& body,
                     // is a typo. Use C_UnknownShape (matches the expr-body
                     // unknown-key check a few lines above) — C_MissingWrapperRules
                     // is reserved for "block/field absent or empty".
+                    // Optional `ternary` wrapper (mixfix `?:`). When present it
+                    // must be a non-empty string distinct from the other three.
+                    const auto nt = wrapperName("ternary");
+                    if (wr.contains("ternary")) {
+                        if (nt.empty()) {
+                            c.emit(DiagnosticCode::C_MissingWrapperRules,
+                                   std::format("{}/ternary", wrPath),
+                                   "'wrapperRules.ternary' (optional) must be a non-empty "
+                                   "string naming the ternary wrapper rule when present");
+                        } else if (nt == nb || nt == nu || nt == np) {
+                            c.emit(DiagnosticCode::C_DuplicateWrapperRules, wrPath,
+                                   std::format("'wrapperRules.ternary' must name a rule distinct "
+                                               "from binary/unary/postfix (got '{}')", nt));
+                        }
+                    }
                     for (auto const& [k, _] : wr.items()) {
-                        if (k != "binary" && k != "unary" && k != "postfix") {
+                        if (k != "binary" && k != "unary" && k != "postfix" && k != "ternary") {
                             c.emit(DiagnosticCode::C_UnknownShape,
                                    std::format("{}/{}", wrPath, k),
                                    std::format("unknown 'wrapperRules' field '{}' "
-                                               "— expected 'binary', 'unary', or "
-                                               "'postfix'", k));
+                                               "— expected 'binary', 'unary', "
+                                               "'postfix', or 'ternary'", k));
                         }
                     }
                 }
@@ -1729,6 +1744,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     if (dt.contains("flags")) {
                         spec.flags = parseFlagList(dt.at("flags"));
                     }
+                    // Optional `coalesce` flag (default false): emit ONE
+                    // in-grammar token for the whole body instead of one per
+                    // codepoint. A value-bearing literal mode (char / string)
+                    // sets this so `operand` can reference the body token and
+                    // the value can be decoded; comment-style modes leave it
+                    // false (per-codepoint, off-grammar, EmptySpace-skipped).
+                    if (dt.contains("coalesce")) {
+                        if (!dt.at("coalesce").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format("{}/defaultToken/coalesce", modePath),
+                                      "'defaultToken.coalesce' must be a boolean");
+                        } else {
+                            spec.coalesce = dt.at("coalesce").get<bool>();
+                        }
+                    }
                     defaultToken = spec;
                 }
             }
@@ -1860,9 +1890,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     if      (a == "infix")   arity = OperatorArity::Infix;
                     else if (a == "prefix")  arity = OperatorArity::Prefix;
                     else if (a == "postfix") arity = OperatorArity::Postfix;
+                    else if (a == "ternary") arity = OperatorArity::Ternary;
                     else {
                         coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
-                                  std::format("unknown arity '{}' (expected infix|prefix|postfix)", a));
+                                  std::format("unknown arity '{}' (expected infix|prefix|postfix|ternary)", a));
                         continue;
                     }
                 }
@@ -1956,11 +1987,58 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     const auto rname = g.at("bodyRule").get<std::string>();
                     bodyRuleId = data.rules->intern(rname);
                 }
-                OperatorTable::Entry entry{precedence, assoc, std::nullopt};
+                // Ternary `middle` separator (C's `:`). Required for ternary
+                // arity, forbidden otherwise.
+                SchemaTokenId middleId{};
+                if (g.contains("middle")) {
+                    if (arity != OperatorArity::Ternary) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'middle' is only valid on a ternary group");
+                        continue;
+                    }
+                    if (!g.at("middle").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'middle' must be a string lexeme");
+                        continue;
+                    }
+                    const auto mid = g.at("middle").get<std::string>();
+                    auto midIt = data.lexemeTable.find(mid);
+                    if (midIt == data.lexemeTable.end() || midIt->second.empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("'middle' lexeme '{}' is not declared in 'tokens'", mid));
+                        continue;
+                    }
+                    if (midIt->second.size() != 1) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  std::format("'middle' lexeme '{}' has multiple meanings; "
+                                              "ambiguous separators are unsupported", mid));
+                        continue;
+                    }
+                    middleId = midIt->second[0].id;
+                }
+                if (arity == OperatorArity::Ternary && !middleId.valid()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "a ternary group requires a 'middle' separator lexeme");
+                    continue;
+                }
+                // A group is either grouped-postfix (endsAt) OR ternary (middle),
+                // never both — the two payloads are mutually exclusive by arity
+                // (grouped is postfix-only, middle is ternary-only, each rejected
+                // on the wrong arity above), so a single group can't reach here
+                // carrying both. Assert to catch a future producer that bypasses
+                // those arity gates.
+                if (endsAtId.valid() && middleId.valid()) {
+                    coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                              "a group cannot be both grouped-postfix ('endsAt') and "
+                              "ternary ('middle')");
+                    continue;
+                }
+                OperatorTable::Entry entry{precedence, assoc, std::nullopt, std::nullopt};
                 if (endsAtId.valid()) {
                     entry.grouped = OperatorTable::GroupedPostfix{
                         endsAtId, bodyRuleId};
                 }
+                if (middleId.valid()) entry.ternaryMiddle = middleId;
 
                 for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
                     json const& op = g.at("operators")[j];
@@ -2317,7 +2395,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     if (!exprBody.contains("wrapperRules")) return;
                     json const& wr = exprBody.at("wrapperRules");
                     if (!wr.is_object()) return;
-                    for (auto const* key : {"binary", "unary", "postfix"}) {
+                    for (auto const* key : {"binary", "unary", "postfix", "ternary"}) {
                         if (wr.contains(key) && wr.at(key).is_string()) {
                             const auto name = wr.at(key).get<std::string>();
                             if (!name.empty()) wrapperNames.push_back(name);
@@ -2377,6 +2455,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         else if (std::string{key} == "unary")   pack.unary   = rid;
                         else /* postfix */                       pack.postfix = rid;
                     }
+                    // Optional ternary wrapper (mixfix `?:`).
+                    if (wr.contains("ternary") && wr.at("ternary").is_string()) {
+                        const auto n = wr.at("ternary").get<std::string>();
+                        if (!n.empty()) pack.ternary = data.rules->intern(n);
+                    }
                     const auto ownerRid = data.rules->intern(shapeName);
                     data.exprWrapperRules.emplace(ownerRid.v, pack);
                 });
@@ -2419,7 +2502,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // owned set (single source of truth shared with
                 // `Parser::Impl` and `TreeBuilder`).
                 for (auto const& mode : data.lexerModes) {
-                    if (mode.defaultToken) {
+                    // A COALESCED body kind is in-grammar (one token, like
+                    // IntLiteral) — it must NOT join the off-grammar set, so
+                    // that `operand` can reference it and the schema cursor
+                    // advances through it normally.
+                    if (mode.defaultToken && !mode.defaultToken->coalesce) {
                         data.bodyDefaultTokenKinds.insert(
                             mode.defaultToken->kind);
                     }
@@ -2980,6 +3067,56 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // SE-arrays (HR9): optional C-style declarator suffix.
+                        //   "arraySuffix": { "rule": "arrayDeclSuffix",
+                        //                    "lengthChild": 1 }
+                        // `rule` names the suffix shape (matched among the
+                        // declaration's visible children); `lengthChild` is the
+                        // visible-child index of the length expression inside
+                        // that suffix. An unknown rule is C_UnknownShape; the
+                        // declaration is still usable (just without arrays).
+                        if (entry.contains("arraySuffix")) {
+                            json const& as = entry.at("arraySuffix");
+                            if (!as.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/arraySuffix",
+                                          "'arraySuffix' must be an object");
+                            } else if (!as.contains("rule") || !as.at("rule").is_string()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/arraySuffix/rule",
+                                          "'arraySuffix.rule' is required and must be a "
+                                          "rule-name string");
+                            } else {
+                                auto const rn = as.at("rule").get<std::string>();
+                                if (!data.rules->contains(rn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/arraySuffix/rule",
+                                              std::format("'arraySuffix.rule' references "
+                                                          "unknown shape '{}'", rn));
+                                } else {
+                                    ArraySuffix suffix;
+                                    suffix.rule     = data.rules->find(rn);
+                                    suffix.ruleName = rn;
+                                    if (as.contains("lengthChild")) {
+                                        auto const& lc = as.at("lengthChild");
+                                        if (!lc.is_number_integer()
+                                            || lc.get<std::int64_t>() < 0
+                                            || lc.get<std::int64_t>()
+                                                   > std::numeric_limits<std::int32_t>::max()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/arraySuffix/lengthChild",
+                                                      "'lengthChild' must be a non-negative "
+                                                      "integer");
+                                        } else {
+                                            suffix.lengthChild =
+                                                static_cast<std::uint32_t>(lc.get<std::int64_t>());
+                                        }
+                                    }
+                                    rule.arraySuffix = std::move(suffix);
+                                }
+                            }
+                        }
+
                         // D8: optional `warnIfUnused` flag (default false).
                         // A non-bool value is the same C_InvalidSemantics
                         // discipline used for other declaration sub-fields.
@@ -3238,6 +3375,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                           entry.at("nameMatch").get<std::string>()));
                                 } else {
                                     rule.nameMatch = *m;
+                                }
+                            }
+                        }
+                        if (entry.contains("hardParents")) {
+                            json const& hp = entry.at("hardParents");
+                            if (!hp.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/hardParents",
+                                          "'hardParents' must be an array of rule names");
+                            } else {
+                                for (std::size_t k = 0; k < hp.size(); ++k) {
+                                    if (!hp[k].is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  std::format("{}/hardParents/{}", path, k),
+                                                  "each 'hardParents' entry must be a string");
+                                        continue;
+                                    }
+                                    auto name = hp[k].get<std::string>();
+                                    if (!data.rules->contains(name)) {
+                                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                                  std::format("{}/hardParents/{}", path, k),
+                                                  std::format("'hardParents' references unknown "
+                                                              "shape '{}'", name));
+                                        continue;
+                                    }
+                                    rule.hardParents.push_back(data.rules->find(name));
+                                    rule.hardParentNames.push_back(std::move(name));
                                 }
                             }
                         }
@@ -3882,6 +4046,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── pointerToken (SE-pointers / G5) ──
+            // An OPTIONAL token whose occurrence in a type-position subtree wraps
+            // the resolved type one level in Ptr (C's `int *p` declarator stars).
+            if (sem.contains("pointerToken")) {
+                json const& tok = sem.at("pointerToken");
+                if (!tok.is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/pointerToken",
+                              "'pointerToken' must be a string");
+                } else {
+                    auto const name = tok.get<std::string>();
+                    if (!data.schemaTokens->contains(name)) {
+                        coll.emit(DiagnosticCode::C_UnknownToken,
+                                  "/semantics/pointerToken",
+                                  std::format("'pointerToken' references unknown "
+                                              "token kind '{}'", name));
+                    } else {
+                        cfg.pointerToken = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
             // A `nameMatch: "lastIdentifier"` rule (declaration or
             // reference) descends a subtree for its LAST identifier token —
             // which requires the engine to know which token kind IS the
@@ -3904,6 +4090,379 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             }
 
             data.semantics = std::move(cfg);
+        }
+    }
+
+    // hirLowering ── per-language CST→HIR lowering config (plan 09 HR8; schema
+    // v4). Optional; absent ⇒ no lowering. Parsed LATE (after shapes/tokens
+    // interned) so rule/token references resolve here. HIR kind/op NAMES are
+    // stored raw (the `core` loader can't see the `hir` enums) and resolved by
+    // the lowering engine, which reports an unknown name as
+    // H_UnsupportedLoweringForKind.
+    if (doc.contains("hirLowering")) {
+        json const& hl = doc.at("hirLowering");
+        if (!hl.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering",
+                      "'hirLowering' must be an object");
+        } else {
+            HirLoweringConfig cfg;
+
+            // Resolve a required rule-name field on `obj` → RuleId + name.
+            auto resolveRuleField = [&](json const& obj, char const* key,
+                                        std::string const& path,
+                                        RuleId& outId, std::string& outName) -> bool {
+                if (!obj.contains(key) || !obj.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path + "/" + key,
+                              std::format("'{}' is required and must be a string", key));
+                    return false;
+                }
+                outName = obj.at(key).get<std::string>();
+                if (!data.rules->contains(outName)) {
+                    coll.emit(DiagnosticCode::C_UnknownShape, path + "/" + key,
+                              std::format("'{}' references unknown shape '{}'", key, outName));
+                    return false;
+                }
+                outId = data.rules->find(outName);
+                return true;
+            };
+            // Resolve a token-name string → SchemaTokenId (C_UnknownToken on miss).
+            auto resolveToken = [&](std::string const& name, std::string const& path,
+                                    SchemaTokenId& out) -> bool {
+                if (!data.schemaTokens->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownToken, path,
+                              std::format("references unknown token kind '{}'", name));
+                    return false;
+                }
+                out = data.schemaTokens->find(name);
+                return true;
+            };
+
+            // ── ruleMappings: [{ rule, hirKind }] ──
+            if (hl.contains("ruleMappings")) {
+                json const& arr = hl.at("ruleMappings");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/ruleMappings",
+                              "'hirLowering.ruleMappings' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/hirLowering/ruleMappings/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each 'ruleMappings' entry must be an object");
+                            continue;
+                        }
+                        HirRuleMapping m;
+                        if (!resolveRuleField(entry, "rule", path, m.rule, m.ruleName)) continue;
+                        if (!entry.contains("hirKind") || !entry.at("hirKind").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/hirKind",
+                                      "'hirKind' is required and must be a string");
+                            continue;
+                        }
+                        m.hirKind = entry.at("hirKind").get<std::string>();
+                        // HR10: optional childGathering [{ match:{rule|classifier},
+                        // optional?, list?, lower, role? }] for extension-kind mappings.
+                        if (entry.contains("childGathering")) {
+                            json const& cg = entry.at("childGathering");
+                            if (!cg.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering, path + "/childGathering",
+                                          "'childGathering' must be an array");
+                            } else {
+                                for (std::size_t j = 0; j < cg.size(); ++j) {
+                                    const auto sPath = std::format("{}/childGathering/{}", path, j);
+                                    json const& sj = cg[j];
+                                    if (!sj.is_object() || !sj.contains("lower")
+                                        || !sj.at("lower").is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath,
+                                                  "each childGathering slot needs a string 'lower'");
+                                        continue;
+                                    }
+                                    ChildSlotSpec slot;
+                                    {   // map the `lower` verb string → ChildLower (closed set)
+                                        auto const lv = sj.at("lower").get<std::string>();
+                                        if      (lv == "expr")     slot.lower = ChildLower::Expr;
+                                        else if (lv == "flatExpr") slot.lower = ChildLower::FlatExpr;
+                                        else if (lv == "ext")      slot.lower = ChildLower::Ext;
+                                        else if (lv == "ref")      slot.lower = ChildLower::Ref;
+                                        else if (lv == "varDecl")  slot.lower = ChildLower::VarDecl;
+                                        else {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath + "/lower",
+                                                      std::format("unknown childGathering lower verb '{}' "
+                                                                  "(expected expr/flatExpr/ext/ref/varDecl)", lv));
+                                            continue;
+                                        }
+                                    }
+                                    if (sj.contains("role") && sj.at("role").is_string())
+                                        slot.role = sj.at("role").get<std::string>();
+                                    if (sj.contains("optional") && sj.at("optional").is_boolean())
+                                        slot.optional = sj.at("optional").get<bool>();
+                                    if (sj.contains("list") && sj.at("list").is_boolean())
+                                        slot.list = sj.at("list").get<bool>();
+                                    // match: exactly one of { rule } / { classifier }.
+                                    if (sj.contains("match") && sj.at("match").is_object()) {
+                                        json const& mj = sj.at("match");
+                                        if (mj.contains("rule"))
+                                            (void)resolveRuleField(mj, "rule", sPath + "/match",
+                                                                   slot.matchRule, slot.matchRuleName);
+                                        else if (mj.contains("classifier") && mj.at("classifier").is_string()) {
+                                            slot.classifier = mj.at("classifier").get<std::string>();
+                                            if (slot.classifier != "expr")
+                                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                          sPath + "/match/classifier",
+                                                          std::format("unknown classifier '{}' (only "
+                                                                      "'expr' is supported)", slot.classifier));
+                                        } else
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath + "/match",
+                                                      "'match' needs a 'rule' or 'classifier'");
+                                    } else {
+                                        coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath,
+                                                  "childGathering slot needs a 'match' object");
+                                    }
+                                    m.childGathering.push_back(std::move(slot));
+                                }
+                            }
+                        }
+                        cfg.ruleMappings.push_back(std::move(m));
+                    }
+                }
+            }
+
+            // ── the four Pratt expression rule ids (optional strings) ──
+            auto readExprRule = [&](char const* key, RuleId& id, std::string& name) {
+                if (!hl.contains(key)) return;
+                (void)resolveRuleField(hl, key, "/hirLowering", id, name);
+            };
+            readExprRule("binaryExprRule",  cfg.binaryExprRule,  cfg.binaryExprRuleName);
+            readExprRule("unaryExprRule",   cfg.unaryExprRule,   cfg.unaryExprRuleName);
+            readExprRule("postfixExprRule", cfg.postfixExprRule, cfg.postfixExprRuleName);
+            readExprRule("ternaryExprRule", cfg.ternaryExprRule, cfg.ternaryExprRuleName);
+            readExprRule("operandRule",     cfg.operandRule,     cfg.operandRuleName);
+            readExprRule("flatExprRule",     cfg.flatExprRule,     cfg.flatExprRuleName);
+            readExprRule("flatBinaryOpRule", cfg.flatBinaryOpRule, cfg.flatBinaryOpRuleName);
+
+            // ── HR10: extensionKinds [{ name, lang }] ──
+            if (hl.contains("extensionKinds")) {
+                json const& arr = hl.at("extensionKinds");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/extensionKinds",
+                              "'extensionKinds' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/hirLowering/extensionKinds/{}", i);
+                        json const& e = arr[i];
+                        if (!e.is_object() || !e.contains("name") || !e.at("name").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each extensionKind needs a string 'name'");
+                            continue;
+                        }
+                        ExtensionKindEntry ek;
+                        ek.name = e.at("name").get<std::string>();
+                        if (ek.name.find("::") == std::string::npos) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path + "/name",
+                                      std::format("extension kind name '{}' must be language-"
+                                                  "qualified (contain '::')", ek.name));
+                            continue;
+                        }
+                        if (e.contains("lang") && e.at("lang").is_string())
+                            ek.lang = e.at("lang").get<std::string>();
+                        cfg.extensionKinds.push_back(std::move(ek));
+                    }
+                }
+            }
+
+            // An extension kind named by a non-array facet (nullExtensionKind /
+            // refExtensionKind) MUST be declared in `extensionKinds`, so the
+            // lowering engine's `extKind()` lookup is total (it never silently
+            // registers an undeclared kind). Emits C_InvalidHirLowering otherwise.
+            auto requireDeclaredExtKind = [&](std::string const& name, std::string const& path) {
+                for (auto const& ek : cfg.extensionKinds) if (ek.name == name) return;
+                coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                          std::format("extension kind '{}' is not declared in "
+                                      "'hirLowering.extensionKinds'", name));
+            };
+
+            // ── HR10: nullLiteral { token, hirKind } ──
+            if (hl.contains("nullLiteral")) {
+                json const& nl = hl.at("nullLiteral");
+                if (!nl.is_object() || !nl.contains("token") || !nl.at("token").is_string()
+                    || !nl.contains("hirKind") || !nl.at("hirKind").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/nullLiteral",
+                              "'nullLiteral' needs string 'token' and 'hirKind'");
+                } else {
+                    cfg.nullTokenName = nl.at("token").get<std::string>();
+                    (void)resolveToken(cfg.nullTokenName, "/hirLowering/nullLiteral/token", cfg.nullToken);
+                    cfg.nullExtensionKind = nl.at("hirKind").get<std::string>();
+                    requireDeclaredExtKind(cfg.nullExtensionKind, "/hirLowering/nullLiteral/hirKind");
+                }
+            }
+
+            // ── HR10: refExtensionKind (string) — name refs lower to this
+            // extension kind instead of a core Ref (SQL relational names). ──
+            if (hl.contains("refExtensionKind")) {
+                if (!hl.at("refExtensionKind").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/refExtensionKind",
+                              "'refExtensionKind' must be a string");
+                } else {
+                    cfg.refExtensionKind = hl.at("refExtensionKind").get<std::string>();
+                    requireDeclaredExtKind(cfg.refExtensionKind, "/hirLowering/refExtensionKind");
+                }
+            }
+
+            // ── operator dispatch tables: [{ token, target, compoundBase? }] ──
+            auto readOps = [&](char const* key, std::vector<HirOperatorEntry>& out) {
+                if (!hl.contains(key)) return;
+                json const& arr = hl.at(key);
+                std::string const base = std::format("/hirLowering/{}", key);
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, base,
+                              std::format("'hirLowering.{}' must be an array", key));
+                    return;
+                }
+                for (std::size_t i = 0; i < arr.size(); ++i) {
+                    const auto path = std::format("{}/{}", base, i);
+                    json const& entry = arr[i];
+                    if (!entry.is_object()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                  "each operator entry must be an object");
+                        continue;
+                    }
+                    if (!entry.contains("token") || !entry.at("token").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField, path + "/token",
+                                  "'token' is required and must be a string");
+                        continue;
+                    }
+                    if (!entry.contains("target") || !entry.at("target").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField, path + "/target",
+                                  "'target' is required and must be a string");
+                        continue;
+                    }
+                    HirOperatorEntry e;
+                    e.tokenName = entry.at("token").get<std::string>();
+                    if (!resolveToken(e.tokenName, path + "/token", e.token)) continue;
+                    e.target = entry.at("target").get<std::string>();
+                    if (entry.contains("compoundBase")) {
+                        if (!entry.at("compoundBase").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path + "/compoundBase",
+                                      "'compoundBase' must be a string");
+                        } else {
+                            e.compoundBase = entry.at("compoundBase").get<std::string>();
+                        }
+                    }
+                    out.push_back(std::move(e));
+                }
+            };
+            readOps("binaryOps",  cfg.binaryOps);
+            readOps("unaryOps",   cfg.unaryOps);
+            readOps("postfixOps", cfg.postfixOps);
+
+            // ── structural specials ──
+            auto readTokenField = [&](char const* key, SchemaTokenId& id, std::string& name) {
+                if (!hl.contains(key)) return;
+                if (!hl.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              std::format("/hirLowering/{}", key),
+                              std::format("'{}' must be a string", key));
+                    return;
+                }
+                name = hl.at(key).get<std::string>();
+                (void)resolveToken(name, std::format("/hirLowering/{}", key), id);
+            };
+            if (hl.contains("deferredRules")) {
+                json const& arr = hl.at("deferredRules");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, "/hirLowering/deferredRules",
+                              "'hirLowering.deferredRules' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/hirLowering/deferredRules/{}", i);
+                        if (!arr[i].is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each 'deferredRules' entry must be a rule-name string");
+                            continue;
+                        }
+                        auto const name = arr[i].get<std::string>();
+                        if (!data.rules->contains(name)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'deferredRules' references unknown shape '{}'", name));
+                            continue;
+                        }
+                        cfg.deferredRules.push_back(data.rules->find(name));
+                    }
+                }
+            }
+
+            readTokenField("forClauseSeparator", cfg.forClauseSeparator, cfg.forClauseSeparatorName);
+            readTokenField("caseDefaultToken",   cfg.caseDefaultToken,   cfg.caseDefaultTokenName);
+            if (hl.contains("caseLabelRule")) {
+                (void)resolveRuleField(hl, "caseLabelRule", "/hirLowering",
+                                       cfg.caseLabelRule, cfg.caseLabelRuleName);
+            }
+
+            // Char / string literal lowering blocks:
+            //   "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   }
+            //   "stringLiteral": { "startToken": "StringStart", "bodyToken": "StringLiteral" }
+            auto readBodyLiteral = [&](char const* key, SchemaTokenId& startId,
+                                       std::string& startName, SchemaTokenId& bodyId,
+                                       std::string& bodyName) {
+                if (!hl.contains(key)) return;
+                json const& bl = hl.at(key);
+                auto readField = [&](char const* f, SchemaTokenId& id, std::string& name) {
+                    if (!bl.contains(f) || !bl.at(f).is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  std::format("/hirLowering/{}/{}", key, f),
+                                  std::format("'{}.{}' is required and must be a token name", key, f));
+                        return;
+                    }
+                    name = bl.at(f).get<std::string>();
+                    (void)resolveToken(name, std::format("/hirLowering/{}/{}", key, f), id);
+                };
+                if (!bl.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              std::format("/hirLowering/{}", key),
+                              std::format("'{}' must be an object", key));
+                    return;
+                }
+                readField("startToken", startId, startName);
+                readField("bodyToken",  bodyId,  bodyName);
+            };
+            readBodyLiteral("charLiteral",   cfg.charStartToken,   cfg.charStartTokenName,
+                            cfg.charBodyToken,   cfg.charBodyTokenName);
+            readBodyLiteral("stringLiteral", cfg.stringStartToken, cfg.stringStartTokenName,
+                            cfg.stringBodyToken, cfg.stringBodyTokenName);
+            // HR10: a second string opener (SQL's `N'…'`) sharing stringBodyToken.
+            if (hl.contains("unicodeStringStartToken")
+                && hl.at("unicodeStringStartToken").is_string()) {
+                cfg.unicodeStringStartTokenName = hl.at("unicodeStringStartToken").get<std::string>();
+                (void)resolveToken(cfg.unicodeStringStartTokenName,
+                                   "/hirLowering/unicodeStringStartToken",
+                                   cfg.unicodeStringStartToken);
+            }
+            // HR10: string bodies use doubled-delimiter (`''`) escaping (SQL).
+            // Derive the delimiter byte from the string opener's StringStyle.endsAt
+            // (single source of truth) so the engine's decoder doesn't duplicate it.
+            if (hl.contains("stringDoubledDelimiter")
+                && hl.at("stringDoubledDelimiter").is_boolean()
+                && hl.at("stringDoubledDelimiter").get<bool>()) {
+                cfg.stringDoubledDelimiter = true;
+                for (auto const& [lex, meanings] : data.lexemeTable) {
+                    (void)lex;
+                    for (auto const& mn : meanings) {
+                        if (mn.id.v == cfg.stringStartToken.v && mn.stringStyleId.valid()
+                            && mn.stringStyleId.v < data.stringStyles.size()) {
+                            auto const& ss = data.stringStyles[mn.stringStyleId.v];
+                            if (!ss.endsAt.empty()) cfg.stringDelimiter = ss.endsAt[0];
+                        }
+                    }
+                }
+                if (cfg.stringDelimiter == '\0') {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/hirLowering/stringDoubledDelimiter",
+                              "could not derive the doubled-delimiter byte from the "
+                              "string opener's StringStyle.endsAt");
+                }
+            }
+
+            data.hirLowering = std::move(cfg);
         }
     }
 

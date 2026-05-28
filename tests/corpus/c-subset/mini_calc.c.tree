@@ -7,15 +7,16 @@ rule:root
           tok:"int"
       tok:"printf"
       rule:externTail
-        tok:"("
-        rule:paramList
-          rule:param
-            rule:typeRef
-              rule:typeBase
-                tok:"int"
-            tok:"fmt"
-        tok:")"
-        tok:";"
+        rule:externFuncTail
+          tok:"("
+          rule:paramList
+            rule:param
+              rule:typeRef
+                rule:typeBase
+                  tok:"int"
+              tok:"fmt"
+          tok:")"
+          tok:";"
   rule:topLevel
     rule:topLevelDecl
       rule:typeRef

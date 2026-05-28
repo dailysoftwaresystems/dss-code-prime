@@ -143,35 +143,15 @@ rule:root
         tok:","
         rule:expression
           rule:operand
-            tok:"'"
-          tok:"A"
-          tok:"l"
-          tok:"i"
-          tok:"c"
-          tok:"e"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"Alice"
         tok:","
         rule:expression
           rule:operand
-            tok:"'"
-          tok:"a"
-          tok:"l"
-          tok:"i"
-          tok:"c"
-          tok:"e"
-          tok:"@"
-          tok:"e"
-          tok:"x"
-          tok:"a"
-          tok:"m"
-          tok:"p"
-          tok:"l"
-          tok:"e"
-          tok:"."
-          tok:"c"
-          tok:"o"
-          tok:"m"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"alice@example.com"
         tok:","
         rule:expression
           rule:operand
@@ -194,39 +174,15 @@ rule:root
         tok:","
         rule:expression
           rule:operand
-            tok:"'"
-          tok:"B"
-          tok:"o"
-          tok:"b"
-          tok:"''"
-          tok:"s"
-          tok:" "
-          tok:"T"
-          tok:"o"
-          tok:"o"
-          tok:"l"
-          tok:"s"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"Bob''s Tools"
         tok:","
         rule:expression
           rule:operand
-            tok:"'"
-          tok:"b"
-          tok:"o"
-          tok:"b"
-          tok:"@"
-          tok:"e"
-          tok:"x"
-          tok:"a"
-          tok:"m"
-          tok:"p"
-          tok:"l"
-          tok:"e"
-          tok:"."
-          tok:"c"
-          tok:"o"
-          tok:"m"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"bob@example.com"
         tok:","
         rule:expression
           rule:operand
@@ -249,31 +205,15 @@ rule:root
         tok:","
         rule:expression
           rule:operand
-            tok:"N'"
-          tok:"h"
-          tok:"é"
-          tok:"l"
-          tok:"l"
-          tok:"o"
-          tok:"'"
+            rule:uniStringLitExpr
+              tok:"N'"
+              tok:"héllo"
         tok:","
         rule:expression
           rule:operand
-            tok:"N'"
-          tok:"h"
-          tok:"@"
-          tok:"e"
-          tok:"x"
-          tok:"a"
-          tok:"m"
-          tok:"p"
-          tok:"l"
-          tok:"e"
-          tok:"."
-          tok:"c"
-          tok:"o"
-          tok:"m"
-          tok:"'"
+            rule:uniStringLitExpr
+              tok:"N'"
+              tok:"h@example.com"
         tok:","
         rule:expression
           rule:operand
@@ -304,15 +244,9 @@ rule:root
         tok:","
         rule:expression
           rule:operand
-            tok:"'"
-          tok:"p"
-          tok:"e"
-          tok:"n"
-          tok:"d"
-          tok:"i"
-          tok:"n"
-          tok:"g"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"pending"
       tok:")"
       tok:";"
   rule:statement
@@ -339,15 +273,9 @@ rule:root
         tok:","
         rule:expression
           rule:operand
-            tok:"'"
-          tok:"s"
-          tok:"h"
-          tok:"i"
-          tok:"p"
-          tok:"p"
-          tok:"e"
-          tok:"d"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"shipped"
       tok:")"
       tok:";"
   rule:statement
@@ -374,15 +302,9 @@ rule:root
         tok:","
         rule:expression
           rule:operand
-            tok:"'"
-          tok:"p"
-          tok:"e"
-          tok:"n"
-          tok:"d"
-          tok:"i"
-          tok:"n"
-          tok:"g"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"pending"
       tok:")"
       tok:";"
   rule:statement
@@ -544,15 +466,9 @@ rule:root
           rule:binaryOp
             tok:"="
           rule:operand
-            tok:"'"
-          tok:"p"
-          tok:"e"
-          tok:"n"
-          tok:"d"
-          tok:"i"
-          tok:"n"
-          tok:"g"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"pending"
       tok:";"
   rule:statement
     rule:selectStmt
@@ -772,15 +688,9 @@ rule:root
           rule:binaryOp
             tok:"!="
           rule:operand
-            tok:"'"
-          tok:"p"
-          tok:"e"
-          tok:"n"
-          tok:"d"
-          tok:"i"
-          tok:"n"
-          tok:"g"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"pending"
       tok:";"
   rule:statement
     rule:selectStmt
@@ -890,15 +800,9 @@ rule:root
           tok:"="
           rule:expression
             rule:operand
-              tok:"'"
-            tok:"s"
-            tok:"h"
-            tok:"i"
-            tok:"p"
-            tok:"p"
-            tok:"e"
-            tok:"d"
-            tok:"'"
+              rule:stringLitExpr
+                tok:"'"
+                tok:"shipped"
       rule:whereClause
         tok:"WHERE"
         rule:expression
@@ -1021,17 +925,9 @@ rule:root
           rule:binaryOp
             tok:"="
           rule:operand
-            tok:"'"
-          tok:"c"
-          tok:"a"
-          tok:"n"
-          tok:"c"
-          tok:"e"
-          tok:"l"
-          tok:"l"
-          tok:"e"
-          tok:"d"
-          tok:"'"
+            rule:stringLitExpr
+              tok:"'"
+              tok:"cancelled"
       tok:";"
   rule:statement
     rule:deleteStmt

@@ -569,7 +569,7 @@ struct ResolvedMeaning {
 [[nodiscard]] bool isBuiltinLiteralKind(GrammarSchema const& schema,
                                         SchemaTokenId id) noexcept {
     static constexpr std::string_view kLiterals[] = {
-        "IntLiteral", "FloatLiteral", "StringLiteral",
+        "IntLiteral", "FloatLiteral", "StringLiteral", "CharLiteral",
     };
     const auto name = schema.schemaTokens().name(id);
     for (auto lit : kLiterals) {

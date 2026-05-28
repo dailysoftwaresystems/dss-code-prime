@@ -17,8 +17,8 @@
 
   "lexerModes": {
     "main":          { "tokens": "default" },
-    "string":        { "defaultToken": { "kind": "StringChar" } },
-    "charBody":      { "defaultToken": { "kind": "CharLiteral" } },
+    "string":        { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
+    "charBody":      { "defaultToken": { "kind": "CharLiteral",   "coalesce": true } },
     "line-comment":  {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -75,6 +75,7 @@
     "*":  [{ "kind": "StarOp"   }],
     "/":  [{ "kind": "SlashOp"  }],
     "!":  [{ "kind": "BangOp"   }],
+    "?":  [{ "kind": "QuestionOp" }],
 
     "==": [{ "kind": "EqEqOp" }],
     "!=": [{ "kind": "NotEqOp" }],
@@ -110,6 +111,7 @@
   "operators": {
     "groups": [
       { "precedence": 15, "associativity": "right",                      "operators": ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] },
+      { "precedence": 16, "associativity": "right", "arity": "ternary",   "operators": ["?"], "middle": ":"                       },
       { "precedence": 20, "associativity": "left",                       "operators": ["||"]                                   },
       { "precedence": 25, "associativity": "left",                       "operators": ["&&"]                                   },
       { "precedence": 30, "associativity": "left",                       "operators": ["|"]                                    },
@@ -120,7 +122,7 @@
       { "precedence": 60, "associativity": "left",                       "operators": ["<<", ">>"]                             },
       { "precedence": 65, "associativity": "left",                       "operators": ["+", "-"]                               },
       { "precedence": 70, "associativity": "left",                       "operators": ["*", "/"]                               },
-      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*"]                     },
+      { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&"]                },
       { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" }
@@ -205,7 +207,7 @@
     },
 
     "includeDirective": {
-      "sequence": [ "HashOp", "IncludeKeyword", "StringStart" ]
+      "sequence": [ "HashOp", "IncludeKeyword", "StringStart", "StringLiteral" ]
     },
 
     "externDecl": {
@@ -217,14 +219,18 @@
       ]
     },
 
+    "externFuncTail": {
+      "sequence": [
+        "ParenOpen",
+        { "optional": "paramList" },
+        "ParenClose",
+        "EndStatement"
+      ]
+    },
+
     "externTail": {
       "alt": [
-        { "sequence": [
-            "ParenOpen",
-            { "optional": "paramList" },
-            "ParenClose",
-            "EndStatement"
-        ] },
+        "externFuncTail",
         "varDeclTail"
       ]
     },
@@ -251,6 +257,7 @@
       "sequence": [
         { "optional": "ConstKeyword" },
         "typeBase",
+        { "repeat": "StarOp" },
         { "optional": "ConstKeyword" }
       ]
     },
@@ -377,7 +384,8 @@
         "wrapperRules": {
           "binary":  "binaryExpr",
           "unary":   "unaryExpr",
-          "postfix": "postfixExpr"
+          "postfix": "postfixExpr",
+          "ternary": "ternaryExpr"
         }
       }
     },
@@ -387,11 +395,14 @@
         "Identifier",
         "IntLiteral",
         "FloatLiteral",
-        "StringStart",
-        "CharStart",
+        "stringLiteralExpr",
+        "charLiteralExpr",
         { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
       ]
     },
+
+    "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
+    "stringLiteralExpr": { "sequence": [ "StringStart", "StringLiteral" ] },
 
     "argList": {
       "optional": {
@@ -405,13 +416,16 @@
 
   "semantics": {
     "identifierToken": "Identifier",
+    "pointerToken":    "StarOp",
     "declarations": [
       { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
-        "constMarker": "ConstKeyword", "warnIfUnused": true },
+        "constMarker": "ConstKeyword", "warnIfUnused": true,
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } },
       { "rule": "param",       "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword" },
       { "rule": "topLevelDecl", "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword",
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
         "kindByChild": {
           "childPath": [2, 0],
           "whenRule": "funcDefTail",
@@ -419,7 +433,14 @@
           "paramsPath": [0],
           "bodyPath":   [1]
         } },
-      { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" }
+      { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" },
+      { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
+        "kindByChild": {
+          "childPath": [3, 0],
+          "whenRule": "externFuncTail",
+          "whenKind": "function",
+          "paramsPath": [1]
+        } }
     ],
     "references": [
       { "rule": "operand" }
@@ -456,5 +477,85 @@
       { "literal": "IntLiteral",   "core": "I32" },
       { "literal": "FloatLiteral", "core": "F64" }
     ]
+  },
+
+  "hirLowering": {
+    "ruleMappings": [
+      { "rule": "includeDirective", "hirKind": "Skip"    },
+      { "rule": "topLevelDecl", "hirKind": "Decl"        },
+      { "rule": "varDeclHead",  "hirKind": "VarDecl"     },
+      { "rule": "param",        "hirKind": "VarDecl"     },
+      { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
+      { "rule": "externDecl",   "hirKind": "ExternDecl"  },
+      { "rule": "block",        "hirKind": "Block"       },
+      { "rule": "ifStmt",       "hirKind": "IfStmt"      },
+      { "rule": "whileStmt",    "hirKind": "WhileStmt"   },
+      { "rule": "doStmt",       "hirKind": "DoWhileStmt" },
+      { "rule": "forStmt",      "hirKind": "ForStmt"     },
+      { "rule": "switchStmt",   "hirKind": "SwitchStmt"  },
+      { "rule": "breakStmt",    "hirKind": "BreakStmt"   },
+      { "rule": "returnStmt",   "hirKind": "ReturnStmt"  },
+      { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
+    ],
+
+    "binaryExprRule":  "binaryExpr",
+    "unaryExprRule":   "unaryExpr",
+    "postfixExprRule": "postfixExpr",
+    "ternaryExprRule": "ternaryExpr",
+    "operandRule":     "operand",
+
+    "binaryOps": [
+      { "token": "PlusOp",   "target": "Add"    },
+      { "token": "MinusOp",  "target": "Sub"    },
+      { "token": "StarOp",   "target": "Mul"    },
+      { "token": "SlashOp",  "target": "Div"    },
+      { "token": "EqEqOp",   "target": "Eq"     },
+      { "token": "NotEqOp",  "target": "Ne"     },
+      { "token": "LtOp",     "target": "Lt"     },
+      { "token": "LtEqOp",   "target": "Le"     },
+      { "token": "GtOp",     "target": "Gt"     },
+      { "token": "GtEqOp",   "target": "Ge"     },
+      { "token": "AndAndOp", "target": "LogicalAnd" },
+      { "token": "OrOrOp",   "target": "LogicalOr"  },
+      { "token": "BitAndOp", "target": "BitAnd" },
+      { "token": "BitOrOp",  "target": "BitOr"  },
+      { "token": "BitXorOp", "target": "BitXor" },
+      { "token": "ShlOp",    "target": "Shl"    },
+      { "token": "ShrOp",    "target": "Shr"    },
+      { "token": "AssignOp", "target": "Assign" },
+
+      { "token": "PlusAssignOp",   "target": "Assign", "compoundBase": "Add"    },
+      { "token": "MinusAssignOp",  "target": "Assign", "compoundBase": "Sub"    },
+      { "token": "StarAssignOp",   "target": "Assign", "compoundBase": "Mul"    },
+      { "token": "SlashAssignOp",  "target": "Assign", "compoundBase": "Div"    },
+      { "token": "ModAssignOp",    "target": "Assign", "compoundBase": "Rem"    },
+      { "token": "BitAndAssignOp", "target": "Assign", "compoundBase": "BitAnd" },
+      { "token": "BitOrAssignOp",  "target": "Assign", "compoundBase": "BitOr"  },
+      { "token": "BitXorAssignOp", "target": "Assign", "compoundBase": "BitXor" },
+      { "token": "ShlAssignOp",    "target": "Assign", "compoundBase": "Shl"    },
+      { "token": "ShrAssignOp",    "target": "Assign", "compoundBase": "Shr"    }
+    ],
+
+    "unaryOps": [
+      { "token": "BangOp",   "target": "Not"       },
+      { "token": "TildeOp",  "target": "BitNot"    },
+      { "token": "MinusOp",  "target": "Neg"       },
+      { "token": "BitAndOp", "target": "AddressOf" },
+      { "token": "StarOp",   "target": "Deref"     }
+    ],
+
+    "postfixOps": [
+      { "token": "ParenOpen",    "target": "Call"    },
+      { "token": "BracketOpen",  "target": "Index"   },
+      { "token": "PlusPlusOp",   "target": "PostInc" },
+      { "token": "MinusMinusOp", "target": "PostDec" }
+    ],
+
+    "forClauseSeparator": "EndStatement",
+    "caseLabelRule":      "caseLabel",
+    "caseDefaultToken":   "DefaultKeyword",
+
+    "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   },
+    "stringLiteral": { "startToken": "StringStart", "bodyToken": "StringLiteral" }
   }
 }
