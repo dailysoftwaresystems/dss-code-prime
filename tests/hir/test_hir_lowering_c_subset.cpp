@@ -1372,6 +1372,120 @@ TEST(HirLoweringCSubset, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
            "appears (substrate-blocked path)";
 }
 
+// ── plan 12.5 §0.2 D6: CST-side const-eval ──────────────────────────
+// The shared CST const-eval engine folds literal arithmetic, ternary,
+// LogicalAnd/Or, and `const`-bound identifier refs at all 3 consumer
+// sites: array length, enumerator value, and index designator.
+
+// Array-length const-expr fold: `int a[1+2];` produces Array<int, 3>.
+// Previously the hand-rolled "literal-only" check refused anything but
+// a single integer literal token; the new engine folds the BinaryOp.
+TEST(HirLoweringCSubset, CstConstEval_ArrayLengthConstExpr) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[1+2]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+}
+
+// Array-length with `const`-bound identifier ref. The resolver walks
+// the scope chain from the declaration site, finds `N` as `isConst`,
+// and folds `N + 1` to 4. Mutable refs still refuse — covered by the
+// locked-in NonLiteral test that uses `int n = 1;` (not `const`).
+TEST(HirLoweringCSubset, CstConstEval_ArrayLengthConstRef) {
+    SemanticModel model = analyzeCSubset(
+        "const int N = 3;\n"
+        "void f() { int xs[N + 1]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+}
+
+// Index designator const-expr fold: `{[1+1] = 7}` lowers to the same
+// ConstructAggregate shape as `{[2] = 7}` (slot 2 gets 7, slots 0/1
+// zero-fill).
+TEST(HirLoweringCSubset, CstConstEval_IndexDesignatorConstExpr) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[3] = {[1+1] = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 3u);
+}
+
+// Index designator with `const`-bound ref: `[N+1]` where `const N=1`
+// folds to slot 2.
+TEST(HirLoweringCSubset, CstConstEval_IndexDesignatorConstRef) {
+    SemanticModel model = analyzeCSubset(
+        "const int N = 1;\n"
+        "void f() { int xs[3] = {[N + 1] = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// Enumerator value const-expr fold: `A = 1+1` ⇒ A=2; subsequent
+// `B` auto-increments to 3.
+TEST(HirLoweringCSubset, CstConstEval_EnumeratorConstExpr) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A = 1 + 1, B };\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    // The two enumerators bind A=2 and B=3; verify via SymbolRecord.
+    bool foundA = false, foundB = false;
+    for (auto const& sym : model.symbols()) {
+        if (sym.name == "A") { EXPECT_EQ(sym.enumValue, 2); foundA = true; }
+        if (sym.name == "B") { EXPECT_EQ(sym.enumValue, 3); foundB = true; }
+    }
+    EXPECT_TRUE(foundA);
+    EXPECT_TRUE(foundB);
+}
+
+// Enumerator value with `const`-bound ref: `A = X + 1` where const X=5
+// resolves to 6.
+TEST(HirLoweringCSubset, CstConstEval_EnumeratorConstRef) {
+    SemanticModel model = analyzeCSubset(
+        "const int X = 5;\n"
+        "enum E { A = X + 1 };\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    for (auto const& sym : model.symbols()) {
+        if (sym.name == "A") { EXPECT_EQ(sym.enumValue, 6); return; }
+    }
+    FAIL() << "enumerator A not found";
+}
+
+// Ternary fold: `[1 < 2 ? 3 : 5]` → length 3 (cond true → then arm).
+TEST(HirLoweringCSubset, CstConstEval_TernaryFolds) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[1 < 2 ? 3 : 5]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+}
+
+// Mutable ref still refuses: `int n = 1; int xs[n+1];` emits
+// S_NonConstantArrayLength because `n` is NOT `isConst`. The engine
+// correctly walks the scope chain, finds `n`, sees it's mutable, and
+// refuses — preserving the locked-in NonLiteralIndexDesignatorEmitsDiag
+// test for the design-time case where a programmer used a runtime
+// variable in a const-expr slot.
+TEST(HirLoweringCSubset, CstConstEval_MutableRefRefuses) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int n = 1; int xs[n + 1]; }\n");
+    bool foundDiag = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
+            foundDiag = true; break;
+        }
+    }
+    EXPECT_TRUE(foundDiag)
+        << "mutable ref `n` must refuse to fold and emit S_NonConstantArrayLength";
+}
+
 // ── D5.4 unions ──────────────────────────────────────────────────────
 
 // `union U u;` declares + types via the same Pass 1.5 path as struct;

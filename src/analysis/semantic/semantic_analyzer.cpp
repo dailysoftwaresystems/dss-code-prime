@@ -14,6 +14,7 @@
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
+#include "hir/cst_const_eval.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -484,40 +485,104 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     return k >= TypeKind::I8 && k <= TypeKind::U128;
 }
 
-// SE-arrays: evaluate a declarator-suffix length expression to a compile-time
-// constant. Succeeds ONLY when the expression peels to a single integer
-// literal — a wrapper rule (expression/operand) or a parenthesized literal is
-// fine, but any branching (a binary op, a call, an identifier) is non-constant
-// and returns nullopt so the caller fails loud. decodeInteger overflow also
-// surfaces as nullopt.
-[[nodiscard]] std::optional<std::uint64_t>
-constIntLength(EngineState& s, Tree const& tree, NodeId node) {
-    NodeId cur = node;
-    for (int guard = 0; guard < 64 && cur.valid(); ++guard) {
-        if (tree.kind(cur) == NodeKind::Token) {
-            auto it = s.idx().literalTypeIds.find(tree.tokenKind(cur).v);
-            if (it == s.idx().literalTypeIds.end()) return std::nullopt;
-            if (!isIntegerKind(s.lattice.interner().kind(it->second))) return std::nullopt;
-            return decodeInteger(tree.text(cur), s.idx().numberStyle);
-        }
-        // Count meaningful children: exactly one internal child ⇒ a wrapper
-        // (expression → operand, operand → `( expr )`) to descend through;
-        // zero internal + one literal token ⇒ the leaf literal.
-        NodeId onlyInternal{};
-        int internalCount = 0;
-        NodeId onlyLiteral{};
-        int literalCount = 0;
-        for (NodeId c : visibleChildren(tree, cur)) {
-            if (tree.kind(c) == NodeKind::Internal) { ++internalCount; onlyInternal = c; }
-            else if (s.idx().literalTypeIds.count(tree.tokenKind(c).v) != 0) {
-                ++literalCount; onlyLiteral = c;
-            }
-        }
-        if (internalCount == 1) { cur = onlyInternal; continue; }
-        if (internalCount == 0 && literalCount == 1) { cur = onlyLiteral; continue; }
-        return std::nullopt;  // branching / no literal ⇒ non-constant
+// Build the int-literal-token set from this schema's `literalTypeIds`
+// filtered to integer cores. Small (≤5 entries per language); built
+// lazily per `constIntExpr` / enum / etc. call. Filtering at use-time
+// means a future schema adding a new integer literal kind is picked up
+// without touching this code.
+[[nodiscard]] std::unordered_set<std::uint32_t>
+integerLiteralTokenSet(EngineState const& s) {
+    std::unordered_set<std::uint32_t> out;
+    for (auto const& [tok, ty] : s.idx().literalTypeIds) {
+        if (isIntegerKind(s.lattice.interner().kind(ty))) out.insert(tok);
+    }
+    return out;
+}
+
+// SE-arrays / D5.5-enum / D5.3-designator: evaluate a CST expression to
+// a compile-time integer constant via the shared CST const-eval engine
+// (plan 12.5 §0.2 D6). Replaces the hand-rolled "linear single-child
+// peel + literal leaf" check that previously sat here and at two other
+// sites. Now folds `[1+1]`, `(2*4)`, `1 << 3`, `cond ? a : b`, etc.
+// Returns nullopt for any expression that doesn't fold; the caller maps
+// to its language-specific `S_NonConstant*` diagnostic.
+// Resolve a constant symbol's defining init-expression CST. Walks the
+// scope chain from `fromScope` looking for `name`; returns the init
+// expression CST ONLY when the bound symbol is `isConst` (mutable
+// symbols can change at runtime — not foldable). The DeclarationRule's
+// `initChild` (already config-driven) gives the visible-child index
+// where the init expression lives.
+[[nodiscard]] std::optional<NodeId>
+resolveConstSymbolInit(EngineState const& s, Tree const& tree,
+                       SemanticConfig const& cfg,
+                       ScopeId fromScope, std::string_view name) {
+    SymbolId const sym = s.scopes.lookup(fromScope, name);
+    if (!sym.valid()) return std::nullopt;
+    auto const& rec = s.symbols.at(sym);
+    if (!rec.isConst) return std::nullopt;
+    if (rec.tree.v != tree.id().v) return std::nullopt;
+    auto declIt = s.idx().declByRule.find(tree.rule(rec.declRuleNode).v);
+    if (declIt == s.idx().declByRule.end()) return std::nullopt;
+    DeclarationRule const& decl = cfg.declarations[declIt->second];
+    auto kids = visibleChildren(tree, rec.declRuleNode);
+    // Explicit `initChild` config wins when present (covers languages
+    // that pin the init's positional slot).
+    if (decl.initChild.has_value()) {
+        if (*decl.initChild >= kids.size()) return std::nullopt;
+        return kids[*decl.initChild];
+    }
+    // Fall back to role-based discovery: the init is the Internal
+    // child that is NOT the type child, NOT the array-suffix child,
+    // and NOT at the name-child position. Mirrors the HIR-lowering
+    // walker's strategy at `lowerVarLike` (which scans for an
+    // expression-role child) but is config-driven via the same
+    // `typeChild` / `nameChild` / `arraySuffix` descriptors.
+    std::optional<std::uint32_t> typePos = decl.typeChild;
+    std::optional<std::uint32_t> namePos = decl.nameChild;
+    RuleId const arraySufRule = decl.arraySuffix.has_value()
+        ? decl.arraySuffix->rule : RuleId{};
+    for (std::uint32_t i = 0; i < kids.size(); ++i) {
+        if (tree.kind(kids[i]) != NodeKind::Internal) continue;
+        if (typePos.has_value() && *typePos == i) continue;
+        if (namePos.has_value() && *namePos == i) continue;
+        if (arraySufRule.valid() && tree.rule(kids[i]) == arraySufRule) continue;
+        return kids[i];
     }
     return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::int64_t>
+constIntExpr(EngineState& s, Tree const& tree, NodeId node,
+             ScopeId fromScope = {}, SemanticConfig const* cfg = nullptr) {
+    if (!node.valid()) return std::nullopt;
+    auto intLits = integerLiteralTokenSet(s);
+    CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
+    CstEvalEnvironment env;
+    if (fromScope.valid() && cfg != nullptr) {
+        env.resolveSymbolInit = [&s, &tree, cfg, fromScope](NodeId identTok)
+            -> std::optional<NodeId> {
+            return resolveConstSymbolInit(s, tree, *cfg, fromScope,
+                                          tree.text(identTok));
+        };
+    }
+    ConstEvalResult const r = evaluateConstantCst(node, ctx, env);
+    if (!r.value.has_value()) return std::nullopt;
+    auto iv = std::get_if<std::int64_t>(&r.value->value);
+    if (iv == nullptr) {
+        // Folded to a non-int-arm (uint64 in range, bool). Bridge via
+        // the shared asInt64 helper — same pattern the HIR walker uses.
+        if (auto p = std::get_if<std::uint64_t>(&r.value->value)) {
+            if (*p > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                return std::nullopt;
+            }
+            return static_cast<std::int64_t>(*p);
+        }
+        if (auto p = std::get_if<bool>(&r.value->value)) {
+            return *p ? std::int64_t{1} : std::int64_t{0};
+        }
+        return std::nullopt;
+    }
+    return *iv;
 }
 
 // SE-arrays: if `decl` configures an array declarator suffix and a node of that
@@ -528,7 +593,8 @@ constIntLength(EngineState& s, Tree const& tree, NodeId node) {
 // type or decaying to a pointer). No suffix present ⇒ returns `base` unchanged.
 [[nodiscard]] TypeId
 applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
-                 NodeId declNode, TypeId base) {
+                 NodeId declNode, TypeId base,
+                 ScopeId fromScope = {}, SemanticConfig const* cfg = nullptr) {
     if (!decl.arraySuffix.has_value() || !base.valid()) return base;
     ArraySuffix const& as = *decl.arraySuffix;
     // Bounded descendant search for the suffix rule. The suffix is a direct
@@ -563,15 +629,16 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         if (*as.lengthChild < sufKids.size())
             lenNode = sufKids[*as.lengthChild];
     }
-    auto len = constIntLength(s, tree, lenNode);
+    auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
     if (!len.has_value()) { emit(DiagnosticCode::S_NonConstantArrayLength); return InvalidType; }
-    // A constant that decodes but exceeds the signed length the interner stores
-    // (int64) must NOT wrap to a negative length — fail loud instead.
-    if (*len > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+    // C99 §6.7.5.2: array length is a positive integer constant
+    // expression. Negative folds (e.g. `int a[-1]`) and zero are
+    // out-of-range; fail loud rather than wrap to a giant unsigned.
+    if (*len <= 0) {
         emit(DiagnosticCode::S_ArrayLengthOutOfRange);
         return InvalidType;
     }
-    return s.lattice.interner().array(base, static_cast<std::int64_t>(*len));
+    return s.lattice.interner().array(base, *len);
 }
 
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
@@ -892,49 +959,26 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             SymbolRecord& erec =
                                                 s.symbols.at(eSymId);
                                             erec.type = compositeTy;
-                                            // Parse the optional `= expr` to
-                                            // recover an explicit integer
-                                            // literal. v1 accepts integer-
-                                            // literal explicit values; non-
-                                            // literal expressions emit
-                                            // S_NonConstantEnumeratorValue
-                                            // (same substrate gap as D5.3's
-                                            // non-literal index designator —
-                                            // mapped to plan 12.5 §0.2 D6).
+                                            // Optional `= expr`: pass through
+                                            // the shared CST const-eval engine
+                                            // (plan 12.5 §0.2 D6). Folds
+                                            // literal arithmetic (`A = 1+1`),
+                                            // bitops, comparisons, ternary;
+                                            // identifier refs are anchored as
+                                            // a real-blocker followup.
                                             std::int64_t value = nextValue;
                                             bool hadExplicit = false;
                                             bool explicitFailed = false;
                                             auto eKids = visibleChildren(tree, erec.declRuleNode);
                                             for (NodeId c : eKids) {
                                                 if (tree.kind(c) != NodeKind::Internal) continue;
-                                                // The optional `expression`
-                                                // child (only present when
-                                                // the enumerator had `= expr`).
                                                 hadExplicit = true;
-                                                // Walk to leaf integer literal.
-                                                NodeId cur = c;
-                                                while (tree.kind(cur) == NodeKind::Internal) {
-                                                    auto kids2 = visibleChildren(tree, cur);
-                                                    if (kids2.size() != 1) { cur = NodeId{}; break; }
-                                                    cur = kids2[0];
-                                                }
-                                                if (!cur.valid() || tree.kind(cur) != NodeKind::Token) {
+                                                if (auto iv = constIntExpr(s, tree, c, erec.scope, &cfg); iv.has_value()) {
+                                                    value = *iv;
+                                                } else {
                                                     explicitFailed = true;
-                                                    break;
                                                 }
-                                                auto tkk = tree.tokenKind(cur);
-                                                auto litIt = s.idx().literalTypeIds.find(tkk.v);
-                                                if (litIt == s.idx().literalTypeIds.end()) {
-                                                    explicitFailed = true;
-                                                    break;
-                                                }
-                                                auto iv = decodeInteger(
-                                                    tree.text(cur), s.idx().numberStyle);
-                                                if (!iv) {
-                                                    explicitFailed = true;
-                                                    break;
-                                                }
-                                                value = static_cast<std::int64_t>(*iv);
+                                                break;  // exactly one expression child per enumerator
                                             }
                                             if (hadExplicit && explicitFailed) {
                                                 ParseDiagnostic d2;
@@ -1009,7 +1053,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         // leaves the type unresolved (applyArraySuffix already
                         // emitted S_NonConstantArrayLength) so we fail loud.
                         TypeId const declTy =
-                            applyArraySuffix(s, tree, decl, node, returnTy);
+                            applyArraySuffix(s, tree, decl, node, returnTy, here, &cfg);
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(resolved.node, declTy);
@@ -1456,7 +1500,7 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
                     s, cfg, tree, kids[*decl.typeChild], scope);
                 // SE-arrays: an array-declarator param (`int a[10]`) carries
                 // the Array type into the signature.
-                pty = applyArraySuffix(s, tree, decl, cur, pty);
+                pty = applyArraySuffix(s, tree, decl, cur, pty, scope, &cfg);
                 out.push_back(pty);
             }
             return;  // a param decl is a leaf for parameter-collection
