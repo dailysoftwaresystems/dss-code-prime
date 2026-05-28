@@ -521,6 +521,10 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
 
     const NodeId ext = findFirstNodeWithRule(t, "externDecl");
     ASSERT_NE(ext, NodeId{});
+    // D5.1 cycle 3: `param` now uses `typeRefAllowingStruct` (which wraps
+    // `typeBaseAllowingStruct`) so a struct-typed parameter parses; primitive
+    // types like `char` flow through the SAME rules — the rule names below
+    // change accordingly.
     constexpr std::string_view kExpected =
         "rule:externDecl\n"
         "  tok:\"extern\"\n"
@@ -533,8 +537,8 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
         "      tok:\"(\"\n"
         "      rule:paramList\n"
         "        rule:param\n"
-        "          rule:typeRef\n"
-        "            rule:typeBase\n"
+        "          rule:typeRefAllowingStruct\n"
+        "            rule:typeBaseAllowingStruct\n"
         "              tok:\"char\"\n"
         "          tok:\"x\"\n"
         "      tok:\")\"\n"
@@ -623,10 +627,13 @@ TEST(ParserCSubsetSmoke, InnerArrayDeclParses) {
 
     const NodeId head = findFirstNodeWithRule(t, "varDeclHead");
     ASSERT_NE(head, NodeId{});
+    // D5.1 cycle 3: `varDeclHead` now uses `typeRefAllowingStruct` so a local
+    // variable's type can be `struct Foo *p`; primitive types like `int`
+    // flow through the same rules.
     constexpr std::string_view kExpected =
         "rule:varDeclHead\n"
-        "  rule:typeRef\n"
-        "    rule:typeBase\n"
+        "  rule:typeRefAllowingStruct\n"
+        "    rule:typeBaseAllowingStruct\n"
         "      tok:\"int\"\n"
         "  tok:\"buf\"\n"
         "  rule:arrayDeclSuffix\n"

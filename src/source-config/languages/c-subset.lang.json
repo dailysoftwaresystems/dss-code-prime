@@ -96,6 +96,9 @@
     "++": [{ "kind": "PlusPlusOp" }],
     "--": [{ "kind": "MinusMinusOp" }],
 
+    ".":  [{ "kind": "DotOp"   }],
+    "->": [{ "kind": "ArrowOp" }],
+
     "+=":  [{ "kind": "PlusAssignOp"   }],
     "-=":  [{ "kind": "MinusAssignOp"  }],
     "*=":  [{ "kind": "StarAssignOp"   }],
@@ -125,7 +128,9 @@
       { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&"]                },
       { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
-      { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" }
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" },
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["."],  "followerRule": "memberFollower" },
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["->"], "followerRule": "memberFollower" }
     ]
   },
 
@@ -159,6 +164,7 @@
     { "word": "char",    "kind": "CharKeyword"    },
     { "word": "const",   "kind": "ConstKeyword"   },
     { "word": "typedef", "kind": "TypedefKeyword" },
+    { "word": "struct",  "kind": "StructKeyword"  },
 
     { "word": "if",      "kind": "IfKeyword"      },
     { "word": "else",    "kind": "ElseKeyword"    },
@@ -181,9 +187,32 @@
       "alt": [
         "includeDirective",
         "typedefDecl",
+        "structDecl",
         "topLevelDecl",
         "externDecl"
       ]
+    },
+
+    "structDecl": {
+      "sequence": [
+        "StructKeyword", "Identifier",
+        "BlockOpen",
+        { "repeat": "structField" },
+        "BlockClose",
+        "EndStatement"
+      ]
+    },
+
+    "structField": {
+      "sequence": [ "typeRefAllowingStruct", "Identifier", "EndStatement" ]
+    },
+
+    "structTypeRef": {
+      "sequence": [ "StructKeyword", "Identifier" ]
+    },
+
+    "memberFollower": {
+      "sequence": [ "Identifier" ]
     },
 
     "topLevelDecl": {
@@ -203,7 +232,7 @@
     },
 
     "typedefDecl": {
-      "sequence": [ "TypedefKeyword", "typeRef", "Identifier", "EndStatement" ]
+      "sequence": [ "TypedefKeyword", "typeRefAllowingStruct", "Identifier", "EndStatement" ]
     },
 
     "includeDirective": {
@@ -262,9 +291,22 @@
       ]
     },
 
+    "typeBaseAllowingStruct": {
+      "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "structTypeRef" ]
+    },
+
+    "typeRefAllowingStruct": {
+      "sequence": [
+        { "optional": "ConstKeyword" },
+        "typeBaseAllowingStruct",
+        { "repeat": "StarOp" },
+        { "optional": "ConstKeyword" }
+      ]
+    },
+
     "varDeclHead": {
       "sequence": [
-        "typeRef",
+        "typeRefAllowingStruct",
         "Identifier",
         { "optional": "arrayDeclSuffix" },
         { "optional": { "sequence": [ "AssignOp", "expression" ] } }
@@ -280,7 +322,7 @@
       ]
     },
 
-    "param": { "sequence": [ "typeRef", "Identifier" ] },
+    "param": { "sequence": [ "typeRefAllowingStruct", "Identifier" ] },
 
     "block": {
       "sequence": [
@@ -434,6 +476,9 @@
           "bodyPath":   [1]
         } },
       { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" },
+      { "rule": "structDecl",  "name": 1, "kind": "type",
+        "fieldChildren": { "rule": "structField" } },
+      { "rule": "structField", "name": 1, "type": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "kindByChild": {
           "childPath": [3, 0],
@@ -445,7 +490,13 @@
     "references": [
       { "rule": "operand" }
     ],
-    "scopes": [ "block", "funcDefTail" ],
+    "memberAccesses": [
+      { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
+        "dereferences": false, "operatorToken": "DotOp"   },
+      { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
+        "dereferences": true,  "operatorToken": "ArrowOp" }
+    ],
+    "scopes": [ "block", "funcDefTail", "structDecl" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
       { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },
@@ -486,6 +537,7 @@
       { "rule": "varDeclHead",  "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
+      { "rule": "structDecl",   "hirKind": "TypeDecl"    },
       { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },

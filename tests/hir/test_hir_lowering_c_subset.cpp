@@ -178,6 +178,98 @@ TEST(HirLoweringCSubset, CallAndTypedef) {
     EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Call);
 }
 
+// D5.1: a `struct Foo { int x; int y; };` declaration lowers to a HIR
+// `TypeDecl` whose `typeId` is the composed `structType("Foo", {I32, I32})`.
+TEST(HirLoweringCSubset, StructDeclarationLowersToTypeDecl) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::TypeDecl);
+
+    // The TypeDecl carries the composed struct type.
+    TypeId const t = res->hir.typeDeclType(decls[0]);
+    ASSERT_TRUE(t.valid());
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(t), TypeKind::Struct);
+    EXPECT_EQ(interner.name(t), "Point");
+    // Field ordering: x (I32), y (I32) — declaration order.
+    auto fields = interner.operands(t);
+    ASSERT_EQ(fields.size(), 2u);
+    EXPECT_EQ(interner.kind(fields[0]), TypeKind::I32);
+    EXPECT_EQ(interner.kind(fields[1]), TypeKind::I32);
+}
+
+// D5.1: a struct used as a pointer-typed parameter + member access via `->`
+// resolves the field SymbolId AND propagates the field's type to the
+// member-access node. The `MemberAccess` HIR-lowering pass is still owed in a
+// later D5.1 cycle, so this test pins the SEMANTIC resolution (the binding
+// the lowering will consume).
+TEST(HirLoweringCSubset, StructFieldAccessResolvesSemantically) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "int read_x(struct Point *p) { return p->x; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+
+    // Walk the CU's tree to find the `x` identifier inside `p->x`. The CST has
+    // one Identifier token per `x` reference; field `x`'s declaration is the
+    // FIRST one (under `struct Point { int x; ... }`) and the USE is the LAST
+    // one (under `return p->x;`). The semantic model's reverse use-index makes
+    // this robust: every use of the field symbol is recorded.
+    auto const& cu = model.unit();
+    SymbolId xField = InvalidSymbol;
+    for (auto const& rec : model.symbols()) {
+        if (rec.name == "x" && rec.kind == DeclarationKind::Variable) {
+            xField = SymbolId{static_cast<std::uint32_t>(&rec - model.symbols().data())};
+            break;
+        }
+    }
+    ASSERT_TRUE(xField.valid()) << "field symbol 'x' not minted";
+
+    // Pass 1 stamps the field's ordinal index on the symbol.
+    auto const* xRec = model.recordFor(xField);
+    ASSERT_NE(xRec, nullptr);
+    EXPECT_EQ(xRec->fieldIndex, 0u);  // x is the first field
+
+    // Pass 2 should have recorded the field use on the `p->x` access. The
+    // reverse-use index gives us every use-site node for the field symbol;
+    // for `p->x` inside `read_x`, that's exactly one use.
+    auto uses = model.usesOf(xField);
+    ASSERT_EQ(uses.size(), 1u) << "field 'x' should have exactly one use site";
+
+    // The use node should carry the field's type (I32) via Pass 2's
+    // propagation. The MEMBER-ACCESS node (the parent postfixExpr) should
+    // ALSO carry that type so chained access `p->x.y` would resolve the
+    // next layer naturally.
+    NodeId useNode = uses[0];
+    TypeId useType = model.typeAt(useNode);
+    auto const& interner = model.lattice().interner();
+    ASSERT_TRUE(useType.valid());
+    EXPECT_EQ(interner.kind(useType), TypeKind::I32);
+
+    // Find the parent postfixExpr node and verify its type matches.
+    Tree const& tree = cu.trees()[0];
+    NodeId parent = tree.parent(useNode);
+    // memberFollower wraps the Identifier; postfixExpr wraps memberFollower.
+    while (parent.valid() && tree.kind(parent) == NodeKind::Internal
+           && tree.rule(parent).v != model.unit().schema().rules().find("postfixExpr").v) {
+        parent = tree.parent(parent);
+    }
+    ASSERT_TRUE(parent.valid()) << "no postfixExpr ancestor for field use";
+    TypeId accessType = model.typeAt(parent);
+    ASSERT_TRUE(accessType.valid()) << "member-access node has no type";
+    EXPECT_EQ(interner.kind(accessType), TypeKind::I32);
+}
+
 TEST(HirLoweringCSubset, ExternFunctionAndGlobal) {
     SemanticModel model = analyzeCSubset(
         "extern int puts(int c);\n"
