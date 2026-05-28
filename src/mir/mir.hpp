@@ -373,6 +373,15 @@ public:
 private:
     // Append `pod` (+ its value operands) to the current open block. Increments
     // the block's instCount. `terminates` seals the block. Returns the new id.
+    // D5.6: shared helper for the ExtractValue / InsertValue builders.
+    // Interns each `path` entry as a Const-i32 MirInst and pushes the
+    // resulting MirInstId onto `operands` in source order. Caller
+    // supplies `indexType` because MirBuilder doesn't carry a
+    // TypeInterner.
+    void appendIndexPathOperands_(std::vector<MirInstId>& operands,
+                                  std::span<std::uint32_t const> path,
+                                  TypeId indexType);
+
     MirInstId appendInst_(detail::MirInst pod, std::span<MirInstId const> operands,
                           bool terminates);
     // Record CFG successors for the just-sealed `terminator` into the succ pool

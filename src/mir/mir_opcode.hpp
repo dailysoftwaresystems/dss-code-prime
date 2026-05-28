@@ -49,15 +49,15 @@ enum class MirOpcode : std::uint16_t {
     Alloca, Load, Store, Gep,
     // ── first-class aggregates (D5.6) ──
     // ExtractValue: read a field/element FROM an aggregate VALUE by
-    // statically-known index. operands = [aggregate]; scalars[0..N) =
-    // the field-index path (length 1 for direct, >1 for nested).
-    // Result = the element's type. Distinct from `Load` — operates on
-    // an in-register aggregate value, not memory.
+    // statically-known index. operands = [aggregate, idx0, idx1, ...]
+    // where each `idx_k` is a Const-i32 MirInstId (Gep-shaped). Result
+    // = the element's type. Distinct from `Load` — operates on an
+    // in-register aggregate value, not memory.
     ExtractValue,
     // InsertValue: produce a NEW aggregate VALUE by replacing one
     // field/element of `aggregate` with `value`. operands = [aggregate,
-    // value]; scalars[0..N) = the field-index path. Result = the
-    // aggregate's type (same shape, one slot replaced).
+    // value, idx0, idx1, ...] — same Const-i32 path convention. Result
+    // = the aggregate's type (same shape, one slot replaced).
     InsertValue,
     // ── casts ──
     Trunc, SExt, ZExt, FPTrunc, FPExt, Bitcast,

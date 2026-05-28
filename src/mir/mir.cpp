@@ -654,8 +654,8 @@ MirInstId MirBuilder::addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags f
 }
 
 // D5.6: first-class aggregate ops. Each path element is interned as a
-// Const MirInst of type I32 carrying the index value; the resulting
-// operand vector is `[aggregate, idx0, idx1, ...]` (Gep-shaped).
+// Const MirInst of type i32 carrying the index value; the resulting
+// operand vector is `[aggregate, (value,) idx0, idx1, ...]` (Gep-shaped).
 namespace {
 [[noreturn]] void requireAggregatePath_(char const* what) {
     std::fprintf(stderr,
@@ -663,7 +663,30 @@ namespace {
                  what);
     std::abort();
 }
+[[noreturn]] void requireMatchingResultType_(char const* what) {
+    std::fprintf(stderr,
+                 "dss::MirBuilder fatal: %s: resultType must equal the "
+                 "aggregate operand's type (InsertValue produces a value of "
+                 "the same aggregate shape)\n",
+                 what);
+    std::abort();
+}
 } // namespace
+
+void MirBuilder::appendIndexPathOperands_(std::vector<MirInstId>& operands,
+                                           std::span<std::uint32_t const> path,
+                                           TypeId indexType) {
+    // indexType MUST be valid (asserted by addConst's value-rule). Static
+    // contract: path indices are i32. Callers thread the interner's i32
+    // TypeId through this signature because MirBuilder intentionally
+    // doesn't carry a TypeInterner (build-once / freeze separation).
+    for (std::uint32_t idx : path) {
+        MirLiteralValue lv;
+        lv.value = static_cast<std::int64_t>(idx);
+        lv.core  = TypeKind::I32;
+        operands.push_back(addConst(std::move(lv), indexType));
+    }
+}
 
 MirInstId MirBuilder::addExtractValue(MirInstId aggregate,
                                        std::span<std::uint32_t const> path,
@@ -673,12 +696,7 @@ MirInstId MirBuilder::addExtractValue(MirInstId aggregate,
     std::vector<MirInstId> operands;
     operands.reserve(1 + path.size());
     operands.push_back(aggregate);
-    for (std::uint32_t idx : path) {
-        MirLiteralValue lv;
-        lv.value = static_cast<std::int64_t>(idx);
-        lv.core  = TypeKind::I32;
-        operands.push_back(addConst(std::move(lv), indexType));
-    }
+    appendIndexPathOperands_(operands, path, indexType);
     return addInst(MirOpcode::ExtractValue, operands, resultType, 0, flags);
 }
 
@@ -687,16 +705,18 @@ MirInstId MirBuilder::addInsertValue(MirInstId aggregate, MirInstId value,
                                       TypeId resultType, TypeId indexType,
                                       MirInstFlags flags) {
     if (path.empty()) requireAggregatePath_("addInsertValue");
+    // D5.6 invariant: InsertValue's result type IS the aggregate's type
+    // (same shape, one slot replaced). Catch a caller mistake here
+    // rather than letting it silently propagate as type-confused IR
+    // downstream. Multi-reviewer bug-finding (D5.6 7-agent review).
+    if (resultType != instArena_.at(aggregate).typeId) {
+        requireMatchingResultType_("addInsertValue");
+    }
     std::vector<MirInstId> operands;
     operands.reserve(2 + path.size());
     operands.push_back(aggregate);
     operands.push_back(value);
-    for (std::uint32_t idx : path) {
-        MirLiteralValue lv;
-        lv.value = static_cast<std::int64_t>(idx);
-        lv.core  = TypeKind::I32;
-        operands.push_back(addConst(std::move(lv), indexType));
-    }
+    appendIndexPathOperands_(operands, path, indexType);
     return addInst(MirOpcode::InsertValue, operands, resultType, 0, flags);
 }
 

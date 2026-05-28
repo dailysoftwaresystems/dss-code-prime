@@ -831,3 +831,91 @@ TEST(MirDeathTest, ExtractValueRejectsSingleOperand) {
     EXPECT_DEATH((void)b.addInst(MirOpcode::ExtractValue, ops, kI32),
                  "extractvalue");
 }
+
+// InsertValue's empty-path is also a builder-fatal — symmetric to
+// ExtractValue. Without this test, the matching guard could be
+// silently removed.
+TEST(MirDeathTest, InsertValueRejectsEmptyPath) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    constexpr TypeId kStruct{4};
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kStruct);
+    MirInstId const v   = b.addConst(intLit(7), kI32);
+    EXPECT_DEATH(
+        (void)b.addInsertValue(arg, v, std::span<std::uint32_t const>{},
+                                kStruct, kI32),
+        "at least one index");
+}
+
+// InsertValue result type MUST equal the aggregate's type. Catching it
+// here rather than letting it propagate as type-confused IR downstream.
+TEST(MirDeathTest, InsertValueRejectsMismatchedResultType) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    constexpr TypeId kStruct{4};
+    constexpr TypeId kOther{5};
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kStruct);
+    MirInstId const v   = b.addConst(intLit(7), kI32);
+    std::array<std::uint32_t, 1> path{0};
+    EXPECT_DEATH(
+        (void)b.addInsertValue(arg, v, path, kOther, kI32),
+        "resultType must equal");
+}
+
+// InsertValue with a nested path: operand layout = [agg, value, idx0, idx1].
+// Exercises the 2-operand prologue + multi-index path; ExtractValue's
+// nested test only covers the 1-operand prologue.
+TEST(Mir, InsertValueSupportsNestedPath) {
+    constexpr TypeId kStruct{4};
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kStruct);
+    MirInstId const v   = b.addConst(intLit(9), kI32);
+    std::array<std::uint32_t, 2> path{0, 2};
+    MirInstId const iv = b.addInsertValue(arg, v, path, kStruct, kI32);
+    b.addReturn(iv);
+    Mir m = std::move(b).finish();
+
+    auto const ops = m.instOperands(iv);
+    ASSERT_EQ(ops.size(), 4u);    // [agg, value, idx0, idx1]
+    EXPECT_EQ(ops[0], arg);
+    EXPECT_EQ(ops[1], v);
+    EXPECT_EQ(m.instOpcode(ops[2]), MirOpcode::Const);
+    EXPECT_EQ(m.instOpcode(ops[3]), MirOpcode::Const);
+}
+
+// Path-index VALUES must be the integers we asked for (not just opcode
+// = Const). Pins the load-bearing D5.6 contract — a bug that swapped
+// index 0 ↔ 1 in the loop, or hardcoded all to 0, would otherwise pass
+// every existing opcode/operand-arity assertion.
+TEST(Mir, AggregatePathOperandsCarryCorrectValues) {
+    constexpr TypeId kStruct{4};
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{42});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const arg = b.addArg(0, kStruct);
+    std::array<std::uint32_t, 2> path{3, 7};
+    MirInstId const xv = b.addExtractValue(arg, path, kI32, kI32);
+    b.addReturn(xv);
+    Mir m = std::move(b).finish();
+
+    auto const ops = m.instOperands(xv);
+    ASSERT_EQ(ops.size(), 3u);
+    auto const& lit0 = m.literalValue(m.constLiteralIndex(ops[1]));
+    auto const& lit1 = m.literalValue(m.constLiteralIndex(ops[2]));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit0.value));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit1.value));
+    EXPECT_EQ(std::get<std::int64_t>(lit0.value), 3);
+    EXPECT_EQ(std::get<std::int64_t>(lit1.value), 7);
+    EXPECT_EQ(lit0.core, TypeKind::I32);
+    EXPECT_EQ(lit1.core, TypeKind::I32);
+}
