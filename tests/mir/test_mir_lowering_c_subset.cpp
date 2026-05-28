@@ -44,8 +44,12 @@ struct Lowered {
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
+    // Cycle 3a wires the HirSourceMap so MIR diagnostics carry source spans
+    // (mirroring HirVerifier's `&sourceMap` plumbing). The pointer is bound
+    // through `hir->sourceMap` which CstToHirResult always populates.
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
-                                    model.lattice().interner(), mirReporter);
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -145,18 +149,17 @@ TEST(MirLoweringCSubset, VoidFunctionWithEmptyBodyGetsImplicitReturn) {
     EXPECT_TRUE(m.instOperands(term).empty());  // void return — no value
 }
 
-// ML2 cycle 1 (review-fix): an unsupported construct mid-body emits a
-// fail-loud diagnostic and the MIR builder still hands back a frozen module
-// (the open block is sealed with Unreachable so finish() can complete).
-// Previously this aborted the process. Uses a function-call (not yet
-// supported in ML2 cycle 1) as the unsupported construct.
+// ML2 cycle 1 (review-fix), updated for cycle 3a: pins finish()-no-abort on
+// unsupported-construct fail-loud. Uses VarDecl-with-init (still deferred to
+// the lvalue-via-alloca sub-cycle as a real prerequisite) so the diagnostic
+// is reachable. The Call-as-unsupported variant was replaced when cycle 3a
+// landed Call lowering; the abort-resilience invariant is independent of
+// which construct is currently unsupported.
 TEST(MirLoweringCSubset, UnsupportedConstructEmitsDiagnosticWithoutAbort) {
     auto L = lowerCSubset(
-        "int g(int x) { return x; }\n"
-        "int h(int y) { return g(y); }\n");
+        "void f() { int x = 5; }\n");  // VarDecl-with-init: lvalue-alloca sub-cycle
     ASSERT_FALSE(L.model.hasErrors());
     ASSERT_TRUE(L.hir->ok);
-    // ML2 cycle 1 doesn't handle Call yet → MIR lowering should fail loud.
     EXPECT_FALSE(L.mir.ok);
     bool sawUnsupported = false;
     for (auto const& d : L.mirReporter.all()) {
@@ -165,8 +168,6 @@ TEST(MirLoweringCSubset, UnsupportedConstructEmitsDiagnosticWithoutAbort) {
         }
     }
     EXPECT_TRUE(sawUnsupported) << "expected H_UnsupportedLoweringForKind";
-    // Critical: finish() did NOT abort. The frozen module exists (even if
-    // partial). This is the load-bearing review-fix.
     EXPECT_FALSE(L.mir.mir.empty());
 }
 
@@ -186,6 +187,95 @@ TEST(MirLoweringCSubset, GlobalDeclarationEmitsUnsupported) {
         }
     }
     EXPECT_TRUE(sawUnsupported) << "expected Global-unsupported diagnostic";
+}
+
+// ─── ML2 cycle 3a: Call + Ternary + Short-circuit ─────────────────────────
+
+// Direct call: callee is a Ref-to-function (lowers as `GlobalAddr`), args are
+// argument expressions, MIR Call's operand[0]=callee, [1..]=args.
+TEST(MirLoweringCSubset, DirectCallLowersToMirCall) {
+    auto L = lowerCSubset(
+        "int g(int x) { return x; }\n"
+        "int h(int y) { return g(y); }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    // `h`'s entry block: Arg(0), GlobalAddr(g), Call(globalAddr, arg), Return(call).
+    MirBlockId const entry = m.funcEntry(m.funcAt(1));
+    ASSERT_GE(m.blockInstCount(entry), 4u);
+    MirInstId const arg0   = m.blockInstAt(entry, 0);
+    MirInstId const callee = m.blockInstAt(entry, 1);
+    MirInstId const call   = m.blockInstAt(entry, 2);
+    EXPECT_EQ(m.instOpcode(arg0), MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(callee), MirOpcode::GlobalAddr);
+    EXPECT_EQ(m.instOpcode(call), MirOpcode::Call);
+    auto ops = m.instOperands(call);
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(ops[0], callee);
+    EXPECT_EQ(ops[1], arg0);
+}
+
+// Ternary `cond ? a : b` lowers to a diamond CFG with a phi at the join.
+TEST(MirLoweringCSubset, TernaryLowersToDiamondPhi) {
+    auto L = lowerCSubset(
+        "int sel(int c, int a, int b) { return c ? a : b; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    // Blocks: entry, thenBB, elseBB, joinBB.
+    EXPECT_EQ(m.funcBlockCount(fn), 4u);
+    MirBlockId const join = m.funcBlockAt(fn, 3);
+    EXPECT_EQ(m.blockMarker(join), StructCfMarker::IfJoin);
+    // join's first instruction is the phi.
+    MirInstId const phi = m.blockInstAt(join, 0);
+    EXPECT_EQ(m.instOpcode(phi), MirOpcode::Phi);
+    auto inc = m.phiIncomings(phi);
+    EXPECT_EQ(inc.size(), 2u);
+}
+
+// LogicalAnd `a && b` short-circuits: lhs is evaluated in the current block,
+// then CondBr(lhs, rhsBlock, joinBlock). The join's phi takes lhs (from the
+// current block) and rhs (from the rhsBlock).
+TEST(MirLoweringCSubset, LogicalAndShortCircuitsWithPhi) {
+    auto L = lowerCSubset(
+        "int and2(int a, int b) { return a && b; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    // Blocks: entry, rhsBB, joinBB.
+    EXPECT_EQ(m.funcBlockCount(fn), 3u);
+    MirBlockId const entry = m.funcEntry(fn);
+    // entry's terminator is CondBr(lhs, rhsBB, joinBB).
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(entry)), MirOpcode::CondBr);
+    auto succs = m.blockSuccessors(entry);
+    ASSERT_EQ(succs.size(), 2u);
+    // joinBB is the second successor (the false-edge / short-circuit target).
+    MirBlockId const joinBB = succs[1];
+    EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(joinBB, 0)), MirOpcode::Phi);
+}
+
+// LogicalOr `a || b` is the symmetric case — short-circuit on lhs TRUE.
+TEST(MirLoweringCSubset, LogicalOrShortCircuitsWithPhi) {
+    auto L = lowerCSubset(
+        "int or2(int a, int b) { return a || b; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    EXPECT_EQ(m.funcBlockCount(fn), 3u);
+    MirBlockId const entry = m.funcEntry(fn);
+    auto succs = m.blockSuccessors(entry);
+    ASSERT_EQ(succs.size(), 2u);
+    // joinBB is the FIRST successor (the true-edge / short-circuit target).
+    MirBlockId const joinBB = succs[0];
+    EXPECT_EQ(m.blockMarker(joinBB), StructCfMarker::IfJoin);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(joinBB, 0)), MirOpcode::Phi);
 }
 
 // ─── ML2 cycle 2: control flow ─────────────────────────────────────────────

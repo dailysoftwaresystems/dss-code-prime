@@ -280,6 +280,20 @@ public:
     // reached (the MirBuilder's "every created block must be filled +
     // terminated by finish()" invariant otherwise aborts).
     [[nodiscard]] bool isBlockUnopened(MirBlockId block) const noexcept;
+    // The currently-open block (or `InvalidMirBlock` when none is open OR the
+    // last-opened block has already been sealed by a terminator). Phi-
+    // insertion lowerings (Ternary, LogicalAnd/Or) need to know which block
+    // an expression's value was computed in so the phi can record the right
+    // predecessor; a sub-expression's recursion may have advanced past the
+    // initial block before returning. Strict: a post-terminator/pre-next-
+    // `beginBlock` read returns invalid rather than the just-sealed id, so a
+    // caller that forgets to capture BEFORE its own terminator gets an obvious
+    // failure instead of a silently wrong phi predecessor.
+    [[nodiscard]] MirBlockId currentlyOpenBlock() const noexcept {
+        if (!openBlock_.valid()) return MirBlockId{};
+        return blockState_[openBlock_.v] == BlockState::Open
+                   ? openBlock_ : MirBlockId{};
+    }
 
     // Freeze. Flushes pending phi incomings, validates the open function/block are
     // closed, and hands over the immutable module. Single-use; consumes *this.

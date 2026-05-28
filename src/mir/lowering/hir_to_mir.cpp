@@ -6,6 +6,7 @@
 #include <format>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace dss {
@@ -21,19 +22,34 @@ struct Lowerer {
     HirLiteralPool const& literals;
     TypeInterner const&   interner;
     DiagnosticReporter&   reporter;
+    HirSourceMap const*   sourceMap;   // optional — diagnostics carry spans when bound
     MirBuilder            mir;
-    // Within one function: HIR VarDecl / param `SymbolId.v` → MirInstId that
-    // produces its value. For ML2 cycle 1 this covers params + var-decl-with-
-    // initializer; locals + assignments come in cycle 2.
+    // Within one function: HIR param/var `SymbolId.v` → MirInstId producer.
+    // Addressable locals (var-with-storage, assignment targets, AddressOf) are
+    // tracked in plan 12 D5/ML2-prelude — see `.plans/12-mir-lir` blocker list.
     std::unordered_map<std::uint32_t, MirInstId> symbolToValue;
+    // Set of module-level function symbols. A pre-pass populates this so a
+    // direct `Call` whose callee is a `Ref` to a forward-declared function
+    // resolves cleanly. The actual MirFuncId is irrelevant during lowering —
+    // direct calls go through `GlobalAddr(SymbolId)`, and codegen wires the
+    // symbol to the MirFunc later. Hence: set, not map.
+    std::unordered_set<std::uint32_t> functionSymbols;
 
-    // Emit an unsupported-construct diagnostic anchored at no specific span
-    // (no HirSourceMap injected yet in ML2 cycle 1; the next cycle wires it).
-    void unsupported(std::string what) {
+    // Emit an unsupported-construct diagnostic anchored at the HIR node's
+    // source span (via the optional source map). The buffer/span both
+    // default to invalid/empty when no source map is bound — matching the
+    // span-less fallback the HirVerifier uses.
+    void unsupported(HirNodeId node, std::string what) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::H_UnsupportedLoweringForKind;
         d.severity = DiagnosticSeverity::Error;
         d.actual   = std::move(what);
+        if (sourceMap != nullptr) {
+            if (auto const* loc = sourceMap->tryGet(node); loc != nullptr) {
+                d.buffer = loc->buffer;
+                d.span   = loc->span;
+            }
+        }
         reporter.report(std::move(d));
     }
 
@@ -99,30 +115,38 @@ struct Lowerer {
                 return mir.addConst(std::move(dst), t);
             }
             case HirKind::Ref: {
-                // The HIR Ref's payload is the resolved SymbolId.v; the
-                // lowering maintains a map from SymbolId.v to its
-                // MirInstId producer (the Arg, or a VarDecl init value
-                // — locals/assignments arrive in ML2 cycle 2).
+                // Resolution order:
+                //   1. Local SSA value (param / var-with-init scalar) — return
+                //      its already-emitted MirInstId.
+                //   2. Module function — emit `GlobalAddr` to the symbol. The
+                //      result type IS the FnSig (matching HIR's convention
+                //      where Ref-to-function's typeId is the FnSig directly);
+                //      MIR's Call accepts that uniformly.
+                //   3. Anything else (globals/externs/storage-bearing locals)
+                //      → unbound at this lowering tier; see plan 12 D5 / ML2-
+                //      prelude (addressable locals) and plan 11 FFI (externs).
                 std::uint32_t const sym = hir.payload(node);
-                auto it = symbolToValue.find(sym);
-                if (it == symbolToValue.end()) {
-                    unsupported(std::format("HIR Ref to symbol {} not yet "
-                                            "supported (likely a global / "
-                                            "function — ML2 cycle 2+)", sym));
-                    return InvalidMirInst;
+                if (auto it = symbolToValue.find(sym); it != symbolToValue.end()) {
+                    return it->second;
                 }
-                return it->second;
+                if (functionSymbols.contains(sym)) {
+                    return mir.addGlobalAddr(SymbolId{sym}, t);
+                }
+                unsupported(node,
+                    std::format("HIR Ref to unbound symbol {} (not a local "
+                                "SSA value and not a module function)", sym));
+                return InvalidMirInst;
             }
             case HirKind::UnaryOp: {
                 std::uint32_t const payload = hir.payload(node);
                 if (!isCoreOp(payload)) {
-                    unsupported("extension UnaryOp (post-v1)");
+                    unsupported(node, "extension UnaryOp (post-v1)");
                     return InvalidMirInst;
                 }
                 HirOpKind const op = decodeCoreOp(payload);
                 auto kids = hir.children(node);
                 if (kids.size() != 1) {
-                    unsupported("malformed UnaryOp (verifier should have flagged)");
+                    unsupported(node, "malformed UnaryOp (verifier should have flagged)");
                     return InvalidMirInst;
                 }
                 MirInstId const operand = lowerExpr(kids[0]);
@@ -154,24 +178,153 @@ struct Lowerer {
                             ops2, t);
                     }
                     default:
-                        unsupported(std::format("UnaryOp '{}' not yet "
-                                                "supported", opName(op)));
+                        unsupported(node,
+                            std::format("UnaryOp '{}' not yet supported",
+                                        opName(op)));
                         return InvalidMirInst;
                 }
                 std::array<MirInstId, 1> operands{operand};
                 return mir.addInst(mop, operands, t);
             }
+            case HirKind::Call: {
+                // children: [callee, args...]. Lower the callee (a Ref-to-
+                // function becomes a `GlobalAddr`; a function-pointer
+                // expression becomes whatever MirInstId it lowers to) and
+                // every arg, then emit a MIR Call. The result type comes
+                // from the HIR node's typeId (the call's result type — HIR
+                // already pulled it from the callee's FnSig at lowering
+                // time). A void-returning callee has typeId == InvalidType,
+                // which Call's MirResultRule::Optional accepts.
+                auto kids = hir.children(node);
+                if (kids.empty()) {
+                    unsupported(node, "malformed Call (no callee child)");
+                    return InvalidMirInst;
+                }
+                MirInstId const callee = lowerExpr(kids[0]);
+                if (!callee.valid()) return InvalidMirInst;
+                std::vector<MirInstId> operands;
+                operands.reserve(kids.size());
+                operands.push_back(callee);
+                for (std::size_t i = 1; i < kids.size(); ++i) {
+                    MirInstId const arg = lowerExpr(kids[i]);
+                    if (!arg.valid()) return InvalidMirInst;
+                    operands.push_back(arg);
+                }
+                return mir.addInst(MirOpcode::Call, operands, t);
+            }
+            case HirKind::IntrinsicCall: {
+                // children: [args...]; the intrinsic id lives in payload.
+                // MirOpcode::IntrinsicCall has the same Optional result rule.
+                auto kids = hir.children(node);
+                std::vector<MirInstId> operands;
+                operands.reserve(kids.size());
+                for (HirNodeId argN : kids) {
+                    MirInstId const arg = lowerExpr(argN);
+                    if (!arg.valid()) return InvalidMirInst;
+                    operands.push_back(arg);
+                }
+                std::uint32_t const intrinsicId = hir.payload(node);
+                return mir.addInst(MirOpcode::IntrinsicCall, operands, t,
+                                   intrinsicId);
+            }
+            case HirKind::Ternary: {
+                // children: [cond, thenExpr, elseExpr]. Lower as a diamond
+                // CFG with a phi at the join — same shape as IfStmt but
+                // value-producing. Each arm lowers its expression in its
+                // own block, branches to the join, and the phi at the join
+                // takes the two incoming values keyed by their predecessor
+                // blocks.
+                auto kids = hir.children(node);
+                if (kids.size() != 3) {
+                    unsupported(node, "malformed Ternary (expect 3 children)");
+                    return InvalidMirInst;
+                }
+                MirInstId const cond = lowerExpr(kids[0]);
+                if (!cond.valid()) return InvalidMirInst;
+                MirBlockId const thenBB = mir.createBlock(StructCfMarker::IfThen);
+                MirBlockId const elseBB = mir.createBlock(StructCfMarker::IfElse);
+                MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+                mir.addCondBr(cond, thenBB, elseBB);
+
+                mir.beginBlock(thenBB);
+                MirInstId const thenVal = lowerExpr(kids[1]);
+                if (!thenVal.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(elseBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return InvalidMirInst;
+                }
+                MirBlockId const thenPred = mir.currentlyOpenBlock();
+                mir.addBr(joinBB);
+
+                mir.beginBlock(elseBB);
+                MirInstId const elseVal = lowerExpr(kids[2]);
+                if (!elseVal.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(joinBB);
+                    return InvalidMirInst;
+                }
+                MirBlockId const elsePred = mir.currentlyOpenBlock();
+                mir.addBr(joinBB);
+
+                mir.beginBlock(joinBB);
+                std::array<MirPhiIncoming, 2> incomings{
+                    MirPhiIncoming{thenVal, thenPred},
+                    MirPhiIncoming{elseVal, elsePred},
+                };
+                return mir.addPhi(t, incomings);
+            }
+            case HirKind::LogicalAnd:
+            case HirKind::LogicalOr: {
+                // Short-circuit lowering: lhs is evaluated in the current
+                // block; if (LogicalAnd && !lhs) OR (LogicalOr && lhs) we
+                // short-circuit to the join with lhs's value; otherwise we
+                // evaluate rhs in a new block and join with its value. The
+                // join's phi takes [lhs (short-circuit block), rhs (rhs block)].
+                auto kids = hir.children(node);
+                if (kids.size() != 2) {
+                    unsupported(node, "malformed LogicalAnd/Or (expect 2 children)");
+                    return InvalidMirInst;
+                }
+                bool const isAnd = (k == HirKind::LogicalAnd);
+                MirInstId const lhs = lowerExpr(kids[0]);
+                if (!lhs.valid()) return InvalidMirInst;
+                MirBlockId const lhsPred = mir.currentlyOpenBlock();
+                MirBlockId const rhsBB   = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const joinBB  = mir.createBlock(StructCfMarker::IfJoin);
+                // AND: lhs true → rhs, lhs false → join (short-circuit).
+                // OR:  lhs true → join (short-circuit), lhs false → rhs.
+                mir.addCondBr(lhs, isAnd ? rhsBB : joinBB,
+                                   isAnd ? joinBB : rhsBB);
+
+                mir.beginBlock(rhsBB);
+                MirInstId const rhs = lowerExpr(kids[1]);
+                if (!rhs.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(joinBB);
+                    return InvalidMirInst;
+                }
+                MirBlockId const rhsPred = mir.currentlyOpenBlock();
+                mir.addBr(joinBB);
+
+                mir.beginBlock(joinBB);
+                std::array<MirPhiIncoming, 2> incomings{
+                    MirPhiIncoming{lhs, lhsPred},
+                    MirPhiIncoming{rhs, rhsPred},
+                };
+                return mir.addPhi(t, incomings);
+            }
             case HirKind::BinaryOp: {
                 std::uint32_t const payload = hir.payload(node);
                 if (!isCoreOp(payload)) {
-                    unsupported("extension BinaryOp (post-v1)");
+                    unsupported(node, "extension BinaryOp (post-v1)");
                     return InvalidMirInst;
                 }
                 HirOpKind const op = decodeCoreOp(payload);
                 auto kids = hir.children(node);
                 if (kids.size() != 2) {
-                    unsupported("malformed BinaryOp (verifier should have "
-                                "flagged this)");
+                    unsupported(node, "malformed BinaryOp (verifier should "
+                                       "have flagged this)");
                     return InvalidMirInst;
                 }
                 MirInstId const lhs = lowerExpr(kids[0]);
@@ -183,9 +336,10 @@ struct Lowerer {
                     ? interner.kind(operandType) : TypeKind::Void;
                 MirOpcode const mop = mapBinaryOp(op, tk);
                 if (mop == MirOpcode::Invalid) {
-                    unsupported(std::format("BinaryOp '{}' on TypeKind {} not "
-                                            "yet supported", opName(op),
-                                            static_cast<unsigned>(tk)));
+                    unsupported(node,
+                        std::format("BinaryOp '{}' on TypeKind {} not yet "
+                                    "supported", opName(op),
+                                    static_cast<unsigned>(tk)));
                     return InvalidMirInst;
                 }
                 std::array<MirInstId, 2> operands{lhs, rhs};
@@ -193,9 +347,9 @@ struct Lowerer {
             }
             default: break;
         }
-        unsupported(std::format("HIR expression kind ordinal {} not yet "
-                                "supported (HIR id {})",
-                                static_cast<unsigned>(k), node.v));
+        unsupported(node,
+            std::format("HIR expression kind ordinal {} not yet supported "
+                        "(HIR id {})", static_cast<unsigned>(k), node.v));
         return InvalidMirInst;
     }
 
@@ -240,9 +394,7 @@ struct Lowerer {
                 return true;
             }
             case HirKind::ExprStmt: {
-                // Discard the value; emit for side effects. ML2 cycle 2 covers
-                // pure expressions only — assignment-as-statement comes in a
-                // later cycle alongside the lvalue-via-alloca model.
+                // Discard the value; emit for side effects.
                 HirNodeId const expr = hir.exprStmtExpr(node);
                 MirInstId const v = lowerExpr(expr);
                 return v.valid();
@@ -384,9 +536,7 @@ struct Lowerer {
                 //   update: <update>; Br(header)   -- created only when update present
                 //   exit:   continuation
                 // Update lives on the continue-target so `continue` runs the
-                // step before re-testing the condition (matches C semantics);
-                // ML2 cycle 2 doesn't yet expose break/continue but the block
-                // layout is the right one.
+                // step before re-testing the condition (matches C semantics).
                 auto const initN   = hir.forInit(node);
                 auto const condN   = hir.loopCondition(node);  // optional
                 auto const updateN = hir.forUpdate(node);
@@ -451,9 +601,9 @@ struct Lowerer {
             }
             default: break;
         }
-        unsupported(std::format("HIR statement kind ordinal {} not yet "
-                                "supported (HIR id {})",
-                                static_cast<unsigned>(k), node.v));
+        unsupported(node,
+            std::format("HIR statement kind ordinal {} not yet supported "
+                        "(HIR id {})", static_cast<unsigned>(k), node.v));
         return false;
     }
 
@@ -472,16 +622,16 @@ struct Lowerer {
         SymbolId const symbol  = hir.functionSymbol(node);
         // Pre-block checks: bail BEFORE opening any block.
         if (!signature.valid()) {
-            unsupported("Function with InvalidType signature (HIR verifier "
-                        "should have flagged this)");
+            unsupported(node, "Function with InvalidType signature (HIR "
+                              "verifier should have flagged this)");
             return false;
         }
         auto params = hir.functionParams(node);
         auto paramTypes = interner.fnParams(signature);
         if (params.size() != paramTypes.size()) {
-            unsupported(std::format("Function param count {} mismatches FnSig "
-                                    "param count {}", params.size(),
-                                    paramTypes.size()));
+            unsupported(node,
+                std::format("Function param count {} mismatches FnSig param "
+                            "count {}", params.size(), paramTypes.size()));
             return false;
         }
 
@@ -493,8 +643,8 @@ struct Lowerer {
         // Params: one `Arg` instruction per param, in declaration order.
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
-            // A param is a VarDecl whose typeId carries the param's type.
-            // ML2 cycle 1 trusts the verifier; later cycles add a kind check.
+            // A param is a VarDecl whose typeId carries the param's type;
+            // verifier already enforced the kind invariant upstream.
             SymbolId const sym = hir.varDeclSymbol(p);
             TypeId const ty = paramTypes[i];
             MirInstId const arg = mir.addArg(static_cast<std::uint32_t>(i), ty);
@@ -528,41 +678,57 @@ struct Lowerer {
         return true;
     }
 
-    // Lower the whole module. Walks moduleDecls and dispatches per kind.
-    // Anything other than Function is fail-loud-deferred to later ML2 cycles
-    // (Global, ExternFunction, ExternGlobal, TypeDecl, ImportGroup).
+    // Pre-pass: collect the set of module-level function symbols so that a
+    // direct `Call` whose callee is a `Ref` to a function declared LATER in
+    // the module still resolves. Direct calls go through `GlobalAddr(symbol)`,
+    // so we only need the set of valid symbols — the MirFunc is built lazily
+    // when each function is lowered in the main pass.
+    void collectFunctions(HirNodeId moduleNode) {
+        for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+            if (hir.kind(decl) != HirKind::Function) continue;
+            TypeId const sig    = hir.functionSignature(decl);
+            SymbolId const sym  = hir.functionSymbol(decl);
+            if (!sig.valid() || !sym.valid()) continue;
+            functionSymbols.insert(sym.v);
+        }
+    }
+
+    // Lower the whole module: collect function symbols, then dispatch each
+    // top-level decl. Non-function decls emit fail-loud diagnostics — see the
+    // switch below for the per-kind disposition.
     void lower() {
         HirNodeId const root = hir.root();
         if (!root.valid() || hir.kind(root) != HirKind::Module) {
-            unsupported("HIR root is not a Module — cannot lower");
+            unsupported(root, "HIR root is not a Module — cannot lower");
             return;
         }
+        collectFunctions(root);
         for (HirNodeId decl : hir.moduleDecls(root)) {
             HirKind const dk = hir.kind(decl);
             switch (dk) {
                 case HirKind::Function:
                     if (!lowerFunction(decl)) return;
                     break;
-                // Fail-loud-deferred (review-fix): the file header doc and the
-                // project discipline both require unsupported HirKinds to emit
-                // `H_UnsupportedLoweringForKind`, not be silently skipped. A
-                // global initializer DOES have runtime effect; an extern's
-                // signature DOES gate codegen later. Silent skip would mask
-                // real gaps in tests of richer corpora. Each kind reopens with
-                // proper handling in subsequent ML2 cycles.
+                // Unsupported top-level kinds emit `H_UnsupportedLoweringForKind`
+                // rather than being silently skipped: a global initializer has
+                // runtime effect, an extern's signature gates codegen later,
+                // and silently passing them would mask real gaps in richer
+                // corpora. Each is tracked as a delimited blocker in plan 12
+                // (`.plans/12-mir-lir` §blockers) / plan 11 (FFI).
                 case HirKind::Global:
-                    unsupported(std::format("HIR Global (id {}) not yet "
-                                            "supported (ML2 cycle 2+)", decl.v));
+                    unsupported(decl, std::format(
+                        "HIR Global (id {}) — module-level storage is not "
+                        "yet lowered", decl.v));
                     return;
                 case HirKind::ExternFunction:
-                    unsupported(std::format("HIR ExternFunction (id {}) not yet "
-                                            "supported (ML2 cycle 2+ via FFI plan 11)",
-                                            decl.v));
+                    unsupported(decl, std::format(
+                        "HIR ExternFunction (id {}) — FFI symbol ingestion "
+                        "is not yet lowered", decl.v));
                     return;
                 case HirKind::ExternGlobal:
-                    unsupported(std::format("HIR ExternGlobal (id {}) not yet "
-                                            "supported (ML2 cycle 2+ via FFI plan 11)",
-                                            decl.v));
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — FFI symbol ingestion is "
+                        "not yet lowered", decl.v));
                     return;
                 case HirKind::TypeDecl:
                     // TypeDecl is the one structural carrier that genuinely
@@ -570,14 +736,14 @@ struct Lowerer {
                     // lattice but emits no code. Skipping is correct here.
                     break;
                 case HirKind::ImportGroup:
-                    unsupported(std::format("HIR ImportGroup (id {}) not yet "
-                                            "supported (ML2 cycle 2+ via plan 11)",
-                                            decl.v));
+                    unsupported(decl, std::format(
+                        "HIR ImportGroup (id {}) — import resolution is not "
+                        "yet lowered", decl.v));
                     return;
                 default:
-                    unsupported(std::format("Top-level HIR kind ordinal {} "
-                                            "(id {}) not yet supported",
-                                            static_cast<unsigned>(dk), decl.v));
+                    unsupported(decl, std::format(
+                        "Top-level HIR kind ordinal {} (id {}) not yet "
+                        "supported", static_cast<unsigned>(dk), decl.v));
                     return;
             }
         }
@@ -589,9 +755,10 @@ struct Lowerer {
 HirToMirResult lowerToMir(Hir const&             hir,
                           HirLiteralPool const&  literals,
                           TypeInterner const&    interner,
-                          DiagnosticReporter&    reporter) {
+                          DiagnosticReporter&    reporter,
+                          HirSourceMap const*    sourceMap) {
     std::size_t const errorsBefore = reporter.errorCount();
-    Lowerer lwr{hir, literals, interner, reporter, MirBuilder{}, {}};
+    Lowerer lwr{hir, literals, interner, reporter, sourceMap, MirBuilder{}, {}, {}};
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
