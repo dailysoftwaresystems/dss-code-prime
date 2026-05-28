@@ -175,7 +175,8 @@
     { "word": "switch",  "kind": "SwitchKeyword"  },
     { "word": "case",    "kind": "CaseKeyword"    },
     { "word": "default", "kind": "DefaultKeyword" },
-    { "word": "break",   "kind": "BreakKeyword"   },
+    { "word": "break",    "kind": "BreakKeyword"    },
+    { "word": "continue", "kind": "ContinueKeyword" },
 
     { "word": "extern",  "kind": "ExternKeyword"  }
   ],
@@ -342,6 +343,7 @@
         "forStmt",
         "switchStmt",
         "breakStmt",
+        "continueStmt",
         "returnStmt",
         "exprStmt"
       ]
@@ -396,7 +398,8 @@
       ]
     },
 
-    "breakStmt": { "sequence": [ "BreakKeyword", "EndStatement" ] },
+    "breakStmt":    { "sequence": [ "BreakKeyword",    "EndStatement" ] },
+    "continueStmt": { "sequence": [ "ContinueKeyword", "EndStatement" ] },
 
     "switchStmt": {
       "sequence": [
@@ -518,7 +521,7 @@
       { "rule": "returnStmt", "value": 1 }
     ],
     "loopRules": [ "whileStmt", "forStmt", "doStmt", "switchStmt" ],
-    "loopControls": [ { "rule": "breakStmt" } ],
+    "loopControls": [ { "rule": "breakStmt" }, { "rule": "continueStmt" } ],
     "builtinTypes": [
       { "name": "int",  "core": "I32"  },
       { "name": "char", "core": "Char" },
@@ -545,7 +548,8 @@
       { "rule": "doStmt",       "hirKind": "DoWhileStmt" },
       { "rule": "forStmt",      "hirKind": "ForStmt"     },
       { "rule": "switchStmt",   "hirKind": "SwitchStmt"  },
-      { "rule": "breakStmt",    "hirKind": "BreakStmt"   },
+      { "rule": "breakStmt",    "hirKind": "BreakStmt"    },
+      { "rule": "continueStmt", "hirKind": "ContinueStmt" },
       { "rule": "returnStmt",   "hirKind": "ReturnStmt"  },
       { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
     ],

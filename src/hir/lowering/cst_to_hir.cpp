@@ -1019,7 +1019,8 @@ struct Lowerer {
         if (k == "Block")       return lowerBlock(node);
         if (k == "ExprStmt")    return lowerExprStmt(node);
         if (k == "ReturnStmt")  return lowerReturn(node);
-        if (k == "BreakStmt")   return track(builder.makeBreak(0), node);
+        if (k == "BreakStmt")    return track(builder.makeBreak(0), node);
+        if (k == "ContinueStmt") return track(builder.makeContinue(0), node);
         if (k == "IfStmt")      return lowerIf(node);
         if (k == "WhileStmt")   return lowerWhile(node, /*doWhile=*/false);
         if (k == "DoWhileStmt") return lowerWhile(node, /*doWhile=*/true);

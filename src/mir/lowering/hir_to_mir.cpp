@@ -44,6 +44,23 @@ struct Lowerer {
     // direct calls go through `GlobalAddr(SymbolId)`, and codegen wires the
     // symbol to the MirFunc later. Hence: set, not map.
     std::unordered_set<std::uint32_t> functionSymbols;
+    // Stack of enclosing loop/switch frames. `BreakStmt`/`ContinueStmt` are
+    // resolved by indexing into this stack with HIR's `branchDepth` (a de
+    // Bruijn index — 0 means innermost). Loops contribute both edges;
+    // switches only contribute a break edge (a `continue` aimed at a switch
+    // is an HIR verifier failure — `continueBB.valid()` is the runtime
+    // assertion). Frames are pushed by `WhileStmt`/`DoWhileStmt`/`ForStmt`/
+    // `SwitchStmt` lowering and popped on scope exit (RAII via a small
+    // helper to keep the push/pop discipline visible at each call site).
+    struct BranchFrame {
+        MirBlockId continueBB;   // invalid for switch (no continue target)
+        MirBlockId breakBB;
+        // True iff a `continue;` inside this frame's body resolved here.
+        // Used by `DoWhileStmt` to decide whether to lower the (otherwise
+        // dead) condition block when the body self-sealed.
+        bool       continueReferenced = false;
+    };
+    std::vector<BranchFrame> branchStack;
 
     // Emit an unsupported-construct diagnostic anchored at the HIR node's
     // source span (via the optional source map). The buffer/span both
@@ -577,7 +594,7 @@ struct Lowerer {
     // Recursively collect into `out` the set of `SymbolId.v`s whose lvalue
     // address is needed somewhere under `node` — i.e. symbols that must be
     // slot-backed rather than pure-SSA. Drives entry-block slot-promotion
-    // for params. Three shapes contribute:
+    // for params. Four shapes contribute:
     //   - `AddressOf(Ref(sym))` — explicit `&sym`.
     //   - `MemberAccess(Ref(sym), …)` — `sym.field` needs `sym`'s address
     //     so GEP can index into its storage. (Conversely `(*p).field`
@@ -586,6 +603,9 @@ struct Lowerer {
     //   - `Index(Ref(sym), …)` when sym's type is NOT a pointer —
     //     indexing an array/aggregate local needs the array's address;
     //     indexing through a pointer (`p[i]`) does not.
+    //   - `AssignStmt` whose target is `Ref(sym)` — the symbol is being
+    //     mutated, so it must live in a storage slot rather than as a
+    //     pure-SSA value.
     // Walks every child; HIR is already verified well-formed before this
     // pass, so all referenced types are valid.
     void collectAddressTakenSymbols(HirNodeId node,
@@ -617,6 +637,11 @@ struct Lowerer {
                         ? interner.kind(baseTy) : TypeKind::Void;
                     if (baseKind != TypeKind::Ptr) out.insert(*s);
                 }
+            }
+        } else if (k == HirKind::AssignStmt) {
+            HirNodeId const target = hir.assignTarget(node);
+            if (auto s = refSymOf(target); s.has_value()) {
+                out.insert(*s);
             }
         }
         for (HirNodeId child : hir.children(node)) {
@@ -760,6 +785,7 @@ struct Lowerer {
                 // header: CondBr(cond, body, exit)
                 // body:   …; Br(header)
                 // exit:   continuation
+                // continue → header; break → exit.
                 HirNodeId const condN = *hir.loopCondition(node);
                 HirNodeId const bodyN = hir.loopBody(node);
 
@@ -780,7 +806,10 @@ struct Lowerer {
                 mir.addCondBr(cond, body, exit);
 
                 mir.beginBlock(body);
-                if (!lowerStmt(bodyN)) {
+                branchStack.push_back({header, exit});
+                bool const bodyOk = lowerStmt(bodyN);
+                branchStack.pop_back();
+                if (!bodyOk) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     sealCreatedAsUnreachable(exit);
                     return false;
@@ -791,23 +820,44 @@ struct Lowerer {
                 return true;
             }
             case HirKind::DoWhileStmt: {
-                // body:   …; CondBr(cond, body, exit)
+                // body:   …; (fall-through?) Br(continueBB)
+                // contBB: CondBr(cond, body, exit)
                 // exit:   continuation
+                // continue → continueBB (runs the cond test), break → exit.
+                // `continueBB` is created ONLY when something might branch
+                // to it: either the body falls through, or a `continue;`
+                // inside the body resolves to this loop's frame. If the
+                // body self-seals AND no continue references the frame,
+                // we elide continueBB entirely — that prevents lowering
+                // the dead cond expression (which would otherwise surface
+                // spurious unsupported-construct diagnostics) and avoids
+                // unreachable MIR bloat.
                 HirNodeId const bodyN = hir.loopBody(node);
                 HirNodeId const condN = *hir.loopCondition(node);
 
-                MirBlockId const body = mir.createBlock(StructCfMarker::LoopHeader);
-                MirBlockId const exit = mir.createBlock(StructCfMarker::LoopExit);
+                MirBlockId const body       = mir.createBlock(StructCfMarker::LoopHeader);
+                MirBlockId const continueBB = mir.createBlock(StructCfMarker::LoopLatch);
+                MirBlockId const exit       = mir.createBlock(StructCfMarker::LoopExit);
 
                 mir.addBr(body);
 
                 mir.beginBlock(body);
-                if (!lowerStmt(bodyN)) {
+                branchStack.push_back({continueBB, exit, false});
+                bool const bodyOk = lowerStmt(bodyN);
+                bool const continueReferenced =
+                    branchStack.back().continueReferenced;
+                branchStack.pop_back();
+                if (!bodyOk) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(continueBB);
                     sealCreatedAsUnreachable(exit);
                     return false;
                 }
-                if (!mir.openBlockHasTerminator()) {
+                bool const bodyFellThrough = !mir.openBlockHasTerminator();
+                if (bodyFellThrough) mir.addBr(continueBB);
+
+                if (continueReferenced || bodyFellThrough) {
+                    mir.beginBlock(continueBB);
                     MirInstId const cond = lowerExpr(condN);
                     if (!cond.valid()) {
                         if (!mir.openBlockHasTerminator()) mir.addUnreachable();
@@ -815,6 +865,9 @@ struct Lowerer {
                         return false;
                     }
                     mir.addCondBr(cond, body, exit);
+                } else {
+                    // No predecessor → seal as unreachable; cond is dead.
+                    sealCreatedAsUnreachable(continueBB);
                 }
 
                 mir.beginBlock(exit);
@@ -868,7 +921,11 @@ struct Lowerer {
                 }
 
                 mir.beginBlock(body);
-                if (!lowerStmt(bodyN)) {
+                // continue → update (or header if no update); break → exit.
+                branchStack.push_back({backTarget, exit});
+                bool const bodyOk = lowerStmt(bodyN);
+                branchStack.pop_back();
+                if (!bodyOk) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     sealCreatedAsUnreachable(update);
                     sealCreatedAsUnreachable(exit);
@@ -890,6 +947,149 @@ struct Lowerer {
                 }
 
                 mir.beginBlock(exit);
+                return true;
+            }
+            case HirKind::BreakStmt: {
+                // HIR's `branchDepth` is a de Bruijn index into the
+                // innermost-first stack of enclosing loop/switch frames.
+                // `branchStack` mirrors that stack (innermost on the back),
+                // so depth-N break targets `branchStack[size-1-N].breakBB`.
+                std::uint32_t const depth = hir.branchDepth(node);
+                if (depth >= branchStack.size()) {
+                    unsupported(node, std::format(
+                        "BreakStmt depth {} exceeds enclosing-frame count {} "
+                        "(HIR verifier should have flagged this)",
+                        depth, branchStack.size()));
+                    return false;
+                }
+                MirBlockId const target =
+                    branchStack[branchStack.size() - 1 - depth].breakBB;
+                mir.addBr(target);
+                return true;
+            }
+            case HirKind::ContinueStmt: {
+                std::uint32_t const depth = hir.branchDepth(node);
+                if (depth >= branchStack.size()) {
+                    unsupported(node, std::format(
+                        "ContinueStmt depth {} exceeds enclosing-frame count "
+                        "{} (HIR verifier should have flagged this)",
+                        depth, branchStack.size()));
+                    return false;
+                }
+                BranchFrame& frame =
+                    branchStack[branchStack.size() - 1 - depth];
+                if (!frame.continueBB.valid()) {
+                    unsupported(node, std::format(
+                        "ContinueStmt depth {} resolves to a switch frame "
+                        "which has no continue target (HIR verifier should "
+                        "have flagged this)", depth));
+                    return false;
+                }
+                frame.continueReferenced = true;
+                mir.addBr(frame.continueBB);
+                return true;
+            }
+            case HirKind::SwitchStmt: {
+                // C-style switch: each `CaseArm` has an optional match value
+                // and a body span; arms execute in declaration order with
+                // FALL-THROUGH when a body doesn't terminate (no break +
+                // no return). `default:` is the fall-back target. Lower as:
+                //   - lower discriminant
+                //   - createBlock per arm (1+ body blocks) + one exit block
+                //   - emit `Switch(disc, cases…, defaultBB)` where
+                //     defaultBB is the default arm's first block (or `exit`
+                //     if no default arm exists)
+                //   - lower each arm's body in order; fall-through arms
+                //     branch to the NEXT arm's first block; the last arm
+                //     falls through to exit.
+                //   - push `{invalid-continue, exit}` so `break;` targets
+                //     exit (continue inside switch is a HIR verifier error).
+                HirNodeId const discN = hir.switchDiscriminant(node);
+                auto       const arms  = hir.switchArms(node);
+
+                MirInstId const disc = lowerExpr(discN);
+                if (!disc.valid()) return false;
+
+                MirBlockId const exitBB = mir.createBlock(StructCfMarker::SwitchJoin);
+                // One block per arm, in declaration order.
+                std::vector<MirBlockId> armBlocks;
+                armBlocks.reserve(arms.size());
+                for (std::size_t i = 0; i < arms.size(); ++i) {
+                    armBlocks.push_back(mir.createBlock(StructCfMarker::SwitchCase));
+                }
+
+                // Build (caseValue, target) list and resolve defaultBB.
+                std::vector<std::pair<MirInstId, MirBlockId>> cases;
+                cases.reserve(arms.size());
+                MirBlockId defaultBB{};
+                for (std::size_t i = 0; i < arms.size(); ++i) {
+                    HirNodeId const arm = arms[i];
+                    if (hir.caseArmIsDefault(arm)) {
+                        if (defaultBB.valid()) {
+                            unsupported(arm, "switch has more than one "
+                                              "default arm (HIR verifier "
+                                              "should have flagged this)");
+                            sealCreatedAsUnreachable(exitBB);
+                            for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
+                            return false;
+                        }
+                        defaultBB = armBlocks[i];
+                        continue;
+                    }
+                    auto const valN = hir.caseArmValue(arm);
+                    if (!valN.has_value()) {
+                        unsupported(arm, "non-default CaseArm without "
+                                          "match value (HIR verifier "
+                                          "should have flagged this)");
+                        sealCreatedAsUnreachable(exitBB);
+                        for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
+                        return false;
+                    }
+                    MirInstId const caseVal = lowerExpr(*valN);
+                    if (!caseVal.valid()) {
+                        sealCreatedAsUnreachable(exitBB);
+                        for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
+                        return false;
+                    }
+                    cases.emplace_back(caseVal, armBlocks[i]);
+                }
+                if (!defaultBB.valid()) defaultBB = exitBB;
+
+                mir.addSwitch(disc, cases, defaultBB);
+
+                // Lower each arm's body, falling through to the next arm
+                // when not self-terminated. Push the break-frame ONCE for
+                // the whole switch (all arms share it).
+                branchStack.push_back({MirBlockId{}, exitBB});
+                for (std::size_t i = 0; i < arms.size(); ++i) {
+                    mir.beginBlock(armBlocks[i]);
+                    HirNodeId const arm = arms[i];
+                    bool armOk = true;
+                    for (HirNodeId stmt : hir.caseArmBody(arm)) {
+                        if (!lowerStmt(stmt)) { armOk = false; break; }
+                    }
+                    if (!armOk) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        // Seal the remaining arm blocks + exit so finish()
+                        // doesn't abort on a created-but-unfilled block.
+                        for (std::size_t j = i + 1; j < arms.size(); ++j) {
+                            sealCreatedAsUnreachable(armBlocks[j]);
+                        }
+                        sealCreatedAsUnreachable(exitBB);
+                        branchStack.pop_back();
+                        return false;
+                    }
+                    if (!mir.openBlockHasTerminator()) {
+                        // Fall through: branch to the next arm's first
+                        // block, or to exit if this is the last arm.
+                        MirBlockId const fall = (i + 1 < arms.size())
+                            ? armBlocks[i + 1] : exitBB;
+                        mir.addBr(fall);
+                    }
+                }
+                branchStack.pop_back();
+
+                mir.beginBlock(exitBB);
                 return true;
             }
             default: break;
@@ -1078,7 +1278,8 @@ HirToMirResult lowerToMir(Hir const&             hir,
                           DiagnosticReporter&    reporter,
                           HirSourceMap const*    sourceMap) {
     std::size_t const errorsBefore = reporter.errorCount();
-    Lowerer lwr{hir, literals, interner, reporter, sourceMap, MirBuilder{}, {}, {}, {}};
+    Lowerer lwr{hir, literals, interner, reporter, sourceMap, MirBuilder{},
+                {}, {}, {}, {}};
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();

@@ -155,26 +155,11 @@ TEST(MirLoweringCSubset, VoidFunctionWithEmptyBodyGetsImplicitReturn) {
 // is reachable. The Call-as-unsupported variant was replaced when cycle 3a
 // landed Call lowering; the abort-resilience invariant is independent of
 // which construct is currently unsupported.
-TEST(MirLoweringCSubset, UnsupportedConstructEmitsDiagnosticWithoutAbort) {
-    // `switch` statements lower to HIR cleanly but the SwitchStmt/CaseArm
-    // statement family is not yet lowered to MIR (separate cycle).  This
-    // test pins the abort-resilience invariant: ok=false, diagnostic
-    // surfaced, MIR still walkable — the lowering must NEVER abort the
-    // process on an unsupported construct.
-    auto L = lowerCSubset(
-        "int f(int x) { switch (x) { case 1: return 1; } return 0; }\n");
-    ASSERT_FALSE(L.model.hasErrors());
-    ASSERT_TRUE(L.hir->ok);
-    EXPECT_FALSE(L.mir.ok);
-    bool sawUnsupported = false;
-    for (auto const& d : L.mirReporter.all()) {
-        if (d.code == DiagnosticCode::H_UnsupportedLoweringForKind) {
-            sawUnsupported = true; break;
-        }
-    }
-    EXPECT_TRUE(sawUnsupported) << "expected H_UnsupportedLoweringForKind";
-    EXPECT_FALSE(L.mir.mir.empty());
-}
+// The abort-resilience invariant ("never abort on unsupported, surface a
+// diagnostic + keep the partial MIR walkable") is pinned by the dedicated
+// Global-decl test below — kept here as the historical anchor for the
+// invariant. When a future HIR construct lands that MIR doesn't lower,
+// reinstate a dedicated `UnsupportedConstruct…` test for it.
 
 // ML2 cycle 1 (review-fix): a Global declaration emits an unsupported
 // diagnostic, not a silent skip. Previously silently skipped which would
@@ -192,6 +177,9 @@ TEST(MirLoweringCSubset, GlobalDeclarationEmitsUnsupported) {
         }
     }
     EXPECT_TRUE(sawUnsupported) << "expected Global-unsupported diagnostic";
+    // Abort-resilience invariant: even on a failed lowering, the partial
+    // MIR module must remain walkable (no abort, no truncation).
+    EXPECT_FALSE(L.mir.mir.empty());
 }
 
 // ─── ML2 cycle 3a: Call + Ternary + Short-circuit ─────────────────────────
@@ -389,43 +377,94 @@ TEST(MirLoweringCSubset, IfBothArmsReturnSealsJoinAsUnreachable) {
     EXPECT_EQ(m.instOpcode(m.blockTerminator(joinBB)), MirOpcode::Unreachable);
 }
 
-// Review-fix I-1: a while loop whose body does NOT return must have a real
-// back-edge from body to header. The original WhileLoopWithEarlyReturn
-// doesn't exercise this because its body returns first.
+// A while loop whose body does NOT return must have a real back-edge from
+// body to header. Pinned now that AssignStmt is lowered (cycle 3b).
 TEST(MirLoweringCSubset, WhileLoopBodyEmitsBackEdgeToHeader) {
     auto L = lowerCSubset(
         "void spin(int n) {\n"
-        "  while (n > 0) { n = n - 1; }\n"  // currently fail-loud-defers on the assignment
+        "  while (n > 0) { n = n - 1; }\n"
         "}\n");
-    // ML2 cycle 2 doesn't yet lower AssignStmt; the cleaner test is to use
-    // a fail-loud-tolerated body that doesn't seal — but every non-sealing
-    // c-subset body shape (ExprStmt, etc) involves either a Call or an
-    // assignment which cycles 1-2 don't lower. Treat as a known gap: pin
-    // the back-edge structurally via a Block-of-nothing once block-scope
-    // empty `{}` is reachable. For NOW, assert the diagnostic surfaces +
-    // the build completes (no abort), proving the back-edge code path is
-    // at least reachable without crashing.
-    EXPECT_FALSE(L.mir.ok);  // assignment-as-stmt not yet supported
-    EXPECT_FALSE(L.mir.mir.empty());  // finish() did not abort
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(fn);
+    // entry → header → body → header (back-edge), header → exit.
+    MirBlockId header{};
+    auto entrySuccs = m.blockSuccessors(entry);
+    ASSERT_GE(entrySuccs.size(), 1u);
+    header = entrySuccs[0];
+    EXPECT_EQ(m.blockMarker(header), StructCfMarker::LoopHeader);
+    auto hdrSuccs = m.blockSuccessors(header);
+    ASSERT_EQ(hdrSuccs.size(), 2u);
+    MirBlockId const body = hdrSuccs[0];
+    // Body's terminator is Br(header) — the back-edge.
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(body)), MirOpcode::Br);
+    auto bodySuccs = m.blockSuccessors(body);
+    ASSERT_EQ(bodySuccs.size(), 1u);
+    EXPECT_EQ(bodySuccs[0], header) << "body back-edge should target header";
 }
 
-// Review-fix I-2: do-while with a non-sealing body — body falls through to
-// the trailing CondBr(body, exit).
-TEST(MirLoweringCSubset, DoWhileLoopHasTrailingCondBr) {
+// Do-while whose body self-seals and never targets `continue;` — the
+// continueBB has no real predecessor and is elided to Unreachable so the
+// dead cond expression isn't lowered. Cycle-4 invariant: continueBB only
+// becomes live (with the cond-test + CondBr) when the body falls through
+// OR a `continue;` resolves to this loop's frame.
+TEST(MirLoweringCSubset, DoWhileBodyReturnsElidesCondTest) {
     auto L = lowerCSubset(
         "void f(int n) {\n"
-        "  do { return; } while (n > 0);\n"  // body returns; cond is skipped
+        "  do { return; } while (n > 0);\n"  // no fall-through, no continue
         "}\n");
     ASSERT_TRUE(L.mir.ok);
     Mir const& m = L.mir.mir;
     MirFuncId const fn = m.funcAt(0);
-    // Blocks: entry, body, exit. Body's terminator is Return (its own seal
-    // suppresses the trailing CondBr); exit has implicit-void-return.
-    EXPECT_EQ(m.funcBlockCount(fn), 3u);
+    // Blocks: entry, body, continueBB(unreachable), exit.
+    EXPECT_EQ(m.funcBlockCount(fn), 4u);
     MirBlockId const entry = m.funcEntry(fn);
     MirBlockId const body = m.blockSuccessors(entry)[0];
     EXPECT_EQ(m.blockMarker(body), StructCfMarker::LoopHeader);
     EXPECT_EQ(m.instOpcode(m.blockTerminator(body)), MirOpcode::Return);
+    // The continueBB exists but is sealed as Unreachable — the cond was
+    // NOT lowered (so no ICmp/Const instructions other than possibly the
+    // exit's implicit return). Locate the LoopLatch block; its terminator
+    // must be Unreachable, NOT CondBr.
+    bool sawLatch = false;
+    auto const blockCount = m.funcBlockCount(fn);
+    for (std::uint32_t i = 0; i < blockCount; ++i) {
+        MirBlockId const b = m.funcBlockAt(fn, i);
+        if (m.blockMarker(b) == StructCfMarker::LoopLatch) {
+            sawLatch = true;
+            EXPECT_EQ(m.instOpcode(m.blockTerminator(b)),
+                      MirOpcode::Unreachable);
+            break;
+        }
+    }
+    EXPECT_TRUE(sawLatch);
+}
+
+// The fall-through path: body has no self-seal, so continueBB IS lowered
+// with the cond-test + CondBr(body, exit). Pins the inverse case.
+TEST(MirLoweringCSubset, DoWhileBodyFallsThroughLowersCondTest) {
+    auto L = lowerCSubset(
+        "void f(int n) {\n"
+        "  do { n = n; } while (n > 0);\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    bool sawLatchWithCondBr = false;
+    auto const blockCount = m.funcBlockCount(fn);
+    for (std::uint32_t i = 0; i < blockCount; ++i) {
+        MirBlockId const b = m.funcBlockAt(fn, i);
+        if (m.blockMarker(b) == StructCfMarker::LoopLatch) {
+            if (m.instOpcode(m.blockTerminator(b)) == MirOpcode::CondBr) {
+                sawLatchWithCondBr = true;
+            }
+            break;
+        }
+    }
+    EXPECT_TRUE(sawLatchWithCondBr);
 }
 
 // Review-fix I-4: a for-loop with cond/update/body lowers to the
@@ -747,6 +786,168 @@ TEST(MirLoweringCSubset, SeqExprLowersStmtsThenYieldsResult) {
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 5)), MirOpcode::Load);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 7)), MirOpcode::Add);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 8)), MirOpcode::Return);
+}
+
+// ─── ML2 cycle 4: Switch / Break / Continue ──────────────────────────────
+
+// A switch with two cases + default + breaks in each arm lowers to:
+//   entry → Switch(disc, [(1, caseA), (2, caseB)], default=caseD)
+//   caseA / caseB / caseD all `Br(exit)` because of the explicit break
+// Exit then runs the implicit-void-return.
+TEST(MirLoweringCSubset, SwitchWithBreaksInEachArm) {
+    auto L = lowerCSubset(
+        "void f(int x) {\n"
+        "  switch (x) {\n"
+        "    case 1: break;\n"
+        "    case 2: break;\n"
+        "    default: break;\n"
+        "  }\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    // Blocks: entry, caseA, caseB, default, exit  → 5
+    EXPECT_EQ(m.funcBlockCount(fn), 5u);
+    MirBlockId const entry = m.funcEntry(fn);
+    // Entry's terminator is the Switch.
+    MirInstId const term = m.blockTerminator(entry);
+    EXPECT_EQ(m.instOpcode(term), MirOpcode::Switch);
+    // Switch successors: [case targets…, default].
+    auto succs = m.blockSuccessors(entry);
+    EXPECT_EQ(succs.size(), 3u);
+    // Every arm's terminator is Br (the break;).
+    for (std::size_t i = 0; i < succs.size(); ++i) {
+        EXPECT_EQ(m.instOpcode(m.blockTerminator(succs[i])), MirOpcode::Br);
+    }
+}
+
+// Fall-through: arm 1 omits `break;`, so MIR must Br to arm 2's block
+// instead of the switch-exit. C semantics preserved.
+TEST(MirLoweringCSubset, SwitchFallthroughBranchesToNextArm) {
+    auto L = lowerCSubset(
+        "void f(int x) {\n"
+        "  switch (x) {\n"
+        "    case 1:\n"           // no break → falls through to case 2
+        "    case 2: break;\n"
+        "  }\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    // Blocks: entry, caseA(empty), caseB, exit → 4
+    EXPECT_EQ(m.funcBlockCount(fn), 4u);
+    MirBlockId const entry = m.funcEntry(fn);
+    auto succs = m.blockSuccessors(entry);
+    ASSERT_EQ(succs.size(), 3u);  // [caseA, caseB, default=exit]
+    // caseA terminator branches to caseB (fall-through), NOT to exit.
+    MirBlockId const caseA = succs[0];
+    MirBlockId const caseB = succs[1];
+    MirBlockId const exit  = succs[2];
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(caseA)), MirOpcode::Br);
+    auto caseAExits = m.blockSuccessors(caseA);
+    ASSERT_EQ(caseAExits.size(), 1u);
+    EXPECT_EQ(caseAExits[0], caseB)
+        << "fall-through should land at next arm, not at switch-exit";
+    EXPECT_NE(caseAExits[0], exit);
+}
+
+// `continue;` inside a while branches to the loop header, NOT to exit.
+TEST(MirLoweringCSubset, ContinueInsideWhileBranchesToHeader) {
+    auto L = lowerCSubset(
+        "void f(int n) {\n"
+        "  while (n > 0) { continue; }\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(fn);
+    MirBlockId const header = m.blockSuccessors(entry)[0];
+    EXPECT_EQ(m.blockMarker(header), StructCfMarker::LoopHeader);
+    // Header's CondBr targets are [body, exit].
+    auto hdrSuccs = m.blockSuccessors(header);
+    ASSERT_EQ(hdrSuccs.size(), 2u);
+    MirBlockId const body = hdrSuccs[0];
+    // Body's terminator is the continue → Br(header).
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(body)), MirOpcode::Br);
+    auto bodySuccs = m.blockSuccessors(body);
+    ASSERT_EQ(bodySuccs.size(), 1u);
+    EXPECT_EQ(bodySuccs[0], header) << "continue should target the loop header";
+}
+
+// `break;` inside a while branches to the loop exit.
+TEST(MirLoweringCSubset, BreakInsideWhileBranchesToExit) {
+    auto L = lowerCSubset(
+        "void f(int n) {\n"
+        "  while (n > 0) { break; }\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    MirBlockId const entry = m.funcEntry(fn);
+    MirBlockId const header = m.blockSuccessors(entry)[0];
+    auto hdrSuccs = m.blockSuccessors(header);
+    ASSERT_EQ(hdrSuccs.size(), 2u);
+    MirBlockId const body = hdrSuccs[0];
+    MirBlockId const exit = hdrSuccs[1];
+    EXPECT_EQ(m.blockMarker(exit), StructCfMarker::LoopExit);
+    // Body's terminator is the break → Br(exit).
+    auto bodySuccs = m.blockSuccessors(body);
+    ASSERT_EQ(bodySuccs.size(), 1u);
+    EXPECT_EQ(bodySuccs[0], exit) << "break should target the loop exit";
+}
+
+// `continue;` inside a do-while branches to the cond-test block, not body.
+// Pins the cycle-4 do-while reshape that introduced an explicit
+// continueBB between body and exit.
+TEST(MirLoweringCSubset, ContinueInsideDoWhileBranchesToCondTest) {
+    auto L = lowerCSubset(
+        "void f(int n) {\n"
+        "  do { continue; } while (n > 0);\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    // Blocks: entry, body, continueBB, exit.
+    EXPECT_EQ(m.funcBlockCount(fn), 4u);
+    MirBlockId const entry = m.funcEntry(fn);
+    MirBlockId const body = m.blockSuccessors(entry)[0];
+    EXPECT_EQ(m.blockMarker(body), StructCfMarker::LoopHeader);
+    auto bodySuccs = m.blockSuccessors(body);
+    ASSERT_EQ(bodySuccs.size(), 1u);
+    MirBlockId const cont = bodySuccs[0];
+    EXPECT_EQ(m.blockMarker(cont), StructCfMarker::LoopLatch);
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(cont)), MirOpcode::CondBr);
+}
+
+// `break;` inside a switch arm goes to the switch's exit, not to any
+// enclosing loop's exit. Pins the switch-pushes-break-only frame
+// discipline.
+TEST(MirLoweringCSubset, BreakInsideSwitchArmTargetsSwitchExit) {
+    auto L = lowerCSubset(
+        "void f(int x) {\n"
+        "  while (x > 0) {\n"
+        "    switch (x) { case 1: break; default: break; }\n"
+        "  }\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    // Locate the switch-join (where both case-arm breaks converge) and
+    // verify it has 2+ predecessors-worth of incoming Br edges from the
+    // arm blocks (by counting blocks with SwitchJoin marker — exactly 1).
+    std::uint32_t joinCount = 0;
+    auto const blockCount = m.funcBlockCount(fn);
+    for (std::uint32_t i = 0; i < blockCount; ++i) {
+        MirBlockId const b = m.funcBlockAt(fn, i);
+        if (m.blockMarker(b) == StructCfMarker::SwitchJoin) ++joinCount;
+    }
+    EXPECT_EQ(joinCount, 1u);
 }
 
 // VarDecl without an initializer still emits the alloca but no store —
