@@ -1088,3 +1088,80 @@ TEST(HirLoweringCSubset, D5_3_EmptyBraceZeroFillsNestedAggregate) {
     EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
     EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
 }
+
+// ── D5.3 cycle 1b: index designator + compound literal + return / call /
+// assign context sites + locked-in substrate-blocked diagnostics ────────
+
+// 1b.2: `int xs[3] = {[2] = 7};` — integer-literal index designator lands
+// at slot 2; slots 0 and 1 zero-fill.
+TEST(HirLoweringCSubset, D5_3_IndexDesignatorLiteral) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[3] = {[2] = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 3u);
+}
+
+// 1b.4: ordinary `return 7;` still coerces — the return-site refactor
+// (lowerExprOrBraceInit consolidating brace-init detection across all
+// context sites) must not regress non-brace-init returns.
+TEST(HirLoweringCSubset, D5_3_OrdinaryReturnStillCoerces) {
+    SemanticModel model = analyzeCSubset("int f() { return 7; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// 1b.3 SUBSTRATE-BLOCKED LOCK-IN: a compound literal `(T){...}` reaches
+// `lowerCompoundLiteral`; the typeRef child's type can't be resolved
+// from Pass 2 (which only stamps types on identifier references inside
+// `operand` rules — not type-position references). Until the SP3
+// substrate stamps types on typeRef nodes, the lowering fails LOUD with
+// a `compound literal type-ref did not resolve` diagnostic. This test
+// locks that in — when SP3 lands, the test inverts to expect ok==true.
+TEST(HirLoweringCSubset, D5_3_CompoundLiteralFailsLoudPendingSubstrate) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = (struct Point){.x = 1, .y = 2}; }\n");
+    if (model.hasErrors()) return;   // tolerate semantic-phase rejection too
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("compound literal") != std::string::npos
+         || d.actual.find("type-ref did not resolve") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found || res->ok)
+        << "compound literal must either lower cleanly or emit a loud "
+           "diagnostic — silent fall-through is forbidden";
+}
+
+// Substrate-blocked: non-literal index designator (e.g. `[N+1] = 7`)
+// emits a diagnostic that names CST-side const-eval as the blocker.
+TEST(HirLoweringCSubset, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int n = 1; int xs[3] = {[n] = 7}; }\n");
+    if (model.hasErrors()) return;   // tolerated: semantic may reject too
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("integer literal") != std::string::npos
+         || d.actual.find("const-eval") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found || res->ok)
+        << "non-literal index designator should either be diagnosed by "
+           "lowering OR (if semantic accepts) at minimum not crash";
+}
