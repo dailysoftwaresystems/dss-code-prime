@@ -148,12 +148,14 @@ public:
                  SchemaCursor               cursor,
                  std::vector<SchemaCursor>  cursorStack,
                  std::vector<bool>          wrapFrameFlags,
+                 std::uint32_t              wrapDepth,
                  bool                       cursorDesynced) noexcept;
 
         GrammarSchema const*       schemaPtr_;
         SchemaCursor               cursor_;
         std::vector<SchemaCursor>  cursorStack_;
         std::vector<bool>          wrapFrameFlags_;
+        std::uint32_t              wrapDepth_;
         bool                       cursorDesynced_;
     };
 
@@ -172,18 +174,27 @@ private:
     DesyncCallback                       onDesync_;
     SchemaCursor                         cursor_{};
     std::vector<SchemaCursor>            cursorStack_;
-    // Parallel-to-`cursorStack_` per-frame "this frame is a Pratt
-    // auto-interned wrapper rule" flag. Pushed by `enterRule` (true
-    // iff `schema_->isAutoInternedWrapperRule(rule)`); popped by
-    // `leaveRule`. Read by `noteDesync_` to suppress the desync latch
-    // while the IMMEDIATE current frame is a wrap — wrapper rules
-    // have no body in the position graph, so cursor advances inside
-    // them (the `pushOperatorToken` advance after `wrapLastChildExpr-
-    // Frame`) are structural-only and don't represent a real grammar
-    // mismatch. Nested non-wrap frames inside a wrap (followers /
-    // grouped postfix bodies) still desync normally because their
-    // top-of-stack flag is `false`. Plan 05 post-close sub-cycle B.
+    // Per-frame "this frame is a Pratt auto-interned wrapper rule"
+    // flag, parallel to `cursorStack_` (one entry per push). Pushed
+    // by `enterRule` (true iff `schema_->isAutoInternedWrapperRule(
+    // rule)`); popped by `leaveRule` AFTER `noteDesync_` so a leave-
+    // time valid→invalid transition still sees the wrap-stack entry
+    // responsible. `wrapDepth_` counts the trues for O(1)
+    // `noteDesync_` suppression — wrapper rules have no body in the
+    // schema's position graph, so cursor advances within them
+    // (including in follower rules opened under the wrap whose
+    // cursor inherits the wrap's invalid-graph context) are
+    // structural-only noise rather than a real grammar mismatch.
+    // The latch is suppressed whenever ANY ancestor frame on the
+    // stack is a wrap (`wrapDepth_ > 0`). Plan 05 post-close sub-
+    // cycle B. The parallel-stack-plus-counter (rather than just a
+    // counter) is needed because `leaveRule`'s decrement must know
+    // whether the SPECIFIC frame being left was a wrap, and
+    // overloading the API's `std::optional<RuleId> rule` parameter
+    // (today a diag hint) with semantic meaning would be a fragile
+    // contract change.
     std::vector<bool>                    wrapFrameFlags_;
+    std::uint32_t                        wrapDepth_ = 0;
     bool                                 cursorDesynced_ = false;
 };
 
