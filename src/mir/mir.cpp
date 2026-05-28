@@ -385,6 +385,10 @@ MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol) {
     return id;
 }
 
+std::uint32_t MirBuilder::literalPoolAdd(MirLiteralValue value) {
+    return literalPool_.add(std::move(value));
+}
+
 MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
                                   std::uint32_t initLiteralIndex,
                                   MirFuncId initFunc) {

@@ -161,25 +161,114 @@ TEST(MirLoweringCSubset, VoidFunctionWithEmptyBodyGetsImplicitReturn) {
 // invariant. When a future HIR construct lands that MIR doesn't lower,
 // reinstate a dedicated `UnsupportedConstruct…` test for it.
 
-// ML2 cycle 1 (review-fix): a Global declaration emits an unsupported
-// diagnostic, not a silent skip. Previously silently skipped which would
-// mask real gaps when later cycles add globals-with-initializers.
-TEST(MirLoweringCSubset, GlobalDeclarationEmitsUnsupported) {
+// A module-level Global with a constant initializer lowers to a MirGlobal
+// whose `initLiteralIndex` points to the folded literal — no synthesized
+// init function needed.
+TEST(MirLoweringCSubset, GlobalWithLiteralInitFoldsToConstant) {
     auto L = lowerCSubset("int g = 42;\n");
     ASSERT_FALSE(L.model.hasErrors());
     ASSERT_TRUE(L.hir->ok);
-    EXPECT_FALSE(L.mir.ok);
-    bool sawUnsupported = false;
-    for (auto const& d : L.mirReporter.all()) {
-        if (d.code == DiagnosticCode::H_UnsupportedLoweringForKind
-            && d.actual.find("Global") != std::string::npos) {
-            sawUnsupported = true; break;
-        }
-    }
-    EXPECT_TRUE(sawUnsupported) << "expected Global-unsupported diagnostic";
-    // Abort-resilience invariant: even on a failed lowering, the partial
-    // MIR module must remain walkable (no abort, no truncation).
-    EXPECT_FALSE(L.mir.mir.empty());
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+        << "constant init should fold to a literal-pool index";
+    EXPECT_FALSE(m.globalInitFunc(g).valid())
+        << "constant-init globals must not carry an init function";
+    // The literal at that index is 42.
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    EXPECT_EQ(std::get<std::int64_t>(lit.value), 42);
+}
+
+// A Global without an initializer is zero-init — no literal, no init func.
+TEST(MirLoweringCSubset, GlobalWithoutInitIsZeroInit) {
+    auto L = lowerCSubset("int g;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_EQ(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+}
+
+// A function reading a module global lowers the read as
+// `GlobalAddr(sym) → Load`. Pins the new globalSymbols resolution path
+// in `lowerExpr`'s `Ref` case.
+TEST(MirLoweringCSubset, FunctionReadingGlobalEmitsGlobalAddrThenLoad) {
+    auto L = lowerCSubset(
+        "int g = 7;\n"
+        "int read_g() { return g; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [GlobalAddr, Load, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 3u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::GlobalAddr);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Load);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::Return);
+}
+
+// `int g = 1 + 2;` — BinaryOp(Add, Literal, Literal) folds to a constant
+// `3` at lowering time. No init function is synthesized.
+TEST(MirLoweringCSubset, GlobalWithBinaryOpOnLiteralsFoldsToConstant) {
+    auto L = lowerCSubset("int g = 1 + 2;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid());
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    EXPECT_EQ(std::get<std::int64_t>(lit.value), 3);
+    EXPECT_EQ(m.moduleFuncCount(), 0u);
+}
+
+// `int g = -1;` — UnaryOp(Neg, Literal) folds to a constant-init global.
+// No init function is synthesized.
+TEST(MirLoweringCSubset, GlobalWithUnaryNegLiteralFoldsToConstant) {
+    auto L = lowerCSubset("int g = -7;\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u);
+    MirGlobalId const g = m.globalAt(0);
+    EXPECT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+    EXPECT_FALSE(m.globalInitFunc(g).valid())
+        << "Neg(Literal) should fold — no init function needed";
+    auto const& lit = m.literalValue(m.globalInitLiteralIndex(g));
+    EXPECT_EQ(std::get<std::int64_t>(lit.value), -7);
+    // No module-init function: only the (zero) real functions in the module.
+    EXPECT_EQ(m.moduleFuncCount(), 0u);
+}
+
+// A function writing to a module global lowers the write as
+// `GlobalAddr(sym) → Store(rhs, addr)`. Pins the lvalue-side of the
+// new globals resolution.
+TEST(MirLoweringCSubset, FunctionWritingGlobalEmitsGlobalAddrThenStore) {
+    auto L = lowerCSubset(
+        "int g;\n"
+        "void set_g(int v) { g = v; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+    // [Arg v, GlobalAddr g, Store, Return]
+    ASSERT_EQ(m.blockInstCount(entry), 4u);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Arg);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::GlobalAddr);
+    MirInstId const storeI = m.blockInstAt(entry, 2);
+    EXPECT_EQ(m.instOpcode(storeI), MirOpcode::Store);
+    auto ops = m.instOperands(storeI);
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(ops[0], m.blockInstAt(entry, 0)) << "value operand is the Arg";
+    EXPECT_EQ(ops[1], m.blockInstAt(entry, 1)) << "ptr operand is the GlobalAddr";
 }
 
 // ─── ML2 cycle 3a: Call + Ternary + Short-circuit ─────────────────────────

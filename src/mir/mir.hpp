@@ -246,6 +246,12 @@ public:
     // FnSig TypeId; `symbol` the declared SymbolId.
     MirFuncId addFunction(TypeId signature, SymbolId symbol);
 
+    // ── literal pool ──
+    // Append `value` to the module's literal pool and return the index.
+    // Used by `addGlobal` to record a constant initializer without emitting
+    // a `Const` instruction (since globals don't live in any function body).
+    [[nodiscard]] std::uint32_t literalPoolAdd(MirLiteralValue value);
+
     // ── global storage ──
     // Append a module-level global to the globals arena. Module-level only — has
     // no lifecycle dependency on the open function / block; can be called at any

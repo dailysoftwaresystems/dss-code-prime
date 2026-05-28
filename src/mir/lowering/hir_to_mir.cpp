@@ -44,6 +44,18 @@ struct Lowerer {
     // direct calls go through `GlobalAddr(SymbolId)`, and codegen wires the
     // symbol to the MirFunc later. Hence: set, not map.
     std::unordered_set<std::uint32_t> functionSymbols;
+    // Set of module-level global symbols. Populated by the global pre-pass
+    // alongside `functionSymbols` so a `Ref` to a global resolves to a
+    // `GlobalAddr(SymbolId)` (consumed via `Load` for reads, used as the
+    // pointer operand of `Store` for writes). The MIR's `addGlobal` records
+    // the storage; codegen later wires the symbol to that arena entry.
+    std::unordered_set<std::uint32_t> globalSymbols;
+    // The synthesized module-init function — created lazily when the first
+    // non-constant initializer needs runtime evaluation. Each subsequent
+    // non-constant init appends a Store-into-global into this function's
+    // entry block. If still invalid at finish() time, no module-init was
+    // needed and none is emitted.
+    MirFuncId moduleInitFunc{};
     // Stack of enclosing loop/switch frames. `BreakStmt`/`ContinueStmt` are
     // resolved by indexing into this stack with HIR's `branchDepth` (a de
     // Bruijn index — 0 means innermost). Loops contribute both edges;
@@ -148,12 +160,16 @@ struct Lowerer {
                 //      the HIR node's type (`t`), which is the pointee type.
                 //   2. Local SSA value (param NOT address-taken / pure-SSA
                 //      temporary) — return its already-emitted MirInstId.
-                //   3. Module function — emit `GlobalAddr` to the symbol. The
+                //   3. Module global — emit `GlobalAddr` for the pointer-to-
+                //      storage, then `Load` for the rvalue read. The lvalue
+                //      path in `lowerLvalueAddress` returns the GlobalAddr
+                //      directly so `Store` / `AddressOf` can use it.
+                //   4. Module function — emit `GlobalAddr` to the symbol. The
                 //      result type IS the FnSig (matching HIR's convention
                 //      where Ref-to-function's typeId is the FnSig directly);
                 //      MIR's Call accepts that uniformly.
-                //   4. Anything else (globals/externs) → unbound at this
-                //      lowering tier; see plan 12 (globals) / plan 11 (FFI).
+                //   5. Anything else (externs) → unbound at this lowering
+                //      tier (FFI plan 11 owns extern-symbol resolution).
                 std::uint32_t const sym = hir.payload(node);
                 if (auto it = addressableLocal.find(sym);
                     it != addressableLocal.end()) {
@@ -163,13 +179,22 @@ struct Lowerer {
                 if (auto it = symbolToValue.find(sym); it != symbolToValue.end()) {
                     return it->second;
                 }
+                if (globalSymbols.contains(sym)) {
+                    // Globals: GlobalAddr's result type is pointer(t); a
+                    // following Load reads the value. The HIR Ref's typeId
+                    // is the global's declared type, not pointer(type).
+                    TypeId const ptrTy = interner.pointer(t);
+                    MirInstId const addr = mir.addGlobalAddr(SymbolId{sym}, ptrTy);
+                    std::array<MirInstId, 1> ops{addr};
+                    return mir.addInst(MirOpcode::Load, ops, t);
+                }
                 if (functionSymbols.contains(sym)) {
                     return mir.addGlobalAddr(SymbolId{sym}, t);
                 }
                 unsupported(node,
                     std::format("HIR Ref to unbound symbol {} (not a local "
-                                "SSA value, addressable local, or module "
-                                "function)", sym));
+                                "SSA value, addressable local, module global, "
+                                "or module function)", sym));
                 return InvalidMirInst;
             }
             case HirKind::UnaryOp: {
@@ -494,6 +519,18 @@ struct Lowerer {
             if (auto it = addressableLocal.find(sym);
                 it != addressableLocal.end()) {
                 return it->second;
+            }
+            if (globalSymbols.contains(sym)) {
+                // Lvalue of a global: the GlobalAddr is the pointer-to-
+                // storage. Result type is pointer(declaredType).
+                TypeId const declared = hir.typeId(node);
+                if (!declared.valid()) {
+                    unsupported(node, std::format(
+                        "global Ref to symbol {} has no type", sym));
+                    return InvalidMirInst;
+                }
+                return mir.addGlobalAddr(SymbolId{sym},
+                                         interner.pointer(declared));
             }
             unsupported(node, std::format(
                 "symbol {} has no storage slot (non-addressable param or "
@@ -1213,9 +1250,241 @@ struct Lowerer {
         }
     }
 
-    // Lower the whole module: collect function symbols, then dispatch each
-    // top-level decl. Non-function decls emit fail-loud diagnostics — see the
-    // switch below for the per-kind disposition.
+    // Pre-pass: collect the set of module-level global symbols so that a
+    // `Ref` to a global resolves to a `GlobalAddr`-then-`Load` (rvalue) or
+    // a `GlobalAddr` (lvalue address). Mirrors `collectFunctions`. The
+    // actual `addGlobal` is deferred to `emitGlobals_` (called after all
+    // functions are lowered) so non-constant initializers can route through
+    // a synthesized module-init function.
+    void collectGlobals(HirNodeId moduleNode) {
+        for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+            if (hir.kind(decl) != HirKind::Global) continue;
+            SymbolId const sym = hir.globalSymbol(decl);
+            if (!sym.valid()) continue;
+            globalSymbols.insert(sym.v);
+        }
+    }
+
+    // Try to constant-fold a HIR expression into a `MirLiteralValue`. Returns
+    // `nullopt` when the expression isn't statically foldable — the caller
+    // falls back to lowering the initializer as instructions in the module-
+    // init function. Supported folding surface:
+    //   - `Literal` — direct mapping into MirLiteralValue.
+    //   - `UnaryOp(Neg/BitNot/Plus)` over an integer Literal — negation /
+    //     bitwise-NOT / identity applied in place. (Float-Neg is left to the
+    //     init-function path because runtime FP semantics differ from
+    //     bit-flip.) The unary cases are common in real C code (`int x = -1;`)
+    //     and need zero substrate beyond the variant arithmetic.
+    // BinaryOp folding requires a constants-evaluation engine (overflow,
+    // promotion, division-by-zero policy) — out of scope for this cycle;
+    // those inits route through the init function correctly.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryConstFold(HirNodeId node) const {
+        if (!node.valid()) return std::nullopt;
+        HirKind const k = hir.kind(node);
+        if (k == HirKind::Literal) {
+            std::uint32_t const idx = hir.payload(node);
+            HirLiteralValue const& src = literals.at(idx);
+            MirLiteralValue dst;
+            dst.value = src.value;
+            dst.core  = src.core;
+            return dst;
+        }
+        if (k == HirKind::UnaryOp) {
+            std::uint32_t const payload = hir.payload(node);
+            if (!isCoreOp(payload)) return std::nullopt;
+            HirOpKind const op = decodeCoreOp(payload);
+            auto kids = hir.children(node);
+            if (kids.size() != 1) return std::nullopt;
+            auto inner = tryConstFold(kids[0]);
+            if (!inner.has_value()) return std::nullopt;
+            // Only integer-typed literals fold here (float-Neg is left
+            // for the init-function path — bit-flip ≠ FP negate).
+            std::int64_t const* iv = std::get_if<std::int64_t>(&inner->value);
+            if (iv == nullptr) return std::nullopt;
+            MirLiteralValue folded = *inner;
+            switch (op) {
+                case HirOpKind::Neg:    folded.value = -(*iv);    return folded;
+                case HirOpKind::BitNot: folded.value = ~(*iv);    return folded;
+                // Unary `+` is identity at the value level.
+                default: return std::nullopt;
+            }
+        }
+        if (k == HirKind::BinaryOp) {
+            std::uint32_t const payload = hir.payload(node);
+            if (!isCoreOp(payload)) return std::nullopt;
+            HirOpKind const op = decodeCoreOp(payload);
+            auto kids = hir.children(node);
+            if (kids.size() != 2) return std::nullopt;
+            auto a = tryConstFold(kids[0]);
+            auto b = tryConstFold(kids[1]);
+            if (!a.has_value() || !b.has_value()) return std::nullopt;
+            // Integer-only folding (float arithmetic + sign-overflow are
+            // policy concerns better owned by a shared constants-evaluation
+            // engine — out of this cycle's scope, deferred to the v1
+            // optimizer's const-fold pass).
+            std::int64_t const* av = std::get_if<std::int64_t>(&a->value);
+            std::int64_t const* bv = std::get_if<std::int64_t>(&b->value);
+            if (av == nullptr || bv == nullptr) return std::nullopt;
+            MirLiteralValue folded = *a;
+            switch (op) {
+                case HirOpKind::Add:    folded.value = *av + *bv;  return folded;
+                case HirOpKind::Sub:    folded.value = *av - *bv;  return folded;
+                case HirOpKind::Mul:    folded.value = *av * *bv;  return folded;
+                case HirOpKind::Div:
+                    if (*bv == 0) return std::nullopt;  // UB — refuse to fold
+                    folded.value = *av / *bv; return folded;
+                case HirOpKind::Rem:
+                    if (*bv == 0) return std::nullopt;
+                    folded.value = *av % *bv; return folded;
+                case HirOpKind::BitAnd: folded.value = *av & *bv;  return folded;
+                case HirOpKind::BitOr:  folded.value = *av | *bv;  return folded;
+                case HirOpKind::BitXor: folded.value = *av ^ *bv;  return folded;
+                case HirOpKind::Shl: {
+                    if (*bv < 0 || *bv >= 64) return std::nullopt;  // UB
+                    folded.value = static_cast<std::int64_t>(
+                        static_cast<std::uint64_t>(*av) << *bv);
+                    return folded;
+                }
+                case HirOpKind::Shr: {
+                    if (*bv < 0 || *bv >= 64) return std::nullopt;
+                    folded.value = *av >> *bv;  // arith shift on signed
+                    return folded;
+                }
+                case HirOpKind::Eq: folded.value = std::int64_t{*av == *bv}; return folded;
+                case HirOpKind::Ne: folded.value = std::int64_t{*av != *bv}; return folded;
+                case HirOpKind::Lt: folded.value = std::int64_t{*av <  *bv}; return folded;
+                case HirOpKind::Le: folded.value = std::int64_t{*av <= *bv}; return folded;
+                case HirOpKind::Gt: folded.value = std::int64_t{*av >  *bv}; return folded;
+                case HirOpKind::Ge: folded.value = std::int64_t{*av >= *bv}; return folded;
+                default: return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Per-global emission record built during the pre-pass and consumed by
+    // `emitGlobals_` after all functions are lowered.
+    struct PendingGlobal {
+        SymbolId  symbol;
+        TypeId    type;
+        // Mutually exclusive — exactly one set:
+        std::optional<MirLiteralValue> constInit;   // foldable literal
+        HirNodeId                      runtimeInit; // non-constant init expr
+        // Both unset → zero-init (no `=` in the declaration).
+    };
+    std::vector<PendingGlobal> pendingGlobals;
+
+    // Classify each module-level global into pendingGlobals. Called after
+    // `collectGlobals` (so `globalSymbols` is already populated for any
+    // function body that refers to globals during lowering).
+    void classifyGlobals(HirNodeId moduleNode) {
+        for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+            if (hir.kind(decl) != HirKind::Global) continue;
+            PendingGlobal pg;
+            pg.symbol = hir.globalSymbol(decl);
+            pg.type   = hir.globalType(decl);
+            if (auto initN = hir.globalInit(decl); initN.has_value()) {
+                if (auto folded = tryConstFold(*initN); folded.has_value()) {
+                    pg.constInit = std::move(*folded);
+                } else {
+                    pg.runtimeInit = *initN;
+                }
+            }
+            pendingGlobals.push_back(std::move(pg));
+        }
+    }
+
+    // After all functions are lowered, emit the actual MIR for every global.
+    // Discipline: every well-formed global gets its `addGlobal` call FIRST,
+    // unconditionally; the init-function body is built second. A failure in
+    // ONE runtime-init's expression lowering MUST NOT cause unrelated globals
+    // (foldable, zero-init, or other runtime-inits) to be dropped from MIR —
+    // the abort-resilience contract requires the partial module remain
+    // walkable. On a per-init failure we seal that init's Store-emission
+    // with Unreachable and continue with the next; the global itself is
+    // still registered.
+    //   - constant-init  → literalPool.add + addGlobal(type, sym, litIdx)
+    //   - zero-init      → addGlobal(type, sym)
+    //   - runtime-init   → synthesize a `__module_init__` MirFunc whose
+    //                       body Stores each runtime-init value into its
+    //                       global, then `addGlobal(..., initFunc=…)`.
+    // The init function is built ONCE; all runtime-init globals share it.
+    bool emitGlobals_() {
+        if (pendingGlobals.empty()) return true;
+        bool anyRuntime = false;
+        for (auto const& pg : pendingGlobals) {
+            if (pg.runtimeInit.valid()) { anyRuntime = true; break; }
+        }
+        // Step 1: synthesize the init function (header + entry block) up
+        // front so its MirFuncId is known when the addGlobal calls below
+        // reference it. The body is filled in step 3.
+        MirBlockId initEntry{};
+        if (anyRuntime) {
+            TypeId const voidTy = interner.primitive(TypeKind::Void);
+            std::array<TypeId, 0> noParams{};
+            // SysV is the canonical MIR-time placeholder; LIR's calling-
+            // convention pass (ML7) maps to the target's real convention.
+            TypeId const initSig = interner.fnSig(noParams, voidTy, CallConv::CcSysV);
+            moduleInitFunc = mir.addFunction(initSig, SymbolId{});
+            initEntry = mir.createBlock(StructCfMarker::EntryBlock);
+        }
+        // Step 2: addGlobal for every pending entry — unconditional, so
+        // an init-failure later doesn't strip unrelated globals from MIR.
+        bool ok = true;
+        for (auto const& pg : pendingGlobals) {
+            if (!pg.type.valid() || !pg.symbol.valid()) {
+                unsupported(HirNodeId{}, std::format(
+                    "global decl has invalid type/symbol (HIR verifier "
+                    "should have flagged this) — symbol {}", pg.symbol.v));
+                ok = false;
+                continue;
+            }
+            if (pg.constInit.has_value()) {
+                std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
+                mir.addGlobal(pg.type, pg.symbol, idx);
+            } else if (pg.runtimeInit.valid()) {
+                mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc);
+            } else {
+                mir.addGlobal(pg.type, pg.symbol);
+            }
+        }
+        // Step 3: fill the init function's body — Store each runtime
+        // initializer into its global. Per-init failures DO NOT seal the
+        // block or stop processing; lowerExpr returning InvalidMirInst
+        // leaves the open block in a still-Open state (the seal-on-failure
+        // discipline is at the STATEMENT tier, not the expression tier),
+        // so we skip the failing Store and continue with the next init.
+        // Every global was already declared in step 2; this loop only
+        // affects whether each global's initial value is actually
+        // installed at module load.
+        if (anyRuntime) {
+            mir.beginBlock(initEntry);
+            for (auto const& pg : pendingGlobals) {
+                if (!pg.runtimeInit.valid()) continue;
+                MirInstId const val = lowerExpr(pg.runtimeInit);
+                if (!val.valid()) {
+                    // Inner expression lowering already emitted a
+                    // diagnostic; the global is declared but its Store
+                    // is dropped. Subsequent inits get their chance.
+                    ok = false;
+                    continue;
+                }
+                MirInstId const addr = mir.addGlobalAddr(
+                    pg.symbol, interner.pointer(pg.type));
+                std::array<MirInstId, 2> ops{val, addr};
+                mir.addInst(MirOpcode::Store, ops);
+            }
+            if (!mir.openBlockHasTerminator()) mir.addReturn();
+        }
+        return ok;
+    }
+
+    // Lower the whole module: collect function + global symbols, classify
+    // globals into the pending queue, lower each function, then emit globals
+    // (constant-init via literal pool, runtime-init via synthesized init
+    // function). Non-function / non-global top-level decls emit fail-loud
+    // diagnostics — extern declarations are owned by FFI plan 11.
     void lower() {
         HirNodeId const root = hir.root();
         if (!root.valid() || hir.kind(root) != HirKind::Module) {
@@ -1223,23 +1492,20 @@ struct Lowerer {
             return;
         }
         collectFunctions(root);
+        collectGlobals(root);
+        classifyGlobals(root);
         for (HirNodeId decl : hir.moduleDecls(root)) {
             HirKind const dk = hir.kind(decl);
             switch (dk) {
                 case HirKind::Function:
                     if (!lowerFunction(decl)) return;
                     break;
-                // Unsupported top-level kinds emit `H_UnsupportedLoweringForKind`
-                // rather than being silently skipped: a global initializer has
-                // runtime effect, an extern's signature gates codegen later,
-                // and silently passing them would mask real gaps in richer
-                // corpora. Each is tracked as a delimited blocker in plan 12
-                // (`.plans/12-mir-lir` §blockers) / plan 11 (FFI).
                 case HirKind::Global:
-                    unsupported(decl, std::format(
-                        "HIR Global (id {}) — module-level storage is not "
-                        "yet lowered", decl.v));
-                    return;
+                    // Already classified into `pendingGlobals` by the
+                    // pre-pass; deferred to `emitGlobals_` below so a
+                    // synthesized module-init function can be built once
+                    // for ALL runtime-init globals.
+                    break;
                 case HirKind::ExternFunction:
                     unsupported(decl, std::format(
                         "HIR ExternFunction (id {}) — FFI symbol ingestion "
@@ -1267,6 +1533,11 @@ struct Lowerer {
                     return;
             }
         }
+        // Emit deferred globals last: builds the synthesized module-init
+        // function (if any runtime-init globals exist) and then `addGlobal`
+        // for every pending entry. Done after all real functions so the
+        // init function lands at a stable, predictable arena slot.
+        (void)emitGlobals_();
     }
 };
 
@@ -1279,7 +1550,7 @@ HirToMirResult lowerToMir(Hir const&             hir,
                           HirSourceMap const*    sourceMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     Lowerer lwr{hir, literals, interner, reporter, sourceMap, MirBuilder{},
-                {}, {}, {}, {}};
+                {}, {}, {}, {}, {}, {}};
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
