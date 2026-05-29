@@ -1161,15 +1161,15 @@ private:
     [[nodiscard]] MirBlockId resolveBlockRef(std::uint32_t slot) {
         auto it = blockMap_.find(slot);
         if (it != blockMap_.end()) return it->second;
-        // Forward reference: create a Linear block now; the actual
-        // header will overwrite the marker via createBlock... but
-        // MirBuilder doesn't allow marker changes after create. So
-        // create the block on first reference with Linear marker; if
-        // the header later wants a different marker, that's a
-        // mismatch.  Real solution: a single pass that pre-scans all
-        // block headers. For cycle 1, we accept Linear default for
-        // forward refs and emit a malformed diagnostic if the header
-        // disagrees later.
+        // Reached only on MALFORMED input: a `br`/`condbr`/`switch`
+        // names a block-slot that was not declared as a `block %bN`
+        // header. `scanBlockHeaders` would have pre-created every
+        // declared block; the lookup miss here means the reference
+        // is to a non-existent block. Create a Linear placeholder
+        // so the builder doesn't abort; the verify-on-load pass
+        // will flag the orphan (block created but never filled, OR
+        // referenced from a terminator whose target doesn't appear
+        // in the function's block range).
         MirBlockId const b = builder_.createBlock(StructCfMarker::Linear);
         blockMap_[slot] = b;
         return b;
