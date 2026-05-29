@@ -1,5 +1,6 @@
 #include "core/types/target_schema.hpp"
 
+#include "core/substrate/relocation_table.hpp"
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -691,31 +692,8 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     //     reference uses `name` as the lookup key (plan 14 §2.0);
     //     an empty name would silently mis-resolve to whichever
     //     format-side row also has an empty key.
-    {
-        std::unordered_map<RelocationKind, std::size_t> seenKind;
-        for (std::size_t i = 0; i < relocations.size(); ++i) {
-            auto const& r = relocations[i];
-            if (r.name.empty()) {
-                fail(std::format("/relocations/{}/name", i),
-                     "relocation row: 'name' must be a non-empty string");
-            }
-            if (!r.kind.valid()) {
-                fail(std::format("/relocations/{}/kind", i),
-                     std::format("relocation '{}': 'kind' must be != 0 "
-                                 "(slot 0 is reserved as the invalid sentinel)",
-                                 r.name));
-                continue;  // skip the uniqueness check for the bad row
-            }
-            auto [it, fresh] = seenKind.emplace(r.kind, i);
-            if (!fresh) {
-                fail(std::format("/relocations/{}/kind", i),
-                     std::format("relocation '{}': duplicate 'kind' value {} "
-                                 "(already declared by relocation '{}' at /relocations/{})",
-                                 r.name, r.kind.v,
-                                 relocations[it->second].name, it->second));
-            }
-        }
-    }
+    substrate::validateRelocationsTable<TargetRelocationInfo>(
+        relocations, fail);
 
     // ── Calling conventions ──────────────────────────────────────
     // Three gates here, in order:

@@ -1,5 +1,6 @@
 #include "link/object_format_schema.hpp"
 
+#include "core/substrate/relocation_table.hpp"
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -7,7 +8,6 @@
 #include <format>
 #include <fstream>
 #include <sstream>
-#include <unordered_map>
 #include <utility>
 
 namespace dss {
@@ -65,35 +65,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "declare one of 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
     }
 
-    // Same discipline as `TargetSchemaData::validate()` for the
-    // assembler-side relocations table — substrate-tier so the
-    // format-side row always satisfies the cross-reference contract
-    // with plan 13 §2.6.
-    {
-        std::unordered_map<RelocationKind, std::size_t> seenKind;
-        for (std::size_t i = 0; i < relocations.size(); ++i) {
-            auto const& r = relocations[i];
-            if (r.name.empty()) {
-                fail(std::format("/relocations/{}/name", i),
-                     "relocation row: 'name' must be a non-empty string");
-            }
-            if (!r.kind.valid()) {
-                fail(std::format("/relocations/{}/kind", i),
-                     std::format("relocation '{}': 'kind' must be != 0 "
-                                 "(slot 0 is reserved as the invalid sentinel)",
-                                 r.name));
-                continue;
-            }
-            auto [it, fresh] = seenKind.emplace(r.kind, i);
-            if (!fresh) {
-                fail(std::format("/relocations/{}/kind", i),
-                     std::format("relocation '{}': duplicate 'kind' value {} "
-                                 "(already declared by relocation '{}' at /relocations/{})",
-                                 r.name, r.kind.v,
-                                 relocations[it->second].name, it->second));
-            }
-        }
-    }
+    // Cross-row reloc uniqueness + non-empty-name + non-zero-kind:
+    // shared substrate with TargetSchema so the two sides of plan
+    // 13 §2.6's reloc-taxonomy unifier are validated identically.
+    substrate::validateRelocationsTable<ObjectFormatRelocationInfo>(
+        relocations, fail);
 
     return problems;
 }

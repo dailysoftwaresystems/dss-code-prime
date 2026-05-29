@@ -1,6 +1,8 @@
 #include "core/types/target_schema.hpp"
 
+#include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
+#include "core/substrate/relocation_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
 #include <nlohmann/json.hpp>
@@ -20,13 +22,7 @@ namespace {
 
 using json = nlohmann::json;
 
-struct Collector {
-    std::vector<ConfigDiagnostic> diagnostics;
-    void emit(DiagnosticCode code, std::string path, std::string message,
-              DiagnosticSeverity sev = DiagnosticSeverity::Error) {
-        diagnostics.push_back({code, sev, std::move(path), std::move(message)});
-    }
-};
+using Collector = substrate::DiagnosticCollector;
 
 [[nodiscard]] std::optional<TargetResultRule> parseResultRule(std::string_view s) noexcept {
     if (s == "none")     return TargetResultRule::None;
@@ -401,72 +397,25 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // zero `kind`, non-empty `name`. `formula` is opaque to the
     // substrate — stored verbatim for diagnostic display and for
     // the linker's `*.format.json` human-readable cross-reference.
-    if (doc.contains("relocations")) {
-        if (!doc.at("relocations").is_array()) {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/relocations",
-                      "'relocations' must be an array");
-        } else {
-            auto const& rels = doc.at("relocations");
-            data.relocations.reserve(rels.size());
-            for (std::size_t i = 0; i < rels.size(); ++i) {
-                auto const& r = rels[i];
-                if (!r.is_object()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/relocations/{}", i),
-                              "relocation entry must be an object");
-                    continue;
+    substrate::loadRelocationsTable<TargetRelocationInfo>(
+        doc, data.relocations, data.relocationNameIndex,
+        data.relocationKindIndex, coll,
+        [](nlohmann::json const& r, TargetRelocationInfo& info,
+           Collector& c, std::size_t i) -> bool {
+            // Target-side extension field: opaque `formula` text
+            // (e.g. "S + A - P - 4"). Stored verbatim — the linker
+            // applies it; the substrate doesn't parse it.
+            if (r.contains("formula")) {
+                if (!r.at("formula").is_string()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/formula", i),
+                           "'formula' must be a string");
+                } else {
+                    info.formula = r.at("formula").get<std::string>();
                 }
-                TargetRelocationInfo info;
-                if (!r.contains("name") || !r.at("name").is_string()) {
-                    coll.emit(DiagnosticCode::C_MissingField,
-                              std::format("/relocations/{}/name", i),
-                              "missing or non-string 'name'");
-                    continue;
-                }
-                info.name = r.at("name").get<std::string>();
-                if (!r.contains("kind") || !r.at("kind").is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MissingField,
-                              std::format("/relocations/{}/kind", i),
-                              "missing or non-integer 'kind' (must be a "
-                              "non-zero uint32 — the opaque tag the "
-                              "assembler stamps onto Relocation::kind)");
-                    continue;
-                }
-                {
-                    std::int64_t const v = r.at("kind").get<std::int64_t>();
-                    if (v < 0 || v > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  std::format("/relocations/{}/kind", i),
-                                  std::format("'kind' ({}) must fit in [0, {}]",
-                                              v, std::numeric_limits<std::uint32_t>::max()));
-                        continue;
-                    }
-                    info.kind = RelocationKind{static_cast<std::uint32_t>(v)};
-                }
-                if (r.contains("formula")) {
-                    if (!r.at("formula").is_string()) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  std::format("/relocations/{}/formula", i),
-                                  "'formula' must be a string");
-                    } else {
-                        info.formula = r.at("formula").get<std::string>();
-                    }
-                }
-                std::uint16_t const idx =
-                    static_cast<std::uint16_t>(data.relocations.size());
-                bool const freshName =
-                    data.relocationNameIndex.emplace(info.name, idx).second;
-                if (!freshName) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/relocations/{}/name", i),
-                              std::format("duplicate relocation name '{}'", info.name));
-                    continue;
-                }
-                (void)data.relocationKindIndex.emplace(info.kind, idx);
-                data.relocations.push_back(std::move(info));
             }
-        }
-    }
+            return true;
+        });
 
     // ── opcodes ──
     if (!doc.contains("opcodes") || !doc.at("opcodes").is_array()) {
@@ -812,12 +761,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         coll.diagnostics.push_back(std::move(problem));
     }
 
-    if (!coll.diagnostics.empty()) {
-        bool fatal = false;
-        for (auto const& d : coll.diagnostics) {
-            if (d.severity == DiagnosticSeverity::Error) { fatal = true; break; }
-        }
-        if (fatal) return std::unexpected(std::move(coll.diagnostics));
+    if (coll.hasErrors()) {
+        return std::unexpected(std::move(coll.diagnostics));
     }
 
     return std::make_shared<TargetSchema>(std::move(data));

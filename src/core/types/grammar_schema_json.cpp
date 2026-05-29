@@ -1,5 +1,6 @@
 #include "core/types/grammar_schema_json.hpp"
 
+#include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/operator_table.hpp"
@@ -76,19 +77,7 @@ constexpr std::string_view kBuiltinTokenKindNames[] = {
     "Newline",
 };
 
-struct Collector {
-    std::vector<ConfigDiagnostic> diagnostics;
-
-    void emit(DiagnosticCode code, std::string path, std::string message,
-              DiagnosticSeverity sev = DiagnosticSeverity::Error) {
-        diagnostics.push_back({code, sev, std::move(path), std::move(message)});
-    }
-
-    [[nodiscard]] bool hasErrors() const noexcept {
-        return std::ranges::any_of(diagnostics,
-            [](auto const& d) { return d.severity == DiagnosticSeverity::Error; });
-    }
-};
+using Collector = substrate::DiagnosticCollector;
 
 // Soft upper bound on how many entries a single scopeRequire list may
 // hold. Real configs use 1–4; anything larger is almost certainly a
@@ -187,7 +176,7 @@ void parseModeFields(json const& m,
 //     compiled at load time via std::regex to surface malformed patterns.
 inline std::optional<StringStyle> parseStringStyle(json const& obj,
                                                    std::string const& path,
-                                                   struct Collector& c);
+                                                   Collector& c);
 
 std::optional<StringStyle> parseStringStyle(json const& obj,
                                             std::string const& path,
