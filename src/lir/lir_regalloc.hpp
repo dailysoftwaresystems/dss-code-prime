@@ -107,6 +107,14 @@ struct DSS_EXPORT LirRegAssignment {
 // allocation: the result carries empty `assignments` and `ok = false`.
 struct DSS_EXPORT LirFuncAllocation {
     LirFuncId                     fn{};
+    // Stamp of the source function's `symbol` field at allocation
+    // time. Downstream passes (ML6 cycle 3b rewrite, ML7 callconv)
+    // produce fresh `Lir` modules with new arena tags, so
+    // `forFunc(LirFuncId)` lookups can't survive the pipeline.
+    // Symbol-id is stable across passes (the rewrite preserves it),
+    // so a per-function `originalSymbol` cross-check structurally
+    // detects reorder/drop drift in the parallel-index contract.
+    SymbolId                      originalSymbol{};
     std::vector<LirRegAssignment> assignments;
     std::uint32_t                 numSpillSlots = 0;
     bool                          ok            = true;

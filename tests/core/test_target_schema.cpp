@@ -590,11 +590,12 @@ TEST(TargetSchema, LinkRegisterResolvesToDeclaredGpr) {
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "registers":[
               {"name":"x0","class":"gpr","widthBytes":8},
+              {"name":"sp","class":"gpr","widthBytes":8},
               {"name":"x30","class":"gpr","widthBytes":8}
             ],
             "callingConventions":[
               {"name":"aapcs64","argGprs":["x0"],"linkRegister":"x30",
-               "stackAlignment":16}
+               "stackPointer":"sp","stackAlignment":16}
             ]})");
     ASSERT_TRUE(r.has_value())
         << "linkRegister resolving to a declared GPR must validate";

@@ -177,6 +177,52 @@ void checkVregClassMatchesMirType(
     }
 }
 
+// Rule 4: IntrinsicCall result-validity. For every LIR `intrinsic_call`
+// inst whose source MIR inst is a MIR `IntrinsicCall`, the LIR
+// result-reg presence must match the MIR result type — Void MIR
+// type → LIR result MUST be `InvalidLirReg`; non-Void MIR type → LIR
+// result MUST be valid. Closes the cycle-3e D-3e.2 deferral.
+void checkIntrinsicCallResultValidity(Lir const& lir, Mir const& mir,
+                                      TypeInterner const& interner,
+                                      TargetSchema const& schema,
+                                      std::span<MirInstId const> map,
+                                      DiagnosticReporter& reporter) {
+    auto const icOp = schema.opcodeByMnemonic("intrinsic_call");
+    if (!icOp.has_value()) return;
+    std::size_t const fnCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const bb = lir.funcBlockAt(fn, bi);
+            std::uint32_t const n = lir.blockInstCount(bb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const li = lir.blockInstAt(bb, i);
+                if (lir.instOpcode(li) != *icOp) continue;
+                MirInstId const src = sourceMirInst(map, li);
+                if (!src.valid()) continue;
+                if (mir.instOpcode(src) != MirOpcode::IntrinsicCall) continue;
+                TypeId const mty = mir.instType(src);
+                bool const mirVoid = !mty.valid()
+                    || interner.kind(mty) == TypeKind::Void;
+                bool const lirHasResult = lir.instResult(li).valid();
+                if (mirVoid && lirHasResult) {
+                    report(reporter, std::format(
+                        "LirVerifier: intrinsic_call LIR inst {} produced a "
+                        "result reg but MIR inst %{} has Void type",
+                        li.v, src.v));
+                }
+                if (!mirVoid && !lirHasResult) {
+                    report(reporter, std::format(
+                        "LirVerifier: intrinsic_call LIR inst {} has no "
+                        "result reg but MIR inst %{} has a non-Void type",
+                        li.v, src.v));
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 LirVerifyResult verifyLir(Lir const&                  lir,
@@ -189,6 +235,7 @@ LirVerifyResult verifyLir(Lir const&                  lir,
     checkMemOperandPairing(lir, schema, reporter);
     checkStoreRegClassMatchesMirType(lir, mir, interner, schema, lirToMirMap, reporter);
     checkVregClassMatchesMirType(lir, mir, interner, lirToMirMap, reporter);
+    checkIntrinsicCallResultValidity(lir, mir, interner, schema, lirToMirMap, reporter);
     return {reporter.errorCount() == baseline};
 }
 
@@ -197,8 +244,8 @@ LirVerifyResult verifyLir(Lir const&                  lir,
 bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
                            DiagnosticReporter& reporter) {
     auto const baseline = reporter.errorCount();
-    auto const frameLoadOp  = schema.opcodeByMnemonic("frame_load");
-    auto const frameStoreOp = schema.opcodeByMnemonic("frame_store");
+    auto const frameLoadOp  = schema.opcodeByMnemonic(schema.frameLoadMnemonic());
+    auto const frameStoreOp = schema.opcodeByMnemonic(schema.frameStoreMnemonic());
     auto checkPhys = [&](LirReg r, char const* what, std::uint32_t instV) {
         if (r.valid() && r.isPhysical == 0) {
             ParseDiagnostic d;

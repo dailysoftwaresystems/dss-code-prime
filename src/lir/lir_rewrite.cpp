@@ -228,8 +228,8 @@ rewriteOneFunc(Lir const&               src,
     bool scratchOk = true;
     ScratchPerClass const scratch = pickScratchRegs(schema, alloc, reporter, scratchOk);
     if (!scratchOk) return false;
-    auto const frameLoadOp  = schema.opcodeByMnemonic("frame_load");
-    auto const frameStoreOp = schema.opcodeByMnemonic("frame_store");
+    auto const frameLoadOp  = schema.opcodeByMnemonic(schema.frameLoadMnemonic());
+    auto const frameStoreOp = schema.opcodeByMnemonic(schema.frameStoreMnemonic());
     if (!frameLoadOp.has_value() || !frameStoreOp.has_value()) {
         report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                DiagnosticSeverity::Error,

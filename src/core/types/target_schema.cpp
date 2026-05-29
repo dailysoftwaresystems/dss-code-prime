@@ -226,6 +226,10 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             std::span<std::string const> linkRefs{&cc.linkRegister->name, 1};
             checkRefs(i, "linkRegister", linkRefs, TargetRegClass::GPR);
         }
+        if (cc.stackPointer.has_value()) {
+            std::span<std::string const> spRefs{&cc.stackPointer->name, 1};
+            checkRefs(i, "stackPointer", spRefs, TargetRegClass::GPR);
+        }
 
         // Stack alignment must be a power of two when ANY ABI field is
         // set (since the call frame is meaningless without it). Zero is
@@ -255,6 +259,18 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                          std::format("callingConvention '{}': redZoneBytes ({}) must be a multiple of stackAlignment ({})",
                                      cc.name, cc.redZoneBytes, cc.stackAlignment));
                 }
+            }
+            // ML7 callconv lowering requires a stack-pointer register
+            // for any register-machine cc carrying ABI info. Surface
+            // the misconfiguration at schema-load time instead of
+            // letting ML7 fail at run time with a misleading
+            // "missing opcode" diagnostic.
+            if (abiModel == TargetAbiModel::RegisterMachine
+                && !cc.stackPointer.has_value()) {
+                fail(std::format("/callingConventions/{}/stackPointer", i),
+                     std::format("callingConvention '{}': register-machine ABI "
+                                 "requires a stackPointer register declaration",
+                                 cc.name));
             }
         }
     }

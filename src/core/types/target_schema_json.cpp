@@ -127,6 +127,17 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             return std::unexpected(std::move(coll.diagnostics));
         }
     }
+    // Optional frame-op mnemonic overrides (default "frame_load" /
+    // "frame_store" on TargetSchemaData). A target may rename the
+    // pseudo-ops without breaking the rewrite/verifier substrate.
+    if (target.contains("frameLoadMnemonic")
+        && target.at("frameLoadMnemonic").is_string()) {
+        data.frameLoadMnemonic = target.at("frameLoadMnemonic").get<std::string>();
+    }
+    if (target.contains("frameStoreMnemonic")
+        && target.at("frameStoreMnemonic").is_string()) {
+        data.frameStoreMnemonic = target.at("frameStoreMnemonic").get<std::string>();
+    }
 
     // ── opcodes ──
     if (!doc.contains("opcodes") || !doc.at("opcodes").is_array()) {
@@ -344,13 +355,29 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 name, it->second
                             };
                         } else {
-                            // Emit the diagnostic NOW so the cycle-3b
-                            // validate() catches it even when the name's
-                            // string is not retained. (Validate() also
-                            // re-checks via the optional's presence.)
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       std::format("{}/linkRegister", ccPath),
                                       std::format("link register '{}' is not "
+                                                  "in the register table", name));
+                        }
+                    }
+                }
+                if (c.contains("stackPointer")) {
+                    if (!c.at("stackPointer").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/stackPointer", ccPath),
+                                  "must be a register-name string");
+                    } else {
+                        auto const name = c.at("stackPointer").get<std::string>();
+                        auto it = data.registerIndex.find(name);
+                        if (it != data.registerIndex.end()) {
+                            cc.stackPointer = TargetCallingConvention::StackPointerRef{
+                                name, it->second
+                            };
+                        } else {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/stackPointer", ccPath),
+                                      std::format("stack pointer '{}' is not "
                                                   "in the register table", name));
                         }
                     }

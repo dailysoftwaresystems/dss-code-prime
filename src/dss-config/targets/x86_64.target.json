@@ -422,6 +422,7 @@
                       "xmm0", "xmm1", "xmm2",  "xmm3",  "xmm4",  "xmm5",  "xmm6",  "xmm7",
                       "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"],
       "calleeSaved": ["rbx", "rbp", "r12", "r13", "r14", "r15"],
+      "stackPointer": "rsp",
       "stackAlignment":   16,
       "shadowSpaceBytes": 0,
       "redZoneBytes":     128
@@ -438,6 +439,7 @@
       "calleeSaved": ["rbx", "rbp", "rdi", "rsi", "r12", "r13", "r14", "r15",
                       "xmm6", "xmm7", "xmm8",  "xmm9",  "xmm10",
                       "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"],
+      "stackPointer": "rsp",
       "stackAlignment":   16,
       "shadowSpaceBytes": 32,
       "redZoneBytes":     0

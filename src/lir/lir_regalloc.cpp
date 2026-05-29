@@ -309,6 +309,7 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                                   bool schemaOk) {
     LirFuncAllocation out;
     out.fn = flow.fn;
+    out.originalSymbol = SymbolId{lir.funcArena().at(flow.fn).symbol};
     auto const baseline = reporter.errorCount();
     if (!schemaOk) {
         // Schema-wide error already reported by the caller; mark this

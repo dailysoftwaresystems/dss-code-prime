@@ -221,6 +221,18 @@ struct DSS_EXPORT TargetCallingConvention {
         std::uint16_t ordinal = 0;
     };
     std::optional<LinkRegisterRef> linkRegister;
+
+    // Stack-pointer register. Required for any register-machine ABI —
+    // ML7 callconv lowering uses this register's ordinal as the base
+    // for prologue/epilogue stack adjustments and frame_load/store
+    // memory addressing. Name + ordinal are populated atomically by
+    // the loader (same discipline as `linkRegister`); empty optional
+    // means a stack-pointer-less target (operand-stack VMs).
+    struct StackPointerRef {
+        std::string   name;
+        std::uint16_t ordinal = 0;
+    };
+    std::optional<StackPointerRef> stackPointer;
 };
 
 // Per-opcode descriptor — populated from the JSON `opcodes` array.
@@ -277,6 +289,16 @@ struct DSS_EXPORT TargetSchemaData {
     // fields.
     std::vector<TargetOpcodeInfo> opcodes;
     substrate::TransparentStringMap<std::uint16_t> mnemonicIndex;
+
+    // Frame-op opcode role tags — the schema-side name of the
+    // pseudo-ops that the post-regalloc rewrite pass emits and ML7
+    // callconv lowering consumes. Defaults are "frame_load" /
+    // "frame_store" but a target may override (e.g. a hypothetical
+    // target with a `spill_reload` mnemonic instead of `frame_load`).
+    // Empty string means the target does not declare frame pseudo-ops
+    // (operand-stack ABIs).
+    std::string frameLoadMnemonic  = "frame_load";
+    std::string frameStoreMnemonic = "frame_store";
 
     // Physical register file (cycle 2b). Empty when the target JSON
     // omits the `registers` array — keeps the cycle 2a-shape targets
@@ -337,6 +359,12 @@ public:
     [[nodiscard]] std::string_view  name()     const noexcept { return d_.name; }
     [[nodiscard]] std::string_view  version()  const noexcept { return d_.version; }
     [[nodiscard]] TargetAbiModel    abiModel() const noexcept { return d_.abiModel; }
+    [[nodiscard]] std::string_view  frameLoadMnemonic()  const noexcept {
+        return d_.frameLoadMnemonic;
+    }
+    [[nodiscard]] std::string_view  frameStoreMnemonic() const noexcept {
+        return d_.frameStoreMnemonic;
+    }
 
     // ── Opcodes ─────────────────────────────────────────────────
     [[nodiscard]] std::span<TargetOpcodeInfo const> opcodes() const noexcept {
