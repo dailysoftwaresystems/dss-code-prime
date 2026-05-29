@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1.x deliverable (post-v1 — not in the initial 6-combo native matrix). The IR design must NOT foreclose it from day one. |
-| Predecessors  | [`09-hir-plan`](09-hir-plan%20-%20tbd.md) (HIR shape), [`12-mir-lir-plan`](12-mir-lir-plan%20-%20tbd.md) (structured-CF markers preserved through MIR — load-bearing), [`06-artifact-profile-plan`](06-artifact-profile-plan%20-%20tbd.md) (`web-wasm` profile selection). |
+| Predecessors  | [`09-hir-plan`](09-hir-plan%20-%20ok.md) (HIR shape), [`12-mir-lir-plan`](12-mir-lir-plan%20-%20tbd.md) (structured-CF markers preserved through MIR — load-bearing), [`06-artifact-profile-plan`](06-artifact-profile-plan%20-%20tbd.md) (`web-wasm` profile selection). |
 | Successors    | [`14-linker-plan`](14-linker-plan%20-%20tbd.md) LK8 (WASM "linking" — Function/Table index renumbering, Import/Export merge); [`15-debug-info-plan`](15-debug-info-plan%20-%20tbd.md) (WASM DWARF / custom-section debug names). |
 | Scope         | **Bounded.** WA1–WA10 below. v1.x = MVP single-module, single-memory, JS-host + WASI `preview1`. Reserved post-v1.x: SIMD, threads, GC types, component model, exception handling. |
 
@@ -241,7 +241,7 @@ Sequencing: WA1 → WA2 → WA3 → WA4 is the critical path (encoder, then leaf
 
 ## 7. Sequencing
 
-- **Depends on:** [`09-hir-plan`](09-hir-plan%20-%20tbd.md) (HIR shape), [`12-mir-lir-plan`](12-mir-lir-plan%20-%20tbd.md) (structured-CF marker preservation through MIR — load-bearing), [`06-artifact-profile-plan`](06-artifact-profile-plan%20-%20tbd.md) (`web-wasm-browser` / `web-wasm-wasi` profiles).
+- **Depends on:** [`09-hir-plan`](09-hir-plan%20-%20ok.md) (HIR shape), [`12-mir-lir-plan`](12-mir-lir-plan%20-%20tbd.md) (structured-CF marker preservation through MIR — load-bearing), [`06-artifact-profile-plan`](06-artifact-profile-plan%20-%20tbd.md) (`web-wasm-browser` / `web-wasm-wasi` profiles).
 - **Coordinates with:** [`14-linker-plan`](14-linker-plan%20-%20tbd.md) LK8 (WASM "linker" duties live there); [`15-debug-info-plan`](15-debug-info-plan%20-%20tbd.md) (WASM DWARF custom-section embedding); [`17-shader-gpu-plan`](17-shader-gpu-plan%20-%20tbd.md) (sidecar `.imports.json` precedent mirrors `.spv.json`).
 - **Runs in parallel with:** native codegen — does NOT block any v1 6-combo native matrix work. Both backends consume the same MIR; both benefit from MIR optimizer improvements; neither is on the other's critical path.
 - **Post-v1.x.** This plan ships in v1.x, AFTER the v1 native matrix is green. Designing it now ensures the IR layering accommodates WASM from day one; the IMPLEMENTATION lands after v1.

@@ -1,14 +1,16 @@
 # In-tree Linker — Sub-Plan (14)
 
-> Owns the **per-format object writers** (ELF, PE/COFF, Mach-O, WASM, SPIR-V) and the **linker engine** (symbol resolution, relocation application, section layout, per-platform metadata). Consumes (bytes, relocations, symbols) from the [in-tree assembler](./13-assembler-plan%20-%20tbd.md); produces final-form binaries.
+> Owns the **object-format engine** (one language-blind C++ engine that reads JSON-configured format schemas) and the **linker engine** (symbol resolution, relocation application, section layout, per-platform metadata). Consumes (bytes, relocations, symbols) from the [in-tree assembler](./13-assembler-plan%20-%20tbd.md); produces final-form binaries.
 >
 > Per the user's mandate ("we will be the process from source to targets"), **no `ld` / `link.exe` / `ld64` / `lld` / `wasm-ld` invocation**. This is the single largest backend chunk of v1.
+>
+> **Universal-compiler thesis extension (rev 3 — 2026-05-29).** Object formats are **100% config-driven** — mirroring [`GrammarSchema`](./05-parser-plan%20-%20ok.md) on the frontend and [`TargetSchema`](./12-mir-lir-plan%20-%20tbd.md) on the backend ISA tier. Each object format (ELF, PE/COFF, Mach-O, WASM, SPIR-V) is a JSON file in `src/dss-config/object-formats/<name>.format.json` declaring section taxonomy, symbol-table layout, relocation kinds, per-format metadata sections, and (where applicable) dynamic-linking constructs. ONE language-blind C++ engine reads the JSON to emit bytes — there is NO per-format C++ writer. Adding a new object format = drop a new JSON file, no engine edits. Honors thesis decision #4 ("config-driven everything") end-to-end.
 
 ## 0. Status (snapshot)
 
 | | |
 |---|---|
-| Status        | ⏳ **planned.** v1 production-critical. Largest single chunk of backend work. |
+| Status        | ⏳ **planned.** v1 production-critical. Largest single chunk of backend work. **Plan rev 3 (2026-05-29): object formats are JSON-configured** (mirrors `GrammarSchema` + `TargetSchema` pattern) — one engine, no per-format C++. |
 | Predecessors  | ⏳ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) (bytes + relocations). ⏳ [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) (extern symbol declarations from precompiled libs). |
 | Successors    | ⏳ [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) (LC_CODE_SIGNATURE / PE security directory placeholders filled post-link). ⏳ [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) (debug sections placed alongside code). |
 | Scope         | **Bounded.** v1: LK1–LK10. v1 acceptance: link c-subset corpus → ELF / PE / Mach-O on every {OS × arch}. WASM (LK8) + SPIR-V (LK9) post-v1 skeletons. **v1.x: LK11** — cross-CU linking (couples with [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) CU6). |
@@ -17,42 +19,64 @@
 
 ## 1. Motivation
 
-Hermetic per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1.1 — no `ld` / `link.exe` / `ld64` invocation. Three payoffs:
+Hermetic per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1.1 — no `ld` / `link.exe` / `ld64` invocation. Four payoffs:
 
-1. **Apple-host-free local dev.** Mach-O writer in-tree eliminates the `osxcross`/`xcrun` dependency.
+1. **Apple-host-free local dev.** Mach-O emission via the in-tree config-driven engine eliminates the `osxcross`/`xcrun` dependency.
 2. **WASM + SPIR-V unification.** Same plumbing covers native, browser, GPU.
 3. **Reproducibility.** Deterministic build-id; no embedded timestamps/paths/version-strings.
+4. **Config-driven object formats.** Every supported format (ELF / PE / Mach-O / WASM / SPIR-V) is a JSON file, not C++. The engine is target-blind + format-blind; format-specific knowledge lives in `*.format.json` schemas validated at load time. Same thesis decision #4 discipline that makes the frontend onboard a new source language via one JSON file (`GrammarSchema`) and the backend ISA tier onboard a new processor via one JSON file (`TargetSchema`).
 
 ---
 
 ## 2. Design
 
+### 2.0 Config-driven object formats (rev 3)
+
+Mirroring `src/dss-config/sources/*.lang.json` (frontend) and `src/dss-config/targets/*.target.json` (backend ISA), each object format is one JSON file under `src/dss-config/object-formats/`:
+
+- `elf.format.json` — ELF64 little-endian, section taxonomy (`.text`/`.data`/`.rodata`/`.bss`/`.debug_*`/…), program-header types (PT_LOAD/PT_DYNAMIC/PT_INTERP/PT_GNU_STACK/PT_GNU_RELRO), dynamic-section entries (DT_NEEDED/DT_HASH/DT_GNU_HASH/DT_RELA/…), relocation kinds (R_X86_64_64/R_AARCH64_ABS64/…), build-id placement (`.note.gnu.build-id`).
+- `pe.format.json` — Section table (file/virtual alignment), import table (`.idata` + IAT), unwind info (`.pdata` + `.xdata`), exception/debug directory entries, signing window (`IMAGE_DIRECTORY_ENTRY_SECURITY` placeholder).
+- `macho.format.json` — Segments (file/virtual alignment), load commands (LC_SEGMENT_64, LC_DYLD_INFO, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_UUID, LC_CODE_SIGNATURE placeholder), chained fixups (Apple Silicon), bind/lazy/rebase opcode tables.
+- `wasm.format.json` — Module sections (type/import/function/table/memory/global/export/start/elem/code/data), name section convention, custom section taxonomy.
+- `spirv.format.json` — Module header (magic/version/generator/bound/schema), section ordering convention (capability/extension/extinstimport/memorymodel/entrypoint/executionmode/...), debug info layout.
+
+The schema vocabulary is universal: every format declares its `sections[]` (kind + flags + alignment), its `symbolTable` (entry layout, kinds, binding/visibility encodings), its `relocations[]` (kind name → operator + bit-width + signed-ness + applies-to-section-kind), its `metadataSections[]` (build-id / signing window / debug-id placement), and its `imports`/`exports` model (for formats that have one). The ENGINE is one set of headers/cpp files under `src/link/` reading `ObjectFormatSchema`; format-specific bit-twiddling lives only in JSON-declared encoders (the schema declares which bytes go where, the engine packs them).
+
+Loader pattern mirrors `TargetSchema::loadShipped`/`GrammarSchema::loadShipped`:
+
+```cpp
+auto fmt = ObjectFormatSchema::loadShipped("elf");
+LinkResult bin = link(input, *fmt, /*architecture=*/"x86_64", reporter);
+```
+
+`O_*` diagnostic family at 0xC00x for object-format validation (mirrors `L_*` 0xB00x for LIR, `I_*` 0xA00x for MIR, `H_*` 0xF00x for HIR).
+
+**Cross-cutting consequence**: the v1 acceptance for "link c-subset to ELF/PE/Mach-O across {OS × arch}" is met by **3 JSON files + 1 engine**, not 3 separate C++ writers. Adding a new format (e.g., COFF for embedded; XCOFF for AIX; a-out for retro) = new JSON file, no engine edits.
+
 ### 2.1 Files
 
 ```
 src/link/
-├── linker.hpp / .cpp            # Engine: resolve + relocate + lay out
-├── symbol_table.hpp / .cpp      # Defined / undefined / weak / local / hidden
-├── section.hpp                  # SectionFlags, SectionKind, layout primitives
-├── relocation_apply.hpp / .cpp  # Per (arch × format) relocation mutators
-├── tls.hpp / .cpp               # Per-platform TLS lowering
-├── objfmt/
-│   ├── elf/
-│   │   ├── elf_writer.hpp / .cpp   # LK1
-│   │   └── elf_dynamic.hpp / .cpp  # .dynamic / GNU_HASH / .interp
-│   ├── pe/
-│   │   ├── pe_writer.hpp / .cpp    # LK2
-│   │   └── pe_imports.hpp / .cpp   # .idata / IAT / .pdata / .xdata
-│   ├── macho/
-│   │   ├── macho_writer.hpp / .cpp # LK3
-│   │   ├── macho_chained.hpp/.cpp  # Chained fixups (Apple Silicon)
-│   │   └── macho_lc_dyld.hpp/.cpp  # LC_DYLD_INFO bind/lazy/rebase opcodes
-│   ├── wasm/
-│   │   └── wasm_writer.hpp / .cpp  # LK8 (skeleton)
-│   └── spirv/
-│       └── spirv_writer.hpp / .cpp # LK9 (skeleton)
-└── build_id.hpp / .cpp          # BLAKE3-based deterministic build-id
+├── linker.hpp / .cpp                   # Engine: resolve + relocate + lay out
+├── object_format_schema.hpp / .cpp / _json.cpp
+│                                       # ObjectFormatSchema + loadShipped (mirrors TargetSchema)
+├── object_format_data.hpp              # detail::ObjectFormatData PODs (sections / symbols / relocs / metadata)
+├── object_writer.hpp / .cpp            # ONE engine reading ObjectFormatSchema; emits bytes for any declared format
+├── symbol_table.hpp / .cpp             # Defined / undefined / weak / local / hidden — format-blind
+├── section.hpp                         # SectionFlags, SectionKind, layout primitives — format-blind
+├── relocation_apply.hpp / .cpp         # Per (arch × format) mutator dispatch via schema.relocationKind(name)
+├── tls.hpp / .cpp                      # Per-platform TLS lowering — config-driven via schema's TLS model
+└── build_id.hpp / .cpp                 # BLAKE3-based deterministic build-id; placement schema-driven
+
+src/dss-config/object-formats/
+├── elf.format.json                     # LK1 — ELF64 LE; section/symbol/reloc/dynamic schema
+├── pe.format.json                      # LK2 — PE/COFF; section table + import/export + unwind schema
+├── macho.format.json                   # LK3 — Mach-O 64; load-command + chained-fixups schema
+├── wasm.format.json                    # LK8 (post-v1 skeleton)
+└── spirv.format.json                   # LK9 (post-v1 skeleton)
 ```
+
+The old `src/link/objfmt/elf/`, `objfmt/pe/`, `objfmt/macho/`, `objfmt/wasm/`, `objfmt/spirv/` per-format-writer C++ trees (rev 1/2 sketch) are DELETED — collapsed into `*.format.json` schemas + the single `object_writer.hpp` engine.
 
 ### 2.2 Engine
 
@@ -129,7 +153,7 @@ v1: implement initial-exec model for static binaries; general-dynamic reserved p
 
 ### 2.10 Diagnostic namespace
 
-`K_*` (K for "linK") — `K_SymbolUndefined`, `K_SymbolRedefined`, `K_RelocationOverflow`, `K_RelocationKindMismatch`, `K_SectionOverlap`, `K_ImportUnresolved`, `K_InvalidLoadCommand` (Mach-O), `K_InvalidPeHeader`, `K_InvalidElfHeader`, `K_TlsModelUnsupported`. Per-format writers also emit `K_*` codes scoped to their format.
+`K_*` (K for "linK") — `K_SymbolUndefined`, `K_SymbolRedefined`, `K_RelocationOverflow`, `K_RelocationKindMismatch`, `K_SectionOverlap`, `K_ImportUnresolved`, `K_InvalidLoadCommand` (Mach-O), `K_InvalidPeHeader`, `K_InvalidElfHeader`, `K_TlsModelUnsupported`. The engine emits these directly; the schema's `ObjectFormatSchema::validate()` separately emits `O_*` diagnostics at 0xC00x for malformed/incomplete format JSON.
 
 ### 2.12 Cross-CU linking (v1.x — coupled with `08-compilation-unit-plan` CU6)
 
@@ -163,19 +187,19 @@ BLAKE3-256 hash of (section contents excluding the build-id field itself, in can
 
 | PR  | Title                                            | Scope |
 |-----|--------------------------------------------------|-------|
-| LK1 | ELF writer                                       | Linux x86_64 + ARM64; executables + shared libs; PLT/GOT; GNU_HASH; PT_GNU_RELRO. |
-| LK2 | PE/COFF writer                                   | Windows x86_64 + ARM64; exe + DLL; subsystem flag per artifactProfile; base relocations; .idata IAT. |
-| LK3 | Mach-O writer                                    | macOS x86_64 + ARM64; executables + dylibs; chained-fixups path; LC_DYLD_INFO legacy path; LC_CODE_SIGNATURE placeholder. |
-| LK4 | Linker engine                                    | Symbol resolution + relocation application + section layout. Format-agnostic; calls into LK1/LK2/LK3 writers. |
+| LK1 | `elf.format.json` + engine ELF support           | Linux x86_64 + ARM64; executables + shared libs; PLT/GOT; GNU_HASH; PT_GNU_RELRO. JSON-declared section/symbol/reloc/dynamic schema; engine reads it (no per-format C++). |
+| LK2 | `pe.format.json` + engine PE support             | Windows x86_64 + ARM64; exe + DLL; subsystem flag per artifactProfile; base relocations; .idata IAT. JSON-declared section table + import/export schema; engine reads it. |
+| LK3 | `macho.format.json` + engine Mach-O support      | macOS x86_64 + ARM64; executables + dylibs; chained-fixups path; LC_DYLD_INFO legacy path; LC_CODE_SIGNATURE placeholder. JSON-declared load-command + chained-fixups schema; engine reads it. |
+| LK4 | `object_writer` engine                           | ONE format-blind engine reading `ObjectFormatSchema`: symbol resolution + relocation application + section layout + per-format metadata emission. NO format-specific dispatch table or per-format C++ writer — all format knowledge in JSON. |
 | LK5 | TLS lowering                                     | Per §2.8 table; initial-exec model on every platform. |
 | LK6 | Dynamic linking + imports                        | PE IAT, ELF GOT/PLT, Mach-O bind opcodes. FFI imports from `11-ffi-plan` arrive here. |
 | LK7 | Codesign hook                                    | Mach-O LC_CODE_SIGNATURE placeholder + PE attribute-cert reservation, both filled by `16-codesign-publish-plan`. |
-| LK8 | WASM writer (skeleton)                           | Module header + section framework; full impl in `18-wasm-plan`. |
-| LK9 | SPIR-V writer (skeleton)                         | Module header + section framework; full impl in `17-shader-gpu-plan`. |
+| LK8 | `wasm.format.json` + engine WASM support (skeleton) | Module header + section framework; JSON-declared; full impl in `18-wasm-plan`. |
+| LK9 | `spirv.format.json` + engine SPIR-V support (skeleton) | Module header + section framework; JSON-declared; full impl in `17-shader-gpu-plan`. |
 | LK10| End-to-end "hello world" integration on all 6 (OS × arch) | The hermetic-acceptance gate: build c-subset corpus on a CI runner with NO system linker installed; produced binary runs + prints expected output. |
 | LK11| **Cross-CU linking** (v1.x)                       | Lifts the v1 single-CU-per-image assumption. Engine's symbol-table merge (§2.2 flow item 1) becomes real; cross-CU symbol resolution + relocation application; CU-boundary diagnostics under `K_CrossCu*`. **Couples with** [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) **CU6**. v1.x — triggers per §2.12. |
 
-Substrate tier (5-agent review) for LK4 (engine) + LK7 (codesign-hook contract). Feature tier for writers.
+Substrate tier (5-agent review) for LK4 (format-blind engine + `ObjectFormatSchema` substrate) + LK7 (codesign-hook contract). Feature tier for per-format JSON onboarding (LK1/LK2/LK3/LK8/LK9 — each PR ships one `*.format.json` + any engine support its schema declarations need).
 
 ---
 
@@ -190,7 +214,7 @@ Substrate tier (5-agent review) for LK4 (engine) + LK7 (codesign-hook contract).
 | 5 | Section ordering policy? | Page-aligned segments per format conventions (ELF: text/rodata/data/bss; PE: text/rdata/data/idata/edata/reloc; Mach-O: __TEXT/__DATA_CONST/__DATA/__LINKEDIT). |
 | 6 | Build-id input space? | BLAKE3 of section contents. Deterministic. |
 | 7 | DT_RPATH / DT_RUNPATH for ELF? | Honored if specified in project config; default unset. Mach-O equivalent: `@rpath` in LC_RPATH (same logic). |
-| 8 | Linker scripts? | **No.** We hardcode per-format layout templates; user-provided linker scripts reserved post-v1. |
+| 8 | Linker scripts? | **No.** Layout templates live in the per-format JSON schema (`*.format.json`); user-provided linker scripts reserved post-v1. |
 
 ---
 

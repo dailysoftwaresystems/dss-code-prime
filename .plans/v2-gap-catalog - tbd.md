@@ -167,8 +167,8 @@ Per the universal-compiler decisions in [`00-master`](./00-compiler-implementati
 | DWARF / PDB debug-info emission | [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) |
 | In-tree assembler (x86_64 + ARM64) | [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) |
 | In-tree linker (ELF / PE / Mach-O / WASM / SPIR-V) | [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) |
-| HIR / MIR / LIR layered IR | [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) + [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) |
-| Core type lattice + per-language extension registry | [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) |
+| HIR / MIR / LIR layered IR | [`09-hir-plan`](./09-hir-plan%20-%20ok.md) + [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) |
+| Core type lattice + per-language extension registry | [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md) |
 | Multi-language compilation units | [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) CU5 |
 | Custom user-authored language (eventual) | [`20-custom-language-reserved-plan`](./20-custom-language-reserved-plan%20-%20tbd.md) |
 | Language runtime (GC / exceptions / coroutines) | [`21-runtime-reserved-plan`](./21-runtime-reserved-plan%20-%20tbd.md) |
