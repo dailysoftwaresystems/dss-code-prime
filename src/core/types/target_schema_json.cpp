@@ -331,6 +331,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   "must be a register-name string");
                     } else {
                         cc.linkRegister = c.at("linkRegister").get<std::string>();
+                        // Cache the resolved ordinal at load time (cycle
+                        // 3b fold of the cycle-3a deferred item) so ML7
+                        // callconv lowering can index without re-looking-
+                        // up. `validate()` later verifies the name
+                        // resolves to a GPR-class register; if not, the
+                        // schema is rejected anyway, so the cached
+                        // ordinal is only consumed on successfully-loaded
+                        // schemas.
+                        auto it = data.registerIndex.find(*cc.linkRegister);
+                        if (it != data.registerIndex.end()) {
+                            cc.linkRegisterOrdinal = it->second;
+                        }
                     }
                 }
 

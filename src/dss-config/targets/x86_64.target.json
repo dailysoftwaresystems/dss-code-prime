@@ -82,6 +82,28 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Materialize a 0/1 boolean from FLAGS. Payload carries the TargetCondCode (eq/ne/slt/.../uge); the LIR substrate is condition-blind. ML6 regalloc treats FLAGS as an implicit predecessor; AS1 emits the real x86_64 setcc-byte + movzx zero-extend sequence.",
+      "mnemonic":      "setcc",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Hard-trap / 'this code path is unreachable'. Cycle 3b lowers MIR Unreachable to this so a malformed CFG terminator is a runtime fault, not an empty block. AS1 maps to x86_64 ud2; ML6 keeps it block-sealing-equivalent.",
+      "mnemonic":      "unreachable",
+      "result":        "none",
+      "isTerminator":  true,
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "mnemonic":      "jmp",
       "result":        "none",
       "isTerminator":  true,

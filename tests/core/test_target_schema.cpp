@@ -583,7 +583,8 @@ TEST(TargetSchema, NonRegisterMachineWithCcStillValidatesRefs) {
 
 TEST(TargetSchema, LinkRegisterResolvesToDeclaredGpr) {
     // Fabricated ARM64-shape config: declare x30 as a GPR and reference it
-    // as the link register. Positive control.
+    // as the link register. Positive control. Cycle 3b also pins the
+    // load-time ordinal cache so ML7 callconv lowering doesn't re-resolve.
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"arm64"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
@@ -601,6 +602,15 @@ TEST(TargetSchema, LinkRegisterResolvesToDeclaredGpr) {
     ASSERT_NE(cc, nullptr);
     ASSERT_TRUE(cc->linkRegister.has_value());
     EXPECT_EQ(*cc->linkRegister, "x30");
+
+    // Cycle 3b fold: ordinal is resolved at load time and matches the
+    // ordinal returned by `registerByName("x30")`.
+    ASSERT_TRUE(cc->linkRegisterOrdinal.has_value())
+        << "linkRegisterOrdinal must be populated at load time when the "
+           "name resolves";
+    auto const expectedOrdinal = (*r)->registerByName("x30");
+    ASSERT_TRUE(expectedOrdinal.has_value());
+    EXPECT_EQ(*cc->linkRegisterOrdinal, *expectedOrdinal);
 }
 
 TEST(TargetSchema, LinkRegisterUnknownNameRejected) {

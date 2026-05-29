@@ -5,6 +5,7 @@
 #include "lir/lir_reg.hpp"
 
 #include <cstdint>
+#include <string_view>
 #include <type_traits>
 
 // LIR node PODs (plan 12 §2.1 file tree → `lir_inst.hpp` + per-block /
@@ -12,6 +13,40 @@
 // arena container assumes trivial-copyability.
 
 namespace dss {
+
+// Universal condition code (target-blind). Used by `jcc` and `setcc`
+// opcodes: cycle 3b carries the chosen condition in the LIR
+// instruction's `payload` field. Every register-machine target (x86,
+// ARM64, RISC-V) has these conditions natively; the per-target
+// assembler maps the enum to its physical encoding.
+enum class TargetCondCode : std::uint8_t {
+    Eq  = 0,  // ==
+    Ne  = 1,  // !=
+    Slt = 2,  // signed <
+    Sle = 3,  // signed <=
+    Sgt = 4,  // signed >
+    Sge = 5,  // signed >=
+    Ult = 6,  // unsigned <
+    Ule = 7,  // unsigned <=
+    Ugt = 8,  // unsigned >
+    Uge = 9,  // unsigned >=
+};
+
+[[nodiscard]] constexpr std::string_view targetCondCodeName(TargetCondCode c) noexcept {
+    switch (c) {
+        case TargetCondCode::Eq:  return "eq";
+        case TargetCondCode::Ne:  return "ne";
+        case TargetCondCode::Slt: return "slt";
+        case TargetCondCode::Sle: return "sle";
+        case TargetCondCode::Sgt: return "sgt";
+        case TargetCondCode::Sge: return "sge";
+        case TargetCondCode::Ult: return "ult";
+        case TargetCondCode::Ule: return "ule";
+        case TargetCondCode::Ugt: return "ugt";
+        case TargetCondCode::Uge: return "uge";
+    }
+    return "eq";
+}
 
 // Operand variant tag carried on each entry of the LIR operand pool.
 // LIR operands are heterogeneous (registers / immediates / memory

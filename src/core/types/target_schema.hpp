@@ -143,6 +143,14 @@ struct DSS_EXPORT TargetCallingConvention {
     // lowering checks `linkRegister.has_value()` to decide whether
     // to spill LR in the prologue. Empty for x86_64.
     std::optional<std::string> linkRegister;
+
+    // Resolved ordinal for `linkRegister`, cached at JSON load time so
+    // ML7 callconv lowering does not need to re-resolve via
+    // `schema.registerByName()` on every function entry. Populated by the
+    // loader iff `linkRegister.has_value()` AND the name resolved to a
+    // register entry; `validate()` guarantees the resolution succeeded
+    // when both fields are set. The string is kept for diagnostics.
+    std::optional<std::uint16_t> linkRegisterOrdinal;
 };
 
 // Per-opcode descriptor — populated from the JSON `opcodes` array.

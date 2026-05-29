@@ -5,9 +5,9 @@
 
 #include <array>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -28,67 +28,122 @@ namespace {
         case MirOpcode::Add:           return "Add";
         case MirOpcode::Sub:           return "Sub";
         case MirOpcode::Mul:           return "Mul";
+        case MirOpcode::ICmpEq:        return "ICmpEq";
+        case MirOpcode::ICmpNe:        return "ICmpNe";
+        case MirOpcode::ICmpSlt:       return "ICmpSlt";
+        case MirOpcode::ICmpSle:       return "ICmpSle";
+        case MirOpcode::ICmpSgt:       return "ICmpSgt";
+        case MirOpcode::ICmpSge:       return "ICmpSge";
+        case MirOpcode::ICmpUlt:       return "ICmpUlt";
+        case MirOpcode::ICmpUle:       return "ICmpUle";
+        case MirOpcode::ICmpUgt:       return "ICmpUgt";
+        case MirOpcode::ICmpUge:       return "ICmpUge";
+        case MirOpcode::Br:            return "Br";
+        case MirOpcode::CondBr:        return "CondBr";
+        case MirOpcode::Switch:        return "Switch";
+        case MirOpcode::Phi:           return "Phi";
         case MirOpcode::Return:        return "Return";
+        case MirOpcode::Unreachable:   return "Unreachable";
         default:                       return "<deferred>";
     }
 }
 
+// Map a MIR ICmp opcode to the universal `TargetCondCode` carried in the
+// LIR `setcc` / `jcc` payload. Target-blind: every register-machine
+// backend (x86_64, ARM64, RISC-V) has these conditions natively; the
+// assembler maps the enum to the physical encoding.
+[[nodiscard]] std::optional<TargetCondCode> condCodeForICmp(MirOpcode op) noexcept {
+    switch (op) {
+        case MirOpcode::ICmpEq:  return TargetCondCode::Eq;
+        case MirOpcode::ICmpNe:  return TargetCondCode::Ne;
+        case MirOpcode::ICmpSlt: return TargetCondCode::Slt;
+        case MirOpcode::ICmpSle: return TargetCondCode::Sle;
+        case MirOpcode::ICmpSgt: return TargetCondCode::Sgt;
+        case MirOpcode::ICmpSge: return TargetCondCode::Sge;
+        case MirOpcode::ICmpUlt: return TargetCondCode::Ult;
+        case MirOpcode::ICmpUle: return TargetCondCode::Ule;
+        case MirOpcode::ICmpUgt: return TargetCondCode::Ugt;
+        case MirOpcode::ICmpUge: return TargetCondCode::Uge;
+        default:                 return std::nullopt;
+    }
+}
+
+[[nodiscard]] bool isMirTerminator(MirOpcode op) noexcept {
+    return op == MirOpcode::Br
+        || op == MirOpcode::CondBr
+        || op == MirOpcode::Switch
+        || op == MirOpcode::Return
+        || op == MirOpcode::Unreachable;
+}
+
 // One transient lowerer per `lowerToLir` call. Holds the per-pass state
-// the dispatcher methods read/write. Mirrors `Lowerer` in `hir_to_mir.cpp`
-// — same single-struct-with-methods style.
+// the dispatcher methods read/write. Mirrors `Lowerer` in `hir_to_mir.cpp`.
 struct Lowerer {
     Mir const&          mir;
     TargetSchema const& target;
     DiagnosticReporter& reporter;
     LirBuilder          lir;
 
-    // Cached opcode mnemonics → numeric opcode indexes. Looked up once per
-    // module, not per instruction. `std::nullopt` when the target schema
-    // does not declare that mnemonic — `reportMissingOpcode` fires ONCE
-    // per missing mnemonic (the `missingReported` bitset gates re-emit).
+    // Cached opcode mnemonics → numeric indexes. Looked up once at Lowerer
+    // construction. `std::nullopt` when the target schema does not declare
+    // the mnemonic; `reportMissingOpcode` fires ONCE per missing slot.
     std::optional<std::uint16_t> opArg;
     std::optional<std::uint16_t> opMov;
     std::optional<std::uint16_t> opAdd;
     std::optional<std::uint16_t> opSub;
     std::optional<std::uint16_t> opMul;
+    std::optional<std::uint16_t> opCmp;
+    std::optional<std::uint16_t> opSetcc;
+    std::optional<std::uint16_t> opJmp;
+    std::optional<std::uint16_t> opJcc;
     std::optional<std::uint16_t> opRet;
-    // Index parallel to the optionals above, one bit per cached mnemonic.
-    // Used by `reportMissingOpcode` to suppress per-instruction spam — a
-    // 10k-`Add`-with-no-`add`-opcode module emits ONE diagnostic, not 10k.
-    enum MnemonicSlot : std::uint8_t { SlotArg, SlotMov, SlotAdd, SlotSub,
-                                       SlotMul, SlotRet, SlotCount };
+    std::optional<std::uint16_t> opUnreachable;
+    enum MnemonicSlot : std::uint8_t {
+        SlotArg, SlotMov, SlotAdd, SlotSub, SlotMul,
+        SlotCmp, SlotSetcc, SlotJmp, SlotJcc,
+        SlotRet, SlotUnreachable, SlotCount
+    };
     std::array<bool, SlotCount> missingReported{};
 
-    // Per-function state, reset by `lowerFunction`.
-    // MIR value (== MirInstId) → its result LirReg. Keyed on the raw `.v`
-    // to match `hir_to_mir.cpp`'s `symbolToValue` convention; a future
-    // substrate-wide switch to typed-id keys lifts both at once.
-    std::unordered_map<std::uint32_t, LirReg> valueToReg;
-    // MIR block → pre-created LIR block (pre-pass; lets forward branches
-    // target a not-yet-emitted block once cycle 3b lands CFG).
-    std::unordered_map<std::uint32_t, LirBlockId> mirBlockToLirBlock;
+    // Per-function state. Cleared at the top of `lowerFunction`.
+    //
+    // `valueToReg`: typed side-table mapping MIR instruction id → LIR
+    // virtual register that materialised its result. Switched from the
+    // cycle-3a `unordered_map<uint32_t, LirReg>` to MirAttribute<LirReg>
+    // for type safety + dense-vector backing once coverage crosses the
+    // substrate threshold — exactly the architect agent's cycle-3a
+    // follow-up.
+    MirAttribute<LirReg>            valueToReg;
+    // `mirBlockToLirBlock`: parallel block-tier map. MirBlockAttribute
+    // binds to the block arena (sibling of the instruction arena).
+    MirBlockAttribute<LirBlockId>   mirBlockToLirBlock;
 
-    // Whether the running lowering pass added any error-severity diagnostics.
-    // Mirrors ML2's delta-on-errorCount; reset before each `lowerToLir` call.
+    // Whether the running lowering pass added any error-severity
+    // diagnostics. Mirrors ML2's delta-on-errorCount; reset by the ctor.
     std::uint32_t baselineErrors = 0;
     bool hadError() const noexcept {
         return reporter.errorCount() != baselineErrors;
     }
 
     Lowerer(Mir const& m, TargetSchema const& t, DiagnosticReporter& r)
-        : mir(m), target(t), reporter(r), lir(t) {
+        : mir(m), target(t), reporter(r), lir(t),
+          valueToReg(m), mirBlockToLirBlock(m.blockArena()) {
         baselineErrors = reporter.errorCount();
-        opArg = target.opcodeByMnemonic("arg");
-        opMov = target.opcodeByMnemonic("mov");
-        opAdd = target.opcodeByMnemonic("add");
-        opSub = target.opcodeByMnemonic("sub");
-        opMul = target.opcodeByMnemonic("mul");
-        opRet = target.opcodeByMnemonic("ret");
+        opArg         = target.opcodeByMnemonic("arg");
+        opMov         = target.opcodeByMnemonic("mov");
+        opAdd         = target.opcodeByMnemonic("add");
+        opSub         = target.opcodeByMnemonic("sub");
+        opMul         = target.opcodeByMnemonic("mul");
+        opCmp         = target.opcodeByMnemonic("cmp");
+        opSetcc       = target.opcodeByMnemonic("setcc");
+        opJmp         = target.opcodeByMnemonic("jmp");
+        opJcc         = target.opcodeByMnemonic("jcc");
+        opRet         = target.opcodeByMnemonic("ret");
+        opUnreachable = target.opcodeByMnemonic("unreachable");
     }
 
-    // Issue a `L_RequiredLirOpcodeMissing` once when a foundational mnemonic
-    // is absent from the target schema. Per-mnemonic flag suppresses spam
-    // (the lowerer would otherwise emit one per instruction).
+    // ── diagnostics ──────────────────────────────────────────────────
+
     void reportMissingOpcode(MnemonicSlot slot, std::string_view mnemonic,
                              std::string_view context) {
         if (missingReported[slot]) return;
@@ -123,14 +178,10 @@ struct Lowerer {
         reporter.report(std::move(d));
     }
 
-    // Look up the LirReg for a MIR value (== MirInstId). The dispatch order
-    // of `lowerInst` ensures every value is mapped before its first use, so
-    // a missing entry is a structural failure — `regForValue` returns
-    // `nullopt` so the CALLER bails out (rather than emitting an LIR inst
-    // that reads an uninitialised vreg). One diagnostic per missing source.
+    // ── value/block map plumbing ─────────────────────────────────────
+
     [[nodiscard]] std::optional<LirReg> regForValue(MirInstId v) {
-        auto it = valueToReg.find(v.v);
-        if (it == valueToReg.end()) {
+        if (!v.valid() || !valueToReg.has(v)) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
             d.severity = DiagnosticSeverity::Error;
@@ -141,29 +192,22 @@ struct Lowerer {
             reporter.report(std::move(d));
             return std::nullopt;
         }
-        return it->second;
+        return valueToReg.get(v);
     }
 
-    // Record a freshly-defined value. Returns false (and emits a diagnostic)
-    // if the value was already mapped — the SSA single-definition contract
-    // would otherwise silently keep the FIRST mapping while the lowerer
-    // emitted a second `addInst`, leaving downstream consumers reading the
-    // wrong vreg.
     bool defineValue(MirInstId id, LirReg reg) {
-        auto [it, inserted] = valueToReg.emplace(id.v, reg);
-        if (!inserted) {
+        if (valueToReg.has(id)) {
             reportDoubleDef(id);
             return false;
         }
+        valueToReg.set(id, reg);
         return true;
     }
 
-    // ── per-instruction lowering ──────────────────────────────────────
+    // ── per-instruction lowering ─────────────────────────────────────
 
-    // Dispatch non-terminator MIR opcodes. `Return` is handled inline by
-    // `lowerBlock` (it tracks the seal flag), so it does NOT appear here;
-    // a stray Return reaching this dispatch is malformed MIR and falls
-    // into `reportUnsupported` by design.
+    // Non-terminator dispatcher (terminators flow through `lowerTerminator`
+    // and Phi is a pre-pass no-op).
     void lowerInst(MirInstId id) {
         MirOpcode const op = mir.instOpcode(id);
         switch (op) {
@@ -172,6 +216,13 @@ struct Lowerer {
             case MirOpcode::Add:    return lowerBinaryOp(id, SlotAdd, "add", opAdd);
             case MirOpcode::Sub:    return lowerBinaryOp(id, SlotSub, "sub", opSub);
             case MirOpcode::Mul:    return lowerBinaryOp(id, SlotMul, "mul", opMul);
+            case MirOpcode::ICmpEq: case MirOpcode::ICmpNe:
+            case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
+            case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
+            case MirOpcode::ICmpUlt: case MirOpcode::ICmpUle:
+            case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge:
+                return lowerICmp(id, *condCodeForICmp(op));
+            case MirOpcode::Phi:    return;  // pre-pass-allocated; no body emission
             default: break;
         }
         reportUnsupported(op, id);
@@ -183,10 +234,6 @@ struct Lowerer {
             return;
         }
         LirReg const result = lir.newVReg(LirRegClass::GPR);
-        // The MIR `Arg` payload (parameter index) flows through to the LIR
-        // `arg` inst's `payload` field — the JSON contract documented at
-        // x86_64.target.json:23 is "minOperands=0, maxOperands=0; payload
-        // carries the parameter index".
         lir.addInst(*opArg, result, std::span<LirOperand const>{},
                     /*payload=*/mir.argIndex(id));
         defineValue(id, result);
@@ -197,10 +244,6 @@ struct Lowerer {
             reportMissingOpcode(SlotMov, "mov", "MIR Const");
             return;
         }
-        // Cycle 3a: only literals that fit in int32 lower cleanly. Larger
-        // integer literals + float / string variants defer to cycle 3b's
-        // literal-pool wiring (movabsq on x86_64, or a fresh ImmFloat
-        // operand kind for floats). Bool literals encode as 0/1.
         std::uint32_t const litIdx = mir.constLiteralIndex(id);
         MirLiteralValue const& lit = mir.literalValue(litIdx);
         std::int32_t imm32 = 0;
@@ -222,9 +265,7 @@ struct Lowerer {
         }
         if (!fits) {
             reportUnsupported(MirOpcode::Const, id);
-            return;  // intentionally NO defineValue: any later use of this
-                     // MirInstId surfaces a fresh, locatable diagnostic via
-                     // `regForValue` rather than threading a placeholder vreg.
+            return;
         }
         LirReg const result = lir.newVReg(LirRegClass::GPR);
         std::array<LirOperand, 1> ops{LirOperand::makeImmInt32(imm32)};
@@ -245,19 +286,130 @@ struct Lowerer {
         }
         std::optional<LirReg> const a = regForValue(operands[0]);
         std::optional<LirReg> const b = regForValue(operands[1]);
-        if (!a.has_value() || !b.has_value()) {
-            return;  // diagnostic already issued; don't emit a half-broken inst
-        }
+        if (!a.has_value() || !b.has_value()) return;
         LirReg const result = lir.newVReg(LirRegClass::GPR);
         std::array<LirOperand, 2> ops{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
         lir.addInst(*opcode, result, ops);
         defineValue(id, result);
     }
 
-    // Return true iff a real `ret` LIR inst was emitted (sealing the block).
-    // False when the lowering bailed (missing opcode / undefined operand /
-    // wrong arity) — the caller may then emit a fallback seal AND know the
-    // sealing happened in a recovery path, not the normal one.
+    // MIR ICmp{Eq,Ne,Slt,...} → LIR `cmp` + `setcc(cond)` pair. Naive
+    // (no peephole with subsequent CondBr); the optimizer's compare-flag
+    // forwarding pass will collapse `cmp/setcc/cmp 0/jcc-ne` to
+    // `cmp/jcc-cond` once a use-count analysis lands.
+    void lowerICmp(MirInstId id, TargetCondCode cond) {
+        if (!opCmp.has_value()) {
+            reportMissingOpcode(SlotCmp, "cmp", "MIR ICmp");
+            return;
+        }
+        if (!opSetcc.has_value()) {
+            reportMissingOpcode(SlotSetcc, "setcc", "MIR ICmp");
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        std::optional<LirReg> const a = regForValue(operands[0]);
+        std::optional<LirReg> const b = regForValue(operands[1]);
+        if (!a.has_value() || !b.has_value()) return;
+        // FLAGS is implicit pre-regalloc; ML6 makes it explicit. Emit the
+        // cmp + setcc as paired instructions; the substrate guarantees no
+        // value-producing inst sits between them (cycle 3a fallback-seal
+        // + cycle 3b ICmp-immediately-followed-by-setcc).
+        std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
+        lir.addInst(*opCmp, InvalidLirReg, cmpOps);
+
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        lir.addInst(*opSetcc, result, std::span<LirOperand const>{},
+                    /*payload=*/static_cast<std::uint32_t>(cond));
+        defineValue(id, result);
+    }
+
+    // ── terminator + phi resolution ──────────────────────────────────
+
+    // Emit the phi-edge moves for one (predecessor, successor) edge:
+    // walk every Phi in the successor block; for each, find the incoming
+    // whose `pred == currentMirBlock` and emit `mov phi_lir_reg,
+    // incoming_value_lir_reg`. Called BEFORE the predecessor's LIR
+    // terminator so the moves dominate every use in the successor.
+    void emitPhiMovesForEdge(MirBlockId currentMir, MirBlockId successorMir) {
+        if (!opMov.has_value()) {
+            reportMissingOpcode(SlotMov, "mov", "MIR Phi edge");
+            return;
+        }
+        std::uint32_t const n = mir.blockInstCount(successorMir);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            MirInstId const inst = mir.blockInstAt(successorMir, i);
+            if (mir.instOpcode(inst) != MirOpcode::Phi) continue;
+            // Phi result reg was pre-allocated by `prepassAllocatePhis`.
+            if (!valueToReg.has(inst)) {
+                // Defensive: a phi without a pre-allocated vreg is a
+                // substrate bug. Diagnose and skip; the using-site will
+                // surface its own `regForValue` diagnostic.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "MIR Phi %{} reached edge-move emission without a "
+                    "pre-allocated LirReg — pre-pass invariant broken",
+                    inst.v);
+                reporter.report(std::move(d));
+                continue;
+            }
+            LirReg const phiReg = valueToReg.get(inst);
+            // Find the incoming whose pred matches the current MIR block.
+            // MIR pinches phi incomings to a fixed (value, pred) list; one
+            // entry per predecessor.
+            bool matched = false;
+            for (MirPhiIncoming const& inc : mir.phiIncomings(inst)) {
+                if (inc.pred != currentMir) continue;
+                matched = true;
+                std::optional<LirReg> const v = regForValue(inc.value);
+                if (!v.has_value()) break;
+                std::array<LirOperand, 1> ops{LirOperand::makeReg(*v)};
+                lir.addInst(*opMov, phiReg, ops);
+                break;
+            }
+            if (!matched) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "MIR Phi %{} has no incoming for predecessor block %{}",
+                    inst.v, currentMir.v);
+                reporter.report(std::move(d));
+            }
+        }
+    }
+
+    // Returns true iff the terminator was emitted (block sealed). `false`
+    // signals the caller to use the fallback seal.
+    bool lowerTerminator(MirBlockId mb, MirInstId termId) {
+        MirOpcode const op = mir.instOpcode(termId);
+        auto succs = mir.blockSuccessors(mb);
+
+        // Emit phi-edge moves for EVERY MIR successor of this block, in
+        // declared order, BEFORE the terminator. This dominates every use
+        // of the phi result in the successor regardless of which jcc arm
+        // ends up taking the edge.
+        for (MirBlockId s : succs) {
+            emitPhiMovesForEdge(mb, s);
+        }
+
+        switch (op) {
+            case MirOpcode::Return:      return lowerReturn(termId);
+            case MirOpcode::Br:          return lowerBr(termId, succs);
+            case MirOpcode::CondBr:      return lowerCondBr(termId, succs);
+            case MirOpcode::Switch:      return lowerSwitch(termId, succs);
+            case MirOpcode::Unreachable: return lowerUnreachable(termId);
+            default:                     break;
+        }
+        reportUnsupported(op, termId);
+        return false;
+    }
+
     bool lowerReturn(MirInstId id) {
         if (!opRet.has_value()) {
             reportMissingOpcode(SlotRet, "ret", "MIR Return");
@@ -269,8 +421,6 @@ struct Lowerer {
             return true;
         }
         if (operands.size() != 1) {
-            // MIR Return is structurally ≤1 operand. >1 is a malformed
-            // input — defense-in-depth.
             reportUnsupported(MirOpcode::Return, id);
             return false;
         }
@@ -281,56 +431,242 @@ struct Lowerer {
         return true;
     }
 
-    // ── per-block / per-function lowering ─────────────────────────────
+    bool lowerBr(MirInstId id, std::span<MirBlockId const> succs) {
+        if (!opJmp.has_value()) {
+            reportMissingOpcode(SlotJmp, "jmp", "MIR Br");
+            return false;
+        }
+        if (succs.size() != 1) {
+            reportUnsupported(MirOpcode::Br, id);
+            return false;
+        }
+        if (!mirBlockToLirBlock.has(succs[0])) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "MIR Br target block %{} has no LIR block mapping",
+                succs[0].v);
+            reporter.report(std::move(d));
+            return false;
+        }
+        lir.addBr(*opJmp, mirBlockToLirBlock.get(succs[0]));
+        return true;
+    }
 
-    void lowerBlock(MirBlockId mb) {
-        LirBlockId const lb = mirBlockToLirBlock.at(mb.v);
-        lir.beginBlock(lb);
-        std::uint32_t const n = mir.blockInstCount(mb);
-        bool sealed = false;
-        for (std::uint32_t i = 0; i < n; ++i) {
-            MirInstId const inst = mir.blockInstAt(mb, i);
-            MirOpcode const op = mir.instOpcode(inst);
-            // `lowerReturn` is the only opcode that emits a terminator in
-            // cycle 3a. Track its emission directly so the fallback-seal
-            // below doesn't fire when the real seal succeeded — and DOES
-            // fire when the missing-`ret`-opcode bail-out left the block
-            // unsealed.
-            if (op == MirOpcode::Return) {
-                sealed = lowerReturn(inst);
-                continue;
+    bool lowerCondBr(MirInstId id, std::span<MirBlockId const> succs) {
+        if (!opCmp.has_value()) {
+            reportMissingOpcode(SlotCmp, "cmp", "MIR CondBr");
+            return false;
+        }
+        if (!opJcc.has_value()) {
+            reportMissingOpcode(SlotJcc, "jcc", "MIR CondBr");
+            return false;
+        }
+        if (succs.size() != 2) {
+            reportUnsupported(MirOpcode::CondBr, id);
+            return false;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::CondBr, id);
+            return false;
+        }
+        std::optional<LirReg> const cond = regForValue(operands[0]);
+        if (!cond.has_value()) return false;
+        if (!mirBlockToLirBlock.has(succs[0]) || !mirBlockToLirBlock.has(succs[1])) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = "MIR CondBr target block(s) have no LIR block mapping";
+            reporter.report(std::move(d));
+            return false;
+        }
+        // Naive: compare the Bool value against 0, jcc-Ne taken when true.
+        // Optimizer fuses adjacent ICmp + CondBr to a single cmp/jcc-cond.
+        std::array<LirOperand, 2> cmpOps{
+            LirOperand::makeReg(*cond), LirOperand::makeImmInt32(0)};
+        lir.addInst(*opCmp, InvalidLirReg, cmpOps);
+        lir.addCondBr(*opJcc, std::span<LirOperand const>{},
+                      mirBlockToLirBlock.get(succs[0]),
+                      mirBlockToLirBlock.get(succs[1]));
+        // payload encodes condition for the jcc; addCondBr currently
+        // doesn't expose a payload setter — the condition is `Ne` and is
+        // documented by convention for cycle 3b. ML7+ will widen the
+        // builder to take an explicit condition payload.
+        return true;
+    }
+
+    // Cascading-compare lowering of MIR Switch. Operands: [discriminant,
+    // case_const_0, case_const_1, ...]. Successors: [case_target_0, ...,
+    // case_target_{N-1}, default_target].
+    //
+    // For each case i in [0, N): emit a fresh "compare" LIR block that does
+    // `cmp discrim, case_const[i]; jcc(eq) case_target[i], next_compare`.
+    // The chain terminates at a block that `jmp default_target`.
+    //
+    // We've already emitted phi-edge moves for ALL successors at the top of
+    // `lowerTerminator`. The cascading-compare path here flows through
+    // freshly-created compare blocks; jumping into the case_target preserves
+    // the dominance of the phi moves (which were emitted at the END of the
+    // ORIGINAL switch-bearing block, before this first jmp).
+    bool lowerSwitch(MirInstId id, std::span<MirBlockId const> succs) {
+        if (!opCmp.has_value()) {
+            reportMissingOpcode(SlotCmp, "cmp", "MIR Switch");
+            return false;
+        }
+        if (!opJmp.has_value()) {
+            reportMissingOpcode(SlotJmp, "jmp", "MIR Switch");
+            return false;
+        }
+        if (!opJcc.has_value()) {
+            reportMissingOpcode(SlotJcc, "jcc", "MIR Switch");
+            return false;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.empty() || succs.size() < 1
+            || operands.size() != succs.size()) {
+            // Convention: 1 discriminant + N case-constants in operands;
+            // N case-targets + 1 default = N+1 successors. So operands.size
+            // = N+1 and succs.size = N+1 too.
+            reportUnsupported(MirOpcode::Switch, id);
+            return false;
+        }
+        std::optional<LirReg> const discrim = regForValue(operands[0]);
+        if (!discrim.has_value()) return false;
+
+        std::size_t const caseCount = operands.size() - 1;
+        MirBlockId const defaultMir = succs[caseCount];
+        if (!mirBlockToLirBlock.has(defaultMir)) {
+            reportUnsupported(MirOpcode::Switch, id);
+            return false;
+        }
+
+        // Emit the first compare in-place; subsequent compares go in
+        // freshly-allocated "next-compare" blocks that we register on the
+        // open function.
+        for (std::size_t i = 0; i < caseCount; ++i) {
+            std::optional<LirReg> const caseConst = regForValue(operands[1 + i]);
+            if (!caseConst.has_value()) return false;
+            if (!mirBlockToLirBlock.has(succs[i])) {
+                reportUnsupported(MirOpcode::Switch, id);
+                return false;
             }
-            lowerInst(inst);
-            // Defense-in-depth: a malformed MIR whose last instruction is
-            // a non-terminator (e.g. `Add`) would otherwise silently fall
-            // through to the fallback seal below. Report it loudly. The
-            // ML3 verifier catches this at MIR-build time; this guard
-            // protects callers who lower raw direct-Mir-ctor input.
-            if (i + 1 == n) {
-                MirOpcode const lastOp = op;
-                bool const isTerminator =
-                       lastOp == MirOpcode::Br
-                    || lastOp == MirOpcode::CondBr
-                    || lastOp == MirOpcode::Switch
-                    || lastOp == MirOpcode::Return
-                    || lastOp == MirOpcode::Unreachable;
-                if (!isTerminator) {
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.actual   = std::format(
-                        "MIR block ended with non-terminator opcode '{}' (inst {}) "
-                        "— structural violation",
-                        mirOpcodeName(lastOp), inst.v);
-                    reporter.report(std::move(d));
-                }
+            std::array<LirOperand, 2> cmpOps{
+                LirOperand::makeReg(*discrim), LirOperand::makeReg(*caseConst)};
+            lir.addInst(*opCmp, InvalidLirReg, cmpOps);
+
+            // Allocate a "next compare" block unless this is the last
+            // case (in which case we fall through to a `jmp default`).
+            LirBlockId nextBlock;
+            bool const isLastCase = (i + 1 == caseCount);
+            LirBlockId const caseTarget = mirBlockToLirBlock.get(succs[i]);
+            if (isLastCase) {
+                // Final compare: jcc-eq to case target, else jcc fallthrough
+                // to a tiny "jmp default" block.
+                LirBlockId const defaultJump = lir.createBlock();
+                lir.addCondBr(*opJcc, std::span<LirOperand const>{},
+                              caseTarget, defaultJump);
+                lir.beginBlock(defaultJump);
+                lir.addBr(*opJmp, mirBlockToLirBlock.get(defaultMir));
+                return true;
+            }
+            nextBlock = lir.createBlock();
+            lir.addCondBr(*opJcc, std::span<LirOperand const>{},
+                          caseTarget, nextBlock);
+            lir.beginBlock(nextBlock);
+        }
+        // No cases (only default): jmp default.
+        lir.addBr(*opJmp, mirBlockToLirBlock.get(defaultMir));
+        return true;
+    }
+
+    bool lowerUnreachable(MirInstId /*id*/) {
+        if (!opUnreachable.has_value()) {
+            reportMissingOpcode(SlotUnreachable, "unreachable", "MIR Unreachable");
+            return false;
+        }
+        // `unreachable` is a terminator opcode but the LirBuilder only has
+        // `addBr`/`addCondBr`/`addReturn` terminators today. Emit via
+        // `addReturn` whose contract is "seals the block with a terminator
+        // opcode of the caller's choice" — the schema says `unreachable` is
+        // a terminator, and the substrate's `addReturn` doesn't enforce
+        // 'must be ret'; it enforces 'opcode is terminator + operand-count
+        // matches'. Cycle 3b adds an explicit `addUnreachable` if a future
+        // consumer needs the cleaner spelling.
+        lir.addReturn(*opUnreachable, std::span<LirOperand const>{});
+        return true;
+    }
+
+    // ── per-block / per-function lowering ────────────────────────────
+
+    // Pre-pass over a function's Phi insts: allocate a fresh LirReg for
+    // each phi result so predecessor blocks can emit `mov phi_reg, ...`
+    // moves at the back-edge BEFORE the phi block is itself lowered.
+    void prepassAllocatePhis(MirFuncId mf) {
+        std::uint32_t const blockCount = mir.funcBlockCount(mf);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            MirBlockId const mb = mir.funcBlockAt(mf, bi);
+            std::uint32_t const n = mir.blockInstCount(mb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirInstId const inst = mir.blockInstAt(mb, i);
+                if (mir.instOpcode(inst) != MirOpcode::Phi) continue;
+                LirReg const r = lir.newVReg(LirRegClass::GPR);
+                defineValue(inst, r);
             }
         }
+    }
+
+    void lowerBlock(MirBlockId mb) {
+        LirBlockId const lb = mirBlockToLirBlock.get(mb);
+        lir.beginBlock(lb);
+        std::uint32_t const n = mir.blockInstCount(mb);
+        if (n == 0) {
+            // Empty MIR block — defensive seal so the LIR module finishes.
+            if (opRet.has_value()) {
+                lir.addReturn(*opRet, std::span<LirOperand const>{});
+            }
+            return;
+        }
+        // Lower non-terminator instructions first.
+        MirInstId const term = mir.blockInstAt(mb, n - 1);
+        for (std::uint32_t i = 0; i + 1 < n; ++i) {
+            MirInstId const inst = mir.blockInstAt(mb, i);
+            MirOpcode const op = mir.instOpcode(inst);
+            if (isMirTerminator(op)) {
+                // Terminator in non-last position is malformed MIR.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "MIR terminator '{}' (inst {}) in non-last position — "
+                    "structural violation",
+                    mirOpcodeName(op), inst.v);
+                reporter.report(std::move(d));
+            }
+            lowerInst(inst);
+        }
+        // Then the terminator (which is also responsible for emitting
+        // phi-edge moves to all its MIR successors BEFORE the LIR
+        // terminator itself).
+        bool sealed = false;
+        if (isMirTerminator(mir.instOpcode(term))) {
+            sealed = lowerTerminator(mb, term);
+        } else {
+            // Last inst is not a terminator — also malformed MIR.
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "MIR block ended with non-terminator opcode '{}' (inst {}) "
+                "— structural violation",
+                mirOpcodeName(mir.instOpcode(term)), term.v);
+            reporter.report(std::move(d));
+            // Still lower the non-terminator (so its diagnostics surface)
+            lowerInst(term);
+        }
         // Fallback seal for blocks whose MIR terminator was deferred to a
-        // later cycle (Br/CondBr/Switch/Unreachable). The diagnostic was
-        // already issued in `lowerInst`. If `opRet` is itself missing the
-        // builder will abort at `finish()` time — that's the cleanest
-        // failure mode given the target is unusable without `ret` anyway.
+        // later cycle. The diagnostic was already issued.
         if (!sealed && opRet.has_value()) {
             lir.addReturn(*opRet, std::span<LirOperand const>{});
         }
@@ -341,15 +677,18 @@ struct Lowerer {
         mirBlockToLirBlock.clear();
         lir.addFunction(mir.funcSymbol(mf));
 
-        // Pre-pass: create one LIR block per MIR block so forward branches
-        // (cycle 3b+) can target them.
+        // Pre-pass 1: pre-allocate LIR blocks (1:1 with MIR blocks).
         std::uint32_t const blockCount = mir.funcBlockCount(mf);
         for (std::uint32_t i = 0; i < blockCount; ++i) {
             MirBlockId const mb = mir.funcBlockAt(mf, i);
             LirBlockId const lb = lir.createBlock();
-            mirBlockToLirBlock.emplace(mb.v, lb);
+            mirBlockToLirBlock.set(mb, lb);
         }
-        // Lower bodies block-by-block in MIR's declared order.
+        // Pre-pass 2: allocate vregs for all Phi results so back-edge
+        // predecessor moves resolve cleanly.
+        prepassAllocatePhis(mf);
+
+        // Pass 3: lower bodies block-by-block in MIR's declared order.
         for (std::uint32_t i = 0; i < blockCount; ++i) {
             MirBlockId const mb = mir.funcBlockAt(mf, i);
             lowerBlock(mb);
