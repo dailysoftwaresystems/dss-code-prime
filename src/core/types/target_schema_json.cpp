@@ -204,7 +204,9 @@ void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
 }
 
 void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
-                       TargetEncodingVariant& variant, Collector& coll) {
+                       TargetEncodingVariant& variant,
+                       detail::TargetSchemaData const& data,
+                       Collector& coll) {
     if (!v.contains("wires")) return;
     auto const& ops = v.at("wires");
     if (!ops.is_array()) {
@@ -250,13 +252,42 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
             continue;
         }
         wire.slotKind = *sk;
+        // `relocationKind` (plan 13 AS4) — name string resolved
+        // against the schema's `relocations[]` rows. The loader
+        // processes `relocations[]` BEFORE the opcode block, so the
+        // resolution is inline. `relocationNameIndex` is keyed by
+        // name; the resolved value is the row's opaque kind tag.
+        if (o2.contains("relocationKind")) {
+            if (!o2.at("relocationKind").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("{}/relocationKind", wirePath),
+                          "'relocationKind' must be a string naming a "
+                          "row in the schema's `relocations[]`");
+            } else {
+                auto const name = o2.at("relocationKind").get<std::string>();
+                auto const it = data.relocationNameIndex.find(name);
+                if (it == data.relocationNameIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/relocationKind", wirePath),
+                              std::format("'relocationKind' = '{}' does not "
+                                          "resolve to any row in the "
+                                          "schema's `relocations[]` "
+                                          "(declare it there first)",
+                                          name));
+                } else {
+                    wire.relocationKind = data.relocations[it->second].kind;
+                }
+            }
+        }
         variant.wires.push_back(wire);
     }
 }
 
 void parseEncodingVariants(json const& vs,
                            std::vector<TargetEncodingVariant>& out,
-                           std::size_t opIdx, Collector& coll) {
+                           std::size_t opIdx,
+                           detail::TargetSchemaData const& data,
+                           Collector& coll) {
     if (!vs.is_array()) {
         coll.emit(DiagnosticCode::C_MalformedJson,
                   std::format("/opcodes/{}/encoding/variants", opIdx),
@@ -276,7 +307,7 @@ void parseEncodingVariants(json const& vs,
         parseVariantGuard      (v, opIdx, vi, variant, coll);
         parseVariantTemplate   (v, opIdx, vi, variant.tmpl, coll);
         parseVariantResultSlot (v, opIdx, vi, variant, coll);
-        parseVariantWires      (v, opIdx, vi, variant, coll);
+        parseVariantWires      (v, opIdx, vi, variant, data, coll);
         out.push_back(std::move(variant));
     }
 }
@@ -354,6 +385,81 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     if (target.contains("frameStoreMnemonic")
         && target.at("frameStoreMnemonic").is_string()) {
         data.frameStoreMnemonic = target.at("frameStoreMnemonic").get<std::string>();
+    }
+
+    // ── relocations (AS1 §2.6 — optional) ─────────────────────────
+    // Loaded BEFORE opcodes so the per-wire `relocationKind` name
+    // lookup at opcode-parse time can resolve against the populated
+    // `relocations[]` table. Empty/absent section is legal; non-
+    // empty rows must satisfy the validate() contract: unique non-
+    // zero `kind`, non-empty `name`. `formula` is opaque to the
+    // substrate — stored verbatim for diagnostic display and for
+    // the linker's `*.format.json` human-readable cross-reference.
+    if (doc.contains("relocations")) {
+        if (!doc.at("relocations").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/relocations",
+                      "'relocations' must be an array");
+        } else {
+            auto const& rels = doc.at("relocations");
+            data.relocations.reserve(rels.size());
+            for (std::size_t i = 0; i < rels.size(); ++i) {
+                auto const& r = rels[i];
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/relocations/{}", i),
+                              "relocation entry must be an object");
+                    continue;
+                }
+                TargetRelocationInfo info;
+                if (!r.contains("name") || !r.at("name").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/relocations/{}/name", i),
+                              "missing or non-string 'name'");
+                    continue;
+                }
+                info.name = r.at("name").get<std::string>();
+                if (!r.contains("kind") || !r.at("kind").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/relocations/{}/kind", i),
+                              "missing or non-integer 'kind' (must be a "
+                              "non-zero uint32 — the opaque tag the "
+                              "assembler stamps onto Relocation::kind)");
+                    continue;
+                }
+                {
+                    std::int64_t const v = r.at("kind").get<std::int64_t>();
+                    if (v < 0 || v > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/relocations/{}/kind", i),
+                                  std::format("'kind' ({}) must fit in [0, {}]",
+                                              v, std::numeric_limits<std::uint32_t>::max()));
+                        continue;
+                    }
+                    info.kind = RelocationKind{static_cast<std::uint32_t>(v)};
+                }
+                if (r.contains("formula")) {
+                    if (!r.at("formula").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/relocations/{}/formula", i),
+                                  "'formula' must be a string");
+                    } else {
+                        info.formula = r.at("formula").get<std::string>();
+                    }
+                }
+                std::uint16_t const idx =
+                    static_cast<std::uint16_t>(data.relocations.size());
+                bool const freshName =
+                    data.relocationNameIndex.emplace(info.name, idx).second;
+                if (!freshName) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/relocations/{}/name", i),
+                              std::format("duplicate relocation name '{}'", info.name));
+                    continue;
+                }
+                (void)data.relocationKindIndex.emplace(info.kind, idx);
+                data.relocations.push_back(std::move(info));
+            }
+        }
     }
 
     // ── opcodes ──
@@ -497,7 +603,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // modrmRegExt in [0,7], operand-wire index in range).
                 if (enc.contains("variants")) {
                     parseEncodingVariants(enc.at("variants"), info.encoding.variants,
-                                          i, coll);
+                                          i, data, coll);
                 }
             }
         }
@@ -687,92 +793,6 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.callingConventions.push_back(std::move(cc));
-            }
-        }
-    }
-
-    // ── relocations (AS1 §2.6 — optional) ─────────────────────────
-    // Empty/absent section is legal (cycle 2a targets emit no
-    // relocations yet); non-empty rows must satisfy the validate()
-    // contract: unique non-zero `kind`, non-empty `name`. The
-    // `formula` is opaque to the substrate — stored verbatim for
-    // diagnostic display and for the linker's `*.format.json`
-    // human-readable cross-reference.
-    if (doc.contains("relocations")) {
-        if (!doc.at("relocations").is_array()) {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/relocations",
-                      "'relocations' must be an array");
-        } else {
-            auto const& rels = doc.at("relocations");
-            data.relocations.reserve(rels.size());
-            for (std::size_t i = 0; i < rels.size(); ++i) {
-                auto const& r = rels[i];
-                if (!r.is_object()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/relocations/{}", i),
-                              "relocation entry must be an object");
-                    continue;
-                }
-                TargetRelocationInfo info;
-                if (!r.contains("name") || !r.at("name").is_string()) {
-                    coll.emit(DiagnosticCode::C_MissingField,
-                              std::format("/relocations/{}/name", i),
-                              "missing or non-string 'name'");
-                    continue;
-                }
-                info.name = r.at("name").get<std::string>();
-                if (!r.contains("kind") || !r.at("kind").is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MissingField,
-                              std::format("/relocations/{}/kind", i),
-                              "missing or non-integer 'kind' (must be a "
-                              "non-zero uint32 — the opaque tag the "
-                              "assembler stamps onto Relocation::kind)");
-                    continue;
-                }
-                {
-                    std::int64_t const v = r.at("kind").get<std::int64_t>();
-                    if (v < 0 || v > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  std::format("/relocations/{}/kind", i),
-                                  std::format("'kind' ({}) must fit in [0, {}]",
-                                              v, std::numeric_limits<std::uint32_t>::max()));
-                        continue;
-                    }
-                    info.kind = RelocationKind{static_cast<std::uint32_t>(v)};
-                }
-                // `formula` (optional) is opaque to the substrate but
-                // type-strict: a present-but-wrong-type field is
-                // diagnosed, NOT silently dropped (mirrors the
-                // `terminatorKind` discipline above).
-                if (r.contains("formula")) {
-                    if (!r.at("formula").is_string()) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  std::format("/relocations/{}/formula", i),
-                                  "'formula' must be a string");
-                    } else {
-                        info.formula = r.at("formula").get<std::string>();
-                    }
-                }
-                std::uint16_t const idx =
-                    static_cast<std::uint16_t>(data.relocations.size());
-                bool const freshName =
-                    data.relocationNameIndex.emplace(info.name, idx).second;
-                if (!freshName) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/relocations/{}/name", i),
-                              std::format("duplicate relocation name '{}'", info.name));
-                    continue;  // skip push_back so vector & index stay in sync
-                }
-                // Parallel kind-index for the linker hot path. Uniqueness
-                // is also checked by validate() (it produces the user-
-                // facing diagnostic with cross-row blame); here we just
-                // need the index entry to exist so `relocationInfo(kind)`
-                // is O(1) for the rows that DID load. If a later row
-                // collides on `kind`, validate() will emit the error and
-                // load is rejected, so the index's "first writer wins"
-                // shape never reaches consumers.
-                (void)data.relocationKindIndex.emplace(info.kind, idx);
-                data.relocations.push_back(std::move(info));
             }
         }
     }

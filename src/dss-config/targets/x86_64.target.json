@@ -179,6 +179,7 @@
       "maxSuccessors": 2
     },
     {
+      "$comment": "call sym — direct near call to a symbol. Encoding: 0xE8 + 4-byte signed PC-relative displacement to the call target (filled with 0 by the assembler; the linker patches via the rel32 relocation). The schema's maxOperands=255 admits a call ABI where extra operands carry arg-register hints; cycle-4 wires the single-SymbolRef variant (the direct-call form). An indirect-call form (call rax, encoding REX 0xFF /2) is anchored as a future variant.",
       "mnemonic":      "call",
       "result":        "optional",
       "hasSideEffects": true,
@@ -186,7 +187,19 @@
       "minOperands":   1,
       "maxOperands":   255,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["symbol"] },
+            "template": { "opcode": [232] },
+            "wires":    [
+              { "index": 0, "slotKind": "disp32", "relocationKind": "rel32" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "ret — 0xC3 near-return. The schema's maxOperands=1 admits an optional return value carrier; AS2 cycle 2 wires the zero-operand variant only. The actual return value is materialized into the calling-convention's return register by ML7 callconv-lowering BEFORE the ret instruction is emitted (via a `mov` to rax/xmm0); the ret instruction itself never carries an operand at the byte level.",
@@ -479,5 +492,11 @@
       "shadowSpaceBytes": 32,
       "redZoneBytes":     0
     }
+  ],
+  "$relocationsComment": "Relocation taxonomy (plan 13 AS4). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker (plan 14) reads via TargetSchema::relocationInfo(kind). `formula` is opaque text — documented in plan 14 §2.0 for human cross-reference + future linker-side decoder. Tag values are arbitrary per-target (only the names need to round-trip with format.json cross-reference).",
+  "relocations": [
+    { "name": "rel32", "kind": 1, "formula": "S + A - P - 4" },
+    { "name": "abs64", "kind": 2, "formula": "S + A"        },
+    { "name": "abs32", "kind": 3, "formula": "S + A"        }
   ]
 }

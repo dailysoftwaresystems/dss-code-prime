@@ -333,15 +333,23 @@ targetEncodingShapeFromName(std::string_view s) noexcept {
 // Imm8/Imm16/Imm64 widening WILL gain its own filter when its
 // consumer lands).
 enum class OperandKindFilter : std::uint8_t {
-    Reg    = 0,  // `LirOperand{kind == Reg}`
-    ImmInt = 1,  // `LirOperand{kind == ImmInt}` — current cycle's
-                 // immInt32 arm; future Imm8/Imm16/Imm64 join as
-                 // distinct filters when their walkers land.
+    Reg       = 0,  // `LirOperand{kind == Reg}`
+    ImmInt    = 1,  // `LirOperand{kind == ImmInt}` — current cycle's
+                    // immInt32 arm; future Imm8/Imm16/Imm64 join as
+                    // distinct filters when their walkers land.
+    SymbolRef = 2,  // `LirOperand{kind == SymbolRef}` — used by call /
+                    // branch instructions in cycle-4. The walker
+                    // emits a Relocation entry when this operand
+                    // reaches a symbol-bearing slot (Disp32 / Imm26).
+                    // Global-address load/store forms (x86 RIP-relative
+                    // mov, ARM64 ADRP+ADD pair) join with their
+                    // consumer cycle (plan 13 §3.1 D-AS4-1 / D-AS4-2).
 };
 
-inline constexpr EnumNameTable<OperandKindFilter, 2> kOperandKindFilterTable{{{
-    { OperandKindFilter::Reg,    "reg"   },
-    { OperandKindFilter::ImmInt, "imm32" },  // JSON-side width label
+inline constexpr EnumNameTable<OperandKindFilter, 3> kOperandKindFilterTable{{{
+    { OperandKindFilter::Reg,       "reg"    },
+    { OperandKindFilter::ImmInt,    "imm32"  },  // JSON-side width label
+    { OperandKindFilter::SymbolRef, "symbol" },
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -384,19 +392,41 @@ enum class EncodingSlotKind : std::uint8_t {
     Rd       = 3,  // destination register, bits 0..4
     Rn       = 4,  // first source register, bits 5..9
     Rm       = 5,  // second source register, bits 16..20
+    // Plan 13 AS4: symbol-bearing slots — values written by the
+    // walker are RELOCATABLE. A wire targeting Disp32 / Imm26
+    // declares its `relocationKind` (the schema row's name from
+    // `relocations[]`); the walker emits a Relocation entry into
+    // the AssembledFunction at the slot's byte offset AND writes
+    // ZEROS at that position. The linker (plan 14) reads the
+    // Relocation and patches in the final displacement at link
+    // time. (Cycle-4 hardcodes the on-bytes value to 0 + addend
+    // 0; a future wire-declared addend bias is anchored at plan
+    // 13 §3.1 D-AS4-4.)
+    Disp32   = 6,  // x86 PC-relative 32-bit displacement (e.g. `call rel32`)
+    Imm26    = 7,  // ARM64 26-bit branch offset / 4 (e.g. `bl imm26`)
     // Future fixed32 slots (paired with their consumer cycle):
     //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
     //   ImmShift / Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 6> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 8> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg, "modrm.reg" },
     { EncodingSlotKind::ModRmRm,  "modrm.rm"  },
     { EncodingSlotKind::Imm32,    "imm32"     },
     { EncodingSlotKind::Rd,       "rd"        },
     { EncodingSlotKind::Rn,       "rn"        },
     { EncodingSlotKind::Rm,       "rm"        },
+    { EncodingSlotKind::Disp32,   "disp32"    },
+    { EncodingSlotKind::Imm26,    "imm26"     },
 }}};
+
+// Centralised count — promoted from per-translation-unit local
+// constexpr per simplifier review. Used as the size of
+// `std::array<bool, N>` slot-tracking buffers in both validate()
+// and the fixed32 walker; keeps both sites in lockstep with the
+// shared enum table.
+inline constexpr std::size_t kEncodingSlotKindCount =
+    kEncodingSlotKindTable.rows.size();
 
 // Architect AS3 followup: each `EncodingSlotKind` is tied to ONE
 // encoding shape — ModRm* and Imm32 are x86-variable; Rd/Rn are
@@ -412,10 +442,12 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Disp32:
             return TargetEncodingShape::X86Variable;
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Imm26:
             return TargetEncodingShape::Fixed32;
     }
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
@@ -476,14 +508,47 @@ struct DSS_EXPORT TargetEncodingTemplate {
     std::uint32_t fixedWord = 0;
 };
 
+// True iff the slot kind carries a SYMBOL-RELATIVE value that the
+// assembler emits as a RELOCATION entry (rather than the operand's
+// hwEncoding or immediate value). The walker writes zeros (or the
+// addend) at the slot's byte position and pushes a Relocation into
+// the AssembledFunction; the linker (plan 14) patches the slot at
+// link time. validate() rule: a wire targeting a symbol-bearing
+// slot MUST declare `relocationKind`; a wire to a non-symbol slot
+// MUST NOT.
+[[nodiscard]] constexpr bool
+isSymbolBearingSlot(EncodingSlotKind s) noexcept {
+    switch (s) {
+        case EncodingSlotKind::Disp32:
+        case EncodingSlotKind::Imm26:
+            return true;
+        case EncodingSlotKind::ModRmReg:
+        case EncodingSlotKind::ModRmRm:
+        case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Rd:
+        case EncodingSlotKind::Rn:
+        case EncodingSlotKind::Rm:
+            return false;
+    }
+    return false;
+}
+
 // One operand-wire: "source operand at LIR-index `index` goes into
 // `slotKind` of the emitted bytes." The struct is intentionally named
 // `Wire` — the LIR-side `operands[]` are the things being wired (the
 // containing variant has both an `operandKinds` guard AND a `wires`
 // list; reusing `operands` for both made the role read ambiguously).
+//
+// `relocationKind` (plan 13 AS4) names which row of
+// `TargetSchemaData::relocations[]` the walker emits when this wire
+// references a `SymbolRef` LIR operand. The loader resolves the
+// name to its opaque `RelocationKind` tag at load time and stashes
+// it here. Required when `slotKind` is symbol-bearing (Disp32 /
+// Imm26); forbidden otherwise.
 struct DSS_EXPORT TargetEncodingWire {
-    std::uint8_t     index    = 0;
-    EncodingSlotKind slotKind = EncodingSlotKind::ModRmReg;
+    std::uint8_t     index           = 0;
+    EncodingSlotKind slotKind        = EncodingSlotKind::ModRmReg;
+    std::optional<RelocationKind> relocationKind;
 };
 
 // One encoding variant — guard + template + slot-wiring. The walker

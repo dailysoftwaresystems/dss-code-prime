@@ -25,8 +25,9 @@ using lir_pass_util::report;
 [[nodiscard]] constexpr std::optional<LirOperandKind>
 filterToLirKind(OperandKindFilter f) noexcept {
     switch (f) {
-        case OperandKindFilter::Reg:    return LirOperandKind::Reg;
-        case OperandKindFilter::ImmInt: return LirOperandKind::ImmInt;
+        case OperandKindFilter::Reg:       return LirOperandKind::Reg;
+        case OperandKindFilter::ImmInt:    return LirOperandKind::ImmInt;
+        case OperandKindFilter::SymbolRef: return LirOperandKind::SymbolRef;
     }
     return std::nullopt;
 }
@@ -84,14 +85,21 @@ hwEncodingOf(LirReg reg, TargetSchema const& schema,
     return static_cast<std::uint8_t>(info->hwEncoding);
 }
 
-// (LE byte emission moved to `asm/format/byte_emit.hpp` — shared with
-// the fixed32 walker.)
+// One pending symbol-relative slot. The walker emits 4 zero bytes
+// at the slot's position and a `Relocation` entry pointing the
+// linker at the symbol. Cycle-4 has one shape (Disp32 = 4 bytes
+// after the opcode/ModR/M).
+struct PendingRelocSlot {
+    RelocationKind kind;
+    SymbolId       target;
+};
 
 // State accumulated while emitting one variant: the 3-bit codes
 // destined for ModR/M.reg / ModR/M.rm + their high bits for REX.R /
-// REX.B, plus the immediate(s) that follow. The struct shape lets
-// the slot wiring loop populate fields independently of emission
-// order — emission writes REX → opcode → ModR/M → imm at the end.
+// REX.B, plus the immediate(s) and pending symbol-relative slot
+// that follow. The struct shape lets the slot wiring loop populate
+// fields independently of emission order — emission writes REX →
+// opcode → ModR/M → imm → disp32 at the end.
 struct EncodingState {
     bool                  hasModRm   = false;
     std::uint8_t          modRmReg3  = 0;       // low 3 bits → ModR/M.reg
@@ -112,7 +120,8 @@ struct EncodingState {
     // catches it as a fail-loud rather than a silent overwrite.
     bool                  wroteModRmReg = false;
     bool                  wroteModRmRm  = false;
-    std::vector<std::int32_t> imm32s;           // emitted after ModR/M, in order
+    std::vector<std::int32_t>     imm32s;        // immediate values to append (LE 4B each)
+    std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
 };
 
 // Wire a value (register hwEncoding OR immediate) into the named
@@ -205,7 +214,7 @@ bool encode(Lir const&                  lir,
             TargetOpcodeInfo const*     info,
             std::span<MirInstId const>  /*lirToMir*/,
             std::vector<std::uint8_t>&  out,
-            std::vector<Relocation>&    /*relocs*/,
+            std::vector<Relocation>&    relocs,
             std::vector<SourceMapEntry>& /*srcMap*/,
             DiagnosticReporter&         reporter) {
     // Substrate contract — `asm.cpp`'s dispatch screens
@@ -277,6 +286,45 @@ bool encode(Lir const&                  lir,
                             info->mnemonic, reporter)) {
                 return false;
             }
+        } else if (srcOp.kind == LirOperandKind::SymbolRef) {
+            // Plan 13 AS4 — symbol-bearing wire emits a Relocation.
+            // Cycle scope: only Disp32 supports the symbol-relative
+            // encoding on x86-variable. validate() pairs Disp32 with
+            // a non-empty `wire.relocationKind`; we re-check
+            // defensively in case a malformed Lir bypassed validate.
+            if (wire.slotKind != EncodingSlotKind::Disp32) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': SymbolRef operand wired "
+                                   "to non-Disp32 slot '{}' — cycle-4 "
+                                   "x86-variable scope supports symbol "
+                                   "references only on Disp32 slots",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            if (!wire.relocationKind.has_value()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': wire to Disp32 slot has "
+                                   "no `relocationKind` — validate() "
+                                   "should have rejected this schema",
+                                   info->mnemonic));
+                return false;
+            }
+            if (st.disp32.has_value()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': second writer to Disp32 "
+                                   "slot — only one symbol-relative "
+                                   "slot per instruction in cycle-4",
+                                   info->mnemonic));
+                return false;
+            }
+            st.disp32 = PendingRelocSlot{
+                *wire.relocationKind,
+                SymbolId{srcOp.symbolV}
+            };
         } else {
             // Guard already screened by operandsMatchGuard, so this
             // only fires on a corrupted Lir.
@@ -340,6 +388,30 @@ bool encode(Lir const&                  lir,
     // 7) Immediates: append in slot-wiring order.
     for (auto v : st.imm32s) {
         asm_byte_emit::appendImm32LE(out, v);
+    }
+
+    // 8) Disp32 (symbol-relative, plan 13 AS4). The relocation
+    //    offset is the byte position WHERE the 4 zero placeholder
+    //    bytes go — `out.size()` at emit time. The linker (plan 14)
+    //    patches the 4 bytes in-place per the kind's formula.
+    //    INVARIANT (silent-failure F4): in cycle-4 Disp32 is always
+    //    the TRAILING bytes of an instruction (`call rel32`,
+    //    `jmp rel32`, etc.), so capturing offset at emit time pins
+    //    the correct patch site. A future x86 instruction that
+    //    interleaves Disp32 with later prefixes/operands needs
+    //    per-slot byte-offset tracking — anchored at plan 13 §3.1
+    //    D-AS4-3.
+    //    Cycle-4 addend is always 0 (no composite operands yet);
+    //    plan 14 may later interpret a wire-declared addend bias.
+    if (st.disp32.has_value()) {
+        relocs.push_back(Relocation{
+            static_cast<std::uint32_t>(out.size()),
+            st.disp32->target,
+            st.disp32->kind,
+            /*addend=*/0,
+        });
+        // 4 placeholder bytes (linker patches these).
+        asm_byte_emit::appendU32LE(out, 0u);
     }
 
     return true;

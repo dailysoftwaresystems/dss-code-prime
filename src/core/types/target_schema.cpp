@@ -4,6 +4,7 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -180,19 +181,54 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // variant once, not per-instruction.
             if (o.encoding.shape == TargetEncodingShape::Fixed32) {
                 for (std::size_t ki = 0; ki < v.operandKinds.size(); ++ki) {
-                    if (v.operandKinds[ki] != OperandKindFilter::Reg) {
+                    if (v.operandKinds[ki] != OperandKindFilter::Reg
+                        && v.operandKinds[ki] != OperandKindFilter::SymbolRef) {
                         fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", i, vi, ki),
                              std::format("opcode '{}' variant {}: "
-                                         "fixed32 cycle-3 scope is "
-                                         "register-only — operand "
-                                         "kind '{}' at position {} "
-                                         "needs an immediate-slot "
-                                         "walker (Imm12 / ImmShift) "
-                                         "not yet shipped",
+                                         "fixed32 cycle-4 scope is "
+                                         "register + symbol-ref only "
+                                         "— operand kind '{}' at "
+                                         "position {} needs an "
+                                         "immediate-slot walker "
+                                         "(Imm12 / ImmShift, per "
+                                         "plan 13 §3.1 D-AS3-6)",
                                          o.mnemonic, vi,
                                          operandKindFilterName(v.operandKinds[ki]),
                                          ki));
                     }
+                }
+            }
+
+            // ── Plan 13 AS4: relocationKind vs slot pairing ─────────
+            // A wire targeting a symbol-bearing slot (Disp32 / Imm26)
+            // MUST declare `relocationKind`; a wire to a non-symbol
+            // slot MUST NOT (would be dead data, or worse misleading).
+            // The loader has already resolved the name into the
+            // `RelocationKind` opaque tag; here we just check
+            // presence-vs-required.
+            for (auto const& w : v.wires) {
+                bool const needsReloc = isSymbolBearingSlot(w.slotKind);
+                bool const hasReloc   = w.relocationKind.has_value();
+                if (needsReloc && !hasReloc) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
+                         std::format("opcode '{}' variant {}: wire to "
+                                     "symbol-bearing slot '{}' must "
+                                     "declare `relocationKind` (the row "
+                                     "in the schema's `relocations[]` "
+                                     "whose kind the assembler stamps "
+                                     "onto each emitted Relocation)",
+                                     o.mnemonic, vi,
+                                     encodingSlotKindName(w.slotKind)));
+                }
+                if (!needsReloc && hasReloc) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
+                         std::format("opcode '{}' variant {}: wire to "
+                                     "non-symbol-bearing slot '{}' "
+                                     "declares `relocationKind` — the "
+                                     "walker never emits a Relocation "
+                                     "for this slot kind",
+                                     o.mnemonic, vi,
+                                     encodingSlotKindName(w.slotKind)));
                 }
             }
 
@@ -288,13 +324,17 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 };
                 // Track each non-multi-writer slot's first writer.
                 // 6 entries — one per EncodingSlotKind value.
-                bool sawSlot[6] = { false, false, false, false, false, false };
+                // Sized from the shared `kEncodingSlotKindCount` so
+                // adding a new slot (Disp32 / Imm26 / etc.) is the
+                // SAME change as updating the enum table, no manual
+                // size update.
+                std::array<bool, kEncodingSlotKindCount> sawSlot{};
                 auto const markOrFail = [&](EncodingSlotKind slot,
                                             std::string const& kindLabel,
                                             std::string const& path) {
                     if (isMultiWriterSlot(slot)) return;
                     auto const idx = static_cast<std::size_t>(slot);
-                    if (idx < std::size(sawSlot) && sawSlot[idx]) {
+                    if (idx < sawSlot.size() && sawSlot[idx]) {
                         fail(path,
                              std::format("opcode '{}' variant {}: "
                                          "{} writer targets '{}' — "
@@ -303,7 +343,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                          "first at encode time",
                                          o.mnemonic, vi, kindLabel,
                                          encodingSlotKindName(slot)));
-                    } else if (idx < std::size(sawSlot)) {
+                    } else if (idx < sawSlot.size()) {
                         sawSlot[idx] = true;
                     }
                 };
@@ -348,10 +388,21 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                    return w.index == 0
                                        && isDestSlot(w.slotKind);
                                });
+            // `isCall` opcodes declare `result: optional` in LIR for
+            // callee-returns-a-value semantics, but the byte
+            // encoding doesn't carry the result — ML7 callconv
+            // lowering materializes the return value into the
+            // calling-convention's return register BEFORE the call,
+            // and consumers read it AFTER. The schema's `result`
+            // describes the LIR vreg semantics, not the byte form.
+            // Skip rule G for call-class opcodes. (`isCall` itself
+            // is constrained at schema-level below — convergence-
+            // fix C / silent-failure F1.)
             if (o.result != TargetResultRule::None
                 && !v.resultSlot.has_value()
                 && !v.tmpl.modrmRegExt.has_value()
-                && !has2AddrDestWire) {
+                && !has2AddrDestWire
+                && !o.isCall) {
                 fail(std::format("/opcodes/{}/encoding/variants/{}", i, vi),
                      std::format("opcode '{}' variant {}: opcode has "
                                  "`result='{}'` but variant declares "
@@ -439,6 +490,42 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      "operandKinds[0] to be 'reg' — the "
                                      "legalize pass needs a Reg operand "
                                      "to copy from",
+                                     o.mnemonic, vi));
+                }
+            }
+        }
+
+        // ── Convergence-fix C: `isCall` constraints (silent-failure F1) ─
+        // `isCall` exempts rule G (call opcodes' result is materialized
+        // by callconv, not by a destination slot). To prevent the
+        // exemption from becoming an escape hatch on non-call opcodes:
+        //   * an `isCall: true` opcode MUST set `hasSideEffects: true`
+        //     (a pure-function call is a contradiction; the regalloc
+        //     tier also relies on `hasSideEffects` for call-boundary
+        //     liveness tracking).
+        //   * an `isCall: true` opcode MUST NOT declare a destination-
+        //     bearing `resultSlot` on any variant (the result lives in
+        //     the callconv return register, not in an encoding slot).
+        // Together, these block a copy-paste `isCall: true` on an
+        // unrelated opcode from silently dropping its destination.
+        if (o.isCall) {
+            if (!o.hasSideEffects) {
+                fail(std::format("/opcodes/{}/isCall", i),
+                     std::format("opcode '{}': `isCall: true` requires "
+                                 "`hasSideEffects: true` (a pure-function "
+                                 "call is a contradiction)",
+                                 o.mnemonic));
+            }
+            for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
+                auto const& v = o.encoding.variants[vi];
+                if (v.resultSlot.has_value()) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/resultSlot", i, vi),
+                         std::format("opcode '{}' variant {}: `isCall: "
+                                     "true` opcode declares a "
+                                     "`resultSlot` — the call's return "
+                                     "value lives in the callconv "
+                                     "return register, not in an "
+                                     "encoding slot",
                                      o.mnemonic, vi));
                 }
             }
