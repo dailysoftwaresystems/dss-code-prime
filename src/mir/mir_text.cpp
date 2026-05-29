@@ -711,7 +711,12 @@ public:
         }
         if (!expectIdent("module")) return makeEmptyResult();
         if (!expect(TokKind::LBrace)) return makeEmptyResult();
-        // Body: zero or more `global` / `function` items.
+        // Body: zero or more `global` / `function` items. Panic-mode
+        // recovery: on an unexpected token, emit ONE diagnostic and
+        // skip until the next `global`/`function` keyword or the
+        // closing `}` — avoids per-token cascade after a parse
+        // failure inside `parseFunction` / `parseGlobal` returned
+        // mid-production.
         while (true) {
             Tok t = lex_.peek();
             if (t.kind == TokKind::RBrace || t.kind == TokKind::End) break;
@@ -723,7 +728,15 @@ public:
                 parseFunction();
             } else {
                 emitMalformed(std::format("expected 'global' or 'function', got '{}'", t.text));
-                lex_.take();  // progress guard
+                // Skip tokens until we find a recovery anchor.
+                while (true) {
+                    Tok pk = lex_.peek();
+                    if (pk.kind == TokKind::End) break;
+                    if (pk.kind == TokKind::RBrace) break;
+                    if (pk.kind == TokKind::Ident
+                     && (pk.text == "global" || pk.text == "function")) break;
+                    lex_.take();
+                }
             }
         }
         (void)expect(TokKind::RBrace);
@@ -1037,9 +1050,9 @@ private:
 
     void parseGlobal() {
         std::uint32_t const sym = parsePercentValue();
-        (void)expect(TokKind::Colon);
+        if (!expect(TokKind::Colon)) return;
         TypeId const ty = parseType();
-        (void)expect(TokKind::Eq);
+        if (!expect(TokKind::Eq)) return;
         Tok pk = lex_.peek();
         if (pk.kind == TokKind::Ident && pk.text == "zero") {
             lex_.take();
@@ -1065,14 +1078,17 @@ private:
 
     void parseFunction() {
         std::uint32_t const sym = parsePercentValue();
-        (void)expect(TokKind::Colon);
+        if (!expect(TokKind::Colon)) return;
         TypeId const sig = parseType();
         MirFuncId const f = builder_.addFunction(sig, SymbolId{sym});
         // Text initfunc references use %f<MirFuncId.v>. Track in
         // parse order so deferred-resolution at finalize works even
         // when a global with `initfunc` precedes its target function.
         funcMap_[f.v] = f;
-        (void)expect(TokKind::LBrace);
+        // Bail on missing `{` — without the function body's opening
+        // brace we have nothing to parse; continuing would cascade
+        // every subsequent token as malformed.
+        if (!expect(TokKind::LBrace)) return;
         // Two-pass: first scan all block headers (with their markers)
         // and create them in declaration order, so forward refs from
         // branch instructions resolve to blocks with the correct
@@ -1177,7 +1193,10 @@ private:
         }
         MirBlockId const b = it->second;
         builder_.beginBlock(b);
-        (void)expect(TokKind::LBrace);
+        // Bail on missing `{` for the block body — without it the
+        // following instructions cannot be parsed in a meaningful
+        // structural context.
+        if (!expect(TokKind::LBrace)) return;
         while (true) {
             Tok pk = lex_.peek();
             if (pk.kind == TokKind::RBrace || pk.kind == TokKind::End) break;
@@ -1229,7 +1248,7 @@ private:
         // Per-opcode operand parsing.
         switch (op) {
             case MirOpcode::Const: {
-                (void)expect(TokKind::LParen);
+                if (!expect(TokKind::LParen)) return;
                 MirLiteralValue lv = parseLiteral();
                 (void)expect(TokKind::RParen);
                 MirInstId const id = builder_.addConst(std::move(lv), resultType);
@@ -1237,7 +1256,7 @@ private:
                 break;
             }
             case MirOpcode::Arg: {
-                (void)expect(TokKind::LParen);
+                if (!expect(TokKind::LParen)) return;
                 Tok n = lex_.take();
                 std::uint32_t const idx = parseNumber<std::uint32_t>(
                     n.text, "arg index");
@@ -1247,7 +1266,7 @@ private:
                 break;
             }
             case MirOpcode::GlobalAddr: {
-                (void)expect(TokKind::LParen);
+                if (!expect(TokKind::LParen)) return;
                 std::uint32_t const sym = parsePercentValue();
                 (void)expect(TokKind::RParen);
                 MirInstId const id = builder_.addGlobalAddr(SymbolId{sym}, resultType);
@@ -1256,8 +1275,8 @@ private:
             }
             case MirOpcode::IntrinsicCall: {
                 // Emitter wrote: `(intrinsic <id>, %v1, %v2, ...)`.
-                (void)expect(TokKind::LParen);
-                (void)expectIdent("intrinsic");
+                if (!expect(TokKind::LParen)) return;
+                if (!expectIdent("intrinsic")) return;
                 Tok idTok = lex_.take();
                 std::uint32_t const intrinId = parseNumber<std::uint32_t>(
                     idTok.text, "intrinsic id");
@@ -1272,7 +1291,7 @@ private:
                 break;
             }
             case MirOpcode::Phi: {
-                (void)expect(TokKind::LBracket);
+                if (!expect(TokKind::LBracket)) return;
                 std::vector<std::pair<std::uint32_t, std::uint32_t>> incs;
                 while (true) {
                     Tok pk = lex_.peek();
@@ -1310,7 +1329,7 @@ private:
             case MirOpcode::Switch: {
                 std::uint32_t const discSlot = parsePercentValue();
                 MirInstId const disc = resolveValue(discSlot);
-                (void)expect(TokKind::LBrace);
+                if (!expect(TokKind::LBrace)) return;
                 std::vector<std::pair<MirInstId, MirBlockId>> cases;
                 MirBlockId defaultBB{};
                 bool sawDefault = false;

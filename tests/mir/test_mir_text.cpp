@@ -295,6 +295,34 @@ TEST(MirText, PointerAndArrayTypesRoundTrip) {
 // I_TextMalformed (was silently zero in cycle 1). The text
 // `lit int abc` has a non-numeric token where an integer is
 // expected; the new parseNumber<T> helper catches this.
+// A function missing its opening `{` used to cascade every subsequent
+// token as a malformed diagnostic. Now the parser bails out of the
+// function on the missing LBrace; only ONE I_TextMalformed per
+// catastrophic structural boundary fires (plus the version/header
+// diagnostics from the rest of the input).
+TEST(MirText, MissingFunctionLBraceDoesNotCascade) {
+    std::string text =
+        "dssir 1\n"
+        "symbols { %1 \"f\" }\n"
+        "module {\n"
+        "  function %1 : fn() -> i32\n"   // <-- missing `{`
+        "    block %b1 [entry] { return }\n"
+        "  }\n"
+        "}\n";
+    DiagnosticReporter r;
+    auto res = parseMir(text, CompilationUnitId{1}, r);
+    EXPECT_FALSE(res->ok);
+    // Count I_TextMalformed diagnostics. Before the fix this was
+    // ≥ 5 (cascade). After the fix it should be small (one per
+    // structural boundary hit by the malformed input).
+    std::size_t nMalformed = 0;
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::I_TextMalformed) ++nMalformed;
+    }
+    EXPECT_LE(nMalformed, 3u)
+        << "missing LBrace cascaded into " << nMalformed << " diagnostics";
+}
+
 TEST(MirText, MalformedNumericLiteralEmitsDiagnostic) {
     // Build a malformed body. The lexer will tokenize `abc` as Ident,
     // not Integer, so the parser's `lit int` branch will fail at the
