@@ -24,13 +24,15 @@ namespace {
 
 Lir::Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
          FuncArena funcArena, std::vector<LirOperand> operandPool,
-         std::vector<LirBlockId> succPool) noexcept
+         std::vector<LirBlockId> succPool,
+         LirLiteralPool literalPool) noexcept
     : target_(target),
       instArena_(std::move(instArena)),
       blockArena_(std::move(blockArena)),
       funcArena_(std::move(funcArena)),
       operandPool_(std::move(operandPool)),
-      succPool_(std::move(succPool)) {
+      succPool_(std::move(succPool)),
+      literalPool_(std::move(literalPool)) {
     // Cross-arena module-id check — all four arenas must share one tag.
     if (instArena_.id() != blockArena_.id()
      || instArena_.id() != funcArena_.id()) {
@@ -313,6 +315,10 @@ void LirBuilder::closeFunction_() {
     openBlock_ = {};
 }
 
+std::uint32_t LirBuilder::literalPoolAdd(LirLiteralValue value) {
+    return literalPool_.add(std::move(value));
+}
+
 Lir LirBuilder::finish() && {
     if (openFunc_.valid()) closeFunction_();
     return Lir{
@@ -322,6 +328,7 @@ Lir LirBuilder::finish() && {
         std::move(funcArena_).finish(),
         std::move(operandPool_),
         std::move(succPool_),
+        std::move(literalPool_),
     };
 }
 

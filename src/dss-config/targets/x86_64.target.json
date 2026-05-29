@@ -142,6 +142,83 @@
       "maxOperands":   1,
       "minSuccessors": 0,
       "maxSuccessors": 0
+    },
+    {
+      "$comment": "Allocate a stack-frame slot (cycle 3c). Payload encodes (size << 16) | alignment; result is a pointer-class virtreg holding the slot's effective address. ML6/ML7 turns this into a real frame-relative `lea` once the frame layout is known.",
+      "mnemonic":      "alloca",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Load from memory. Operands: [base_reg, MemBase(scale=1), MemOffset(disp)]. Optional index-reg arm added in cycle 3d. AS1 emits `mov reg, [base + disp]` or RIP-relative for global addresses.",
+      "mnemonic":      "load",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)]. No result. AS1 emits `mov [base + disp], reg`.",
+      "mnemonic":      "store",
+      "result":        "none",
+      "isTerminator":  false,
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)]. AS1 emits x86_64 `lea reg, [base + index*scale + disp]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm in cycle 3d.",
+      "mnemonic":      "lea",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). Operands: [src_reg]. Width comes from the result reg's class + the source reg's width-of-record. AS1 emits movsx.",
+      "mnemonic":      "sext",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Zero-extend integer (cycle 3c cast lowering for MIR ZExt). Operands: [src_reg]. AS1 emits movzx.",
+      "mnemonic":      "zext",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Truncate integer (cycle 3c cast lowering for MIR Trunc). Operands: [src_reg]. AS1 emits mov of the low N bits (effectively a no-op on x86_64 since registers alias subregs).",
+      "mnemonic":      "trunc",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
     }
   ],
   "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal the assembler/encoder will read.",

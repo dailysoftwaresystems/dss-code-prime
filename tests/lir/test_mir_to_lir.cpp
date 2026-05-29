@@ -14,11 +14,16 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "mir/mir.hpp"
+#include "mir/mir_literal_pool.hpp"
+#include "mir/mir_node.hpp"
+#include "mir/mir_opcode.hpp"
 
 #include <gtest/gtest.h>
 
@@ -272,13 +277,13 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
 }
 
 TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
-    // Cycle 3b lowers Br/CondBr/ICmp*/Phi/Switch/Unreachable, so the
-    // cycle-3a `if (x < 0)` pin is no longer unsupported. Now memory
-    // operations (Load/Store/Alloca/Gep) — deferred to cycle 3c — are the
-    // canonical fail-loud example: a function with a local variable hits
-    // MIR Alloca + Store + Load which cycle 3b does NOT yet lower.
+    // Cycle 3c lowers memory ops (Alloca/Load/Store/Gep) + cast (SExt/
+    // ZExt/Trunc/Bitcast/IntToPtr/PtrToInt). Still-deferred: Call (cycle
+    // 3d), bitwise ops (cycle 3d), float ops, aggregates. A direct
+    // function call is the cleanest cycle-3d-deferred trigger.
     auto L = lowerCSubsetToLir(
-        "int f() { int x = 42; return x; }");
+        "int f(int x) { return x; }\n"
+        "int g(int y) { return f(y); }\n");
     assertUpstreamClean(L);
     EXPECT_FALSE(L.lir.ok);
     bool foundUnsupported = false;
@@ -513,6 +518,170 @@ TEST(MirToLir, SwitchLowersToCascadingCompares) {
         << "switch with 2 cases must emit ≥2 cmp+jcc pairs (one per case)";
     EXPECT_GE(jmpTerminators, 1)
         << "switch must emit a `jmp default` terminator in its tail block";
+}
+
+// ─── cycle 3c vertical slice: memory ops + cast + wide literals ─────────
+
+TEST(MirToLir, LocalVariableLowersAllocaLoadStore) {
+    // `int f() { int x = 42; return x; }` — exercises the cycle-3c
+    // memory triad: Alloca + Store + Load + Return. The function uses
+    // ALL three new memory opcodes plus the existing cycle-3a/3b
+    // mov/ret. After cycle 3c this fully lowers.
+    auto L = lowerCSubsetToLir(
+        "int f() { int x = 42; return x; }");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "cycle-3c memory ops must lower a local-variable round-trip cleanly";
+
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    LirFuncId const fn = lir.funcAt(0);
+    LirBlockId const entry = lir.funcEntry(fn);
+    // Walk the entry block and verify alloca + store + load all emitted.
+    bool foundAlloca = false, foundStore = false, foundLoad = false;
+    auto const allocaOp = *sch.opcodeByMnemonic("alloca");
+    auto const storeOp  = *sch.opcodeByMnemonic("store");
+    auto const loadOp   = *sch.opcodeByMnemonic("load");
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        auto const o = lir.instOpcode(lir.blockInstAt(entry, i));
+        if (o == allocaOp) foundAlloca = true;
+        if (o == storeOp)  foundStore  = true;
+        if (o == loadOp)   foundLoad   = true;
+    }
+    EXPECT_TRUE(foundAlloca);
+    EXPECT_TRUE(foundStore);
+    EXPECT_TRUE(foundLoad);
+}
+
+TEST(MirToLir, StoreEmitsCorrectOperandShape) {
+    // Pin the cycle-3c Store operand convention: [value, base, MemBase,
+    // MemOffset]. A regression dropping the MemBase/MemOffset operands
+    // or swapping value/base order would silently produce broken
+    // addressing-mode encoding downstream.
+    auto L = lowerCSubsetToLir(
+        "int f() { int x = 7; return x; }");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+    auto const storeOp = *L.target->opcodeByMnemonic("store");
+    Lir const& lir = L.lir.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    bool foundStore = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) != storeOp) continue;
+        foundStore = true;
+        auto const ops = lir.instOperands(inst);
+        ASSERT_EQ(ops.size(), 4u);
+        EXPECT_EQ(ops[0].kind, LirOperandKind::Reg);        // value
+        EXPECT_EQ(ops[1].kind, LirOperandKind::Reg);        // base
+        EXPECT_EQ(ops[2].kind, LirOperandKind::MemBase);    // scale
+        EXPECT_EQ(ops[3].kind, LirOperandKind::MemOffset);  // displacement
+        break;
+    }
+    EXPECT_TRUE(foundStore);
+}
+
+TEST(MirToLir, AllocaResultIsAddressableViaStore) {
+    // Cycle-3c Alloca lowering: the LIR alloca's result register flows
+    // into the immediately following Store as its `base` operand. This
+    // pins the (Alloca result → Store base) wiring; a regression that
+    // dropped the result-register propagation would surface here.
+    //
+    // Payload semantics on Alloca are ML6/ML7-driven (the size and
+    // alignment encoding co-designs with frame-layout in cycle 3d);
+    // cycle 3c is the pass-through layer.
+    auto L = lowerCSubsetToLir(
+        "int f() { int x; x = 1; return x; }");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+    auto const allocaOp = *L.target->opcodeByMnemonic("alloca");
+    auto const storeOp  = *L.target->opcodeByMnemonic("store");
+    Lir const& lir = L.lir.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    LirReg allocaResult{};
+    bool sawAlloca = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) == allocaOp) {
+            allocaResult = lir.instResult(inst);
+            sawAlloca = true;
+            EXPECT_TRUE(allocaResult.valid())
+                << "Alloca must produce a valid result vreg";
+        }
+        if (lir.instOpcode(inst) == storeOp && sawAlloca) {
+            auto const ops = lir.instOperands(inst);
+            ASSERT_EQ(ops.size(), 4u);
+            // ops[1] is the base register the Store writes through.
+            EXPECT_EQ(ops[1].kind, LirOperandKind::Reg);
+            EXPECT_EQ(ops[1].reg, allocaResult)
+                << "Store's base operand must reference Alloca's result";
+            break;
+        }
+    }
+    EXPECT_TRUE(sawAlloca);
+}
+
+TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
+    // Cycle-3c wide-literal path: int64 values outside int32 range
+    // route through the LirLiteralPool. The mov inst's operand carries
+    // kind=LiteralIndex pointing at the pool entry.
+    //
+    // c-subset doesn't naturally produce wide MIR Const (semantics
+    // rejects int literals > INT32_MAX), so we build MIR directly via
+    // the synthetic-MIR helper. This pins the wide-literal cycle-3c
+    // gap the cycle-3a/3b tests couldn't reach end-to-end.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    // Build a synthetic MIR module: one function with one block
+    // containing a Const(int64_max) + Return.
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i64    = interner.primitive(::dss::TypeKind::I64);
+    auto const voidT  = interner.primitive(::dss::TypeKind::Void);
+    auto const fnSig  = interner.fnSig(std::span<::dss::TypeId const>{}, i64, ::dss::CallConv::CcSysV);
+    (void)voidT;
+    ::dss::MirBuilder mb;
+    ::dss::MirLiteralValue lv;
+    lv.value = static_cast<std::int64_t>(0x1234567890ABCDEF);  // > INT32_MAX
+    lv.core  = ::dss::TypeKind::I64;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const constInst = mb.addConst(lv, i64);
+    std::array<::dss::MirInstId, 1> retOps{constInst};
+    mb.addReturn(constInst);
+    ::dss::Mir m = std::move(mb).finish();
+    (void)retOps;
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, rep);
+    ASSERT_TRUE(result.ok)
+        << "wide-literal MIR Const must lower cleanly via the LIR literal pool";
+
+    // Find the mov; its operand kind must be LiteralIndex (not ImmInt).
+    Lir const& lir = result.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    bool foundLitMov = false;
+    auto const movOp = *sch.opcodeByMnemonic("mov");
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) != movOp) continue;
+        auto const ops = lir.instOperands(inst);
+        if (ops.size() != 1) continue;
+        if (ops[0].kind == LirOperandKind::LiteralIndex) {
+            foundLitMov = true;
+            // The pool entry must round-trip the original int64.
+            auto const& lirLit = lir.literalValue(ops[0].litIndex);
+            auto const* asI64 = std::get_if<std::int64_t>(&lirLit.value);
+            ASSERT_NE(asI64, nullptr);
+            EXPECT_EQ(*asI64, 0x1234567890ABCDEF);
+            break;
+        }
+    }
+    EXPECT_TRUE(foundLitMov)
+        << "wide-literal mov must use LirOperandKind::LiteralIndex (not ImmInt)";
+    EXPECT_EQ(lir.literalPool().size(), 1u);
 }
 
 TEST(MirToLir, LinkRegisterUnknownNameRejectedNegativePath) {

@@ -76,6 +76,31 @@ namespace {
         || op == MirOpcode::Unreachable;
 }
 
+// Single source of truth for the lowerer's opcode-mnemonic cache. The
+// enum entry order MUST match `kMnemonicTable` below; the static_assert
+// pins the alignment.
+//
+// Cycle 3c collapsed the cycle-3a-pattern of three parallel sequences
+// (enum / optional<uint16_t> fields / bool array) into one indexable
+// array — the type-design agent's recommendation closing the silent-
+// drift hazard between the three. Now every new opcode = one enum row
+// + one table row, never a missing-bool flag.
+enum class MnemonicSlot : std::uint8_t {
+    Arg, Mov, Add, Sub, Mul,
+    Cmp, Setcc, Jmp, Jcc,
+    Ret, Unreachable,
+    Alloca, Load, Store, Lea,        // cycle 3c memory ops
+    SExt, ZExt, Trunc,                // cycle 3c cast lowering
+    Count_
+};
+constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
+
+struct MnemonicCache {
+    std::string_view             mnemonic;
+    std::optional<std::uint16_t> id;
+    bool                         missingReported = false;
+};
+
 // One transient lowerer per `lowerToLir` call. Holds the per-pass state
 // the dispatcher methods read/write. Mirrors `Lowerer` in `hir_to_mir.cpp`.
 struct Lowerer {
@@ -84,38 +109,14 @@ struct Lowerer {
     DiagnosticReporter& reporter;
     LirBuilder          lir;
 
-    // Cached opcode mnemonics → numeric indexes. Looked up once at Lowerer
-    // construction. `std::nullopt` when the target schema does not declare
-    // the mnemonic; `reportMissingOpcode` fires ONCE per missing slot.
-    std::optional<std::uint16_t> opArg;
-    std::optional<std::uint16_t> opMov;
-    std::optional<std::uint16_t> opAdd;
-    std::optional<std::uint16_t> opSub;
-    std::optional<std::uint16_t> opMul;
-    std::optional<std::uint16_t> opCmp;
-    std::optional<std::uint16_t> opSetcc;
-    std::optional<std::uint16_t> opJmp;
-    std::optional<std::uint16_t> opJcc;
-    std::optional<std::uint16_t> opRet;
-    std::optional<std::uint16_t> opUnreachable;
-    enum MnemonicSlot : std::uint8_t {
-        SlotArg, SlotMov, SlotAdd, SlotSub, SlotMul,
-        SlotCmp, SlotSetcc, SlotJmp, SlotJcc,
-        SlotRet, SlotUnreachable, SlotCount
-    };
-    std::array<bool, SlotCount> missingReported{};
+    // Single table of cached opcode ids. `kMnemonics[i].mnemonic` is the
+    // JSON-side name, `cache_[i].id` is the resolved numeric opcode (or
+    // nullopt when the target schema omits it), `cache_[i].missingReported`
+    // gates the one-shot diagnostic.
+    std::array<MnemonicCache, kMnemonicCount> cache_;
 
     // Per-function state. Cleared at the top of `lowerFunction`.
-    //
-    // `valueToReg`: typed side-table mapping MIR instruction id → LIR
-    // virtual register that materialised its result. Switched from the
-    // cycle-3a `unordered_map<uint32_t, LirReg>` to MirAttribute<LirReg>
-    // for type safety + dense-vector backing once coverage crosses the
-    // substrate threshold — exactly the architect agent's cycle-3a
-    // follow-up.
     MirAttribute<LirReg>            valueToReg;
-    // `mirBlockToLirBlock`: parallel block-tier map. MirBlockAttribute
-    // binds to the block arena (sibling of the instruction arena).
     MirBlockAttribute<LirBlockId>   mirBlockToLirBlock;
 
     // Whether the running lowering pass added any error-severity
@@ -129,31 +130,36 @@ struct Lowerer {
         : mir(m), target(t), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()) {
         baselineErrors = reporter.errorCount();
-        opArg         = target.opcodeByMnemonic("arg");
-        opMov         = target.opcodeByMnemonic("mov");
-        opAdd         = target.opcodeByMnemonic("add");
-        opSub         = target.opcodeByMnemonic("sub");
-        opMul         = target.opcodeByMnemonic("mul");
-        opCmp         = target.opcodeByMnemonic("cmp");
-        opSetcc       = target.opcodeByMnemonic("setcc");
-        opJmp         = target.opcodeByMnemonic("jmp");
-        opJcc         = target.opcodeByMnemonic("jcc");
-        opRet         = target.opcodeByMnemonic("ret");
-        opUnreachable = target.opcodeByMnemonic("unreachable");
+        // Mnemonics in MnemonicSlot enum-declaration order.
+        constexpr std::array<std::string_view, kMnemonicCount> kMnemonics{{
+            "arg", "mov", "add", "sub", "mul",
+            "cmp", "setcc", "jmp", "jcc",
+            "ret", "unreachable",
+            "alloca", "load", "store", "lea",
+            "sext", "zext", "trunc",
+        }};
+        for (std::size_t i = 0; i < kMnemonicCount; ++i) {
+            cache_[i].mnemonic = kMnemonics[i];
+            cache_[i].id       = target.opcodeByMnemonic(kMnemonics[i]);
+        }
+    }
+
+    [[nodiscard]] std::optional<std::uint16_t> opcode(MnemonicSlot s) const {
+        return cache_[static_cast<std::size_t>(s)].id;
     }
 
     // ── diagnostics ──────────────────────────────────────────────────
 
-    void reportMissingOpcode(MnemonicSlot slot, std::string_view mnemonic,
-                             std::string_view context) {
-        if (missingReported[slot]) return;
-        missingReported[slot] = true;
+    void reportMissingOpcode(MnemonicSlot slot, std::string_view context) {
+        auto& entry = cache_[static_cast<std::size_t>(slot)];
+        if (entry.missingReported) return;
+        entry.missingReported = true;
         ParseDiagnostic d;
         d.code     = DiagnosticCode::L_RequiredLirOpcodeMissing;
         d.severity = DiagnosticSeverity::Error;
         d.actual   = std::format(
             "target '{}' declares no '{}' opcode (required for lowering {})",
-            target.name(), mnemonic, context);
+            target.name(), entry.mnemonic, context);
         reporter.report(std::move(d));
     }
 
@@ -213,9 +219,9 @@ struct Lowerer {
         switch (op) {
             case MirOpcode::Arg:    return lowerArg(id);
             case MirOpcode::Const:  return lowerConst(id);
-            case MirOpcode::Add:    return lowerBinaryOp(id, SlotAdd, "add", opAdd);
-            case MirOpcode::Sub:    return lowerBinaryOp(id, SlotSub, "sub", opSub);
-            case MirOpcode::Mul:    return lowerBinaryOp(id, SlotMul, "mul", opMul);
+            case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
+            case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
+            case MirOpcode::Mul:    return lowerBinaryOp(id, MnemonicSlot::Mul);
             case MirOpcode::ICmpEq: case MirOpcode::ICmpNe:
             case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
             case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
@@ -223,25 +229,40 @@ struct Lowerer {
             case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge:
                 return lowerICmp(id, *condCodeForICmp(op));
             case MirOpcode::Phi:    return;  // pre-pass-allocated; no body emission
+            case MirOpcode::Alloca: return lowerAlloca(id);
+            case MirOpcode::Load:   return lowerLoad(id);
+            case MirOpcode::Store:  return lowerStore(id);
+            case MirOpcode::Gep:    return lowerGep(id);
+            case MirOpcode::Trunc:  return lowerCast(id, MnemonicSlot::Trunc, "MIR Trunc");
+            case MirOpcode::SExt:   return lowerCast(id, MnemonicSlot::SExt,  "MIR SExt");
+            case MirOpcode::ZExt:   return lowerCast(id, MnemonicSlot::ZExt,  "MIR ZExt");
+            case MirOpcode::Bitcast:
+            case MirOpcode::IntToPtr:
+            case MirOpcode::PtrToInt:
+                // These are bit-pattern-preserving identity casts on
+                // x86_64 (pointers are 64-bit registers like int64). The
+                // LIR substrate lowers them as a single `mov` (or as the
+                // direct vreg pass-through ML6 will coalesce away).
+                return lowerCast(id, MnemonicSlot::Mov, "MIR Bitcast/IntToPtr/PtrToInt");
             default: break;
         }
         reportUnsupported(op, id);
     }
 
     void lowerArg(MirInstId id) {
-        if (!opArg.has_value()) {
-            reportMissingOpcode(SlotArg, "arg", "MIR Arg");
+        if (!opcode(MnemonicSlot::Arg).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Arg, "MIR Arg");
             return;
         }
         LirReg const result = lir.newVReg(LirRegClass::GPR);
-        lir.addInst(*opArg, result, std::span<LirOperand const>{},
+        lir.addInst(*opcode(MnemonicSlot::Arg), result, std::span<LirOperand const>{},
                     /*payload=*/mir.argIndex(id));
         defineValue(id, result);
     }
 
     void lowerConst(MirInstId id) {
-        if (!opMov.has_value()) {
-            reportMissingOpcode(SlotMov, "mov", "MIR Const");
+        if (!opcode(MnemonicSlot::Mov).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Mov, "MIR Const");
             return;
         }
         std::uint32_t const litIdx = mir.constLiteralIndex(id);
@@ -263,20 +284,131 @@ struct Lowerer {
             imm32 = *b ? 1 : 0;
             fits  = true;
         }
-        if (!fits) {
+        if (fits) {
+            LirReg const result = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> ops{LirOperand::makeImmInt32(imm32)};
+            lir.addInst(*opcode(MnemonicSlot::Mov), result, ops);
+            defineValue(id, result);
+            return;
+        }
+        // Wide literal — route through the cycle-3c LirLiteralPool.
+        LirLiteralValue lirLit;
+        lirLit.core = lit.core;
+        if (auto const* i = std::get_if<std::int64_t>(&lit.value))       lirLit.value = *i;
+        else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) lirLit.value = *u;
+        else if (auto const* d = std::get_if<double>(&lit.value))        lirLit.value = *d;
+        else if (auto const* b = std::get_if<bool>(&lit.value))          lirLit.value = *b;
+        else if (auto const* s = std::get_if<std::string>(&lit.value))   lirLit.value = *s;
+        else {
             reportUnsupported(MirOpcode::Const, id);
             return;
         }
+        std::uint32_t const lirLitIdx = lir.literalPoolAdd(std::move(lirLit));
         LirReg const result = lir.newVReg(LirRegClass::GPR);
-        std::array<LirOperand, 1> ops{LirOperand::makeImmInt32(imm32)};
-        lir.addInst(*opMov, result, ops);
+        std::array<LirOperand, 1> ops{LirOperand::makeLiteralIndex(lirLitIdx)};
+        lir.addInst(*opcode(MnemonicSlot::Mov), result, ops);
         defineValue(id, result);
     }
 
-    void lowerBinaryOp(MirInstId id, MnemonicSlot slot, std::string_view mnemonic,
-                       std::optional<std::uint16_t> opcode) {
-        if (!opcode.has_value()) {
-            reportMissingOpcode(slot, mnemonic, mirOpcodeName(mir.instOpcode(id)));
+    // ── memory ops (cycle 3c) ────────────────────────────────────────
+
+    void lowerAlloca(MirInstId id) {
+        if (!opcode(MnemonicSlot::Alloca).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Alloca, "MIR Alloca");
+            return;
+        }
+        std::uint32_t const payload = mir.instPayload(id);
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        lir.addInst(*opcode(MnemonicSlot::Alloca), result,
+                    std::span<LirOperand const>{}, payload);
+        defineValue(id, result);
+    }
+
+    void lowerLoad(MirInstId id) {
+        if (!opcode(MnemonicSlot::Load).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Load, "MIR Load");
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) { reportUnsupported(MirOpcode::Load, id); return; }
+        std::optional<LirReg> const base = regForValue(operands[0]);
+        if (!base.has_value()) return;
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 3> ops{
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        lir.addInst(*opcode(MnemonicSlot::Load), result, ops);
+        defineValue(id, result);
+    }
+
+    void lowerStore(MirInstId id) {
+        if (!opcode(MnemonicSlot::Store).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Store, "MIR Store");
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
+        std::optional<LirReg> const value = regForValue(operands[0]);
+        std::optional<LirReg> const base  = regForValue(operands[1]);
+        if (!value.has_value() || !base.has_value()) return;
+        std::array<LirOperand, 4> ops{
+            LirOperand::makeReg(*value),
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        lir.addInst(*opcode(MnemonicSlot::Store), InvalidLirReg, ops);
+    }
+
+    void lowerGep(MirInstId id) {
+        if (!opcode(MnemonicSlot::Lea).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Lea, "MIR Gep");
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.empty()) { reportUnsupported(MirOpcode::Gep, id); return; }
+        std::optional<LirReg> const base = regForValue(operands[0]);
+        if (!base.has_value()) return;
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        // Cycle 3c: degenerate no-index Gep → `lea result, [base + 0]`.
+        // Dynamic indices defer to cycle 3d.
+        std::array<LirOperand, 3> ops{
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        lir.addInst(*opcode(MnemonicSlot::Lea), result, ops);
+        defineValue(id, result);
+    }
+
+    // Single-operand value-producing cast. The result register class +
+    // width come from the inst's MIR type (ML6/AS1 reads it); cycle 3c
+    // emits as `<slot> result, src` and lets the downstream encoder
+    // resolve to movsx/movzx/mov.
+    void lowerCast(MirInstId id, MnemonicSlot slot, std::string_view context) {
+        if (!opcode(slot).has_value()) {
+            reportMissingOpcode(slot, context);
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        std::optional<LirReg> const src = regForValue(operands[0]);
+        if (!src.has_value()) return;
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
+        lir.addInst(*opcode(slot), result, ops);
+        defineValue(id, result);
+    }
+
+    void lowerBinaryOp(MirInstId id, MnemonicSlot slot) {
+        auto const op = opcode(slot);
+        if (!op.has_value()) {
+            reportMissingOpcode(slot, mirOpcodeName(mir.instOpcode(id)));
             return;
         }
         auto const operands = mir.instOperands(id);
@@ -289,7 +421,7 @@ struct Lowerer {
         if (!a.has_value() || !b.has_value()) return;
         LirReg const result = lir.newVReg(LirRegClass::GPR);
         std::array<LirOperand, 2> ops{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
-        lir.addInst(*opcode, result, ops);
+        lir.addInst(*op, result, ops);
         defineValue(id, result);
     }
 
@@ -298,12 +430,12 @@ struct Lowerer {
     // forwarding pass will collapse `cmp/setcc/cmp 0/jcc-ne` to
     // `cmp/jcc-cond` once a use-count analysis lands.
     void lowerICmp(MirInstId id, TargetCondCode cond) {
-        if (!opCmp.has_value()) {
-            reportMissingOpcode(SlotCmp, "cmp", "MIR ICmp");
+        if (!opcode(MnemonicSlot::Cmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Cmp, "MIR ICmp");
             return;
         }
-        if (!opSetcc.has_value()) {
-            reportMissingOpcode(SlotSetcc, "setcc", "MIR ICmp");
+        if (!opcode(MnemonicSlot::Setcc).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Setcc, "MIR ICmp");
             return;
         }
         auto const operands = mir.instOperands(id);
@@ -319,10 +451,10 @@ struct Lowerer {
         // value-producing inst sits between them (cycle 3a fallback-seal
         // + cycle 3b ICmp-immediately-followed-by-setcc).
         std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
-        lir.addInst(*opCmp, InvalidLirReg, cmpOps);
+        lir.addInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
 
         LirReg const result = lir.newVReg(LirRegClass::GPR);
-        lir.addInst(*opSetcc, result, std::span<LirOperand const>{},
+        lir.addInst(*opcode(MnemonicSlot::Setcc), result, std::span<LirOperand const>{},
                     /*payload=*/static_cast<std::uint32_t>(cond));
         defineValue(id, result);
     }
@@ -356,8 +488,8 @@ struct Lowerer {
     //    is SKIPPED so a poisoned tmp does not silently propagate
     //  - phi without an incoming for this predecessor → loud
     void emitPhiMovesForEdge(MirBlockId currentMir, MirBlockId successorMir) {
-        if (!opMov.has_value()) {
-            reportMissingOpcode(SlotMov, "mov", "MIR Phi edge");
+        if (!opcode(MnemonicSlot::Mov).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Mov, "MIR Phi edge");
             return;
         }
         // Collect (phiReg, incomingReg) pairs for this edge.
@@ -420,13 +552,13 @@ struct Lowerer {
         for (auto const& p : pairs) {
             LirReg const tmp = lir.newVReg(LirRegClass::GPR);
             std::array<LirOperand, 1> ops{LirOperand::makeReg(p.incoming)};
-            lir.addInst(*opMov, tmp, ops);
+            lir.addInst(*opcode(MnemonicSlot::Mov), tmp, ops);
             temps.push_back(tmp);
         }
         // Step 2: write each phi-result from its captured temp.
         for (std::size_t k = 0; k < pairs.size(); ++k) {
             std::array<LirOperand, 1> ops{LirOperand::makeReg(temps[k])};
-            lir.addInst(*opMov, pairs[k].phi, ops);
+            lir.addInst(*opcode(MnemonicSlot::Mov), pairs[k].phi, ops);
         }
     }
 
@@ -457,13 +589,13 @@ struct Lowerer {
     }
 
     bool lowerReturn(MirInstId id) {
-        if (!opRet.has_value()) {
-            reportMissingOpcode(SlotRet, "ret", "MIR Return");
+        if (!opcode(MnemonicSlot::Ret).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Ret, "MIR Return");
             return false;
         }
         auto const operands = mir.instOperands(id);
         if (operands.empty()) {
-            lir.addReturn(*opRet, std::span<LirOperand const>{});
+            lir.addReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
             return true;
         }
         if (operands.size() != 1) {
@@ -473,13 +605,13 @@ struct Lowerer {
         std::optional<LirReg> const v = regForValue(operands[0]);
         if (!v.has_value()) return false;
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*v)};
-        lir.addReturn(*opRet, ops);
+        lir.addReturn(*opcode(MnemonicSlot::Ret), ops);
         return true;
     }
 
     bool lowerBr(MirInstId id, std::span<MirBlockId const> succs) {
-        if (!opJmp.has_value()) {
-            reportMissingOpcode(SlotJmp, "jmp", "MIR Br");
+        if (!opcode(MnemonicSlot::Jmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Jmp, "MIR Br");
             return false;
         }
         if (succs.size() != 1) {
@@ -496,17 +628,17 @@ struct Lowerer {
             reporter.report(std::move(d));
             return false;
         }
-        lir.addBr(*opJmp, mirBlockToLirBlock.get(succs[0]));
+        lir.addBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succs[0]));
         return true;
     }
 
     bool lowerCondBr(MirInstId id, std::span<MirBlockId const> succs) {
-        if (!opCmp.has_value()) {
-            reportMissingOpcode(SlotCmp, "cmp", "MIR CondBr");
+        if (!opcode(MnemonicSlot::Cmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Cmp, "MIR CondBr");
             return false;
         }
-        if (!opJcc.has_value()) {
-            reportMissingOpcode(SlotJcc, "jcc", "MIR CondBr");
+        if (!opcode(MnemonicSlot::Jcc).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Jcc, "MIR CondBr");
             return false;
         }
         if (succs.size() != 2) {
@@ -536,8 +668,8 @@ struct Lowerer {
         // defaulted to 0 (= TargetCondCode::Eq) and inverted the branch.
         std::array<LirOperand, 2> cmpOps{
             LirOperand::makeReg(*cond), LirOperand::makeImmInt32(0)};
-        lir.addInst(*opCmp, InvalidLirReg, cmpOps);
-        lir.addCondBr(*opJcc, std::span<LirOperand const>{},
+        lir.addInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+        lir.addCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
                       mirBlockToLirBlock.get(succs[0]),
                       mirBlockToLirBlock.get(succs[1]),
                       static_cast<std::uint32_t>(TargetCondCode::Ne));
@@ -558,16 +690,16 @@ struct Lowerer {
     // the dominance of the phi moves (which were emitted at the END of the
     // ORIGINAL switch-bearing block, before this first jmp).
     bool lowerSwitch(MirInstId id, std::span<MirBlockId const> succs) {
-        if (!opCmp.has_value()) {
-            reportMissingOpcode(SlotCmp, "cmp", "MIR Switch");
+        if (!opcode(MnemonicSlot::Cmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Cmp, "MIR Switch");
             return false;
         }
-        if (!opJmp.has_value()) {
-            reportMissingOpcode(SlotJmp, "jmp", "MIR Switch");
+        if (!opcode(MnemonicSlot::Jmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Jmp, "MIR Switch");
             return false;
         }
-        if (!opJcc.has_value()) {
-            reportMissingOpcode(SlotJcc, "jcc", "MIR Switch");
+        if (!opcode(MnemonicSlot::Jcc).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Jcc, "MIR Switch");
             return false;
         }
         auto const operands = mir.instOperands(id);
@@ -601,7 +733,7 @@ struct Lowerer {
             }
             std::array<LirOperand, 2> cmpOps{
                 LirOperand::makeReg(*discrim), LirOperand::makeReg(*caseConst)};
-            lir.addInst(*opCmp, InvalidLirReg, cmpOps);
+            lir.addInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
 
             // Allocate a "next compare" block unless this is the last
             // case (in which case we fall through to a `jmp default`).
@@ -615,28 +747,28 @@ struct Lowerer {
                 // Final compare: jcc-eq to case target, else jcc fallthrough
                 // to a tiny "jmp default" block.
                 LirBlockId const defaultJump = lir.createBlock();
-                lir.addCondBr(*opJcc, std::span<LirOperand const>{},
+                lir.addCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
                               caseTarget, defaultJump, eqCond);
                 lir.beginBlock(defaultJump);
-                lir.addBr(*opJmp, mirBlockToLirBlock.get(defaultMir));
+                lir.addBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
                 return true;
             }
             nextBlock = lir.createBlock();
-            lir.addCondBr(*opJcc, std::span<LirOperand const>{},
+            lir.addCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
                           caseTarget, nextBlock, eqCond);
             lir.beginBlock(nextBlock);
         }
         // No cases (only default): jmp default.
-        lir.addBr(*opJmp, mirBlockToLirBlock.get(defaultMir));
+        lir.addBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
         return true;
     }
 
     bool lowerUnreachable(MirInstId /*id*/) {
-        if (!opUnreachable.has_value()) {
-            reportMissingOpcode(SlotUnreachable, "unreachable", "MIR Unreachable");
+        if (!opcode(MnemonicSlot::Unreachable).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Unreachable, "MIR Unreachable");
             return false;
         }
-        lir.addUnreachable(*opUnreachable);
+        lir.addUnreachable(*opcode(MnemonicSlot::Unreachable));
         return true;
     }
 
@@ -665,8 +797,8 @@ struct Lowerer {
         std::uint32_t const n = mir.blockInstCount(mb);
         if (n == 0) {
             // Empty MIR block — defensive seal so the LIR module finishes.
-            if (opRet.has_value()) {
-                lir.addReturn(*opRet, std::span<LirOperand const>{});
+            if (opcode(MnemonicSlot::Ret).has_value()) {
+                lir.addReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
             }
             return;
         }
@@ -727,8 +859,8 @@ struct Lowerer {
         }
         // Fallback seal for blocks whose MIR terminator was deferred to a
         // later cycle. The diagnostic was already issued.
-        if (!sealed && opRet.has_value()) {
-            lir.addReturn(*opRet, std::span<LirOperand const>{});
+        if (!sealed && opcode(MnemonicSlot::Ret).has_value()) {
+            lir.addReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
         }
     }
 

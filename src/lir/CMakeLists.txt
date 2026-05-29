@@ -1,5 +1,6 @@
 add_library(lir OBJECT
     lir.cpp
+    lir_literal_pool.cpp
 )
 
 target_include_directories(lir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

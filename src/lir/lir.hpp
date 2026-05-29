@@ -5,12 +5,14 @@
 #include "core/substrate/arena_container.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
+#include "lir/lir_literal_pool.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
 
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 // `Lir` (ML5) — the frozen, immutable low-level IR module. Per-target
@@ -49,7 +51,8 @@ public:
     Lir() noexcept = default;
     Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
         FuncArena funcArena, std::vector<LirOperand> operandPool,
-        std::vector<LirBlockId> succPool) noexcept;
+        std::vector<LirBlockId> succPool,
+        LirLiteralPool literalPool) noexcept;
 
     Lir(Lir const&)            = delete;
     Lir& operator=(Lir const&) = delete;
@@ -93,6 +96,12 @@ public:
     [[nodiscard]] std::size_t moduleFuncCount() const noexcept;
     [[nodiscard]] LirFuncId   funcAt(std::uint32_t i) const;
 
+    // ── literal pool (cycle 3c) ──
+    [[nodiscard]] LirLiteralValue const& literalValue(std::uint32_t i) const {
+        return literalPool_.at(i);
+    }
+    [[nodiscard]] LirLiteralPool const& literalPool() const noexcept { return literalPool_; }
+
 private:
     TargetSchemaId            target_{};
     InstArena                 instArena_;
@@ -100,6 +109,7 @@ private:
     FuncArena                 funcArena_;
     std::vector<LirOperand>   operandPool_;
     std::vector<LirBlockId>   succPool_;
+    LirLiteralPool            literalPool_;
 };
 
 static_assert(substrate::Arena<Lir>,
@@ -179,6 +189,12 @@ public:
     // maps to x86_64 ud2 / ARM64 brk / WASM unreachable.
     LirInstId addUnreachable(std::uint16_t opcode);
 
+    // Append a wide literal to the module's pool; returns the index
+    // suitable for `LirOperand::makeLiteralIndex(...)`. Cycle 3c uses
+    // this for int64/double/string literals that don't fit in the
+    // 8-byte operand POD's `immInt32` arm.
+    [[nodiscard]] std::uint32_t literalPoolAdd(LirLiteralValue value);
+
     // Consume the builder, returning the frozen Lir module. Aborts
     // on any contract violation (open function with no terminated
     // block; created-but-never-opened block; etc.) — same discipline
@@ -198,6 +214,7 @@ private:
     substrate::ArenaBuilder<detail::LirFunc,  LirFuncId,  LirModuleId> funcArena_;
     std::vector<LirOperand> operandPool_;
     std::vector<LirBlockId> succPool_;
+    LirLiteralPool          literalPool_;
 
     // Per-function state, reset by `addFunction`.
     LirFuncId  openFunc_{};

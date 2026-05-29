@@ -37,6 +37,12 @@ enum class LirOperandKind : std::uint8_t {
     // the pairing.
     MemBase    = 6,
     MemOffset  = 7,
+    // Pool index for wide literals (int64/double/string/aggregate). The
+    // 8-byte operand POD cannot inline a 64-bit immediate without
+    // breaking the cache-density invariant, so wide literals flow
+    // through `LirLiteralPool` (cycle 3c). `litIndex` indexes into the
+    // owning module's pool; consumers fetch via `lir.literalValue(idx)`.
+    LiteralIndex = 8,
 };
 
 // One slot in the operand pool. The tag picks the active field.
@@ -50,6 +56,7 @@ struct LirOperand {
         std::uint32_t symbolV;    // 4 — kind == SymbolRef → SymbolId.v
         std::uint32_t scale;      // 4 — kind == MemBase (1/2/4/8)
         std::int32_t  offset;     // 4 — kind == MemOffset
+        std::uint32_t litIndex;   // 4 — kind == LiteralIndex (into LirLiteralPool)
     };
 
     constexpr LirOperand() noexcept : kind(LirOperandKind::None), reg{} {}
@@ -83,6 +90,24 @@ struct LirOperand {
         LirOperand o{};
         o.kind     = LirOperandKind::SymbolRef;
         o.symbolV  = v;
+        return o;
+    }
+    [[nodiscard]] static constexpr LirOperand makeMemBase(std::uint32_t scale) noexcept {
+        LirOperand o{};
+        o.kind  = LirOperandKind::MemBase;
+        o.scale = scale;
+        return o;
+    }
+    [[nodiscard]] static constexpr LirOperand makeMemOffset(std::int32_t offset) noexcept {
+        LirOperand o{};
+        o.kind   = LirOperandKind::MemOffset;
+        o.offset = offset;
+        return o;
+    }
+    [[nodiscard]] static constexpr LirOperand makeLiteralIndex(std::uint32_t idx) noexcept {
+        LirOperand o{};
+        o.kind     = LirOperandKind::LiteralIndex;
+        o.litIndex = idx;
         return o;
     }
 };
