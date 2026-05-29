@@ -259,6 +259,23 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  o.mnemonic, vi,
                                  targetResultRuleName(o.result)));
             }
+
+            // ── Architect followup (inverse of G): no result + slot ──
+            // The opposite trap: an opcode with `result == None`
+            // (e.g. `ret`, `cmp`) declaring a `resultSlot` is
+            // nonsensical — there IS no result register to route.
+            // The walker would deref a default-constructed `LirReg`
+            // for `hwEncodingOf` and emit a runtime diagnostic.
+            // Reject at load instead.
+            if (o.result == TargetResultRule::None
+                && v.resultSlot.has_value()) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/resultSlot", i, vi),
+                     std::format("opcode '{}' variant {}: opcode has "
+                                 "`result='none'` but variant declares "
+                                 "a `resultSlot` — there IS no result "
+                                 "register to route",
+                                 o.mnemonic, vi));
+            }
         }
 
         // ── Convergence-fix D: overlapping variant guards ─────────
@@ -330,6 +347,19 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     auto haveRegister = [&](std::string_view nm) -> bool {
         return registerIndex.find(nm) != registerIndex.end();
     };
+    // M-1 (silent-failure follow-up): if ANY opcode declares the
+    // `x86-variable` encoding shape, every GPR/FPR register's
+    // `hwEncoding` must fit in 4 bits (the x86 ModR/M + REX-extended
+    // field width). The walker re-checks at encode time, but that's
+    // per-instruction overhead and the failure surface — failing
+    // at schema-load surfaces it once.
+    bool anyX86VariableOpcode = false;
+    for (auto const& o : opcodes) {
+        if (o.encoding.shape == TargetEncodingShape::X86Variable) {
+            anyX86VariableOpcode = true;
+            break;
+        }
+    }
     for (std::size_t i = 0; i < registers.size(); ++i) {
         auto const& r = registers[i];
         // Classed register must declare positive width — closes the
@@ -344,6 +374,17 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             fail(std::format("/registers/{}/subOf", i),
                  std::format("register '{}': subOf='{}' does not resolve to a known register",
                              r.name, r.subOf));
+        }
+        if (anyX86VariableOpcode
+            && (r.regClass == TargetRegClass::GPR
+                || r.regClass == TargetRegClass::FPR)
+            && r.hwEncoding > 15) {
+            fail(std::format("/registers/{}/hwEncoding", i),
+                 std::format("register '{}': hwEncoding {} exceeds 4 "
+                             "bits — the target declares x86-variable "
+                             "encoding which can only express GPR/FPR "
+                             "ordinals 0..15 via REX-extended ModR/M",
+                             r.name, r.hwEncoding));
         }
     }
     // subOf cycle detection. A misconfigured target with `eax.subOf=rax,

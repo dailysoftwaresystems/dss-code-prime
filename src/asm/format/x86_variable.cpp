@@ -4,6 +4,7 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <cassert>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -212,6 +213,14 @@ bool encode(Lir const&                  lir,
             std::vector<Relocation>&    /*relocs*/,
             std::vector<SourceMapEntry>& /*srcMap*/,
             DiagnosticReporter&         reporter) {
+    // Substrate contract — `asm.cpp`'s dispatch screens
+    // `opcodeInfo(opcode) != nullptr` BEFORE routing to a format
+    // walker. Defensive assertion: a future caller bypassing the
+    // dispatch (e.g. a unit test that constructs an inst with an
+    // out-of-range opcode and calls `encode` directly) should fail
+    // loud rather than dereference a null pointer below.
+    assert(info != nullptr && "x86_variable::encode requires non-null info");
+
     auto const instOps = lir.instOperands(inst);
     LirReg const result = lir.instResult(inst);
 

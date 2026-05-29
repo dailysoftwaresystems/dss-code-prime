@@ -67,6 +67,203 @@ void readBoundedInt(json const& obj, Collector& coll,
     out = static_cast<T>(v);
 }
 
+// ── Encoding-variant sub-parsers (plan 13 AS2) ────────────────────
+//
+// One free function per sub-tree of the `variants[]` JSON shape.
+// Mirrors the file's `readStringArray` pattern (used by the
+// calling-conventions block above) — each helper takes the parent
+// `coll` + the JSON path prefix and populates a typed sub-field.
+// The opcode-level driver (`parseEncodingVariants`) just walks the
+// array and calls these. Replaces the inline 175-line nested block
+// flagged by simplifier review.
+
+void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
+                       TargetEncodingVariant& variant, Collector& coll) {
+    if (!v.contains("guard")) return;
+    auto const& g = v.at("guard");
+    if (!g.is_object()) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  std::format("/opcodes/{}/encoding/variants/{}/guard", opIdx, vi),
+                  "'guard' must be an object");
+        return;
+    }
+    if (!g.contains("operandKinds")) return;
+    auto const& oks = g.at("operandKinds");
+    if (!oks.is_array()) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds", opIdx, vi),
+                  "'operandKinds' must be an array of strings");
+        return;
+    }
+    for (std::size_t ki = 0; ki < oks.size(); ++ki) {
+        if (!oks[ki].is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", opIdx, vi, ki),
+                      "every operandKinds entry must be a string");
+            continue;
+        }
+        auto const k = operandKindFilterFromName(oks[ki].get<std::string>());
+        if (!k.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", opIdx, vi, ki),
+                      "expected 'reg' / 'imm32'");
+            continue;
+        }
+        variant.operandKinds.push_back(*k);
+    }
+}
+
+void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
+                          TargetEncodingTemplate& tmpl, Collector& coll) {
+    if (!v.contains("template")) return;
+    auto const& t = v.at("template");
+    if (!t.is_object()) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  std::format("/opcodes/{}/encoding/variants/{}/template", opIdx, vi),
+                  "'template' must be an object");
+        return;
+    }
+    if (t.contains("rexW") && t.at("rexW").is_boolean()) {
+        tmpl.rexW = t.at("rexW").get<bool>();
+    }
+    if (t.contains("opcode")) {
+        auto const& ob = t.at("opcode");
+        if (!ob.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/template/opcode", opIdx, vi),
+                      "'opcode' must be an array of byte integers");
+        } else {
+            for (auto const& bn : ob) {
+                if (!bn.is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/encoding/variants/{}/template/opcode", opIdx, vi),
+                              "every opcode entry must be an integer in [0, 255]");
+                    continue;
+                }
+                std::int64_t const bv = bn.get<std::int64_t>();
+                if (bv < 0 || bv > 255) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/encoding/variants/{}/template/opcode", opIdx, vi),
+                              std::format("opcode byte {} out of range [0, 255]", bv));
+                    continue;
+                }
+                tmpl.opcodeBytes.push_back(static_cast<std::uint8_t>(bv));
+            }
+        }
+    }
+    if (t.contains("modrmRegExt")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", opIdx, vi);
+        if (!t.at("modrmRegExt").is_number_integer()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'modrmRegExt' must be an integer in [0, 7]");
+        } else {
+            std::int64_t const mv = t.at("modrmRegExt").get<std::int64_t>();
+            if (mv < 0 || mv > 7) {
+                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                          std::format("'modrmRegExt' ({}) must be in [0, 7]", mv));
+            } else {
+                tmpl.modrmRegExt = static_cast<std::uint8_t>(mv);
+            }
+        }
+    }
+}
+
+void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
+                            TargetEncodingVariant& variant, Collector& coll) {
+    if (!v.contains("resultSlot")) return;
+    auto const path = std::format("/opcodes/{}/encoding/variants/{}/resultSlot", opIdx, vi);
+    if (!v.at("resultSlot").is_string()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  "'resultSlot' must be a slot-kind string");
+        return;
+    }
+    auto const r = encodingSlotKindFromName(v.at("resultSlot").get<std::string>());
+    if (!r.has_value()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  "expected 'modrm.reg' / 'modrm.rm' / 'imm32'");
+        return;
+    }
+    variant.resultSlot = *r;
+}
+
+void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
+                       TargetEncodingVariant& variant, Collector& coll) {
+    if (!v.contains("wires")) return;
+    auto const& ops = v.at("wires");
+    if (!ops.is_array()) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  std::format("/opcodes/{}/encoding/variants/{}/wires", opIdx, vi),
+                  "'wires' must be an array");
+        return;
+    }
+    for (std::size_t oi = 0; oi < ops.size(); ++oi) {
+        auto const& o2 = ops[oi];
+        auto const wirePath = std::format("/opcodes/{}/encoding/variants/{}/wires/{}", opIdx, vi, oi);
+        if (!o2.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, wirePath,
+                      "wire entry must be an object");
+            continue;
+        }
+        TargetEncodingWire wire;
+        if (!o2.contains("index") || !o2.at("index").is_number_integer()) {
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("{}/index", wirePath),
+                      "missing or non-integer 'index'");
+            continue;
+        }
+        std::int64_t const iv = o2.at("index").get<std::int64_t>();
+        if (iv < 0 || iv > 255) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/index", wirePath),
+                      std::format("'index' ({}) must fit in [0, 255]", iv));
+            continue;
+        }
+        wire.index = static_cast<std::uint8_t>(iv);
+        if (!o2.contains("slotKind") || !o2.at("slotKind").is_string()) {
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("{}/slotKind", wirePath),
+                      "missing or non-string 'slotKind'");
+            continue;
+        }
+        auto const sk = encodingSlotKindFromName(o2.at("slotKind").get<std::string>());
+        if (!sk.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/slotKind", wirePath),
+                      "expected 'modrm.reg' / 'modrm.rm' / 'imm32'");
+            continue;
+        }
+        wire.slotKind = *sk;
+        variant.wires.push_back(wire);
+    }
+}
+
+void parseEncodingVariants(json const& vs,
+                           std::vector<TargetEncodingVariant>& out,
+                           std::size_t opIdx, Collector& coll) {
+    if (!vs.is_array()) {
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  std::format("/opcodes/{}/encoding/variants", opIdx),
+                  "'variants' must be an array");
+        return;
+    }
+    out.reserve(vs.size());
+    for (std::size_t vi = 0; vi < vs.size(); ++vi) {
+        auto const& v = vs[vi];
+        if (!v.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}", opIdx, vi),
+                      "variant entry must be an object");
+            continue;
+        }
+        TargetEncodingVariant variant;
+        parseVariantGuard      (v, opIdx, vi, variant, coll);
+        parseVariantTemplate   (v, opIdx, vi, variant.tmpl, coll);
+        parseVariantResultSlot (v, opIdx, vi, variant, coll);
+        parseVariantWires      (v, opIdx, vi, variant, coll);
+        out.push_back(std::move(variant));
+    }
+}
+
 } // namespace
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
@@ -279,179 +476,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // cross-field invariants (opcode bytes non-empty,
                 // modrmRegExt in [0,7], operand-wire index in range).
                 if (enc.contains("variants")) {
-                    if (!enc.at("variants").is_array()) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  std::format("/opcodes/{}/encoding/variants", i),
-                                  "'variants' must be an array");
-                    } else {
-                        auto const& vs = enc.at("variants");
-                        info.encoding.variants.reserve(vs.size());
-                        for (std::size_t vi = 0; vi < vs.size(); ++vi) {
-                            auto const& v = vs[vi];
-                            if (!v.is_object()) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          std::format("/opcodes/{}/encoding/variants/{}", i, vi),
-                                          "variant entry must be an object");
-                                continue;
-                            }
-                            TargetEncodingVariant variant;
-                            // guard.operandKinds
-                            if (v.contains("guard")) {
-                                auto const& g = v.at("guard");
-                                if (!g.is_object()) {
-                                    coll.emit(DiagnosticCode::C_MalformedJson,
-                                              std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
-                                              "'guard' must be an object");
-                                } else if (g.contains("operandKinds")) {
-                                    auto const& oks = g.at("operandKinds");
-                                    if (!oks.is_array()) {
-                                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                                  std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds", i, vi),
-                                                  "'operandKinds' must be an array of strings");
-                                    } else {
-                                        for (std::size_t ki = 0; ki < oks.size(); ++ki) {
-                                            if (!oks[ki].is_string()) {
-                                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                                          std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", i, vi, ki),
-                                                          "every operandKinds entry must be a string");
-                                                continue;
-                                            }
-                                            auto const k = operandKindFilterFromName(oks[ki].get<std::string>());
-                                            if (!k.has_value()) {
-                                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                                          std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", i, vi, ki),
-                                                          "expected 'reg' / 'imm32'");
-                                                continue;
-                                            }
-                                            variant.operandKinds.push_back(*k);
-                                        }
-                                    }
-                                }
-                            }
-                            // template
-                            if (v.contains("template")) {
-                                auto const& t = v.at("template");
-                                if (!t.is_object()) {
-                                    coll.emit(DiagnosticCode::C_MalformedJson,
-                                              std::format("/opcodes/{}/encoding/variants/{}/template", i, vi),
-                                              "'template' must be an object");
-                                } else {
-                                    if (t.contains("rexW")
-                                        && t.at("rexW").is_boolean()) {
-                                        variant.tmpl.rexW = t.at("rexW").get<bool>();
-                                    }
-                                    if (t.contains("opcode")) {
-                                        auto const& ob = t.at("opcode");
-                                        if (!ob.is_array()) {
-                                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                                      std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
-                                                      "'opcode' must be an array of byte integers");
-                                        } else {
-                                            for (auto const& bn : ob) {
-                                                if (!bn.is_number_integer()) {
-                                                    coll.emit(DiagnosticCode::C_MalformedJson,
-                                                              std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
-                                                              "every opcode entry must be an integer in [0, 255]");
-                                                    continue;
-                                                }
-                                                std::int64_t const bv = bn.get<std::int64_t>();
-                                                if (bv < 0 || bv > 255) {
-                                                    coll.emit(DiagnosticCode::C_MalformedJson,
-                                                              std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
-                                                              std::format("opcode byte {} out of range [0, 255]", bv));
-                                                    continue;
-                                                }
-                                                variant.tmpl.opcodeBytes.push_back(static_cast<std::uint8_t>(bv));
-                                            }
-                                        }
-                                    }
-                                    if (t.contains("modrmRegExt")) {
-                                        if (!t.at("modrmRegExt").is_number_integer()) {
-                                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                                      std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", i, vi),
-                                                      "'modrmRegExt' must be an integer in [0, 7]");
-                                        } else {
-                                            std::int64_t const mv = t.at("modrmRegExt").get<std::int64_t>();
-                                            if (mv < 0 || mv > 7) {
-                                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                                          std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", i, vi),
-                                                          std::format("'modrmRegExt' ({}) must be in [0, 7]", mv));
-                                            } else {
-                                                variant.tmpl.modrmRegExt = static_cast<std::uint8_t>(mv);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // resultSlot
-                            if (v.contains("resultSlot")) {
-                                if (!v.at("resultSlot").is_string()) {
-                                    coll.emit(DiagnosticCode::C_MalformedJson,
-                                              std::format("/opcodes/{}/encoding/variants/{}/resultSlot", i, vi),
-                                              "'resultSlot' must be a slot-kind string");
-                                } else {
-                                    auto const r = encodingSlotKindFromName(v.at("resultSlot").get<std::string>());
-                                    if (!r.has_value()) {
-                                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                                  std::format("/opcodes/{}/encoding/variants/{}/resultSlot", i, vi),
-                                                  "expected 'modrm.reg' / 'modrm.rm' / 'imm32'");
-                                    } else {
-                                        variant.resultSlot = *r;
-                                    }
-                                }
-                            }
-                            // operands[]
-                            if (v.contains("wires")) {
-                                auto const& ops = v.at("wires");
-                                if (!ops.is_array()) {
-                                    coll.emit(DiagnosticCode::C_MalformedJson,
-                                              std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
-                                              "'operands' must be an array");
-                                } else {
-                                    for (std::size_t oi = 0; oi < ops.size(); ++oi) {
-                                        auto const& o2 = ops[oi];
-                                        if (!o2.is_object()) {
-                                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                                      std::format("/opcodes/{}/encoding/variants/{}/wires/{}", i, vi, oi),
-                                                      "operand-wire entry must be an object");
-                                            continue;
-                                        }
-                                        TargetEncodingWire wire;
-                                        if (!o2.contains("index") || !o2.at("index").is_number_integer()) {
-                                            coll.emit(DiagnosticCode::C_MissingField,
-                                                      std::format("/opcodes/{}/encoding/variants/{}/wires/{}/index", i, vi, oi),
-                                                      "missing or non-integer 'index'");
-                                            continue;
-                                        }
-                                        std::int64_t const iv = o2.at("index").get<std::int64_t>();
-                                        if (iv < 0 || iv > 255) {
-                                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                                      std::format("/opcodes/{}/encoding/variants/{}/wires/{}/index", i, vi, oi),
-                                                      std::format("'index' ({}) must fit in [0, 255]", iv));
-                                            continue;
-                                        }
-                                        wire.index = static_cast<std::uint8_t>(iv);
-                                        if (!o2.contains("slotKind") || !o2.at("slotKind").is_string()) {
-                                            coll.emit(DiagnosticCode::C_MissingField,
-                                                      std::format("/opcodes/{}/encoding/variants/{}/wires/{}/slotKind", i, vi, oi),
-                                                      "missing or non-string 'slotKind'");
-                                            continue;
-                                        }
-                                        auto const sk = encodingSlotKindFromName(o2.at("slotKind").get<std::string>());
-                                        if (!sk.has_value()) {
-                                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                                      std::format("/opcodes/{}/encoding/variants/{}/wires/{}/slotKind", i, vi, oi),
-                                                      "expected 'modrm.reg' / 'modrm.rm' / 'imm32'");
-                                            continue;
-                                        }
-                                        wire.slotKind = *sk;
-                                        variant.wires.push_back(wire);
-                                    }
-                                }
-                            }
-                            info.encoding.variants.push_back(std::move(variant));
-                        }
-                    }
+                    parseEncodingVariants(enc.at("variants"), info.encoding.variants,
+                                          i, coll);
                 }
             }
         }

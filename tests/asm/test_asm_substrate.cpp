@@ -16,6 +16,7 @@
 // non-`None` diagnostic expectations as their arms light up.
 
 #include "asm/asm.hpp"
+#include "asm_test_support.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -31,20 +32,7 @@
 
 using namespace dss;
 using dss::test_support::lowerCSubsetToLir;
-
-namespace {
-
-// Count how many diagnostics in the reporter carry the given code.
-[[nodiscard]] std::size_t
-countDiagnostics(DiagnosticReporter const& rep, DiagnosticCode code) {
-    std::size_t n = 0;
-    for (auto const& d : rep.all()) {
-        if (d.code == code) ++n;
-    }
-    return n;
-}
-
-} // namespace
+using dss::test_support::asm_::countDiagnostics;
 
 // ── Substrate surface: `assemble()` over an empty module ──────────────
 

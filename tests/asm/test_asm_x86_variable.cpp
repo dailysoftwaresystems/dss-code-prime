@@ -7,6 +7,7 @@
 // `A_NoMatchingEncodingVariant` fail-loud path are all covered.
 
 #include "asm/asm.hpp"
+#include "asm_test_support.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -18,17 +19,9 @@
 #include <vector>
 
 using namespace dss;
+using dss::test_support::asm_::countDiagnostics;
 
 namespace {
-
-[[nodiscard]] std::size_t
-countDiagnostics(DiagnosticReporter const& rep, DiagnosticCode code) {
-    std::size_t n = 0;
-    for (auto const& d : rep.all()) {
-        if (d.code == code) ++n;
-    }
-    return n;
-}
 
 // Build a one-function LIR with a single block containing the given
 // instructions. Caller supplies a callback that emits insts; the
