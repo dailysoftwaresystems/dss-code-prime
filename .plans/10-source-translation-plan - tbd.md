@@ -1,6 +1,14 @@
 # Source-to-source Translation — Sub-Plan (10)
 
 > Owns **language-pair `.map.json`** schema + **HIR→HIR translation pass** + **target-CST construction** + **target-schema-aware pretty-printer**. Lets the compiler turn any configured source language into any configured target language, via [HIR](./09-hir-plan%20-%20ok.md) as the lossless pivot. Promoted from `00-master` §9 long-running note in rev 2.
+>
+> **Scope boundary (clarified rev 3, 2026-05-29):** this plan owns **syntactic source-to-source transpilation** — the output is intended to read like a human wrote it in the target language. A developer transpiling C++ → C# wants to read, maintain, and ship the C# output as-if hand-written; running the MIR optimizer would inline functions, fold constants, eliminate dead code, and introduce CSE temporaries that DESTROY that readability. So the default is **HIR→HIR walker → target-CST → pretty-print, NO MIR detour, NO optimization passes**. This is the optimization opt-out that source-to-source requires.
+>
+> **Structured-bytecode lowerings live elsewhere** (one-line cross-reference, expanded in §2.6 below):
+> - WASM → [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) (MIR→WAT→.wasm; full optimizer upstream)
+> - SPIR-V → [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) (MIR→SPIR-V binary; full optimizer upstream)
+>
+> These targets produce machine-consumable bytecode where readability does NOT matter and competitive output requires the optimizer. They share the MIR pivot with native ISAs; they do NOT share this plan's HIR-walker machinery. See §2.6 for the table.
 
 ## 0. Status (snapshot)
 
@@ -138,6 +146,23 @@ New artifactProfile value `transpile` (per [`06-artifact-profile-plan`](./06-art
   "output":          "dist/myapp.js"
 }
 ```
+
+### 2.7 Target-class boundary (cross-reference)
+
+Where each downstream-of-frontend target class lives. **This plan owns ONLY syntactic source-to-source** (the first row). Everything else is somebody else's home.
+
+| Target class | Pivot tier | Path | Optimizer? | Owning plan |
+|---|---|---|---|---|
+| **Syntactic source-to-source** (C++→C#, Python→JS, c-subset→csharp) | HIR | HIR walker → target-CST → pretty-print | **OFF by default** (output must read like human-written code in the target language; running MIR opt would inline / fold / DCE the structure away) | **This plan (10)** |
+| **Native ISA binary** (x86_64, ARM64, future RV) | MIR | MIR optimizer → MIR→LIR isel → regalloc → callconv → assembler → bytes | ON | 12 + 13 |
+| **Structured bytecode VM** (WASM; future JVM*, .NET IL*) | MIR | MIR optimizer → MIR→WAT walker → .wasm binary encoder + minifier | ON | 18 |
+| **Shader bytecode** (SPIR-V; future DXIL*) | MIR (+ shader-attr side-tables) | MIR optimizer → MIR→SPIR-V walker → .spv binary encoder + minifier | ON | 17 |
+
+*Post-v1.
+
+**The opt-out the syntactic source-to-source flow requires** is the absence of the MIR detour entirely. There is no `optimize: false` knob — the path simply doesn't go through MIR. A developer transpiling C++ → C# gets HIR (typed, scope-resolved, control-flow-recognizable) walked one-to-one into a C# CST shaped by the language-pair map, then pretty-printed; their `int sum(int a, int b) { return a + b; }` arrives as `int Sum(int a, int b) { return a + b; }`, NOT as a hoisted-and-inlined SSA-rewritten variant.
+
+**The opposite scenario** — "I want a working binary in language X, idiomatic readability does not matter" — is a **compile-and-retarget** flow that is NOT this plan's scope. If a user wants `c++ → optimized-but-unreadable c# IL emission`, that's a `.NET IL` artifact target (post-v1, in the "Structured bytecode VM" row above), NOT a syntactic c++→c# transpile.
 
 ---
 
