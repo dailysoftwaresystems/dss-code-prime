@@ -487,6 +487,35 @@ TEST(MirVerifier, IfElseWithoutIfJoinEmitsStructCfMismatch) {
     EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
 }
 
+// LoopHeader with no back-edge predecessor (no pred dominated by the
+// header) fails I_StructCfMismatch. Closes the gap the LoopLatch≤
+// LoopHeader relaxation left: presence-only count check accepts
+// `nLoopLatch == 0`, so the back-edge invariant has to be enforced
+// via dominance.
+TEST(MirVerifier, LoopHeaderWithoutBackEdgeEmitsStructCfMismatch) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = b.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const exit   = b.createBlock(StructCfMarker::LoopExit);
+    b.beginBlock(entry);
+    b.addBr(header);
+    b.beginBlock(header);
+    // Branch straight to exit — NO back-edge. The header has only
+    // one predecessor (entry), and `header` does NOT dominate
+    // `entry`, so the back-edge check fires.
+    b.addBr(exit);
+    b.beginBlock(exit);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
+}
+
 // Without an interner: type-gated rules are skipped — even a malformed
 // type-typed value passes (because the verifier can't decode types).
 TEST(MirVerifier, InternerGatedRulesSkippedWhenInternerAbsent) {
