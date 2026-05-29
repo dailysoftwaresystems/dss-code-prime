@@ -332,6 +332,10 @@ enum class DiagnosticCode : std::uint16_t {
     // LoopHeader has matching LoopLatch/LoopExit; ExitBlock terminates
     // in Return/Unreachable.
     I_StructCfMismatch        = 0xA00B,
+    // A block in a function is not reachable from the function's
+    // entry block. Orphan CFG islands are a structural invariant
+    // violation — every block must be reachable from entry.
+    I_UnreachableBlock        = 0xA00C,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

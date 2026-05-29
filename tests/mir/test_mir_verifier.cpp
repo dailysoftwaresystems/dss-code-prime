@@ -421,6 +421,72 @@ TEST(MirVerifier, ReturnTypeMismatch) {
     EXPECT_GE(countCode(r, DiagnosticCode::I_TerminatorTypeMismatch), 1u);
 }
 
+// An orphan block — present in the function but with no predecessor
+// path from entry — fails I_UnreachableBlock. ML2-lowered code never
+// produces orphans, but a future optimizer pass that deletes dead
+// branches could leave one; the verifier catches it.
+TEST(MirVerifier, OrphanBlockEmitsUnreachable) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const orphan = b.createBlock(StructCfMarker::Linear);
+    b.beginBlock(entry);
+    b.addReturn();
+    // `orphan` has no predecessor — entry does NOT branch to it.
+    b.beginBlock(orphan);
+    b.addUnreachable();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_GE(countCode(r, DiagnosticCode::I_UnreachableBlock), 1u);
+}
+
+// Count-based marker pairing: two IfThen + one IfJoin fails
+// I_StructCfMismatch (was a silent-pass with the presence-only check).
+TEST(MirVerifier, TwoIfThenOneIfJoinEmitsStructCfMismatch) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const then1  = b.createBlock(StructCfMarker::IfThen);
+    MirBlockId const then2  = b.createBlock(StructCfMarker::IfThen);
+    MirBlockId const join   = b.createBlock(StructCfMarker::IfJoin);
+    b.beginBlock(entry);
+    MirInstId const c1 = b.addConst(intLit(1), kBool);
+    b.addCondBr(c1, then1, then2);
+    b.beginBlock(then1); b.addBr(join);
+    b.beginBlock(then2); b.addBr(join);
+    b.beginBlock(join);  b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
+}
+
+// IfElse without IfJoin: count check catches it.
+TEST(MirVerifier, IfElseWithoutIfJoinEmitsStructCfMismatch) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const elseB = b.createBlock(StructCfMarker::IfElse);
+    b.beginBlock(entry);
+    MirInstId const c1 = b.addConst(intLit(1), kBool);
+    b.addCondBr(c1, elseB, elseB);
+    b.beginBlock(elseB); b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_GE(countCode(r, DiagnosticCode::I_StructCfMismatch), 1u);
+}
+
 // Without an interner: type-gated rules are skipped — even a malformed
 // type-typed value passes (because the verifier can't decode types).
 TEST(MirVerifier, InternerGatedRulesSkippedWhenInternerAbsent) {

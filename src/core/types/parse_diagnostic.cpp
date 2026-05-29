@@ -110,6 +110,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_ArgIndexOutOfRange:       return "I_ArgIndexOutOfRange";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
+        case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
     }
     return "Unknown";
 }
