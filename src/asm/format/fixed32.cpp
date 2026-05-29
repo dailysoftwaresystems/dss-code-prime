@@ -1,6 +1,7 @@
 #include "asm/format/fixed32.hpp"
 
 #include "asm/format/byte_emit.hpp"
+#include "asm/format/walker_util.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -17,71 +18,19 @@ namespace {
 
 using lir_pass_util::report;
 
-// Substrate-tier helper shared with `x86_variable::encode`. Kept
-// local because the project has not (yet) lifted a cross-walker
-// helper module — when AS-future adds a third walker, this and the
-// matching `hwEncodingOf` in x86_variable.cpp should hoist to a
-// `src/asm/format/walker_util.{hpp,cpp}`. Anchored as a delimited
-// cleanup at that future cycle.
-[[nodiscard]] std::optional<std::uint8_t>
+// (`filterToLirKind`, `operandsMatchGuard`, and `hwEncodingOf`
+// hoisted to `asm/format/walker_util.hpp` per D-AS3-2 closure —
+// architect AS5 review.)
+using walker_util::operandsMatchGuard;
+
+[[nodiscard]] inline std::optional<std::uint8_t>
 hwEncodingOf(LirReg reg, TargetSchema const& schema,
              std::string_view mnemonic, DiagnosticReporter& reporter) {
-    if (!reg.valid() || reg.isPhysical == 0) {
-        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': register operand is not a "
-                           "physical register (post-regalloc invariant "
-                           "broken)",
-                           mnemonic));
-        return std::nullopt;
-    }
-    auto const* info = schema.registerInfo(static_cast<std::uint16_t>(reg.id));
-    if (info == nullptr) {
-        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': register ordinal {} not in "
-                           "target schema '{}' register table",
-                           mnemonic, static_cast<unsigned>(reg.id),
-                           schema.name()));
-        return std::nullopt;
-    }
-    // AArch64-style 5-bit register fields can address 32 registers
-    // (X0..X30 + XZR=31). A future widening (SVE vector regs use
-    // a 5-bit-extended encoding scheme) would gain its own slot.
-    if (info->hwEncoding > 31) {
-        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': register '{}' hwEncoding {} "
-                           "exceeds 5 bits — fixed32 cannot encode",
-                           mnemonic, info->name, info->hwEncoding));
-        return std::nullopt;
-    }
-    return static_cast<std::uint8_t>(info->hwEncoding);
-}
-
-// Mirrors `operandsMatchGuard` in x86_variable.cpp. The function
-// stays local (not lifted) for the same reason as `hwEncodingOf` —
-// anchored as a future walker-util consolidation.
-[[nodiscard]] constexpr std::optional<LirOperandKind>
-filterToLirKind(OperandKindFilter f) noexcept {
-    switch (f) {
-        case OperandKindFilter::Reg:       return LirOperandKind::Reg;
-        case OperandKindFilter::ImmInt:    return LirOperandKind::ImmInt;
-        case OperandKindFilter::SymbolRef: return LirOperandKind::SymbolRef;
-    }
-    return std::nullopt;
-}
-
-[[nodiscard]] bool
-operandsMatchGuard(std::span<LirOperand const>            instOps,
-                   std::span<OperandKindFilter const>      guard) noexcept {
-    if (instOps.size() != guard.size()) return false;
-    for (std::size_t i = 0; i < guard.size(); ++i) {
-        auto const wanted = filterToLirKind(guard[i]);
-        if (!wanted.has_value()) return false;
-        if (instOps[i].kind != *wanted) return false;
-    }
-    return true;
+    // fixed32 (AArch64-style) uses 5-bit register fields — capacity
+    // 0..31 (X0..X30 + XZR=31). Future SVE-style widening would gain
+    // its own slot vocabulary and a wider call here.
+    return walker_util::hwEncodingOf(reg, schema, mnemonic,
+                                      /*maxBitWidth=*/5, reporter);
 }
 
 // Per-slot bit-window descriptor. `lsb` is the bit position of the

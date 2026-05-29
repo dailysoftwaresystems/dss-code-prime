@@ -1,5 +1,6 @@
 #include "asm/format/fixed32_disasm.hpp"
 
+#include "asm/format/walker_util.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -33,13 +34,9 @@ windowFor(EncodingSlotKind s) noexcept {
     return std::nullopt;
 }
 
-[[nodiscard]] std::uint32_t
-readU32LE(std::span<std::uint8_t const> bytes, std::size_t offset) noexcept {
-    return  static_cast<std::uint32_t>(bytes[offset])
-        | (static_cast<std::uint32_t>(bytes[offset + 1]) <<  8)
-        | (static_cast<std::uint32_t>(bytes[offset + 2]) << 16)
-        | (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
-}
+// (`readU32LE` hoisted to `asm/format/walker_util.hpp` per D-AS3-2
+// closure — architect AS5 review.)
+using walker_util::readU32LE;
 
 } // namespace
 
@@ -89,9 +86,22 @@ disassemble(TargetSchema const&            schema,
         std::uint32_t const baseBits = word & ~slotMask;
         if (baseBits != (variant.tmpl.fixedWord & ~slotMask)) continue;
 
-        // Extract each slot's value from the bit field.
+        // Extract each slot's value from the bit field. The width
+        // mask `((1 << width) - 1)` guarantees the recovered value
+        // is in-range for the slot's window — a wider-than-window
+        // value would silently truncate without it, masking a
+        // real encoder-write-too-wide bug. (`shapeOk` above
+        // guarantees `windowFor` returns a value for every slot
+        // this variant uses; the optional deref is safe inside
+        // this scope, NOT in general.)
         auto const extract = [&](EncodingSlotKind kind) -> std::int64_t {
             auto const w = windowFor(kind);
+            // Defense-in-depth (silent-failure #5): if this is ever
+            // called with a slot kind outside the variant's
+            // declared set, the optional would be empty — return 0
+            // visibly so a future refactor that breaks the scoping
+            // doesn't UB.
+            if (!w.has_value()) return 0;
             std::uint32_t const bits =
                 (word >> w->lsb) & ((1u << w->width) - 1u);
             return static_cast<std::int64_t>(bits);

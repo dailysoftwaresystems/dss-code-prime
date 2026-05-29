@@ -196,7 +196,16 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::ModRmReg: return state->modRmRegFull();
                 case EncodingSlotKind::ModRmRm:  return state->modRmRmFull();
                 case EncodingSlotKind::Imm32:    return state->imm32;
-                case EncodingSlotKind::Disp32:   return 0;
+                case EncodingSlotKind::Disp32:
+                    // Symbol-bearing slot: encoder writes ZEROS at
+                    // this position so the linker can patch later.
+                    // The zero-check on the actual bytes lives
+                    // UPSTREAM at the slot-consume loop (line ~175);
+                    // moving it here would re-read 4 bytes. The
+                    // upstream guard is the contract — if it ever
+                    // moves out of the consume loop, the symmetry
+                    // with fixed32's Imm26 in-place check breaks.
+                    return 0;
                 case EncodingSlotKind::Rd:
                 case EncodingSlotKind::Rn:
                 case EncodingSlotKind::Rm:

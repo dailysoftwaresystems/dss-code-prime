@@ -1,6 +1,7 @@
 #include "asm/format/x86_variable.hpp"
 
 #include "asm/format/byte_emit.hpp"
+#include "asm/format/walker_util.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -22,67 +23,16 @@ using lir_pass_util::report;
 // the filter doesn't have a single matching LIR operand-kind (none
 // today; reserved for future fields like a `Mem` filter that
 // matches a leading `Reg + MemBase + MemOffset` triplet).
-[[nodiscard]] constexpr std::optional<LirOperandKind>
-filterToLirKind(OperandKindFilter f) noexcept {
-    switch (f) {
-        case OperandKindFilter::Reg:       return LirOperandKind::Reg;
-        case OperandKindFilter::ImmInt:    return LirOperandKind::ImmInt;
-        case OperandKindFilter::SymbolRef: return LirOperandKind::SymbolRef;
-    }
-    return std::nullopt;
-}
+// (`filterToLirKind`, `operandsMatchGuard`, and `hwEncodingOf`
+// hoisted to `asm/format/walker_util.hpp` per D-AS3-2 closure —
+// architect AS5 review.)
+using walker_util::operandsMatchGuard;
 
-// Returns true iff the instruction's source operand kinds match the
-// variant guard exactly (length AND per-position kind).
-[[nodiscard]] bool
-operandsMatchGuard(std::span<LirOperand const>            instOps,
-                   std::span<OperandKindFilter const>      guard) noexcept {
-    if (instOps.size() != guard.size()) return false;
-    for (std::size_t i = 0; i < guard.size(); ++i) {
-        auto const wanted = filterToLirKind(guard[i]);
-        if (!wanted.has_value()) return false;
-        if (instOps[i].kind != *wanted) return false;
-    }
-    return true;
-}
-
-// Resolve a register operand's `hwEncoding` (the ModR/M ordinal the
-// CPU expects). Emits a diagnostic + returns nullopt when the operand
-// is not a physical register, the register table doesn't carry it,
-// or `hwEncoding` doesn't fit in 4 bits (defense — the schema's
-// validate() pins the field width, but verifying here closes the
-// "schema bug masquerading as encoder bug" silent-failure path).
-[[nodiscard]] std::optional<std::uint8_t>
+[[nodiscard]] inline std::optional<std::uint8_t>
 hwEncodingOf(LirReg reg, TargetSchema const& schema,
              std::string_view mnemonic, DiagnosticReporter& reporter) {
-    if (!reg.valid() || reg.isPhysical == 0) {
-        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': register operand is not a "
-                           "physical register (post-regalloc invariant "
-                           "broken)",
-                           mnemonic));
-        return std::nullopt;
-    }
-    auto const* info = schema.registerInfo(static_cast<std::uint16_t>(reg.id));
-    if (info == nullptr) {
-        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': register ordinal {} not in "
-                           "target schema '{}' register table",
-                           mnemonic, static_cast<unsigned>(reg.id),
-                           schema.name()));
-        return std::nullopt;
-    }
-    if (info->hwEncoding > 15) {
-        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': register '{}' hwEncoding {} "
-                           "exceeds 4 bits — x86-variable cannot encode",
-                           mnemonic, info->name, info->hwEncoding));
-        return std::nullopt;
-    }
-    return static_cast<std::uint8_t>(info->hwEncoding);
+    return walker_util::hwEncodingOf(reg, schema, mnemonic,
+                                      /*maxBitWidth=*/4, reporter);
 }
 
 // One pending symbol-relative slot. The walker emits 4 zero bytes
