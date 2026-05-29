@@ -299,9 +299,7 @@ MirGlobalId Mir::globalAt(std::uint32_t i) const {
 // ── MirBuilder ──────────────────────────────────────────────────────────────
 
 MirModuleId MirBuilder::nextModuleId() noexcept {
-    // Overflow guard lives in `substrate::mintMonotonicId` — see
-    // `HirBuilder::nextModuleId` for the silent-defeat-of-cross-module-
-    // isolation rationale this guard exists for.
+    // Aborts on uint32 overflow — see `substrate::mintMonotonicId`.
     return substrate::mintMonotonicId<MirModuleId>();
 }
 

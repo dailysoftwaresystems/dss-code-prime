@@ -100,7 +100,7 @@
       "maxSuccessors": 0
     }
   ],
-  "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal AS1 will read.",
+  "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal the assembler/encoder will read.",
   "registers": [
     { "name": "rax", "class": "gpr", "widthBytes": 8, "hwEncoding": 0 },
     { "name": "rcx", "class": "gpr", "widthBytes": 8, "hwEncoding": 1 },
@@ -157,7 +157,7 @@
     },
     {
       "name": "ms_x64",
-      "$comment": "Microsoft x64 ABI (Windows). First 4 args in RCX/RDX/R8/R9 regardless of int-vs-float (slot-aligned: an XMM arg in slot N uses XMM_N AND consumes the matching GPR slot, even if the GPR is unused). Integer return: RAX. Float return: XMM0. Stack 16-byte aligned before call; 32-byte shadow space (home space) always allocated by caller for callee to spill arg registers. No red zone.",
+      "$comment": "Microsoft x64 ABI (Windows). First 4 args in RCX/RDX/R8/R9 regardless of int-vs-float (slot-aligned: an XMM arg in slot N uses XMM_N AND consumes the matching GPR slot, even if the GPR is unused; symmetrically, an integer in slot N consumes XMM_N). Integer return: RAX. Float return: XMM0. Stack 16-byte aligned before call; 32-byte shadow space (home space) always allocated by caller for callee to spill arg registers. No red zone.",
       "argGprs":     ["rcx", "rdx", "r8", "r9"],
       "argFprs":     ["xmm0", "xmm1", "xmm2", "xmm3"],
       "returnGprs":  ["rax"],

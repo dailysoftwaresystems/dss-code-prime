@@ -5,9 +5,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <concepts>
 #include <cstdint>
 #include <format>
+#include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace dss {
@@ -29,6 +33,34 @@ struct Collector {
     if (s == "value")    return TargetResultRule::Value;
     if (s == "optional") return TargetResultRule::Optional;
     return std::nullopt;
+}
+
+// Single helper for "read a bounded non-negative integer field". Replaces
+// the cycle-2b-first-cut `readByte` + `readU16` duplication — the only
+// real differences were the upper bound and the output type, both of
+// which the template captures. The path argument lets the caller pass
+// the JSON path prefix (`/opcodes/N/`, `/registers/N/`, etc.); the field
+// name is appended.
+template <std::unsigned_integral T>
+void readBoundedInt(json const& obj, Collector& coll,
+                    std::string_view pathPrefix,
+                    char const* field, T& out) {
+    if (!obj.contains(field)) return;
+    auto const path = std::format("{}/{}", pathPrefix, field);
+    if (!obj.at(field).is_number_integer()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  "must be a non-negative integer");
+        return;
+    }
+    std::int64_t const v = obj.at(field).get<std::int64_t>();
+    constexpr std::int64_t kMax =
+        static_cast<std::int64_t>(std::numeric_limits<T>::max());
+    if (v < 0 || v > kMax) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  std::format("must fit in [0, {}]", kMax));
+        return;
+    }
+    out = static_cast<T>(v);
 }
 
 } // namespace
@@ -138,31 +170,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         if (o.contains("hasSideEffects") && o.at("hasSideEffects").is_boolean()) {
             info.hasSideEffects = o.at("hasSideEffects").get<bool>();
         }
-        // Arity bounds (optional, default 0). Stored as uint8; values
-        // outside [0,255] are diagnosed and skipped (the field keeps
-        // its zero default rather than being silently truncated).
-        auto readByte = [&](std::string_view field,
-                            std::uint8_t& out) {
-            if (!o.contains(field)) return;
-            if (!o.at(std::string{field}).is_number_integer()) {
-                coll.emit(DiagnosticCode::C_MalformedJson,
-                          std::format("/opcodes/{}/{}", i, field),
-                          "must be a non-negative integer");
-                return;
-            }
-            std::int64_t const v = o.at(std::string{field}).get<std::int64_t>();
-            if (v < 0 || v > 255) {
-                coll.emit(DiagnosticCode::C_MalformedJson,
-                          std::format("/opcodes/{}/{}", i, field),
-                          "must fit in [0, 255]");
-                return;
-            }
-            out = static_cast<std::uint8_t>(v);
-        };
-        readByte("minOperands",   info.minOperands);
-        readByte("maxOperands",   info.maxOperands);
-        readByte("minSuccessors", info.minSuccessors);
-        readByte("maxSuccessors", info.maxSuccessors);
+        // Arity bounds (optional, default 0). Out-of-range values are
+        // diagnosed (the schema is rejected by the final fatal-scan);
+        // absent fields stay at the zero default. `validate()` enforces
+        // cross-field invariants (min<=max, terminator-implies-successors).
+        std::string const opcPath = std::format("/opcodes/{}", i);
+        readBoundedInt(o, coll, opcPath, "minOperands",   info.minOperands);
+        readBoundedInt(o, coll, opcPath, "maxOperands",   info.maxOperands);
+        readBoundedInt(o, coll, opcPath, "minSuccessors", info.minSuccessors);
+        readBoundedInt(o, coll, opcPath, "maxSuccessors", info.maxSuccessors);
         // Slot-0 Invalid-sentinel sanity check.
         if (i == 0 && info.mnemonic != "invalid") {
             coll.emit(DiagnosticCode::C_MalformedJson, "/opcodes/0",
@@ -171,10 +187,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "opcode field; substrate `addInst` rejects opcode 0)");
         }
         std::uint16_t const idx = static_cast<std::uint16_t>(data.opcodes.size());
-        if (data.mnemonicIndex.emplace(info.mnemonic, idx).second == false) {
+        bool const fresh = data.mnemonicIndex.emplace(info.mnemonic, idx).second;
+        if (!fresh) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("/opcodes/{}/mnemonic", i),
                       std::format("duplicate mnemonic '{}'", info.mnemonic));
+            continue;  // skip push_back so vector & index stay in sync
         }
         data.opcodes.push_back(std::move(info));
     }
@@ -222,32 +240,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 if (r.contains("subOf") && r.at("subOf").is_string()) {
                     info.subOf = r.at("subOf").get<std::string>();
                 }
-                if (r.contains("widthBytes") && r.at("widthBytes").is_number_integer()) {
-                    std::int64_t const w = r.at("widthBytes").get<std::int64_t>();
-                    if (w < 0 || w > 0xFFFF) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  std::format("/registers/{}/widthBytes", i),
-                                  "must fit in [0, 65535]");
-                        continue;
-                    }
-                    info.widthBytes = static_cast<std::uint16_t>(w);
-                }
-                if (r.contains("hwEncoding") && r.at("hwEncoding").is_number_integer()) {
-                    std::int64_t const e = r.at("hwEncoding").get<std::int64_t>();
-                    if (e < 0 || e > 0xFFFF) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  std::format("/registers/{}/hwEncoding", i),
-                                  "must fit in [0, 65535]");
-                        continue;
-                    }
-                    info.hwEncoding = static_cast<std::uint16_t>(e);
-                }
+                std::string const regPath = std::format("/registers/{}", i);
+                readBoundedInt(r, coll, regPath, "widthBytes", info.widthBytes);
+                readBoundedInt(r, coll, regPath, "hwEncoding", info.hwEncoding);
+
                 std::uint16_t const ordinal =
                     static_cast<std::uint16_t>(data.registers.size());
-                if (!data.registerIndex.emplace(info.name, ordinal).second) {
+                bool const fresh = data.registerIndex.emplace(info.name, ordinal).second;
+                if (!fresh) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/registers/{}/name", i),
                               std::format("duplicate register name '{}'", info.name));
+                    continue;  // skip push_back so vector & index stay in sync
                 }
                 data.registers.push_back(std::move(info));
             }
@@ -283,26 +287,6 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     out.push_back(s.get<std::string>());
                 }
             };
-            auto readU16 = [&](json const& root,
-                               std::size_t  ci,
-                               char const*  field,
-                               std::uint16_t& out) {
-                if (!root.contains(field)) return;
-                if (!root.at(field).is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/callingConventions/{}/{}", ci, field),
-                              "must be a non-negative integer");
-                    return;
-                }
-                std::int64_t const v = root.at(field).get<std::int64_t>();
-                if (v < 0 || v > 0xFFFF) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/callingConventions/{}/{}", ci, field),
-                              "must fit in [0, 65535]");
-                    return;
-                }
-                out = static_cast<std::uint16_t>(v);
-            };
             for (std::size_t i = 0; i < ccs.size(); ++i) {
                 auto const& c = ccs[i];
                 if (!c.is_object()) {
@@ -325,16 +309,19 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readStringArray(c, i, "returnFprs",  cc.returnFprs);
                 readStringArray(c, i, "callerSaved", cc.callerSaved);
                 readStringArray(c, i, "calleeSaved", cc.calleeSaved);
-                readU16(c, i, "stackAlignment",   cc.stackAlignment);
-                readU16(c, i, "shadowSpaceBytes", cc.shadowSpaceBytes);
-                readU16(c, i, "redZoneBytes",     cc.redZoneBytes);
+                std::string const ccPath = std::format("/callingConventions/{}", i);
+                readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
+                readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);
+                readBoundedInt(c, coll, ccPath, "redZoneBytes",     cc.redZoneBytes);
 
                 std::uint16_t const idx =
                     static_cast<std::uint16_t>(data.callingConventions.size());
-                if (!data.callingConventionIndex.emplace(cc.name, idx).second) {
+                bool const fresh = data.callingConventionIndex.emplace(cc.name, idx).second;
+                if (!fresh) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/callingConventions/{}/name", i),
                               std::format("duplicate calling-convention name '{}'", cc.name));
+                    continue;  // skip push_back so vector & index stay in sync
                 }
                 data.callingConventions.push_back(std::move(cc));
             }
@@ -342,13 +329,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     }
 
     // ── Cross-field invariants (validate after per-field parse) ───
-    // Closes the gap the type-design review flagged: invariants that
-    // span multiple JSON paths (operand min<=max, terminator implies
-    // successor, register subOf resolution, calling-convention reg
-    // references) are enforced once at the end of parsing rather than
-    // smeared across per-field branches.
-    for (auto const& problem : data.validate()) {
-        coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel}, problem);
+    // `validate()` returns pre-shaped `ConfigDiagnostic`s carrying their
+    // specific JSON paths (`/opcodes/3/maxSuccessors`, etc.). Append-as-
+    // is instead of reshaping under a single sourceLabel path — the path
+    // is the load-bearing locator for the user fixing the config.
+    for (auto&& problem : data.validate()) {
+        coll.diagnostics.push_back(std::move(problem));
     }
 
     if (!coll.diagnostics.empty()) {

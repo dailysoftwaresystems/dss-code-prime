@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/target_schema.hpp"   // TargetRegClass (synchrony assert)
 
 #include <cstdint>
 #include <type_traits>
@@ -64,6 +65,17 @@ struct LirReg {
 };
 static_assert(sizeof(LirReg) == 4, "LirReg POD must stay 4 bytes");
 static_assert(std::is_trivially_copyable_v<LirReg>);
+
+// Synchrony between the LIR substrate's `LirRegClass` and the target-
+// schema-side `TargetRegClass` — they must stay numerically aligned so
+// the JSON's `"class": "gpr"/"fpr"/..."` strings map to identical
+// numeric tags at both ends of the LIR/regalloc/encoding pipeline. A
+// future enum addition that lands in only one side fails this assert.
+static_assert(static_cast<int>(LirRegClass::None)  == static_cast<int>(TargetRegClass::None));
+static_assert(static_cast<int>(LirRegClass::GPR)   == static_cast<int>(TargetRegClass::GPR));
+static_assert(static_cast<int>(LirRegClass::FPR)   == static_cast<int>(TargetRegClass::FPR));
+static_assert(static_cast<int>(LirRegClass::VR)    == static_cast<int>(TargetRegClass::VR));
+static_assert(static_cast<int>(LirRegClass::Flags) == static_cast<int>(TargetRegClass::Flags));
 
 // Factory helpers. The substrate emits virtual regs only; physical-
 // reg creation will be gated behind a passkey when the ML6 regalloc

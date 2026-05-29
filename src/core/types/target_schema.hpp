@@ -28,8 +28,9 @@
 //
 // Lifecycle: `loadShipped` / `loadFromFile` / `loadFromText` mirror
 // `GrammarSchema`'s loaders verbatim. Each call returns a freshly-
-// allocated `shared_ptr<TargetSchema const>` (no caching here — that's
-// a separate concern). Discovery: cwd-walk for
+// allocated `shared_ptr<TargetSchema>` (no caching here — that's a
+// separate concern; the value is move-only and non-mutating after the
+// loader returns it). Discovery: cwd-walk for
 // `src/dss-config/targets/<name>.target.json` (up to 8 levels).
 
 namespace dss {
@@ -82,9 +83,9 @@ enum class TargetRegClass : std::uint8_t {
 struct DSS_EXPORT TargetRegisterInfo {
     std::string    name;          // canonical mnemonic ("rax" / "xmm0" / ...)
     TargetRegClass regClass = TargetRegClass::None;
-    // `subOf` lets a target declare aliasing relationships ("eax" is the
-    // low 32 bits of "rax"). For ML6 regalloc to track full clobber sets
-    // correctly. Empty when this register is independent.
+    // `subOf` lets a target declare aliasing relationships (e.g. "eax"
+    // is the low 32 bits of "rax") so ML6 regalloc can track full
+    // clobber sets correctly. Empty when this register is independent.
     std::string    subOf;
     // 16/8/4/1 etc. — width in bytes. Required so ML6 knows spill-slot
     // sizing without re-deriving it from the regClass.
@@ -134,10 +135,10 @@ struct DSS_EXPORT TargetOpcodeInfo {
 
 namespace detail {
 
-// Heterogeneous-lookup support for `mnemonicIndex`. Lets
-// `opcodeByMnemonic(string_view)` look up without allocating a
-// `std::string` per call (matters once cycle 3 isel pattern-matching
-// queries the index per emitted instruction).
+// Heterogeneous-lookup support for the schema's name→ordinal maps. Lets
+// every lookup (`opcodeByMnemonic`, `registerByName`, `callingConvention
+// ByName`) accept a `string_view` without allocating a `std::string` per
+// call — cycle 3 isel pattern matching hits these in tight loops.
 struct DSS_EXPORT TransparentStringHash {
     using is_transparent = void;
     std::size_t operator()(std::string_view sv) const noexcept {
@@ -155,15 +156,11 @@ struct DSS_EXPORT TransparentStringEq {
     bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
 };
 
-using MnemonicIndexMap = std::unordered_map<
-    std::string, std::uint16_t,
-    TransparentStringHash, TransparentStringEq>;
-
-using RegisterIndexMap = std::unordered_map<
-    std::string, std::uint16_t,
-    TransparentStringHash, TransparentStringEq>;
-
-using CallingConventionIndexMap = std::unordered_map<
+// One alias serves all three index maps (mnemonic / register-name /
+// calling-convention-name). The three were identical instantiations
+// in cycle 2b's first cut — collapsing avoids three places to update
+// if the hash policy ever changes.
+using TransparentNameIndex = std::unordered_map<
     std::string, std::uint16_t,
     TransparentStringHash, TransparentStringEq>;
 
@@ -184,26 +181,46 @@ struct DSS_EXPORT TargetSchemaData {
     // unconditionally invalid via the addInst guard, not via these
     // fields.
     std::vector<TargetOpcodeInfo> opcodes;
-    MnemonicIndexMap              mnemonicIndex;
+    TransparentNameIndex          mnemonicIndex;
 
     // Physical register file (cycle 2b). Empty when the target JSON
     // omits the `registers` array — keeps the cycle 2a-shape targets
     // valid until ML6 regalloc requires the section.
     std::vector<TargetRegisterInfo> registers;
-    RegisterIndexMap                registerIndex;
+    TransparentNameIndex            registerIndex;
 
     // Calling conventions (cycle 2b). Same optional-for-now discipline
     // as `registers` — ML7 callconv lowering will require ≥1 entry.
     std::vector<TargetCallingConvention> callingConventions;
-    CallingConventionIndexMap            callingConventionIndex;
+    TransparentNameIndex                 callingConventionIndex;
 
-    // Cross-field invariants the loader cannot trivially express per
-    // field (operand min<=max; terminator implies minSuccessors>=1;
-    // register `subOf` references resolve; calling-convention register
-    // names resolve to entries in `registers`). Returns the list of
-    // problems; an empty result means the schema is well-formed. Called
-    // at the end of the JSON loader; never called by consumers.
-    [[nodiscard]] std::vector<std::string> validate() const;
+    // Cross-field invariants the per-field JSON parse cannot express.
+    // Returns the list of problems as fully-shaped `ConfigDiagnostic`s
+    // (each one carries its JSON path in `.path`); the loader stamps
+    // them as fatal. Empty result = well-formed. Called once at the
+    // end of `loadFromText`; never called by external consumers.
+    //
+    // Rules enforced (cycle 2b):
+    //   Opcode arity:
+    //     - minOperands <= maxOperands
+    //     - minSuccessors <= maxSuccessors
+    //     - isTerminator && minSuccessors>0 && maxSuccessors==0 (contradiction)
+    //     - !isTerminator && maxSuccessors>0 (non-terminator has no successors)
+    //   Register file:
+    //     - widthBytes > 0 when regClass != None (silent-zero guard)
+    //     - subOf resolves to a known register
+    //     - subOf chain is acyclic (mark-and-visit)
+    //   Calling conventions:
+    //     - every name resolves to a register (gated on
+    //       `registers.empty() || callingConventions.empty()` to allow
+    //       cycle-2a-shape configs but trap the silent-failure case
+    //       where ONLY callingConventions is declared)
+    //     - argGprs/returnGprs/callerSaved/calleeSaved must be GPR class
+    //     - argFprs/returnFprs must be FPR class
+    //     - stackAlignment is a power of two (and >0 when ANY field set)
+    //     - shadowSpaceBytes % stackAlignment == 0
+    //     - redZoneBytes    % stackAlignment == 0
+    [[nodiscard]] std::vector<ConfigDiagnostic> validate() const;
 };
 
 } // namespace detail

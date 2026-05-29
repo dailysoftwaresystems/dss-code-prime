@@ -36,6 +36,7 @@ dss_add_test(NAME core/substrate/test_arena_tag       SOURCES substrate/test_are
 dss_add_test(NAME core/substrate/test_arena_container SOURCES substrate/test_arena_container.cpp)
 dss_add_test(NAME core/substrate/test_arena_attribute SOURCES substrate/test_arena_attribute.cpp)
 dss_add_test(NAME core/substrate/test_arena_concepts  SOURCES substrate/test_arena_concepts.cpp)
+dss_add_test(NAME core/substrate/test_mint_monotonic_id SOURCES substrate/test_mint_monotonic_id.cpp)
 target_include_directories(dss_core_substrate_test_arena_tag       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_container PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_attribute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

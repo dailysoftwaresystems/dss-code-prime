@@ -326,3 +326,211 @@ TEST(TargetSchema, OpcodeMinGreaterThanMaxRejected) {
         << "validate() must catch min>max even when each field parses cleanly";
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
+
+TEST(TargetSchema, OpcodeMinSuccessorsGreaterThanMaxRejected) {
+    // The successors-axis parallel of the min>max check. Pinned so a
+    // future refactor that drops the second `if` in validate() trips
+    // this test rather than silently passing.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"jmp","result":"none","isTerminator":true,
+               "minSuccessors":3,"maxSuccessors":1}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, OpcodeTerminatorMinSuccessorsButZeroMaxRejected) {
+    // `isTerminator: true` with `minSuccessors: 1, maxSuccessors: 0` is
+    // self-contradictory. The Return shape (min=max=0) stays legal.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"jmp","result":"none","isTerminator":true,
+               "minSuccessors":1,"maxSuccessors":0}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, OpcodeNonTerminatorWithSuccessorsRejected) {
+    // Only terminators have CFG successors. A non-terminator with
+    // maxSuccessors>0 is structurally impossible.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"mov","result":"value","isTerminator":false,
+               "maxSuccessors":2}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, OpcodeReturnShapeIsLegal) {
+    // Positive control: an opcode with isTerminator=true and
+    // (minSuccessors=0, maxSuccessors=0) must NOT be flagged — that's
+    // the Return / Unreachable shape.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"ret","result":"none","isTerminator":true,
+               "minSuccessors":0,"maxSuccessors":0}
+            ]})");
+    ASSERT_TRUE(r.has_value())
+        << "Return-shaped opcode (terminator + min=max=0) must validate cleanly";
+}
+
+// ─── cycle 2b — register-file validate() rules ────────────────────────────
+
+TEST(TargetSchema, RegisterWidthBytesZeroWhenClassedRejected) {
+    // Silent-zero guard: a register with class:gpr but no widthBytes
+    // (defaults to 0) would silently pass through to ML6 regalloc and
+    // produce zero-byte spills. validate() must reject.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rax","class":"gpr"}]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, RegisterSubOfCycleRejected) {
+    // subOf chain `a -> b -> a` is a cycle. validate() must trap it
+    // before ML6 walks the chain.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[
+              {"name":"a","class":"gpr","widthBytes":4,"subOf":"b"},
+              {"name":"b","class":"gpr","widthBytes":4,"subOf":"a"}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ─── cycle 2b — calling-convention validate() rules ───────────────────────
+
+TEST(TargetSchema, CallingConventionWithoutRegistersIsRejected) {
+    // CRITICAL silent-failure trap (silent-failure-hunter finding):
+    // a config with NO `registers` but a fully-populated
+    // `callingConventions` would previously have resolved nothing
+    // silently. validate() must flag every reference.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "callingConventions":[
+              {"name":"bogus","argGprs":["rdi"]}
+            ]})");
+    ASSERT_FALSE(r.has_value())
+        << "callingConventions referencing names with no registers section "
+           "must fail-loud (the gate is registers.empty() && cc.empty())";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, CallingConventionStackAlignmentMustBePow2) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rax","class":"gpr","widthBytes":8}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rax"],"stackAlignment":12}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, CallingConventionShadowSpaceMustAlignToStack) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rax","class":"gpr","widthBytes":8}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rax"],"stackAlignment":16,"shadowSpaceBytes":12}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, CallingConventionRedZoneMustAlignToStack) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rax","class":"gpr","widthBytes":8}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rax"],"stackAlignment":16,"redZoneBytes":100}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ─── cycle 2b — JSON loader edge cases ────────────────────────────────────
+
+TEST(TargetSchema, RegistersSectionMustBeArray) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":{"oops":"not-an-array"}})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, RegisterInvalidClassStringRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"r","class":"banana","widthBytes":4}]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, RegisterWidthAboveU16MaxRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"r","class":"gpr","widthBytes":65536}]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, CallingConventionsSectionMustBeArray) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "callingConventions":42})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, CallingConventionArgGprsMustBeStringArray) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "callingConventions":[{"name":"x","argGprs":[42]}]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, CallingConventionStackAlignmentMustBeInteger) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "callingConventions":[{"name":"x","stackAlignment":"sixteen"}]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ─── ShippedX86_64 — exact-count assertions ───────────────────────────────
+
+TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
+    // 16 GPRs + 16 FPRs + rflags = 33. EXPECT_EQ (not EXPECT_GE) so a
+    // future accidental duplicate / addition trips the test rather than
+    // silently passing.
+    auto r = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->registerCount(), 33u);
+}

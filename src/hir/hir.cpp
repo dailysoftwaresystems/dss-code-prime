@@ -120,12 +120,7 @@ std::span<HirNodeId const> Hir::children(HirNodeId id) const {
 // ── HirBuilder ──────────────────────────────────────────────────────────────
 
 HirModuleId HirBuilder::nextModuleId() noexcept {
-    // Overflow guard lives in `substrate::mintMonotonicId` — a wrapped
-    // counter would mint `HirModuleId{0}` (== `InvalidHirModule`) and
-    // stamp `arenaTag = 0` on every emitted HirNodeId, which the
-    // cross-arena guard treats as "untagged" and lets pass — SILENTLY
-    // defeating cross-module isolation. The shared minter aborts loud
-    // on uint32 overflow before that can happen.
+    // Aborts on uint32 overflow — see `substrate::mintMonotonicId`.
     return substrate::mintMonotonicId<HirModuleId>();
 }
 
