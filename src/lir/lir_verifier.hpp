@@ -2,53 +2,50 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/strong_ids.hpp"
+#include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
 #include "mir/mir.hpp"
 
 #include <cstdint>
+#include <span>
+#include <vector>
 
 // `LirVerifier` (plan 12 §2.9, ML5 cycle 3e) — substrate-tier
 // invariant checker for the frozen `Lir` module. Mirrors `MirVerifier`
-// (ML3 cycle 1): a class instantiated once per verify, runs a sequence
-// of rule families, emits `L_VerifierFailure`-shaped diagnostics into
-// the reporter, returns `true` iff no error-severity diagnostics were
-// added during the run.
+// (ML3 cycle 1): runs a sequence of rule families, emits
+// `L_VerifierFailure`-shaped diagnostics into the reporter, returns
+// `true` iff no error-severity diagnostics were added during the run.
 //
 // Cycle 3e ships THREE rule families anchored by the cycle-3c review
 // and the cycle-3d FPR-class plumbing review:
 //
 //   1. `checkMemOperandPairing` — every LIR memory-bearing instruction
-//      (Load/Store/Lea) must end with the `[Reg base, ..., MemBase,
-//      MemOffset]` operand triple/quad. Catches a malformed builder
-//      that emits Load with 2 operands (missing MemOffset) or Store
-//      with operand kinds out of order.
+//      (Load/Store/Lea) must end with the `[MemBase, MemOffset]`
+//      operand pair. Catches malformed addressing-mode operand lists.
 //
-//   2. `checkStoreRegClassMatchesMirType` — for each Store inst, the
-//      value operand's vreg class must equal the regClassForCoreType
-//      of the MIR pointee type. Closes the silent-corruption hazard
-//      where an F64 Load + F64 Store chain could route through GPR
-//      vregs and corrupt at AS1 encoding.
+//   2. `checkStoreRegClassMatchesMirType` — for each LIR `store` inst
+//      whose source MIR inst is a MIR `Store`, the value operand's
+//      vreg class must equal regClassForCoreType of the MIR pointee
+//      type. Uses the `lirToMir` mapping (see below) to drive the
+//      cross-reference per LIR inst, NOT positional MIR-vs-LIR walk
+//      (cycle-3e fix-up: positional walk silently skipped switch-
+//      bearing functions whose LIR has extra synthetic blocks).
 //
-//   3. `checkVregClassMatchesMirType` — for every Lir inst that
-//      results from a MIR inst (via the lowerer's `valueToReg`
-//      mapping), the LirReg's class must equal regClassForCoreType of
-//      the MIR result type. The cycle-3d review caught the cycle-3c
-//      lowerLoad / prepassAllocatePhis / emitPhiMovesForEdge gap
-//      where some methods hardcoded GPR; this verifier rule catches
-//      any future regression of the same shape.
+//   3. `checkVregClassMatchesMirType` — for every LIR inst with both
+//      a valid result vreg AND a recorded source MIR inst, the
+//      LirReg's class must match regClassForCoreType of the MIR
+//      result type. Same mapping-driven walk as rule 2. Closes the
+//      cycle-3d "lowerLoad / prepassAllocatePhis / emitPhiMovesForEdge
+//      hardcoded GPR" silent-corruption hazard at the verifier tier.
 //
-// Cycle 3e is the FIRST consumer of `regClassForCoreType` (cycle 3d
-// substrate-tier helper). Adding the verifier completes the cycle:
-// substrate function → lowerer + verifier both consume.
-//
-// The verifier requires the `Mir` source (to read `instType` for
-// each LIR-producing MIR inst) and the `TypeInterner` (to read
-// `kind(typeId)`). It does NOT require a `valueToReg` mapping — for
-// cycle-3e checks, the verifier walks both Mir + Lir in matching
-// order (the lowerer emits instructions in MIR-block order, so
-// LIR-block-N corresponds to MIR-block-N; rules 2+3 cross-reference
-// at the block-tier).
+// Cycle 3e takes `TargetSchema const&` from the caller (was previously
+// hardcoded `loadShipped("x86_64")` — architect-flagged target-
+// agnosticism violation, now closed). The `lirToMirMap` parameter is
+// the cycle-3e-added side-table from `MirToLirResult.lirToMir`; the
+// verifier walks the LIR module and uses the mapping to fetch the
+// source MIR inst per LIR inst.
 
 namespace dss {
 
@@ -57,13 +54,16 @@ struct DSS_EXPORT LirVerifyResult {
 };
 
 // Run all rule families. The caller owns `lir`, `mir`, `interner`,
-// and `reporter`; the verifier does not mutate any of them. Returns
-// `ok=true` iff zero error-severity diagnostics were added during the
-// run (delta-on-errorCount discipline mirroring ML2/ML3/cycle-3a-3d).
+// `schema`, and `reporter`; the verifier does not mutate any of them.
+// `lirToMirMap` is `MirToLirResult.lirToMir` — indexed by LirInstId.v,
+// returning `InvalidMirInst` for LIR insts with no source MIR inst.
+// Returns `ok=true` iff zero error-severity diagnostics were added.
 [[nodiscard]] DSS_EXPORT LirVerifyResult
-verifyLir(Lir const&          lir,
-          Mir const&          mir,
-          TypeInterner const& interner,
-          DiagnosticReporter& reporter);
+verifyLir(Lir const&             lir,
+          Mir const&             mir,
+          TypeInterner const&    interner,
+          TargetSchema const&    schema,
+          std::span<MirInstId const> lirToMirMap,
+          DiagnosticReporter&    reporter);
 
 } // namespace dss

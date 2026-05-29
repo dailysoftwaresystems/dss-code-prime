@@ -1,7 +1,6 @@
 #include "lir/lir_verifier.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
-#include "core/types/target_schema.hpp"  // regClassForCoreType
 
 #include <format>
 #include <string>
@@ -19,11 +18,6 @@ void report(DiagnosticReporter& reporter, std::string actual) {
     reporter.report(std::move(d));
 }
 
-// Resolve a mnemonic-by-name once. The verifier needs `load`/`store`/
-// `lea`'s opcode numbers to find the memory-bearing insts; cycle 3e
-// only checks register-machine-shaped targets, so a missing mnemonic
-// returns nullopt and the rule silently skips (a non-register-machine
-// target legitimately omits these).
 struct MemOpcodeIds {
     std::optional<std::uint16_t> load;
     std::optional<std::uint16_t> store;
@@ -39,12 +33,9 @@ struct MemOpcodeIds {
 }
 
 // Rule 1: every Load/Store/Lea inst's operand list must END with a
-// MemBase followed by a MemOffset operand. Cycle 3c/3d emit:
-//   Load:  [Reg base, MemBase, MemOffset]
-//   Store: [Reg value, Reg base, MemBase, MemOffset]
-//   Lea:   [Reg base, MemBase, MemOffset] (3-operand) or
-//          [Reg base, Reg index, MemBase, MemOffset] (4-operand)
-// The shared invariant: the last two operands are MemBase, MemOffset.
+// MemBase followed by a MemOffset operand. Walks LIR only; no MIR
+// cross-reference needed. Operates per-block; safe across function
+// boundaries.
 void checkMemOperandPairing(Lir const& lir, TargetSchema const& sch,
                             DiagnosticReporter& reporter) {
     auto const mem = resolveMemOpcodes(sch);
@@ -77,108 +68,108 @@ void checkMemOperandPairing(Lir const& lir, TargetSchema const& sch,
     }
 }
 
-// Rule 2: every Store inst's value-operand register class must match
-// the regClassForCoreType of the MIR pointee type. The lowerer routes
-// MIR Store → LIR `store`; the verifier cross-references both modules.
-// Cycle 3e's Mir-vs-Lir alignment is implicit (LIR funcs/blocks/insts
-// are emitted in MIR order); we walk both in parallel.
-void checkStoreRegClassMatchesMirType(Lir const& lir, Mir const& mir,
-                                      TypeInterner const& interner,
-                                      TargetSchema const& sch,
-                                      DiagnosticReporter& reporter) {
+// Look up the source MIR inst for a LIR inst via the `lirToMirMap`.
+// Returns `InvalidMirInst` (default-constructed) when:
+//   - the LIR inst id is past the map's range (defensive; means the
+//     lowerer didn't record this inst)
+//   - the recorded entry is the default-constructed `InvalidMirInst`
+[[nodiscard]] MirInstId sourceMirInst(std::span<MirInstId const> map, LirInstId li) {
+    if (!li.valid()) return MirInstId{};
+    if (li.v >= map.size()) return MirInstId{};
+    return map[li.v];
+}
+
+// Rule 2: for each LIR `store` inst with a source MIR Store, cross-
+// check the value-operand's vreg class against
+// `regClassForCoreType(interner.kind(mir.instType(mirStoreValueOp)))`.
+// Walks LIR by inst and uses `lirToMirMap` for source resolution —
+// REPLACES the cycle-3e positional MIR-vs-LIR walk that silently
+// skipped switch-bearing functions (architect HIGH + silent-failure
+// CRITICAL findings).
+void checkStoreRegClassMatchesMirType(
+    Lir const& lir, Mir const& mir, TypeInterner const& interner,
+    TargetSchema const& sch, std::span<MirInstId const> map,
+    DiagnosticReporter& reporter) {
     auto const storeOp = sch.opcodeByMnemonic("store");
-    if (!storeOp.has_value()) return;  // non-register-machine
-    if (lir.moduleFuncCount() != mir.moduleFuncCount()) return;  // alignment broken
-    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
-        LirFuncId const lfn = lir.funcAt(fi);
-        MirFuncId const mfn = mir.funcAt(fi);
-        if (lir.funcBlockCount(lfn) != mir.funcBlockCount(mfn)) continue;
-        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(lfn); ++bi) {
-            LirBlockId const lbb = lir.funcBlockAt(lfn, bi);
-            MirBlockId const mbb = mir.funcBlockAt(mfn, bi);
-            std::uint32_t const ln = lir.blockInstCount(lbb);
-            std::uint32_t const mn = mir.blockInstCount(mbb);
-            // For each MIR Store, find the corresponding LIR `store`.
-            // Walk LIR ops once per MIR Store; the lowerer emits in
-            // sequence so a forward scan finds the next match.
-            std::uint32_t li = 0;
-            for (std::uint32_t mi = 0; mi < mn; ++mi) {
-                MirInstId const minst = mir.blockInstAt(mbb, mi);
-                if (mir.instOpcode(minst) != MirOpcode::Store) continue;
-                while (li < ln && lir.instOpcode(lir.blockInstAt(lbb, li)) != *storeOp) ++li;
-                if (li >= ln) break;
-                LirInstId const linst = lir.blockInstAt(lbb, li++);
-                auto const lops = lir.instOperands(linst);
+    if (!storeOp.has_value()) {
+        // Schema lacks `store` — non-register-machine target. Skip
+        // silently is acceptable here because the rule has nothing to
+        // check; if any LIR `store` HAD been emitted on such a target,
+        // it would have hit `reportMissingOpcode` at lowering time.
+        return;
+    }
+    std::size_t const fnCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const bb = lir.funcBlockAt(fn, bi);
+            std::uint32_t const n = lir.blockInstCount(bb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const li = lir.blockInstAt(bb, i);
+                if (lir.instOpcode(li) != *storeOp) continue;
+                MirInstId const src = sourceMirInst(map, li);
+                if (!src.valid()) continue;
+                if (mir.instOpcode(src) != MirOpcode::Store) continue;
+                auto const lops = lir.instOperands(li);
                 if (lops.empty() || lops[0].kind != LirOperandKind::Reg) continue;
-                // The MIR Store's value type drives the expected class.
-                auto const mops = mir.instOperands(minst);
-                if (mops.size() < 1) continue;
+                auto const mops = mir.instOperands(src);
+                if (mops.empty()) continue;
                 TypeId const valueTy = mir.instType(mops[0]);
                 if (!valueTy.valid()) continue;
-                LirRegClass const expected =
-                    static_cast<LirRegClass>(regClassForCoreType(interner.kind(valueTy)));
+                LirRegClass const expected = static_cast<LirRegClass>(
+                    regClassForCoreType(interner.kind(valueTy)));
                 LirRegClass const actual = lops[0].reg.regClass();
                 if (expected != actual && actual != LirRegClass::None) {
                     report(reporter, std::format(
                         "LirVerifier: Store value-operand reg class {} does "
                         "not match MIR pointee-type regClass {} (LIR inst {})",
                         static_cast<int>(actual),
-                        static_cast<int>(expected), linst.v));
+                        static_cast<int>(expected), li.v));
                 }
             }
         }
     }
 }
 
-// Rule 3: every LIR inst that produces a result and whose result reg
-// is class-typed must match the regClassForCoreType of the
-// corresponding MIR inst's type. Walks both modules in parallel; for
-// each MIR value-producing inst, find the next LIR inst whose result
-// is a valid vreg and cross-check. The check skips opcodes whose
-// result class is target-defined rather than type-derived (Alloca's
-// result is always a pointer / GPR regardless of the Mir typeId
-// detail; future cycles add address-of opcodes the same way).
-void checkVregClassMatchesMirType(Lir const& lir, Mir const& mir,
-                                  TypeInterner const& interner,
-                                  DiagnosticReporter& reporter) {
-    if (lir.moduleFuncCount() != mir.moduleFuncCount()) return;
-    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
-        LirFuncId const lfn = lir.funcAt(fi);
-        MirFuncId const mfn = mir.funcAt(fi);
-        if (lir.funcBlockCount(lfn) != mir.funcBlockCount(mfn)) continue;
-        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(lfn); ++bi) {
-            LirBlockId const lbb = lir.funcBlockAt(lfn, bi);
-            MirBlockId const mbb = mir.funcBlockAt(mfn, bi);
-            std::uint32_t const ln = lir.blockInstCount(lbb);
-            std::uint32_t const mn = mir.blockInstCount(mbb);
-            std::uint32_t li = 0;
-            for (std::uint32_t mi = 0; mi < mn; ++mi) {
-                MirInstId const minst = mir.blockInstAt(mbb, mi);
-                TypeId const mty = mir.instType(minst);
-                // Skip MIR insts that don't produce values or have an
-                // invalid type (terminators, side-effect-only ops).
+// Rule 3: for every LIR inst with both a valid result vreg AND a
+// recorded source MIR inst, the LirReg's class must match the MIR
+// inst's result type's expected class. Same lirToMirMap-driven walk
+// as rule 2 — robust to cycle-3b Switch lowering's extra LIR blocks.
+void checkVregClassMatchesMirType(
+    Lir const& lir, Mir const& mir, TypeInterner const& interner,
+    std::span<MirInstId const> map, DiagnosticReporter& reporter) {
+    std::size_t const fnCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const bb = lir.funcBlockAt(fn, bi);
+            std::uint32_t const n = lir.blockInstCount(bb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const li = lir.blockInstAt(bb, i);
+                LirReg const result = lir.instResult(li);
+                if (!result.valid()) continue;
+                MirInstId const src = sourceMirInst(map, li);
+                if (!src.valid()) continue;
+                MirOpcode const mop = mir.instOpcode(src);
+                // Skip opcodes whose LIR vreg class is target-defined
+                // rather than type-derived. Phi/Alloca/GlobalAddr
+                // produce GPR pointers regardless of payload type.
+                if (mop == MirOpcode::Phi)        continue;
+                if (mop == MirOpcode::Alloca)     continue;
+                if (mop == MirOpcode::GlobalAddr) continue;
+                TypeId const mty = mir.instType(src);
                 if (!mty.valid()) continue;
                 if (interner.kind(mty) == TypeKind::Void) continue;
-                if (mir.instOpcode(minst) == MirOpcode::Phi) continue;
-                if (mir.instOpcode(minst) == MirOpcode::Alloca) continue;
-                if (mir.instOpcode(minst) == MirOpcode::GlobalAddr) continue;
-                // Advance LIR cursor to the next value-producing inst.
-                while (li < ln) {
-                    LirInstId const cand = lir.blockInstAt(lbb, li);
-                    if (lir.instResult(cand).valid()) break;
-                    ++li;
-                }
-                if (li >= ln) break;
-                LirInstId const linst = lir.blockInstAt(lbb, li++);
-                LirRegClass const expected =
-                    static_cast<LirRegClass>(regClassForCoreType(interner.kind(mty)));
-                LirRegClass const actual = lir.instResult(linst).regClass();
+                LirRegClass const expected = static_cast<LirRegClass>(
+                    regClassForCoreType(interner.kind(mty)));
+                LirRegClass const actual = result.regClass();
                 if (expected != actual && actual != LirRegClass::None) {
                     report(reporter, std::format(
                         "LirVerifier: LIR inst {} produced reg class {} but "
-                        "the corresponding MIR inst %{} has type kind that "
-                        "expects class {}",
-                        linst.v, static_cast<int>(actual), minst.v,
+                        "MIR inst %{} has type kind expecting class {}",
+                        li.v, static_cast<int>(actual), src.v,
                         static_cast<int>(expected)));
                 }
             }
@@ -188,20 +179,16 @@ void checkVregClassMatchesMirType(Lir const& lir, Mir const& mir,
 
 } // namespace
 
-LirVerifyResult verifyLir(Lir const&          lir,
-                          Mir const&          mir,
-                          TypeInterner const& interner,
-                          DiagnosticReporter& reporter) {
-    auto schema = TargetSchema::loadShipped("x86_64");
-    if (!schema) {
-        // No target schema loadable — cycle 3e ships only the x86_64
-        // path; future targets will pass the schema in directly.
-        return {true};
-    }
+LirVerifyResult verifyLir(Lir const&                  lir,
+                          Mir const&                  mir,
+                          TypeInterner const&         interner,
+                          TargetSchema const&         schema,
+                          std::span<MirInstId const>  lirToMirMap,
+                          DiagnosticReporter&         reporter) {
     auto const baseline = reporter.errorCount();
-    checkMemOperandPairing(lir, **schema, reporter);
-    checkStoreRegClassMatchesMirType(lir, mir, interner, **schema, reporter);
-    checkVregClassMatchesMirType(lir, mir, interner, reporter);
+    checkMemOperandPairing(lir, schema, reporter);
+    checkStoreRegClassMatchesMirType(lir, mir, interner, schema, lirToMirMap, reporter);
+    checkVregClassMatchesMirType(lir, mir, interner, lirToMirMap, reporter);
     return {reporter.errorCount() == baseline};
 }
 

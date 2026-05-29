@@ -98,8 +98,8 @@ enum class MnemonicSlot : std::uint8_t {
     FpCvt, FpToSi, FpToUi, SiToFp, UiToFp,
     // cycle 3d cross-class move (movq via FPR↔GPR Bitcast)
     MovqXClass,
-    // cycle 3e: intrinsic_call (Call and GlobalAddr reuse `call`/`mov`)
-    IntrinsicCall,
+    // cycle 3e: Call + IntrinsicCall (GlobalAddr reuses Mov via SymbolRef)
+    Call, IntrinsicCall,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -154,7 +154,8 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::SiToFp,        "si_to_fp"},
     {MnemonicSlot::UiToFp,        "ui_to_fp"},
     {MnemonicSlot::MovqXClass,    "movq_xclass"},
-    {MnemonicSlot::IntrinsicCall, "intrinsic_call"},
+    {MnemonicSlot::Call,           "call"},
+    {MnemonicSlot::IntrinsicCall,  "intrinsic_call"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -186,6 +187,20 @@ struct Lowerer {
     // Per-function state. Cleared at the top of `lowerFunction`.
     MirAttribute<LirReg>            valueToReg;
     MirBlockAttribute<LirBlockId>   mirBlockToLirBlock;
+
+    // Module-tier (NOT per-function) reverse-mapping LirInstId.v →
+    // MirInstId. Grows as the lowerer emits LIR insts (slot 0 is the
+    // arena's invalid sentinel, default-initialized `InvalidMirInst`).
+    // The LirVerifier consumes this to cross-reference LIR vregs
+    // against MIR types WITHOUT the cycle-3e positional-alignment
+    // hazard that silently skipped switch-bearing functions.
+    std::vector<MirInstId>          lirToMir;
+    // Current MIR inst being lowered. Set by `lowerInst` /
+    // `lowerTerminator` / pre-pass methods so the per-inst LIR emit
+    // helpers can record the source. `InvalidMirInst` means "no MIR
+    // source" (e.g., Switch's synthetic next-compare blocks, phi-edge
+    // parallel-copy moves).
+    MirInstId                       currentMir{};
 
     // Whether the running lowering pass added any error-severity
     // diagnostics. Mirrors ML2's delta-on-errorCount; reset by the ctor.
@@ -316,6 +331,7 @@ struct Lowerer {
     // Non-terminator dispatcher (terminators flow through `lowerTerminator`
     // and Phi is a pre-pass no-op).
     void lowerInst(MirInstId id) {
+        currentMir = id;
         MirOpcode const op = mir.instOpcode(id);
         switch (op) {
             case MirOpcode::Arg:    return lowerArg(id);
@@ -387,7 +403,7 @@ struct Lowerer {
         // reads the result class to pick the right arg-passing
         // register per the cycle-2b TargetCallingConvention.
         LirReg const result = lir.newVReg(regClassFor(id));
-        lir.addInst(*opcode(MnemonicSlot::Arg), result, std::span<LirOperand const>{},
+        emitInst(*opcode(MnemonicSlot::Arg), result, std::span<LirOperand const>{},
                     /*payload=*/mir.argIndex(id));
         defineValue(id, result);
     }
@@ -399,7 +415,7 @@ struct Lowerer {
     LirReg emitMovToFresh(MirInstId id, LirOperand op, LirRegClass cls) {
         LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 1> ops{op};
-        lir.addInst(*opcode(MnemonicSlot::Mov), result, ops);
+        emitInst(*opcode(MnemonicSlot::Mov), result, ops);
         defineValue(id, result);
         return result;
     }
@@ -486,7 +502,7 @@ struct Lowerer {
         }
         std::uint32_t const payload = mir.instPayload(id);
         LirReg const result = lir.newVReg(LirRegClass::GPR);
-        lir.addInst(*opcode(MnemonicSlot::Alloca), result,
+        emitInst(*opcode(MnemonicSlot::Alloca), result,
                     std::span<LirOperand const>{}, payload);
         defineValue(id, result);
     }
@@ -509,7 +525,7 @@ struct Lowerer {
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        lir.addInst(*opcode(MnemonicSlot::Load), result, ops);
+        emitInst(*opcode(MnemonicSlot::Load), result, ops);
         defineValue(id, result);
     }
 
@@ -529,7 +545,7 @@ struct Lowerer {
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        lir.addInst(*opcode(MnemonicSlot::Store), InvalidLirReg, ops);
+        emitInst(*opcode(MnemonicSlot::Store), InvalidLirReg, ops);
     }
 
     void lowerGep(MirInstId id) {
@@ -569,7 +585,7 @@ struct Lowerer {
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            lir.addInst(*opcode(MnemonicSlot::Lea), result, ops);
+            emitInst(*opcode(MnemonicSlot::Lea), result, ops);
             defineValue(id, result);
             return;
         }
@@ -616,7 +632,7 @@ struct Lowerer {
         }
         LirReg const result = lir.newVReg(dstCls);
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
-        lir.addInst(*opcode(slot), result, ops);
+        emitInst(*opcode(slot), result, ops);
         defineValue(id, result);
     }
 
@@ -636,7 +652,7 @@ struct Lowerer {
         SymbolId const sym = mir.globalAddrSymbol(id);
         LirReg const result = lir.newVReg(regClassFor(id));
         std::array<LirOperand, 1> ops{LirOperand::makeSymbolRef(sym.v)};
-        lir.addInst(*opcode(MnemonicSlot::Mov), result, ops);
+        emitInst(*opcode(MnemonicSlot::Mov), result, ops);
         defineValue(id, result);
     }
 
@@ -650,22 +666,12 @@ struct Lowerer {
     // argFprs/returnGprs/returnFprs). Cycle 3e keeps the LIR at the
     // abstract "call(callee, args...)" form — target-blind.
     void lowerCall(MirInstId id) {
-        if (!opcode(MnemonicSlot::Mov).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Mov, "MIR Call (mov for callee/args)");
-            return;
-        }
-        // Look up the `call` opcode by mnemonic — not in MnemonicCache
-        // because it's a one-shot lookup that ML7 callconv lowering may
-        // route to multiple physical-call opcodes per target later.
-        auto const callOp = target.opcodeByMnemonic("call");
-        if (!callOp.has_value()) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::L_RequiredLirOpcodeMissing;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "target '{}' declares no 'call' opcode (required for MIR Call)",
-                target.name());
-            reporter.report(std::move(d));
+        // Cycle 3e fix-up: opcode resolution now goes through the
+        // MnemonicCache (was ad-hoc `target.opcodeByMnemonic("call")`
+        // before — flagged by code-reviewer as MED follow-up). Cached
+        // resolution + one-shot diagnostic for missing mnemonic.
+        if (!opcode(MnemonicSlot::Call).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Call, "MIR Call");
             return;
         }
         auto const operands = mir.instOperands(id);
@@ -673,29 +679,37 @@ struct Lowerer {
             reportUnsupported(MirOpcode::Call, id);
             return;
         }
-        std::optional<LirReg> const callee = regForValue(operands[0]);
-        if (!callee.has_value()) return;
+        // Cycle 3e fix-up: HOIST all regForValue checks BEFORE any
+        // state mutation. The cycle-3e first cut built the operand
+        // vector inline; a mid-loop arg-not-mapped bail-out would
+        // leave the partial operand list dangling AND skip
+        // `defineValue`, producing cascading "used before definition"
+        // diagnostics that drown the root cause. Same discipline as
+        // `lowerStore`/`lowerInsertValue`.
+        std::vector<LirReg> argRegs;
+        argRegs.reserve(operands.size());
+        for (auto const opnd : operands) {
+            std::optional<LirReg> const r = regForValue(opnd);
+            if (!r.has_value()) return;
+            argRegs.push_back(*r);
+        }
 
         // Build the LIR operand list: [callee_reg, arg0, arg1, ...].
         std::vector<LirOperand> ops;
-        ops.reserve(operands.size());
-        ops.push_back(LirOperand::makeReg(*callee));
-        for (std::size_t k = 1; k < operands.size(); ++k) {
-            std::optional<LirReg> const arg = regForValue(operands[k]);
-            if (!arg.has_value()) return;
-            ops.push_back(LirOperand::makeReg(*arg));
-        }
+        ops.reserve(argRegs.size());
+        for (auto const r : argRegs) ops.push_back(LirOperand::makeReg(r));
 
         // Result class follows MIR's result type. Void-returning calls
         // produce an invalid result vreg (no value).
         TypeId const resultTy = mir.instType(id);
-        if (!resultTy.valid()
-            || interner.kind(resultTy) == TypeKind::Void) {
-            lir.addInst(*callOp, InvalidLirReg, ops);
+        bool const isVoid = !resultTy.valid()
+                         || interner.kind(resultTy) == TypeKind::Void;
+        if (isVoid) {
+            emitInst(*opcode(MnemonicSlot::Call), InvalidLirReg, ops);
             return;
         }
         LirReg const result = lir.newVReg(regClassFor(id));
-        lir.addInst(*callOp, result, ops);
+        emitInst(*opcode(MnemonicSlot::Call), result, ops);
         defineValue(id, result);
     }
 
@@ -703,29 +717,56 @@ struct Lowerer {
     // payload carries the intrinsic id. Result is optional (per the
     // schema's `result: "optional"` for the opcode). AS1 maps the
     // intrinsic id to its concrete sequence per target.
+    //
+    // Cycle 3e fix-up: hoist all regForValue checks BEFORE state
+    // mutation (mirrors lowerCall fix). A mid-loop arg-not-mapped
+    // bail-out would otherwise leave a partial operand list dangling.
     void lowerIntrinsicCall(MirInstId id) {
         if (!opcode(MnemonicSlot::IntrinsicCall).has_value()) {
             reportMissingOpcode(MnemonicSlot::IntrinsicCall, "MIR IntrinsicCall");
             return;
         }
         auto const operands = mir.instOperands(id);
-        std::vector<LirOperand> ops;
-        ops.reserve(operands.size());
+        std::vector<LirReg> argRegs;
+        argRegs.reserve(operands.size());
         for (auto const opnd : operands) {
-            std::optional<LirReg> const arg = regForValue(opnd);
-            if (!arg.has_value()) return;
-            ops.push_back(LirOperand::makeReg(*arg));
+            std::optional<LirReg> const r = regForValue(opnd);
+            if (!r.has_value()) return;
+            argRegs.push_back(*r);
         }
+        std::vector<LirOperand> ops;
+        ops.reserve(argRegs.size());
+        for (auto const r : argRegs) ops.push_back(LirOperand::makeReg(r));
+
         std::uint32_t const intrId = mir.intrinsicId(id);
         TypeId const resultTy = mir.instType(id);
-        if (!resultTy.valid()
-            || interner.kind(resultTy) == TypeKind::Void) {
-            lir.addInst(*opcode(MnemonicSlot::IntrinsicCall), InvalidLirReg, ops, intrId);
+        bool const isVoid = !resultTy.valid()
+                         || interner.kind(resultTy) == TypeKind::Void;
+        if (isVoid) {
+            emitInst(*opcode(MnemonicSlot::IntrinsicCall), InvalidLirReg, ops, intrId);
             return;
         }
         LirReg const result = lir.newVReg(regClassFor(id));
-        lir.addInst(*opcode(MnemonicSlot::IntrinsicCall), result, ops, intrId);
+        emitInst(*opcode(MnemonicSlot::IntrinsicCall), result, ops, intrId);
         defineValue(id, result);
+    }
+
+    // Cycle 3e fix-up: shared helper for aggregate-op index validation.
+    // The cycle-3e first cut only accepted `int64_t` zero — the
+    // `uint64_t` and `bool` variants of `MirLiteralValue` silently fell
+    // through to `reportUnsupported` even when the value WAS zero.
+    // Type-design + silent-failure-hunter flagged this as a real latent
+    // bug since MIR text round-trip accepts both `lit int N` and
+    // `lit uint N` variants. Now accepts int64==0 OR uint64==0 OR bool
+    // false (the three literal variants `lowerConst` produces).
+    [[nodiscard]] bool isZeroIntegerLiteral(MirInstId idxOp) const {
+        if (mir.instOpcode(idxOp) != MirOpcode::Const) return false;
+        std::uint32_t const litIdx = mir.constLiteralIndex(idxOp);
+        MirLiteralValue const& lit = mir.literalValue(litIdx);
+        if (auto const* i = std::get_if<std::int64_t>(&lit.value))  return *i == 0;
+        if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) return *u == 0;
+        if (auto const* b = std::get_if<bool>(&lit.value))          return !*b;
+        return false;
     }
 
     // ── cycle 3e: aggregate ops (memory-flattening lowering) ─────────
@@ -742,7 +783,7 @@ struct Lowerer {
     // field). Real field-offset computation needs the MIR type's
     // layout from the interner, which is co-designed with ML6's
     // frame-layout phase. Until that lands, ExtractValue/InsertValue
-    // with a non-zero index defers to cycle 3f.
+    // with a non-zero index defers to ML6 frame-layout.
 
     void lowerExtractValue(MirInstId id) {
         // MIR operands: [aggregate, index_const_1, index_const_2, ...].
@@ -755,18 +796,11 @@ struct Lowerer {
             reportUnsupported(MirOpcode::ExtractValue, id);
             return;
         }
-        // Every index must be a Const-0 for cycle 3e's degenerate path.
+        // Every index must be a zero-valued Const-literal for cycle
+        // 3e's degenerate path. Non-zero indices defer to ML6 frame-
+        // layout co-design (need type-layout-driven field offsets).
         for (std::size_t k = 1; k < operands.size(); ++k) {
-            if (mir.instOpcode(operands[k]) != MirOpcode::Const) {
-                reportUnsupported(MirOpcode::ExtractValue, id);
-                return;
-            }
-            std::uint32_t const litIdx = mir.constLiteralIndex(operands[k]);
-            MirLiteralValue const& lit = mir.literalValue(litIdx);
-            auto const* asI = std::get_if<std::int64_t>(&lit.value);
-            if (asI == nullptr || *asI != 0) {
-                // Non-zero index — cycle 3f real-blocker (needs type
-                // layout).
+            if (!isZeroIntegerLiteral(operands[k])) {
                 reportUnsupported(MirOpcode::ExtractValue, id);
                 return;
             }
@@ -784,7 +818,7 @@ struct Lowerer {
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        lir.addInst(*opcode(MnemonicSlot::Load), result, ops);
+        emitInst(*opcode(MnemonicSlot::Load), result, ops);
         defineValue(id, result);
     }
 
@@ -792,21 +826,14 @@ struct Lowerer {
         // MIR operands: [aggregate, value, index_const_1, ...].
         // Cycle 3e: degenerate zero-index → emit `store value, base`
         // and return the (modified) aggregate base. Multi-byte offsets
-        // defer to cycle 3f.
+        // defer to ML6 frame-layout.
         auto const operands = mir.instOperands(id);
         if (operands.size() < 3) {
             reportUnsupported(MirOpcode::InsertValue, id);
             return;
         }
         for (std::size_t k = 2; k < operands.size(); ++k) {
-            if (mir.instOpcode(operands[k]) != MirOpcode::Const) {
-                reportUnsupported(MirOpcode::InsertValue, id);
-                return;
-            }
-            std::uint32_t const litIdx = mir.constLiteralIndex(operands[k]);
-            MirLiteralValue const& lit = mir.literalValue(litIdx);
-            auto const* asI = std::get_if<std::int64_t>(&lit.value);
-            if (asI == nullptr || *asI != 0) {
+            if (!isZeroIntegerLiteral(operands[k])) {
                 reportUnsupported(MirOpcode::InsertValue, id);
                 return;
             }
@@ -824,7 +851,7 @@ struct Lowerer {
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        lir.addInst(*opcode(MnemonicSlot::Store), InvalidLirReg, ops);
+        emitInst(*opcode(MnemonicSlot::Store), InvalidLirReg, ops);
         // The result of InsertValue is conceptually the modified
         // aggregate. In the memory-flattening model the aggregate IS
         // the base pointer; reuse it as the result. ML6's promote-to-
@@ -858,7 +885,7 @@ struct Lowerer {
         // Result reg class follows the MIR result type — FPR for float
         // ops, VR for vector ops, GPR otherwise.
         LirReg const result = lir.newVReg(regClassFor(id));
-        lir.addInst(*op, result, ops);
+        emitInst(*op, result, ops);
         defineValue(id, result);
     }
 
@@ -891,10 +918,10 @@ struct Lowerer {
         // value-producing inst sits between them (cycle 3a fallback-seal
         // + cycle 3b ICmp-immediately-followed-by-setcc).
         std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
-        lir.addInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+        emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
 
         LirReg const result = lir.newVReg(LirRegClass::GPR);
-        lir.addInst(*opcode(MnemonicSlot::Setcc), result, std::span<LirOperand const>{},
+        emitInst(*opcode(MnemonicSlot::Setcc), result, std::span<LirOperand const>{},
                     /*payload=*/static_cast<std::uint32_t>(cond));
         defineValue(id, result);
     }
@@ -996,19 +1023,20 @@ struct Lowerer {
         for (auto const& p : pairs) {
             LirReg const tmp = lir.newVReg(p.phi.regClass());
             std::array<LirOperand, 1> ops{LirOperand::makeReg(p.incoming)};
-            lir.addInst(*opcode(MnemonicSlot::Mov), tmp, ops);
+            emitInst(*opcode(MnemonicSlot::Mov), tmp, ops);
             temps.push_back(tmp);
         }
         // Step 2: write each phi-result from its captured temp.
         for (std::size_t k = 0; k < pairs.size(); ++k) {
             std::array<LirOperand, 1> ops{LirOperand::makeReg(temps[k])};
-            lir.addInst(*opcode(MnemonicSlot::Mov), pairs[k].phi, ops);
+            emitInst(*opcode(MnemonicSlot::Mov), pairs[k].phi, ops);
         }
     }
 
     // Returns true iff the terminator was emitted (block sealed). `false`
     // signals the caller to use the fallback seal.
     bool lowerTerminator(MirBlockId mb, MirInstId termId) {
+        currentMir = termId;
         MirOpcode const op = mir.instOpcode(termId);
         auto succs = mir.blockSuccessors(mb);
 
@@ -1039,7 +1067,7 @@ struct Lowerer {
         }
         auto const operands = mir.instOperands(id);
         if (operands.empty()) {
-            lir.addReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
+            emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
             return true;
         }
         if (operands.size() != 1) {
@@ -1049,7 +1077,7 @@ struct Lowerer {
         std::optional<LirReg> const v = regForValue(operands[0]);
         if (!v.has_value()) return false;
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*v)};
-        lir.addReturn(*opcode(MnemonicSlot::Ret), ops);
+        emitReturn(*opcode(MnemonicSlot::Ret), ops);
         return true;
     }
 
@@ -1072,7 +1100,7 @@ struct Lowerer {
             reporter.report(std::move(d));
             return false;
         }
-        lir.addBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succs[0]));
+        emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succs[0]));
         return true;
     }
 
@@ -1112,8 +1140,8 @@ struct Lowerer {
         // defaulted to 0 (= TargetCondCode::Eq) and inverted the branch.
         std::array<LirOperand, 2> cmpOps{
             LirOperand::makeReg(*cond), LirOperand::makeImmInt32(0)};
-        lir.addInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
-        lir.addCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
+        emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+        emitCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
                       mirBlockToLirBlock.get(succs[0]),
                       mirBlockToLirBlock.get(succs[1]),
                       static_cast<std::uint32_t>(TargetCondCode::Ne));
@@ -1177,7 +1205,7 @@ struct Lowerer {
             }
             std::array<LirOperand, 2> cmpOps{
                 LirOperand::makeReg(*discrim), LirOperand::makeReg(*caseConst)};
-            lir.addInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
 
             // Allocate a "next compare" block unless this is the last
             // case (in which case we fall through to a `jmp default`).
@@ -1191,19 +1219,19 @@ struct Lowerer {
                 // Final compare: jcc-eq to case target, else jcc fallthrough
                 // to a tiny "jmp default" block.
                 LirBlockId const defaultJump = lir.createBlock();
-                lir.addCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
+                emitCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
                               caseTarget, defaultJump, eqCond);
                 lir.beginBlock(defaultJump);
-                lir.addBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
+                emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
                 return true;
             }
             nextBlock = lir.createBlock();
-            lir.addCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
+            emitCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
                           caseTarget, nextBlock, eqCond);
             lir.beginBlock(nextBlock);
         }
         // No cases (only default): jmp default.
-        lir.addBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
+        emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
         return true;
     }
 
@@ -1212,7 +1240,7 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Unreachable, "MIR Unreachable");
             return false;
         }
-        lir.addUnreachable(*opcode(MnemonicSlot::Unreachable));
+        emitUnreachable(*opcode(MnemonicSlot::Unreachable));
         return true;
     }
 
@@ -1247,7 +1275,7 @@ struct Lowerer {
         if (n == 0) {
             // Empty MIR block — defensive seal so the LIR module finishes.
             if (opcode(MnemonicSlot::Ret).has_value()) {
-                lir.addReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
+                emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
             }
             return;
         }
@@ -1309,7 +1337,7 @@ struct Lowerer {
         // Fallback seal for blocks whose MIR terminator was deferred to a
         // later cycle. The diagnostic was already issued.
         if (!sealed && opcode(MnemonicSlot::Ret).has_value()) {
-            lir.addReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
+            emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
         }
     }
 
@@ -1336,12 +1364,64 @@ struct Lowerer {
         }
     }
 
+    // Record the LIR inst → source MIR inst mapping. Resizes the
+    // `lirToMir` vector so `lirToMir[li.v]` is always the producer.
+    void recordSource(LirInstId li) {
+        if (!li.valid()) return;
+        if (li.v >= lirToMir.size()) lirToMir.resize(li.v + 1);
+        lirToMir[li.v] = currentMir;
+    }
+
+    // Forwarding wrappers around `LirBuilder` emitters that AUTO-RECORD
+    // the source MIR inst (via `currentMir`). Cycle 3e fix-up: every
+    // emission site was previously calling `lir.addInst`/`addBr`/etc.
+    // directly, leaving `lirToMir` empty so the verifier was forced to
+    // walk by position (the architect-flagged Switch hazard). These
+    // wrappers + the `currentMir` discipline keep the mapping
+    // continuous.
+    LirInstId emitInst(std::uint16_t op, LirReg result,
+                       std::span<LirOperand const> ops,
+                       std::uint32_t payload = 0,
+                       std::uint8_t  flags   = 0) {
+        LirInstId const li = lir.addInst(op, result, ops, payload, flags);
+        recordSource(li);
+        return li;
+    }
+    LirInstId emitBr(std::uint16_t op, LirBlockId target) {
+        LirInstId const li = lir.addBr(op, target);
+        recordSource(li);
+        return li;
+    }
+    LirInstId emitCondBr(std::uint16_t op, std::span<LirOperand const> ops,
+                         LirBlockId ifT, LirBlockId ifF,
+                         std::uint32_t payload = 0) {
+        LirInstId const li = lir.addCondBr(op, ops, ifT, ifF, payload);
+        recordSource(li);
+        return li;
+    }
+    LirInstId emitReturn(std::uint16_t op, std::span<LirOperand const> ops) {
+        LirInstId const li = lir.addReturn(op, ops);
+        recordSource(li);
+        return li;
+    }
+    LirInstId emitUnreachable(std::uint16_t op) {
+        LirInstId const li = lir.addUnreachable(op);
+        recordSource(li);
+        return li;
+    }
+
     [[nodiscard]] MirToLirResult run() {
         std::size_t const fnCount = mir.moduleFuncCount();
         for (std::uint32_t i = 0; i < fnCount; ++i) {
             lowerFunction(mir.funcAt(i));
         }
-        return MirToLirResult{ std::move(lir).finish(), !hadError() };
+        Lir frozen = std::move(lir).finish();
+        // Ensure lirToMir spans every LIR inst slot (any trailing
+        // slots without recorded sources default to InvalidMirInst).
+        if (lirToMir.size() < frozen.nodeCount()) {
+            lirToMir.resize(frozen.nodeCount());
+        }
+        return MirToLirResult{ std::move(frozen), std::move(lirToMir), !hadError() };
     }
 };
 

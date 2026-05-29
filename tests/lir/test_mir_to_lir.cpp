@@ -1292,7 +1292,7 @@ TEST(MirToLir, VoidCallProducesNoResultReg) {
     ADD_FAILURE() << "no call inst found";
 }
 
-TEST(LirVerifier, AcceptsCleanCycle3aThroughCycle3dPipelines) {
+TEST(LirVerifier, AcceptsCleanCSubsetPipelines) {
     // Smoke test: every c-subset corpus example that lowers cleanly
     // through cycles 3a-3e must also pass the LirVerifier without
     // any new diagnostics. This is the regression-lock for the
@@ -1308,9 +1308,191 @@ TEST(LirVerifier, AcceptsCleanCycle3aThroughCycle3dPipelines) {
 
     ::dss::DiagnosticReporter rep;
     auto const r = ::dss::verifyLir(L.lir.lir, L.mir.mir,
-                                    L.model.lattice().interner(), rep);
+                                    L.model.lattice().interner(),
+                                    *L.target, L.lir.lirToMir, rep);
     EXPECT_TRUE(r.ok)
         << "LirVerifier must accept a clean cycle-3a-3d c-subset pipeline";
+}
+
+// ─── cycle 3e fix-up: aggregate ops + IntrinsicCall + verifier negatives ──
+
+TEST(MirToLir, ExtractValueZeroIndexLowersToLoad) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    std::array<::dss::TypeId, 1> params{ptrT};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const agg = mb.addArg(0, ptrT);
+    ::dss::MirLiteralValue zero;  zero.value = static_cast<std::int64_t>(0);
+                                  zero.core  = ::dss::TypeKind::I32;
+    ::dss::MirInstId const idx = mb.addConst(zero, i32);
+    std::array<::dss::MirInstId, 2> ops{agg, idx};
+    ::dss::MirInstId const ext = mb.addInst(::dss::MirOpcode::ExtractValue, ops, i32);
+    mb.addReturn(ext);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "ExtractValue with zero-index Const must lower cleanly";
+    auto const loadOp = *sch.opcodeByMnemonic("load");
+    ::dss::Lir const& lir = result.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    bool foundLoad = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(entry, i)) == loadOp) {
+            foundLoad = true; break;
+        }
+    }
+    EXPECT_TRUE(foundLoad)
+        << "zero-index ExtractValue must emit `load`";
+}
+
+TEST(MirToLir, ExtractValueNonZeroIndexDefersWithDiagnostic) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    std::array<::dss::TypeId, 1> params{ptrT};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const agg = mb.addArg(0, ptrT);
+    // Non-zero index — cycle 3e MUST fail loud, deferring to ML6
+    // frame-layout for type-driven field offsets.
+    ::dss::MirLiteralValue one;  one.value = static_cast<std::int64_t>(1);
+                                 one.core  = ::dss::TypeKind::I32;
+    ::dss::MirInstId const idx = mb.addConst(one, i32);
+    std::array<::dss::MirInstId, 2> ops{agg, idx};
+    ::dss::MirInstId const ext = mb.addInst(::dss::MirOpcode::ExtractValue, ops, i32);
+    mb.addReturn(ext);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "non-zero index ExtractValue must defer with L_Unsupported";
+    bool found = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == ::dss::DiagnosticCode::L_UnsupportedLoweringForOpcode) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(MirToLir, ExtractValueZeroIndexAcceptsUintLiteralVariant) {
+    // Cycle 3e review (silent-failure + type-design): the cycle-3e
+    // first cut only accepted `int64_t` zero — `uint64_t 0` (legal MIR
+    // text round-trip output) silently fell through to fail-loud. The
+    // `isZeroIntegerLiteral` helper fixes this.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    std::array<::dss::TypeId, 1> params{ptrT};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const agg = mb.addArg(0, ptrT);
+    // uint64_t variant of zero — MUST now be accepted (cycle-3e fix-up).
+    ::dss::MirLiteralValue uzero;  uzero.value = static_cast<std::uint64_t>(0);
+                                   uzero.core  = ::dss::TypeKind::U32;
+    ::dss::MirInstId const idx = mb.addConst(uzero, i32);
+    std::array<::dss::MirInstId, 2> ops{agg, idx};
+    ::dss::MirInstId const ext = mb.addInst(::dss::MirOpcode::ExtractValue, ops, i32);
+    mb.addReturn(ext);
+    ::dss::Mir m = std::move(mb).finish();
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_TRUE(result.ok)
+        << "uint64_t-0 index must be accepted as zero (was silently rejected "
+           "in cycle 3e first cut)";
+}
+
+TEST(MirToLir, IntrinsicCallLowersToIntrinsicCallOpcode) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    std::array<::dss::TypeId, 1> params{i32};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const arg = mb.addArg(0, i32);
+    std::array<::dss::MirInstId, 1> ops{arg};
+    ::dss::MirInstId const intr = mb.addInst(::dss::MirOpcode::IntrinsicCall, ops, i32, /*payload=*/42);
+    mb.addReturn(intr);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    ASSERT_TRUE(result.ok);
+    auto const intrOp = *sch.opcodeByMnemonic("intrinsic_call");
+    ::dss::Lir const& lir = result.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    bool found = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) == intrOp) {
+            found = true;
+            EXPECT_EQ(lir.instPayload(inst), 42u)
+                << "IntrinsicCall payload must carry the intrinsic id";
+            break;
+        }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(LirVerifier, FiresOnSwitchBearingFunctionsAfterMapPlumbing) {
+    // Cycle-3e review: the cycle-3e FIRST CUT walked MIR vs LIR
+    // POSITIONALLY by block index. cycle-3b Switch lowering creates
+    // extra LIR blocks (per-case "next-compare" blocks), causing the
+    // verifier to silently bail out on `funcBlockCount` mismatch —
+    // architect-flagged HIGH (silent-failure-hunter rated CRITICAL).
+    //
+    // The fix-up plumbs a `lirToMir` mapping through MirToLirResult;
+    // the verifier walks LIR insts and uses the mapping per-inst.
+    // This test pins: even a switch-bearing c-subset function passes
+    // the verifier WITHOUT being silently skipped.
+    auto L = lowerCSubsetToLir(
+        "int f(int x) {\n"
+        "  switch (x) {\n"
+        "    case 1: return 10;\n"
+        "    case 2: return 20;\n"
+        "    default: return 0;\n"
+        "  }\n"
+        "}\n");
+    assertUpstreamClean(L);
+    ::dss::DiagnosticReporter rep;
+    auto const r = ::dss::verifyLir(L.lir.lir, L.mir.mir,
+                                    L.model.lattice().interner(),
+                                    *L.target, L.lir.lirToMir, rep);
+    EXPECT_TRUE(r.ok)
+        << "LirVerifier must run cleanly on switch-bearing functions "
+           "(positional-walk silent-skip closed by lirToMir mapping)";
 }
 
 TEST(MirToLir, LinkRegisterUnknownNameRejectedNegativePath) {

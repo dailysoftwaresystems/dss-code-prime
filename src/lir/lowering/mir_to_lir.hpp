@@ -8,6 +8,7 @@
 #include "mir/mir.hpp"
 
 #include <memory>
+#include <vector>
 
 // MIR → LIR instruction selection (plan 12 ML5 cycle 3). Takes a frozen
 // MIR module plus the chosen `TargetSchema` (the cycle-2b-shaped JSON
@@ -37,9 +38,24 @@ namespace dss {
 // Output of MIR→LIR lowering. `ok` mirrors ML2's delta-on-errorCount —
 // `true` iff this lowering pass added no new error-severity diagnostics.
 // `lir` is the frozen module the assembler (AS1 onward) will consume.
+//
+// `lirToMir` is a substrate-tier reverse-mapping (LirInstId → MirInstId)
+// the lowerer populates as it emits LIR instructions. The vector is
+// indexed by `LirInstId.v` (slot 0 is the arena's invalid sentinel,
+// already-default-`InvalidMirInst`-initialized). Multiple LIR insts
+// may map to the same source MIR inst (cycle-3b Switch lowering emits
+// 2N+1 LIR blocks per MIR Switch; cycle-3c memory ops emit Load
+// followed by additional address-mode insts); some LIR insts have no
+// MIR counterpart (Switch's "next-compare" blocks, phi-edge parallel-
+// copy moves), in which case the entry is the default `InvalidMirInst`.
+//
+// `LirVerifier` consumes this mapping to cross-reference LIR vreg
+// classes against MIR types WITHOUT the cycle-3e positional-alignment
+// hazard that silently skipped switch-bearing functions.
 struct DSS_EXPORT MirToLirResult {
-    Lir  lir;
-    bool ok = true;
+    Lir                    lir;
+    std::vector<MirInstId> lirToMir;
+    bool                   ok = true;
 };
 
 // Lower the frozen `mir` module to LIR, dispatched against `target`.
