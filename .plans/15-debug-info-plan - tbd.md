@@ -28,23 +28,31 @@ src/debuginfo/
 ├── source_map.hpp / .cpp        # SourceMap: per-instruction → SourceSpan
 ├── dwarf/
 │   ├── dwarf5_writer.hpp / .cpp # DB2: skeleton + abbrev + str + info
-│   ├── dwarf5_types.hpp / .cpp  # DB3: DW_TAG_* type DIEs
-│   ├── dwarf5_line.hpp / .cpp   # Line-program state machine
-│   ├── dwarf5_cfi.hpp / .cpp    # DB4: .eh_frame / .debug_frame CFI
+│   ├── dwarf5_types.hpp / .cpp  # DB3: Universal type→DIE mapper over TypeInterner + optional debugInfo facet
+│   ├── dwarf5_line.hpp / .cpp   # DB-line: Line-program state machine (bucket-2 universal emitter)
+│   ├── dwarf5_cfi.hpp / .cpp    # DB4: .eh_frame / .debug_frame CFI (bucket-2 universal stream)
 │   └── dwarf5_locs.hpp / .cpp   # DB-loc: .debug_loclists (post-v1)
 ├── pdb/
 │   ├── pdb_msf.hpp / .cpp       # DB5: MSF container (stream-of-streams)
 │   ├── pdb_tpi.hpp / .cpp       # DB6: type / id streams (TPI + IPI)
 │   ├── pdb_dbi.hpp / .cpp       # DB7: DBI + module + lines streams
 │   ├── pdb_gsi.hpp / .cpp       # Global/Public symbol streams
-│   └── pdb_pdata.hpp / .cpp     # DB8: Win64 SEH .pdata / .xdata
-├── macho/
-│   └── macho_unwind.hpp / .cpp  # DB9: __TEXT,__unwind_info compact unwind
-└── lang/
-    ├── toy_debug.cpp            # DB10: per-language type-DIE mapping
-    ├── c_subset_debug.cpp
-    └── tsql_subset_debug.cpp
+│   └── pdb_pdata.hpp / .cpp     # DB8: Win64 SEH .pdata / .xdata (bucket-2 universal stream)
+└── macho/
+    └── macho_unwind.hpp / .cpp  # DB9: __TEXT,__unwind_info compact unwind
 ```
+
+**Removed from the rev-1/2 sketch** (was: `src/debuginfo/lang/toy_debug.cpp` + `c_subset_debug.cpp` + `tsql_subset_debug.cpp` — per-language `.cpp` for type→DIE mapping). Per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) Decision #4's three-bucket rule (clarified 2026-05-29): a per-language `.cpp` tree IS bucket-3 identity-branching, which the thesis forbids. The replacement is a single bucket-2 universal mapper:
+
+- **`dwarf5_types.hpp / .cpp`** consumes `TypeInterner` directly. Every core `TypeKind` (Bool/I*/U*/F*/Char/Byte/Void/Struct/Union/Tuple/Array/Slice/Enum/Ptr/Ref/FnPtr/FnSig/…) has a deterministic DW_TAG mapping declared once.
+- **Per-language extension types** (C# Boxed/Delegate/GcRef, T-SQL Varchar<N>/RowType, VHDL Std_Logic, shader Sampler/Texture, etc.) declare their DW_TAG choice in an OPTIONAL `debugInfo` facet on the source `.lang.json` (bucket-1: `{ extensionKindName: "VarcharN", dwarfTag: "DW_TAG_string_type", encoding: ... }`). A language with no `debugInfo` facet falls back to a generic DW_TAG_unspecified_type for its extensions.
+- The mapper has **zero `if (schema.name() == ...)` branches**. New language onboarding = new `debugInfo` facet (or zero work if the core lattice suffices).
+
+**Bucket-2 streams** named explicitly here so the substrate doesn't drift into per-format `.cpp`:
+- `dwarf5_line.cpp` — DWARF 5 line-program state machine (universal opcode encoder over `DW_LNS_*` / `DW_LNE_*` / special-opcode tables; opcode tables are JSON-declared in `debug-info.format.json` if any per-platform tweaks are needed; v1 standard DWARF 5 has no per-platform variation, so the tables can be compile-time).
+- `dwarf5_cfi.cpp` — `.eh_frame` / `.debug_frame` CIE/FDE encoder; CFI opcodes (`DW_CFA_*`) are a stream emitter, target-blind once the target's register-number assignment is read from `*.target.json`'s `debugInfo.dwarfRegisters[]` facet.
+- `pdb_pdata.cpp` — Win64 SEH unwind-info encoder; per-arch `UnwindCode` opcode set is JSON-declared (x86_64 SET_FPREG / SAVE_NONVOL / ALLOC_LARGE / ALLOC_SMALL / PUSH_MACHFRAME etc.; ARM64 has its own packed set).
+- `macho_unwind.cpp` — Apple `__unwind_info` compact-encoding emitter; per-arch encoding constants in JSON, the page-walker is universal.
 
 ### 2.2 Source-position preservation chain
 

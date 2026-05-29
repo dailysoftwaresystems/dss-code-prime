@@ -18,6 +18,22 @@ The product is defined by the intersection of four properties. Each one alone ex
 
 1. **Config-driven all phases.** Every phase — lex, parse, semantic, HIR lowering, MIR/LIR rules, FFI ingestion, codegen hints — is described by JSON config. The engine has zero per-language C++. A new language is a config PR, not an engineering quarter. Decision #4 of plan 00 is the load-bearing discipline: extend the vocabulary, never branch the engine on `schema.name()`.
 
+   **What "config-driven" admits** (the three-bucket rule that closes the back-half drift):
+
+   | Bucket | What it is | Where it lives | Config-driven? |
+   |---|---|---|---|
+   | **1. Declarative layout** | Fixed-width fields, opcode tables, section/symbol tables, reloc formulas, encoding rows (e.g. ModR/M slots, ARM bit-field templates), DWARF tag tables. | JSON | ✅ schema = bytes |
+   | **2. Universal algorithm over declared vocabulary** | Isel (patterns + costs), instruction encoding (prefix/ModR/M assembly), procedural streams (Mach-O bind/lazy/rebase opcode trie, DWARF line program, CFI), regalloc, GOT/PLT synthesis. | One engine algorithm; JSON declares the vocabulary it walks | ✅ — this is "the hard part in the source code" |
+   | **3. Identity-branching C++** | `if (schema.name() == "c-subset")`, `if (arch == "arm64") { ... } else if (arch == "x86_64") { ... }`, per-arch/per-format/per-language `.cpp` directories. | Nowhere — forbidden | ❌ Decision #4 violation |
+
+   **The operative test, stated once:** config-driven is defined by **the absence of an identity branch, not the absence of an algorithm**. A 2,000-line universal bind-trie emitter that branches on nothing is fully thesis-compliant. A 10-line `if (format == "macho")` is not. The hard algorithms living in the engine ARE the design — not a compromise.
+
+   **Arch-shape differences live in the JSON vocabulary, not in the engine.** x86 ModR/M, ARM bit-field encoding, RISC-V immediate splits are different *encoding-row formats* — bucket 1 declarations rich enough to express all three uniformly. The bucket-2 algorithm walks the declared rows; it never branches on which ISA produced them.
+
+   **Existence proof:** ML5 cycle 2a (2026-05-29) pivoted from `Lir<TargetTraits>` (templated per arch) to `runtime TargetSchemaId + JSON config + universal engine`. The MIR→LIR isel is a ~2,000-line bucket-2 algorithm parameterized by the JSON vocabulary. Adding ARM64 became "drop a `.target.json`," zero engine work. This is the template for the back half (assembler / linker / debug-info / shader / WASM).
+
+   **The one carve-out:** any genuinely unavoidable identity-specific code is a named, delimited real-blocker per [[feedback_no_deferring_without_blocker]] — never silent, never permanent. The expectation is that no such carve-out is needed; if one becomes necessary, that's a thesis falsification event worth its own review.
+
 2. **HIR as a real pivot.** Language-neutral, structured, typed, with attribute side-tables for shader/FFI/transpile/async/effects/GC/etc. HIR is the layer where transpilation, native lowering, GPU lowering, and WASM lowering all converge. LLVM IR is too low for clean source-to-source; MLIR is a framework for dialects, not a pivot. HIR is what makes the engine multi-purpose instead of single-purpose.
 
 3. **Hermetic end-to-end.** Own assembler, linker, DWARF/PDB writers, codesigner, crypto substrate. No `ld` / `link.exe` / `ld64` / `lld` / `wasm-ld` / `xcrun` / `clang` / `gcc` / `MSVC` / `dxc` / `glslc` / `dsymutil` / `mspdb` / `codesign` / `signtool` invocations. OS-supplied runtime libs, browsers, GPU drivers, and Apple developer certs are FFI targets and credentials — never tools. The payoff: cross-compile signed Mach-O from a Linux box with no Apple tooling. Nobody else can do that.

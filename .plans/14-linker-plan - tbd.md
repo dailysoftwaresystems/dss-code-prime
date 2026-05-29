@@ -40,7 +40,16 @@ Mirroring `src/dss-config/sources/*.lang.json` (frontend) and `src/dss-config/ta
 - `wasm.format.json` — Module sections (type/import/function/table/memory/global/export/start/elem/code/data), name section convention, custom section taxonomy.
 - `spirv.format.json` — Module header (magic/version/generator/bound/schema), section ordering convention (capability/extension/extinstimport/memorymodel/entrypoint/executionmode/...), debug info layout.
 
-The schema vocabulary is universal: every format declares its `sections[]` (kind + flags + alignment), its `symbolTable` (entry layout, kinds, binding/visibility encodings), its `relocations[]` (kind name → operator + bit-width + signed-ness + applies-to-section-kind), its `metadataSections[]` (build-id / signing window / debug-id placement), and its `imports`/`exports` model (for formats that have one). The ENGINE is one set of headers/cpp files under `src/link/` reading `ObjectFormatSchema`; format-specific bit-twiddling lives only in JSON-declared encoders (the schema declares which bytes go where, the engine packs them).
+The schema vocabulary is universal: every format declares its `sections[]` (kind + flags + alignment), its `symbolTable` (entry layout, kinds, binding/visibility encodings), its `relocations[]` (kind name → operator + bit-width + signed-ness + applies-to-section-kind), its `metadataSections[]` (build-id / signing window / debug-id placement), and its `imports`/`exports` model (for formats that have one). The ENGINE is one set of headers/cpp files under `src/link/` reading `ObjectFormatSchema`.
+
+**The bucket-1 vs bucket-2 split** (per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) Decision #4's three-bucket rule, clarified 2026-05-29):
+
+- **Bucket 1 — declarative layout (JSON):** section/symbol/reloc/field byte layouts; section kind taxonomy; relocation formulas (operator + bit-width + sign); load-command / program-header field tables; chained-fixups data-page descriptors; build-id placement; signing-window placement. The schema says "these bytes go in these slots."
+- **Bucket 2 — universal algorithm over declared vocabulary (one C++ engine):** Mach-O bind / lazy-bind / rebase opcode tries (variable-length opcode streams keyed by per-segment data pages, encoded as JSON-declared opcode tables walked by ONE stream emitter); chained-fixups page-encoding walker; ELF GNU_HASH bucket computation; GOT / PLT slot synthesis; relocation application (mutator dispatch via `schema.relocationKind(name)` → bucket-1 formula); per-format metadata section emission. The engine walks the JSON vocabulary and emits the bytes; **no `if (format == "macho")` branch anywhere in the engine**.
+
+Bucket-3 drift (per-format `.cpp` directories) is the failure mode this plan explicitly rejected — see §2.1 below for the deleted `objfmt/elf/`, `objfmt/pe/`, `objfmt/macho/` trees.
+
+**Shared with plan 13 (assembler) — the relocation-taxonomy unifier:** the relocation taxonomy lives as a `relocations[]` facet on `*.target.json` (one row per opaque tag → bit-width + isPCRelative + addend-width formula), authored once in plan 13 cycle AS4. The assembler emits `Relocation{ kind: uint32_t tag }` (opaque); the linker consumes via `schema.relocationInfo(tag) → { isPCRelative, width, ... }` and applies the formula via `relocation_apply.cpp`. The object-format-specific reloc *names* (e.g. `R_X86_64_PC32` for ELF, `IMAGE_REL_AMD64_REL32` for PE, `X86_64_RELOC_BRANCH` for Mach-O) live in `*.format.json` as `format-name → schema-tag` mappings — so one bucket-1 formula (`PC-relative 32-bit signed`) serves every format that supports it. **No per-(arch×format) C++ enum anywhere.** The cross-cycle "linker engine mismatch with assembler relocation kinds" risk (rev 1/2's §6 High/High) is closed structurally by both sides reading from the same `TargetSchema` instance.
 
 Loader pattern mirrors `TargetSchema::loadShipped`/`GrammarSchema::loadShipped`:
 
@@ -64,7 +73,7 @@ src/link/
 ├── object_writer.hpp / .cpp            # ONE engine reading ObjectFormatSchema; emits bytes for any declared format
 ├── symbol_table.hpp / .cpp             # Defined / undefined / weak / local / hidden — format-blind
 ├── section.hpp                         # SectionFlags, SectionKind, layout primitives — format-blind
-├── relocation_apply.hpp / .cpp         # Per (arch × format) mutator dispatch via schema.relocationKind(name)
+├── relocation_apply.hpp / .cpp         # Mutator dispatch via shared TargetSchema::relocationInfo(tag) — same opaque schema-tag the assembler emits per plan 13 §2.6 (NO per-(arch×format) C++ enum)
 ├── tls.hpp / .cpp                      # Per-platform TLS lowering — config-driven via schema's TLS model
 └── build_id.hpp / .cpp                 # BLAKE3-based deterministic build-id; placement schema-driven
 
@@ -234,12 +243,12 @@ Substrate tier (5-agent review) for LK4 (format-blind engine + `ObjectFormatSche
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
-| Mach-O chained-fixups format complexity (intricate bind opcode trie) | High | High | LK3 lands behind a thin shim with both legacy LC_DYLD_INFO and chained paths; integration test on Apple Silicon CI runner before LK3 ships. |
+| Mach-O chained-fixups format complexity (intricate bind opcode trie) | High | High | **Classified as bucket-2 universal-algorithm** per §2.0 (the bind / lazy-bind / rebase opcode trie is one stream emitter walking a JSON-declared opcode vocabulary, NOT a per-format C++ tree). LK3 lands the JSON declaration + the engine's trie-emit pass; integration test on Apple Silicon CI runner pins the byte output against an oracle (real `dyld_info` dump) before LK3 ships. Same shape for chained-fixups page encoding (LC_DYLD_CHAINED_FIXUPS) — chain templates declared in JSON, the page-walker is universal. |
 | PE IAT layout intricacies (32-bit vs 64-bit thunks, hint/name tables) | Medium | High | Per-import golden bytes pinned against dumpbin oracle output. |
 | ELF dynamic linking edge cases (PLT lazy-binding races, GNU_HASH layout) | Medium | High | Lazy-binding deferred to post-v1; v1 uses immediate binding (BIND_NOW). |
 | TLS model bugs surface only at multi-threaded runtime | Medium | Critical | LK5 acceptance includes a multi-threaded smoke test per platform. |
 | WASM / SPIR-V skeleton drifts from full plans (18 / 17) | Low | Medium | LK8 / LK9 are skeleton-only; full impl is plan-owned; cross-link discipline enforced. |
-| Linker engine mismatch with assembler relocation kinds | High | High | AS4 (assembler) and LK4 (engine) co-reviewed; relocation taxonomy lives in shared `relocation.hpp`. |
+| ~~Linker engine mismatch with assembler relocation kinds~~ | Low | Low | **Resolved rev 3 via plan 13 §2.6 unifier (2026-05-29):** relocation taxonomy lives as a `relocations[]` facet on `*.target.json` (NOT a separate `relocation.hpp` enum). Assembler emits opaque `uint32_t kind = tag`; linker resolves via `schema.relocationInfo(tag)`. Both consume the same `TargetSchema` instance — there's no two-side enum to drift. The object-format-specific reloc *names* (e.g. `R_X86_64_PC32` vs `IMAGE_REL_AMD64_REL32`) live in `*.format.json` as `format-name → schema-tag` mappings, so a single bucket-1 formula serves every format that supports it. |
 
 ---
 
