@@ -1,0 +1,89 @@
+{
+  "$comment": "ELF64 relocatable + dynamic for x86_64 (Linux / SysV). First shipped object-format JSON (plan 14 LK1, 2026-05-29). Consumed by `src/link/format/elf.cpp` via the format-blind linker engine. Section names + flags + ELF identity fields are the SAME values readelf prints; relocation `nativeId` values are the ELF type numbers stored in `r_info` low 32 bits.",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "elf64-x86_64-linux",
+    "version": "1.0",
+    "kind": "elf"
+  },
+
+  "elf": {
+    "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian); `osabi` = ELFOSABI_NONE (SysV, conventional for relocatable .o); `machine` = EM_X86_64 (62).",
+    "class": "elf64",
+    "data": "lsb",
+    "osabi": "sysv",
+    "abiVersion": 0,
+    "machine": 62
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code. sh_type = SHT_PROGBITS (1); sh_flags = SHF_ALLOC | SHF_EXECINSTR (0x6); addralign = 16 (x86_64 psABI).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1,
+      "flags": 6,
+      "addrAlign": 16,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Relocation table for .text. sh_type = SHT_RELA (4); sh_flags = SHF_INFO_LINK (0x40); addralign = 8; entrysize = 24 (Elf64_Rela). sh_link/sh_info are set per-link.",
+      "kind": "reloc",
+      "name": ".rela.text",
+      "type": 4,
+      "flags": 64,
+      "addrAlign": 8,
+      "entrySize": 24
+    },
+    {
+      "$comment": "Symbol table. sh_type = SHT_SYMTAB (2); addralign = 8; entrysize = 24 (Elf64_Sym).",
+      "kind": "symtab",
+      "name": ".symtab",
+      "type": 2,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 24
+    },
+    {
+      "$comment": "Symbol-name string table. sh_type = SHT_STRTAB (3); addralign = 1.",
+      "kind": "strtab",
+      "name": ".strtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Section-header string table. sh_type = SHT_STRTAB (3); addralign = 1. e_shstrndx of the ELF header points at this section.",
+      "kind": "shstrtab",
+      "name": ".shstrtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "PC-relative 32-bit (call / jmp rel32). ELF type R_X86_64_PC32 = 2. `kind` = 1 matches x86_64.target.json's `rel32` row.",
+      "name": "R_X86_64_PC32",
+      "kind": 1,
+      "nativeId": 2
+    },
+    {
+      "$comment": "Absolute 64-bit. ELF type R_X86_64_64 = 1. `kind` = 2 matches x86_64.target.json's `abs64` row.",
+      "name": "R_X86_64_64",
+      "kind": 2,
+      "nativeId": 1
+    },
+    {
+      "$comment": "Absolute 32-bit zero-extend. ELF type R_X86_64_32 = 10. `kind` = 3 matches x86_64.target.json's `abs32` row.",
+      "name": "R_X86_64_32",
+      "kind": 3,
+      "nativeId": 10
+    }
+  ]
+}

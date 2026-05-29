@@ -132,6 +132,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::A_RoundTripMismatch:            return "A_RoundTripMismatch";
         case DiagnosticCode::K_SymbolUndefined:              return "K_SymbolUndefined";
         case DiagnosticCode::K_RelocationKindMismatch:       return "K_RelocationKindMismatch";
+        case DiagnosticCode::K_NoMatchingObjectFormat:       return "K_NoMatchingObjectFormat";
     }
     return "Unknown";
 }

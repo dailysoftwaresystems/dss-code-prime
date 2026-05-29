@@ -57,7 +57,7 @@ struct DSS_EXPORT LinkedImage {
 // Format-blind linker entrypoint. Same target-blind shape that
 // `assemble()` mirrors from ML5 cycle 2a's pivot.
 //
-// **Cycle-scope behavior (LK4 substrate)**:
+// **Behavior**:
 //   * Walks every relocation in every `AssembledFunction`.
 //   * Verifies each `Relocation::kind` resolves via
 //     `targetSchema.relocationInfo(kind)` AND via
@@ -67,8 +67,11 @@ struct DSS_EXPORT LinkedImage {
 //     symbol is not declared by any `AssembledFunction` in the
 //     module. (v1 is single-CU; cross-CU resolution is LK11; FFI
 //     import resolution is LK6.)
-//   * Does NOT actually emit format bytes — LK1+ plug in
-//     per-format walkers.
+//   * Dispatches the per-format byte-emission walker via a
+//     closed-enum switch over `ObjectFormatKind`. LK1 plugged in
+//     ELF (`src/link/format/elf.cpp`); PE / Mach-O / WASM / SPIR-V
+//     arms still fire `K_NoMatchingObjectFormat` until their
+//     walkers land (LK2 / LK3 / plan 18 / plan 17).
 //
 // Returns a `LinkedImage` whose `ok()` reflects parallel-index
 // shape. The reporter is the success channel for per-relocation

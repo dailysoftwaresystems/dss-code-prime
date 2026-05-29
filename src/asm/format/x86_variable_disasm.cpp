@@ -190,41 +190,72 @@ disassemble(TargetSchema const&            schema,
         result.variantIndex  = vi;
         result.bytesConsumed = cursor;
 
+        // Defensive: each accessor returns nullopt when the
+        // corresponding state field was never populated. Without
+        // these guards, a future encoder variant whose ModRm/Imm32
+        // slot consume path didn't fire would silently return 0 (the
+        // default-initialized field value) — which collides with
+        // legitimate values and round-trips as "match." (silent-
+        // failure-hunter HIGH-3.)
         auto const valueForSlot = [&](EncodingSlotKind slot)
-                -> std::int64_t {
+                -> std::optional<std::int64_t> {
             switch (slot) {
-                case EncodingSlotKind::ModRmReg: return state->modRmRegFull();
-                case EncodingSlotKind::ModRmRm:  return state->modRmRmFull();
-                case EncodingSlotKind::Imm32:    return state->imm32;
+                case EncodingSlotKind::ModRmReg:
+                    return state->hasModRm
+                        ? std::optional<std::int64_t>{state->modRmRegFull()}
+                        : std::nullopt;
+                case EncodingSlotKind::ModRmRm:
+                    return state->hasModRm
+                        ? std::optional<std::int64_t>{state->modRmRmFull()}
+                        : std::nullopt;
+                case EncodingSlotKind::Imm32:
+                    return state->hasImm32
+                        ? std::optional<std::int64_t>{state->imm32}
+                        : std::nullopt;
                 case EncodingSlotKind::Disp32:
                     // Symbol-bearing slot: encoder writes ZEROS at
                     // this position so the linker can patch later.
-                    // The zero-check on the actual bytes lives
-                    // UPSTREAM at the slot-consume loop (line ~175);
-                    // moving it here would re-read 4 bytes. The
-                    // upstream guard is the contract — if it ever
-                    // moves out of the consume loop, the symmetry
-                    // with fixed32's Imm26 in-place check breaks.
-                    return 0;
+                    // `nullopt` (D-AS5-3) explicitly marks "value
+                    // undefined here — consult the Relocation entry"
+                    // and prevents collision with a legitimate Imm32
+                    // value of 0. The zero-check on the actual bytes
+                    // lives upstream at the slot-consume loop.
+                    return std::nullopt;
                 case EncodingSlotKind::Rd:
                 case EncodingSlotKind::Rn:
                 case EncodingSlotKind::Rm:
                 case EncodingSlotKind::Imm26:
-                    // fixed32 slots — never reached here (validate
-                    // rejects cross-shape variants).
-                    return 0;
+                    // fixed32 slots. Validate-time rules reject
+                    // cross-shape variants, but if a future variant
+                    // drift reached this arm, returning nullopt
+                    // would silently masquerade as a SymbolRef slot
+                    // (the roundTripVerify accepts nullopt for
+                    // SymbolRef). Fail loud — silent-failure-hunter
+                    // CRITICAL-2 convergence.
+                    report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                           DiagnosticSeverity::Error,
+                           std::format("round-trip: opcode '{}' variant "
+                                       "{} declared a fixed32 slot kind "
+                                       "'{}' in an x86-variable walker "
+                                       "(substrate-invariant violation: "
+                                       "validate() should have rejected "
+                                       "this cross-shape variant before "
+                                       "the walker ran)",
+                                       info->mnemonic, vi,
+                                       encodingSlotKindName(slot)));
+                    return std::nullopt;
             }
-            return 0;
+            return std::nullopt;
         };
 
         if (variant.resultSlot.has_value()) {
-            result.slots.push_back(DisassembledSlot{
+            result.result = DisassembledSlot{
                 *variant.resultSlot,
                 valueForSlot(*variant.resultSlot)
-            });
+            };
         }
         for (auto const& w : variant.wires) {
-            result.slots.push_back(DisassembledSlot{
+            result.wires.push_back(DisassembledSlot{
                 w.slotKind,
                 valueForSlot(w.slotKind)
             });

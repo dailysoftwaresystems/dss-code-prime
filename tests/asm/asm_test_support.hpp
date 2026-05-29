@@ -81,11 +81,30 @@ roundTripVerify(TargetSchema const&            schema,
     auto const  instOps  = lir.instOperands(inst);
     LirReg const resultReg = lir.instResult(inst);
 
-    std::size_t cursor = 0;
+    // D-AS5-3 closure: `DisassembledInst` splits into
+    // `optional<DisassembledSlot> result` + `vector<DisassembledSlot>
+    // wires`. The result-slot check runs against `result->result`;
+    // the wire iteration runs against `result->wires` parallel-indexed
+    // with `variant.wires`. No more positional cursor.
     auto const checkSlot = [&](DisassembledSlot const& slot,
                                 std::int64_t expected,
                                 std::string_view label) -> bool {
-        if (slot.value != expected) {
+        // Symbol-bearing slots carry std::nullopt (Disp32 / Imm26).
+        // The expected-value comparison is meaningful only when the
+        // recovered value is present; the symbol-identity check runs
+        // out of band (Relocation entry cross-reference).
+        if (!slot.value.has_value()) {
+            report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                   DiagnosticSeverity::Error,
+                   std::format("round-trip: opcode '{}' slot '{}' "
+                               "({}): disasm recovered nullopt but "
+                               "caller expected concrete value {}",
+                               info->mnemonic,
+                               encodingSlotKindName(slot.kind),
+                               label, expected));
+            return false;
+        }
+        if (*slot.value != expected) {
             report(reporter, DiagnosticCode::A_RoundTripMismatch,
                    DiagnosticSeverity::Error,
                    std::format("round-trip: opcode '{}' slot '{}' "
@@ -93,18 +112,18 @@ roundTripVerify(TargetSchema const&            schema,
                                "recovered {}",
                                info->mnemonic,
                                encodingSlotKindName(slot.kind),
-                               label, expected, slot.value));
+                               label, expected, *slot.value));
             return false;
         }
         return true;
     };
 
     if (variant.resultSlot.has_value()) {
-        if (cursor >= result->slots.size()) {
+        if (!result->result.has_value()) {
             report(reporter, DiagnosticCode::A_RoundTripMismatch,
                    DiagnosticSeverity::Error,
                    std::format("round-trip: opcode '{}' resultSlot "
-                               "declared but disasm produced no slot",
+                               "declared but disasm produced no result",
                                info->mnemonic));
             return false;
         }
@@ -120,24 +139,32 @@ roundTripVerify(TargetSchema const&            schema,
                                static_cast<unsigned>(resultReg.id)));
             return false;
         }
-        if (!checkSlot(result->slots[cursor],
+        if (!checkSlot(*result->result,
                         static_cast<std::int64_t>(regInfo->hwEncoding),
                         "result")) {
             return false;
         }
-        ++cursor;
+    } else if (result->result.has_value()) {
+        report(reporter, DiagnosticCode::A_RoundTripMismatch,
+               DiagnosticSeverity::Error,
+               std::format("round-trip: opcode '{}' variant declared no "
+                           "resultSlot but disasm produced one",
+                           info->mnemonic));
+        return false;
     }
 
-    for (auto const& wire : variant.wires) {
-        if (cursor >= result->slots.size()) {
-            report(reporter, DiagnosticCode::A_RoundTripMismatch,
-                   DiagnosticSeverity::Error,
-                   std::format("round-trip: opcode '{}' variant has "
-                               "more wires than disasm produced slots",
-                               info->mnemonic));
-            return false;
-        }
-        auto const& slot   = result->slots[cursor];
+    if (result->wires.size() != variant.wires.size()) {
+        report(reporter, DiagnosticCode::A_RoundTripMismatch,
+               DiagnosticSeverity::Error,
+               std::format("round-trip: opcode '{}' variant declared {} "
+                           "wires but disasm produced {}",
+                           info->mnemonic, variant.wires.size(),
+                           result->wires.size()));
+        return false;
+    }
+    for (std::size_t wi = 0; wi < variant.wires.size(); ++wi) {
+        auto const& wire   = variant.wires[wi];
+        auto const& slot   = result->wires[wi];
         auto const& srcOp  = instOps[wire.index];
         std::int64_t expected = 0;
         // Closed-enum switch (convergence-fix B, AS5 review): every
@@ -166,11 +193,22 @@ roundTripVerify(TargetSchema const&            schema,
                 expected = static_cast<std::int64_t>(srcOp.immInt32);
                 break;
             case LirOperandKind::SymbolRef:
-                // Symbol-bearing slots: encoder writes ZEROS. Full
-                // symbol-identity check is the caller's Relocation
-                // cross-reference, not this slot-value check.
-                expected = 0;
-                break;
+                // Symbol-bearing slots: disasm reports nullopt
+                // (D-AS5-3). The full symbol-identity check is the
+                // caller's Relocation cross-reference. Confirm the
+                // slot value IS nullopt then move on.
+                if (slot.value.has_value()) {
+                    report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                           DiagnosticSeverity::Error,
+                           std::format("round-trip: opcode '{}' wire {} "
+                                       "SymbolRef slot must be nullopt "
+                                       "(linker patches at link time) "
+                                       "but disasm recovered value {}",
+                                       info->mnemonic, wire.index,
+                                       *slot.value));
+                    return false;
+                }
+                continue;  // skip the value-comparison checkSlot below
             case LirOperandKind::None:
             case LirOperandKind::BlockRef:
             case LirOperandKind::MemBase:
@@ -191,19 +229,12 @@ roundTripVerify(TargetSchema const&            schema,
                        std::format("wire[index={}]", wire.index))) {
             return false;
         }
-        ++cursor;
     }
 
-    if (cursor != result->slots.size()) {
-        report(reporter, DiagnosticCode::A_RoundTripMismatch,
-               DiagnosticSeverity::Error,
-               std::format("round-trip: opcode '{}' disasm produced {} "
-                           "slots but variant declared {}",
-                           info->mnemonic, result->slots.size(),
-                           cursor));
-        return false;
-    }
-
+    // Wire arity check ran before the loop; result-slot presence
+    // check ran above. D-AS5-3 closure: the structural split into
+    // `result` + `wires` makes the previous positional cursor-vs-
+    // slots.size() check redundant.
     return true;
 }
 

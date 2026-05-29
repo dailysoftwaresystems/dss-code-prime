@@ -86,21 +86,26 @@ enum class SectionKind : std::uint8_t {
     Data       = 2,  // initialised mutable data
     Bss        = 3,  // zero-initialised mutable data
     Symtab     = 4,  // symbol table
-    Strtab     = 5,  // string table
-    RelocTable = 6,  // relocation entries
-    Dynamic    = 7,  // ELF .dynamic / PE .idata / Mach-O LC_DYLD_INFO
-    Note       = 8,  // build-id / vendor notes
-    Debug      = 9,  // DWARF / CodeView debug info
-    Custom     = 10, // anything else the format JSON names
+    Strtab     = 5,  // symbol-name string table
+    ShStrtab   = 6,  // section-name string table (ELF .shstrtab;
+                     // distinct from Strtab — the consumer code
+                     // path is "find names of OTHER sections" vs
+                     // "find symbol names")
+    RelocTable = 7,  // relocation entries
+    Dynamic    = 8,  // ELF .dynamic / PE .idata / Mach-O LC_DYLD_INFO
+    Note       = 9,  // build-id / vendor notes
+    Debug      = 10, // DWARF / CodeView debug info
+    Custom     = 11, // anything else the format JSON names
 };
 
-inline constexpr EnumNameTable<SectionKind, 11> kSectionKindTable{{{
+inline constexpr EnumNameTable<SectionKind, 12> kSectionKindTable{{{
     { SectionKind::Text,       "text"       },
     { SectionKind::Rodata,     "rodata"     },
     { SectionKind::Data,       "data"       },
     { SectionKind::Bss,        "bss"        },
     { SectionKind::Symtab,     "symtab"     },
     { SectionKind::Strtab,     "strtab"     },
+    { SectionKind::ShStrtab,   "shstrtab"   },
     { SectionKind::RelocTable, "reloc"      },
     { SectionKind::Dynamic,    "dynamic"    },
     { SectionKind::Note,       "note"       },
@@ -182,9 +187,51 @@ symbolVisibilityFromName(std::string_view s) noexcept {
 // `TargetRelocationInfo::kind`. The format engine looks up by kind
 // (O(1) via `relocationKindIndex`) and writes `name` into the
 // output bytes.
+//
+// `nativeId` is the FORMAT-SPECIFIC numeric tag the format engine
+// writes into its relocation record (e.g. ELF's `r_info` low 32 bits
+// = R_X86_64_PC32 = 2; PE's IMAGE_REL_AMD64_REL32 = 4; Mach-O's
+// X86_64_RELOC_BRANCH = 2). Distinct from the universal `kind`
+// (cross-side join key) — `kind` is opaque to all formats; `nativeId`
+// is the actual byte value embedded in the format's reloc record.
+// Validated as != 0 (slot-0 reserved as sentinel) when present.
 struct DSS_EXPORT ObjectFormatRelocationInfo {
     std::string    name;            // e.g. "R_X86_64_PC32"
     RelocationKind kind{};          // matches assembler-side tag
+    std::uint32_t  nativeId = 0;    // ELF r_info type / PE characteristics
+                                    // / Mach-O type — format-specific
+};
+
+// ── Per-section row (plan 14 D-LK4-2) ───────────────────────────
+//
+// Each format's `sections[]` row maps the UNIVERSAL `SectionKind` (the
+// engine speaks this) to the FORMAT-NATIVE section name + structural
+// fields (e.g. ELF sh_type / sh_flags / sh_addralign). The substrate
+// validates the universal `kind` join key + `name` non-empty +
+// `kind` unique cross-row; the format-specific numeric fields are
+// stored verbatim and interpreted by the format walker.
+struct DSS_EXPORT ObjectFormatSectionInfo {
+    SectionKind   kind{};            // universal kind enum
+    std::string   name;              // e.g. ".text" / ".rela.text"
+    std::uint32_t type = 0;          // ELF sh_type / PE characteristics
+    std::uint64_t flags = 0;         // ELF sh_flags / PE flags
+    std::uint64_t addrAlign = 0;     // sh_addralign or format equivalent
+    std::uint64_t entrySize = 0;     // sh_entsize (0 for variable-size)
+};
+
+// ── ELF-specific identity block (loaded only when kind == Elf) ──
+//
+// Mirrors `Elf64_Ehdr::e_ident[EI_CLASS..EI_OSABI]` + `e_machine`.
+// Lives on `ObjectFormatData` so the ELF walker reads the values
+// from JSON instead of hardcoding them. Future PE/MachO format
+// files declare their own identity sub-block (`pe.peCoffHeader`,
+// `macho.machHeader`) when LK2/LK3 land — substrate stays generic.
+struct DSS_EXPORT ElfIdentity {
+    std::uint8_t  fileClass = 0;     // ELFCLASS64=2 / ELFCLASS32=1
+    std::uint8_t  dataEncoding = 0;  // ELFDATA2LSB=1 / ELFDATA2MSB=2
+    std::uint8_t  osabi = 0;         // ELFOSABI_NONE=0 / ELFOSABI_GNU=3 / …
+    std::uint8_t  abiVersion = 0;
+    std::uint16_t machine = 0;       // e_machine: EM_X86_64=62 / EM_AARCH64=183
 };
 
 namespace detail {
@@ -195,17 +242,30 @@ struct DSS_EXPORT ObjectFormatData {
     std::string          version;
     ObjectFormatKind     kind = ObjectFormatKind::Elf;
 
-    // Relocations row — substrate-tier (per-format LK1+ cycles
-    // populate). Same shape as `TargetSchema::relocations[]` so
-    // the reloc-taxonomy unifier (plan 13 §2.6) is symmetric.
+    // Relocations row — same shape as `TargetSchema::relocations[]`
+    // so the reloc-taxonomy unifier (plan 13 §2.6) is symmetric.
     std::vector<ObjectFormatRelocationInfo> relocations;
     substrate::TransparentStringMap<std::uint16_t> relocationNameIndex;
     std::unordered_map<RelocationKind, std::uint16_t> relocationKindIndex;
 
-    // Cross-field invariants. Same discipline as TargetSchemaData:
-    //   * `kind != 0` per relocation row (slot-0 invalid sentinel)
-    //   * `kind` unique cross-row
-    //   * `name` non-empty + unique
+    // Sections row (D-LK4-2). The walker reads sections by
+    // SectionKind; `kind` must be unique across rows so the lookup
+    // is unambiguous. `name`/`type`/`flags`/`addrAlign`/`entrySize`
+    // are format-specific (interpreted by the walker for its format).
+    std::vector<ObjectFormatSectionInfo> sections;
+    std::unordered_map<SectionKind, std::uint16_t> sectionKindIndex;
+
+    // ELF identity (populated only when `kind == Elf`; zeroed
+    // otherwise). The ELF walker reads these from JSON, never
+    // hardcodes machine/class/data.
+    ElfIdentity elf{};
+
+    // Cross-field invariants:
+    //   * relocations: kind != 0, kind unique cross-row, name unique
+    //     + non-empty, nativeId != 0 when relocations are non-empty.
+    //   * sections: kind unique cross-row, name non-empty.
+    //   * ELF identity: when kind == Elf, fileClass / dataEncoding /
+    //     machine must all be != 0.
     [[nodiscard]] std::vector<ConfigDiagnostic> validate() const;
 };
 
@@ -249,6 +309,27 @@ public:
         if (it == d_.relocationNameIndex.end()) return nullptr;
         return &d_.relocations[it->second];
     }
+
+    // Section accessors — the walker calls `sectionByKind(...)` to
+    // resolve format-native name + sh_type / sh_flags / addralign
+    // for an emitted section.
+    [[nodiscard]] std::span<ObjectFormatSectionInfo const>
+    sections() const noexcept { return d_.sections; }
+
+    [[nodiscard]] std::size_t
+    sectionCount() const noexcept { return d_.sections.size(); }
+
+    [[nodiscard]] ObjectFormatSectionInfo const*
+    sectionByKind(SectionKind kind) const noexcept {
+        auto it = d_.sectionKindIndex.find(kind);
+        if (it == d_.sectionKindIndex.end()) return nullptr;
+        return &d_.sections[it->second];
+    }
+
+    // ELF identity — populated only when `kind() == Elf`. Walker
+    // reads `machine` / `fileClass` / `dataEncoding` / `osabi` for
+    // the ELF header.
+    [[nodiscard]] ElfIdentity const& elf() const noexcept { return d_.elf; }
 
     // ── Loaders ───────────────────────────────────────────────
     static LoadResult<std::shared_ptr<ObjectFormatSchema>>

@@ -1,6 +1,7 @@
 #include "link/linker.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/format/elf.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <string>
@@ -22,6 +23,16 @@ LinkedImage link(AssembledModule const&    module,
     LinkedImage image;
     image.format = objectFormatSchema.kind();
     image.expectedFuncCount = module.expectedFuncCount;
+
+    // Snapshot error count so we can detect whether the cross-
+    // reference unifier pass (below) added any new K_* diagnostics
+    // — if so, the module is not valid input for the format walker
+    // and we must skip dispatch. Separation of concerns mirrors
+    // ML6 cycle 3a's `LirAllocation::ok()` discipline: linkage
+    // VALIDITY (kind + symbol cross-checks) is one stage; format
+    // EMISSION (byte serialization) is another; the second runs
+    // only when the first passed.
+    std::size_t const errorsAtEntry = reporter.errorCount();
 
     // Index every function symbol the assembler declared. Single-CU
     // resolution; cross-CU symbol-table merge is LK11; FFI import
@@ -92,10 +103,62 @@ LinkedImage link(AssembledModule const&    module,
         if (funcResolved) ++image.resolvedFuncCount;
     }
 
-    // LK4 substrate ships the dispatch shell — per-format byte
-    // emission (ELF/PE/Mach-O writers) is anchored at D-LK4-1
-    // (LK1+). The `bytes` buffer stays empty until those cycles
-    // plug in.
+    // Skip walker dispatch if the cross-reference unifier failed.
+    // A module that produces K_SymbolUndefined / K_RelocationKindMismatch
+    // is not valid input for the format walker — emitting partial
+    // bytes from a known-invalid module is exactly the silent-failure
+    // class the substrate discipline rejects.
+    //
+    // Resetting `resolvedFuncCount` is load-bearing (architect
+    // convergence): without it, a 3-function module where ONLY fn#1
+    // had a reloc failure would report `resolvedFuncCount = 2`,
+    // `expectedFuncCount = 3` (ok() = false — correct) — but a
+    // 1-function module whose ONLY function had a reloc failure
+    // would still report `resolvedFuncCount = 0` (ok() = false, also
+    // correct). The subtle bug: a 2-function module where fn#0 had
+    // no relocs and fn#1's relocs all failed: pre-fix produced
+    // resolvedFuncCount=1, expectedFuncCount=2 (ok()=false, correct
+    // by accident). But if EVERY function's relocs failed,
+    // resolvedFuncCount remained partial. Reset on linkage failure
+    // makes "linkage failed → no functions are resolved" structural.
+    if (reporter.errorCount() != errorsAtEntry) {
+        image.resolvedFuncCount = 0;
+        return image;
+    }
+
+    // Format-keyed dispatch — closed-enum switch, fail-loud on
+    // any format whose walker hasn't landed yet so the substrate
+    // discipline reports the missing walker instead of silently
+    // returning empty bytes.
+    switch (objectFormatSchema.kind()) {
+    case ObjectFormatKind::Unknown:
+        report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+               DiagnosticSeverity::Error,
+               "linker: format kind 'unknown' is the invalid sentinel; "
+               "the object format schema was constructed without a valid "
+               "format declaration");
+        break;
+    case ObjectFormatKind::Elf:
+        image.bytes = elf::encode(module, targetSchema,
+                                  objectFormatSchema, reporter);
+        break;
+    case ObjectFormatKind::Pe:
+    case ObjectFormatKind::MachO:
+    case ObjectFormatKind::Wasm:
+    case ObjectFormatKind::Spirv:
+        // Per-format walkers for these arrive in LK2 / LK3 / plan 18
+        // / plan 17. Fail loud rather than silently producing empty
+        // bytes — same substrate discipline the assembler's
+        // `A_NoEncodingShapeWalker` enforces.
+        report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+               DiagnosticSeverity::Error,
+               std::string{"linker: no walker registered for object format "
+                           "kind '"}
+                   + std::string{objectFormatKindName(objectFormatSchema.kind())}
+                   + "' (plan 14 LK2/LK3/LK8/LK9)");
+        break;
+    }
+
     return image;
 }
 

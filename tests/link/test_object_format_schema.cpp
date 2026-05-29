@@ -50,6 +50,7 @@ TEST(ObjectFormatSchemaEnum, SectionKindNameRoundTrip) {
     for (auto k : {SectionKind::Text, SectionKind::Rodata,
                    SectionKind::Data, SectionKind::Bss,
                    SectionKind::Symtab, SectionKind::Strtab,
+                   SectionKind::ShStrtab,
                    SectionKind::RelocTable, SectionKind::Dynamic,
                    SectionKind::Note, SectionKind::Debug,
                    SectionKind::Custom}) {
@@ -83,9 +84,10 @@ constexpr std::string_view kElfMinimal = R"({
     "version": "1.0",
     "kind": "elf"
   },
+  "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
   "relocations": [
-    { "name": "R_X86_64_PC32",  "kind": 1 },
-    { "name": "R_X86_64_PLT32", "kind": 2 }
+    { "name": "R_X86_64_PC32",  "kind": 1, "nativeId": 2 },
+    { "name": "R_X86_64_PLT32", "kind": 2, "nativeId": 4 }
   ]
 })";
 } // namespace

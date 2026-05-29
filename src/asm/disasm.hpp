@@ -37,35 +37,38 @@
 
 namespace dss {
 
-// One disassembled slot value. Tagged by the slot kind it came from.
-// `Reg` carries the raw `hwEncoding` ordinal recovered from the
-// bytes; the caller cross-references against `TargetSchema::
-// registerInfo` if it needs the register's name. `Imm32` carries the
-// 32-bit value. Symbol-bearing slots (Disp32 / Imm26) leave the
-// integer value at 0 (the encoder wrote zeros; linker patches at
-// link time) and instead identify the slot via its declared
-// `relocationKind`; the round-trip caller matches it against the
-// expected Relocation entry separately.
+// One disassembled slot. `kind` names the encoding-slot variety
+// the bytes were extracted from. `value` carries the recovered
+// integer:
+//   * Reg slots: the operand's raw `hwEncoding` ordinal.
+//   * Imm32 slots: the 32-bit immediate (sign-extended to i64).
+//   * Symbol-bearing slots (Disp32 / Imm26): always `std::nullopt`
+//     because the encoder writes ZEROS at the slot's byte position
+//     (the Relocation entry carries the symbol identity, not the
+//     bytes). An explicit `nullopt` distinguishes "symbol-bearing,
+//     value-undefined" from "legitimately-zero Imm32" — that
+//     distinction was sentinel-collision-prone in the previous
+//     `int64_t = 0` shape (D-AS5-3 closure).
 struct DSS_EXPORT DisassembledSlot {
-    EncodingSlotKind kind = EncodingSlotKind::ModRmReg;
-    // For Reg slots: the operand's raw hwEncoding ordinal.
-    // For Imm32 slots: the immediate value (signed).
-    // For symbol-bearing slots (Disp32 / Imm26): always 0 (the
-    // encoder writes zeros at the slot's byte position; the
-    // Relocation entry carries the symbol identity).
-    std::int64_t     value = 0;
+    EncodingSlotKind             kind = EncodingSlotKind::ModRmReg;
+    std::optional<std::int64_t>  value;
 };
 
 // Result of inverting one encoded instruction. The variant index
 // names which row of `TargetOpcodeInfo::encoding.variants` the bytes
-// matched; the slots list mirrors the variant's `wires` (plus the
-// `resultSlot` if the variant declared one — emitted as the first
-// slot when present so the caller doesn't need a separate field).
+// matched. `result` is populated when the variant declares a
+// `resultSlot`; `wires` mirrors the variant's `wires` list 1:1 (same
+// index ordering). This shape MIRRORS `TargetEncodingVariant`
+// (encoder side) so the round-trip oracle's iteration is structural
+// rather than positional (D-AS5-3 closure: previously a single flat
+// `slots` vector with a positional "first slot = result when present"
+// contract — error-prone for callers).
 struct DSS_EXPORT DisassembledInst {
-    std::uint16_t                 opcode        = 0;
-    std::size_t                   variantIndex  = 0;
-    std::size_t                   bytesConsumed = 0;
-    std::vector<DisassembledSlot> slots;
+    std::uint16_t                  opcode        = 0;
+    std::size_t                    variantIndex  = 0;
+    std::size_t                    bytesConsumed = 0;
+    std::optional<DisassembledSlot> result;
+    std::vector<DisassembledSlot>   wires;
 };
 
 // Disassemble exactly one instruction from the head of `bytes`. The

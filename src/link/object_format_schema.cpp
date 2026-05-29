@@ -8,6 +8,7 @@
 #include <format>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 namespace dss {
@@ -70,6 +71,63 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // 13 §2.6's reloc-taxonomy unifier are validated identically.
     substrate::validateRelocationsTable<ObjectFormatRelocationInfo>(
         relocations, fail);
+
+    // nativeId is the format's actual wire value (e.g. ELF R_X86_64_PC32
+    // = 2 in `r_info` low 32 bits). Zero would silently write a
+    // R_X86_64_NONE relocation that the linker treats as a no-op — a
+    // miscompile that round-trips as syntactically valid. Reject at
+    // load time when relocations[] is non-empty.
+    for (std::size_t i = 0; i < relocations.size(); ++i) {
+        if (relocations[i].nativeId == 0) {
+            fail(std::format("/relocations/{}/nativeId", i),
+                 std::format("relocation '{}': 'nativeId' must be != 0 "
+                             "(the format-specific wire tag, e.g. ELF "
+                             "R_X86_64_PC32 = 2)",
+                             relocations[i].name));
+        }
+    }
+
+    // Sections: kind unique cross-row + name non-empty. The format
+    // walker resolves `sectionByKind(SectionKind::Text)` to find
+    // the format-native section name + structural fields.
+    {
+        std::unordered_map<SectionKind, std::size_t> seenSection;
+        for (std::size_t i = 0; i < sections.size(); ++i) {
+            auto const& s = sections[i];
+            if (s.name.empty()) {
+                fail(std::format("/sections/{}/name", i),
+                     "section row: 'name' must be a non-empty string");
+            }
+            auto [it, fresh] = seenSection.emplace(s.kind, i);
+            if (!fresh) {
+                fail(std::format("/sections/{}/kind", i),
+                     std::format("section '{}': duplicate 'kind' value "
+                                 "(already declared by section '{}' at "
+                                 "/sections/{})",
+                                 s.name, sections[it->second].name,
+                                 it->second));
+            }
+        }
+    }
+
+    // ELF identity: when format kind is Elf, the identity block must
+    // be populated. `fileClass=0` means "no class declared" which
+    // would emit an invalid ELF header byte.
+    if (kind == ObjectFormatKind::Elf) {
+        if (elf.fileClass == 0) {
+            fail("/elf/class", "ELF format requires 'elf.class' "
+                               "(one of 'elf32' / 'elf64')");
+        }
+        if (elf.dataEncoding == 0) {
+            fail("/elf/data", "ELF format requires 'elf.data' "
+                              "(one of 'lsb' / 'msb')");
+        }
+        if (elf.machine == 0) {
+            fail("/elf/machine", "ELF format requires 'elf.machine' "
+                                 "(EM_* value, e.g. 62 for x86_64, "
+                                 "183 for aarch64)");
+        }
+    }
 
     return problems;
 }

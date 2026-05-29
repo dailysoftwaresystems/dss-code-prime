@@ -212,6 +212,92 @@ TEST(X86RoundTrip, CallSymRoundTrips) {
     assertRoundTripsClean(bundle, **schema);
 }
 
+// D-AS5-3 closure pin: symbol-bearing Disp32/Imm26 slots disassemble
+// to `std::nullopt`, NOT integer 0. The distinction is load-bearing —
+// a literal-zero Imm32 must not collide with a symbol-bearing slot
+// in the oracle's value check (test-analyzer Gap 5 convergence).
+TEST(DisassemblerSlotShape, SymbolBearingSlotsReturnNullopt) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto bundle = buildAndAssemble(**schema, [&](LirBuilder& b) {
+        auto const callOp = (*schema)->opcodeByMnemonic("call");
+        auto const retOp  = (*schema)->opcodeByMnemonic("ret");
+        LirOperand const ops[] = { LirOperand::makeSymbolRef(123) };
+        (void)b.addInst(*callOp, LirReg{}, ops);
+        (void)b.addReturn(*retOp, {});
+    });
+    ASSERT_TRUE(bundle.result.ok());
+    auto const& fn0 = bundle.result.functions[0];
+    auto const& bytes = fn0.bytes;
+    auto const& srcMap = fn0.sourceMap;
+    ASSERT_FALSE(srcMap.empty());
+    // First inst is `call sym` — disassemble its byte window and
+    // verify the Disp32 wire's value is nullopt.
+    std::uint32_t const start = srcMap[0].byteOffset;
+    std::uint32_t const end =
+        (srcMap.size() > 1) ? srcMap[1].byteOffset
+                            : static_cast<std::uint32_t>(bytes.size());
+    std::span<std::uint8_t const> callBytes{
+        bytes.data() + start, end - start};
+
+    auto const callOp = (*schema)->opcodeByMnemonic("call");
+    DiagnosticReporter localRep;
+    auto disasmed = disassembleInst(**schema, *callOp, callBytes, localRep);
+    ASSERT_TRUE(disasmed.has_value());
+    ASSERT_EQ(disasmed->wires.size(), 1u);
+    auto const& wire = disasmed->wires[0];
+    EXPECT_EQ(wire.kind, EncodingSlotKind::Disp32);
+    EXPECT_FALSE(wire.value.has_value())
+        << "Disp32 symbol-bearing slot must disassemble to nullopt "
+           "(D-AS5-3 closure) — a value of 0 here would silently "
+           "match a legitimate Imm32 zero in the oracle";
+}
+
+// Companion pin: non-symbol Imm32 slots DO carry a value via
+// `mov reg, imm32` (uses x86_64.target.json's `mov` opcode with
+// an immediate operand — the variant matcher picks the imm32 form).
+TEST(DisassemblerSlotShape, Imm32SlotsCarryConcreteValue) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const movOpOpt = (*schema)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(movOpOpt.has_value());
+    auto const raxOpt = (*schema)->registerByName("rax");
+    ASSERT_TRUE(raxOpt.has_value());
+
+    auto bundle = buildAndAssemble(**schema, [&](LirBuilder& b) {
+        auto const retOp = (*schema)->opcodeByMnemonic("ret");
+        LirReg const raxReg = LirReg{
+            static_cast<std::uint32_t>(*raxOpt), 1u,
+            static_cast<std::uint8_t>(LirRegClass::GPR)};
+        LirOperand const ops[] = { LirOperand::makeImmInt32(0x12345678) };
+        (void)b.addInst(*movOpOpt, raxReg, ops);
+        (void)b.addReturn(*retOp, {});
+    });
+    ASSERT_TRUE(bundle.result.ok());
+    auto const& fn0 = bundle.result.functions[0];
+    ASSERT_GE(fn0.sourceMap.size(), 2u);
+    std::uint32_t const start = fn0.sourceMap[0].byteOffset;
+    std::uint32_t const end = fn0.sourceMap[1].byteOffset;
+    std::span<std::uint8_t const> bytes{
+        fn0.bytes.data() + start, end - start};
+
+    DiagnosticReporter localRep;
+    auto disasmed = disassembleInst(**schema, *movOpOpt, bytes, localRep);
+    ASSERT_TRUE(disasmed.has_value());
+    bool foundImm32 = false;
+    for (auto const& w : disasmed->wires) {
+        if (w.kind == EncodingSlotKind::Imm32) {
+            foundImm32 = true;
+            ASSERT_TRUE(w.value.has_value())
+                << "Imm32 slot must carry a concrete value (D-AS5-3) "
+                   "— nullopt would only be valid for symbol-bearing "
+                   "Disp32/Imm26 slots";
+            EXPECT_EQ(*w.value, 0x12345678);
+        }
+    }
+    EXPECT_TRUE(foundImm32);
+}
+
 // ── arm64 round-trip — all shipped variants ─────────────────────────
 
 TEST(Arm64RoundTrip, RetUnreachableRoundTrip) {

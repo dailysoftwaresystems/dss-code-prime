@@ -124,9 +124,9 @@ disassemble(TargetSchema const&            schema,
         result.variantIndex  = vi;
         result.bytesConsumed = 4;
         if (variant.resultSlot.has_value()) {
-            result.slots.push_back(DisassembledSlot{
+            result.result = DisassembledSlot{
                 *variant.resultSlot, extract(*variant.resultSlot)
-            });
+            };
         }
         for (auto const& wire : variant.wires) {
             // Convergence-fix A (3-agent: silent-failure #1 +
@@ -152,11 +152,13 @@ disassemble(TargetSchema const&            schema,
                                        info->mnemonic, actualBits));
                     return std::nullopt;
                 }
-                result.slots.push_back(DisassembledSlot{
-                    wire.slotKind, /*value=*/0
+                // D-AS5-3: `nullopt` marks "symbol-bearing slot —
+                // consult the Relocation entry, not the bytes."
+                result.wires.push_back(DisassembledSlot{
+                    wire.slotKind, std::nullopt
                 });
             } else {
-                result.slots.push_back(DisassembledSlot{
+                result.wires.push_back(DisassembledSlot{
                     wire.slotKind, extract(wire.slotKind)
                 });
             }

@@ -447,12 +447,25 @@ enum class DiagnosticCode : std::uint16_t {
     //   name) must both be declared. The diagnostic message names
     //   the missing side(s).
     //
-    // Per-format codes (K_NoMatchingObjectFormat for artifact-profile
-    // dispatch, ELF header malformation, Mach-O load-command overflow,
-    // etc.) join the family alongside their LK* cycles. The substrate
-    // ships ONLY the codes the format-blind engine itself can fire.
+    // Per-format codes join the family alongside their LK* cycles.
+    //
+    // K_NoMatchingObjectFormat fires in four scenarios (all LK1):
+    //   1. The linker engine's format-dispatch switch reaches
+    //      `ObjectFormatKind::Unknown` (the invalid sentinel was
+    //      not initialized by the format schema's loader path).
+    //   2. The switch reaches a format whose walker is not yet
+    //      registered (Pe / MachO / Wasm / Spirv until LK2 / LK3 /
+    //      plan 18 / plan 17 plug them in).
+    //   3. A format walker was invoked for a schema whose `kind()`
+    //      does not match the walker (e.g. `elf::encode` called
+    //      with a PE-tagged schema).
+    //   4. The format schema declares the right `kind()` but omits
+    //      a `sections[]` row the walker needs (e.g. ELF writer
+    //      requires SectionKind::Text/RelocTable/Symtab/Strtab/
+    //      ShStrtab — any missing row fires this code).
     K_SymbolUndefined              = 0x8001,
     K_RelocationKindMismatch       = 0x8002,
+    K_NoMatchingObjectFormat       = 0x8003,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

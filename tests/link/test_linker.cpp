@@ -45,22 +45,44 @@ namespace {
 // agreement — so we craft a format schema that declares the real
 // `rel32` tag (kind=1) by name.
 
+// All five sections are required by the ELF walker — declaring them
+// minimally keeps the LK1 dispatch arm satisfied so these tests
+// focus on the linker substrate's reloc/symbol behavior, not on
+// format-walker prerequisites (which are pinned in
+// `test_elf_writer.cpp`).
 constexpr std::string_view kFormatMatchingX86_64 = R"({
   "dssObjectFormatVersion": 1,
   "format": {"name": "test-elf", "kind": "elf"},
+  "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+  "sections": [
+    {"kind":"text",    "name":".text",     "type":1, "flags":6,  "addrAlign":16, "entrySize":0},
+    {"kind":"reloc",   "name":".rela.text","type":4, "flags":64, "addrAlign":8,  "entrySize":24},
+    {"kind":"symtab",  "name":".symtab",   "type":2, "flags":0,  "addrAlign":8,  "entrySize":24},
+    {"kind":"strtab",  "name":".strtab",   "type":3, "flags":0,  "addrAlign":1,  "entrySize":0},
+    {"kind":"shstrtab","name":".shstrtab", "type":3, "flags":0,  "addrAlign":1,  "entrySize":0}
+  ],
   "relocations": [
-    { "name": "R_X86_64_PC32",   "kind": 1 },
-    { "name": "R_X86_64_64",     "kind": 2 },
-    { "name": "R_X86_64_32",     "kind": 3 }
+    { "name": "R_X86_64_PC32",   "kind": 1, "nativeId": 2  },
+    { "name": "R_X86_64_64",     "kind": 2, "nativeId": 1  },
+    { "name": "R_X86_64_32",     "kind": 3, "nativeId": 10 }
   ]
 })";
 
 // Same target side, but a format schema that DOESN'T declare
 // the assembler-side reloc tag — isolates the format-side
-// half of plan 13 §2.6's reloc-taxonomy unifier.
+// half of plan 13 §2.6's reloc-taxonomy unifier. Sections[] still
+// declared so the ELF walker doesn't pollute the diagnostic count.
 constexpr std::string_view kFormatMissingReloc = R"({
   "dssObjectFormatVersion": 1,
-  "format": {"name": "test-elf-bare", "kind": "elf"}
+  "format": {"name": "test-elf-bare", "kind": "elf"},
+  "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+  "sections": [
+    {"kind":"text",    "name":".text",     "type":1, "flags":6,  "addrAlign":16, "entrySize":0},
+    {"kind":"reloc",   "name":".rela.text","type":4, "flags":64, "addrAlign":8,  "entrySize":24},
+    {"kind":"symtab",  "name":".symtab",   "type":2, "flags":0,  "addrAlign":8,  "entrySize":24},
+    {"kind":"strtab",  "name":".strtab",   "type":3, "flags":0,  "addrAlign":1,  "entrySize":0},
+    {"kind":"shstrtab","name":".shstrtab", "type":3, "flags":0,  "addrAlign":1,  "entrySize":0}
+  ]
 })";
 
 struct Loaded {
@@ -209,8 +231,15 @@ TEST(Linker, PartialResolutionAcrossMultipleFunctions) {
     auto image = link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_FALSE(image.ok());
     EXPECT_EQ(image.expectedFuncCount, 3u);
-    EXPECT_EQ(image.resolvedFuncCount, 2u);
+    // Architect Decision 4 convergence: on linkage failure the
+    // engine resets `resolvedFuncCount = 0`, so `ok()` cannot
+    // false-positive when the walker is skipped. Per-reloc
+    // diagnostic count still reflects the EXACT bad reloc the
+    // unifier rejected (1, not 3) — accounting is at the reloc
+    // level, not the function level.
+    EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_RelocationKindMismatch), 1u);
+    EXPECT_TRUE(image.bytes.empty());
 }
 
 TEST(Linker, KindMissingFromTargetEmitsMismatchWithBothSidesNamed) {
