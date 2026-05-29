@@ -40,19 +40,24 @@ remapBlockRef(LirOperand const& op,
 
 // Emit the rewritten terminator. The per-inst loop in each pass
 // translates `newOps`; this routes to the matching `LirBuilder`
-// entrypoint per successor count.
+// entrypoint via `info->terminatorKind` (single source of truth,
+// shared with the `.dsslir` parser dispatch — replaces the
+// successor-count-counting heuristic that earlier draft used).
 //
 // `passName` is the prefix used in any error diagnostic (e.g.
 // "rewrite", "callconv") so the reporter caller is identifiable.
 //
-// Returns false on > 2 successors (an unsupported substrate shape;
-// future Switch lowering would need explicit handling).
+// Returns false on Switch (reserved — future LIR Switch lowering will
+// add the dispatch) or `terminatorKind == None` (substrate invariant
+// violation — `info->isTerminator()` should have already filtered the
+// call site).
 [[nodiscard]] DSS_EXPORT bool
 emitTerminator(LirBuilder& b, std::uint16_t op,
                TargetOpcodeInfo const* info,
                std::span<LirBlockId const> succs,
                std::span<LirOperand const> newOps,
                std::uint32_t payload,
+               std::uint8_t  flags,
                std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst,
                std::string_view passName,
                DiagnosticReporter& reporter);

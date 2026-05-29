@@ -292,7 +292,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             std::uint32_t const payload = src.instPayload(inst);
 
             auto const* info = schema.opcodeInfo(op);
-            bool const isTerm = (info != nullptr && info->isTerminator);
+            bool const isTerm = (info != nullptr && info->isTerminator());
 
             // Materialize frame_load / frame_store.
             if (op == h.frameLoad) {
@@ -332,7 +332,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     emitEpilogue(b, outLayout, sp, h.add, h.load);
                 }
                 if (!lir_pass_util::emitTerminator(b, op, info, succs, newOps,
-                                                   payload, srcToDst,
+                                                   payload, src.instFlags(inst),
+                                                   srcToDst,
                                                    "callconv", reporter)) {
                     return false;
                 }

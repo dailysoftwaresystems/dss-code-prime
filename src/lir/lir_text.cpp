@@ -1148,7 +1148,9 @@ private:
     }
 
     // `<reg>` operand: either phys mnemonic OR `%v.<id>:<class>`.
-    // Returns the parsed LirReg.
+    // Returns the parsed LirReg. Same routine serves both result-
+    // position (LHS of `=`) and operand-position; callers disambiguate
+    // by reading the result back into the right slot.
     //
     // The `:<class>` suffix is MANDATORY (mirrors the emitter — required
     // for byte-identical round-trip of FPR/VR/Flags vregs that would
@@ -1350,57 +1352,94 @@ private:
         }
         // Dispatch by terminator-ness.
         auto const* info = schema_.opcodeInfo(op);
-        bool const isTerm = (info != nullptr && info->isTerminator);
+        bool const isTerm = (info != nullptr && info->isTerminator());
         if (isTerm) {
-            // Use the BLOCK's header successor list (`currentBlockSuccSlots_`)
-            // as the authoritative dispatch driver. The operand-list
-            // BlockRefs are noise here:
-            //   * `addBr` embeds a BlockRef in the inst's operands AND
-            //     records a successor — operand list has 1 BlockRef.
-            //   * `addCondBr` does NOT embed BlockRefs in the operand
-            //     list, only the successors — operand list has 0
-            //     BlockRefs even when there are 2 successors.
-            // Earlier draft counted operand-list BlockRefs and silently
-            // dispatched CondBr as Return. Header-driven dispatch
-            // closes that hole.
+            // Schema-driven dispatch via `info->terminatorKind`. Earlier
+            // draft used an operand-emptiness heuristic ("0 successors +
+            // 0 operands + result=None → Unreachable, else Return")
+            // which silently mis-classified any opcode whose `ret`
+            // takes 0 operands (e.g. a future void-only-return target).
+            // Now the JSON declares it explicitly and the loader's
+            // `validate()` enforces `isTerminator ↔ terminatorKind`.
             std::vector<LirOperand> nonBlock;
             for (auto const& o : operands) {
                 if (o.kind != LirOperandKind::BlockRef) {
                     nonBlock.push_back(o);
                 }
             }
-            std::vector<LirBlockId> targets;
-            targets.reserve(currentBlockSuccSlots_.size());
-            for (std::uint32_t slot : currentBlockSuccSlots_) {
-                auto it = blockMap_.find(slot);
-                if (it == blockMap_.end()) {
-                    emit(DiagnosticCode::I_TextUnknownName,
-                         std::format("block header successor ^b{} not "
-                                     "declared in this function "
-                                     "(CFG-corruption guard)", slot));
-                    return;
+            // Resolve block-header successor slots into tagged ids
+            // (loud on miss — CFG-corruption guard).
+            auto resolveTargets = [&]() -> std::optional<std::vector<LirBlockId>> {
+                std::vector<LirBlockId> ts;
+                ts.reserve(currentBlockSuccSlots_.size());
+                for (std::uint32_t slot : currentBlockSuccSlots_) {
+                    auto it = blockMap_.find(slot);
+                    if (it == blockMap_.end()) {
+                        emit(DiagnosticCode::I_TextUnknownName,
+                             std::format("block header successor ^b{} not "
+                                         "declared in this function "
+                                         "(CFG-corruption guard)", slot));
+                        return std::nullopt;
+                    }
+                    ts.push_back(it->second);
                 }
-                targets.push_back(it->second);
-            }
-            if (targets.size() == 0) {
-                if (info->minSuccessors == 0 && info->maxSuccessors == 0
-                    && info->result == TargetResultRule::None
-                    && nonBlock.empty()) {
-                    builder_.addUnreachable(op, payload, flags);
-                } else {
+                return ts;
+            };
+            switch (info->terminatorKind) {
+                case TargetTerminatorKind::Return:
                     builder_.addReturn(op, nonBlock, payload, flags);
+                    break;
+                case TargetTerminatorKind::Unreachable:
+                    builder_.addUnreachable(op, payload, flags);
+                    break;
+                case TargetTerminatorKind::Br: {
+                    auto ts = resolveTargets();
+                    if (!ts.has_value() || ts->size() != 1) {
+                        if (ts.has_value()) {
+                            emit(DiagnosticCode::I_TextMalformed,
+                                 std::format("Br opcode '{}' requires 1 "
+                                             "successor; block declared {}",
+                                             mnem.text, ts->size()));
+                        }
+                        return;
+                    }
+                    builder_.addBr(op, (*ts)[0], payload, flags);
+                    break;
                 }
-            } else if (targets.size() == 1) {
-                builder_.addBr(op, targets[0], payload, flags);
-            } else if (targets.size() == 2) {
-                builder_.addCondBr(op, nonBlock,
-                                   targets[0], targets[1],
-                                   payload, flags);
-            } else {
-                emit(DiagnosticCode::I_TextMalformed,
-                     std::format("terminator with {} block successors "
-                                 "(only 0/1/2 supported)",
-                                 targets.size()));
+                case TargetTerminatorKind::CondBr: {
+                    auto ts = resolveTargets();
+                    if (!ts.has_value() || ts->size() != 2) {
+                        if (ts.has_value()) {
+                            emit(DiagnosticCode::I_TextMalformed,
+                                 std::format("CondBr opcode '{}' requires 2 "
+                                             "successors; block declared {}",
+                                             mnem.text, ts->size()));
+                        }
+                        return;
+                    }
+                    builder_.addCondBr(op, nonBlock, (*ts)[0], (*ts)[1],
+                                       payload, flags);
+                    break;
+                }
+                case TargetTerminatorKind::Switch:
+                    emit(DiagnosticCode::I_TextMalformed,
+                         std::format("Switch terminator opcode '{}' not yet "
+                                     "supported in `.dsslir` round-trip "
+                                     "(reserved for LIR Switch lowering)",
+                                     mnem.text));
+                    return;
+                case TargetTerminatorKind::None:
+                    // Unreachable: `isTerm` derives from `terminatorKind
+                    // != None`, so this arm is unreachable by
+                    // construction. Kept as a `default`-style fail-loud
+                    // guard in case a future hand-built `Lir` ever lies
+                    // about its opcode's role.
+                    emit(DiagnosticCode::I_TextMalformed,
+                         std::format("opcode '{}' has terminatorKind=none "
+                                     "but reached terminator dispatch "
+                                     "(substrate invariant violation)",
+                                     mnem.text));
+                    return;
             }
         } else {
             builder_.addInst(op, result, operands, payload, flags);

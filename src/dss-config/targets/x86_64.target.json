@@ -5,14 +5,13 @@
     "name": "x86_64",
     "version": "0.2",
     "description": "x86_64 opcode set + physical register file + SysV AMD64 / Microsoft x64 calling conventions. Cycle 2b: regfile/ABI added. Cycle 3 (instruction selection) expands the opcode set to full c-subset corpus coverage.",
-    "$reservedFields": "The per-opcode minOperands/maxOperands/minSuccessors/maxSuccessors fields are documented in the JSON for completeness but are NOT yet enforced by the substrate — the LIR builder only checks terminator-ness against `isTerminator` today. Cycle 3 isel + the MIR verifier will start consuming the arity bounds; until then they are advisory metadata."
+    "$reservedFields": "The per-opcode minOperands/maxOperands fields are documented in the JSON for completeness but are NOT yet fully enforced by the substrate. Terminator-ness derives from `terminatorKind` (Br/CondBr/Switch/Return/Unreachable; default `none` = non-terminator); the parser's `parseInst` and `LirVerifier` consult it directly. Per-kind successor-count is enforced by `TargetSchemaData::validate()` via the shared `kTargetTerminatorShapes` table."
   },
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel. Every target must declare it as the first opcode so the substrate's `opcode == 0` check (in LirBuilder::addInst) catches default-constructed insts loudly.",
       "mnemonic":      "invalid",
       "result":        "none",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   0,
       "maxOperands":   0,
@@ -23,7 +22,6 @@
       "$comment": "Virtual-ISA pseudo-op: 'this LirReg is the function's k-th input parameter' (payload = k). ML7 calling-convention lowering rewrites `arg` to the real mov-from-arg-register sequence; before that, it represents the parameter as a virtreg that ML5 cycle 3 MIR→LIR isel can consume directly. Every target backend needs SOME representation of 'i-th function parameter'; pre-regalloc this is the uniform shape.",
       "mnemonic":      "arg",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   0,
       "maxOperands":   0,
@@ -33,7 +31,6 @@
     {
       "mnemonic":      "mov",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
@@ -43,7 +40,6 @@
     {
       "mnemonic":      "add",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   2,
       "maxOperands":   2,
@@ -53,7 +49,6 @@
     {
       "mnemonic":      "sub",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   2,
       "maxOperands":   2,
@@ -64,7 +59,6 @@
       "$comment": "2-operand multiply. x86 has both 2-op `imul reg, reg` (writes the low half to the destination — what cycle 3a uses) and 1-op `mul/imul reg` (writes rdx:rax with the full double-width product — needed only when overflow detection or 128-bit results matter; cycle 3c/AS1 lower those via a different opcode pseudonym). Cycle 3a sticks to the low-half-only shape.",
       "mnemonic":      "mul",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   2,
       "maxOperands":   2,
@@ -74,7 +68,6 @@
     {
       "mnemonic":      "cmp",
       "result":        "none",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   2,
       "maxOperands":   2,
@@ -85,7 +78,6 @@
       "$comment": "Materialize a 0/1 boolean from FLAGS. Payload carries the TargetCondCode (eq/ne/slt/.../uge); the LIR substrate is condition-blind. ML6 regalloc treats FLAGS as an implicit predecessor; AS1 emits the real x86_64 setcc-byte + movzx zero-extend sequence.",
       "mnemonic":      "setcc",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   0,
       "maxOperands":   0,
@@ -96,7 +88,7 @@
       "$comment": "Hard-trap / 'this code path is unreachable'. Cycle 3b lowers MIR Unreachable via `LirBuilder::addUnreachable` (the dedicated zero-successor terminator API added in cycle 3b's review fix-up). AS1 maps to x86_64 ud2; ML6 keeps it block-sealing-equivalent.",
       "mnemonic":      "unreachable",
       "result":        "none",
-      "isTerminator":  true,
+      "terminatorKind": "unreachable",
       "hasSideEffects": true,
       "minOperands":   0,
       "maxOperands":   0,
@@ -106,7 +98,7 @@
     {
       "mnemonic":      "jmp",
       "result":        "none",
-      "isTerminator":  true,
+      "terminatorKind": "br",
       "hasSideEffects": true,
       "minOperands":   1,
       "maxOperands":   1,
@@ -116,7 +108,7 @@
     {
       "mnemonic":      "jcc",
       "result":        "none",
-      "isTerminator":  true,
+      "terminatorKind": "cond-br",
       "hasSideEffects": true,
       "minOperands":   0,
       "maxOperands":   255,
@@ -126,7 +118,6 @@
     {
       "mnemonic":      "call",
       "result":        "optional",
-      "isTerminator":  false,
       "hasSideEffects": true,
       "isCall":        true,
       "minOperands":   1,
@@ -137,7 +128,7 @@
     {
       "mnemonic":      "ret",
       "result":        "none",
-      "isTerminator":  true,
+      "terminatorKind": "return",
       "hasSideEffects": true,
       "minOperands":   0,
       "maxOperands":   1,
@@ -148,7 +139,6 @@
       "$comment": "Allocate a stack-frame slot (cycle 3c). Cycle 3c is the pass-through layer: payload is threaded verbatim from MIR Alloca (currently 0 — MIR does not yet encode size/align; that lands when ML6's frame-layout phase pulls on it). Result is a pointer-class virtreg holding the slot's effective address. AS1 turns this into a frame-relative `lea` once the frame layout is known.",
       "mnemonic":      "alloca",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   0,
       "maxOperands":   0,
@@ -159,7 +149,6 @@
       "$comment": "Load from memory. Operands: [base_reg, MemBase(scale=1), MemOffset(disp)]. Optional index-reg arm added in cycle 3d. AS1 emits `mov reg, [base + disp]` or RIP-relative for global addresses.",
       "mnemonic":      "load",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   3,
       "maxOperands":   3,
@@ -170,7 +159,6 @@
       "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)]. No result. AS1 emits `mov [base + disp], reg`.",
       "mnemonic":      "store",
       "result":        "none",
-      "isTerminator":  false,
       "hasSideEffects": true,
       "minOperands":   4,
       "maxOperands":   4,
@@ -181,7 +169,6 @@
       "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)]. AS1 emits x86_64 `lea reg, [base + index*scale + disp]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm in cycle 3d.",
       "mnemonic":      "lea",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   3,
       "maxOperands":   4,
@@ -192,7 +179,6 @@
       "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). Operands: [src_reg]. Width comes from the result reg's class + the source reg's width-of-record. AS1 emits movsx.",
       "mnemonic":      "sext",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
@@ -203,7 +189,6 @@
       "$comment": "Zero-extend integer (cycle 3c cast lowering for MIR ZExt). Operands: [src_reg]. AS1 emits movzx.",
       "mnemonic":      "zext",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
@@ -214,7 +199,6 @@
       "$comment": "Truncate integer (cycle 3c cast lowering for MIR Trunc). Operands: [src_reg]. AS1 emits mov of the low N bits (effectively a no-op on x86_64 since registers alias subregs).",
       "mnemonic":      "trunc",
       "result":        "value",
-      "isTerminator":  false,
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
@@ -224,149 +208,127 @@
     {
       "$comment": "Bitwise AND. Cycle 3d bitwise wave — same shape as add/sub/mul. AS1 emits x86_64 `and`.",
       "mnemonic": "and", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "mnemonic": "or",  "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "mnemonic": "xor", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Logical left shift. Same opcode shape as add/sub.",
       "mnemonic": "shl", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Logical right shift (LShr). AS1 emits x86_64 `shr`.",
       "mnemonic": "shr_l", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Arithmetic right shift (AShr). AS1 emits x86_64 `sar`.",
       "mnemonic": "shr_a", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Bitwise NOT — 1-operand. AS1 emits x86_64 `not`.",
       "mnemonic": "not", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Integer two's-complement negate. AS1 emits x86_64 `neg`.",
       "mnemonic": "neg", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Float arithmetic (cycle 3d FPR wave). FAdd → `addsd`/`addss` per width; cycle 3d emits the abstract opcode and lets AS1 pick the right scalar variant from the operand width.",
       "mnemonic": "fadd", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "mnemonic": "fsub", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "mnemonic": "fmul", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "mnemonic": "fdiv", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 2, "maxOperands": 2,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Float unary negate. AS1 emits xorps reg, [.LC0_signbit] OR subss zero, reg — the abstract opcode hides this.",
       "mnemonic": "fneg", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). AS1 emits cvtsd2ss / cvtss2sd.",
       "mnemonic": "fpcvt", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Float-to-signed-integer conversion (FPToSI). AS1 emits cvttss2si / cvttsd2si (truncating).",
       "mnemonic": "fp_to_si", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Float-to-unsigned-integer conversion (FPToUI). x86 has no direct opcode; AS1 emits a guarded cvttsd2si sequence.",
       "mnemonic": "fp_to_ui", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Signed-integer-to-float (SIToFP). AS1 emits cvtsi2ss / cvtsi2sd.",
       "mnemonic": "si_to_fp", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Unsigned-integer-to-float (UIToFP). Similar AS1 guarded sequence.",
       "mnemonic": "ui_to_fp", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Cross-class bit-pattern move (GPR↔FPR). AS1 emits x86_64 `movq` (the QWord variant). Cycle-3d Bitcast lowers via this opcode whenever src and dst register classes differ; same-class Bitcasts continue to use `mov` (handled by cycle 3c).",
       "mnemonic": "movq_xclass", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Intrinsic call. Payload = intrinsic id (per HirIntrinsicRegistry / MIR convention). Operands = args. Result is optional (some intrinsics produce values, some don't). AS1 maps the intrinsic id to its concrete sequence (e.g. memcpy, debugtrap, sqrt) per target. Cycle 3e lowers MIR IntrinsicCall to this opcode.",
       "mnemonic": "intrinsic_call", "result": "optional",
-      "isTerminator": false, "hasSideEffects": true, "isCall": true,
       "minOperands": 0, "maxOperands": 255,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Spill reload pseudo-op. Payload = spill-slot index (LirSpillSlot.v). Result = the reloaded value's physical reg. The encoder/ML7 materializes this as `mov result, [stackPointer + slotOffset]`; the exact stackPointer + offset come from per-target callconv lowering. Target-blind at LIR tier.",
       "mnemonic": "frame_load", "result": "value",
-      "isTerminator": false, "hasSideEffects": false,
       "minOperands": 0, "maxOperands": 0,
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
       "$comment": "Spill store pseudo-op. Payload = spill-slot index. Operand[0] = the physical reg whose value is being stored. The encoder/ML7 materializes this as `mov [stackPointer + slotOffset], operand`. Target-blind at LIR tier.",
       "mnemonic": "frame_store", "result": "none",
-      "isTerminator": false, "hasSideEffects": true,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
     }

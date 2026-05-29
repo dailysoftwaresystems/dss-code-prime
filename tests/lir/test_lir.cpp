@@ -148,7 +148,7 @@ TEST(Lir, TargetSchemaLoadsX86_64FromJson) {
     auto const* slot0 = s.opcodeInfo(0);
     ASSERT_NE(slot0, nullptr);
     EXPECT_EQ(slot0->mnemonic, "invalid");
-    EXPECT_FALSE(slot0->isTerminator);
+    EXPECT_FALSE(slot0->isTerminator());
     // ret is a terminator.
     auto retIdx = s.opcodeByMnemonic("ret");
     ASSERT_TRUE(retIdx.has_value());

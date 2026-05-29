@@ -259,11 +259,11 @@ rewriteOneFunc(Lir const&               src,
             }
 
             auto const* info = schema.opcodeInfo(op);
-            bool const isTerm = (info != nullptr && info->isTerminator);
+            bool const isTerm = (info != nullptr && info->isTerminator());
             if (isTerm) {
                 auto const succs = src.blockSuccessors(srcBlock);
                 if (!lir_pass_util::emitTerminator(b, op, info, succs, newOps,
-                                                   payload, srcToDst,
+                                                   payload, flags, srcToDst,
                                                    "rewrite", reporter)) {
                     return false;
                 }

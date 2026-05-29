@@ -35,6 +35,10 @@ struct Collector {
     return std::nullopt;
 }
 
+// Note: `targetTerminatorKindFromName` lives in `target_schema.hpp`
+// alongside the enum, so loader + future emit-side serializers share
+// one source of truth for the string mapping.
+
 // Single helper for "read a bounded non-negative integer field". Replaces
 // the cycle-2b-first-cut `readByte` + `readU16` duplication — the only
 // real differences were the upper bound and the output type, both of
@@ -185,15 +189,39 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             continue;
         }
         info.result = *rr;
-        // Booleans (optional, default false).
-        if (o.contains("isTerminator") && o.at("isTerminator").is_boolean()) {
-            info.isTerminator = o.at("isTerminator").get<bool>();
-        }
+        // Booleans (optional, default false). Note: `isTerminator` is
+        // NOT a JSON field — it derives from `terminatorKind != none`.
+        // Earlier draft accepted both fields; the redundancy invited
+        // silent disagreement bugs. Single source of truth wins.
         if (o.contains("hasSideEffects") && o.at("hasSideEffects").is_boolean()) {
             info.hasSideEffects = o.at("hasSideEffects").get<bool>();
         }
         if (o.contains("isCall") && o.at("isCall").is_boolean()) {
             info.isCall = o.at("isCall").get<bool>();
+        }
+        // terminatorKind (optional — default is `None`, i.e. not a
+        // terminator). MUST be a string when present; silent type
+        // mismatches would let a `terminatorKind: 4` (integer) slip
+        // through as the default and silently mis-classify the opcode.
+        if (o.contains("terminatorKind")) {
+            auto const& tkNode = o.at("terminatorKind");
+            if (!tkNode.is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/opcodes/{}/terminatorKind", i),
+                          "'terminatorKind' must be a string (one of "
+                          "'none' / 'br' / 'cond-br' / 'switch' / "
+                          "'return' / 'unreachable')");
+            } else {
+                auto const tk = targetTerminatorKindFromName(tkNode.get<std::string>());
+                if (tk.has_value()) {
+                    info.terminatorKind = *tk;
+                } else {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/terminatorKind", i),
+                              "expected 'none' / 'br' / 'cond-br' / "
+                              "'switch' / 'return' / 'unreachable'");
+                }
+            }
         }
         // Arity bounds (optional, default 0). Out-of-range values are
         // diagnosed (the schema is rejected by the final fatal-scan);

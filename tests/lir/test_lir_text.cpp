@@ -963,6 +963,62 @@ TEST(LirTextRoundTrip, NegativeImmInt) {
     EXPECT_NE(text.find("mov #-5"), std::string::npos);
 }
 
+TEST(LirTextRoundTrip, UnreachableTerminatorRoundTripsLossless) {
+    // Test-analyzer rating 7 fold-now from cycle 3 review — `unreachable`
+    // was the only terminator opcode with no round-trip coverage.
+    // Exercises the schema-driven dispatch's `Unreachable` arm in
+    // `parseInst`. Validates the JSON's terminatorKind="unreachable"
+    // routes through `LirBuilder::addUnreachable` (zero successors,
+    // zero operands) and re-emits byte-identically.
+    auto sch = shippedX86();
+    auto const unreachableOp = sch->opcodeByMnemonic("unreachable");
+    ASSERT_TRUE(unreachableOp.has_value());
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    b.addUnreachable(*unreachableOp);
+    Lir lir = std::move(b).finish();
+    LirTextContext ctx;
+    std::string const text = roundTripOrFail(
+        lir, *sch, ctx, "unreachable terminator");
+    EXPECT_NE(text.find("unreachable ; payload=0 flags=0"),
+              std::string::npos)
+        << "unreachable round-trips with no operands AND zero payload/flags";
+}
+
+TEST(LirTextRoundTrip, IntrinsicCallPayloadAndArgsRoundTrip) {
+    // Test-analyzer rating 8 — `intrinsic_call` is non-terminator with
+    // `payload = intrinsic id` semantics. Cycle 2 fold-now coverage gap
+    // surfaced + closed in the post-cycle-2 cleanup pass.
+    auto sch = shippedX86();
+    auto const movOp     = sch->opcodeByMnemonic("mov");
+    auto const intrinOp  = sch->opcodeByMnemonic("intrinsic_call");
+    auto const retOp     = sch->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value()
+             && intrinOp.has_value() && retOp.has_value());
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const rax = makePhysicalReg(0, LirRegClass::GPR);
+    std::array<LirOperand, 1> mov{LirOperand::makeImmInt32(7)};
+    b.addInst(*movOp, rax, mov);
+    // intrinsic_call with payload = some intrinsic id (e.g. 42) AND an
+    // argument operand. Result is the rax reg (Optional rule).
+    std::array<LirOperand, 1> args{LirOperand::makeReg(rax)};
+    b.addInst(*intrinOp, rax, args, /*payload=*/42, /*flags=*/0);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+    LirTextContext ctx;
+    std::string const text = roundTripOrFail(
+        lir, *sch, ctx, "intrinsic_call w/ payload=42 + reg arg");
+    EXPECT_NE(text.find("intrinsic_call rax ; payload=42 flags=0"),
+              std::string::npos)
+        << "intrinsic_call must round-trip its payload (intrinsic id) "
+           "and its operand list lossless";
+}
+
 TEST(LirTextRoundTrip, FprVRegRoundTripsWithClassTag) {
     // 3-agent CRITICAL fold pin — FPR vreg must round-trip without
     // silently demoting to GPR. The `%v.N:fpr` form carries the class

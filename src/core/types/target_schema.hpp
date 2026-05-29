@@ -6,10 +6,12 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeKind for regClassForCoreType
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <span>
 #include <string>
 #include <string_view>
@@ -232,6 +234,84 @@ struct DSS_EXPORT TargetCallingConvention {
     std::optional<NamedRegisterRef> stackPointer;
 };
 
+// Discriminates the FIVE concrete terminator shapes a target's opcode
+// table can declare. Required because the `.dsslir` parser
+// (`parseInst` in `src/lir/lir_text.cpp`) dispatches terminator
+// construction (`addBr` / `addCondBr` / `addReturn` / `addUnreachable`)
+// based on the opcode's role, NOT on operand-list emptiness heuristics
+// — earlier draft used "0 successors + 0 operands + result=None →
+// Unreachable, else Return" which silently mis-classified any future
+// target whose `ret` opcode takes zero operands.
+//
+// `None` is the default for non-terminator opcodes. `TargetOpcodeInfo::
+// isTerminator()` derives boolean terminator-ness from this single
+// field — the substrate has ONE source of truth, not a redundant pair.
+enum class TargetTerminatorKind : std::uint8_t {
+    None        = 0,    // non-terminator opcode (default)
+    Br          = 1,    // 1 successor, embeds BlockRef operand (LirBuilder::addBr)
+    CondBr      = 2,    // 2 successors, NO BlockRef operands       (LirBuilder::addCondBr)
+    Switch      = 3,    // >=2 successors                           (LirBuilder::addSwitch — reserved)
+    Return      = 4,    // 0 successors, may carry return-value ops (LirBuilder::addReturn)
+    Unreachable = 5,    // 0 successors, 0 operands                 (LirBuilder::addUnreachable)
+};
+
+// Canonical string form used by `.target.json` and `.dsslir` text.
+// Single source of truth for the loader (string → enum) and any future
+// emit-side serializer (enum → string).
+[[nodiscard]] constexpr std::string_view
+targetTerminatorKindName(TargetTerminatorKind k) noexcept {
+    switch (k) {
+        case TargetTerminatorKind::None:        return "none";
+        case TargetTerminatorKind::Br:          return "br";
+        case TargetTerminatorKind::CondBr:      return "cond-br";
+        case TargetTerminatorKind::Switch:      return "switch";
+        case TargetTerminatorKind::Return:      return "return";
+        case TargetTerminatorKind::Unreachable: return "unreachable";
+    }
+    return "none";
+}
+
+[[nodiscard]] constexpr std::optional<TargetTerminatorKind>
+targetTerminatorKindFromName(std::string_view s) noexcept {
+    if (s == "none")        return TargetTerminatorKind::None;
+    if (s == "br")          return TargetTerminatorKind::Br;
+    if (s == "cond-br")     return TargetTerminatorKind::CondBr;
+    if (s == "switch")      return TargetTerminatorKind::Switch;
+    if (s == "return")      return TargetTerminatorKind::Return;
+    if (s == "unreachable") return TargetTerminatorKind::Unreachable;
+    return std::nullopt;
+}
+
+// Per-kind contract: successor-count window the loader's `validate()`
+// enforces AND `.dsslir` parser dispatch consults. Single source of
+// truth — adding e.g. `IndirectBr` is one row here, not two switches.
+// `None` is omitted: non-terminators are policed by the `maxSuccessors
+// == 0` rule on the opposite branch.
+struct TargetTerminatorShape {
+    TargetTerminatorKind kind;
+    std::uint8_t         minSuccessors;
+    std::uint8_t         maxSuccessors;
+    // Sentinel: `Switch.maxSuccessors == 255` means "unbounded above
+    // the minimum" — Switch arity is open-ended by design. Validator
+    // treats `maxSuccessors == 255` as "no upper bound".
+};
+
+inline constexpr std::array<TargetTerminatorShape, 5> kTargetTerminatorShapes{{
+    { TargetTerminatorKind::Br,          1, 1   },
+    { TargetTerminatorKind::CondBr,      2, 2   },
+    { TargetTerminatorKind::Switch,      2, 255 },  // 255 = unbounded sentinel
+    { TargetTerminatorKind::Return,      0, 0   },
+    { TargetTerminatorKind::Unreachable, 0, 0   },
+}};
+
+[[nodiscard]] constexpr TargetTerminatorShape const*
+findTerminatorShape(TargetTerminatorKind k) noexcept {
+    for (auto const& s : kTargetTerminatorShapes) {
+        if (s.kind == k) return &s;
+    }
+    return nullptr;  // `None` — non-terminator
+}
+
 // Per-opcode descriptor — populated from the JSON `opcodes` array.
 // One row per opcode; index in the vector IS the opcode's numeric
 // value (stored as `std::uint16_t` in the LIR instruction PODs).
@@ -242,21 +322,35 @@ struct DSS_EXPORT TargetCallingConvention {
 // the MIR verifier will start consuming the operand/successor bounds;
 // until then they document expected shape without enforcing it.
 struct DSS_EXPORT TargetOpcodeInfo {
-    std::string      mnemonic;
-    TargetResultRule result         = TargetResultRule::None;
-    bool             isTerminator   = false;
-    bool             hasSideEffects = false;
+    std::string          mnemonic;
+    TargetResultRule     result         = TargetResultRule::None;
+    bool                 hasSideEffects = false;
     // True iff this opcode performs a function call (or an intrinsic
     // dispatch). The register allocator uses this to determine which
     // ranges cross a call boundary and therefore must avoid caller-
     // saved registers. Promotes "call-detection" out of mnemonic
     // matching (the allocator was previously matching "call" /
     // "intrinsic_call" strings, breaking target-agnosticism).
-    bool             isCall         = false;
-    std::uint8_t     minOperands    = 0;
-    std::uint8_t     maxOperands    = 0;
-    std::uint8_t     minSuccessors  = 0;
-    std::uint8_t     maxSuccessors  = 0;
+    bool                 isCall         = false;
+    // Concrete terminator shape (see TargetTerminatorKind). Drives the
+    // `.dsslir` parser's `parseInst` terminator-dispatch fork AND
+    // `LirVerifier`'s successor-count cross-check. `None` for all
+    // non-terminator opcodes. The previous design carried a separate
+    // `isTerminator` bool too; that field was deleted because it was
+    // derivable from `terminatorKind != None` (3-agent convergence
+    // ML8 cycle 3 review: type-design + simplifier + silent-failure).
+    TargetTerminatorKind terminatorKind = TargetTerminatorKind::None;
+    std::uint8_t         minOperands    = 0;
+    std::uint8_t         maxOperands    = 0;
+    std::uint8_t         minSuccessors  = 0;
+    std::uint8_t         maxSuccessors  = 0;
+
+    // Terminator-ness derives from `terminatorKind` — single source of
+    // truth. Callers ported from the old `isTerminator` bool field
+    // gain a trailing `()` and keep working unchanged.
+    [[nodiscard]] constexpr bool isTerminator() const noexcept {
+        return terminatorKind != TargetTerminatorKind::None;
+    }
 };
 
 namespace detail {
@@ -385,7 +479,7 @@ public:
     // higher level, not silently pass as a terminator).
     [[nodiscard]] bool isTerminator(std::uint16_t op) const noexcept {
         auto const* info = opcodeInfo(op);
-        return info != nullptr && info->isTerminator;
+        return info != nullptr && info->isTerminator();
     }
 
     // Look up an opcode index by mnemonic. Returns nullopt for an

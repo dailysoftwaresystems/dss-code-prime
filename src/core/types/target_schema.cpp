@@ -84,20 +84,37 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                  std::format("opcode '{}': minSuccessors ({}) > maxSuccessors ({})",
                              o.mnemonic, o.minSuccessors, o.maxSuccessors));
         }
-        // Terminator with min>0 + max==0 is self-contradictory. The
-        // (min=0, max=0) shape stays legal — that's the Return/Unreachable
-        // case.
-        if (o.isTerminator && o.minSuccessors > 0 && o.maxSuccessors == 0) {
+        // Non-terminator opcodes (`terminatorKind == None`) cannot have
+        // declared CFG successors. Only terminators have CFG-out edges.
+        if (!o.isTerminator() && o.maxSuccessors > 0) {
             fail(std::format("/opcodes/{}/maxSuccessors", i),
-                 std::format("opcode '{}': terminator with minSuccessors>0 but maxSuccessors==0",
-                             o.mnemonic));
-        }
-        // Non-terminator with declared successors is structurally
-        // impossible — only terminators have CFG successors.
-        if (!o.isTerminator && o.maxSuccessors > 0) {
-            fail(std::format("/opcodes/{}/maxSuccessors", i),
-                 std::format("opcode '{}': non-terminator with maxSuccessors>0 ({})",
+                 std::format("opcode '{}': non-terminator (terminatorKind=none) "
+                             "with maxSuccessors>0 ({})",
                              o.mnemonic, o.maxSuccessors));
+        }
+        // Per-kind successor-count contract via the `kTargetTerminatorShapes`
+        // table — single source of truth shared between the validator
+        // AND the `.dsslir` parser dispatch in `lir_text.cpp`. The
+        // 255-sentinel on `Switch.maxSuccessors` means "unbounded above
+        // the minimum"; the validator treats it as no upper bound.
+        if (auto const* shape = findTerminatorShape(o.terminatorKind)) {
+            bool const minWrong = o.minSuccessors < shape->minSuccessors;
+            bool const maxWrong =
+                (shape->maxSuccessors != 255)
+                ? (o.maxSuccessors != shape->maxSuccessors
+                   || o.minSuccessors != shape->minSuccessors)
+                : (o.maxSuccessors < shape->minSuccessors);
+            if (minWrong || maxWrong) {
+                fail(std::format("/opcodes/{}/maxSuccessors", i),
+                     std::format("opcode '{}': terminatorKind={} requires "
+                                 "successors in [{}, {}] (got min={}, max={})",
+                                 o.mnemonic,
+                                 targetTerminatorKindName(o.terminatorKind),
+                                 shape->minSuccessors,
+                                 (shape->maxSuccessors == 255 ? "+inf" :
+                                  std::format("{}", shape->maxSuccessors)),
+                                 o.minSuccessors, o.maxSuccessors));
+            }
         }
     }
 

@@ -371,18 +371,127 @@ TEST(TargetSchema, OpcodeNonTerminatorWithSuccessorsRejected) {
 }
 
 TEST(TargetSchema, OpcodeReturnShapeIsLegal) {
-    // Positive control: an opcode with isTerminator=true and
-    // (minSuccessors=0, maxSuccessors=0) must NOT be flagged — that's
-    // the Return / Unreachable shape.
+    // Positive control: a `return`-kinded opcode with
+    // (minSuccessors=0, maxSuccessors=0) must validate cleanly.
+    // `terminatorKind` is MANDATORY on every terminator (validate()
+    // enforces `isTerminator ↔ terminatorKind ≠ NotATerminator`).
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[
               {"mnemonic":"invalid","result":"none"},
               {"mnemonic":"ret","result":"none","isTerminator":true,
+               "terminatorKind":"return",
                "minSuccessors":0,"maxSuccessors":0}
             ]})");
     ASSERT_TRUE(r.has_value())
         << "Return-shaped opcode (terminator + min=max=0) must validate cleanly";
+}
+
+TEST(TargetSchema, TerminatorKindIsTheSingleSourceOfTruth) {
+    // With the `isTerminator` boolean field deleted (3-agent
+    // convergence ML8 cycle 3 review: type-design + simplifier +
+    // silent-failure), terminator-ness derives solely from
+    // `terminatorKind != none`. The JSON `isTerminator` key is
+    // IGNORED by the loader (kept here only to prove the loader
+    // doesn't choke on a stray legacy key — but the value has no
+    // effect). What matters is `terminatorKind`.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"add","result":"value","isTerminator":true,
+               "minOperands":2,"maxOperands":2}
+            ]})");
+    ASSERT_TRUE(r.has_value())
+        << "Legacy `isTerminator` key must be silently ignored; terminator-"
+           "ness derives from `terminatorKind` (default `none` = non-"
+           "terminator).";
+    auto info = r.value()->opcodeInfo(1);
+    ASSERT_NE(info, nullptr);
+    EXPECT_FALSE(info->isTerminator())
+        << "no `terminatorKind` declared → derived isTerminator() is false";
+}
+
+TEST(TargetSchema, TerminatorKindNonStringRejected) {
+    // Silent-failure F1 (ML8 cycle 3 review): a non-string
+    // `terminatorKind` value (e.g. integer, null) must be loud-rejected.
+    // Earlier draft silently fell back to the default `none`, masking
+    // the schema author's intent.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"ret","result":"none","terminatorKind":4,
+               "minSuccessors":0,"maxSuccessors":0}
+            ]})");
+    ASSERT_FALSE(r.has_value())
+        << "non-string `terminatorKind` must reject loudly";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, TerminatorKindBrRequiresOneSuccessor) {
+    // `br`-kinded opcode declaring (min=max=2) is contradictory.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"badbr","result":"none",
+               "terminatorKind":"br",
+               "minSuccessors":2,"maxSuccessors":2}
+            ]})");
+    ASSERT_FALSE(r.has_value())
+        << "br-kinded opcode requires exactly 1 successor";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, TerminatorKindCondBrRequiresTwoSuccessors) {
+    // Companion to the Br test — locks the `kTargetTerminatorShapes`
+    // table's CondBr row. Test-analyzer rating 7 fold-now from cycle 3.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"badcondbr","result":"none",
+               "terminatorKind":"cond-br",
+               "minSuccessors":1,"maxSuccessors":1}
+            ]})");
+    ASSERT_FALSE(r.has_value())
+        << "cond-br-kinded opcode requires exactly 2 successors";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, TerminatorKindSwitchAllowsArbitrarySuccessorCount) {
+    // Positive control for the `Switch.maxSuccessors == 255`
+    // (unbounded sentinel) in `kTargetTerminatorShapes`. Test-analyzer
+    // rating 8 — the Switch arm had zero coverage. A future refactor
+    // that drops the 255-sentinel handling would silently constrain
+    // Switch arity; this test traps it.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"sw","result":"none",
+               "terminatorKind":"switch",
+               "minSuccessors":2,"maxSuccessors":8}
+            ]})");
+    ASSERT_TRUE(r.has_value())
+        << "switch-kinded opcode with min=2, max=8 must validate (the "
+           "shape table's Switch row is unbounded above min=2).";
+}
+
+TEST(TargetSchema, TerminatorKindSwitchRejectsSubMinimumSuccCount) {
+    // Negative: Switch with min=1 (< 2) is degenerate by design.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"sw","result":"none",
+               "terminatorKind":"switch",
+               "minSuccessors":1,"maxSuccessors":3}
+            ]})");
+    ASSERT_FALSE(r.has_value())
+        << "switch with minSuccessors<2 violates the shape table";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
 
 // ─── cycle 2b — register-file validate() rules ────────────────────────────

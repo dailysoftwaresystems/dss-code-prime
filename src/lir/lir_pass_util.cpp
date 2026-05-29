@@ -29,38 +29,68 @@ bool emitTerminator(LirBuilder& b, std::uint16_t op,
                     std::span<LirBlockId const> succs,
                     std::span<LirOperand const> newOps,
                     std::uint32_t payload,
+                    std::uint8_t  flags,
                     std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst,
                     std::string_view passName,
                     DiagnosticReporter& reporter) {
-    switch (succs.size()) {
-        case 0:
-            if (info != nullptr
-                && info->minSuccessors == 0 && info->maxSuccessors == 0
-                && info->result == TargetResultRule::None
-                && newOps.empty()) {
-                b.addUnreachable(op);
-            } else {
-                b.addReturn(op, newOps);
-            }
+    // Schema-driven dispatch via `info->terminatorKind` — shared with
+    // the `.dsslir` parser. Earlier draft used a successor-count +
+    // operand-emptiness heuristic that silently mis-classified any
+    // opcode whose `ret` takes 0 operands (same silent-failure path
+    // the parser dispatch was rewritten to close in ML8 cycle 3).
+    if (info == nullptr) {
+        report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+               DiagnosticSeverity::Error,
+               std::format("{}: terminator opcode {} has no schema entry",
+                           passName, static_cast<unsigned>(op)));
+        return false;
+    }
+    auto resolveAt = [&](std::size_t i) -> LirBlockId {
+        return srcToDst.at(succs[i].v);
+    };
+    switch (info->terminatorKind) {
+        case TargetTerminatorKind::Return:
+            b.addReturn(op, newOps, payload, flags);
             return true;
-        case 1:
-            b.addBr(op, srcToDst.at(succs[0].v));
+        case TargetTerminatorKind::Unreachable:
+            b.addUnreachable(op, payload, flags);
             return true;
-        case 2:
-            b.addCondBr(op, newOps,
-                        srcToDst.at(succs[0].v),
-                        srcToDst.at(succs[1].v), payload);
+        case TargetTerminatorKind::Br:
+            if (succs.size() != 1) break;  // diagnostic below
+            b.addBr(op, resolveAt(0), payload, flags);
             return true;
-        default:
+        case TargetTerminatorKind::CondBr:
+            if (succs.size() != 2) break;
+            b.addCondBr(op, newOps, resolveAt(0), resolveAt(1),
+                        payload, flags);
+            return true;
+        case TargetTerminatorKind::Switch:
             report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
                    DiagnosticSeverity::Error,
-                   std::format("{}: terminator opcode {} has {} successors; "
-                               "only 0/1/2 supported",
-                               passName,
-                               static_cast<unsigned>(op),
-                               static_cast<unsigned>(succs.size())));
+                   std::format("{}: Switch terminator opcode {} not yet "
+                               "supported by this pass (reserved for LIR "
+                               "Switch lowering)",
+                               passName, static_cast<unsigned>(op)));
+            return false;
+        case TargetTerminatorKind::None:
+            report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                   DiagnosticSeverity::Error,
+                   std::format("{}: opcode {} has terminatorKind=none yet "
+                               "reached the terminator-emit path (caller "
+                               "must filter via info->isTerminator())",
+                               passName, static_cast<unsigned>(op)));
             return false;
     }
+    // Reached only when Br/CondBr had wrong successor count for its
+    // declared kind — schema invariant violated upstream.
+    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+           DiagnosticSeverity::Error,
+           std::format("{}: terminator opcode {} ({}) has {} successors "
+                       "(schema invariant violated)",
+                       passName, static_cast<unsigned>(op),
+                       targetTerminatorKindName(info->terminatorKind),
+                       static_cast<unsigned>(succs.size())));
+    return false;
 }
 
 } // namespace dss::lir_pass_util

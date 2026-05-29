@@ -253,6 +253,7 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
               {"mnemonic":"invalid","result":"none"},
               {"mnemonic":"add","result":"value","minOperands":2,"maxOperands":2},
               {"mnemonic":"ret","result":"none","isTerminator":true,
+               "terminatorKind":"return",
                "minOperands":0,"maxOperands":1}
             ]})");
     ASSERT_TRUE(incomplete.has_value());
