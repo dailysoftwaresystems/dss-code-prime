@@ -3,7 +3,7 @@
 #include "core/export.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"                 // HirSourceMap
-#include "hir/lowering/hir_literal_pool.hpp"
+#include "hir/hir_literal_pool.hpp"
 
 #include <memory>
 

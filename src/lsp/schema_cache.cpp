@@ -46,7 +46,7 @@ ShippedDiscoveryResult SchemaCache::discoverShippedLanguages(
     std::error_code ec;
     fs::path here = startPath.value_or(fs::current_path(ec));
     for (int i = 0; i < 8 && !here.empty(); ++i) {
-        const fs::path candidate = here / "src" / "source-config" / "languages";
+        const fs::path candidate = here / "src" / "dss-config" / "sources";
         if (fs::is_directory(candidate, ec)) {
             std::vector<std::string> names;
             for (auto const& entry : fs::directory_iterator(candidate, ec)) {
@@ -162,7 +162,7 @@ SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
         if (!shippedDir_.has_value()) {
             return std::unexpected(SchemaResolveError{
                 SchemaResolveErrorKind::ShippedDirNotFound,
-                "shipped-language directory `src/source-config/languages` "
+                "shipped-language directory `src/dss-config/sources` "
                 "was not located within 8 parent levels of the working "
                 "directory; pass --schema-dir explicitly or invoke from "
                 "the repository"});

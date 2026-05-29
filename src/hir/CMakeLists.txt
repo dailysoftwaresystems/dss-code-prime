@@ -1,8 +1,11 @@
 add_library(hir OBJECT
+    const_eval.cpp
+    cst_const_eval.cpp
     hir.cpp
     hir_cursor.cpp
     hir_intrinsic_registry.cpp
     hir_kind_registry.cpp
+    hir_literal_pool.cpp
     hir_op_registry.cpp
     hir_text.cpp
     hir_verifier.cpp

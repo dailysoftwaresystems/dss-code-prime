@@ -1,13 +1,13 @@
 # FFI / Precompiled-Library Ingestion — Sub-Plan (11)
 
-> Owns **object-file readers** (ELF / PE / Mach-O / COFF / `.a` / `.lib` / `.so` / `.dll` / `.dylib`) + **C / C++ minimal header parser** + **ABI catalog** + **name-mangling readers** (Itanium / MSVC) + **extern-decl ingestion** into [HIR](./09-hir-plan%20-%20tbd.md) + the [core type lattice](./08.5-substrate-prep-plan%20-%20tbd.md). Per the user's mandate: "We will be able to read pre-compiled libraries (FFI)."
+> Owns **object-file readers** (ELF / PE / Mach-O / COFF / `.a` / `.lib` / `.so` / `.dll` / `.dylib`) + **C / C++ minimal header parser** + **ABI catalog** + **name-mangling readers** (Itanium / MSVC) + **extern-decl ingestion** into [HIR](./09-hir-plan%20-%20ok.md) + the [core type lattice](./08.5-substrate-prep-plan%20-%20ok.md). Per the user's mandate: "We will be able to read pre-compiled libraries (FFI)."
 
 ## 0. Status (snapshot)
 
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 production-critical. Without FFI we can't call libc → no `printf` → no useful binary. |
-| Predecessors  | ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (core type lattice). ✅ [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (`ExternFunction` / `ExternGlobal` nodes — HR1–HR11 ✅ 2026-05-26..28: the declarations landed at HR4 and the `FfiMetadata` / `HirFfiMap` side-table FFI ingestion populates is in place HR4–HR5, round-trip-serialized by HR7's `.dsshir` `@ffi(...)`; **HR9 added `externDecl`→ExternFunction/ExternGlobal lowering** (c-subset `externFuncTail` grammar split + `externDecl` semantics rule + `lowerExternDecl`), so the extern *surface* now lowers — the FFI *metadata* population (linkage/ABI/mangling from real binaries/headers) is still THIS plan's job; HR10 added tsql-subset lowering, HR11 ✅ done 2026-05-28 (multi-language CU lowering) — plan 09 complete). |
+| Predecessors  | ✅ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md) (core type lattice — complete). ✅ [`09-hir-plan`](./09-hir-plan%20-%20ok.md) (`ExternFunction` / `ExternGlobal` nodes — HR1–HR11 ✅ 2026-05-26..28: the declarations landed at HR4 and the `FfiMetadata` / `HirFfiMap` side-table FFI ingestion populates is in place HR4–HR5, round-trip-serialized by HR7's `.dsshir` `@ffi(...)`; **HR9 added `externDecl`→ExternFunction/ExternGlobal lowering** (c-subset `externFuncTail` grammar split + `externDecl` semantics rule + `lowerExternDecl`), so the extern *surface* now lowers — the FFI *metadata* population (linkage/ABI/mangling from real binaries/headers) is still THIS plan's job; HR10 added tsql-subset lowering, HR11 ✅ done 2026-05-28 (multi-language CU lowering) — plan 09 complete). |
 | Successors    | ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) LK6 consumes extern symbol declarations for import-table generation. |
 | Scope         | **Bounded.** FF1–FF6. v1 must read enough to declare libc / libSystem / msvcrt / kernel32 symbols. Full C++ name mangling (Itanium / MSVC) post-v1; C-style first. |
 
@@ -102,7 +102,7 @@ typedef unsigned long size_t;
 - `signature` = core lattice `FnSig` with v1 calling convention default (`CcSysV` / `CcMS64` per platform)
 - `linkage` = strong default
 
-Full C99 preprocessor is **out of v1** — the header mode accepts typedef + struct + extern + simple macros only. Real headers (glibc / Windows SDK) often need the preprocessor; v1 accepts hand-curated reduced headers shipped under `src/source-config/ffi-headers/`.
+Full C99 preprocessor is **out of v1** — the header mode accepts typedef + struct + extern + simple macros only. Real headers (glibc / Windows SDK) often need the preprocessor; v1 accepts hand-curated reduced headers shipped under `src/dss-config/ffi-headers/`.
 
 Open question §4.3: full preprocessor in v1 or v1.x?
 
@@ -176,7 +176,7 @@ Substrate tier (5-agent review) for FF3 (ABI catalog).
 
 | # | Question | Default if unanswered |
 |---|----------|-----------------------|
-| 1 | Header sources for libc — ship pre-reduced headers or read system headers? | **Pre-reduced headers** in `src/source-config/ffi-headers/{libc,libsystem,msvcrt,kernel32}/*.h`. Hermetic + small + version-stable. System-header parsing reserved post-v1. |
+| 1 | Header sources for libc — ship pre-reduced headers or read system headers? | **Pre-reduced headers** in `src/dss-config/ffi-headers/{libc,libsystem,msvcrt,kernel32}/*.h`. Hermetic + small + version-stable. System-header parsing reserved post-v1. |
 | 2 | C++ FFI in v1? | **No.** C-only. C++ Itanium / MSVC demangling reserved post-v1. |
 | 3 | Preprocessor support in header mode? | **Limited** — typedef + struct + extern + simple `#define`-only-macros. No `#include` chasing (use the pre-reduced headers); no function-like macros. |
 | 4 | TLS variable ingestion from binaries? | **Yes** — TLS extern globals emit `ExternGlobal` with `linkage: Tls` flag; linker LK5 handles. |

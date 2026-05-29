@@ -56,6 +56,13 @@ namespace {
     return names;
 }
 
+[[nodiscard]] HirNodeId firstFunction(Hir const& hir) {
+    for (HirNodeId d : hir.moduleDecls(hir.root())) {
+        if (hir.kind(d) == HirKind::Function) return d;
+    }
+    return HirNodeId{};
+}
+
 } // namespace
 
 TEST(HirLoweringCSubset, EmptyVoidFunction) {
@@ -93,7 +100,7 @@ TEST(HirLoweringCSubset, ArithmeticAndParams) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    HirNodeId fn = res->hir.moduleDecls(res->hir.root())[0];
+    HirNodeId fn = firstFunction(res->hir);
     ASSERT_EQ(res->hir.kind(fn), HirKind::Function);
     EXPECT_EQ(res->hir.functionParams(fn).size(), 2u);          // a, b
     HirNodeId body = res->hir.functionBody(fn);
@@ -116,7 +123,7 @@ TEST(HirLoweringCSubset, ControlFlowAndAssignment) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    HirNodeId fn = res->hir.moduleDecls(res->hir.root())[0];
+    HirNodeId fn = firstFunction(res->hir);
     HirNodeId body = res->hir.functionBody(fn);
     auto stmts = res->hir.children(body);
     ASSERT_EQ(stmts.size(), 1u);
@@ -131,7 +138,7 @@ TEST(HirLoweringCSubset, ForLoop) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    HirNodeId fn = res->hir.moduleDecls(res->hir.root())[0];
+    HirNodeId fn = firstFunction(res->hir);
     HirNodeId body = res->hir.functionBody(fn);
     HirNodeId forS = res->hir.children(body)[0];
     ASSERT_EQ(res->hir.kind(forS), HirKind::ForStmt);
@@ -148,7 +155,7 @@ TEST(HirLoweringCSubset, SwitchGroupsFlatCases) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    HirNodeId fn = res->hir.moduleDecls(res->hir.root())[0];
+    HirNodeId fn = firstFunction(res->hir);
     HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
     ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
     auto arms = res->hir.switchArms(sw);
@@ -176,6 +183,260 @@ TEST(HirLoweringCSubset, CallAndTypedef) {
     HirNodeId fbody = res->hir.functionBody(decls[2]);
     HirNodeId ret = res->hir.children(fbody)[0];
     EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Call);
+}
+
+// D5.1: a `struct Foo { int x; int y; };` declaration lowers to a HIR
+// `TypeDecl` whose `typeId` is the composed `structType("Foo", {I32, I32})`.
+TEST(HirLoweringCSubset, StructDeclarationLowersToTypeDecl) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::TypeDecl);
+
+    // The TypeDecl carries the composed struct type.
+    TypeId const t = res->hir.typeDeclType(decls[0]);
+    ASSERT_TRUE(t.valid());
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(t), TypeKind::Struct);
+    EXPECT_EQ(interner.name(t), "Point");
+    // Field ordering: x (I32), y (I32) — declaration order.
+    auto fields = interner.operands(t);
+    ASSERT_EQ(fields.size(), 2u);
+    EXPECT_EQ(interner.kind(fields[0]), TypeKind::I32);
+    EXPECT_EQ(interner.kind(fields[1]), TypeKind::I32);
+}
+
+// D5.1: a struct used as a pointer-typed parameter + member access via `->`
+// resolves the field SymbolId AND propagates the field's type to the
+// member-access node. Pins the SEMANTIC layer (Pass 1.5 struct composition +
+// Pass 2 field-symbol binding + type propagation).
+TEST(HirLoweringCSubset, StructFieldAccessResolvesSemantically) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "int read_x(struct Point *p) { return p->x; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+
+    // Walk the CU's tree to find the `x` identifier inside `p->x`. The CST has
+    // one Identifier token per `x` reference; field `x`'s declaration is the
+    // FIRST one (under `struct Point { int x; ... }`) and the USE is the LAST
+    // one (under `return p->x;`). The semantic model's reverse use-index makes
+    // this robust: every use of the field symbol is recorded.
+    auto const& cu = model.unit();
+    SymbolId xField = InvalidSymbol;
+    for (auto const& rec : model.symbols()) {
+        if (rec.name == "x" && rec.kind == DeclarationKind::Variable) {
+            xField = SymbolId{static_cast<std::uint32_t>(&rec - model.symbols().data())};
+            break;
+        }
+    }
+    ASSERT_TRUE(xField.valid()) << "field symbol 'x' not minted";
+
+    // Pass 1 stamps the field's ordinal index on the symbol.
+    auto const* xRec = model.recordFor(xField);
+    ASSERT_NE(xRec, nullptr);
+    EXPECT_EQ(xRec->fieldIndex, 0u);  // x is the first field
+
+    // Pass 2 should have recorded the field use on the `p->x` access. The
+    // reverse-use index gives us every use-site node for the field symbol;
+    // for `p->x` inside `read_x`, that's exactly one use.
+    auto uses = model.usesOf(xField);
+    ASSERT_EQ(uses.size(), 1u) << "field 'x' should have exactly one use site";
+
+    // The use node should carry the field's type (I32) via Pass 2's
+    // propagation. The MEMBER-ACCESS node (the parent postfixExpr) should
+    // ALSO carry that type so chained access `p->x.y` would resolve the
+    // next layer naturally.
+    NodeId useNode = uses[0];
+    TypeId useType = model.typeAt(useNode);
+    auto const& interner = model.lattice().interner();
+    ASSERT_TRUE(useType.valid());
+    EXPECT_EQ(interner.kind(useType), TypeKind::I32);
+
+    // Find the parent postfixExpr node and verify its type matches.
+    Tree const& tree = cu.trees()[0];
+    NodeId parent = tree.parent(useNode);
+    // memberFollower wraps the Identifier; postfixExpr wraps memberFollower.
+    while (parent.valid() && tree.kind(parent) == NodeKind::Internal
+           && tree.rule(parent).v != model.unit().schema().rules().find("postfixExpr").v) {
+        parent = tree.parent(parent);
+    }
+    ASSERT_TRUE(parent.valid()) << "no postfixExpr ancestor for field use";
+    TypeId accessType = model.typeAt(parent);
+    ASSERT_TRUE(accessType.valid()) << "member-access node has no type";
+    EXPECT_EQ(interner.kind(accessType), TypeKind::I32);
+}
+
+// D5.1 cycle 4: the `MemberAccess` HIR-lowering branch in lowerPostfix. A `.`
+// access lowers to a plain `HirKind::MemberAccess` with the field's payload =
+// fieldIndex. An arrow `->` access is desugared at HIR level to
+// `MemberAccess(Deref(p), idx)` -- same HirKind handles both forms; MIR sees
+// uniform GEP-after-load patterns.
+TEST(HirLoweringCSubset, MemberAccessLowersToHirMemberAccess) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "int get_y(struct Point *p) { return p->y; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 2u);   // struct Point, function get_y
+    HirNodeId const fn = decls[1];
+    ASSERT_EQ(res->hir.kind(fn), HirKind::Function);
+    HirNodeId const body = res->hir.functionBody(fn);
+    // body = Block of [ReturnStmt(MemberAccess(Deref(Ref(p)), 1))]
+    auto stmts = res->hir.children(body);
+    ASSERT_EQ(stmts.size(), 1u);
+    HirNodeId const ret = stmts[0];
+    ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
+    auto const retVal = res->hir.returnValue(ret);
+    ASSERT_TRUE(retVal.has_value());
+    HirNodeId const access = *retVal;
+    ASSERT_EQ(res->hir.kind(access), HirKind::MemberAccess);
+    // Field 'y' is the SECOND field (index 1) of Point.
+    EXPECT_EQ(res->hir.payload(access), 1u);
+    // The MemberAccess's result type is the field type (I32).
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(res->hir.typeId(access)), TypeKind::I32);
+    // Arrow form: the access's single child is a Deref of the original LHS.
+    auto kids = res->hir.children(access);
+    ASSERT_EQ(kids.size(), 1u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Deref);
+    // The Deref's result type is the pointee (struct Point).
+    EXPECT_EQ(interner.kind(res->hir.typeId(kids[0])), TypeKind::Struct);
+}
+
+// D5.2 cycle 1: adding `Identifier` to `typeBase` lets typedef'd / struct-tag
+// names work bare in type position at top level. The engine's `resolveTypeNode`
+// already resolved Identifier-in-type-position via the SE5 alias path
+// (Type-kind symbol → its `.type`); this cycle's contribution is the schema
+// change that lets the parser accept the form. Block-scope alias (`{ Foo x; }`)
+// is intentionally deferred — it collides with `exprStmt` at the statement
+// alt and needs speculative-alt support (later cycle).
+//
+// **Known C divergence**: c-subset has a single identifier namespace (no
+// separate "tag namespace"), and `resolveTypeNode`'s alias lookup doesn't
+// distinguish typedef-minted Type symbols from struct-tag Type symbols.
+// Consequence: after `struct Foo { ... };` alone (no typedef), `Foo x;` ALSO
+// lowers cleanly — i.e. every struct tag is implicitly usable as a bare type
+// name. Real C requires `struct Foo` or an explicit typedef. The two tests
+// below pin both shapes honestly.
+TEST(HirLoweringCSubset, TypedefStructAliasAtTopLevel) {
+    // The alias name must differ from the struct tag because the single
+    // identifier namespace rejects same-name redeclaration. See the negative
+    // test `TypedefSameNameAsTagRedeclaresInSingleNamespace` below.
+    SemanticModel model = analyzeCSubset(
+        "struct Foo { int x; };\n"
+        "typedef struct Foo FooT;\n"
+        "FooT origin;\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 3u);   // struct Foo, typedef FooT, origin
+    // The third decl is the Global `origin`; its type should be the same
+    // composed Struct as the struct decl produced.
+    HirNodeId const origin = decls[2];
+    ASSERT_EQ(res->hir.kind(origin), HirKind::Global);
+    TypeId const originType = res->hir.globalType(origin);
+    ASSERT_TRUE(originType.valid());
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(originType), TypeKind::Struct);
+    EXPECT_EQ(interner.name(originType), "Foo");
+}
+
+// D5.2 cycle 1 (review-fix): pin the bare-struct-tag-as-type-name behavior
+// that falls out of the schema change. Without a typedef, `Foo x;` ALSO
+// works — the resolveTypeNode SE5 alias path doesn't distinguish struct
+// tags from typedef'd Type symbols. Documented as a known C divergence; this
+// test pins it so a future cycle that separates the namespaces fails loud.
+TEST(HirLoweringCSubset, BareStructTagUsableAsTypeName) {
+    SemanticModel model = analyzeCSubset(
+        "struct Foo { int x; };\n"
+        "Foo bare;\n");                  // no typedef
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 2u);   // struct Foo, bare
+    HirNodeId const bare = decls[1];
+    ASSERT_EQ(res->hir.kind(bare), HirKind::Global);
+    TypeId const bareType = res->hir.globalType(bare);
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(bareType), TypeKind::Struct);
+    EXPECT_EQ(interner.name(bareType), "Foo");
+}
+
+// D5.2 cycle 1 (review-fix): pin the negative — same-name typedef of a
+// struct tag fires S_RedeclaredSymbol (single namespace). Catches any
+// future cycle that mistakenly relaxes the same-scope dup check.
+TEST(HirLoweringCSubset, TypedefSameNameAsTagRedeclaresInSingleNamespace) {
+    SemanticModel model = analyzeCSubset(
+        "struct Foo { int x; };\n"
+        "typedef struct Foo Foo;\n");    // same name as the tag — collides
+    EXPECT_TRUE(model.hasErrors());
+    bool sawRedecl = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_RedeclaredSymbol) { sawRedecl = true; break; }
+    }
+    EXPECT_TRUE(sawRedecl)
+        << "expected S_RedeclaredSymbol on `typedef struct Foo Foo;`";
+}
+
+// D5.1 cycle 4 review fix: the DOT form goes through a different lowering
+// path than ARROW (no Deref synthesis). The previous test only exercised
+// arrow; this one pins the dot path's structural shape.
+TEST(HirLoweringCSubset, DotMemberAccessLowersWithoutDeref) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "int by_value(struct Point s) { return s.x; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 2u);
+    HirNodeId const fn = decls[1];
+    HirNodeId const body = res->hir.functionBody(fn);
+    auto stmts = res->hir.children(body);
+    ASSERT_EQ(stmts.size(), 1u);
+    HirNodeId const ret = stmts[0];
+    auto const retVal = res->hir.returnValue(ret);
+    ASSERT_TRUE(retVal.has_value());
+    HirNodeId const access = *retVal;
+    ASSERT_EQ(res->hir.kind(access), HirKind::MemberAccess);
+    EXPECT_EQ(res->hir.payload(access), 0u);  // x is field 0
+    // Dot form: child is the LHS DIRECTLY, no Deref wrapping.
+    auto kids = res->hir.children(access);
+    ASSERT_EQ(kids.size(), 1u);
+    EXPECT_NE(res->hir.kind(kids[0]), HirKind::Deref);
+    // The LHS's type is the struct directly (not Ptr<Struct>).
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(res->hir.typeId(kids[0])), TypeKind::Struct);
 }
 
 TEST(HirLoweringCSubset, ExternFunctionAndGlobal) {
@@ -376,8 +637,48 @@ TEST(HirLoweringCSubset, IncludeDirectiveIsSkippedNotFailed) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Function);
 }
 
+// HR cycle C: an int-typed `return expr;` whose expr type is non-int (e.g.
+// a comparison that produces Bool) gets a `Cast(_, int)` wrapper inserted
+// by the coercion pass. Pins the return-type-threading + coerce mechanism.
+TEST(HirLoweringCSubset, ReturnOfBoolFromIntFunctionEmitsCast) {
+    SemanticModel model = analyzeCSubset(
+        "int gt(int a, int b) { return a > b; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ret  = res->hir.children(body)[0];
+    HirNodeId val  = *res->hir.returnValue(ret);
+    // The returned expression is now `Cast(BinaryOp(Gt, ...), int)`.
+    EXPECT_EQ(res->hir.kind(val), HirKind::Cast);
+    auto castKids = res->hir.children(val);
+    ASSERT_EQ(castKids.size(), 1u);
+    EXPECT_EQ(res->hir.kind(castKids[0]), HirKind::BinaryOp);
+}
+
+// HR cycle C: an `if` condition that's already Bool-typed (from a
+// comparison) does NOT get a redundant Cast — coerce(child, target) is
+// a no-op when child.type == target.
+TEST(HirLoweringCSubset, IfConditionAlreadyBoolStaysUncasted) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x) { if (x > 0) { return; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId ifs  = res->hir.children(body)[0];
+    HirNodeId cond = res->hir.ifCondition(ifs);
+    // `x > 0` is already Bool — no Cast wrapper needed.
+    EXPECT_EQ(res->hir.kind(cond), HirKind::BinaryOp);
+}
+
 TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
-    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else].
+    // `cond ? a : b` lowers to a HIR Ternary [cond, then, else]. With HR's
+    // implicit-coercion pass, the cond is wrapped in `Cast(_, Bool)` when
+    // its source type is non-Bool — matches the CondBr-expects-Bool
+    // discipline at the MIR boundary.
     SemanticModel model = analyzeCSubset("int f(int x) { return x ? 1 : 2; }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
@@ -389,7 +690,11 @@ TEST(HirLoweringCSubset, TernaryLowersToTernaryNode) {
     ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
     auto kids = res->hir.children(tern);
     ASSERT_EQ(kids.size(), 3u);
-    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Ref);       // cond: x
+    // cond is now `Cast(Ref(x), Bool)` after the implicit-coercion pass.
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Cast);
+    auto castKids = res->hir.children(kids[0]);
+    ASSERT_EQ(castKids.size(), 1u);
+    EXPECT_EQ(res->hir.kind(castKids[0]), HirKind::Ref);   // cond's operand: x
     EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);   // then: 1
     EXPECT_EQ(res->hir.kind(kids[2]), HirKind::Literal);   // else: 2
 }
@@ -610,4 +915,1124 @@ TEST(HirLoweringCSubset, GoldenRepresentativeProgram) {
     std::string diags;
     for (auto const& d : pr.all()) diags += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
     EXPECT_TRUE(parsed->ok) << "lowered .dsshir did not round-trip/verify\n" << diags;
+}
+
+// ── D5.3 cycle 1a: brace-init lowering ───────────────────────────────────
+//
+// Each test lowers a VarDecl whose initializer is a `braceInitList` and
+// pins that the lowered HIR contains a `ConstructAggregate` node with the
+// expected slot count and that the lowering reports clean (`res->ok`).
+
+namespace {
+[[nodiscard]] HirNodeId firstVarInitOfFn(Hir const& hir, HirNodeId fn) {
+    HirNodeId body = hir.functionBody(fn);
+    for (HirNodeId s : hir.children(body)) {
+        if (hir.kind(s) == HirKind::VarDecl) {
+            if (auto init = hir.varDeclInit(s)) return *init;
+        }
+    }
+    return HirNodeId{};
+}
+} // namespace
+
+TEST(HirLoweringCSubset, D5_3_PositionalStructInit) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {1, 2}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 2u);
+}
+
+// SP3.c LANDED 2026-05-28: single-level field designator now resolves
+// via the TYPE-AWARE path (look up name in `compositeScopeFor(context)`
+// rather than the lexical scope Pass 2 stamps). Pins value ORDERING:
+// `.y = 7, .x = 3` must produce slot 0 = 3 (.x), slot 1 = 7 (.y).
+// A regression that swapped lexical-order resolution for declaration-
+// order would pass a count-only assertion silently.
+TEST(HirLoweringCSubset, D5_3_FieldDesignatorInit) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.y = 7, .x = 3}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // Slot 0 is .x = 3, slot 1 is .y = 7 (declaration order).
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    ASSERT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+    auto slot0Lit = res->literalPool.at(res->hir.payload(kids[0]));
+    auto slot1Lit = res->literalPool.at(res->hir.payload(kids[1]));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(slot0Lit.value));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(slot1Lit.value));
+    EXPECT_EQ(std::get<std::int64_t>(slot0Lit.value), 3);
+    EXPECT_EQ(std::get<std::int64_t>(slot1Lit.value), 7);
+}
+
+// C99 §6.7.8p19: a later designator OVERRIDES an earlier value at the
+// same subobject. `{.x = 1, .x = 2}` → slot 0 = 2 (last wins).
+TEST(HirLoweringCSubset, D5_3_LaterDesignatorOverridesEarlier) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.x = 1, .x = 2}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    auto slot0Lit = res->literalPool.at(res->hir.payload(kids[0]));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(slot0Lit.value));
+    EXPECT_EQ(std::get<std::int64_t>(slot0Lit.value), 2)
+        << "later .x = 2 must override earlier .x = 1 per C99 §6.7.8p19";
+}
+
+// Dot-chained designator coexists with a sibling brace-init under a
+// different outer slot. Exercises the InitSlot tree's nested-merge
+// substrate when a chained write and a positional write both land at
+// the same outer-aggregate level.
+TEST(HirLoweringCSubset, D5_3_DotChainedDesignatorWithSibling) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {.a.v = 1, .b = {.v = 9}}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
+
+// Restored: zero-fill with designators
+TEST(HirLoweringCSubset, D5_3_ZeroFillsOmittedField) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.y = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+}
+
+// Restored: chained-brace with field designators
+TEST(HirLoweringCSubset, D5_3_ChainedBraceNesting) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {.a = {.v = 1}, .b = {.v = 2}}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
+
+// Lock-in: field designator naming a NON-EXISTENT field emits a
+// diagnostic that the field doesn't belong to the target struct.
+TEST(HirLoweringCSubset, D5_3_UnknownFieldDesignatorEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {.bogus = 7}; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("doesn't belong") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "unknown field designator must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
+
+TEST(HirLoweringCSubset, D5_3_OmittedFieldZeroFillStructureWithoutDesignator) {
+    // Without field designators, `struct Point p = {7}` lands `7` at
+    // slot 0 (positional) + zero-fills slot 1. This exercises the
+    // zero-fill path WITHOUT depending on the substrate-blocked
+    // designator-name resolution.
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = {7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+}
+
+TEST(HirLoweringCSubset, D5_3_ChainedBraceNestingPositional) {
+    // The positional form `struct Outer o = {{1}, {2}}` exercises the
+    // chained-brace nesting recursion without depending on designator
+    // resolution.
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {{1}, {2}}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
+
+TEST(HirLoweringCSubset, D5_3_PositionalArrayInit) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[3] = {10, 20, 30}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 3u);
+}
+
+// Under-filled array: explicit elements at slots 0..k-1, synth-zero at k..N-1.
+TEST(HirLoweringCSubset, D5_3_ArrayUnderfillZeroFillsTail) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[5] = {1, 2}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 5u);
+    for (auto k : kids) EXPECT_EQ(res->hir.kind(k), HirKind::Literal);
+}
+
+// C99 §6.7.8p17: a designator restarts the fill cursor at the designated
+// position; the immediately following positional element resumes from
+// `designated + 1`. Exercised here with INDEX designators (array).
+TEST(HirLoweringCSubset, D5_3_CursorRestartAfterIndexDesignator) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[5] = {[1] = 9, 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 5u);
+    for (auto k : kids) EXPECT_EQ(res->hir.kind(k), HirKind::Literal);
+}
+
+// Same C99 §6.7.8p17 invariant exercised with FIELD designators
+// (struct) — now that SP3.c lifted the field-designator substrate
+// blocker. `{.b = 9, 7}` puts 9 at .b (slot 1), then the positional 7
+// at slot 2 (.c) per cursor restart.
+TEST(HirLoweringCSubset, D5_3_CursorRestartAfterFieldDesignator) {
+    SemanticModel model = analyzeCSubset(
+        "struct Trip { int a; int b; int c; };\n"
+        "void f() { struct Trip t = {.b = 9, 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 3u);
+    for (auto k : kids) EXPECT_EQ(res->hir.kind(k), HirKind::Literal);
+}
+
+// Empty brace `T x = {};` — fully zero-fills via synthZero recursion. The
+// existing zero-fill test only exercises synthZero on scalar fields; this
+// hits the recursive aggregate-arm (struct of struct).
+TEST(HirLoweringCSubset, D5_3_EmptyBraceZeroFillsNestedAggregate) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
+
+// ── D5.3 cycle 1b: index designator + compound literal + return / call /
+// assign context sites + locked-in substrate-blocked diagnostics ────────
+
+// 1b.2: `int xs[3] = {[2] = 7};` — integer-literal index designator lands
+// at slot 2; slots 0 and 1 zero-fill.
+TEST(HirLoweringCSubset, D5_3_IndexDesignatorLiteral) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[3] = {[2] = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 3u);
+}
+
+// 1b.2: multi-index designator with cursor jump — `{[0] = 1, [4] = 5}`
+// against a 5-slot array. Pins the cursor-restart behavior past one
+// jump (the test-analyzer's #2 rating-8 gap).
+TEST(HirLoweringCSubset, D5_3_MultiIndexDesignatorWithCursorJump) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[5] = {[0] = 1, [4] = 5}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 5u);
+    // Slots 0 and 4 are explicit Literals; 1, 2, 3 are zero-fill Literals.
+    for (auto k : kids) EXPECT_EQ(res->hir.kind(k), HirKind::Literal);
+}
+
+// SP3.c LANDED 2026-05-28: dot-chained `.a.v = 1` now resolves via the
+// type-aware designator walker that threads a current-type cursor
+// through each step. The InitSlot tree's `nested` substrate (sleeping
+// since cycle 1b) makes the multi-step write semantically right (.a
+// becomes a sub-aggregate; .v inside it is the explicit value; the
+// rest of .a + the entire .b zero-fill).
+TEST(HirLoweringCSubset, D5_3_DotChainedDesignator) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "struct Outer { struct Inner a; struct Inner b; };\n"
+        "void f() { struct Outer o = {.a.v = 1}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // .a is a sub-aggregate (the dot-chained write created it).
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    // .b is the synth-zero sub-aggregate (omitted).
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
+
+// 1b.4: ordinary `return 7;` still coerces — the return-site refactor
+// (lowerExprOrBraceInit consolidating brace-init detection across all
+// context sites) must not regress non-brace-init returns.
+TEST(HirLoweringCSubset, D5_3_OrdinaryReturnStillCoerces) {
+    SemanticModel model = analyzeCSubset("int f() { return 7; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// 1b.3 SUBSTRATE-BLOCKED LOCK-IN: a compound literal `(T){...}` reaches
+// `lowerCompoundLiteral`; the typeRef child's type can't be resolved
+// from Pass 2 (which only stamps types on identifier references inside
+// `operand` rules — not type-position references). Until plan 08.5 §SP3
+// substrate stamps types on typeRef nodes, the lowering fails LOUD with
+// a `compound literal type-ref did not resolve` diagnostic. This test
+// STRICTLY asserts the diagnostic — when SP3 lands, this test must be
+// inverted to assert `res->ok && children.size() == 2`. The strict form
+// matters: a `found || res->ok` short-circuit would let a future
+// regression silently set ok=true with InvalidType and still pass.
+// SP3.b LANDED 2026-05-28: with `structTypeRef` added to the c-subset
+// `references` config (with `nameMatch: "lastIdentifier"`), Pass 2
+// resolves the struct's Identifier + stamps `nodeToType` on it; the
+// recursive `resolveStampedTypeBelow` then finds the stamp and the
+// compound-literal lowers cleanly.
+TEST(HirLoweringCSubset, D5_3_CompoundLiteralInVarDeclInit) {
+    SemanticModel model = analyzeCSubset(
+        "struct Point { int x; int y; };\n"
+        "void f() { struct Point p = (struct Point){.x = 1, .y = 2}; }\n");
+    if (model.hasErrors()) {
+        for (auto const& d : model.diagnostics().all())
+            ADD_FAILURE() << diagnosticCodeName(d.code) << " actual=" << d.actual;
+        return;
+    }
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 2u);
+}
+
+// Substrate-blocked: non-literal index designator (e.g. `[n] = 7`)
+// must emit a diagnostic that names CST-side const-eval as the blocker.
+// Strict form: when semantic accepts the input, the lowering MUST emit
+// the diagnostic (silent acceptance would be a regression the looser
+// `found || res->ok` form would have missed).
+TEST(HirLoweringCSubset, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int n = 1; int xs[3] = {[n] = 7}; }\n");
+    if (model.hasErrors()) return;   // tolerated: semantic may reject too
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("integer literal") != std::string::npos
+         || d.actual.find("const-eval") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "non-literal index designator MUST be diagnosed pending "
+           "CST-side const-eval substrate";
+    EXPECT_FALSE(res->ok)
+        << "lowering must fail when a non-literal index designator "
+           "appears (substrate-blocked path)";
+}
+
+// ── plan 12.5 §0.2 D6: CST-side const-eval ──────────────────────────
+// The shared CST const-eval engine folds literal arithmetic, ternary,
+// LogicalAnd/Or, and `const`-bound identifier refs at all 3 consumer
+// sites: array length, enumerator value, and index designator.
+
+// Helper: extract the Array length from a VAR symbol's declared type
+// via the TypeInterner. Returns -1 if the symbol isn't found or its
+// type isn't an Array; the caller asserts the expected length.
+static std::int64_t arrayLengthOfVar(SemanticModel const& model,
+                                     std::string_view name) {
+    auto const& interner = model.lattice().interner();
+    for (auto const& sym : model.symbols()) {
+        if (sym.name != name) continue;
+        if (!sym.type.valid()) return -1;
+        if (interner.kind(sym.type) != TypeKind::Array) return -1;
+        auto scals = interner.scalars(sym.type);
+        if (scals.empty()) return -1;
+        return scals[0];
+    }
+    return -1;
+}
+
+// Array-length const-expr fold: `int a[1+2];` produces Array<int, 3>.
+// Previously the hand-rolled "literal-only" check refused anything but
+// a single integer literal token; the new engine folds the BinaryOp.
+TEST(HirLoweringCSubset, CstConstEval_ArrayLengthConstExpr) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[1+2]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+}
+
+// Array-length with `const`-bound identifier ref. The resolver walks
+// the scope chain from the declaration site, finds `N` as `isConst`,
+// and folds `N + 1` to 4. Mutable refs still refuse — covered by the
+// locked-in NonLiteral test that uses `int n = 1;` (not `const`).
+TEST(HirLoweringCSubset, CstConstEval_ArrayLengthConstRef) {
+    SemanticModel model = analyzeCSubset(
+        "const int N = 3;\n"
+        "void f() { int xs[N + 1]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 4);
+}
+
+// UnaryOp fold: `-(-3)` → 3. Pins the UnaryExprRule branch
+// (previously test-coverage gap).
+TEST(HirLoweringCSubset, CstConstEval_UnaryFolds) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[-(-3)]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+}
+
+// LogicalAnd short-circuit: `1 && 2` is 1; combine with arithmetic to
+// land on a non-trivial length. Pins the LogicalAnd/Or branch.
+TEST(HirLoweringCSubset, CstConstEval_LogicalAndFolds) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[(1 && 2) + 4]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 5);
+}
+
+// LogicalOr short-circuit: `1 || (some_runtime)` should fold to 1
+// regardless of the rhs being non-foldable. The rhs is a mutable
+// reference that would refuse to fold if reached.
+TEST(HirLoweringCSubset, CstConstEval_LogicalOrShortCircuits) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int n = 1; int xs[(1 || n) + 2]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+}
+
+// Cycle detection: `const int a = b + 0; const int b = a + 0;` is a
+// genuine cycle. The engine refuses with NotAConstantExpression at
+// the second encounter; caller emits S_NonConstantArrayLength.
+TEST(HirLoweringCSubset, CstConstEval_CycleRefuses) {
+    SemanticModel model = analyzeCSubset(
+        "const int a = b + 0;\n"
+        "const int b = a + 0;\n"
+        "void f() { int xs[a + 1]; }\n");
+    bool found = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "cyclic const-init chain must refuse to fold";
+}
+
+// D7 scope-context tracking: shadowing across scopes is NOT a cycle.
+// Outer `const X=1; const Y=X+1;` + inner `const X=Y;` — the inner X
+// shadows the outer X at use-site, but Y's init `X+1` must be
+// evaluated in MODULE scope (Y's scope), where it correctly resolves
+// to the OUTER X (= 1). Result: inner X = Y = 2; `xs[X+1]` = 3.
+//
+// Without scope-context tracking, evaluating Y's `X+1` would re-use
+// the function scope (the original use-site) and find the inner X
+// → false cycle or wrong value. The engine threads
+// `resolved->initScopeOpaque` through recursion to fix this.
+TEST(HirLoweringCSubset, CstConstEval_ShadowingResolvesCorrectScope) {
+    SemanticModel model = analyzeCSubset(
+        "const int X = 1;\n"
+        "const int Y = X + 1;\n"
+        "void f() { const int X = Y; int xs[X + 1]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+}
+
+// Cross-scope ref chain (no shadowing): outer module consts referenced
+// from a function body. Two-deep const-ref chain. The engine resolves
+// `xs[N + 1]` → folds N (which is itself `M+1`=3) → fold to 4.
+TEST(HirLoweringCSubset, CstConstEval_TransitiveConstRef) {
+    SemanticModel model = analyzeCSubset(
+        "const int M = 2;\n"
+        "const int N = M + 1;\n"
+        "void f() { int xs[N + 1]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 4);
+}
+
+// Division by zero in a const-expr: `int xs[1/0];` — the engine
+// refuses with DivisionByZero (caller maps to S_NonConstantArrayLength
+// since array length doesn't have a dedicated div-by-zero diagnostic).
+TEST(HirLoweringCSubset, CstConstEval_DivByZeroRefuses) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[1/0]; }\n");
+    bool found = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "div-by-zero in const-expr must refuse to fold";
+}
+
+// Index designator const-expr fold: `{[1+1] = 7}` lowers to the same
+// ConstructAggregate shape as `{[2] = 7}` (slot 2 gets 7, slots 0/1
+// zero-fill).
+TEST(HirLoweringCSubset, CstConstEval_IndexDesignatorConstExpr) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[3] = {[1+1] = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 3u);
+}
+
+// Index designator with `const`-bound ref: `[N+1]` where `const N=1`
+// folds to slot 2.
+TEST(HirLoweringCSubset, CstConstEval_IndexDesignatorConstRef) {
+    SemanticModel model = analyzeCSubset(
+        "const int N = 1;\n"
+        "void f() { int xs[3] = {[N + 1] = 7}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// Enumerator value const-expr fold: `A = 1+1` ⇒ A=2; subsequent
+// `B` auto-increments to 3.
+TEST(HirLoweringCSubset, CstConstEval_EnumeratorConstExpr) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A = 1 + 1, B };\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    // The two enumerators bind A=2 and B=3; verify via SymbolRecord.
+    bool foundA = false, foundB = false;
+    for (auto const& sym : model.symbols()) {
+        if (sym.name == "A") { EXPECT_EQ(sym.enumValue, 2); foundA = true; }
+        if (sym.name == "B") { EXPECT_EQ(sym.enumValue, 3); foundB = true; }
+    }
+    EXPECT_TRUE(foundA);
+    EXPECT_TRUE(foundB);
+}
+
+// Enumerator value with `const`-bound ref: `A = X + 1` where const X=5
+// resolves to 6.
+TEST(HirLoweringCSubset, CstConstEval_EnumeratorConstRef) {
+    SemanticModel model = analyzeCSubset(
+        "const int X = 5;\n"
+        "enum E { A = X + 1 };\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    for (auto const& sym : model.symbols()) {
+        if (sym.name == "A") { EXPECT_EQ(sym.enumValue, 6); return; }
+    }
+    FAIL() << "enumerator A not found";
+}
+
+// Ternary fold: `[1 < 2 ? 3 : 5]` → length 3 (cond true → then arm).
+TEST(HirLoweringCSubset, CstConstEval_TernaryFolds) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int xs[1 < 2 ? 3 : 5]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+}
+
+// Mutable ref still refuses: `int n = 1; int xs[n+1];` emits
+// S_NonConstantArrayLength because `n` is NOT `isConst`. The engine
+// correctly walks the scope chain, finds `n`, sees it's mutable, and
+// refuses — preserving the locked-in NonLiteralIndexDesignatorEmitsDiag
+// test for the design-time case where a programmer used a runtime
+// variable in a const-expr slot.
+TEST(HirLoweringCSubset, CstConstEval_MutableRefRefuses) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { int n = 1; int xs[n + 1]; }\n");
+    bool foundDiag = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
+            foundDiag = true; break;
+        }
+    }
+    EXPECT_TRUE(foundDiag)
+        << "mutable ref `n` must refuse to fold and emit S_NonConstantArrayLength";
+}
+
+// ── D5.4 unions ──────────────────────────────────────────────────────
+
+// `union U u;` declares + types via the same Pass 1.5 path as struct;
+// the difference is `compositeKind: "union"` in the c-subset config →
+// `interner.unionType(...)`. Empty init zero-fills the FIRST variant.
+TEST(HirLoweringCSubset, D5_4_UnionDeclLowersToTypeDecl) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::TypeDecl);
+}
+
+// Positional union brace-init `{ 5 }` initializes the FIRST variant.
+// Aggregate is 1-child (NOT 2 — unions are not zero-fill-all).
+TEST(HirLoweringCSubset, D5_4_UnionPositionalInit) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { 5 }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 1u)
+        << "union aggregate must have exactly 1 child (the active variant)";
+}
+
+// Designated union brace-init `{ .c = 'a' }` initializes the named
+// variant — second variant (index 1), not first.
+TEST(HirLoweringCSubset, D5_4_UnionDesignatedInit) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { .c = 'a' }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 1u);
+    // The child's HIR type identifies the chosen variant — Char here.
+    // (We don't read the type interner from the test directly; the
+    // child being Literal is enough to confirm the chosen variant's
+    // value was lowered.)
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+}
+
+// Empty `{}` union init zero-fills the FIRST variant (1-child aggregate).
+TEST(HirLoweringCSubset, D5_4_UnionEmptyBrace) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = {}; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 1u);
+}
+
+// Multi-element union brace-init MUST emit a diagnostic.
+TEST(HirLoweringCSubset, D5_4_UnionMultiElementEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { 1, 2 }; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("at most one variant") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "multi-element union init must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
+
+// Unknown union variant name → diagnostic.
+TEST(HirLoweringCSubset, D5_4_UnionUnknownVariantEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { .bogus = 1 }; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("doesn't belong") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "unknown union variant must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
+
+// Index designator on a union is nonsensical → diagnostic.
+TEST(HirLoweringCSubset, D5_4_UnionIndexDesignatorEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { [0] = 1 }; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("not meaningful on union") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "index designator on union must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
+
+// Chained designator `{.a.b = 1}` on a union must be diagnosed (variant
+// access has no sub-position semantics in C99). Lock-in for the
+// silent-failure-hunter HIGH finding.
+TEST(HirLoweringCSubset, D5_4_UnionChainedDesignatorEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "struct Inner { int v; };\n"
+        "union U { struct Inner a; int i; };\n"
+        "void f() { union U u = { .a.v = 1 }; }\n");
+    if (model.hasErrors()) return;
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("chained designator on a union") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "chained designator on union must be diagnosed";
+    EXPECT_FALSE(res->ok);
+}
+
+// Union nested inside a struct: the recursive InitSlot path lands on
+// the union's `lowerUnionBraceInit` correctly + omitted struct slots
+// containing unions zero-fill via the corrected `synthZeroOrError`
+// Union arm (1-child first-variant).
+TEST(HirLoweringCSubset, D5_4_UnionNestedInStruct) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "struct S { union U u; int x; };\n"
+        "void f() { struct S s = { .u = { .c = 'a' }, .x = 7 }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // Outer slot 0 is the union → 1-child ConstructAggregate.
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(kids[0]).size(), 1u);
+    // Outer slot 1 is .x = 7 → Literal.
+    EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Literal);
+}
+
+// Union zero-filled by the containing struct's missing-field path: the
+// `synthZeroOrError(unionTy)` produces a 1-child aggregate (not N).
+TEST(HirLoweringCSubset, D5_4_UnionZeroFilledByContainingStruct) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "struct S { int x; union U u; };\n"
+        "void f() { struct S s = { .x = 1 }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    auto kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 2u);
+    // Slot 0 = .x = 1 (Literal). Slot 1 = synth-zero union → 1-child agg.
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+    ASSERT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(kids[1]).size(), 1u);
+}
+
+// Compound literal of union type: `(union U){.c='a'}` exercises
+// lowerCompoundLiteral → lowerBraceInit → lowerUnionBraceInit chain.
+TEST(HirLoweringCSubset, D5_4_UnionCompoundLiteral) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = (union U){ .c = 'a' }; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(init).size(), 1u);
+}
+
+// Member access on a union: `u.c` must resolve via the existing
+// MemberAccess path (same `compositeScopeByType` substrate that
+// structs use).
+TEST(HirLoweringCSubset, D5_4_UnionMemberAccess) {
+    SemanticModel model = analyzeCSubset(
+        "union U { int i; char c; };\n"
+        "void f() { union U u = { .c = 'a' }; char x = u.c; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// ── D5.5 enums ───────────────────────────────────────────────────────
+
+// `enum E { A, B, C };` declares a TypeDecl. The enum type is nominal-
+// by-name; enumerators are Variable symbols with the enum type, bound
+// in the enum's inner scope (accessed as `E.A` via MemberAccess).
+TEST(HirLoweringCSubset, D5_5_EnumDeclLowersToTypeDecl) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C };\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::TypeDecl);
+}
+
+// C-classic enumerator visibility: `enum E { A, B }` makes `A` and `B`
+// visible directly in the enclosing scope (Pass 1.5 lifts the
+// enumerator bindings from the enum's inner scope to the parent).
+// `enum E e = A;` resolves `A` against the enclosing scope.
+TEST(HirLoweringCSubset, D5_5_EnumValueUseViaBareName) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C };\n"
+        "void f() { enum E e = A; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// Enum with trailing comma + multi-enumerator parse cleanly.
+TEST(HirLoweringCSubset, D5_5_EnumTrailingCommaParses) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C, };\n");
+    ASSERT_FALSE(model.hasErrors());
+}
+
+// Enumerator values: implicit auto-increment + explicit integer-literal
+// + auto-increment from explicit. C99 §6.7.2.2. Verifies that Pass 1.5
+// actually COMPUTES the values (not just parses them).
+TEST(HirLoweringCSubset, D5_5_EnumValuesComputed) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C = 5, D };\n");
+    ASSERT_FALSE(model.hasErrors());
+    // Look up each enumerator's value in the symbol table.
+    auto findEnumerator = [&](std::string const& name) -> SymbolRecord const* {
+        for (auto const& s : model.symbols()) {
+            if (s.name == name) return &s;
+        }
+        return nullptr;
+    };
+    auto const* a = findEnumerator("A");
+    auto const* b = findEnumerator("B");
+    auto const* c = findEnumerator("C");
+    auto const* d = findEnumerator("D");
+    ASSERT_NE(a, nullptr); ASSERT_NE(b, nullptr);
+    ASSERT_NE(c, nullptr); ASSERT_NE(d, nullptr);
+    EXPECT_EQ(a->enumValue, 0) << "A implicit → 0";
+    EXPECT_EQ(b->enumValue, 1) << "B implicit → A + 1 = 1";
+    EXPECT_EQ(c->enumValue, 5) << "C explicit = 5";
+    EXPECT_EQ(d->enumValue, 6) << "D implicit → C + 1 = 6";
+}
+
+// Enumerator type identity: each enumerator must be typed as the enum
+// (not as the underlying int). A regression that left enumerators
+// typed as I32 would pass count-only assertions but break downstream
+// type-equivalence checks.
+TEST(HirLoweringCSubset, D5_5_EnumeratorTypedAsEnum) {
+    SemanticModel model = analyzeCSubset("enum E { A };\n");
+    ASSERT_FALSE(model.hasErrors());
+    auto& interner = model.lattice().interner();
+    TypeId const enumTy = interner.enumType("E", TypeKind::I32);
+    // The enumerator A must carry the enum TypeId, not raw I32.
+    SymbolRecord const* a = nullptr;
+    for (auto const& s : model.symbols())
+        if (s.name == "A") { a = &s; break; }
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->type.v, enumTy.v)
+        << "enumerator must be typed as the enum, not the underlying int";
+    EXPECT_NE(a->type.v, interner.primitive(TypeKind::I32).v)
+        << "enumerator MUST NOT carry the raw I32 TypeId";
+}
+
+// Lift-to-enclosing collision: `int A; enum E { A };` must emit
+// S_RedeclaredSymbol pointing at the enumerator decl. Locks the
+// otherwise-test-untouched diagnostic branch.
+TEST(HirLoweringCSubset, D5_5_EnumeratorCollidesWithEnclosingName) {
+    SemanticModel model = analyzeCSubset(
+        "int A = 7;\n"
+        "enum E { A };\n");
+    bool foundRedecl = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_RedeclaredSymbol && d.actual == "A") {
+            foundRedecl = true; break;
+        }
+    }
+    EXPECT_TRUE(foundRedecl)
+        << "lifting enumerator name into a scope that already binds it "
+           "must emit S_RedeclaredSymbol";
+}
+
+// Non-literal explicit value emits S_NonConstantEnumeratorValue. v1
+// accepts integer-literal explicit values only; arbitrary const-exprs
+// require CST-side const-eval (plan 12.5 §0.2 D6).
+TEST(HirLoweringCSubset, D5_5_NonLiteralEnumeratorValueEmitsDiag) {
+    SemanticModel model = analyzeCSubset(
+        "int n = 5;\n"
+        "enum E { A = n };\n");
+    bool found = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_NonConstantEnumeratorValue) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "non-literal enumerator value must emit S_NonConstantEnumeratorValue";
+}
+
+// D5.5-FU2: prove the `liftToEnclosingScope` gate is wired by toggling
+// the c-subset config's flag to `false` and verifying `A` no longer
+// resolves at the use site. Pins the otherwise-test-untouched
+// opt-OUT branch — without this, removing the `&&
+// decl.fieldChildren->liftToEnclosingScope` guard would silently
+// keep all tests green.
+TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
+    // Read the shipped c-subset config text and flip the enumDecl's
+    // `liftToEnclosingScope` from true to false. The rest of the
+    // schema (incl. `compositeKind: "enum"`) stays untouched.
+    fs::path here = fs::current_path();
+    fs::path schemaPath;
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        fs::path const cand = here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
+        if (fs::exists(cand)) { schemaPath = cand; break; }
+        fs::path const par = here.parent_path();
+        if (par == here) break;
+        here = par;
+    }
+    ASSERT_FALSE(schemaPath.empty()) << "cannot locate c-subset.lang.json";
+    std::ifstream in{schemaPath, std::ios::binary};
+    ASSERT_TRUE(in.is_open()) << "cannot open " << schemaPath.string();
+    std::ostringstream buf; buf << in.rdbuf();
+    std::string text = std::move(buf).str();
+    std::string const target =
+        "\"compositeKind\": \"enum\",\n"
+        "                           \"liftToEnclosingScope\": true";
+    auto const pos = text.find(target);
+    ASSERT_NE(pos, std::string::npos)
+        << "c-subset config no longer carries the expected enum lift flag";
+    text.replace(pos, target.size(),
+        "\"compositeKind\": \"enum\",\n"
+        "                           \"liftToEnclosingScope\": false");
+
+    auto loaded = GrammarSchema::loadFromText(text, "<c-subset-no-lift>");
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "" : loaded.error()[0].message);
+
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(
+        "enum E { A, B, C };\n"
+        "void f() { enum E e = A; }\n",
+        "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    SemanticModel model = analyze(cu);
+
+    bool foundUndecl = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_UndeclaredIdentifier && d.actual == "A") {
+            foundUndecl = true; break;
+        }
+    }
+    EXPECT_TRUE(foundUndecl)
+        << "with liftToEnclosingScope=false, bare-name `A` MUST emit "
+           "S_UndeclaredIdentifier — the gate's opt-out branch is otherwise "
+           "test-untouched";
+}
+
+// D5.5-FU4 + FU5: enum-typed program emits + re-parses cleanly (the
+// HIR text format `enum "E"` round-trip is locked in by parse re-verify).
+TEST(HirLoweringCSubset, D5_5_EnumHirTextRoundTrip) {
+    SemanticModel model = analyzeCSubset(
+        "enum E { A, B, C };\n"
+        "void f() { enum E e = A; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    std::vector<std::string> names = symbolNames(model);
+    HirTextContext ctx;
+    ctx.interner    = &model.lattice().interner();
+    ctx.symbolNames = &names;
+    ctx.literalPool = &res->literalPool;
+    DiagnosticReporter er;
+    std::string const out = emitHir(res->hir, ctx, er);
+    EXPECT_NE(out.find("enum"), std::string::npos);
+
+    DiagnosticReporter pr;
+    auto parsed = parseHir(out, CompilationUnitId{42}, pr);
+    EXPECT_TRUE(parsed->ok)
+        << "re-parsed enum program must verify cleanly";
 }

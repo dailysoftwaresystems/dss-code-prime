@@ -97,12 +97,51 @@ DSS_STRONG_ID(HirOpId);
 // node's `payload`; resolved against the module's HirIntrinsicRegistry.
 DSS_STRONG_ID(HirIntrinsicId);
 
+// MIR ids (ML1). `MirModuleId` is a MIR module's identity tag — the arena-tag
+// stamped onto every MirInstId/MirBlockId/MirFuncId of that module (one tag,
+// three element-id arenas), minted by a monotonic counter, mirroring
+// HirModuleId. The optimizer rebuilds MIR functionally (read old module → build
+// a new one), so each rebuilt module gets a fresh MirModuleId; CU-scoped TypeIds
+// survive the rebuild untouched (their arenaTag is the CompilationUnitId, not
+// the module).
+DSS_STRONG_ID(MirModuleId);
+
 // Arena-element ids (carry `arenaTag`): NodeId is the Tree's node index; TypeId
 // is the CU-scoped type lattice's index (its arena tag is the CompilationUnitId);
 // HirNodeId is a HIR module's node index (its arena tag is the HirModuleId).
 DSS_ARENA_ID(NodeId);
 DSS_ARENA_ID(TypeId);
 DSS_ARENA_ID(HirNodeId);
+// MIR arena-element ids (ML1), all tagged by the owning MirModuleId. In the
+// FUSED value model a non-void instruction IS its SSA value, so there is no
+// separate value arena: `MirValueId` is an alias of `MirInstId` (declared in
+// mir/mir_node.hpp, where it has the id type in scope).
+DSS_ARENA_ID(MirInstId);
+DSS_ARENA_ID(MirBlockId);
+DSS_ARENA_ID(MirFuncId);
+DSS_ARENA_ID(MirGlobalId);
+
+// LIR ids (ML5). `LirModuleId` is the LIR module's identity tag — the
+// arena-tag stamped onto every LirInstId/LirBlockId/LirFuncId of that
+// module. The LIR substrate is target-blind; each module carries a
+// runtime `TargetSchemaId` that refers to a JSON-loaded `TargetSchema`
+// (parallel to `SchemaId` for the frontend). ML5 cycle 2 pivot:
+// targets are config files (`src/dss-config/targets/*.target.json`),
+// not C++ enums.
+DSS_STRONG_ID(LirModuleId);
+DSS_STRONG_ID(TargetSchemaId);
+DSS_ARENA_ID(LirInstId);
+DSS_ARENA_ID(LirBlockId);
+DSS_ARENA_ID(LirFuncId);
+
+// `LirSpillSlot` is the strong-typed stack-slot id minted by the
+// register allocator's spill path (ML6). A bare `std::uint32_t` would
+// alias every other count/ordinal in scope; the strong id makes the
+// variant arm of `LirRegAssignment` nominally distinct from physical
+// register ordinals. Allocator counts spills via a plain `uint32_t`
+// counter (a cardinality, not an identity) and mints `LirSpillSlot{n}`
+// values from it.
+DSS_STRONG_ID(LirSpillSlot);
 
 #undef DSS_STRONG_ID
 #undef DSS_ARENA_ID
@@ -127,6 +166,17 @@ inline constexpr HirKindId       InvalidHirKind{};
 inline constexpr HirOpId         InvalidHirOp{};
 inline constexpr HirIntrinsicId  InvalidHirIntrinsic{};
 inline constexpr HirNodeId       InvalidHirNode{};
+inline constexpr MirModuleId     InvalidMirModule{};
+inline constexpr MirInstId       InvalidMirInst{};
+inline constexpr MirBlockId      InvalidMirBlock{};
+inline constexpr LirModuleId     InvalidLirModule{};
+inline constexpr LirInstId       InvalidLirInst{};
+inline constexpr LirBlockId      InvalidLirBlock{};
+inline constexpr LirFuncId       InvalidLirFunc{};
+inline constexpr LirSpillSlot    InvalidLirSpillSlot{};
+inline constexpr TargetSchemaId  InvalidTargetSchema{};
+inline constexpr MirFuncId       InvalidMirFunc{};
+inline constexpr MirGlobalId     InvalidMirGlobal{};
 
 } // namespace dss
 
@@ -158,5 +208,15 @@ DSS_HASH_ID(HirKindId);
 DSS_HASH_ID(HirOpId);
 DSS_HASH_ID(HirIntrinsicId);
 DSS_HASH_ID(HirNodeId);
+DSS_HASH_ID(MirModuleId);
+DSS_HASH_ID(MirInstId);
+DSS_HASH_ID(MirBlockId);
+DSS_HASH_ID(MirFuncId);
+DSS_HASH_ID(MirGlobalId);
+DSS_HASH_ID(LirModuleId);
+DSS_HASH_ID(LirInstId);
+DSS_HASH_ID(LirBlockId);
+DSS_HASH_ID(LirFuncId);
+DSS_HASH_ID(TargetSchemaId);
 
 #undef DSS_HASH_ID

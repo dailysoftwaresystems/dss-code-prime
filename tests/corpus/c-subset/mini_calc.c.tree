@@ -11,8 +11,8 @@ rule:root
           tok:"("
           rule:paramList
             rule:param
-              rule:typeRef
-                rule:typeBase
+              rule:typeRefAllowingStruct
+                rule:typeBaseAllowingStruct
                   tok:"int"
               tok:"fmt"
           tok:")"
@@ -26,9 +26,10 @@ rule:root
       rule:topLevelDeclTail
         rule:varDeclTail
           tok:"="
-          rule:expression
-            rule:operand
-              tok:"0"
+          rule:initValue
+            rule:expression
+              rule:operand
+                tok:"0"
           tok:";"
   rule:topLevel
     rule:topLevelDecl
@@ -69,8 +70,8 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"x"
             tok:")"
@@ -100,14 +101,14 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"a"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"b"
             tok:")"
@@ -137,20 +138,20 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"a"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"b"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"c"
             tok:")"
@@ -245,14 +246,14 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"arr"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"len"
             tok:")"
@@ -261,26 +262,28 @@ rule:root
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"total"
                   tok:"="
-                  rule:expression
-                    rule:operand
-                      tok:"0"
+                  rule:initValue
+                    rule:expression
+                      rule:operand
+                        tok:"0"
                 tok:";"
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"i"
                   tok:"="
-                  rule:expression
-                    rule:operand
-                      tok:"0"
+                  rule:initValue
+                    rule:expression
+                      rule:operand
+                        tok:"0"
                 tok:";"
             rule:statement
               rule:whileStmt
@@ -346,8 +349,8 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"n"
             tok:")"
@@ -411,8 +414,8 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"n"
             tok:")"
@@ -487,8 +490,8 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"x"
             tok:")"
@@ -539,8 +542,8 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"value"
             tok:")"
@@ -549,26 +552,28 @@ rule:root
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"count"
                   tok:"="
-                  rule:expression
-                    rule:operand
-                      tok:"0"
+                  rule:initValue
+                    rule:expression
+                      rule:operand
+                        tok:"0"
                 tok:";"
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"v"
                   tok:"="
-                  rule:expression
-                    rule:operand
-                      tok:"value"
+                  rule:initValue
+                    rule:expression
+                      rule:operand
+                        tok:"value"
                 tok:";"
             rule:statement
               rule:whileStmt
@@ -592,15 +597,16 @@ rule:root
                         rule:expression
                           rule:binaryExpr
                             rule:operand
-                              tok:"("
-                              rule:expression
-                                rule:binaryExpr
-                                  rule:operand
-                                    tok:"v"
-                                  tok:"&"
-                                  rule:operand
-                                    tok:"1"
-                              tok:")"
+                              rule:parenExpr
+                                tok:"("
+                                rule:expression
+                                  rule:binaryExpr
+                                    rule:operand
+                                      tok:"v"
+                                    tok:"&"
+                                    rule:operand
+                                      tok:"1"
+                                tok:")"
                             tok:"!="
                             rule:operand
                               tok:"0"
@@ -658,8 +664,8 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"ptr"
             tok:")"
@@ -687,14 +693,14 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"a"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"b"
             tok:")"
@@ -743,20 +749,20 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"x"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"lo"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"hi"
             tok:")"
@@ -808,20 +814,20 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"a"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"b"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"limit"
             tok:")"
@@ -830,18 +836,19 @@ rule:root
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"s"
                   tok:"="
-                  rule:expression
-                    rule:binaryExpr
-                      rule:operand
-                        tok:"a"
-                      tok:"+"
-                      rule:operand
-                        tok:"b"
+                  rule:initValue
+                    rule:expression
+                      rule:binaryExpr
+                        rule:operand
+                          tok:"a"
+                        tok:"+"
+                        rule:operand
+                          tok:"b"
                 tok:";"
             rule:statement
               rule:ifStmt
@@ -913,20 +920,20 @@ rule:root
             tok:"("
             rule:paramList
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"a"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"b"
               tok:","
               rule:param
-                rule:typeRef
-                  rule:typeBase
+                rule:typeRefAllowingStruct
+                  rule:typeBaseAllowingStruct
                     tok:"int"
                 tok:"c"
             tok:")"
@@ -935,81 +942,84 @@ rule:root
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"t1"
                   tok:"="
-                  rule:expression
-                    rule:binaryExpr
-                      rule:postfixExpr
-                        rule:operand
-                          tok:"square"
-                        tok:"("
-                        rule:argList
-                          rule:expression
-                            rule:operand
-                              tok:"a"
-                        tok:")"
-                      tok:"+"
-                      rule:postfixExpr
-                        rule:operand
-                          tok:"square"
-                        tok:"("
-                        rule:argList
-                          rule:expression
-                            rule:operand
-                              tok:"b"
-                        tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:binaryExpr
+                        rule:postfixExpr
+                          rule:operand
+                            tok:"square"
+                          tok:"("
+                          rule:argList
+                            rule:expression
+                              rule:operand
+                                tok:"a"
+                          tok:")"
+                        tok:"+"
+                        rule:postfixExpr
+                          rule:operand
+                            tok:"square"
+                          tok:"("
+                          rule:argList
+                            rule:expression
+                              rule:operand
+                                tok:"b"
+                          tok:")"
                 tok:";"
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"t2"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"add"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"t1"
-                        tok:","
-                        rule:expression
-                          rule:postfixExpr
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"add"
+                        tok:"("
+                        rule:argList
+                          rule:expression
                             rule:operand
-                              tok:"square"
-                            tok:"("
-                            rule:argList
-                              rule:expression
-                                rule:operand
-                                  tok:"c"
-                            tok:")"
-                      tok:")"
+                              tok:"t1"
+                          tok:","
+                          rule:expression
+                            rule:postfixExpr
+                              rule:operand
+                                tok:"square"
+                              tok:"("
+                              rule:argList
+                                rule:expression
+                                  rule:operand
+                                    tok:"c"
+                              tok:")"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"t3"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"bit_count"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"t2"
-                      tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"bit_count"
+                        tok:"("
+                        rule:argList
+                          rule:expression
+                            rule:operand
+                              tok:"t2"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:exprStmt
@@ -1043,16 +1053,16 @@ rule:root
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"arr"
                 tok:";"
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"local_buf"
                   rule:arrayDeclSuffix
@@ -1065,25 +1075,26 @@ rule:root
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"sum"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"sum_array"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"arr"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"10"
-                      tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"sum_array"
+                        tok:"("
+                        rule:argList
+                          rule:expression
+                            rule:operand
+                              tok:"arr"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"10"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:exprStmt
@@ -1104,97 +1115,100 @@ rule:root
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"m"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"max3"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"sum"
-                        tok:","
-                        rule:expression
-                          rule:postfixExpr
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"max3"
+                        tok:"("
+                        rule:argList
+                          rule:expression
                             rule:operand
-                              tok:"fact"
-                            tok:"("
-                            rule:argList
-                              rule:expression
-                                rule:operand
-                                  tok:"5"
-                            tok:")"
-                        tok:","
-                        rule:expression
-                          rule:postfixExpr
-                            rule:operand
-                              tok:"fib"
-                            tok:"("
-                            rule:argList
-                              rule:expression
-                                rule:operand
-                                  tok:"8"
-                            tok:")"
-                      tok:")"
+                              tok:"sum"
+                          tok:","
+                          rule:expression
+                            rule:postfixExpr
+                              rule:operand
+                                tok:"fact"
+                              tok:"("
+                              rule:argList
+                                rule:expression
+                                  rule:operand
+                                    tok:"5"
+                              tok:")"
+                          tok:","
+                          rule:expression
+                            rule:postfixExpr
+                              rule:operand
+                                tok:"fib"
+                              tok:"("
+                              rule:argList
+                                rule:expression
+                                  rule:operand
+                                    tok:"8"
+                              tok:")"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"c"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"clamp"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"m"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"0"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"100"
-                      tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"clamp"
+                        tok:"("
+                        rule:argList
+                          rule:expression
+                            rule:operand
+                              tok:"m"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"0"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"100"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:varDecl
                 rule:varDeclHead
-                  rule:typeRef
-                    rule:typeBase
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
                       tok:"int"
                   tok:"s"
                   tok:"="
-                  rule:expression
-                    rule:postfixExpr
-                      rule:operand
-                        tok:"saturating_add"
-                      tok:"("
-                      rule:argList
-                        rule:expression
-                          rule:operand
-                            tok:"c"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"50"
-                        tok:","
-                        rule:expression
-                          rule:operand
-                            tok:"200"
-                      tok:")"
+                  rule:initValue
+                    rule:expression
+                      rule:postfixExpr
+                        rule:operand
+                          tok:"saturating_add"
+                        tok:"("
+                        rule:argList
+                          rule:expression
+                            rule:operand
+                              tok:"c"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"50"
+                          tok:","
+                          rule:expression
+                            rule:operand
+                              tok:"200"
+                        tok:")"
                 tok:";"
             rule:statement
               rule:returnStmt

@@ -2,16 +2,17 @@
 
 > **Reserved scope.** Owns the **sibling-of-HIR** intermediate representation for hardware description languages (VHDL, Verilog, SystemVerilog). Per the user's stated final goals: "From any configured language ... build any configured language output ... this will include WASM and VHDL/Verilog."
 >
-> Software HIR ([`09-hir-plan`](./09-hir-plan%20-%20tbd.md)) is **fundamentally sequential**. Hardware is **concurrent + signal-typed + clock-bound**. The shapes do not unify cleanly. A sibling HIR-HW is the right answer.
+> Software HIR ([`09-hir-plan`](./09-hir-plan%20-%20ok.md)) is **fundamentally sequential**. Hardware is **concurrent + signal-typed + clock-bound**. The shapes do not unify cleanly. A sibling HIR-HW is the right answer.
 
 ## 0. Status (snapshot)
 
 | | |
 |---|---|
 | Status        | 🔒 **reserved.** No work begins until a real VHDL/Verilog target is requested. Plan exists to (a) prevent software HIR (plan 09) from designing in ways that foreclose hardware semantics and (b) reserve the namespace + name. |
-| Predecessors  | ✅ [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (software HIR exists, proves the substrate — HR1 ✅ 2026-05-26 proves the open-core+extensions discipline this sibling-IR will mirror). ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (lattice + arena substrate reused). |
+| Predecessors  | ✅ [`09-hir-plan`](./09-hir-plan%20-%20ok.md) (software HIR exists, proves the substrate — HR1 ✅ 2026-05-26 proves the open-core+extensions discipline this sibling-IR will mirror). ✅ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md) (lattice + arena substrate reused — complete). |
 | Successors    | Hardware-targeting language pairs in [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md). |
 | Scope         | **Unspecified — placeholder.** Will detail when triggered. |
+| Mapped from elsewhere | **F128 const-eval Cast target** (from plan [12.5 §0.2 D1b](./12.5-const-eval-plan%20-%20ok.md)): quad-precision float folding in `const_eval` is gated on a soft-float / `std::float128_t` polyfill. HW description languages (incl. fixed-point arithmetic regimes for HDL) are the first consumer that may need wider-than-64-bit numeric precision; whichever HR-HW cycle introduces F128 literals owns the polyfill. The CE engine currently refuses F128 with `UnsupportedTypeKind` — a delimited HR-HW prerequisite, not a CE gap. |
 
 ---
 

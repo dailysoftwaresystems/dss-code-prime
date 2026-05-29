@@ -1,4 +1,4 @@
-#include "hir/lowering/hir_literal_pool.hpp"
+#include "hir/hir_literal_pool.hpp"
 
 #include <cstdio>
 #include <cstdlib>

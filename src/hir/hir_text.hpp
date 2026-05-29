@@ -5,7 +5,7 @@
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner (by-value in the parse result)
 #include "hir/hir.hpp"                              // Hir
 #include "hir/hir_attrs.hpp"                        // the five HirAttribute<T> side-table aliases
-#include "hir/lowering/hir_literal_pool.hpp"        // HirLiteralPool (literal values)
+#include "hir/hir_literal_pool.hpp"                 // HirLiteralPool (literal values)
 
 #include <memory>
 #include <string>

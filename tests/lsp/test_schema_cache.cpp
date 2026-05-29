@@ -22,7 +22,7 @@ TEST(SchemaCache, ResolvesShippedToyByName) {
     SchemaCache c;
     auto r = c.resolveByName("toy");
     ASSERT_TRUE(r.has_value()) << "loadShipped(\"toy\") must succeed; the JSON"
-                                  " lives in src/source-config/languages/";
+                                  " lives in src/dss-config/sources/";
     EXPECT_NE(*r, nullptr);
     // Display name in the JSON is "Toy" (capitalized); the loader
     // preserves the file's `name` field. `loadShipped("toy")`
@@ -106,14 +106,14 @@ TEST(SchemaCache, UnknownExtensionWithShippedConfigsReportsNoMatch) {
 // F14 (loud-fail follow-up; NO WORKAROUNDS): the discovery walk is a
 // pure function — verify it explicitly distinguishes "directory not
 // found" from "directory found". `temp_directory_path()` is guaranteed
-// to have no `src/source-config/languages/` ancestor in any realistic
+// to have no `src/dss-config/sources/` ancestor in any realistic
 // CI/dev layout, so the walk MUST return an empty `directory`.
 TEST(SchemaCache, DiscoverShippedLanguagesReportsAbsentDirectory) {
     const auto tmp = std::filesystem::temp_directory_path();
     const auto result = SchemaCache::discoverShippedLanguages(tmp);
     EXPECT_FALSE(result.directory.has_value())
         << "tmp path " << tmp.string()
-        << " unexpectedly has a `src/source-config/languages/` ancestor";
+        << " unexpectedly has a `src/dss-config/sources/` ancestor";
     EXPECT_TRUE(result.names.empty());
 }
 
@@ -128,7 +128,7 @@ TEST(SchemaCache, ShippedModeWithNoDirectoryReportsShippedDirNotFound) {
     auto r = c.resolveByExtension(".toy");
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, SchemaResolveErrorKind::ShippedDirNotFound);
-    EXPECT_NE(r.error().detail.find("source-config/languages"),
+    EXPECT_NE(r.error().detail.find("dss-config/sources"),
               std::string::npos)
         << "error must name the directory the operator should populate, "
         << "got: " << r.error().detail;
@@ -137,13 +137,13 @@ TEST(SchemaCache, ShippedModeWithNoDirectoryReportsShippedDirNotFound) {
 // F14 (loud-fail follow-up; NO WORKAROUNDS): a discovered-but-empty
 // shipped directory is a deploy-error class distinct from
 // not-found-at-all. Build the empty case via a temp dir containing
-// `src/source-config/languages/` with zero `*.lang.json` files.
+// `src/dss-config/sources/` with zero `*.lang.json` files.
 TEST(SchemaCache, ShippedModeWithEmptyDirectoryReportsShippedDirEmpty) {
     namespace fs = std::filesystem;
     const auto tmp = fs::temp_directory_path() / "dss_schema_cache_empty_dir";
     std::error_code ec;
     fs::remove_all(tmp, ec);   // clean any prior run
-    fs::create_directories(tmp / "src" / "source-config" / "languages");
+    fs::create_directories(tmp / "src" / "dss-config" / "sources");
     SchemaCache c{std::nullopt, tmp};
     auto r = c.resolveByExtension(".toy");
     ASSERT_FALSE(r.has_value());

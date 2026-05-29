@@ -401,6 +401,23 @@ private:
             case TypeKind::Tuple:  out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
             case TypeKind::Struct: out_ += "struct "; out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
             case TypeKind::Union:  out_ += "union ";  out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
+            // D5.5: enum is nominal-by-name; underlying TypeKind lives in
+            // scalars[0]. Round-trip the underlying explicitly when it
+            // diverges from the default I32 (`enum "E" : kindOrdinal`);
+            // omit the suffix when underlying = I32 to keep the common
+            // form readable. Parser defaults to I32 when the suffix is
+            // absent — emission elision MUST stay in lockstep with the
+            // parser default for round-trip correctness.
+            case TypeKind::Enum: {
+                out_ += "enum ";
+                out_ += quote(in.name(t));
+                auto sc = in.scalars(t);
+                if (!sc.empty() && static_cast<TypeKind>(sc[0]) != TypeKind::I32) {
+                    out_ += " : ";
+                    out_ += std::to_string(sc[0]);
+                }
+                return;
+            }
             case TypeKind::FnSig: {
                 out_ += "fn(";
                 args(in.fnParams(t));
@@ -1685,6 +1702,19 @@ private:
         if (kw == "union") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
             auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
             return interner_.unionType(name, ts); }
+        // D5.5: `enum "Name"` with optional `: <underlyingOrdinal>`. Enumerator
+        // names live in the SemanticModel symbol table, not the type record;
+        // only the nominal name + underlying TypeKind round-trip here.
+        if (kw == "enum") {
+            std::string name = takeStr();
+            TypeKind underlying = TypeKind::I32;
+            if (accept(Tk::Colon)) {
+                std::uint64_t const ord = takeInt();
+                if (ord < static_cast<std::uint64_t>(TypeKind::Count_)) {
+                    underlying = static_cast<TypeKind>(ord);
+                }
+            }
+            return interner_.enumType(name, underlying); }
         if (kw == "fn") {
             expect(Tk::LParen, "'('"); auto params = parseTypeListUntil(Tk::RParen); expect(Tk::RParen, "')'");
             expect(Tk::Arrow, "'->'"); TypeId result = parseType();

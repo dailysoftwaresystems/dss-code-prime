@@ -193,6 +193,23 @@ enum class DiagnosticCode : std::uint16_t {
     // wrap to a negative length). Distinct from S_NonConstantArrayLength (which
     // is "not a constant at all"); kept separate so the message matches reality.
     S_ArrayLengthOutOfRange       = 0xE00C,
+    // D5.1: a `.` or `->` member access whose LHS resolves to a non-composite
+    // type (not a TypeKind::Struct / Union). Distinct from S_TypeMismatch so
+    // downstream LSP/fixits/error-recovery can match the specific shape
+    // (parallels S_NotCallable). Emitted by the member-access resolution.
+    S_NotAComposite               = 0xE00D,
+    // D5.1: a `->` member access whose LHS resolves to a non-pointer type.
+    // Distinct from S_TypeMismatch (and from S_NotAComposite) so downstream
+    // can disambiguate the two arrow-form failure modes — the LHS isn't a
+    // pointer at all (here), vs. the LHS IS Ptr<T> but T isn't composite
+    // (S_NotAComposite).
+    S_NotAPointer                 = 0xE00E,
+    // D5.5: an enumerator's explicit `= expr` is not a constant integer
+    // literal. v1 accepts integer-literal explicit values; arbitrary
+    // const-expressions require CST-side const-eval (plan 12.5 §0.2 D6).
+    // Implicit (no `= expr`) enumerators auto-increment from the prior;
+    // this diagnostic is reserved for the explicit-non-literal case.
+    S_NonConstantEnumeratorValue  = 0xE00F,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -273,6 +290,95 @@ enum class DiagnosticCode : std::uint16_t {
     //   a later plan). An `Error` HIR node is emitted as a recovery sentinel and
     //   lowering continues (collect-all); never a silent skip or a miscompile.
     H_UnsupportedLoweringForKind  = 0xF009,
+
+    // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
+    // for the IR-gen / mid-level layer). Each code names a structural-,
+    // dominance-, or type-consistency invariant on the frozen `Mir` module
+    // that `MirVerifier::verify()` checks AFTER the ML1 builder/freeze
+    // sweep. Re-running the ML1 invariants on the frozen module catches
+    // the direct-`Mir`-ctor path (test fixtures, future synthetic IR) that
+    // bypasses the builder; the dom-tree / interner-gated checks are
+    // genuinely beyond what ML1 can see.
+
+    // I_VerifierFailure: catch-all for structural invariants that don't
+    // have a dedicated code (re-run of ML1's opcode/arity/result-rule
+    // checks on the frozen module).
+    I_VerifierFailure         = 0xA001,
+    // Exactly one block per function has StructCfMarker::EntryBlock AND
+    // it is the function's first block (funcBlockAt(f, 0)).
+    I_NoEntryBlock            = 0xA002,
+    I_MultipleEntryBlocks     = 0xA003,
+    I_EntryBlockNotFirst      = 0xA004,
+    // The block's last instruction's opcode is not a terminator
+    // (defense-in-depth: ML1 already enforces this at build time).
+    I_BlockNotTerminated      = 0xA005,
+    // A Phi's incoming.pred is not in the CFG-predecessor set of the
+    // phi's enclosing block.
+    I_PhiPredNotInCfg         = 0xA006,
+    // An instruction's value operand is defined in a block that does
+    // NOT dominate the use site (SSA invariant; needs the dom tree).
+    I_NotDominated            = 0xA007,
+    // CondBr condition is not a Bool, or Return value type doesn't
+    // match the function's FnSig return type. Interner-gated.
+    I_TerminatorTypeMismatch  = 0xA008,
+    // Arg-instruction's argIndex is >= the function's FnSig.paramCount.
+    // Interner-gated.
+    I_ArgIndexOutOfRange      = 0xA009,
+    // An instruction's typeId resolves to a TypeKind::Extension —
+    // every extension type must have been resolved to a core lattice
+    // kind at the HIR→MIR boundary. Interner-gated.
+    I_ExtensionTypeInMir      = 0xA00A,
+    // StructCfMarker pairing — IfThen has matching IfElse/IfJoin;
+    // LoopHeader has matching LoopLatch/LoopExit; ExitBlock terminates
+    // in Return/Unreachable.
+    I_StructCfMismatch        = 0xA00B,
+    // A block in a function is not reachable from the function's
+    // entry block. Orphan CFG islands are a structural invariant
+    // violation — every block must be reachable from entry.
+    I_UnreachableBlock        = 0xA00C,
+    // ML4 — `.dssir` text format diagnostics (mirrors HR7's H_Text*
+    // family for HIR).
+    I_TextMalformed           = 0xA00D,
+    I_TextVersionMismatch     = 0xA00E,
+    I_TextUnknownName         = 0xA00F,
+
+    // ── LIR lowering + verifier (renders as `L`) ──────────────────────
+    //
+    // The MIR→LIR instruction-selection pass emits these when a MIR
+    // opcode has no per-target lowering rule (or the target schema does
+    // not declare the required LIR opcode). Same fail-loud-deferral
+    // discipline as `H_UnsupportedLoweringForKind`. Additional `L_*`
+    // codes (e.g. verifier failures) belong to this family.
+    L_UnsupportedLoweringForOpcode = 0xB001,
+    L_RequiredLirOpcodeMissing     = 0xB002,
+    L_VirtualRegInPostRegalloc     = 0xB003,
+    L_InvalidSpillSlotSentinel     = 0xB004,
+    // Producer-side register-table integrity failure surfaced by the
+    // LIR text emitter: an instruction references a physical-register
+    // ordinal that is not in the target schema's register table. This
+    // is distinct from "unsupported lowering" (which is an inability to
+    // map a MIR opcode); the register is the bug, not the opcode.
+    L_PhysRegOrdinalOutOfRange     = 0xB005,
+    // Memory addressing-mode operand pairing failure: a Load/Store/Lea
+    // instruction's operand list does not end with the required
+    // `[MemBase, MemOffset]` pair. Surfaced by `LirVerifier`'s Rule 1
+    // (verifyLir + verifyLirText). Distinct from
+    // L_UnsupportedLoweringForOpcode (which is about opcode-lowering
+    // coverage gaps): this code names the malformed substrate shape.
+    L_MemOperandMalformed          = 0xB006,
+
+    // ── Register allocator (renders as `R`) ────────────────────────────
+    //
+    // The linear-scan register allocator emits these when a target
+    // schema is missing required calling-convention data, when an LIR
+    // input contains a vreg that should have been caught upstream by
+    // the LirVerifier, or as informational notes about spill decisions
+    // so consumers can understand register-pressure costs.
+    R_NoCallingConventions         = 0x4001,
+    R_CallingConventionLookupFailed = 0x4002,
+    R_VRegHasNoClass               = 0x4003,
+    R_SpilledDueToPressure         = 0x4004,
+    R_SpilledDueToCrossCallExhaustion = 0x4005,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

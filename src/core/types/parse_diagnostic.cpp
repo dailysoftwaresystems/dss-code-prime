@@ -82,6 +82,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_ControlOutsideLoop:       return "S_ControlOutsideLoop";
         case DiagnosticCode::S_UnusedVariable:           return "S_UnusedVariable";
         case DiagnosticCode::S_NonConstantArrayLength:   return "S_NonConstantArrayLength";
+        case DiagnosticCode::S_NonConstantEnumeratorValue: return "S_NonConstantEnumeratorValue";
         case DiagnosticCode::S_ArrayLengthOutOfRange:    return "S_ArrayLengthOutOfRange";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
@@ -98,6 +99,32 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_TextVersionMismatch:      return "H_TextVersionMismatch";
         case DiagnosticCode::H_TextUnknownName:          return "H_TextUnknownName";
         case DiagnosticCode::H_UnsupportedLoweringForKind: return "H_UnsupportedLoweringForKind";
+        case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
+        case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
+        case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
+        case DiagnosticCode::I_EntryBlockNotFirst:       return "I_EntryBlockNotFirst";
+        case DiagnosticCode::I_BlockNotTerminated:       return "I_BlockNotTerminated";
+        case DiagnosticCode::I_PhiPredNotInCfg:          return "I_PhiPredNotInCfg";
+        case DiagnosticCode::I_NotDominated:             return "I_NotDominated";
+        case DiagnosticCode::I_TerminatorTypeMismatch:   return "I_TerminatorTypeMismatch";
+        case DiagnosticCode::I_ArgIndexOutOfRange:       return "I_ArgIndexOutOfRange";
+        case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
+        case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
+        case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
+        case DiagnosticCode::I_TextMalformed:            return "I_TextMalformed";
+        case DiagnosticCode::I_TextVersionMismatch:      return "I_TextVersionMismatch";
+        case DiagnosticCode::I_TextUnknownName:          return "I_TextUnknownName";
+        case DiagnosticCode::L_UnsupportedLoweringForOpcode: return "L_UnsupportedLoweringForOpcode";
+        case DiagnosticCode::L_RequiredLirOpcodeMissing:     return "L_RequiredLirOpcodeMissing";
+        case DiagnosticCode::L_VirtualRegInPostRegalloc:     return "L_VirtualRegInPostRegalloc";
+        case DiagnosticCode::L_InvalidSpillSlotSentinel:     return "L_InvalidSpillSlotSentinel";
+        case DiagnosticCode::L_PhysRegOrdinalOutOfRange:     return "L_PhysRegOrdinalOutOfRange";
+        case DiagnosticCode::L_MemOperandMalformed:          return "L_MemOperandMalformed";
+        case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
+        case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
+        case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";
+        case DiagnosticCode::R_SpilledDueToPressure:          return "R_SpilledDueToPressure";
+        case DiagnosticCode::R_SpilledDueToCrossCallExhaustion: return "R_SpilledDueToCrossCallExhaustion";
     }
     return "Unknown";
 }
@@ -105,16 +132,28 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
 std::string diagnosticCodePrefix(DiagnosticCode c) {
     // The numeric value carries the phase letter in its high nibble:
     //   0x0xxx → P0xxx     (parse)
+    //   0x4xxx → R0xxx     (register allocator)
+    //   0x5xxx → O0xxx     RESERVED — object format / linker (not yet shipped;
+    //                       holding the slot here so plan-14 doesn't accidentally
+    //                       land on 0xCxxx (which is C_*) or 0xDxxx (D_*))
     //   0x9xxx → P9xxx     (parse, internal-invariant range)
     //   0xCxxx → C0xxx     (config)
     //   0xDxxx → D0xxx     (driver / compilation-unit)
-    //   0xExxx → S0xxx     (semantic analysis, plan 08.6)
-    //   0xFxxx → H0xxx     (HIR verifier / lowering, plan 09)
+    //   0xAxxx → I0xxx     (MIR verifier / IR-gen mid-level)
+    //   0xBxxx → L0xxx     (LIR lowering + verifier)
+    //   0xExxx → S0xxx     (semantic analysis)
+    //   0xFxxx → H0xxx     (HIR verifier / lowering)
     // Render as the 4-digit hex grouping the user actually sees.
     const auto v          = static_cast<std::uint16_t>(c);
     const std::uint16_t nibble = v & 0xF000u;
     char letter = 'P';
-    if (nibble == 0xC000u) {
+    if (nibble == 0x4000u) {
+        letter = 'R';
+    } else if (nibble == 0xA000u) {
+        letter = 'I';
+    } else if (nibble == 0xB000u) {
+        letter = 'L';
+    } else if (nibble == 0xC000u) {
         letter = 'C';
     } else if (nibble == 0xD000u) {
         letter = 'D';
@@ -124,10 +163,12 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'H';
     }
     // Strip the high nibble for the numeric portion when it's a phase
-    // marker (C/D/S/H). The 9xxx range stays 9xxx so P_BuilderInvariant prints
-    // as "P9000".
-    const bool hasNibbleMarker = (nibble == 0xC000u || nibble == 0xD000u
-                                  || nibble == 0xE000u || nibble == 0xF000u);
+    // marker (R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
+    // P_BuilderInvariant prints as "P9000".
+    const bool hasNibbleMarker = (nibble == 0x4000u || nibble == 0xA000u
+                                  || nibble == 0xB000u || nibble == 0xC000u
+                                  || nibble == 0xD000u || nibble == 0xE000u
+                                  || nibble == 0xF000u);
     const std::uint16_t lo = hasNibbleMarker ? (v & 0x0FFFu) : v;
     return std::format("{}{:04X}", letter, lo);
 }

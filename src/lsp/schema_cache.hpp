@@ -35,7 +35,7 @@ enum class SchemaResolveErrorKind : std::uint8_t {
     LoadFailed,         // file exists but loader rejected it
     NoExtensionMatch,   // file extension matches no known language
     // Shipped-mode only: cwd-walk failed to locate the
-    // `src/source-config/languages/` directory within 8 parent levels.
+    // `src/dss-config/sources/` directory within 8 parent levels.
     // Without it, extension-based resolution has no candidate list. Loud
     // failure prevents a silent "extension matches nothing" misdiagnosis
     // when the real problem is "shipped configs not discoverable from
@@ -72,7 +72,7 @@ struct DSS_EXPORT ShippedDiscoveryResult {
 class DSS_EXPORT SchemaCache {
 public:
     // `schemaDir` empty ⇒ shipped-only mode (the cache auto-discovers
-    // `src/source-config/languages/` via cwd-walk). `discoveryStartPath`
+    // `src/dss-config/sources/` via cwd-walk). `discoveryStartPath`
     // overrides the walk's starting point and exists for tests that need
     // to pin "no shipped dir found" / "dir found but empty" behaviour
     // without mutating process cwd; production callers leave it default.
@@ -80,7 +80,7 @@ public:
                          std::optional<std::filesystem::path> discoveryStartPath = std::nullopt);
 
     // Walk up from `startPath` (default: `current_path()`) up to 8
-    // parent levels looking for `src/source-config/languages/`. If
+    // parent levels looking for `src/dss-config/sources/`. If
     // found, enumerate `*.lang.json` and return the sorted base names
     // alongside the located directory. Public + static so tests can
     // pin behavior without mutating process cwd.

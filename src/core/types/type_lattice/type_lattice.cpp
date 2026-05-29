@@ -4,6 +4,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -183,6 +184,14 @@ TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> va
     return internContent(TypeKind::Union, {}, variants, {}, names_.intern(name));
 }
 
+TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
+    // scalars=[(int)underlying]; no operands (enumerator symbols carry
+    // the enum's TypeId individually as Variables; the enum type itself
+    // is identified nominally by name + tagged with its underlying type).
+    std::array<std::int64_t, 1> const sc{static_cast<std::int64_t>(underlying)};
+    return internContent(TypeKind::Enum, {}, {}, sc, names_.intern(name));
+}
+
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc) {
     // operands = [result, params...] so the result is recoverable at a fixed
     // position; scalars = [(int)cc].
@@ -224,6 +233,107 @@ TypeId TypeInterner::fnResult(TypeId id) const {
 std::span<TypeId const> TypeInterner::fnParams(TypeId id) const {
     if (kind(id) != TypeKind::FnSig) latticeFatal("fnParams: TypeId is not a FnSig");
     return operands(id).subspan(1);
+}
+
+namespace {
+
+// Integer-rank (C99 §6.3.1.1). Bool < Char/I8/U8 < I16/U16 < I32/U32 < I64/U64
+// < I128/U128. Same rank for signed/unsigned of the same width — the
+// signedness tie-break lives in `commonType` below. Returns -1 for
+// non-integer kinds.
+[[nodiscard]] int integerRank(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::Bool:                                   return 0;
+        case TypeKind::I8:   case TypeKind::U8:
+        case TypeKind::Char: case TypeKind::Byte:              return 1;
+        case TypeKind::I16:  case TypeKind::U16:               return 2;
+        case TypeKind::I32:  case TypeKind::U32:               return 3;
+        case TypeKind::I64:  case TypeKind::U64:               return 4;
+        case TypeKind::I128: case TypeKind::U128:              return 5;
+        default: return -1;
+    }
+}
+
+[[nodiscard]] int floatRank(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::F16:  return 1;
+        case TypeKind::F32:  return 2;
+        case TypeKind::F64:  return 3;
+        case TypeKind::F128: return 4;
+        default: return -1;
+    }
+}
+
+[[nodiscard]] bool isSignedInt(TypeKind k) noexcept {
+    return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
+        || k == TypeKind::I64 || k == TypeKind::I128 || k == TypeKind::Char;
+}
+
+// Map a (rank, signed) pair to the canonical TypeKind. Used by commonType
+// when synthesizing the result kind after integer promotion / cross-
+// signedness tie-break.
+[[nodiscard]] TypeKind integerKindAtRank(int rank, bool isSigned) noexcept {
+    switch (rank) {
+        case 0: return TypeKind::Bool;
+        case 1: return isSigned ? TypeKind::I8   : TypeKind::U8;
+        case 2: return isSigned ? TypeKind::I16  : TypeKind::U16;
+        case 3: return isSigned ? TypeKind::I32  : TypeKind::U32;
+        case 4: return isSigned ? TypeKind::I64  : TypeKind::U64;
+        case 5: return isSigned ? TypeKind::I128 : TypeKind::U128;
+        default: return TypeKind::Void;
+    }
+}
+
+} // namespace
+
+TypeId TypeInterner::commonType(TypeId a, TypeId b) {
+    if (!a.valid() || !b.valid()) return InvalidType;
+    TypeKind const ka = kind(a);
+    TypeKind const kb = kind(b);
+    // Same-type short-circuit applies ONLY when no integer promotion is
+    // owed. C99 §6.3.1.8: integer promotion (rank-<int → int) applies
+    // per-operand BEFORE the common-type computation, so `u16 + u16`
+    // produces `i32`, not `u16`. Floats and ≥int integer ranks have
+    // identity promotion and may short-circuit.
+    if (a == b) {
+        int const r = integerRank(ka);
+        if (r < 0 || r >= 3) return a;
+        // Else fall through to the promotion path below.
+    }
+    // Floating-point hierarchy wins over integer (per C99): if either is
+    // float, promote both to the wider float.
+    int const fa = floatRank(ka);
+    int const fb = floatRank(kb);
+    if (fa >= 0 || fb >= 0) {
+        // If only one side is float, the other must promote to it; the
+        // common type is the float side (or the wider float if both).
+        if (fa >= 0 && fb < 0) return a;
+        if (fb >= 0 && fa < 0) return b;
+        // Both float: wider rank wins.
+        return (fa >= fb) ? a : b;
+    }
+    // Integer side: apply integer promotions (rank < I32 → I32) and then
+    // pick the wider rank, with signedness tie-break on equal width.
+    int const ra = integerRank(ka);
+    int const rb = integerRank(kb);
+    if (ra < 0 || rb < 0) return InvalidType;  // not arithmetic
+    // Integer promotion: anything narrower than I32 (rank<3) widens to I32
+    // (signed). Bool and char follow the same rule.
+    int const prA = ra < 3 ? 3 : ra;
+    int const prB = rb < 3 ? 3 : rb;
+    bool const sA = ra < 3 ? true : isSignedInt(ka);
+    bool const sB = rb < 3 ? true : isSignedInt(kb);
+    int const targetRank = std::max(prA, prB);
+    bool signedness;
+    if (prA == prB) {
+        // Same width → unsigned wins (C99: same-rank signed/unsigned →
+        // unsigned). Bool widening to I32 is signed by promotion.
+        signedness = sA && sB;
+    } else {
+        // Different width → take the wider side's signedness.
+        signedness = (prA > prB) ? sA : sB;
+    }
+    return primitive(integerKindAtRank(targetRank, signedness));
 }
 
 // ── TypeRegistry ──────────────────────────────────────────────────────────

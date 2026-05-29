@@ -13,6 +13,7 @@
 #include "core/types/tree_node.hpp"             // isEmptySpace
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "hir/cst_const_eval.hpp"
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
 
@@ -51,13 +52,10 @@ namespace {
     return std::nullopt;
 }
 
-[[nodiscard]] bool isComparison(HirOpKind op) noexcept {
-    switch (op) {
-        case HirOpKind::Eq: case HirOpKind::Ne: case HirOpKind::Lt:
-        case HirOpKind::Le: case HirOpKind::Gt: case HirOpKind::Ge: return true;
-        default: return false;
-    }
-}
+// `isComparison` lives in `hir/hir_op.hpp` — one source of truth across HR
+// lowering's `combineBinary`, MIR's `mapBinaryOp`, and the constants-eval
+// engine's BinaryOp branch. A new comparison-shaped op (e.g. `Spaceship`)
+// would otherwise need updates in all three sites.
 
 // decodeInteger lives in core/types/number_decode.hpp — shared with the
 // semantic phase so a literal's text is interpreted identically everywhere.
@@ -118,8 +116,55 @@ struct Lowerer {
     std::unordered_map<std::uint32_t, TypeKind>    litCore_;     // SchemaTokenId.v → TypeKind
     std::unordered_map<std::uint32_t, bool>        deferred_;    // RuleId.v of explicitly-deferred rules
 
+    // The enclosing function's declared return type, threaded into `lowerReturn`
+    // so a `return expr;` whose `expr.type` differs from the declared type
+    // emits an implicit `Cast(expr → declaredType)`. Invalid outside any
+    // function body (top-level Module / global initializers).
+    TypeId currentReturnType_{};
+
     // The result of lowering an expression: the HIR node + its resolved type.
     struct E { HirNodeId id; TypeId type; };
+
+    // Coerce an expression to `target` by emitting a `Cast` when its type
+    // differs. Same-type, invalid-target (treat as a pass-through — the
+    // semantic phase has likely already flagged the mismatch), or invalid-
+    // source all pass through unchanged. Calling this is the single point
+    // where HR commits to an implicit-conversion site; the MIR-side `Cast`
+    // lowering (cycle C's mapCast) picks the right opcode from the
+    // (sourceKind, targetKind) pair. The emitted Cast is aliased to its
+    // OPERAND's source-map entry so diagnostics anchored at the synthetic
+    // Cast still locate to real source.
+    [[nodiscard]] E coerce(E child, TypeId target) {
+        if (!target.valid() || !child.type.valid()) return child;
+        if (child.type == target) return child;
+        // Pointers, structs, FnSig are not coerced implicitly; let the
+        // caller decide whether the mismatch is a diagnostic. Arithmetic
+        // (int + float kinds) is the implicit-conversion surface.
+        TypeKind const ck = interner.kind(child.type);
+        TypeKind const tk = interner.kind(target);
+        auto isArithmetic = [](TypeKind k) noexcept {
+            return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
+                || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32
+                || k == TypeKind::I64  || k == TypeKind::I128
+                || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
+                || k == TypeKind::U64  || k == TypeKind::U128
+                || k == TypeKind::F16  || k == TypeKind::F32
+                || k == TypeKind::F64  || k == TypeKind::F128;
+        };
+        if (!isArithmetic(ck) || !isArithmetic(tk)) return child;
+        HirNodeId const cast = builder.makeCast(child.id, target, HirFlags::Synthetic);
+        // Alias the synthetic Cast to its operand's pending span entry so
+        // diagnostics anchored at the Cast locate to real source. The
+        // operand may have multiple pending entries (rare — only when an
+        // earlier coerce already wrapped it); use the most recent (last).
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->first == child.id) {
+                spans.push_back({cast, it->second});
+                break;
+            }
+        }
+        return E{cast, target};
+    }
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
@@ -327,8 +372,21 @@ struct Lowerer {
     }
 
     E lowerOperand(NodeId node) {
-        // operand = Identifier | <literal token> | <char/string literal> | ( expression )
+        // operand = Identifier | <literal token> | <char/string literal>
+        //         | ( expression ) | compoundLiteralExpr | ...
         if (auto lit = tryLowerLeafLiteral(node)) return *lit;
+        // D5.3 cycle 1b.3: compound literal `(T){...}` as an expression.
+        // Detected BEFORE the generic internal-child descent because
+        // its shape is `(T){...}` — lowerExpr's rule dispatch doesn't
+        // recognize compoundLiteralExpr; route it through the dedicated
+        // lowering that resolves the type-ref + lowers the brace child.
+        for (NodeId c : visible(node)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (cfg.compoundLiteralRule.valid()
+             && tree().rule(c).v == cfg.compoundLiteralRule.v) {
+                return lowerCompoundLiteral(c);
+            }
+        }
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) return lowerExpr(c);  // paren-wrapped
         }
@@ -524,10 +582,38 @@ struct Lowerer {
             return exprError(callNode, "call has no callee child");
         }
         std::vector<HirNodeId> args;
+        // If the callee's typeId is a FnSig, coerce each arg to its declared
+        // param type. Variadic / unknown signatures pass through unchanged
+        // (the verifier owns the arity-vs-FnSig rule).
+        std::span<TypeId const> paramTypes{};
+        if (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig) {
+            paramTypes = interner.fnParams(calleeTy);
+        }
+        std::size_t argIdx = 0;
         if (cr.argsChild < vis.size()) {
             for (NodeId a : visible(vis[cr.argsChild])) {
                 if (isToken(a)) continue;                       // skip commas
-                args.push_back(lowerFlatExpr(a).id);
+                TypeId const paramType = (argIdx < paramTypes.size())
+                                       ? paramTypes[argIdx] : InvalidType;
+                // D5.3 cycle 1b.4: brace-init argument `f({1, 2})`
+                // lowers via the shared helper with the callee's
+                // FnSig param type pushed as the brace-init context.
+                // For non-brace args the helper degrades to the same
+                // `lowerExpr + coerce` shape, but the flat-expression
+                // arm uses `lowerFlatExpr` (SQL-style flat expressions)
+                // — handle that specifically.
+                NodeId const core = peelToBraceInitOrCore(a);
+                HirNodeId argNode;
+                if (isBraceInitList(core)) {
+                    argNode = lowerBraceInit(core, paramType);
+                } else {
+                    E const arg = lowerFlatExpr(a);
+                    E const coerced = paramType.valid() ? coerce(arg, paramType)
+                                                        : arg;
+                    argNode = coerced.id;
+                }
+                args.push_back(argNode);
+                ++argIdx;
             }
         }
         TypeId const result = (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig)
@@ -726,18 +812,35 @@ struct Lowerer {
     // type) stay identical. Does NOT handle `Assign` (an expression-position
     // store) — that is Pratt-only and resolved by the caller before this point.
     E combineBinary(NodeId anchor, HirOperatorEntry const& e, E lhs, E rhs) {
-        if (e.target == "LogicalAnd")
-            return {track(builder.makeLogicalAnd(lhs.id, rhs.id, boolType()), anchor), boolType()};
-        if (e.target == "LogicalOr")
-            return {track(builder.makeLogicalOr(lhs.id, rhs.id, boolType()), anchor), boolType()};
+        // LogicalAnd/Or: operands coerce to Bool (short-circuit semantics).
+        if (e.target == "LogicalAnd" || e.target == "LogicalOr") {
+            E const lb = coerce(lhs, boolType());
+            E const rb = coerce(rhs, boolType());
+            if (e.target == "LogicalAnd")
+                return {track(builder.makeLogicalAnd(lb.id, rb.id, boolType()), anchor), boolType()};
+            return {track(builder.makeLogicalOr(lb.id, rb.id, boolType()), anchor), boolType()};
+        }
         auto op = coreOpFromName(e.target);
         if (!op || arityOf(*op) != HirOpArity::Binary) {
             unsupported(anchor, std::format("binary target '{}' is not a core binary operator", e.target));
             return {errorNode(anchor), InvalidType};
         }
+        // C99 usual arithmetic conversions: both operands coerce to their
+        // common type before the op. The result type is that common type
+        // (or Bool for comparisons). `commonType` returns InvalidType for
+        // non-arithmetic operand pairs — fall back to the prior "first
+        // valid type wins" rule so non-arithmetic Refs (e.g. pointer +
+        // pointer comparisons) still lower without losing structure.
+        TypeId const common = interner.commonType(lhs.type, rhs.type);
+        E lc = lhs, rc = rhs;
+        if (common.valid()) {
+            lc = coerce(lhs, common);
+            rc = coerce(rhs, common);
+        }
         TypeId const result = isComparison(*op) ? boolType()
-                            : (lhs.type.valid() ? lhs.type : rhs.type);
-        return {track(builder.addParent(HirKind::BinaryOp, std::array{lhs.id, rhs.id},
+                            : (common.valid() ? common
+                                              : (lhs.type.valid() ? lhs.type : rhs.type));
+        return {track(builder.addParent(HirKind::BinaryOp, std::array{lc.id, rc.id},
                                         result, encodeOp(*op)), anchor), result};
     }
 
@@ -842,9 +945,20 @@ struct Lowerer {
             return {errorNode(node), InvalidType};
         }
         E cond = lowerExpr(operands[0]);
+        // Coerce cond to Bool (C99 + LLVM-style i1 discipline at the
+        // CondBr / Ternary boundary).
+        cond = coerce(cond, boolType());
         E thenE = lowerExpr(operands[1]);
         E elseE = lowerExpr(operands[2]);
-        TypeId const result = typeAtOr(node, thenE.type.valid() ? thenE.type : elseE.type);
+        // Coerce both arms to their common type (C99 conditional-expression
+        // type-balance rule). Falls back to the type-attribute-or-then.
+        TypeId const common = interner.commonType(thenE.type, elseE.type);
+        if (common.valid()) {
+            thenE = coerce(thenE, common);
+            elseE = coerce(elseE, common);
+        }
+        TypeId const result = common.valid() ? common
+                            : typeAtOr(node, thenE.type.valid() ? thenE.type : elseE.type);
         return {track(builder.makeTernary(cond.id, thenE.id, elseE.id, result), node), result};
     }
 
@@ -889,7 +1003,23 @@ struct Lowerer {
         E base = lowerExpr(baseN);
         if (e.target == "Call") {
             std::vector<HirNodeId> args;
-            for (NodeId argN : argExpressions(rest)) args.push_back(lowerExpr(argN).id);
+            // Coerce each arg to its FnSig param type (when the callee's
+            // signature is known). Same discipline as the lowerFlatExpr's
+            // call arm above — single source of truth for arg-coercion.
+            std::span<TypeId const> paramTypes{};
+            if (base.type.valid() && interner.kind(base.type) == TypeKind::FnSig) {
+                paramTypes = interner.fnParams(base.type);
+            }
+            std::size_t argIdx = 0;
+            for (NodeId argN : argExpressions(rest)) {
+                TypeId const paramType = (argIdx < paramTypes.size())
+                                       ? paramTypes[argIdx] : InvalidType;
+                // D5.3 cycle 1b.4: `f({1, 2})` lowers via the shared
+                // helper with the callee's FnSig param type pushed as
+                // the brace-init context.
+                args.push_back(lowerExprOrBraceInit(argN, paramType));
+                ++argIdx;
+            }
             // Prefer the semantic phase's resolved call type (it types call nodes);
             // fall back to the callee FnSig's result.
             TypeId inferred = InvalidType;
@@ -910,6 +1040,81 @@ struct Lowerer {
             }
             TypeId const result = typeAtOr(node, inferred);
             return {track(builder.makeIndex(base.id, idx, result), node), result};
+        }
+        // D5.1: `obj.field` and `ptr->field`. The semantic phase (Pass 2)
+        // already resolved the field's SymbolId (via the `memberAccesses`
+        // facet) and propagated its type to both the field-name leaf and
+        // the postfixExpr node. We read fieldIndex off the field's
+        // SymbolRecord (Pass 1 stamped it as the field's declaration-order
+        // ordinal in its struct scope). The arrow form is desugared at HIR
+        // level: `p->x` = `MemberAccess(Deref(p), idx)` — one HIR kind
+        // handles both forms, downstream MIR sees uniform GEP-after-load
+        // patterns.
+        if (e.target == "MemberAccess" || e.target == "MemberAccessThruPtr") {
+            // Locate the field-name token inside the follower subtree
+            // (c-subset's `memberFollower = {sequence: [Identifier]}`). Robust
+            // against a future schema that wraps the name (e.g. bracketed
+            // identifiers): scan for a real token first, fall back to the
+            // first visible child if the follower is all Internal.
+            NodeId followerN = rest.empty() ? NodeId{} : rest.front();
+            NodeId fieldNameN{};
+            if (followerN.valid()) {
+                for (NodeId c : visible(followerN)) {
+                    if (isToken(c)) { fieldNameN = c; break; }
+                    if (!fieldNameN.valid()) fieldNameN = c;
+                }
+            }
+            if (!fieldNameN.valid()) {
+                return exprError(node, "member access has no field-name leaf");
+            }
+            SymbolId const fieldSym = model.symbolAt(fieldNameN);
+            if (!fieldSym.valid()) {
+                return exprError(node, "member access field did not resolve "
+                                       "to a symbol (semantic phase miss)");
+            }
+            auto const* frec = model.recordFor(fieldSym);
+            if (frec == nullptr) {
+                return exprError(node, "member access field SymbolId has no record");
+            }
+            // Defensive: the resolved symbol must be a field of a composite
+            // type. Pass 2's member-access path always binds to a field
+            // (struct-scope lookup), but a future Pass-2 recovery path that
+            // falls back to enclosing-scope lookup could mis-bind to a
+            // non-field symbol whose `fieldIndex` is just declaration-order
+            // noise. Catch it here rather than emitting a structurally-valid
+            // but semantically-wrong MemberAccess with a bogus index.
+            if (!frec->scope.valid()
+                || frec->kind != DeclarationKind::Variable) {
+                return exprError(node, "member access resolved to a non-field "
+                                       "symbol (semantic-phase mis-binding)");
+            }
+            std::uint32_t const fieldIndex = frec->fieldIndex;
+            // Field type: prefer the semantic-phase-propagated type on the
+            // field-name node; fall back to the symbol record's type.
+            TypeId fieldType = model.typeAt(fieldNameN);
+            if (!fieldType.valid()) fieldType = frec->type;
+            HirNodeId object = base.id;
+            if (e.target == "MemberAccessThruPtr") {
+                // Arrow form: dereference the LHS pointer first. The Deref's
+                // result type is the pointee type (Struct) — read from the
+                // interner via the base's Ptr operand.
+                TypeId pointeeType = InvalidType;
+                if (base.type.valid()
+                    && interner.kind(base.type) == TypeKind::Ptr
+                    && !interner.operands(base.type).empty()) {
+                    pointeeType = interner.operands(base.type)[0];
+                }
+                // Pass 2 also emitted S_NotAPointer if base.type wasn't a
+                // pointer, but we still need a type here for the Deref node
+                // to be HIR-verifier-valid (it requires a valid type). If
+                // pointee is invalid, leave it InvalidType — the verifier's
+                // requiresValidType rule will surface H_TypeUnresolved.
+                object = track(builder.makeDeref(base.id, pointeeType,
+                                                 HirFlags::Synthetic), node);
+            }
+            return {track(builder.makeMemberAccess(object, fieldIndex,
+                                                   fieldType), node),
+                    fieldType};
         }
         return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
     }
@@ -944,7 +1149,8 @@ struct Lowerer {
         if (k == "Block")       return lowerBlock(node);
         if (k == "ExprStmt")    return lowerExprStmt(node);
         if (k == "ReturnStmt")  return lowerReturn(node);
-        if (k == "BreakStmt")   return track(builder.makeBreak(0), node);
+        if (k == "BreakStmt")    return track(builder.makeBreak(0), node);
+        if (k == "ContinueStmt") return track(builder.makeContinue(0), node);
         if (k == "IfStmt")      return lowerIf(node);
         if (k == "WhileStmt")   return lowerWhile(node, /*doWhile=*/false);
         if (k == "DoWhileStmt") return lowerWhile(node, /*doWhile=*/true);
@@ -973,8 +1179,13 @@ struct Lowerer {
         }
         if (!lhsN.valid() || !rhsN.valid())  // malformed (parse-recovery) node — never abort
             return reportedError(binNode, "malformed assignment expression");
-        E lhs = lowerExpr(lhsN), rhs = lowerExpr(rhsN);
-        return track(builder.makeAssignStmt(lhs.id, rhs.id), binNode);
+        E const lhs = lowerExpr(lhsN);
+        // D5.3 cycle 1b.4: `s = {.x = 1};` lowers via the same helper
+        // as VarDecl init / return — push the LHS type as the brace-
+        // init's context type. Assignment is asymmetric (rhs coerces
+        // to lhs's type); the helper folds in the coerce step.
+        HirNodeId const rhsId = lowerExprOrBraceInit(rhsN, lhs.type);
+        return track(builder.makeAssignStmt(lhs.id, rhsId), binNode);
     }
 
     // A simple, side-effect-free lvalue (a plain variable reference): its CST
@@ -1003,6 +1214,730 @@ struct Lowerer {
         else if (isSignedCore(core)) v.value = std::int64_t{1};
         else                         v.value = std::uint64_t{1};
         return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+    }
+
+    // D5.3: synthetic zero-fill literal of `type`. For scalar types this is
+    // `0` / `0.0` / `false`. For aggregate types (`Struct`/`Union`/`Array`)
+    // this is a recursive `ConstructAggregate` whose every field/element is
+    // zero-fill — the C99 §6.7.8p21 default for omitted aggregate initializer
+    // elements. Used by `lowerBraceInit` to fill un-initialized slots before
+    // emitting the final aggregate. Synthetic ⇒ no source span.
+    //
+    // `synthZeroOrError`: same shape, but the Array path requires a
+    // well-formed (sized + element-typed) Array type. Malformed inputs
+    // (empty ops / scalars) emit a diagnostic against `at` rather than
+    // silently falling through to a scalar literal whose declared type
+    // would be `Array` — a type-system corruption.
+    [[nodiscard]] HirNodeId synthZeroOrError(NodeId at, TypeId type) {
+        TypeKind const core = type.valid() ? interner.kind(type) : TypeKind::I32;
+        // D5.4-FU3 + D5.5-FU3: unified composite arm — Struct, Union
+        // and Enum all dispatch here. Per-kind child count: Struct =
+        // every field; Union = first variant only (C99 §6.7.8p18+p21);
+        // Enum = zero-as-underlying tagged with the enum's TypeId (so
+        // the zero literal carries the enum's nominal identity).
+        if (core == TypeKind::Struct || core == TypeKind::Union) {
+            auto const ops = interner.operands(type);
+            if (core == TypeKind::Union && ops.empty()) {
+                return reportedError(at,
+                    "synthZero reached a malformed Union type "
+                    "(no variants)");
+            }
+            std::size_t const n =
+                (core == TypeKind::Union) ? std::size_t{1} : ops.size();
+            std::vector<HirNodeId> children;
+            children.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                children.push_back(synthZeroOrError(at, ops[i]));
+            }
+            return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
+        }
+        if (core == TypeKind::Enum) {
+            // The enum's underlying is in scalars[0]; the zero literal
+            // is typed AS the enum (not as the raw underlying), so a
+            // downstream consumer comparing TypeIds keeps the nominal
+            // distinction. Empty scalars = malformed enum type → fail
+            // loud (symmetric with the Union arm's malformed-variants
+            // check; missed in the first FU3 cut, surfaced by the
+            // silent-failure review).
+            auto const scals = interner.scalars(type);
+            if (scals.empty()) {
+                return reportedError(at,
+                    "synthZero reached a malformed Enum type "
+                    "(no underlying scalar)");
+            }
+            TypeKind const underlying = static_cast<TypeKind>(scals[0]);
+            HirLiteralValue v;
+            v.core = underlying;
+            if (isFloatCore(underlying))       v.value = 0.0;
+            else if (isSignedCore(underlying)) v.value = std::int64_t{0};
+            else                               v.value = std::uint64_t{0};
+            return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+        }
+        if (core == TypeKind::Array) {
+            auto const ops   = interner.operands(type);
+            auto const scals = interner.scalars(type);
+            if (ops.empty() || scals.empty()) {
+                return reportedError(at,
+                    "synthZero reached a malformed Array type "
+                    "(missing element type or length)");
+            }
+            TypeId const elemT = ops[0];
+            auto   const len   = scals[0];
+            std::vector<HirNodeId> children;
+            children.reserve(static_cast<std::size_t>(len));
+            for (std::uint32_t i = 0; i < len; ++i) {
+                children.push_back(synthZeroOrError(at, elemT));
+            }
+            return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
+        }
+        HirLiteralValue v;
+        v.core = core;
+        if (isFloatCore(core))       v.value = 0.0;
+        else if (isSignedCore(core)) v.value = std::int64_t{0};
+        else                         v.value = std::uint64_t{0};
+        return builder.makeLiteral(type, literals.add(v), HirFlags::Synthetic);
+    }
+
+    // Peel wrapper-rule layers off `n` UNTIL reaching `braceInitListRule`
+    // (or until no more sole-meaningful descents are possible). Used by
+    // D5.3 lowering: `peelToCore` over-peels through a single-element
+    // braceInitList to its lone initElement, so callers that need to
+    // recognize a braceInitList in init position must stop AT the rule
+    // rather than past it. Returns the deepest reachable node; the
+    // caller checks the rule.
+    [[nodiscard]] NodeId peelToBraceInitOrCore(NodeId n) const {
+        NodeId cur = n;
+        while (tree().kind(cur) == NodeKind::Internal) {
+            if (cfg.braceInitListRule.valid()
+             && tree().rule(cur).v == cfg.braceInitListRule.v) break;
+            NodeId const only = soleMeaningfulChild(cur);
+            if (!only.valid()) break;
+            cur = only;
+        }
+        return cur;
+    }
+    [[nodiscard]] bool isBraceInitList(NodeId n) const {
+        return cfg.braceInitListRule.valid()
+            && tree().kind(n) == NodeKind::Internal
+            && tree().rule(n).v == cfg.braceInitListRule.v;
+    }
+
+    // D5-FU3: peel wrapper-rule layers off `n` UNTIL reaching one of the
+    // recognized designator-leaf rules (designatedFieldRule /
+    // designatedIndexRule), or until no more sole-meaningful descents
+    // are possible. The c-subset grammar's `designator: alt[...]` parses
+    // to an auto-interned alt-wrapper whose rule isn't either leaf rule;
+    // callers that need to recognize a designator-leaf in initElement
+    // position use this peel rather than `peelToCore` (which over-peels
+    // through any single-child wrapper). Returns `{designatorCore, ruleIdValue}`
+    // where `ruleIdValue` is 0 if the result isn't internal.
+    [[nodiscard]] std::pair<NodeId, std::uint32_t>
+    peelToDesignatorLeaf(NodeId n) const {
+        NodeId cur = n;
+        while (tree().kind(cur) == NodeKind::Internal) {
+            std::uint32_t const rr = tree().rule(cur).v;
+            if (cfg.designatedFieldRule.valid() && rr == cfg.designatedFieldRule.v) break;
+            if (cfg.designatedIndexRule.valid() && rr == cfg.designatedIndexRule.v) break;
+            NodeId const only = soleMeaningfulChild(cur);
+            if (!only.valid()) break;
+            cur = only;
+        }
+        std::uint32_t const r = (tree().kind(cur) == NodeKind::Internal)
+                                    ? tree().rule(cur).v : std::uint32_t{0};
+        return {cur, r};
+    }
+
+    // D5-FU3: find the first identifier token (the schema's
+    // `sem.identifierToken`) among `parent`'s visible children. Returns
+    // an invalid NodeId when no such token exists. Used by every
+    // designator-name + lvalue path that needs to recover the name leaf
+    // without a full peel.
+    [[nodiscard]] NodeId firstIdentifierToken(NodeId parent) const {
+        if (!sem.identifierToken.valid()) return {};
+        for (NodeId t : visible(parent)) {
+            if (isToken(t) && tree().tokenKind(t).v == sem.identifierToken.v) {
+                return t;
+            }
+        }
+        return {};
+    }
+
+    // D5.3 cycle 1b consolidated brace-init-aware lowering. Used by every
+    // context-typing site (VarDecl init, return, call-arg, assign-RHS,
+    // nested-brace inside lowerBraceInit) — detects a `braceInitList`
+    // and routes to `lowerBraceInit(...)` with the surrounding context's
+    // resolved target type; otherwise falls through to ordinary
+    // expression lowering + coerce. Single source of truth for the
+    // detection pattern, replacing what was 5 hand-rolled copies.
+    [[nodiscard]] HirNodeId lowerExprOrBraceInit(NodeId valueNode,
+                                                 TypeId contextType) {
+        NodeId const core = peelToBraceInitOrCore(valueNode);
+        if (isBraceInitList(core)) {
+            return lowerBraceInit(core, contextType);
+        }
+        E const ve = lowerExpr(valueNode);
+        E const coerced = coerce(ve, contextType);
+        return coerced.id;
+    }
+
+    // D5.3 cycle 1b.3: compound literal `(T){...}` as an expression.
+    // The grammar parses `compoundLiteralExpr = ParenOpen
+    // typeRefAllowingStruct ParenClose braceInitList`; the type-ref
+    // child resolves via the semantic phase's per-node type stamp.
+    // The semantic phase stamps types on specific leaves (the resolved
+    // name token of a struct, builtin keywords, etc.) — not on the
+    // outer `typeRefAllowingStruct` wrapper — so recursively probe the
+    // subtree until a stamped type is found.
+    [[nodiscard]] TypeId resolveStampedTypeBelow(NodeId n) const {
+        if (TypeId t = model.typeAt(n); t.valid()) return t;
+        if (tree().kind(n) != NodeKind::Internal) return InvalidType;
+        for (NodeId c : visible(n)) {
+            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) return t;
+        }
+        return InvalidType;
+    }
+    [[nodiscard]] E lowerCompoundLiteral(NodeId clNode) {
+        NodeId typeRefN{}, braceN{};
+        for (NodeId c : visible(clNode)) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (isBraceInitList(c))                     braceN   = c;
+            else if (!typeRefN.valid())                 typeRefN = c;
+        }
+        if (!typeRefN.valid() || !braceN.valid()) {
+            return exprError(clNode,
+                "compound literal is missing its type-ref or brace-init");
+        }
+        TypeId const type = resolveStampedTypeBelow(typeRefN);
+        if (!type.valid()) {
+            return exprError(clNode,
+                "compound literal type-ref did not resolve to a type");
+        }
+        HirNodeId const agg = lowerBraceInit(braceN, type);
+        return {track(agg, clNode), type};
+    }
+
+    // D5.3 cycle 1b.2: resolve an `designatedIndex` CST `[i]` to an
+    // integer offset by walking the wrapped expression to its leaf
+    // token and decoding as an integer literal. Sufficient for the
+    // realistic v1 corpus (`[0]` / `[7]` / `[0x10]` etc.). Arbitrary
+    // const-expression indices are mapped as a real-blocker substrate
+    // item (needs CST-side const-eval — the HIR builder is write-only
+    // and `const_eval` consumes HIR). Returns nullopt + emits a real
+    // diagnostic when the index isn't a recognizable integer literal.
+    [[nodiscard]] std::optional<std::int64_t>
+    resolveIndexDesignatorLiteral(NodeId diNode) {
+        NodeId exprChild{};
+        for (NodeId c : visible(diNode)) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) == NodeKind::Internal) { exprChild = c; break; }
+        }
+        if (!exprChild.valid()) return std::nullopt;
+        // Hand off to the shared CST const-eval engine (plan 12.5
+        // §0.2 D6). Folds literal arithmetic / bitops / ternary /
+        // parens, plus identifier refs to `isConst`-bound symbols
+        // resolved through the frozen SemanticModel.
+        std::unordered_set<std::uint32_t> intLits;
+        for (auto const& [tok, kind] : litCore_) {
+            if (!isFloatCore(kind)) intLits.insert(tok);
+        }
+        CstEvalContext ctx{tree(), tree().schema(), intLits, numberStyle};
+        // Ref resolution: name → symbol via `symbolAt(identTok)` →
+        // SymbolRecord. Only `isConst` symbols are foldable. The
+        // shared `findInitExprInDecl` helper (in the engine library)
+        // handles initChild + role-based discovery in one place,
+        // keeping this site and the semantic-side resolver in lockstep.
+        CstEvalEnvironment env;
+        // HIR-lowering uses the frozen SemanticModel, whose `symbolAt`
+        // is already use-site-aware (Pass 2 resolved every reference
+        // at the CST position). Scope-context tracking via the engine
+        // is unused here — the identifier-token NodeId carries its
+        // own resolved binding. The scope arg is accepted to match
+        // the resolver signature; the returned `initScopeOpaque`
+        // is set to the symbol's own scope for parity with the
+        // semantic-side resolver.
+        env.resolveSymbolInit = [this](NodeId identTok, std::uint32_t /*curScope*/)
+            -> std::optional<CstResolvedSymbol> {
+            SymbolId const sym = model.symbolAt(identTok);
+            if (!sym.valid()) return std::nullopt;
+            SymbolRecord const* rec = model.recordFor(sym);
+            if (rec == nullptr || !rec->isConst) return std::nullopt;
+            if (!rec->declRuleNode.valid()) return std::nullopt;
+            if (rec->tree.v != tree().id().v) return std::nullopt;
+            for (auto const& dr : sem.declarations) {
+                if (dr.rule.v == tree().rule(rec->declRuleNode).v) {
+                    auto initExpr = findInitExprInDecl(tree(), dr, rec->declRuleNode);
+                    if (!initExpr.has_value()) return std::nullopt;
+                    return CstResolvedSymbol{*initExpr, rec->scope.v};
+                }
+            }
+            return std::nullopt;
+        };
+        ConstEvalResult const r = evaluateConstantCst(exprChild, ctx, env);
+        if (!r.value.has_value()) return std::nullopt;
+        return asInt64Bridge(*r.value);
+    }
+
+    // D5.3 cycle 1b InitSlot tree node. The intended invariant is
+    // EITHER `value` set (direct element / leaf of a designator chain)
+    // OR `nested` populated (in-progress sub-aggregate addressed by
+    // deeper designators) OR neither (empty — flattens to
+    // `synthZeroOrError`). The xor is maintained by the helper methods
+    // (`writeInitSlotAt` clears `nested` when writing `value`;
+    // `initSlotAsAggregate` resets `value` when growing `nested`;
+    // `flattenInitSlot` reads `value` first). Do NOT mutate the fields
+    // directly — go through the helpers, or convert to
+    // `std::variant<monostate, HirNodeId, std::vector<InitSlot>>` if
+    // direct-mutation paths grow (the variant rewrite is the compile-
+    // checked form; cycle 1b chose the field form to keep diff size
+    // small for the substrate-only landing).
+    struct InitSlot {
+        std::optional<HirNodeId> value;
+        std::vector<InitSlot>    nested;
+        TypeId                   slotType{};
+    };
+    // Idempotent: turn `s` into an in-progress sub-aggregate with one
+    // nested slot per field/element of `s.slotType`. Discards a
+    // previously-stored direct value (a later designator that addresses
+    // a strict sub-position overrides the earlier wholesale write per
+    // C99 §6.7.8p19's "later wins" rule).
+    void initSlotAsAggregate(InitSlot& s) {
+        if (!s.nested.empty()) return;
+        s.value.reset();
+        if (!s.slotType.valid()) return;
+        TypeKind const k = interner.kind(s.slotType);
+        if (k == TypeKind::Struct) {
+            auto fields = interner.operands(s.slotType);
+            s.nested.resize(fields.size());
+            for (std::size_t i = 0; i < fields.size(); ++i)
+                s.nested[i].slotType = fields[i];
+        } else if (k == TypeKind::Array) {
+            auto ops   = interner.operands(s.slotType);
+            auto scals = interner.scalars(s.slotType);
+            if (!ops.empty() && !scals.empty()) {
+                s.nested.resize(scals[0]);
+                for (auto& n : s.nested) n.slotType = ops[0];
+            }
+        }
+    }
+    // Write `val` at the slot reachable from `s` by following the path
+    // of nested-slot indices. Out-of-range step → silent no-op (callers
+    // bounds-check up front; this guard is defense-in-depth).
+    void writeInitSlotAt(InitSlot& s,
+                         std::span<std::uint32_t const> path,
+                         HirNodeId val) {
+        if (path.empty()) { s.nested.clear(); s.value = val; return; }
+        initSlotAsAggregate(s);
+        if (path[0] >= s.nested.size()) return;
+        writeInitSlotAt(s.nested[path[0]], path.subspan(1), val);
+    }
+    // Flatten a slot to its HIR node: a direct value when set, a
+    // recursive `ConstructAggregate` when sub-aggregating, or
+    // `synthZeroOrError(at, type)` when empty.
+    [[nodiscard]] HirNodeId flattenInitSlot(NodeId at, InitSlot const& s) {
+        if (s.value.has_value()) return *s.value;
+        if (s.nested.empty()) return synthZeroOrError(at, s.slotType);
+        std::vector<HirNodeId> kids;
+        kids.reserve(s.nested.size());
+        for (auto const& n : s.nested) kids.push_back(flattenInitSlot(at, n));
+        return builder.makeConstructAggregate(kids, s.slotType,
+                                              HirFlags::Synthetic);
+    }
+
+    // D5.4: union brace-init lowering. Unions hold exactly ONE active
+    // variant at a time; their brace-init must therefore initialize
+    // exactly one of the declared variants. C99 §6.7.8p17–p18 (the
+    // current-object framework + the "only the first named member of
+    // a union" rule for no-designator initializers):
+    //   • positional `{ expr }` → initializes the FIRST variant.
+    //   • designator `{ .name = expr }` → initializes the named
+    //     variant. With no other variants zero-filled (overlapping
+    //     storage; only the chosen variant is live).
+    //   • multiple elements → diagnostic. The grammar's brace-init
+    //     allows N elements; the SEMANTICS for unions cap at 1.
+    //   • chained designators `{.a.b = ...}` → diagnostic. Variant
+    //     access has no sub-position semantics in C99; chained dot
+    //     would walk INTO the chosen variant and is not yet supported.
+    // Result: a 1-child `ConstructAggregate(value, contextType)`.
+    // Empty `{}` produces the same shape as `synthZeroOrError(union)`
+    // (first-variant zero-fill per C99 §6.7.8p21).
+    [[nodiscard]] HirNodeId lowerUnionBraceInit(NodeId braceInitListNode,
+                                                TypeId contextType) {
+        auto const variants = interner.operands(contextType);
+        if (variants.empty()) {
+            return reportedError(braceInitListNode,
+                "union brace-init target has no variants");
+        }
+        // Collect all initElement children up front so we can diagnose
+        // multi-element forms before lowering anything.
+        std::vector<NodeId> elements;
+        for (NodeId c : visible(braceInitListNode)) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (cfg.initElementRule.valid()
+             && tree().rule(c).v == cfg.initElementRule.v) {
+                elements.push_back(c);
+            }
+        }
+        if (elements.empty()) {
+            // Empty `{}` — default-initialize the first variant per
+            // §6.7.8p10 (overlap with synthZeroOrError's union path).
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        if (elements.size() > 1) {
+            reportedError(braceInitListNode,
+                "union brace-init must initialize at most one variant");
+            // Take the structurally-valid zero-fill path so the
+            // pipeline downstream sees a typed aggregate without
+            // having to discriminate "really succeeded" from
+            // "succeeded with diagnostics". res->ok is already false.
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        NodeId const elem = elements[0];
+
+        // Walk the initElement: find an optional `designatedField`
+        // (designators decide WHICH variant); the value expression is
+        // the trailing non-designator non-token child. Index designators
+        // are nonsensical for unions (variants are name-indexed only).
+        // Multiple designators in one element (chained `.a.b = ...`)
+        // would walk INTO the chosen variant — diagnose, don't silently
+        // last-win on the leaf.
+        std::optional<std::uint32_t> targetVariant;
+        bool failed = false;
+        int designatorCount = 0;
+        NodeId valueExprCst{};
+        for (NodeId c : visible(elem)) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            auto const [designatorCore, r] = peelToDesignatorLeaf(c);
+            if (cfg.designatedFieldRule.valid()
+             && r == cfg.designatedFieldRule.v) {
+                ++designatorCount;
+                if (designatorCount > 1) {
+                    reportedError(designatorCore,
+                        "chained designator on a union is not supported "
+                        "(a union initializer must select exactly one "
+                        "variant)");
+                    failed = true;
+                    continue;
+                }
+                NodeId const nameTok = firstIdentifierToken(designatorCore);
+                if (!nameTok.valid()) {
+                    reportedError(designatorCore,
+                        "variant designator is missing its name");
+                    failed = true;
+                    continue;
+                }
+                ScopeId const unionScope =
+                    model.compositeScopeFor(contextType);
+                if (!unionScope.valid()) {
+                    reportedError(designatorCore,
+                        "could not resolve members of the target union "
+                        "type");
+                    failed = true;
+                    continue;
+                }
+                std::string const name{tree().text(nameTok)};
+                auto const& scope = model.scopeRecord(unionScope);
+                auto sit = scope.bindings.find(name);
+                if (sit == scope.bindings.end()) {
+                    reportedError(designatorCore,
+                        "designator names a variant that doesn't belong "
+                        "to the target union type");
+                    failed = true;
+                    continue;
+                }
+                auto const* rec = model.recordFor(sit->second);
+                if (rec == nullptr || rec->kind != DeclarationKind::Variable) {
+                    reportedError(designatorCore,
+                        "variant designator resolved to a non-variant "
+                        "symbol");
+                    failed = true;
+                    continue;
+                }
+                if (rec->fieldIndex >= variants.size()) {
+                    reportedError(designatorCore,
+                        "union variant index out of range");
+                    failed = true;
+                    continue;
+                }
+                targetVariant = rec->fieldIndex;
+                continue;
+            }
+            if (cfg.designatedIndexRule.valid()
+             && r == cfg.designatedIndexRule.v) {
+                ++designatorCount;
+                reportedError(designatorCore,
+                    "index designators are not meaningful on union types");
+                failed = true;
+                continue;
+            }
+            valueExprCst = c;
+        }
+        if (failed) {
+            // Still emit a structurally-valid (first-variant zero-fill)
+            // aggregate so downstream lowering doesn't cascade. res->ok
+            // is already false via reportedError.
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        if (!valueExprCst.valid()) {
+            // `union U u = { };` — already handled at the empty-list
+            // check above; reaching here implies a malformed initElement.
+            reportedError(elem, "union init element has no value expression");
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        std::uint32_t const variant = targetVariant.value_or(0);
+        TypeId const variantType = variants[variant];
+        HirNodeId const valueNode =
+            lowerExprOrBraceInit(valueExprCst, variantType);
+
+        // Union HIR shape: a 1-child ConstructAggregate whose single
+        // child is the chosen variant's value. The variant index is
+        // implicit-by-type (the value's HIR type identifies WHICH
+        // variant); a future explicit-tag substrate can layer an
+        // index attribute when codegen needs it.
+        std::vector<HirNodeId> children{ valueNode };
+        return builder.makeConstructAggregate(children, contextType,
+                                              HirFlags::Synthetic);
+    }
+
+    // D5.3 brace-init lowering. Takes a `braceInitList` CST node and a
+    // CONTEXT TYPE (the resolved type the brace-init must produce — a
+    // struct or array). Produces a positional `HirKind::ConstructAggregate`
+    // whose every slot is set: explicit elements at their chosen
+    // position, omitted slots zero-filled via `synthZeroOrError(fieldType)`.
+    // Supports:
+    //   • positional elements `{a, b, c}` with C99 §6.7.8 fill-cursor
+    //   • single-level field designator `{.x = a, .y = b}`
+    //   • dot-chained field designator `{.a.v = 1}` (SP3 — type-aware
+    //     name lookup via `compositeScopeFor(currentType)` + cursor
+    //     descent into the resolved field's type)
+    //   • index designator `{[2] = a}` with integer-literal indices
+    //   • mixed positional / designator with cursor restart at the
+    //     designated position (§6.7.8p17)
+    //   • chained-brace nesting `{.outer = {.inner = a}}` via recursion
+    //   • zero-fill omitted slots (§6.7.8p21)
+    //
+    // One real-blocker substrate item remaining:
+    //   • index-designator `[expr] = ...` with non-literal indices —
+    //     requires CST-side const-eval (HIR builder is write-only and
+    //     `const_eval` consumes HIR). Anchored at plan 12.5 §0.2 D6.
+    //     Locked-in by `D5_3_NonLiteralIndexDesignatorEmitsDiag`.
+    //
+    // Union brace-init is routed to `lowerUnionBraceInit` above
+    // (separate semantics — one active variant). D5.4 ✅.
+    [[nodiscard]] HirNodeId lowerBraceInit(NodeId braceInitListNode,
+                                           TypeId contextType) {
+        if (!contextType.valid()) {
+            return reportedError(braceInitListNode,
+                "brace-init requires a known context type");
+        }
+        TypeKind const containerKind = interner.kind(contextType);
+        bool const isArray  = (containerKind == TypeKind::Array);
+        bool const isStruct = (containerKind == TypeKind::Struct);
+        bool const isUnion  = (containerKind == TypeKind::Union);
+        if (!isArray && !isStruct && !isUnion) {
+            return reportedError(braceInitListNode,
+                "brace-init target type must be struct, union, or array");
+        }
+        // D5.4: union brace-init has distinct semantics from struct —
+        // at most ONE element, initializing exactly one variant.
+        // Positional → first variant; designator → that variant. No
+        // zero-fill across overlapping variants. Route to a dedicated
+        // path; the rest of this function handles struct + array.
+        if (isUnion) {
+            return lowerUnionBraceInit(braceInitListNode, contextType);
+        }
+        std::uint32_t slotCount = 0;
+        TypeId elemTypeForArray{};
+        std::span<TypeId const> structFields{};
+        if (isStruct) {
+            structFields = interner.operands(contextType);
+            slotCount = static_cast<std::uint32_t>(structFields.size());
+        } else {
+            auto const scals = interner.scalars(contextType);
+            auto const ops   = interner.operands(contextType);
+            if (!scals.empty()) slotCount = scals[0];
+            if (!ops.empty())   elemTypeForArray = ops[0];
+        }
+        if (slotCount == 0) {
+            return reportedError(braceInitListNode,
+                "brace-init target type has zero slots");
+        }
+        auto slotType = [&](std::uint32_t i) -> TypeId {
+            return isStruct ? structFields[i] : elemTypeForArray;
+        };
+
+        // Root level of the InitSlot tree — one slot per top-level
+        // field/element. Single-designator writes have empty residual
+        // path (store directly at the slot); dot-chained writes have
+        // a non-empty residual that descends into the slot's `nested`
+        // sub-aggregate via `writeInitSlotAt`.
+        std::vector<InitSlot> rootSlots(slotCount);
+        for (std::uint32_t i = 0; i < slotCount; ++i)
+            rootSlots[i].slotType = slotType(i);
+
+        // SP3.c: type-aware field-designator resolution is now inlined
+        // into the initElement-walk loop below — the resolver threads a
+        // `designatorCurrentType` cursor through each chained step so
+        // `.a.b = 1` resolves `.b` in field `.a`'s type's scope.
+
+        std::uint32_t cursor = 0;
+        for (NodeId elem : visible(braceInitListNode)) {
+            if (isToken(elem)) continue;
+            if (tree().kind(elem) != NodeKind::Internal) continue;
+            if (!cfg.initElementRule.valid()
+             || tree().rule(elem).v != cfg.initElementRule.v) continue;
+
+            // SP3.c: walk the initElement's children collecting a FULL
+            // designator path (single OR dot-chained). At each step we
+            // descend into the type that the previous step pointed to,
+            // so a chain like `.a.v = 1` resolves `.v` in field `.a`'s
+            // struct scope (the InitSlot tree's `nested` substrate is
+            // what makes the multi-step write semantically right).
+            std::vector<std::uint32_t> designatorPath;
+            TypeId designatorCurrentType = contextType;
+            bool designatorFailed = false;
+            NodeId valueExprCst{};
+            for (NodeId c : visible(elem)) {
+                if (isToken(c)) continue;
+                if (tree().kind(c) != NodeKind::Internal) continue;
+                // D5-FU3 helper: peel through the auto-interned
+                // `designator` alt-wrapper to a designator leaf rule.
+                auto const [designatorCore, r] = peelToDesignatorLeaf(c);
+                if (cfg.designatedFieldRule.valid()
+                 && r == cfg.designatedFieldRule.v) {
+                    // Resolve `.name` against the CURRENT type's scope.
+                    // For the first designator, current=contextType; for
+                    // each subsequent step, current= the resolved
+                    // field's type (descends per the C99 chain rule).
+                    NodeId const nameTok = firstIdentifierToken(designatorCore);
+                    if (!nameTok.valid()) {
+                        reportedError(designatorCore,
+                            "field designator missing name token");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    ScopeId const structScope =
+                        model.compositeScopeFor(designatorCurrentType);
+                    if (!structScope.valid()) {
+                        reportedError(designatorCore,
+                            "field designator's container is not a struct");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    std::string const name{tree().text(nameTok)};
+                    auto const& scope = model.scopeRecord(structScope);
+                    auto sit = scope.bindings.find(name);
+                    if (sit == scope.bindings.end()) {
+                        reportedError(designatorCore,
+                            "field designator names a field that doesn't "
+                            "belong to the target struct type");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    auto const* rec = model.recordFor(sit->second);
+                    if (rec == nullptr || rec->kind != DeclarationKind::Variable) {
+                        reportedError(designatorCore,
+                            "field designator resolved to a non-field symbol");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    designatorPath.push_back(rec->fieldIndex);
+                    designatorCurrentType = rec->type;
+                    continue;
+                }
+                if (cfg.designatedIndexRule.valid()
+                 && r == cfg.designatedIndexRule.v) {
+                    auto idx = resolveIndexDesignatorLiteral(designatorCore);
+                    if (!idx.has_value()) {
+                        reportedError(designatorCore,
+                            "index designator must be an integer literal");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    // Descend into the array element's type (so a
+                    // subsequent designator can target a sub-position).
+                    // Invalid current type (prior chain step landed on
+                    // an unresolved field) → fail LOUD; without this
+                    // arm the index would silently append to the path
+                    // and `writeInitSlotAt` would no-op past an empty
+                    // `nested`, dropping the init silently.
+                    if (!designatorCurrentType.valid()) {
+                        reportedError(designatorCore,
+                            "index designator on an unresolved or "
+                            "invalid prior-step type");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    if (interner.kind(designatorCurrentType)
+                        != TypeKind::Array) {
+                        reportedError(designatorCore,
+                            "index designator on a non-array type");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    auto ops = interner.operands(designatorCurrentType);
+                    if (ops.empty()) {
+                        reportedError(designatorCore,
+                            "index designator's array type has no "
+                            "element type");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    designatorCurrentType = ops[0];
+                    designatorPath.push_back(
+                        static_cast<std::uint32_t>(*idx));
+                    continue;
+                }
+                valueExprCst = c;
+            }
+            if (designatorFailed) continue;
+            if (!valueExprCst.valid()) {
+                reportedError(elem,
+                    "init element has no value expression");
+                continue;
+            }
+
+            // Determine the OUTER target slot index + the residual path
+            // for nested writes.
+            std::uint32_t target = cursor;
+            std::span<std::uint32_t const> residualPath;
+            if (!designatorPath.empty()) {
+                target = designatorPath[0];
+                cursor = target;
+                residualPath = std::span<std::uint32_t const>{
+                    designatorPath}.subspan(1);
+            }
+            if (target >= slotCount) {
+                reportedError(elem,
+                    "init element targets position out of aggregate range");
+                continue;
+            }
+            // The value's target type is the slot's type AFTER following
+            // the designator path. When no path, slotType(target).
+            TypeId const valueTargetType =
+                designatorPath.empty() ? rootSlots[target].slotType
+                                       : designatorCurrentType;
+
+            HirNodeId const valueNode =
+                lowerExprOrBraceInit(valueExprCst, valueTargetType);
+
+            // `writeInitSlotAt(slot, residualPath, value)` writes value
+            // at the slot reachable from `slot` by the residual path;
+            // single-level designators have an empty residual, while
+            // dot-chained designators have a non-empty residual that
+            // descends into nested sub-aggregates.
+            writeInitSlotAt(rootSlots[target], residualPath, valueNode);
+            cursor = target + 1;
+        }
+
+        std::vector<HirNodeId> children;
+        children.reserve(slotCount);
+        for (auto const& s : rootSlots)
+            children.push_back(flattenInitSlot(braceInitListNode, s));
+        return builder.makeConstructAggregate(children, contextType,
+                                              HirFlags::Synthetic);
     }
 
     // A fresh SymbolId for a lowering-synthesized temporary, minted above the
@@ -1087,12 +2022,27 @@ struct Lowerer {
         auto lv = lhsN.valid() ? classifyLvalue(lhsN) : std::nullopt;
         if (!lv || !rhsN.valid() || !op || arityOf(*op) != HirOpArity::Binary)
             return reportedError(binNode, "compound assignment needs an lvalue and a binary base op");
-        HirNodeId rhs = lowerExpr(rhsN).id;
-        // lhs OP= rhs → lhs = (lhs OP rhs); the lvalue is read once + written once
-        // (a complex lvalue's address is bound in lv.prep, evaluated once).
-        HirNodeId value = track(builder.addParent(HirKind::BinaryOp, std::array{lvRead(*lv), rhs},
-                                                  lv->type, encodeOp(*op)), binNode);
-        return asStmt(*lv, lvWrite(*lv, value), binNode);
+        E rhs = lowerExpr(rhsN);
+        // C99 compound-assign spec: `a OP= b` ≡ `a = (T)((a) OP (b))` where
+        // T is the type of `a`, and OP is computed at the COMMON type of a
+        // and b (so a narrower-than-int operand is integer-promoted first).
+        // Implement that exactly: read lhs, coerce both to common, OP, then
+        // narrow result back to lhs's type for the store.
+        HirNodeId const lhsRead = lvRead(*lv);
+        TypeId const common = interner.commonType(lv->type, rhs.type);
+        E lhsE{lhsRead, lv->type};
+        E rhsE = rhs;
+        TypeId const opType = common.valid() ? common : lv->type;
+        if (common.valid()) {
+            lhsE = coerce(lhsE, common);
+            rhsE = coerce(rhsE, common);
+        }
+        HirNodeId const opResult = track(builder.addParent(
+            HirKind::BinaryOp, std::array{lhsE.id, rhsE.id}, opType,
+            encodeOp(*op)), binNode);
+        // Narrow back to lhs's type before the store (if different).
+        E const narrowed = coerce(E{opResult, opType}, lv->type);
+        return asStmt(*lv, lvWrite(*lv, narrowed.id), binNode);
     }
 
     // `x++` / `x--` in STATEMENT position → `x = x +/- 1` (the produced value is
@@ -1162,7 +2112,15 @@ struct Lowerer {
     HirNodeId lowerReturn(NodeId node) {
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
-            return track(builder.makeReturn(lowerExpr(c).id), node);
+            // D5.3 cycle 1b.4: `return {1, 2};` lowers via the same
+            // helper as VarDecl init — push the enclosing function's
+            // declared return type as the brace-init's context type.
+            // `currentReturnType_` is set by `lowerFunctionDecl` before
+            // walking the body; absent (Invalid) outside any function
+            // body — in which case lowerExprOrBraceInit's coerce path
+            // is a no-op.
+            HirNodeId const v = lowerExprOrBraceInit(c, currentReturnType_);
+            return track(builder.makeReturn(v), node);
         }
         return track(builder.makeReturn(std::nullopt), node);
     }
@@ -1173,7 +2131,10 @@ struct Lowerer {
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
-            if (role == Role::Expr && !cond) cond = lowerExpr(c).id;
+            if (role == Role::Expr && !cond) {
+                E const condE = lowerExpr(c);
+                cond = coerce(condE, boolType()).id;
+            }
             else if (role == Role::Stmt)     bodies.push_back(lowerStmt(c));
         }
         HirNodeId condId = orError(cond, node, "if statement has no condition");
@@ -1189,7 +2150,10 @@ struct Lowerer {
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
             Role const role = classify(c);
-            if (role == Role::Expr && !cond)      cond = lowerExpr(c).id;
+            if (role == Role::Expr && !cond) {
+                E const condE = lowerExpr(c);
+                cond = coerce(condE, boolType()).id;
+            }
             else if (role == Role::Stmt && !body) body = lowerStmt(c);
         }
         HirNodeId condId = orError(cond, node, "loop has no condition");
@@ -1217,7 +2181,10 @@ struct Lowerer {
         std::optional<HirNodeId> init, cond, update;
         for (auto const& [s, c] : clauses) {
             if (s == 0)      init   = lowerForClause(c);
-            else if (s == 1) cond   = lowerExpr(c).id;
+            else if (s == 1) {
+                E const condE = lowerExpr(c);
+                cond = coerce(condE, boolType()).id;
+            }
             else if (s == 2) update = lowerForClause(c);
         }
         HirNodeId body = lowerStmt(bodyN);
@@ -1312,7 +2279,16 @@ struct Lowerer {
             if (decl && decl->arraySuffix && tree().kind(c) == NodeKind::Internal
                 && tree().rule(c).v == decl->arraySuffix->rule.v)
                 continue;
-            if (classify(c) == Role::Expr) { init = lowerExpr(c).id; break; }
+            if (classify(c) == Role::Expr
+             || (cfg.braceInitListRule.valid()
+                 && isBraceInitList(peelToBraceInitOrCore(c)))) {
+                // D5.3: the shared `lowerExprOrBraceInit` helper covers
+                // both ordinary expression and aggregate brace-init
+                // (`int p[3] = {1,2,3}` / `struct Point p = {.x=1}`).
+                // Coerces the initializer to the declared variable type.
+                init = lowerExprOrBraceInit(c, type);
+                break;
+            }
         }
         return asGlobal ? track(builder.makeGlobal(type, sym.v, init), node)
                         : track(builder.makeVarDecl(type, sym.v, init), node);
@@ -1361,7 +2337,20 @@ struct Lowerer {
                                        "(the lattice has no Array type yet)");
         std::optional<HirNodeId> init;
         RuleId const skip = decl.arraySuffix ? decl.arraySuffix->rule : RuleId{};
-        for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) { init = lowerExpr(c).id; break; }
+        for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) {
+            // Coerce the initializer to the declared variable type — the same
+            // discipline `lowerVarLike` applies for local VarDecls. Without
+            // this, a module global declared `int g = 1.7 + 2.5;` lands with
+            // an F64-typed init under an I32 global (mismatch), and downstream
+            // const-eval (plan 12.5) folds the float arithmetic but skips the
+            // narrowing the runtime would perform. Language-blind: `coerce`
+            // checks arithmetic kinds via the lattice and is a no-op when
+            // already at target type.
+            E const initE   = lowerExpr(c);
+            E const coerced = coerce(initE, type);
+            init = coerced.id;
+            break;
+        }
         return track(builder.makeGlobal(type, sym.v, init), node);
     }
 
@@ -1383,9 +2372,16 @@ struct Lowerer {
         std::vector<HirNodeId> params;
         if (decl.paramsChild && *decl.paramsChild < vis.size())
             collectParams(vis[*decl.paramsChild], params);
+        // Set currentReturnType_ around the body so `lowerReturn` coerces
+        // each `return expr;` to the declared return type. Saved + restored
+        // around the call to handle nested functions if a future frontend
+        // emits them (today's grammars don't).
+        TypeId const savedReturn = currentReturnType_;
+        currentReturnType_ = sig.valid() ? interner.fnResult(sig) : InvalidType;
         HirNodeId body = (decl.bodyChild && *decl.bodyChild < vis.size())
                        ? lowerStmt(vis[*decl.bodyChild])
                        : track(builder.makeBlock({}), node);
+        currentReturnType_ = savedReturn;
         return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 
@@ -1421,7 +2417,10 @@ struct Lowerer {
         NodeId paramsNode = descend(discNode, disc.paramsPath);
         if (paramsNode.valid()) collectParams(paramsNode, params);
         NodeId bodyNode = descend(discNode, disc.bodyPath);
+        TypeId const savedReturn = currentReturnType_;
+        currentReturnType_ = sig.valid() ? interner.fnResult(sig) : InvalidType;
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
+        currentReturnType_ = savedReturn;
         return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 

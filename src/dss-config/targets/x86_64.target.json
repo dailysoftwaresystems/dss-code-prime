@@ -1,0 +1,410 @@
+{
+  "$comment": "x86_64 target descriptor (plan 12 §2.6 ML5 cycle 2 pivot — config-driven targets). Parallels src/dss-config/sources/*.lang.json: a compile target is a config file the LIR substrate reads, NOT C++ code. Adding a new target = drop a new .target.json. Loaded via TargetSchema::loadShipped(\"x86_64\").",
+  "dssTargetVersion": 1,
+  "target": {
+    "name": "x86_64",
+    "version": "0.2",
+    "description": "x86_64 opcode set + physical register file + SysV AMD64 / Microsoft x64 calling conventions. Cycle 2b: regfile/ABI added. Cycle 3 (instruction selection) expands the opcode set to full c-subset corpus coverage.",
+    "$reservedFields": "The per-opcode minOperands/maxOperands fields are documented in the JSON for completeness but are NOT yet fully enforced by the substrate. Terminator-ness derives from `terminatorKind` (Br/CondBr/Switch/Return/Unreachable; default `none` = non-terminator); the parser's `parseInst` and `LirVerifier` consult it directly. Per-kind successor-count is enforced by `TargetSchemaData::validate()` via the shared `kTargetTerminatorShapes` table."
+  },
+  "opcodes": [
+    {
+      "$comment": "Slot 0 = the Invalid sentinel. Every target must declare it as the first opcode so the substrate's `opcode == 0` check (in LirBuilder::addInst) catches default-constructed insts loudly.",
+      "mnemonic":      "invalid",
+      "result":        "none",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op: 'this LirReg is the function's k-th input parameter' (payload = k). ML7 calling-convention lowering rewrites `arg` to the real mov-from-arg-register sequence; before that, it represents the parameter as a virtreg that ML5 cycle 3 MIR→LIR isel can consume directly. Every target backend needs SOME representation of 'i-th function parameter'; pre-regalloc this is the uniform shape.",
+      "mnemonic":      "arg",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "mov",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "add",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "sub",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "2-operand multiply. x86 has both 2-op `imul reg, reg` (writes the low half to the destination — what cycle 3a uses) and 1-op `mul/imul reg` (writes rdx:rax with the full double-width product — needed only when overflow detection or 128-bit results matter; cycle 3c/AS1 lower those via a different opcode pseudonym). Cycle 3a sticks to the low-half-only shape.",
+      "mnemonic":      "mul",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "cmp",
+      "result":        "none",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Materialize a 0/1 boolean from FLAGS. Payload carries the TargetCondCode (eq/ne/slt/.../uge); the LIR substrate is condition-blind. ML6 regalloc treats FLAGS as an implicit predecessor; AS1 emits the real x86_64 setcc-byte + movzx zero-extend sequence.",
+      "mnemonic":      "setcc",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Hard-trap / 'this code path is unreachable'. Cycle 3b lowers MIR Unreachable via `LirBuilder::addUnreachable` (the dedicated zero-successor terminator API added in cycle 3b's review fix-up). AS1 maps to x86_64 ud2; ML6 keeps it block-sealing-equivalent.",
+      "mnemonic":      "unreachable",
+      "result":        "none",
+      "terminatorKind": "unreachable",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "jmp",
+      "result":        "none",
+      "terminatorKind": "br",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 1,
+      "maxSuccessors": 1
+    },
+    {
+      "mnemonic":      "jcc",
+      "result":        "none",
+      "terminatorKind": "cond-br",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   255,
+      "minSuccessors": 2,
+      "maxSuccessors": 2
+    },
+    {
+      "mnemonic":      "call",
+      "result":        "optional",
+      "hasSideEffects": true,
+      "isCall":        true,
+      "minOperands":   1,
+      "maxOperands":   255,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "ret",
+      "result":        "none",
+      "terminatorKind": "return",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Allocate a stack-frame slot (cycle 3c). Cycle 3c is the pass-through layer: payload is threaded verbatim from MIR Alloca (currently 0 — MIR does not yet encode size/align; that lands when ML6's frame-layout phase pulls on it). Result is a pointer-class virtreg holding the slot's effective address. AS1 turns this into a frame-relative `lea` once the frame layout is known.",
+      "mnemonic":      "alloca",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Load from memory. Operands: [base_reg, MemBase(scale=1), MemOffset(disp)]. Optional index-reg arm added in cycle 3d. AS1 emits `mov reg, [base + disp]` or RIP-relative for global addresses.",
+      "mnemonic":      "load",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)]. No result. AS1 emits `mov [base + disp], reg`.",
+      "mnemonic":      "store",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)]. AS1 emits x86_64 `lea reg, [base + index*scale + disp]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm in cycle 3d.",
+      "mnemonic":      "lea",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). Operands: [src_reg]. Width comes from the result reg's class + the source reg's width-of-record. AS1 emits movsx.",
+      "mnemonic":      "sext",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Zero-extend integer (cycle 3c cast lowering for MIR ZExt). Operands: [src_reg]. AS1 emits movzx.",
+      "mnemonic":      "zext",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Truncate integer (cycle 3c cast lowering for MIR Trunc). Operands: [src_reg]. AS1 emits mov of the low N bits (effectively a no-op on x86_64 since registers alias subregs).",
+      "mnemonic":      "trunc",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Bitwise AND. Cycle 3d bitwise wave — same shape as add/sub/mul. AS1 emits x86_64 `and`.",
+      "mnemonic": "and", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "mnemonic": "or",  "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "mnemonic": "xor", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Logical left shift. Same opcode shape as add/sub.",
+      "mnemonic": "shl", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Logical right shift (LShr). AS1 emits x86_64 `shr`.",
+      "mnemonic": "shr_l", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Arithmetic right shift (AShr). AS1 emits x86_64 `sar`.",
+      "mnemonic": "shr_a", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Bitwise NOT — 1-operand. AS1 emits x86_64 `not`.",
+      "mnemonic": "not", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Integer two's-complement negate. AS1 emits x86_64 `neg`.",
+      "mnemonic": "neg", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Float arithmetic (cycle 3d FPR wave). FAdd → `addsd`/`addss` per width; cycle 3d emits the abstract opcode and lets AS1 pick the right scalar variant from the operand width.",
+      "mnemonic": "fadd", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "mnemonic": "fsub", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "mnemonic": "fmul", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "mnemonic": "fdiv", "result": "value",
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Float unary negate. AS1 emits xorps reg, [.LC0_signbit] OR subss zero, reg — the abstract opcode hides this.",
+      "mnemonic": "fneg", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). AS1 emits cvtsd2ss / cvtss2sd.",
+      "mnemonic": "fpcvt", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Float-to-signed-integer conversion (FPToSI). AS1 emits cvttss2si / cvttsd2si (truncating).",
+      "mnemonic": "fp_to_si", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Float-to-unsigned-integer conversion (FPToUI). x86 has no direct opcode; AS1 emits a guarded cvttsd2si sequence.",
+      "mnemonic": "fp_to_ui", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Signed-integer-to-float (SIToFP). AS1 emits cvtsi2ss / cvtsi2sd.",
+      "mnemonic": "si_to_fp", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Unsigned-integer-to-float (UIToFP). Similar AS1 guarded sequence.",
+      "mnemonic": "ui_to_fp", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Cross-class bit-pattern move (GPR↔FPR). AS1 emits x86_64 `movq` (the QWord variant). Cycle-3d Bitcast lowers via this opcode whenever src and dst register classes differ; same-class Bitcasts continue to use `mov` (handled by cycle 3c).",
+      "mnemonic": "movq_xclass", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Intrinsic call. Payload = intrinsic id (per HirIntrinsicRegistry / MIR convention). Operands = args. Result is optional (some intrinsics produce values, some don't). AS1 maps the intrinsic id to its concrete sequence (e.g. memcpy, debugtrap, sqrt) per target. Cycle 3e lowers MIR IntrinsicCall to this opcode.",
+      "mnemonic": "intrinsic_call", "result": "optional",
+      "minOperands": 0, "maxOperands": 255,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Spill reload pseudo-op. Payload = spill-slot index (LirSpillSlot.v). Result = the reloaded value's physical reg. The encoder/ML7 materializes this as `mov result, [stackPointer + slotOffset]`; the exact stackPointer + offset come from per-target callconv lowering. Target-blind at LIR tier.",
+      "mnemonic": "frame_load", "result": "value",
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Spill store pseudo-op. Payload = spill-slot index. Operand[0] = the physical reg whose value is being stored. The encoder/ML7 materializes this as `mov [stackPointer + slotOffset], operand`. Target-blind at LIR tier.",
+      "mnemonic": "frame_store", "result": "none",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    }
+  ],
+  "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal the assembler/encoder will read.",
+  "registers": [
+    { "name": "rax", "class": "gpr", "widthBytes": 8, "hwEncoding": 0 },
+    { "name": "rcx", "class": "gpr", "widthBytes": 8, "hwEncoding": 1 },
+    { "name": "rdx", "class": "gpr", "widthBytes": 8, "hwEncoding": 2 },
+    { "name": "rbx", "class": "gpr", "widthBytes": 8, "hwEncoding": 3 },
+    { "name": "rsp", "class": "gpr", "widthBytes": 8, "hwEncoding": 4 },
+    { "name": "rbp", "class": "gpr", "widthBytes": 8, "hwEncoding": 5 },
+    { "name": "rsi", "class": "gpr", "widthBytes": 8, "hwEncoding": 6 },
+    { "name": "rdi", "class": "gpr", "widthBytes": 8, "hwEncoding": 7 },
+    { "name": "r8",  "class": "gpr", "widthBytes": 8, "hwEncoding": 8 },
+    { "name": "r9",  "class": "gpr", "widthBytes": 8, "hwEncoding": 9 },
+    { "name": "r10", "class": "gpr", "widthBytes": 8, "hwEncoding": 10 },
+    { "name": "r11", "class": "gpr", "widthBytes": 8, "hwEncoding": 11 },
+    { "name": "r12", "class": "gpr", "widthBytes": 8, "hwEncoding": 12 },
+    { "name": "r13", "class": "gpr", "widthBytes": 8, "hwEncoding": 13 },
+    { "name": "r14", "class": "gpr", "widthBytes": 8, "hwEncoding": 14 },
+    { "name": "r15", "class": "gpr", "widthBytes": 8, "hwEncoding": 15 },
+
+    { "name": "xmm0",  "class": "fpr", "widthBytes": 16, "hwEncoding": 0 },
+    { "name": "xmm1",  "class": "fpr", "widthBytes": 16, "hwEncoding": 1 },
+    { "name": "xmm2",  "class": "fpr", "widthBytes": 16, "hwEncoding": 2 },
+    { "name": "xmm3",  "class": "fpr", "widthBytes": 16, "hwEncoding": 3 },
+    { "name": "xmm4",  "class": "fpr", "widthBytes": 16, "hwEncoding": 4 },
+    { "name": "xmm5",  "class": "fpr", "widthBytes": 16, "hwEncoding": 5 },
+    { "name": "xmm6",  "class": "fpr", "widthBytes": 16, "hwEncoding": 6 },
+    { "name": "xmm7",  "class": "fpr", "widthBytes": 16, "hwEncoding": 7 },
+    { "name": "xmm8",  "class": "fpr", "widthBytes": 16, "hwEncoding": 8 },
+    { "name": "xmm9",  "class": "fpr", "widthBytes": 16, "hwEncoding": 9 },
+    { "name": "xmm10", "class": "fpr", "widthBytes": 16, "hwEncoding": 10 },
+    { "name": "xmm11", "class": "fpr", "widthBytes": 16, "hwEncoding": 11 },
+    { "name": "xmm12", "class": "fpr", "widthBytes": 16, "hwEncoding": 12 },
+    { "name": "xmm13", "class": "fpr", "widthBytes": 16, "hwEncoding": 13 },
+    { "name": "xmm14", "class": "fpr", "widthBytes": 16, "hwEncoding": 14 },
+    { "name": "xmm15", "class": "fpr", "widthBytes": 16, "hwEncoding": 15 },
+
+    { "name": "rflags", "class": "flags", "widthBytes": 8, "hwEncoding": 0 }
+  ],
+  "$callingConventionsComment": "Per-platform x86_64 ABIs. ML7 callconv lowering selects one based on driver flag / function attribute. SysV AMD64 = Linux/macOS/BSD; ms_x64 = Windows. argGprs/argFprs ordering is significant (caller MUST place int args in those registers in that order, then spill to stack).",
+  "callingConventions": [
+    {
+      "name": "sysv_amd64",
+      "$comment": "System V AMD64 ABI (Linux, macOS, BSD). Integer args: RDI/RSI/RDX/RCX/R8/R9 then stack. Float args: XMM0..7 then stack. Integer return: RAX (low 64 bits) + RDX (high 64 bits if >64-bit aggregate). Float return: XMM0/XMM1. Stack 16-byte aligned BEFORE call (RSP%16==0); the call instruction pushes RIP, leaving RSP%16==8 at callee entry. 128-byte red zone below RSP for leaf functions.",
+      "argGprs":     ["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
+      "argFprs":     ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"],
+      "returnGprs":  ["rax", "rdx"],
+      "returnFprs":  ["xmm0", "xmm1"],
+      "callerSaved": ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                      "xmm0", "xmm1", "xmm2",  "xmm3",  "xmm4",  "xmm5",  "xmm6",  "xmm7",
+                      "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"],
+      "calleeSaved": ["rbx", "rbp", "r12", "r13", "r14", "r15"],
+      "stackPointer": "rsp",
+      "stackAlignment":   16,
+      "shadowSpaceBytes": 0,
+      "redZoneBytes":     128
+    },
+    {
+      "name": "ms_x64",
+      "$comment": "Microsoft x64 ABI (Windows). First 4 args in RCX/RDX/R8/R9 regardless of int-vs-float (slot-aligned: an XMM arg in slot N uses XMM_N AND consumes the matching GPR slot, even if the GPR is unused; symmetrically, an integer in slot N consumes XMM_N). Integer return: RAX. Float return: XMM0. Stack 16-byte aligned before call; 32-byte shadow space (home space) always allocated by caller for callee to spill arg registers. No red zone.",
+      "argGprs":     ["rcx", "rdx", "r8", "r9"],
+      "argFprs":     ["xmm0", "xmm1", "xmm2", "xmm3"],
+      "returnGprs":  ["rax"],
+      "returnFprs":  ["xmm0"],
+      "callerSaved": ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11",
+                      "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"],
+      "calleeSaved": ["rbx", "rbp", "rdi", "rsi", "r12", "r13", "r14", "r15",
+                      "xmm6", "xmm7", "xmm8",  "xmm9",  "xmm10",
+                      "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"],
+      "stackPointer": "rsp",
+      "stackAlignment":   16,
+      "shadowSpaceBytes": 32,
+      "redZoneBytes":     0
+    }
+  ]
+}

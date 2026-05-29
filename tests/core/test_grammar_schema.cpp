@@ -248,8 +248,8 @@ TEST(GrammarSchema, MissingRootShapeReportsCode) {
 
 TEST(GrammarSchema, LoadShippedToy) {
     // The ctest cwd is the build dir. loadShipped checks two roots:
-    //   <cwd>/src/source-config/languages/toy.lang.json
-    //   <cwd>/../src/source-config/languages/toy.lang.json
+    //   <cwd>/src/dss-config/sources/toy.lang.json
+    //   <cwd>/../src/dss-config/sources/toy.lang.json
     // From build/, the second hits.
     auto result = GrammarSchema::loadShipped("toy");
     if (!result.has_value()) {

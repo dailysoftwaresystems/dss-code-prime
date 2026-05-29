@@ -12,6 +12,7 @@
 | Predecessors  | ⏳ v1 ship per [`07-production-readiness-plan`](./07-production-readiness-plan%20-%20tbd.md). ⏳ Schema v3 (per [`06-artifact-profile-plan`](./06-artifact-profile-plan%20-%20tbd.md) + lattice extension support). ⏳ Mature C++/C# language configs (post-v1 work). |
 | Successors    | First-class user of [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) (the same-source CPU+GPU goal). |
 | Scope         | **Unspecified.** Design lands when triggered. |
+| Mapped from elsewhere | **Schema-driven `allowFloat`** (from plan [12.5 §0.2 D3](./12.5-const-eval-plan%20-%20ok.md)): if the custom language adopts non-IEEE float semantics (decimal float, fixed-point, saturating arithmetic), the `EvalOptions::allowFloat` knob — today opted in unconditionally by MIR-globals because every v1 shipped language is IEEE 754 — must become per-schema in `HirLoweringConfig`. The custom-language cycle that introduces non-IEEE semantics owns the substrate change. Until then no v1 schema needs it. |
 
 ---
 
@@ -28,10 +29,10 @@ Until then: this plan exists to declare that **no new substrate work is required
 ## 2. What the engine already gives the custom language
 
 - **A schema-driven frontend.** Write a `.lang.json`; the same tokenizer + parser drives it.
-- **A core type lattice + extension registry.** Per [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md). The custom language declares its types as either core members or extensions.
+- **A core type lattice + extension registry.** Per [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md). The custom language declares its types as either core members or extensions.
 - **HIR as the pivot.** Lower CST → HIR via a custom-language-specific lowering pass.
 - **Same-source CPU + GPU.** The HIR shader-shape mechanism (per [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) §2.4) makes `[[shader.usable]] [[host.usable]]` functions dual-lowering targets.
-- **Multi-target codegen.** Native (3 OS × 2 arch via [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) + [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) + [`14-linker-plan`](./14-linker-plan%20-%20tbd.md)), shader (SPIR-V), web (WASM via [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md)), transpile (any other configured language via [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md)).
+- **Multi-target codegen.** Native (3 OS × 2 arch via [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) + [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) + [`14-linker-plan`](./14-linker-plan%20-%20tbd.md)), shader (SPIR-V), web (WASM via [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md)), transpile (any other configured language via [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md)).
 - **Debug info, codesign, FFI.** All in-tree, all hermetic — same machinery the shipped languages use.
 
 ---

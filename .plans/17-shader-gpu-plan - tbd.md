@@ -7,9 +7,10 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1.x — lit up once the user's custom language begins (`20-custom-language-reserved-plan`). Reserved scope today; design lands now to keep HIR honest. |
-| Predecessors  | ✅ [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (shader-shape HIR extensions — HR1 ✅ 2026-05-26 ships the open `HirKindRegistry` shader-shape extensions will register against, HR2 ✅ adds the typed-expression + `HirOpRegistry` substrate, HR3 ✅ adds structured control flow, HR4 ✅ adds the declaration + extern surface, HR5 ✅ adds the attribute side-tables — incl. the `ShaderIntrinsic` / `HirShaderMap` side-table shader lowering populates (stage / built-in / workgroup / binding), HR6 ✅ adds the verifier's HIR-level shader-restriction gate (`H_ShaderViolation`: recursion / indirect call / non-shader callee over `ShaderUsable` subtrees — the fuller `SH_*` checks remain this plan's SG2), HR7 ✅ 2026-05-27 adds the `.dsshir` text format (serializes the `ShaderIntrinsic` side-table + `ShaderUsable` flag + shader extension kinds — the shader-lowering test/debug surface), HR8 ✅ 2026-05-27 adds the config-driven CST→HIR lowering engine (the `hirLowering` facet shader-shape languages will use to map their CST to shader extension kinds), proven on c-subset; HR9 ✅ 2026-05-27 enriched toy into a typed language + un-deferred arrays end-to-end; HR10 ✅ + HR11 ✅ done 2026-05-28 — plan 09 (HIR) complete). ⏳ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) (structured-CF markers carry into SPIR-V `OpLoopMerge` / `OpSelectionMerge`). |
+| Predecessors  | ✅ [`09-hir-plan`](./09-hir-plan%20-%20ok.md) (shader-shape HIR extensions — HR1 ✅ 2026-05-26 ships the open `HirKindRegistry` shader-shape extensions will register against, HR2 ✅ adds the typed-expression + `HirOpRegistry` substrate, HR3 ✅ adds structured control flow, HR4 ✅ adds the declaration + extern surface, HR5 ✅ adds the attribute side-tables — incl. the `ShaderIntrinsic` / `HirShaderMap` side-table shader lowering populates (stage / built-in / workgroup / binding), HR6 ✅ adds the verifier's HIR-level shader-restriction gate (`H_ShaderViolation`: recursion / indirect call / non-shader callee over `ShaderUsable` subtrees — the fuller `SH_*` checks remain this plan's SG2), HR7 ✅ 2026-05-27 adds the `.dsshir` text format (serializes the `ShaderIntrinsic` side-table + `ShaderUsable` flag + shader extension kinds — the shader-lowering test/debug surface), HR8 ✅ 2026-05-27 adds the config-driven CST→HIR lowering engine (the `hirLowering` facet shader-shape languages will use to map their CST to shader extension kinds), proven on c-subset; HR9 ✅ 2026-05-27 enriched toy into a typed language + un-deferred arrays end-to-end; HR10 ✅ + HR11 ✅ done 2026-05-28 — plan 09 (HIR) complete). ⏳ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) (structured-CF markers carry into SPIR-V `OpLoopMerge` / `OpSelectionMerge`). |
 | Successors    | [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md) for SPIR-V→{DXIL, MSL, WGSL} transpile post-v1. |
 | Scope         | **Bounded.** SG1–SG10. v1 deliverable for the custom language is "compute + vertex + fragment shaders compile to spirv-val-clean SPIR-V." |
+| Mapped from elsewhere | **F16 const-eval Cast target** (from plan [12.5 §0.2 D1](./12.5-const-eval-plan%20-%20ok.md)): half-precision float folding in `const_eval` is gated on a soft-float helper. Shaders are the first consumer that emits half-precision constants; SG-cycles that introduce F16 literals (or const-evaluate them at SPIR-V codegen time) own the soft-float helper that closes this. The CE engine's `Cast` quadrant currently refuses F16 with `UnsupportedTypeKind` — unblocking is a delimited shader-cycle prerequisite, not a CE gap. |
 
 ---
 
@@ -47,8 +48,8 @@ src/shader/
 
 **Two distinct registration paths — do not conflate them:**
 
-- Shader **types** (`Sampler`, `Texture<>`, `UAV<>`, `ConstantBuffer<>`, `WorkgroupShared<>`): registered via the language schema's `typeExtensions[]` block (v3, SP2) into the `TypeRegistry` (per [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) §2.2). Listed in the "Shader-shape extensions" table below.
-- Shader **HIR kinds** (`WorkgroupBarrier`, `DerivativeX`/`Y`, `TextureSample`, `TextureLoad`, `ImageStore`, `AtomicOp`, etc.): registered via the language schema's `hirLowering` block (v4, planned per [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) §2.5) into the `HirKindRegistry` (`HirKind ≥ 256`). They are **registered HIR extension kinds, not hardcoded core HIR enum members** — the open core + per-language registered-extensions pattern from `09-hir-plan` §2.2 applies. Listed in the table immediately below.
+- Shader **types** (`Sampler`, `Texture<>`, `UAV<>`, `ConstantBuffer<>`, `WorkgroupShared<>`): registered via the language schema's `typeExtensions[]` block (v3, SP2) into the `TypeRegistry` (per [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md) §2.2). Listed in the "Shader-shape extensions" table below.
+- Shader **HIR kinds** (`WorkgroupBarrier`, `DerivativeX`/`Y`, `TextureSample`, `TextureLoad`, `ImageStore`, `AtomicOp`, etc.): registered via the language schema's `hirLowering` block (v4, planned per [`09-hir-plan`](./09-hir-plan%20-%20ok.md) §2.5) into the `HirKindRegistry` (`HirKind ≥ 256`). They are **registered HIR extension kinds, not hardcoded core HIR enum members** — the open core + per-language registered-extensions pattern from `09-hir-plan` §2.2 applies. Listed in the table immediately below.
 
 The shader-extension HIR kinds (registered via `hirLowering` per the language schema, into the `HirKindRegistry`):
 
@@ -62,7 +63,7 @@ The shader-extension HIR kinds (registered via `hirLowering` per the language sc
 | `AtomicOp` | `atomicAdd`/`atomicMax`/etc. → `OpAtomic*` |
 | `Swizzle` | `v.xyz` → `OpVectorShuffle` |
 
-Lattice membership (per [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) §2.2):
+Lattice membership (per [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md) §2.2):
 
 **Core lattice** (universal — non-shader code uses these too):
 - `Vector<T, N>` where N ∈ {2, 3, 4}, T ∈ {f16, f32, f64, i32, u32, bool}

@@ -537,6 +537,23 @@ public:
     // threads them through the climb.
     [[nodiscard]] ExprWrapperRules exprWrapperRules(RuleId rule) const noexcept;
 
+    // True iff `rule` is one of the Pratt-walker auto-interned wrapper
+    // rules (binary / unary / postfix / ternary). The loader populates
+    // the union-set at compile time; this is O(1) hash-set membership.
+    //
+    // **Why the SchemaWalker needs this**: auto-interned wrappers are
+    // entered via `wrapLastChildExprFrame` for structural reparenting
+    // of an already-built operand, NOT via the schema's standard
+    // routing dispatch (the wrapper rules have no body in the position
+    // graph — they exist only for tree shape). Cursor advances inside
+    // a wrap frame would trip the `cursorDesynced_` latch as a false
+    // positive — the latch's contract is "real grammar mismatch," not
+    // "Pratt wrapper structural-only frame." The walker consults this
+    // accessor to suppress the latch while the current frame is a
+    // wrap, fixing the speculative-alt + postfix-wrap interaction
+    // (plan 05 post-close sub-cycle B).
+    [[nodiscard]] bool isAutoInternedWrapperRule(RuleId rule) const noexcept;
+
     // Numeric-literal lexical grammar declared by the language's
     // `numberStyle` block. Returns nullptr when no block was
     // declared — the tokenizer then knows the language has no

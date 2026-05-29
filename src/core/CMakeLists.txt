@@ -8,8 +8,11 @@ add_library(core OBJECT
     types/scope_kind.cpp
     types/parse_diagnostic.cpp
     types/diagnostic_reporter.cpp
+    types/config_path_walk.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
+    types/target_schema.cpp
+    types/target_schema_json.cpp
     types/lexer_mode.cpp
     types/schema_walker.cpp
     types/string_style.cpp

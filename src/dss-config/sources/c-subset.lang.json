@@ -96,6 +96,9 @@
     "++": [{ "kind": "PlusPlusOp" }],
     "--": [{ "kind": "MinusMinusOp" }],
 
+    ".":  [{ "kind": "DotOp"   }],
+    "->": [{ "kind": "ArrowOp" }],
+
     "+=":  [{ "kind": "PlusAssignOp"   }],
     "-=":  [{ "kind": "MinusAssignOp"  }],
     "*=":  [{ "kind": "StarAssignOp"   }],
@@ -125,7 +128,9 @@
       { "precedence": 90, "associativity": "right", "arity": "prefix",   "operators": ["!", "~", "-", "*", "&"]                },
       { "precedence": 95,                            "arity": "postfix",  "operators": ["++", "--"]                            },
       { "precedence": 100,                           "arity": "postfix",  "operators": ["("], "endsAt": ")", "bodyRule": "argList" },
-      { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" }
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["["], "endsAt": "]", "bodyRule": "expression" },
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["."],  "followerRule": "memberFollower" },
+      { "precedence": 100,                           "arity": "postfix",  "operators": ["->"], "followerRule": "memberFollower" }
     ]
   },
 
@@ -159,6 +164,9 @@
     { "word": "char",    "kind": "CharKeyword"    },
     { "word": "const",   "kind": "ConstKeyword"   },
     { "word": "typedef", "kind": "TypedefKeyword" },
+    { "word": "struct",  "kind": "StructKeyword"  },
+    { "word": "union",   "kind": "UnionKeyword"   },
+    { "word": "enum",    "kind": "EnumKeyword"    },
 
     { "word": "if",      "kind": "IfKeyword"      },
     { "word": "else",    "kind": "ElseKeyword"    },
@@ -169,7 +177,8 @@
     { "word": "switch",  "kind": "SwitchKeyword"  },
     { "word": "case",    "kind": "CaseKeyword"    },
     { "word": "default", "kind": "DefaultKeyword" },
-    { "word": "break",   "kind": "BreakKeyword"   },
+    { "word": "break",    "kind": "BreakKeyword"    },
+    { "word": "continue", "kind": "ContinueKeyword" },
 
     { "word": "extern",  "kind": "ExternKeyword"  }
   ],
@@ -181,9 +190,78 @@
       "alt": [
         "includeDirective",
         "typedefDecl",
+        "structDecl",
+        "unionDecl",
+        "enumDecl",
         "topLevelDecl",
         "externDecl"
       ]
+    },
+
+    "structDecl": {
+      "sequence": [
+        "StructKeyword", "Identifier",
+        "BlockOpen",
+        { "repeat": "structField" },
+        "BlockClose",
+        "EndStatement"
+      ]
+    },
+
+    "structField": {
+      "sequence": [ "typeRefAllowingStruct", "Identifier", "EndStatement" ]
+    },
+
+    "structTypeRef": {
+      "sequence": [ "StructKeyword", "Identifier" ]
+    },
+
+    "unionDecl": {
+      "sequence": [
+        "UnionKeyword", "Identifier",
+        "BlockOpen",
+        { "repeat": "unionField" },
+        "BlockClose",
+        "EndStatement"
+      ]
+    },
+
+    "unionField": {
+      "sequence": [ "typeRefAllowingStruct", "Identifier", "EndStatement" ]
+    },
+
+    "unionTypeRef": {
+      "sequence": [ "UnionKeyword", "Identifier" ]
+    },
+
+    "enumDecl": {
+      "sequence": [
+        "EnumKeyword", "Identifier",
+        "BlockOpen",
+        { "optional": {
+            "sequence": [
+              "enumerator",
+              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
+            ]
+        }},
+        "BlockClose",
+        "EndStatement"
+      ]
+    },
+
+    "enumerator": {
+      "sequence": [
+        "Identifier",
+        { "optional": { "sequence": [ "AssignOp", "expression" ] } }
+      ]
+    },
+
+    "enumTypeRef": {
+      "sequence": [ "EnumKeyword", "Identifier" ]
+    },
+
+    "memberFollower": {
+      "sequence": [ "Identifier" ]
     },
 
     "topLevelDecl": {
@@ -203,7 +281,7 @@
     },
 
     "typedefDecl": {
-      "sequence": [ "TypedefKeyword", "typeRef", "Identifier", "EndStatement" ]
+      "sequence": [ "TypedefKeyword", "typeRefAllowingStruct", "Identifier", "EndStatement" ]
     },
 
     "includeDirective": {
@@ -238,10 +316,12 @@
     "varDeclTail": {
       "sequence": [
         { "optional": "arrayDeclSuffix" },
-        { "optional": { "sequence": [ "AssignOp", "expression" ] } },
+        { "optional": { "sequence": [ "AssignOp", "initValue" ] } },
         "EndStatement"
       ]
     },
+
+    "initValue": { "alt": [ "braceInitList", "expression" ] },
 
     "arrayDeclSuffix": {
       "sequence": [
@@ -251,7 +331,7 @@
       ]
     },
 
-    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword" ] },
+    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "Identifier" ] },
 
     "typeRef": {
       "sequence": [
@@ -262,12 +342,25 @@
       ]
     },
 
+    "typeBaseAllowingStruct": {
+      "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+    },
+
+    "typeRefAllowingStruct": {
+      "sequence": [
+        { "optional": "ConstKeyword" },
+        "typeBaseAllowingStruct",
+        { "repeat": "StarOp" },
+        { "optional": "ConstKeyword" }
+      ]
+    },
+
     "varDeclHead": {
       "sequence": [
-        "typeRef",
+        "typeRefAllowingStruct",
         "Identifier",
         { "optional": "arrayDeclSuffix" },
-        { "optional": { "sequence": [ "AssignOp", "expression" ] } }
+        { "optional": { "sequence": [ "AssignOp", "initValue" ] } }
       ]
     },
 
@@ -280,7 +373,7 @@
       ]
     },
 
-    "param": { "sequence": [ "typeRef", "Identifier" ] },
+    "param": { "sequence": [ "typeRefAllowingStruct", "Identifier" ] },
 
     "block": {
       "sequence": [
@@ -300,6 +393,7 @@
         "forStmt",
         "switchStmt",
         "breakStmt",
+        "continueStmt",
         "returnStmt",
         "exprStmt"
       ]
@@ -354,7 +448,8 @@
       ]
     },
 
-    "breakStmt": { "sequence": [ "BreakKeyword", "EndStatement" ] },
+    "breakStmt":    { "sequence": [ "BreakKeyword",    "EndStatement" ] },
+    "continueStmt": { "sequence": [ "ContinueKeyword", "EndStatement" ] },
 
     "switchStmt": {
       "sequence": [
@@ -397,9 +492,47 @@
         "FloatLiteral",
         "stringLiteralExpr",
         "charLiteralExpr",
-        { "sequence": [ "ParenOpen", "expression", "ParenClose" ] }
+        "compoundLiteralExpr",
+        "parenExpr"
+      ],
+      "speculative": true,
+      "lookahead": 8
+    },
+
+    "parenExpr": { "sequence": [ "ParenOpen", "expression", "ParenClose" ] },
+
+    "compoundLiteralExpr": {
+      "sequence": [ "ParenOpen", "typeRefAllowingStruct", "ParenClose", "braceInitList" ]
+    },
+
+    "braceInitList": {
+      "sequence": [
+        "BlockOpen",
+        { "optional": {
+            "sequence": [
+              "initElement",
+              { "repeat": { "sequence": [ "Comma", { "optional": "initElement" } ] } }
+            ]
+        }},
+        "BlockClose"
       ]
     },
+
+    "initElement": {
+      "alt": [
+        { "sequence": [
+            "designator",
+            { "repeat": "designator" },
+            "AssignOp",
+            "initValue"
+        ]},
+        "initValue"
+      ]
+    },
+
+    "designator": { "alt": [ "designatedField", "designatedIndex" ] },
+    "designatedField": { "sequence": [ "DotOp", "Identifier" ] },
+    "designatedIndex": { "sequence": [ "BracketOpen", "expression", "BracketClose" ] },
 
     "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
     "stringLiteralExpr": { "sequence": [ "StringStart", "StringLiteral" ] },
@@ -434,6 +567,16 @@
           "bodyPath":   [1]
         } },
       { "rule": "typedefDecl", "name": 2, "type": 1, "kind": "type" },
+      { "rule": "structDecl",  "name": 1, "kind": "type",
+        "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
+      { "rule": "structField", "name": 1, "type": 0, "kind": "variable" },
+      { "rule": "unionDecl",   "name": 1, "kind": "type",
+        "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
+      { "rule": "unionField",  "name": 1, "type": 0, "kind": "variable" },
+      { "rule": "enumDecl",    "name": 1, "kind": "type",
+        "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
+                           "liftToEnclosingScope": true } },
+      { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "kindByChild": {
           "childPath": [3, 0],
@@ -443,9 +586,18 @@
         } }
     ],
     "references": [
-      { "rule": "operand" }
+      { "rule": "operand" },
+      { "rule": "structTypeRef", "nameMatch": "lastIdentifier" },
+      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier" },
+      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier" }
     ],
-    "scopes": [ "block", "funcDefTail" ],
+    "memberAccesses": [
+      { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
+        "dereferences": false, "operatorToken": "DotOp"   },
+      { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
+        "dereferences": true,  "operatorToken": "ArrowOp" }
+    ],
+    "scopes": [ "block", "funcDefTail", "structDecl", "unionDecl", "enumDecl" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
       { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },
@@ -467,7 +619,7 @@
       { "rule": "returnStmt", "value": 1 }
     ],
     "loopRules": [ "whileStmt", "forStmt", "doStmt", "switchStmt" ],
-    "loopControls": [ { "rule": "breakStmt" } ],
+    "loopControls": [ { "rule": "breakStmt" }, { "rule": "continueStmt" } ],
     "builtinTypes": [
       { "name": "int",  "core": "I32"  },
       { "name": "char", "core": "Char" },
@@ -486,6 +638,9 @@
       { "rule": "varDeclHead",  "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
+      { "rule": "structDecl",   "hirKind": "TypeDecl"    },
+      { "rule": "unionDecl",    "hirKind": "TypeDecl"    },
+      { "rule": "enumDecl",     "hirKind": "TypeDecl"    },
       { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },
@@ -493,7 +648,8 @@
       { "rule": "doStmt",       "hirKind": "DoWhileStmt" },
       { "rule": "forStmt",      "hirKind": "ForStmt"     },
       { "rule": "switchStmt",   "hirKind": "SwitchStmt"  },
-      { "rule": "breakStmt",    "hirKind": "BreakStmt"   },
+      { "rule": "breakStmt",    "hirKind": "BreakStmt"    },
+      { "rule": "continueStmt", "hirKind": "ContinueStmt" },
       { "rule": "returnStmt",   "hirKind": "ReturnStmt"  },
       { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
     ],
@@ -503,6 +659,15 @@
     "postfixExprRule": "postfixExpr",
     "ternaryExprRule": "ternaryExpr",
     "operandRule":     "operand",
+
+    "braceInitListRule":   "braceInitList",
+    "initElementRule":     "initElement",
+    "designatedFieldRule": "designatedField",
+    "designatedIndexRule": "designatedIndex",
+    "compoundLiteralRule": "compoundLiteralExpr",
+
+    "globalsConstEval": { "allowFloat": true },
+
 
     "binaryOps": [
       { "token": "PlusOp",   "target": "Add"    },
@@ -548,7 +713,9 @@
       { "token": "ParenOpen",    "target": "Call"    },
       { "token": "BracketOpen",  "target": "Index"   },
       { "token": "PlusPlusOp",   "target": "PostInc" },
-      { "token": "MinusMinusOp", "target": "PostDec" }
+      { "token": "MinusMinusOp", "target": "PostDec" },
+      { "token": "DotOp",        "target": "MemberAccess"       },
+      { "token": "ArrowOp",      "target": "MemberAccessThruPtr"}
     ],
 
     "forClauseSeparator": "EndStatement",

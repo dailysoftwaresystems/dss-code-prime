@@ -1,13 +1,13 @@
 # Source-to-source Translation — Sub-Plan (10)
 
-> Owns **language-pair `.map.json`** schema + **HIR→HIR translation pass** + **target-CST construction** + **target-schema-aware pretty-printer**. Lets the compiler turn any configured source language into any configured target language, via [HIR](./09-hir-plan%20-%20tbd.md) as the lossless pivot. Promoted from `00-master` §9 long-running note in rev 2.
+> Owns **language-pair `.map.json`** schema + **HIR→HIR translation pass** + **target-CST construction** + **target-schema-aware pretty-printer**. Lets the compiler turn any configured source language into any configured target language, via [HIR](./09-hir-plan%20-%20ok.md) as the lossless pivot. Promoted from `00-master` §9 long-running note in rev 2.
 
 ## 0. Status (snapshot)
 
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1.x — first user likely c-subset → JS for a Web target. Reserved scope today; design lands now to keep HIR honest. |
-| Predecessors  | ✅ [`09-hir-plan`](./09-hir-plan%20-%20tbd.md) (the pivot layer — HR1–HR10 ✅ (HR1–HR5 2026-05-26, HR6–HR10 2026-05-27..28), incl. the `TranspileHint` / `HirTranspileMap` side-table this plan consumes — round-trip-serialized by HR7's `.dsshir` format; HR8 added the config-driven CST→HIR lowering engine (c-subset), HR9 enriched toy + un-deferred arrays end-to-end, HR10 added tsql-subset lowering (role-explicit SQL extension nodes, all config-driven); HR11 ✅ done 2026-05-28 (multi-language CU lowering) — plan 09 complete). ⏳ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) (core type lattice). |
+| Predecessors  | ✅ [`09-hir-plan`](./09-hir-plan%20-%20ok.md) (the pivot layer — HR1–HR10 ✅ (HR1–HR5 2026-05-26, HR6–HR10 2026-05-27..28), incl. the `TranspileHint` / `HirTranspileMap` side-table this plan consumes — round-trip-serialized by HR7's `.dsshir` format; HR8 added the config-driven CST→HIR lowering engine (c-subset), HR9 enriched toy + un-deferred arrays end-to-end, HR10 added tsql-subset lowering (role-explicit SQL extension nodes, all config-driven); HR11 ✅ done 2026-05-28 (multi-language CU lowering) — plan 09 complete). ✅ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md) (core type lattice — complete). |
 | Successors    | Used by [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) for SPIR-V→DXIL/MSL/WGSL paths. Reserved consumer of [`19-hir-hw-reserved-plan`](./19-hir-hw-reserved-plan%20-%20tbd.md) for VHDL/Verilog emission. |
 | Scope         | **Bounded.** ST1 schema. ST2 HIR→HIR translator. ST3 target-CST builder. ST4 target-schema pretty-printer. ST5 shipped language-pair maps (at least one v1.x flagship). |
 
@@ -34,7 +34,7 @@ src/transpile/
 ├── cst_pretty_print.hpp / .cpp   # ST4: target schema-aware text emitter
 └── diagnostics.hpp               # T_* codes
 
-src/source-config/language-pairs/
+src/dss-config/language-pairs/
 ├── c-subset-to-javascript.map.json
 ├── c-subset-to-csharp.map.json
 └── ... (per-pair authoring per ST5)

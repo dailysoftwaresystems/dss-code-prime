@@ -14,6 +14,7 @@
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
+#include "hir/cst_const_eval.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -74,6 +75,11 @@ struct SchemaIndexes {
     NumberStyle const*    numberStyle = nullptr;  // its numeric-literal style (may be null)
     std::unordered_map<std::uint32_t, std::size_t> declByRule;
     std::unordered_map<std::uint32_t, std::size_t> refByRule;
+    // D5.1: member-access rules (`obj.field` and `ptr->field`). Multi-entry
+    // per rule when multiple shapes share the same rule (e.g. c-subset's
+    // single `postfixExpr` covers BOTH `.` and `->`); each is distinguished
+    // by `MemberAccessRule.operatorToken`, just like `assignByRule`.
+    std::unordered_map<std::uint32_t, std::vector<std::size_t>> memberAccessByRule;
     std::unordered_map<std::uint32_t, std::size_t> typeShapeByRule;
     std::unordered_map<std::uint32_t, bool>        scopeByRule;
     // Multiple assignment entries may share one rule (e.g. c-subset's
@@ -115,6 +121,11 @@ struct EngineState {
     std::unordered_map<std::uint32_t /*ScopeId.v*/, TypeId> fnResultByScope;
     // SE7 reverse use-index: SymbolId.v → its use-site NodeIds.
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol;
+    // D5.1: composite type → the inner scope holding its fields, populated in
+    // Pass 1.5 when a `fieldChildren`-bearing decl composes its struct type.
+    // Pass 2's member-access resolution reads this to find the field-name's
+    // scope from the LHS expression's TypeId (no type-name string lookup).
+    std::unordered_map<std::uint32_t /*TypeId.v*/, ScopeId> compositeScopeByType;
 
     // Select the index bundle for `schema` before processing one of its trees.
     void activate(GrammarSchema const& schema) {
@@ -315,6 +326,9 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     for (std::size_t i = 0; i < cfg.references.size(); ++i) {
         idx.refByRule[cfg.references[i].rule.v] = i;
     }
+    for (std::size_t i = 0; i < cfg.memberAccesses.size(); ++i) {
+        idx.memberAccessByRule[cfg.memberAccesses[i].rule.v].push_back(i);
+    }
     for (std::size_t i = 0; i < cfg.typeShapes.size(); ++i) {
         idx.typeShapeByRule[cfg.typeShapes[i].rule.v] = i;
     }
@@ -471,40 +485,77 @@ resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     return k >= TypeKind::I8 && k <= TypeKind::U128;
 }
 
-// SE-arrays: evaluate a declarator-suffix length expression to a compile-time
-// constant. Succeeds ONLY when the expression peels to a single integer
-// literal — a wrapper rule (expression/operand) or a parenthesized literal is
-// fine, but any branching (a binary op, a call, an identifier) is non-constant
-// and returns nullopt so the caller fails loud. decodeInteger overflow also
-// surfaces as nullopt.
-[[nodiscard]] std::optional<std::uint64_t>
-constIntLength(EngineState& s, Tree const& tree, NodeId node) {
-    NodeId cur = node;
-    for (int guard = 0; guard < 64 && cur.valid(); ++guard) {
-        if (tree.kind(cur) == NodeKind::Token) {
-            auto it = s.idx().literalTypeIds.find(tree.tokenKind(cur).v);
-            if (it == s.idx().literalTypeIds.end()) return std::nullopt;
-            if (!isIntegerKind(s.lattice.interner().kind(it->second))) return std::nullopt;
-            return decodeInteger(tree.text(cur), s.idx().numberStyle);
-        }
-        // Count meaningful children: exactly one internal child ⇒ a wrapper
-        // (expression → operand, operand → `( expr )`) to descend through;
-        // zero internal + one literal token ⇒ the leaf literal.
-        NodeId onlyInternal{};
-        int internalCount = 0;
-        NodeId onlyLiteral{};
-        int literalCount = 0;
-        for (NodeId c : visibleChildren(tree, cur)) {
-            if (tree.kind(c) == NodeKind::Internal) { ++internalCount; onlyInternal = c; }
-            else if (s.idx().literalTypeIds.count(tree.tokenKind(c).v) != 0) {
-                ++literalCount; onlyLiteral = c;
-            }
-        }
-        if (internalCount == 1) { cur = onlyInternal; continue; }
-        if (internalCount == 0 && literalCount == 1) { cur = onlyLiteral; continue; }
-        return std::nullopt;  // branching / no literal ⇒ non-constant
+// Build the int-literal-token set from this schema's `literalTypeIds`
+// filtered to integer cores. Small (≤5 entries per language); built
+// lazily per `constIntExpr` / enum / etc. call. Filtering at use-time
+// means a future schema adding a new integer literal kind is picked up
+// without touching this code.
+[[nodiscard]] std::unordered_set<std::uint32_t>
+integerLiteralTokenSet(EngineState const& s) {
+    std::unordered_set<std::uint32_t> out;
+    for (auto const& [tok, ty] : s.idx().literalTypeIds) {
+        if (isIntegerKind(s.lattice.interner().kind(ty))) out.insert(tok);
     }
-    return std::nullopt;
+    return out;
+}
+
+// SE-arrays / D5.5-enum / D5.3-designator: evaluate a CST expression to
+// a compile-time integer constant via the shared CST const-eval engine
+// (plan 12.5 §0.2 D6). Replaces the hand-rolled "linear single-child
+// peel + literal leaf" check that previously sat here and at two other
+// sites. Now folds `[1+1]`, `(2*4)`, `1 << 3`, `cond ? a : b`, etc.
+// Returns nullopt for any expression that doesn't fold; the caller maps
+// to its language-specific `S_NonConstant*` diagnostic.
+// Resolve a constant symbol's defining init-expression CST. Walks the
+// scope chain from `fromScope` looking for `name`; returns the init
+// expression CST ONLY when the bound symbol is `isConst` (mutable
+// symbols can change at runtime — not foldable). The DeclarationRule's
+// `initChild` (already config-driven) gives the visible-child index
+// where the init expression lives.
+[[nodiscard]] std::optional<CstResolvedSymbol>
+resolveConstSymbolInit(EngineState const& s, Tree const& tree,
+                       SemanticConfig const& cfg,
+                       ScopeId fromScope, std::string_view name) {
+    SymbolId const sym = s.scopes.lookup(fromScope, name);
+    if (!sym.valid()) return std::nullopt;
+    auto const& rec = s.symbols.at(sym);
+    if (!rec.isConst) return std::nullopt;
+    if (rec.tree.v != tree.id().v) return std::nullopt;
+    auto declIt = s.idx().declByRule.find(tree.rule(rec.declRuleNode).v);
+    if (declIt == s.idx().declByRule.end()) return std::nullopt;
+    auto initExpr = findInitExprInDecl(tree, cfg.declarations[declIt->second],
+                                       rec.declRuleNode);
+    if (!initExpr.has_value()) return std::nullopt;
+    // D7: return the SYMBOL's defining scope so the engine evaluates
+    // its init expression in the scope where the symbol was declared
+    // — not the original use-site scope. This is what makes shadowing
+    // work correctly across const ref chains.
+    return CstResolvedSymbol{*initExpr, rec.scope.v};
+}
+
+[[nodiscard]] std::optional<std::int64_t>
+constIntExpr(EngineState& s, Tree const& tree, NodeId node,
+             ScopeId fromScope = {}, SemanticConfig const* cfg = nullptr) {
+    if (!node.valid()) return std::nullopt;
+    auto intLits = integerLiteralTokenSet(s);
+    CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
+    CstEvalEnvironment env;
+    if (fromScope.valid() && cfg != nullptr) {
+        // The resolver receives the CURRENT scope context (initially
+        // `fromScope`, but updated as the engine recurses into other
+        // symbols' init expressions). It looks up the identifier
+        // from that scope, returning the resolved symbol's init AND
+        // its declaring scope so the engine carries the right
+        // context into the recursive evaluation.
+        env.resolveSymbolInit = [&s, &tree, cfg](NodeId identTok, std::uint32_t curScopeOpaque)
+            -> std::optional<CstResolvedSymbol> {
+            return resolveConstSymbolInit(s, tree, *cfg, ScopeId{curScopeOpaque},
+                                          tree.text(identTok));
+        };
+    }
+    ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
+    if (!r.value.has_value()) return std::nullopt;
+    return asInt64Bridge(*r.value);
 }
 
 // SE-arrays: if `decl` configures an array declarator suffix and a node of that
@@ -515,7 +566,8 @@ constIntLength(EngineState& s, Tree const& tree, NodeId node) {
 // type or decaying to a pointer). No suffix present ⇒ returns `base` unchanged.
 [[nodiscard]] TypeId
 applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
-                 NodeId declNode, TypeId base) {
+                 NodeId declNode, TypeId base,
+                 ScopeId fromScope = {}, SemanticConfig const* cfg = nullptr) {
     if (!decl.arraySuffix.has_value() || !base.valid()) return base;
     ArraySuffix const& as = *decl.arraySuffix;
     // Bounded descendant search for the suffix rule. The suffix is a direct
@@ -550,15 +602,16 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         if (*as.lengthChild < sufKids.size())
             lenNode = sufKids[*as.lengthChild];
     }
-    auto len = constIntLength(s, tree, lenNode);
+    auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
     if (!len.has_value()) { emit(DiagnosticCode::S_NonConstantArrayLength); return InvalidType; }
-    // A constant that decodes but exceeds the signed length the interner stores
-    // (int64) must NOT wrap to a negative length — fail loud instead.
-    if (*len > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+    // C99 §6.7.5.2: array length is a positive integer constant
+    // expression. Negative folds (e.g. `int a[-1]`) and zero are
+    // out-of-range; fail loud rather than wrap to a giant unsigned.
+    if (*len <= 0) {
         emit(DiagnosticCode::S_ArrayLengthOutOfRange);
         return InvalidType;
     }
-    return s.lattice.interner().array(base, static_cast<std::int64_t>(*len));
+    return s.lattice.interner().array(base, *len);
 }
 
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
@@ -618,6 +671,23 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     rec.tree         = tree.id();
                     rec.kind         = effectiveKind;
                     rec.warnIfUnused = decl.warnIfUnused;
+                    // D5.1: stamp the declaration-order index of this symbol in
+                    // its declaring scope. The scope's `bindings` count BEFORE
+                    // we bind this symbol IS its 0-based ordinal. Meaningful for
+                    // field symbols of a composite-type decl (`obj.field` index
+                    // resolution); harmless positional metadata for everything
+                    // else (Variable/Function/Type/Table outside a composite).
+                    rec.fieldIndex = static_cast<std::uint32_t>(
+                        s.scopes.scopes()[bindScope.v].bindings.size());
+                    // D5.1: if THIS declaration introduces a composite type
+                    // (carries `fieldChildren`), record the inner scope it just
+                    // opened so Pass 2's member-access resolution can find the
+                    // struct's fields. `here != current` iff this rule is in
+                    // `scopeByRule` (which the loader/`fieldChildren` contract
+                    // requires for any composite-type decl).
+                    if (decl.fieldChildren.has_value() && here.v != current.v) {
+                        rec.structScope = here;
+                    }
 
                     // SE4: const-marking. Scan the type subtree (or the
                     // whole decl subtree when no typeChild) for the
@@ -769,7 +839,164 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             bodyNode = kids[*decl.bodyChild];
                         }
                     }
-                    if (effectiveKind == DeclarationKind::Function) {
+                    if (decl.fieldChildren.has_value()) {
+                        // D5.1: compose the composite (struct/union) type from
+                        // its field symbols. Post-order means every field's
+                        // type is already resolved (each field is itself a
+                        // declaration, processed earlier in the post-order
+                        // walk). We iterate the struct's inner scope, collect
+                        // (fieldIndex, type) pairs for symbols whose declaring
+                        // rule matches `fieldChildren.rule`, sort by ordinal,
+                        // and intern the structType. If any field type is
+                        // unresolved the struct type stays InvalidType — the
+                        // HIR verifier's requiresValidType then surfaces it
+                        // through TypeDecl as H_TypeUnresolved (no silent gap).
+                        SymbolRecord& srec = s.symbols.at(sym);
+                        if (srec.structScope.valid()) {
+                            std::vector<std::pair<std::uint32_t, TypeId>> fields;
+                            auto const& scope = s.scopes.scopes()[srec.structScope.v];
+                            bool anyInvalid = false;
+                            // D5.5: enum members have NO declared type
+                            // (they're typed BY the enum type Pass 1.5
+                            // is about to mint); skip the "field's type
+                            // must be resolved" gate for enum.
+                            bool const requireFieldTypes =
+                                decl.fieldChildren->compositeKind
+                                != CompositeKind::Enum;
+                            for (auto const& [_name, fieldSymId] : scope.bindings) {
+                                SymbolRecord const& frec = s.symbols.at(fieldSymId);
+                                if (!frec.declRuleNode.valid()
+                                    || frec.tree.v != tree.id().v) continue;
+                                if (tree.rule(frec.declRuleNode)
+                                    != decl.fieldChildren->rule) continue;
+                                if (requireFieldTypes && !frec.type.valid()) {
+                                    anyInvalid = true;
+                                    break;
+                                }
+                                fields.emplace_back(frec.fieldIndex, frec.type);
+                            }
+                            if (!anyInvalid) {
+                                std::sort(fields.begin(), fields.end());
+                                std::vector<TypeId> fieldTypes;
+                                fieldTypes.reserve(fields.size());
+                                for (auto const& [_idx, t] : fields)
+                                    fieldTypes.push_back(t);
+                                // D5.4 / D5.5: struct vs union vs enum
+                                // dispatch is config-driven via
+                                // FieldChildrenDescriptor::compositeKind.
+                                CompositeKind const ck =
+                                    decl.fieldChildren->compositeKind;
+                                TypeId compositeTy;
+                                if (ck == CompositeKind::Union) {
+                                    compositeTy = s.lattice.interner().unionType(
+                                        srec.name, fieldTypes);
+                                } else if (ck == CompositeKind::Enum) {
+                                    // D5.5: enum type carries no field-
+                                    // operands — only its nominal name +
+                                    // underlying TypeKind (I32 in v1).
+                                    // Pass 1 created each enumerator's
+                                    // SymbolRecord with type still invalid;
+                                    // we now SET each enumerator's type to
+                                    // the enum type, COMPUTE its integer
+                                    // value (C99 §6.7.2.2: explicit `= N`
+                                    // overrides the running counter; missing
+                                    // initializer = previous + 1), AND
+                                    // also-bind the enumerator name to the
+                                    // enclosing scope (NOT a lift — original
+                                    // binding stays in the inner scope; this
+                                    // is a republication) so C-classic
+                                    // `enum E { A } ... A` works.
+                                    compositeTy = s.lattice.interner().enumType(
+                                        srec.name, TypeKind::I32);
+                                    if (srec.structScope.valid()) {
+                                        auto const enclosingId =
+                                            s.scopes.scopes()[srec.structScope.v].parent;
+                                        // Collect enumerators in fieldIndex
+                                        // order so the running counter
+                                        // matches source declaration order.
+                                        std::vector<std::pair<std::uint32_t, SymbolId>> ordered;
+                                        for (auto const& [_n, eSymId]
+                                             : s.scopes.scopes()[srec.structScope.v].bindings) {
+                                            SymbolRecord const& er = s.symbols.at(eSymId);
+                                            if (!er.declRuleNode.valid()
+                                                || er.tree.v != tree.id().v)
+                                                continue;
+                                            if (tree.rule(er.declRuleNode)
+                                                != decl.fieldChildren->rule)
+                                                continue;
+                                            ordered.emplace_back(er.fieldIndex, eSymId);
+                                        }
+                                        std::sort(ordered.begin(), ordered.end());
+                                        std::int64_t nextValue = 0;
+                                        for (auto const& [_idx, eSymId] : ordered) {
+                                            SymbolRecord& erec =
+                                                s.symbols.at(eSymId);
+                                            erec.type = compositeTy;
+                                            // Optional `= expr`: pass through
+                                            // the shared CST const-eval engine
+                                            // (plan 12.5 §0.2 D6). Folds
+                                            // literal arithmetic (`A = 1+1`),
+                                            // bitops, comparisons, ternary;
+                                            // identifier refs are anchored as
+                                            // a real-blocker followup.
+                                            std::int64_t value = nextValue;
+                                            bool hadExplicit = false;
+                                            bool explicitFailed = false;
+                                            auto eKids = visibleChildren(tree, erec.declRuleNode);
+                                            for (NodeId c : eKids) {
+                                                if (tree.kind(c) != NodeKind::Internal) continue;
+                                                hadExplicit = true;
+                                                if (auto iv = constIntExpr(s, tree, c, erec.scope, &cfg); iv.has_value()) {
+                                                    value = *iv;
+                                                } else {
+                                                    explicitFailed = true;
+                                                }
+                                                break;  // exactly one expression child per enumerator
+                                            }
+                                            if (hadExplicit && explicitFailed) {
+                                                ParseDiagnostic d2;
+                                                d2.code = DiagnosticCode::S_NonConstantEnumeratorValue;
+                                                d2.severity = DiagnosticSeverity::Error;
+                                                d2.buffer = tree.source().id();
+                                                d2.span = tree.span(erec.declRuleNode);
+                                                d2.actual = erec.name;
+                                                s.reporter.report(std::move(d2));
+                                            }
+                                            erec.enumValue = value;
+                                            nextValue = value + 1;
+                                            // D5.5-FU2: only also-bind to the
+                                            // enclosing scope when the config
+                                            // opts in (`liftToEnclosingScope:
+                                            // true`). C-style enums opt in;
+                                            // future Rust-style `E.A`-only
+                                            // schemas would leave it false.
+                                            if (enclosingId.valid()
+                                             && decl.fieldChildren->liftToEnclosingScope) {
+                                                SymbolId const prior =
+                                                    s.scopes.bind(
+                                                        enclosingId, erec.name, eSymId);
+                                                if (prior.valid()) {
+                                                    ParseDiagnostic d2;
+                                                    d2.code     = DiagnosticCode::S_RedeclaredSymbol;
+                                                    d2.severity = DiagnosticSeverity::Error;
+                                                    d2.buffer   = tree.source().id();
+                                                    d2.span     = tree.span(erec.declRuleNode);
+                                                    d2.actual   = erec.name;
+                                                    s.reporter.report(std::move(d2));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    compositeTy = s.lattice.interner().structType(
+                                        srec.name, fieldTypes);
+                                }
+                                srec.type = compositeTy;
+                                s.nodeToType.set(resolved.node, compositeTy);
+                                s.compositeScopeByType[compositeTy.v] = srec.structScope;
+                            }
+                        }
+                    } else if (effectiveKind == DeclarationKind::Function) {
                         // SE6: build a FnSig over the param types.
                         std::vector<TypeId> paramTypes;
                         if (paramsNode.valid()) {
@@ -799,7 +1026,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         // leaves the type unresolved (applyArraySuffix already
                         // emitted S_NonConstantArrayLength) so we fail loud.
                         TypeId const declTy =
-                            applyArraySuffix(s, tree, decl, node, returnTy);
+                            applyArraySuffix(s, tree, decl, node, returnTy, here, &cfg);
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(resolved.node, declTy);
@@ -930,6 +1157,170 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         }
                     }
                 }
+            }
+        }
+
+        // D5.1: member-access resolution (`obj.field` and `ptr->field`).
+        // Pass 2 visits post-order so the LHS's type is already in
+        // `nodeToType` by the time we reach the member-access internal
+        // node. We:
+        //   1. read LHS type via `typeAt(kids[lhsChild])`,
+        //   2. unwrap one Ptr layer if the access dereferences (arrow form),
+        //   3. find the resolved struct's inner scope via
+        //      `compositeScopeByType` (populated by Pass 1.5),
+        //   4. extract the field-name identifier text from `kids[nameChild]`,
+        //   5. look it up in the struct's scope → bind the field SymbolId on
+        //      the name node and propagate the field type to the
+        //      member-access node (so chained access `f.x.y` resolves the
+        //      next layer in the same post-order step).
+        // No conflict with the reference-resolution block above: that one
+        // resolves identifier USES against the LEXICAL scope chain; this one
+        // resolves field-names against a struct's STRUCT scope — orthogonal.
+        auto maIt = s.idx().memberAccessByRule.find(rule.v);
+        // Pick the matching entry by operator-token (mirrors `assignByRule`'s
+        // discipline: multiple entries per rule are distinguished by which
+        // operator token — `.` vs `->` — is present in the node). Ungated
+        // entries match unconditionally and must be the sole entry for the
+        // rule. Returns null when no entry's operator-token matches: the node
+        // is structurally a member-access-rule node but carries a different
+        // operator (e.g. c-subset's `postfixExpr` with `++`/`(`/`[`).
+        MemberAccessRule const* const ma = [&]() -> MemberAccessRule const* {
+            if (maIt == s.idx().memberAccessByRule.end()) return nullptr;
+            for (std::size_t midx : maIt->second) {
+                auto const& cand = cfg.memberAccesses[midx];
+                if (!cand.operatorToken.has_value()) return &cand;  // ungated
+                for (auto kid : tree.children(node)) {
+                    if (tree.kind(kid) == NodeKind::Token
+                        && tree.tokenKind(kid) == *cand.operatorToken) {
+                        return &cand;
+                    }
+                }
+            }
+            return nullptr;
+        }();
+        if (ma != nullptr) {
+            auto kids = visibleChildren(tree, node);
+            if (ma->lhsChild < kids.size() && ma->nameChild < kids.size()) {
+                NodeId const lhsNode  = kids[ma->lhsChild];
+                NodeId const nameNode = kids[ma->nameChild];
+                TypeId lhsType = s.typeAt(lhsNode);
+                if (lhsType.valid()) {
+                    TypeId effectiveType = lhsType;
+                    bool   typeOk = true;
+                    if (ma->dereferences) {
+                        // Arrow form: `p->x` is sugar for `(*p).x`. The LHS
+                        // must be `Ptr<Struct>`; one indirection only. If the
+                        // LHS isn't even a pointer, emit S_NotAPointer; the
+                        // post-unwrap "non-composite" case (Ptr<int>->x) falls
+                        // through to S_NotAComposite below with arrow-aware
+                        // wording.
+                        if (s.lattice.interner().kind(effectiveType)
+                            == TypeKind::Ptr) {
+                            auto ops = s.lattice.interner()
+                                       .operands(effectiveType);
+                            if (!ops.empty()) effectiveType = ops[0];
+                            else typeOk = false;
+                        } else {
+                            typeOk = false;
+                        }
+                        if (!typeOk) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_NotAPointer;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode);
+                            d.actual   = "arrow operator '->' requires a "
+                                         "pointer operand";
+                            s.reporter.report(std::move(d));
+                        }
+                    }
+                    if (typeOk) {
+                        auto scopeIt =
+                            s.compositeScopeByType.find(effectiveType.v);
+                        if (scopeIt == s.compositeScopeByType.end()) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_NotAComposite;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode);
+                            // Disambiguate the two arrow-form failure shapes
+                            // in the message text so the reader knows whether
+                            // the LHS itself was non-composite (`.x` form) or
+                            // the LHS was Ptr<T> but T is non-composite (`->x`
+                            // form — review F5).
+                            d.actual   = ma->dereferences
+                                ? "arrow operator '->' pointee is not a "
+                                  "composite type"
+                                : "member access '.' requires a composite-"
+                                  "typed operand";
+                            s.reporter.report(std::move(d));
+                        } else {
+                            auto fnRes = extractNameNode(
+                                tree, nameNode, NameMatchMode::Self,
+                                cfg.identifierToken,
+                                cfg.bracketIdentifierToken);
+                            // Gate to a real identifier leaf, mirroring the
+                            // reference-resolution discipline above. A non-
+                            // identifier nameChild is a schema-shape bug
+                            // (member-access's nameChild is positionally
+                            // fixed by the rule) — emit C_InvalidSemantics
+                            // rather than silently failing or producing a
+                            // phantom S_UndeclaredIdentifier on the token's
+                            // raw source text (reviews F3 + F7).
+                            bool isIdentifier = false;
+                            if (fnRes.node.valid()
+                                && tree.kind(fnRes.node) == NodeKind::Token) {
+                                auto const rtk = tree.tokenKind(fnRes.node);
+                                if (cfg.identifierToken.valid()
+                                    && rtk == cfg.identifierToken) {
+                                    isIdentifier = true;
+                                } else if (cfg.bracketIdentifierToken
+                                               .has_value()
+                                           && cfg.bracketIdentifierToken
+                                                  ->valid()
+                                           && rtk == *cfg.bracketIdentifierToken) {
+                                    isIdentifier = true;
+                                }
+                            }
+                            if (!isIdentifier || fnRes.name.empty()) {
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::C_InvalidSemantics;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(nameNode);
+                                d.actual   = "member-access nameChild did not "
+                                             "resolve to an identifier leaf";
+                                s.reporter.report(std::move(d));
+                            } else {
+                                ScopeId const fieldScope = scopeIt->second;
+                                auto const& sc =
+                                    s.scopes.scopes()[fieldScope.v];
+                                auto bindIt = sc.bindings.find(fnRes.name);
+                                if (bindIt != sc.bindings.end()) {
+                                    SymbolId const fieldSym = bindIt->second;
+                                    SymbolRecord const& frec =
+                                        s.symbols.at(fieldSym);
+                                    s.nodeToSymbol.set(fnRes.node, fieldSym);
+                                    s.usesBySymbol[fieldSym.v].push_back(
+                                        fnRes.node);
+                                    if (frec.type.valid()) {
+                                        s.nodeToType.set(fnRes.node, frec.type);
+                                        s.nodeToType.set(node, frec.type);
+                                    }
+                                } else {
+                                    ParseDiagnostic d;
+                                    d.code     = DiagnosticCode::S_UndeclaredIdentifier;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(fnRes.node);
+                                    d.actual   = fnRes.name;
+                                    s.reporter.report(std::move(d));
+                                }
+                            }
+                        }
+                    }
+                }
+                // lhsType invalid ⇒ likely a chained error; stay quiet.
             }
         }
     }
@@ -1082,7 +1473,7 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
                     s, cfg, tree, kids[*decl.typeChild], scope);
                 // SE-arrays: an array-declarator param (`int a[10]`) carries
                 // the Array type into the signature.
-                pty = applyArraySuffix(s, tree, decl, cur, pty);
+                pty = applyArraySuffix(s, tree, decl, cur, pty, scope, &cfg);
                 out.push_back(pty);
             }
             return;  // a param decl is a leaf for parameter-collection
@@ -1475,6 +1866,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
         std::move(s.nodeToType),
         std::move(s.reporter),
         std::move(s.usesBySymbol),
+        std::move(s.compositeScopeByType),
     };
 }
 

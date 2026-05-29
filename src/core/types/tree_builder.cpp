@@ -1,9 +1,9 @@
 #include "core/types/tree_builder.hpp"
 
+#include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -133,8 +133,7 @@ TreeBuilder::Checkpoint::~Checkpoint() noexcept {
 // ─────────────────────────────────────────────────────────────────────────
 
 TreeId TreeBuilder::nextTreeId() noexcept {
-    static std::atomic<std::uint32_t> sCounter{0};
-    return TreeId{++sCounter};
+    return substrate::mintMonotonicId<TreeId>();
 }
 
 TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
@@ -262,18 +261,25 @@ void TreeBuilder::addBuilderInvariant_(std::string actual, SourceSpan span) {
 }
 
 void TreeBuilder::propagateHasError_(NodeId start) noexcept {
-    // The starting node already has HasError set by the caller (it IS
-    // the error). Walk from its PARENT upward. Stops at the first
-    // already-flagged ancestor — the chain is monotone since every
-    // prior propagation flagged every ancestor up to root.
-    if (!start.valid() || start.v >= arena_.size()) return;
-    NodeId cur = arena_.at(start).parent;
-    while (cur.valid() && cur.v < arena_.size()) {
-        detail::Node& n = arena_.at(cur);
-        if (hasError(n.flags)) break;
-        n.flags |= NodeFlags::HasError;
-        cur = n.parent;
-    }
+    // Plan 05 post-close substrate fix: HasError propagation MUST be
+    // lazy (frame-close-driven) so speculative rollback doesn't leave
+    // pre-existing ancestor flags stuck. The eager walk-up-from-Error-
+    // leaf previously implemented here mutated ancestors that existed
+    // BEFORE the speculative checkpoint — ancestors the checkpoint's
+    // `arena.truncateTo(nodesSize)` rollback cannot un-mutate (the
+    // ancestor isn't truncated; its flag is). Result: a failed
+    // speculative branch that pushed an Error leaf would corrupt the
+    // committed work's HasError flag chain. The frame-close OR-reduce
+    // loop in `closeTopFrame_` (around tree_builder.cpp:472-474)
+    // correctly OR-reduces HasError from EACH frame's children into
+    // the closing parent ONLY when the frame commits — work that
+    // rolls back never reaches its close, so its Error leaves never
+    // pollute the upper chain. Removing the eager walk here is the
+    // correct contract: propagation is the OR-reduce's job, not this
+    // function's. The caller's `errNode.flags |= NodeFlags::HasError`
+    // on the Error leaf is preserved; that flag's children-to-parent
+    // OR-reduction happens at commit time via the natural close path.
+    (void)start;
 }
 
 // ── open / close ─────────────────────────────────────────────────────────

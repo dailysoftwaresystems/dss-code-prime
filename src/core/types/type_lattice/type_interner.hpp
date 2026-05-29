@@ -64,6 +64,11 @@ public:
     // struct/union: nominal name + operands=[fields/variants...].
     TypeId structType(std::string_view name, std::span<TypeId const> fields);
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
+    // enum: nominal name + scalars=[(int)underlyingTypeKind]. Variants
+    // are NOT stored as operands (each enumerator is a Variable symbol
+    // with the enum TypeId; the enum type itself is int-compatible).
+    TypeId enumType(std::string_view name,
+                    TypeKind underlying = TypeKind::I32);
     // fnSig: operands=[result, params...], scalars=[(int)cc].
     TypeId fnSig(std::span<TypeId const> params, TypeId result, CallConv cc);
     // extension: kind = TypeKind::Extension, extensionKind = `kind`, nominal name,
@@ -84,6 +89,20 @@ public:
     // `id` is not a FnSig.
     [[nodiscard]] TypeId                   fnResult(TypeId id) const;
     [[nodiscard]] std::span<TypeId const>  fnParams(TypeId id) const;
+
+    // ── promotion / coercion (C99 "usual arithmetic conversions") ──
+    // The common arithmetic type two operands are coerced to before a binary
+    // op. Returns `InvalidType` for non-arithmetic operand pairs (pointers,
+    // structs, etc. — the caller decides whether that's a diagnostic or a
+    // pass-through). Algorithm follows C99 §6.3.1.8 in spirit:
+    //   - if either is floating-point, promote both to the wider floating
+    //     type;
+    //   - else apply integer promotions (Bool/Char/I8/U8/I16/U16 → I32);
+    //   - then equal types → same; same-signedness → wider rank;
+    //     cross-signedness → unsigned wins on equal rank, else the wider
+    //     rank's signedness.
+    // Pure type-level query; no constant evaluation, no diagnostics.
+    [[nodiscard]] TypeId commonType(TypeId a, TypeId b);
 
 private:
     TypeId internContent(TypeKind kind, TypeKindId extensionKind,

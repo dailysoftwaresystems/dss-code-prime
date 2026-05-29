@@ -195,6 +195,41 @@ struct DSS_EXPORT HirLoweringConfig {
     // unresolved core Ref. Empty ⇒ refs lower to core `Ref` (typed languages).
     std::string   refExtensionKind;   // e.g. "TSQL::Name"
 
+    // D5.3 brace-init + designated-initializer + compound-literal
+    // vocabulary. Generic across record-bearing languages; absent ⇒
+    // language has no brace-init expression form. The engine's
+    // `lowerBraceInit` consumes designators (field-name + index forms,
+    // including dot-chained), normalizes to positional with zero-fills
+    // against the context type's interner-known field list, and emits
+    // a core `HirKind::ConstructAggregate`. Element types are coerced
+    // to their slot type via the shared `coerce` helper (the same path
+    // ordinary VarDecl init / coerce uses). Compound literal `(T){...}`
+    // lowers via the same `lowerBraceInit` with the type taken from
+    // the parenthesized prefix — declared via a separate operand-alt
+    // rule (`compoundLiteralRule`) so its lookup is positional and the
+    // engine never branches on language.
+    RuleId      braceInitListRule{};   std::string braceInitListRuleName;
+    RuleId      initElementRule{};     std::string initElementRuleName;
+    RuleId      designatedFieldRule{}; std::string designatedFieldRuleName;
+    RuleId      designatedIndexRule{}; std::string designatedIndexRuleName;
+    RuleId      compoundLiteralRule{}; std::string compoundLiteralRuleName;
+
+    // Per-language MIR-globals const-evaluation policy. The shared
+    // const-eval engine (plan 12.5) supports a float-folding gate via
+    // its `allowFloat` knob; today every v1 schema is IEEE 754 so the
+    // engine ran with `allowFloat=true` unconditionally inside
+    // MIR-globals. Plan 12.5 §0.2 D3 closed: the policy is now per-
+    // schema (JSON-declared, NOT C++-coded — config-driven), so a
+    // future schema with non-IEEE float semantics (decimal float,
+    // fixed-point, saturating arithmetic) declares `allowFloat: false`
+    // and the engine refuses to fold its float arithmetic at module-
+    // load time. The MIR-globals caller reads this struct off the
+    // owning schema and threads it into `EvalOptions`.
+    struct GlobalsConstEval {
+        bool allowFloat = true;
+    };
+    GlobalsConstEval globalsConstEval{};
+
     // True when the block carries no facets — the engine then does nothing.
     [[nodiscard]] bool empty() const noexcept {
         return ruleMappings.empty() && binaryOps.empty() && unaryOps.empty()

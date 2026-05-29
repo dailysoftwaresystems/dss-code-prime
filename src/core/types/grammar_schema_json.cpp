@@ -1,5 +1,6 @@
 #include "core/types/grammar_schema_json.hpp"
 
+#include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/rule_id.hpp"
@@ -10,7 +11,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <format>
@@ -1162,20 +1162,39 @@ void validateOperatorBodyRules(GrammarSchemaData& data, Collector& coll) {
         // Postfix is the only arity that carries `bodyRule`, so iterate
         // just that slice — O(N) in the declared-token count, trivial
         // at load time.
-        bool referenced = false;
-        for (std::uint32_t t = 1; t < data.schemaTokens->size() && !referenced; ++t) {
+        bool referencedAsBody     = false;
+        bool referencedAsFollower = false;
+        for (std::uint32_t t = 1;
+             t < data.schemaTokens->size()
+             && !(referencedAsBody || referencedAsFollower);
+             ++t) {
             const SchemaTokenId tid{t};
             const auto entry = data.operators.lookup(tid, OperatorArity::Postfix);
-            if (entry && entry->grouped
-                && entry->grouped->bodyRule.v == rule.v) {
-                referenced = true;
+            if (!entry) continue;
+            if (entry->grouped && entry->grouped->bodyRule.v == rule.v) {
+                referencedAsBody = true;
+            }
+            // D5.1: `followerRule` also references a rule that must be
+            // declared — same audit gap that `bodyRule` had. The loader
+            // interns the name at operator-load time (shapes haven't been
+            // compiled yet); the real "shape exists" check is here.
+            if (entry->followerRule.has_value()
+                && entry->followerRule->v == rule.v) {
+                referencedAsFollower = true;
             }
         }
-        if (referenced) {
+        if (referencedAsBody) {
             coll.emit(DiagnosticCode::C_UnknownShape,
                       "/operators/groups",
                       std::format("postfix operator group references "
                                   "'bodyRule' = '{}' but no shape with "
+                                  "that name is declared", name));
+        }
+        if (referencedAsFollower) {
+            coll.emit(DiagnosticCode::C_UnknownShape,
+                      "/operators/groups",
+                      std::format("postfix operator group references "
+                                  "'followerRule' = '{}' but no shape with "
                                   "that name is declared", name));
         }
     }
@@ -1300,8 +1319,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     data.schemaVersion = schemaVer;
     // Per-instance monotonic schema id stamped onto every LexemeMeaning
     // so cross-schema misuse is catchable at the failing lookup.
-    static std::atomic<std::uint32_t> sNextSchemaId{1};
-    data.id            = SchemaId{sNextSchemaId.fetch_add(1, std::memory_order_relaxed)};
+    data.id            = substrate::mintMonotonicId<SchemaId>();
 
     if (langObj.contains("fileExtensions") && langObj.at("fileExtensions").is_array()) {
         for (auto const& ext : langObj.at("fileExtensions")) {
@@ -1987,6 +2005,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     const auto rname = g.at("bodyRule").get<std::string>();
                     bodyRuleId = data.rules->intern(rname);
                 }
+                // D5.1: `followerRule` — a postfix operator followed by
+                // exactly one occurrence of a named rule shape (e.g. `.field`
+                // is `DotOp` + a `memberFollower` rule). No closer; the rule's
+                // own shape terminates the body. Mutually exclusive with the
+                // `endsAt`/`bodyRule` (grouped) form — postfix forms are
+                // either bracketed-body OR single-rule-follower OR bare (`++`).
+                RuleId followerRuleId{};
+                if (g.contains("followerRule")) {
+                    if (arity != OperatorArity::Postfix) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'followerRule' is only valid on a postfix group");
+                        continue;
+                    }
+                    if (endsAtId.valid() || bodyRuleId.valid()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'followerRule' is mutually exclusive with "
+                                  "'endsAt'/'bodyRule' (grouped postfix)");
+                        continue;
+                    }
+                    if (!g.at("followerRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
+                                  "'followerRule' must be a string rule name");
+                        continue;
+                    }
+                    const auto rname = g.at("followerRule").get<std::string>();
+                    followerRuleId = data.rules->intern(rname);
+                }
                 // Ternary `middle` separator (C's `:`). Required for ternary
                 // arity, forbidden otherwise.
                 SchemaTokenId middleId{};
@@ -2033,11 +2078,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "ternary ('middle')");
                     continue;
                 }
-                OperatorTable::Entry entry{precedence, assoc, std::nullopt, std::nullopt};
+                OperatorTable::Entry entry{precedence, assoc,
+                                           std::nullopt, std::nullopt, std::nullopt};
                 if (endsAtId.valid()) {
                     entry.grouped = OperatorTable::GroupedPostfix{
                         endsAtId, bodyRuleId};
                 }
+                if (followerRuleId.valid()) entry.followerRule = followerRuleId;
                 if (middleId.valid()) entry.ternaryMiddle = middleId;
 
                 for (std::size_t j = 0; j < g.at("operators").size(); ++j) {
@@ -3117,6 +3164,90 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D5.1: optional `fieldChildren` descriptor — declares
+                        // this declaration as a composite-type introducer.
+                        //   "fieldChildren": { "rule": "structField" }
+                        // Pass 1.5 collects the named field-rule symbols in the
+                        // declaration's scope (in fieldIndex order) and
+                        // composes `interner.structType(name, fieldTypes)`.
+                        if (entry.contains("fieldChildren")) {
+                            json const& fc = entry.at("fieldChildren");
+                            if (!fc.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/fieldChildren",
+                                          "'fieldChildren' must be an object");
+                            } else if (!fc.contains("rule") || !fc.at("rule").is_string()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/fieldChildren/rule",
+                                          "'fieldChildren.rule' is required and must "
+                                          "be a rule-name string");
+                            } else {
+                                auto const rn = fc.at("rule").get<std::string>();
+                                if (!data.rules->contains(rn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/fieldChildren/rule",
+                                              std::format("'fieldChildren.rule' references "
+                                                          "unknown shape '{}'", rn));
+                                } else if (!fc.contains("compositeKind")) {
+                                    // D5.4 gap-closure: `compositeKind`
+                                    // is REQUIRED when `fieldChildren` is
+                                    // present. Defaulting silently to
+                                    // Struct would let a future union-
+                                    // or enum-bearing schema mis-type
+                                    // its composites with no signal.
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/fieldChildren/compositeKind",
+                                              "'fieldChildren.compositeKind' is required and "
+                                              "must be 'struct', 'union' or 'enum' — explicit "
+                                              "declaration guards against silently mis-interning "
+                                              "a future composite type");
+                                } else if (!fc.at("compositeKind").is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/fieldChildren/compositeKind",
+                                              "'compositeKind' must be a string "
+                                              "'struct' or 'union'");
+                                } else {
+                                    auto const k = fc.at("compositeKind").get<std::string>();
+                                    FieldChildrenDescriptor fcd;
+                                    fcd.rule     = data.rules->find(rn);
+                                    fcd.ruleName = rn;
+                                    if (k == "struct") {
+                                        fcd.compositeKind = CompositeKind::Struct;
+                                    } else if (k == "union") {
+                                        fcd.compositeKind = CompositeKind::Union;
+                                    } else if (k == "enum") {
+                                        fcd.compositeKind = CompositeKind::Enum;
+                                    } else {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/fieldChildren/compositeKind",
+                                                  std::format("'compositeKind' must be 'struct', "
+                                                              "'union' or 'enum' (got '{}')", k));
+                                        // Keep loading; the default Struct
+                                        // is the safer fallback for an
+                                        // unrecognized value (still emits
+                                        // C_InvalidSemantics so res->ok is
+                                        // false).
+                                    }
+                                    // D5.5-FU2: optional `liftToEnclosingScope`
+                                    // flag controls C-classic enumerator
+                                    // visibility (only meaningful for
+                                    // `compositeKind: enum`; ignored
+                                    // otherwise but loader-validated).
+                                    if (fc.contains("liftToEnclosingScope")) {
+                                        if (!fc.at("liftToEnclosingScope").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/fieldChildren/liftToEnclosingScope",
+                                                      "'liftToEnclosingScope' must be a boolean");
+                                        } else {
+                                            fcd.liftToEnclosingScope =
+                                                fc.at("liftToEnclosingScope").get<bool>();
+                                        }
+                                    }
+                                    rule.fieldChildren = std::move(fcd);
+                                }
+                            }
+                        }
+
                         // D8: optional `warnIfUnused` flag (default false).
                         // A non-bool value is the same C_InvalidSemantics
                         // discipline used for other declaration sub-fields.
@@ -3410,6 +3541,107 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── memberAccesses (D5.1) ──
+            // Each entry names a member-access rule (`obj.field` or
+            // `ptr->field`), the visible-child indices of LHS + name, and
+            // whether the form dereferences first. The engine reads only
+            // these — there is no per-language member-access C++ branch.
+            if (sem.contains("memberAccesses")) {
+                json const& arr = sem.at("memberAccesses");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/memberAccesses",
+                              "'semantics.memberAccesses' must be an array");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path = std::format("/semantics/memberAccesses/{}", i);
+                        json const& entry = arr[i];
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "each 'memberAccesses' entry must be an object");
+                            continue;
+                        }
+                        if (!entry.contains("rule") || !entry.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        MemberAccessRule rule;
+                        rule.ruleName = entry.at("rule").get<std::string>();
+                        if (!data.rules->contains(rule.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path + "/rule",
+                                      std::format("'memberAccesses[{}].rule' references "
+                                                  "unknown shape '{}'", i, rule.ruleName));
+                            continue;
+                        }
+                        rule.rule = data.rules->find(rule.ruleName);
+                        auto readReqUint = [&](char const* key, std::uint32_t& out) -> bool {
+                            if (!entry.contains(key) || !entry.at(key).is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/" + key,
+                                          std::format("'{}' is required and must be a "
+                                                      "non-negative integer", key));
+                                return false;
+                            }
+                            auto v = entry.at(key).get<std::int64_t>();
+                            if (v < 0 || v > std::numeric_limits<std::int32_t>::max()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/" + key,
+                                          std::format("'{}' visible-child index out of range", key));
+                                return false;
+                            }
+                            out = static_cast<std::uint32_t>(v);
+                            return true;
+                        };
+                        bool ok = readReqUint("lhsChild",  rule.lhsChild)
+                              &&  readReqUint("nameChild", rule.nameChild);
+                        if (!ok) continue;
+                        if (rule.lhsChild == rule.nameChild) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      path,
+                                      std::format("'memberAccesses[{}]': "
+                                                  "lhsChild and nameChild must "
+                                                  "be distinct visible-child "
+                                                  "indices (got {})",
+                                                  i, rule.lhsChild));
+                            continue;
+                        }
+                        if (entry.contains("dereferences")) {
+                            if (!entry.at("dereferences").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/dereferences",
+                                          "'dereferences' must be a boolean");
+                            } else {
+                                rule.dereferences = entry.at("dereferences").get<bool>();
+                            }
+                        }
+                        // Optional gating token kind. Same discipline as
+                        // `AssignmentRule.operatorToken`: multiple entries
+                        // sharing a `rule` are distinguished by which operator
+                        // token (`.` vs `->`) appears in the node.
+                        if (entry.contains("operatorToken")) {
+                            if (!entry.at("operatorToken").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/operatorToken",
+                                          "'operatorToken' must be a string");
+                            } else {
+                                auto const tk = entry.at("operatorToken").get<std::string>();
+                                if (!data.schemaTokens->contains(tk)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              path + "/operatorToken",
+                                              std::format("'memberAccesses[{}].operatorToken' "
+                                                          "references unknown token kind '{}'",
+                                                          i, tk));
+                                } else {
+                                    rule.operatorToken = data.schemaTokens->find(tk);
+                                }
+                            }
+                        }
+                        cfg.memberAccesses.push_back(std::move(rule));
+                    }
+                }
+            }
+
             // ── scopes ──
             if (sem.contains("scopes")) {
                 json const& arr = sem.at("scopes");
@@ -3437,6 +3669,44 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         scopeRule.ruleName = name;
                         cfg.scopes.push_back(std::move(scopeRule));
                     }
+                }
+            }
+
+            // ── D5.1: cross-field validation for `fieldChildren` ──
+            // The header docstring promises that a declaration carrying
+            // `fieldChildren` must (a) also appear in `scopes` (so fields
+            // bind into the struct's own scope, not the enclosing one),
+            // and (b) declare `kind: type`. Pass 1 silently no-ops a
+            // misconfigured fieldChildren (via the `here != current` gate)
+            // and Pass 1.5 silently leaves the struct type unresolved —
+            // exactly the kind of "documented invariant, unenforced"
+            // anti-pattern the project rejects. Validate here, before
+            // analysis ever runs.
+            for (std::size_t i = 0; i < cfg.declarations.size(); ++i) {
+                auto const& d = cfg.declarations[i];
+                if (!d.fieldChildren.has_value()) continue;
+                const auto path = std::format("/semantics/declarations/{}", i);
+                if (d.kind != DeclarationKind::Type) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/fieldChildren",
+                              std::format("declaration '{}' carries "
+                                          "'fieldChildren' but its 'kind' is "
+                                          "not 'type' — a composite-type "
+                                          "introducer must declare kind:type",
+                                          d.ruleName));
+                }
+                bool inScopes = false;
+                for (auto const& sc : cfg.scopes) {
+                    if (sc.rule.v == d.rule.v) { inScopes = true; break; }
+                }
+                if (!inScopes) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/fieldChildren",
+                              std::format("declaration '{}' carries "
+                                          "'fieldChildren' but its rule is "
+                                          "not in 'scopes' — fields must bind "
+                                          "into the struct's own scope",
+                                          d.ruleName));
                 }
             }
 
@@ -4239,6 +4509,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("operandRule",     cfg.operandRule,     cfg.operandRuleName);
             readExprRule("flatExprRule",     cfg.flatExprRule,     cfg.flatExprRuleName);
             readExprRule("flatBinaryOpRule", cfg.flatBinaryOpRule, cfg.flatBinaryOpRuleName);
+            // D5.3 brace-init + designated-initializer + compound-
+            // literal rule ids. Each optional — absent ⇒ language has
+            // no such form; the engine simply never matches.
+            readExprRule("braceInitListRule",   cfg.braceInitListRule,   cfg.braceInitListRuleName);
+            readExprRule("initElementRule",     cfg.initElementRule,     cfg.initElementRuleName);
+            readExprRule("designatedFieldRule", cfg.designatedFieldRule, cfg.designatedFieldRuleName);
+            readExprRule("designatedIndexRule", cfg.designatedIndexRule, cfg.designatedIndexRuleName);
+            readExprRule("compoundLiteralRule", cfg.compoundLiteralRule, cfg.compoundLiteralRuleName);
 
             // ── HR10: extensionKinds [{ name, lang }] ──
             if (hl.contains("extensionKinds")) {
@@ -4293,6 +4571,31 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     (void)resolveToken(cfg.nullTokenName, "/hirLowering/nullLiteral/token", cfg.nullToken);
                     cfg.nullExtensionKind = nl.at("hirKind").get<std::string>();
                     requireDeclaredExtKind(cfg.nullExtensionKind, "/hirLowering/nullLiteral/hirKind");
+                }
+            }
+
+            // ── plan-12.5 §0.2 D3: globalsConstEval { allowFloat: bool } —
+            // per-schema MIR-globals const-evaluation policy. Default is
+            // IEEE 754 (allowFloat=true); a non-IEEE-float language
+            // declares `false` and the engine refuses to fold its float
+            // arithmetic into module-init literals. JSON-declared, NOT
+            // C++-coded — config-driven discipline (no schema.name()
+            // branches anywhere downstream). ──
+            if (hl.contains("globalsConstEval")) {
+                json const& gce = hl.at("globalsConstEval");
+                if (!gce.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/hirLowering/globalsConstEval",
+                              "'globalsConstEval' must be an object");
+                } else if (gce.contains("allowFloat")) {
+                    if (!gce.at("allowFloat").is_boolean()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  "/hirLowering/globalsConstEval/allowFloat",
+                                  "'allowFloat' must be a boolean");
+                    } else {
+                        cfg.globalsConstEval.allowFloat =
+                            gce.at("allowFloat").get<bool>();
+                    }
                 }
             }
 

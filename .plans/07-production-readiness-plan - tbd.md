@@ -1,11 +1,11 @@
 # Production Readiness — Master Plan
 
-> **Scope.** v1 ships **end-to-end binaries for every language in `src/source-config/languages/`** on **{Windows, Linux, macOS} × {x86_64, ARM64}**, gated by [`artifactProfile`](./06-artifact-profile-plan%20-%20tbd.md). v1.x extends to WASM / shader / transpile / iOS / Android via the new sub-plans (rev 2).
+> **Scope.** v1 ships **end-to-end binaries for every language in `src/dss-config/sources/`** on **{Windows, Linux, macOS} × {x86_64, ARM64}**, gated by [`artifactProfile`](./06-artifact-profile-plan%20-%20tbd.md). v1.x extends to WASM / shader / transpile / iOS / Android via the new sub-plans (rev 2).
 >
 > **Rev 2 (2026-05-23) — hermetic + 3-IR + lattice-extensions.** Three architectural commitments (per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1):
 > 1. **Hermetic compiler.** Own every byte source-to-binary; no external tool invocations.
-> 2. **HIR → MIR → LIR.** Three IR layers, not one. ([`09-hir-plan`](./09-hir-plan%20-%20tbd.md), [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md))
-> 3. **Core lattice + per-language type extensions.** ([`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md))
+> 2. **HIR → MIR → LIR.** Three IR layers, not one. ([`09-hir-plan`](./09-hir-plan%20-%20ok.md), [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md))
+> 3. **Core lattice + per-language type extensions.** ([`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md))
 >
 > These reframe several gap clusters; see §3 (IR — re-scoped), §5 (codegen — hermetic), §8 (new — FFI), §9 (new — transpile), §10 (new — shader/GPU), §11 (new — WASM).
 
@@ -21,7 +21,7 @@
 
 ### v1 deliverable in one sentence
 
-> A single CLI invocation `dss-code-prime build my-project.dss-project.json` produces a working artifact (`.exe` / `.dll` / `.so` / `.dylib` / `.sql`) on Windows/Linux/macOS × x86_64/ARM64, for any language declared in `src/source-config/languages/`, with diagnostic UX equivalent to modern compilers (`clang`/`tsc`/`rustc`-level errors).
+> A single CLI invocation `dss-code-prime build my-project.dss-project.json` produces a working artifact (`.exe` / `.dll` / `.so` / `.dylib` / `.sql`) on Windows/Linux/macOS × x86_64/ARM64, for any language declared in `src/dss-config/sources/`, with diagnostic UX equivalent to modern compilers (`clang`/`tsc`/`rustc`-level errors).
 
 ### Headline gaps
 
@@ -88,8 +88,8 @@ The §1–§7 sections below enumerate **127 distinct gaps** (numbered for cross
 
 | ID    | Gap | Notes |
 |-------|-----|-------|
-| G-301a | **HIR design.** Language-neutral, structured (if/while/for/switch preserved), typed, attribute side-tables. | ✅ **CLOSED — plan 09 (HIR) COMPLETE (HR1–HR11).** Owned by [`09-hir-plan`](./09-hir-plan%20-%20tbd.md). The pivot layer for transpile + native lowering + shader + WASM. HR1 ✅ 2026-05-26 (arena + node shapes + walker + ids + extension registry) + HR2 ✅ (typed expressions + operator registry + verifier) + HR3 ✅ (structured CF + break/continue & per-kind-arity verifier rules) + HR4 ✅ (declarations + extern surface + FfiMetadata side-table) + HR5 ✅ (attribute side-tables — SourceSpan/Shader/Transpile/Diagnostic + `hir_attrs.hpp` catalog; verifier emits real diagnostic spans) + HR6 ✅ (full verifier — block dead-code, return completeness, Call-arg-vs-FnSig, intrinsic-registered, shader-restriction subverifier; `HirIntrinsicRegistry`) + HR7 ✅ 2026-05-27 (round-trippable `.dsshir` text format — `emitHir`/`parseHir`, verify-on-load) + HR8 ✅ 2026-05-27 (config-driven CST→HIR lowering engine + `hirLowering` schema facet, proven on c-subset) + HR9 ✅ 2026-05-27..28 (toy enriched into a typed language + generic lowering test; arrays un-deferred end-to-end via a config-driven declarator-suffix descriptor + semantic-time constant-length eval; + gap-closure: char/string VALUES, SeqExpr, pointers, ternary) + HR10 ✅ 2026-05-27..28 (tsql-subset lowering — role-explicit SQL extension nodes via a generic `childGathering` config + `ChildLower` enum, flat-expr lowering, coalesced/doubled-delimiter strings, `NULL`/relational-name extensions, `ReferenceRule.hardParents`; same language-agnostic engine); **HR11 ✅ done — plan 09 (HIR) COMPLETE**. |
-| G-301b | **MIR design.** SSA over CFG + structured-CF markers preserved as block annotations. | Owned by [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md). Structured-CF markers let WASM lowering skip Relooper. |
+| G-301a | **HIR design.** Language-neutral, structured (if/while/for/switch preserved), typed, attribute side-tables. | ✅ **CLOSED — plan 09 (HIR) COMPLETE (HR1–HR11).** Owned by [`09-hir-plan`](./09-hir-plan%20-%20ok.md). The pivot layer for transpile + native lowering + shader + WASM. HR1 ✅ 2026-05-26 (arena + node shapes + walker + ids + extension registry) + HR2 ✅ (typed expressions + operator registry + verifier) + HR3 ✅ (structured CF + break/continue & per-kind-arity verifier rules) + HR4 ✅ (declarations + extern surface + FfiMetadata side-table) + HR5 ✅ (attribute side-tables — SourceSpan/Shader/Transpile/Diagnostic + `hir_attrs.hpp` catalog; verifier emits real diagnostic spans) + HR6 ✅ (full verifier — block dead-code, return completeness, Call-arg-vs-FnSig, intrinsic-registered, shader-restriction subverifier; `HirIntrinsicRegistry`) + HR7 ✅ 2026-05-27 (round-trippable `.dsshir` text format — `emitHir`/`parseHir`, verify-on-load) + HR8 ✅ 2026-05-27 (config-driven CST→HIR lowering engine + `hirLowering` schema facet, proven on c-subset) + HR9 ✅ 2026-05-27..28 (toy enriched into a typed language + generic lowering test; arrays un-deferred end-to-end via a config-driven declarator-suffix descriptor + semantic-time constant-length eval; + gap-closure: char/string VALUES, SeqExpr, pointers, ternary) + HR10 ✅ 2026-05-27..28 (tsql-subset lowering — role-explicit SQL extension nodes via a generic `childGathering` config + `ChildLower` enum, flat-expr lowering, coalesced/doubled-delimiter strings, `NULL`/relational-name extensions, `ReferenceRule.hardParents`; same language-agnostic engine); **HR11 ✅ done — plan 09 (HIR) COMPLETE**. |
+| G-301b | **MIR design.** SSA over CFG + structured-CF markers preserved as block annotations. | Owned by [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md). Structured-CF markers let WASM lowering skip Relooper. |
 | G-301c | **LIR design.** Per-target ISA, virtual + physical registers, calling-conv lowered, stack frame materialized. | Owned by `12-mir-lir-plan` (same sub-plan, second half). Consumed by `13-assembler-plan`. |
 | G-302 | IR text formats `.dsshir` / `.dssir` / `.dsslir` for debugging + golden test fixtures. | Three formats, one per layer. All round-trippable. Binary cache forms post-v1. 🟡 `.dsshir` ✅ 2026-05-27 (HR7, byte-identical round-trip + verify-on-load + golden corpus); `.dssir` / `.dsslir` pending (`12-mir-lir-plan` ML4 / ML8). |
 | G-303 | Per-layer verifiers. HIR verifier (typed expr + structured CF + shader restrictions). MIR verifier (SSA dominance + structured-CF markers consistent). LIR verifier (no virtual regs after regalloc + calling-conv shape). | Fail-loud per `H_*` / `I_*` / `L_*` namespaces. |
@@ -301,9 +301,9 @@ This is the **largest single chunk of work** in v1.
 | G-807 | C name mangling (per-platform underscoring); Itanium + MSVC demangling reserved post-v1. | FF4. |
 | G-808 | `ingest()` entry point + `HirAttribute<FfiMetadata>` populated on extern decls. | FF5. |
 | G-809 | libc smoke: `extern printf(...)` end-to-end on all 6 (OS × arch). | FF6. |
-| G-810 | (post-v1) C preprocessor for header mode (`#include` + function-like macros). | Reserved. v1 uses pre-reduced headers in `src/source-config/ffi-headers/`. |
+| G-810 | (post-v1) C preprocessor for header mode (`#include` + function-like macros). | Reserved. v1 uses pre-reduced headers in `src/dss-config/ffi-headers/`. |
 | G-811 | (post-v1) Itanium + MSVC C++ demanglers. | FF7 / FF8. |
-| G-812 | Pre-reduced headers for {libc, libSystem, msvcrt, kernel32} on each platform. | Ships under `src/source-config/ffi-headers/`. |
+| G-812 | Pre-reduced headers for {libc, libSystem, msvcrt, kernel32} on each platform. | Ships under `src/dss-config/ffi-headers/`. |
 | G-813 | Symbol-existence pin: CI reads the actual platform libc binary and asserts every header-declared symbol is present. | Catches drift between pre-reduced headers and reality. |
 
 ---
@@ -452,8 +452,8 @@ New gap clusters from the universal-compiler decisions:
 
 | Cluster | Section | Owning sub-plan |
 |---|---|---|
-| HIR + MIR + LIR (replaces single-SSA G-301) | §3 G-301a/b/c, G-309, G-310 | [`09-hir-plan`](./09-hir-plan%20-%20tbd.md), [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) |
-| Core type lattice + extensions | §3 G-307 | [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20tbd.md) |
+| HIR + MIR + LIR (replaces single-SSA G-301) | §3 G-301a/b/c, G-309, G-310 | [`09-hir-plan`](./09-hir-plan%20-%20ok.md), [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) |
+| Core type lattice + extensions | §3 G-307 | [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md) |
 | In-tree linker (replaces system-linker G-540..G-543) | §5.5 G-560..G-571 | [`14-linker-plan`](./14-linker-plan%20-%20tbd.md), [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) |
 | In-tree codesign + publish | §5.6 G-590..G-597 | [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) |
 | FFI ingestion | §8 G-801..G-813 | [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) |

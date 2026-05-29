@@ -92,6 +92,13 @@ public:
         // `f(args)` or `a[i]`; the walker parses `bodyRule` (when
         // valid) until the `endsAt` closer.
         std::optional<GroupedPostfix>  grouped{};
+        // D5.1: postfix "follower" — present ⇒ the operator is followed by
+        // exactly one occurrence of `followerRule` (e.g. `obj.field` is
+        // `DotOp` + a `memberFollower` shape wrapping an `Identifier`). No
+        // closer needed; the rule's own shape terminates the body. Mutually
+        // exclusive with `grouped` (loader rejects both being set). Generic:
+        // any language can use this for `op <rule-shape>` postfix forms.
+        std::optional<RuleId>          followerRule{};
         // Ternary (mixfix) only: the separator token between the middle and
         // right operands (C's `:`). Absent for non-ternary entries.
         std::optional<SchemaTokenId>   ternaryMiddle{};

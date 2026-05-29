@@ -2,11 +2,11 @@
 
 #include "analysis/compilation_unit/import_resolver.hpp"
 #include "analysis/syntactic/parser.hpp"
+#include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "tokenizer/tokenizer.hpp"
 
-#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -53,8 +53,7 @@ void reportDriver(DiagnosticReporter& rep,
 // ── CompilationUnit::nextId ───────────────────────────────────────────────
 // Process-global monotonic counter starting at 1; 0 is InvalidCompilationUnit.
 CompilationUnitId CompilationUnit::nextId() noexcept {
-    static std::atomic<std::uint32_t> counter{1};
-    return CompilationUnitId{counter.fetch_add(1, std::memory_order_relaxed)};
+    return substrate::mintMonotonicId<CompilationUnitId>();
 }
 
 // ── CompilationUnit lifecycle ─────────────────────────────────────────────
