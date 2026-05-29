@@ -1,5 +1,6 @@
 #include "lir/lir_regalloc.hpp"
 
+#include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 
 #include <algorithm>
@@ -7,15 +8,21 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace dss {
 
 namespace {
 
+// Producer-side invariants (factory misuse). Genuine programmer
+// errors — substrate-tier consumers route data-driven failures
+// through `DiagnosticReporter` instead.
 [[noreturn]] void regallocFatal(char const* what) {
     std::fputs("dss::LirRegAlloc fatal: ", stderr);
     std::fputs(what, stderr);
@@ -23,29 +30,41 @@ namespace {
     std::abort();
 }
 
-// Per-class register lists. Each class holds two sub-lists: registers
-// classified as caller-saved by the active calling convention, and the
-// rest (callee-saved or unclassified — treated as safe across calls).
-// Both lists are seeded in target-declared ordinal order and used as
-// LIFO stacks (pop/push at the back) — this is O(1) and the order is
-// fully deterministic, which is all the allocator requires.
+void report(DiagnosticReporter& reporter, DiagnosticCode code,
+            DiagnosticSeverity severity, std::string actual) {
+    ParseDiagnostic d;
+    d.code     = code;
+    d.severity = severity;
+    d.actual   = std::move(actual);
+    reporter.report(std::move(d));
+}
+
+// Per-class register lists. The naming is conservative: `calleeSaved`
+// here means "treated as call-safe for allocation" — populated with
+// every register in the cc's `allocatable` set that is NOT in
+// `cc.callerSaved`. A target that declares an arg-only or return-only
+// register without also placing it in `callerSaved` will land that
+// register in this bucket; downstream cross-call ranges will use it.
+// The conservatism assumes any register a producer deliberately omits
+// from `callerSaved` is safe to keep live across a call.
 struct RegList {
-    std::vector<std::uint16_t> calleeSaved;  // safe across calls
-    std::vector<std::uint16_t> callerSaved;  // clobbered by call
+    std::vector<std::uint16_t> calleeSaved;
+    std::vector<std::uint16_t> callerSaved;
 };
 
-// One free list per `LirRegClass`. Indexed by static_cast<int>(class).
-// The array bound MUST match the enum's cardinality — locked by
-// `static_assert` so adding a new class (e.g. predicates for SVE) is a
-// compile error here instead of a silent skip in buildFreeLists.
+// kLirRegClassCount derives from `LirRegClass::Flags + 1` — extending
+// the enum past `Flags` auto-widens the constant. The literal lock
+// (`static_assert(kLirRegClassCount == 5u)`) pins the count so adding
+// a tail entry (e.g. predicates for SVE) trips here and forces an
+// audit of `buildFreeLists`, the bucket layout, and downstream
+// consumers.
 constexpr std::size_t kLirRegClassCount =
     static_cast<std::size_t>(LirRegClass::Flags) + 1u;
 using FreeListsByClass = std::array<RegList, kLirRegClassCount>;
 static_assert(kLirRegClassCount == 5u,
               "FreeListsByClass size out of sync with LirRegClass enum; "
-              "extend kLirRegClassCount when adding a new class");
+              "audit buildFreeLists when adding a new class");
 
-// Pop the top of `regs`; std::nullopt when empty.
 [[nodiscard]] std::optional<std::uint16_t>
 popReg(std::vector<std::uint16_t>& regs) {
     if (regs.empty()) return std::nullopt;
@@ -54,25 +73,11 @@ popReg(std::vector<std::uint16_t>& regs) {
     return r;
 }
 
-// Build the per-class register lists from the target schema +
-// chosen calling convention. Only registers that appear in the
-// calling convention's saved-sets, arg-passing sets, or return sets
-// are allocatable — registers absent from all of those (e.g. `rsp`,
-// `rflags`) are RESERVED and silently kept out of the pools.
-// Allocating `rsp` as a GPR would clobber the stack pointer mid-
-// function; this guard closes that fatal silent-failure path.
-//
-// Sub-registers (entries with non-empty `subOf`) are excluded — only
-// parent registers are allocated. Downstream encode is expected to
-// pick the appropriate sub-width based on the result type.
 [[nodiscard]] FreeListsByClass
 buildFreeLists(TargetSchema const&            schema,
                TargetCallingConvention const& cc) {
     FreeListsByClass out{};
 
-    // Union of every register name participating in the cc: saved-
-    // sets + arg-passing + return. Anything outside this set is
-    // reserved (RSP, RFLAGS, etc.).
     std::unordered_set<std::string_view> allocatable;
     auto absorb = [&](std::vector<std::string> const& names) {
         for (auto const& n : names) allocatable.insert(n);
@@ -96,11 +101,8 @@ buildFreeLists(TargetSchema const&            schema,
         if (!allocatable.contains(info.name)) continue;  // reserved (rsp / rflags / …)
         std::size_t const classIdx = static_cast<std::size_t>(info.regClass);
         if (classIdx >= out.size()) {
-            // Unreachable per `static_assert(kLirRegClassCount == 5)` +
-            // the TargetRegClass↔LirRegClass synchrony assert. Fatal
-            // so a future enum-cardinality drift is loud.
             regallocFatal("buildFreeLists: TargetRegClass out of range — "
-                          "extend kLirRegClassCount");
+                          "audit kLirRegClassCount");
         }
         if (callerSet.contains(info.name)) {
             out[classIdx].callerSaved.push_back(i);
@@ -111,14 +113,11 @@ buildFreeLists(TargetSchema const&            schema,
     return out;
 }
 
-// Scan the function for call-shaped opcodes, recording their early-
-// position. Call detection is target-agnostic: walks
-// `schema.opcodeInfo(op).isCall` rather than matching mnemonic
-// strings. For non-register-machine ABIs (operand-stack, result-id)
-// the schema may declare no opcodes with `isCall == true`, in which
-// case the returned vector is empty and `rangeCrossesCall` returns
-// false for every range — the correct behavior because those ABIs
-// don't have a caller-saved register clobber model.
+// Returns the EARLY slot (`pos`) of each call instruction, scaled to
+// liveness's 2-slot-per-inst convention (see lir_liveness.cpp). The
+// `pos += 2u` arithmetic is coupled to `rangeCrossesCall`'s `p + 1`
+// (= late slot) test AND to liveness's slot scale — these three must
+// move together.
 [[nodiscard]] std::vector<std::uint32_t>
 collectCallPositions(Lir const& lir, TargetSchema const& schema,
                      LirFuncLiveness const& flow) {
@@ -130,7 +129,7 @@ collectCallPositions(Lir const& lir, TargetSchema const& schema,
             LirInstId const inst = lir.blockInstAt(b, i);
             auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
             if (info != nullptr && info->isCall) {
-                out.push_back(pos);  // early-slot of the call inst
+                out.push_back(pos);
             }
             pos += 2u;
         }
@@ -143,29 +142,23 @@ collectCallPositions(Lir const& lir, TargetSchema const& schema,
 // a call argument has `range.end == call.early + 1 == call.late`
 // (the use is at `call.early`, range end is `lastUse + 1`); that
 // case is NOT a crossing because the value is consumed by the call
-// itself. The fix below was previously `*lo < r.end` which fired for
-// call-args-only vregs and spuriously forced them to callee-saved.
+// itself.
 [[nodiscard]] bool
 rangeCrossesCall(LirLiveRange const& r,
                  std::vector<std::uint32_t> const& callPositions) {
     auto lo = std::lower_bound(callPositions.begin(), callPositions.end(),
                                r.start);
     if (lo == callPositions.end()) return false;
-    // Call at position p occupies [p, p+2). Range crosses iff it is
-    // still live AT OR AFTER p+2 — i.e. r.end > p + 1 (the late slot).
     return *lo + 1u < r.end;
 }
 
-// Active-list entry: a vreg currently holding a physical reg.
 struct ActiveEntry {
     LirLiveRange  range;
     LirRegClass   cls;
     std::uint16_t physOrdinal;
-    bool          isCalleeSaved;  // for free-list return
+    bool          isCalleeSaved;
 };
 
-// Expire active ranges whose end ≤ currentStart. Return their phys
-// regs to the appropriate free list.
 void expireActive(std::vector<ActiveEntry>& active,
                   FreeListsByClass&         free,
                   std::uint32_t             currentStart) {
@@ -183,10 +176,6 @@ void expireActive(std::vector<ActiveEntry>& active,
     }
 }
 
-// Try to obtain a physical register for `r` of class `cls`. When the
-// range crosses a call, only callee-saved regs are eligible. Returns
-// (ordinal, is_callee_saved) or nullopt when no compatible reg is
-// free.
 struct AllocPick {
     std::uint16_t ordinal;
     bool          isCalleeSaved;
@@ -198,18 +187,13 @@ tryAllocate(FreeListsByClass& free, LirRegClass cls, bool crossesCall) {
     if (auto r = popReg(bucket.calleeSaved); r.has_value()) {
         return AllocPick{*r, true};
     }
-    if (crossesCall) return std::nullopt;  // can't use caller-saved
+    if (crossesCall) return std::nullopt;
     if (auto r = popReg(bucket.callerSaved); r.has_value()) {
         return AllocPick{*r, false};
     }
     return std::nullopt;
 }
 
-// Spill-at-interval: pick the active range of the same class with
-// the LATEST end. When `requireCalleeSaved` is true, only callee-
-// saved entries are eligible (used when the incoming range crosses
-// a call and would otherwise gain nothing from evicting a caller-
-// saved holder). Returns iterator-into-active or active.end().
 [[nodiscard]] std::vector<ActiveEntry>::iterator
 findSpillCandidate(std::vector<ActiveEntry>& active, LirRegClass cls,
                    bool requireCalleeSaved) {
@@ -224,6 +208,31 @@ findSpillCandidate(std::vector<ActiveEntry>& active, LirRegClass cls,
         }
     }
     return best;
+}
+
+// Per-function spill bookkeeping. Aggregated and emitted as a single
+// `R_SpillSummary` note at end-of-function so the reporter's per-code
+// cap (50) cannot silently drop notes on highly-pressured functions
+// (the per-vreg-note design would lose data past the 50th spill with
+// no visible signal).
+struct SpillStats {
+    std::uint32_t pressure       = 0;
+    std::uint32_t crossCallExhaustion = 0;
+};
+
+void emitSpillSummary(DiagnosticReporter& reporter, LirFuncId fn,
+                      SpillStats const& s) {
+    if (s.pressure == 0 && s.crossCallExhaustion == 0) return;
+    DiagnosticCode const code =
+        (s.crossCallExhaustion > 0)
+            ? DiagnosticCode::R_SpilledDueToCrossCallExhaustion
+            : DiagnosticCode::R_SpilledDueToPressure;
+    report(reporter, code, DiagnosticSeverity::Info,
+           std::format("func {} spilled {} vreg(s) ({} pressure, "
+                       "{} cross-call exhaustion)",
+                       fn.v,
+                       s.pressure + s.crossCallExhaustion,
+                       s.pressure, s.crossCallExhaustion));
 }
 
 } // namespace
@@ -241,23 +250,21 @@ LirRegAssignment LirRegAssignment::makePhys(LirReg vreg, LirReg phys) {
         regallocFatal("makePhys: class mismatch between vreg and physReg");
     }
     LirRegAssignment a{};
-    a.vreg      = vreg;
-    a.physReg   = phys;
-    a.spillSlot = UINT32_MAX;
+    a.vreg       = vreg;
+    a.assignment = phys;
     return a;
 }
 
-LirRegAssignment LirRegAssignment::makeSpill(LirReg vreg, std::uint32_t slot) {
+LirRegAssignment LirRegAssignment::makeSpill(LirReg vreg, LirSpillSlot slot) {
     if (vreg.isPhysical != 0) {
         regallocFatal("makeSpill: input vreg must be virtual");
     }
-    if (slot == UINT32_MAX) {
-        regallocFatal("makeSpill: slot must not be UINT32_MAX sentinel");
+    if (!slot.valid()) {
+        regallocFatal("makeSpill: slot must be valid (v != 0)");
     }
     LirRegAssignment a{};
-    a.vreg      = vreg;
-    a.physReg   = InvalidLirReg;
-    a.spillSlot = slot;
+    a.vreg       = vreg;
+    a.assignment = slot;
     return a;
 }
 
@@ -265,10 +272,19 @@ LirRegAssignment LirRegAssignment::makeSpill(LirReg vreg, std::uint32_t slot) {
 
 LirRegAssignment const*
 LirFuncAllocation::forVReg(std::uint32_t vregId) const noexcept {
+    // id 0 is the sentinel slot — never a valid lookup target.
+    // Out-of-range ids return nullptr rather than UB.
     if (vregId == 0 || vregId >= assignments.size()) return nullptr;
     auto const& a = assignments[vregId];
     if (a.vreg.id == 0) return nullptr;  // unfilled slot
     return &a;
+}
+
+bool LirAllocation::ok() const noexcept {
+    for (auto const& f : perFunc) {
+        if (!f.ok) return false;
+    }
+    return true;
 }
 
 LirFuncAllocation const* LirAllocation::forFunc(LirFuncId fn) const noexcept {
@@ -280,32 +296,43 @@ LirFuncAllocation const* LirAllocation::forFunc(LirFuncId fn) const noexcept {
 
 // ── allocate ───────────────────────────────────────────────────────
 
-LirFuncAllocation
-allocateFuncRegisters(Lir const&             lir,
-                      TargetSchema const&    schema,
-                      LirFuncLiveness const& flow) {
+namespace {
+
+// Per-function core. Wraps the linear-scan loop with `ok` derivation
+// via reporter delta + emits the per-function spill summary at the
+// end. `schemaOk` is the pre-checked schema-wide validity (≥1 cc) —
+// false short-circuits to an empty result with `ok = false`.
+LirFuncAllocation allocateOneFunc(Lir const& lir,
+                                  TargetSchema const& schema,
+                                  LirFuncLiveness const& flow,
+                                  DiagnosticReporter& reporter,
+                                  bool schemaOk) {
     LirFuncAllocation out;
     out.fn = flow.fn;
-
-    // Always use calling-convention index 0. Per-function cc
-    // selection requires functions to carry an explicit cc attribute;
-    // not yet implemented. Reordering CCs in the target JSON will
-    // change every function's allocation.
-    if (schema.callingConventionCount() == 0) {
-        regallocFatal("allocateFuncRegisters: target schema declares no "
-                      "calling conventions");
+    auto const baseline = reporter.errorCount();
+    if (!schemaOk) {
+        // Schema-wide error already reported by the caller; mark this
+        // func failed without re-emitting (avoids per-func duplication
+        // that the reporter's dedup-window would silently swallow).
+        out.ok = false;
+        return out;
     }
+
     out.callingConventionIndex = 0;
     auto const* cc = schema.callingConvention(0);
-    if (cc == nullptr) regallocFatal("allocateFuncRegisters: cc lookup failed");
+    if (cc == nullptr) {
+        // Should be unreachable given schemaOk; defensive only.
+        report(reporter, DiagnosticCode::R_CallingConventionLookupFailed,
+               DiagnosticSeverity::Error,
+               "calling convention index 0 lookup returned nullptr");
+        out.ok = false;
+        return out;
+    }
 
     FreeListsByClass free = buildFreeLists(schema, *cc);
     std::vector<std::uint32_t> const callPositions =
         collectCallPositions(lir, schema, flow);
 
-    // Pre-size the assignments vector to cover every vreg id observed
-    // in the flow. The cycle-1 substrate emits ranges keyed by vreg
-    // id; we size to one past the largest id encountered.
     std::uint32_t maxVRegId = 0;
     for (auto const& r : flow.ranges) {
         if (r.vreg.id > maxVRegId) maxVRegId = r.vreg.id;
@@ -315,19 +342,27 @@ allocateFuncRegisters(Lir const&             lir,
     std::vector<ActiveEntry> active;
     active.reserve(flow.ranges.size());
 
-    // Linear-scan over ranges sorted by start (the substrate
-    // guarantees this).
+    SpillStats spills;
+    // Slots start at 1; slot 0 is the LirSpillSlot invalid sentinel.
+    std::uint32_t nextSlotV = 1;
+
+    auto mintSlot = [&]() -> LirSpillSlot {
+        LirSpillSlot const s{nextSlotV++};
+        ++out.numSpillSlots;
+        return s;
+    };
+
     for (auto const& r : flow.ranges) {
-        if (r.vreg.id == 0) continue;  // sentinel; substrate skips these too
+        if (r.vreg.id == 0) continue;
         LirRegClass const cls = r.vreg.regClass();
         if (cls == LirRegClass::None) {
-            // Substrate violation: a None-class vreg reached liveness.
-            // The LirVerifier (cycle 3e rule 3) catches this; if we see
-            // it here, the verifier didn't run or has a hole. Loud
-            // failure now is better than a silent unassigned vreg in
-            // the rewrite pass.
-            regallocFatal("allocateFuncRegisters: vreg has LirRegClass::None "
-                          "— run LirVerifier before allocator");
+            report(reporter, DiagnosticCode::R_VRegHasNoClass,
+                   DiagnosticSeverity::Error,
+                   std::format("func {} vreg id {} has LirRegClass::None — "
+                               "run LirVerifier before allocator",
+                               flow.fn.v,
+                               static_cast<std::uint32_t>(r.vreg.id)));
+            continue;
         }
 
         expireActive(active, free, r.start);
@@ -342,28 +377,32 @@ allocateFuncRegisters(Lir const&             lir,
             continue;
         }
 
-        // Spill heuristic: pick the same-class active range with the
-        // latest end. If that end is later than r's end, evict it and
-        // hand r the freed register; otherwise spill r itself. When r
-        // crosses a call, the candidate must also be callee-saved —
-        // evicting a caller-saved holder gains nothing for r since r
-        // would not be allowed to reuse the caller-saved slot anyway.
+        // Invariant: every spill emits exactly one slot increment via
+        // `mintSlot` and contributes to one `SpillStats` counter.
         auto const spillIt = findSpillCandidate(active, cls, crossesCall);
         bool const evictCandidate =
             spillIt != active.end() && spillIt->range.end > r.end;
 
         if (!evictCandidate) {
-            std::uint32_t const slot = out.numSpillSlots++;
+            // Spill r itself.
+            LirSpillSlot const slot = mintSlot();
             out.assignments[r.vreg.id] =
                 LirRegAssignment::makeSpill(r.vreg, slot);
+            if (crossesCall) ++spills.crossCallExhaustion;
+            else             ++spills.pressure;
             continue;
         }
 
         // Evict spillIt: its vreg goes to a new spill slot; r gets its
-        // physical register.
-        std::uint32_t const slot = out.numSpillSlots++;
+        // physical register. The evicted range's spill cause is its
+        // OWN crossesCall status, not r's — they may differ.
+        LirSpillSlot const slot = mintSlot();
         out.assignments[spillIt->range.vreg.id] =
             LirRegAssignment::makeSpill(spillIt->range.vreg, slot);
+        bool const evictedCrossesCall =
+            rangeCrossesCall(spillIt->range, callPositions);
+        if (evictedCrossesCall) ++spills.crossCallExhaustion;
+        else                    ++spills.pressure;
 
         std::uint16_t const freedOrdinal = spillIt->physOrdinal;
         bool const freedIsCalleeSaved    = spillIt->isCalleeSaved;
@@ -375,17 +414,46 @@ allocateFuncRegisters(Lir const&             lir,
         active.push_back({r, cls, freedOrdinal, freedIsCalleeSaved});
     }
 
+    emitSpillSummary(reporter, flow.fn, spills);
+    out.ok = (reporter.errorCount() == baseline);
     return out;
+}
+
+} // namespace
+
+LirFuncAllocation
+allocateFuncRegisters(Lir const&             lir,
+                      TargetSchema const&    schema,
+                      LirFuncLiveness const& flow,
+                      DiagnosticReporter&    reporter) {
+    bool const schemaOk = (schema.callingConventionCount() > 0);
+    if (!schemaOk) {
+        report(reporter, DiagnosticCode::R_NoCallingConventions,
+               DiagnosticSeverity::Error,
+               "target schema declares no calling conventions");
+    }
+    return allocateOneFunc(lir, schema, flow, reporter, schemaOk);
 }
 
 LirAllocation
 allocateRegisters(Lir const&          lir,
                   TargetSchema const& schema,
-                  LirLiveness const&  liveness) {
+                  LirLiveness const&  liveness,
+                  DiagnosticReporter& reporter) {
     LirAllocation out;
+    bool const schemaOk = (schema.callingConventionCount() > 0);
+    if (!schemaOk) {
+        // Emit ONCE at module level rather than re-emitting per-
+        // function (which would hit the reporter's dedup window after
+        // the 4th identical message).
+        report(reporter, DiagnosticCode::R_NoCallingConventions,
+               DiagnosticSeverity::Error,
+               "target schema declares no calling conventions");
+    }
     out.perFunc.reserve(liveness.perFunc.size());
     for (auto const& flow : liveness.perFunc) {
-        out.perFunc.push_back(allocateFuncRegisters(lir, schema, flow));
+        out.perFunc.push_back(
+            allocateOneFunc(lir, schema, flow, reporter, schemaOk));
     }
     return out;
 }

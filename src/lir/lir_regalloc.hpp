@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/diagnostic_reporter.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
@@ -8,6 +9,7 @@
 #include "lir/lir_reg.hpp"
 
 #include <cstdint>
+#include <variant>
 #include <vector>
 
 // Linear-scan register allocator over the `LirLiveness` substrate.
@@ -22,25 +24,29 @@
 // no register is free for the current range, pick the same-class
 // active range with the latest `end`; if that end is later than the
 // current range's end, evict it and reuse its register; otherwise
-// spill the current range. (Wimmer-Franz interval splitting is NOT
-// implemented — see "sub-interval splitting" note below.)
+// spill the current range.
 //
 // **Call-aware constraint**: a range that survives past the late
 // slot of a call instruction MUST NOT be assigned to a caller-saved
 // physical register (per the active `TargetCallingConvention`). The
-// allocator preserves the constraint by preferring callee-saved
-// regs for call-crossing ranges and falling back to spilling when
-// callee-saved is exhausted. Call detection is target-agnostic via
-// `TargetOpcodeInfo::isCall`. Sub-interval splitting would refine
-// this — splitting a range at the call site lets the across-call
-// portion go to callee-saved while the live-before / live-after
-// portions use any class. Not implemented; flat-interval allocation
-// is conservative but always correct.
+// allocator's tryAllocate always tries the callee-saved partition
+// first; for ranges that do NOT cross a call it then falls back to
+// caller-saved; for cross-call ranges it falls back directly to
+// spilling. Call detection is target-agnostic via
+// `TargetOpcodeInfo::isCall`.
 //
 // **Reserved registers**: registers that appear in no calling-
 // convention saved/arg/return set (e.g. `rsp`, `rflags`) are filtered
 // out of the allocator's pool. Allocating `rsp` would clobber the
 // stack pointer mid-function — fatal at runtime.
+//
+// **Diagnostics**: the allocator threads a `DiagnosticReporter&` and
+// emits `R_*` codes for schema-config errors (no calling conventions
+// declared, missing class on a vreg) plus one `R_SpillSummary` Info
+// note per function with non-zero spills. Per-spill granularity is
+// captured in `LirFuncAllocation::numSpillSlots` — the reporter is
+// not used as a streaming spill log (the per-code cap = 50 in the
+// reporter would silently drop notes past the 50th).
 //
 // **Target-blind**: depends only on `TargetSchema.registers()` +
 // `callingConventions()` + per-opcode `isCall` flag. No mnemonic
@@ -50,46 +56,66 @@
 
 namespace dss {
 
-// Per-vreg assignment. Exactly one of `physReg.valid()` (assigned a
-// physical register) OR `spillSlot != UINT32_MAX` (assigned a stack
-// slot) holds for a well-formed assignment. Default-constructed
-// slots (vreg.id == 0) are the unfilled sentinel.
+// Per-vreg assignment. The `assignment` payload is a tagged union:
+//   * `std::get<LirReg>(assignment)` — assigned a physical register
+//   * `std::get<LirSpillSlot>(assignment)` — assigned a stack slot
+// Use `isSpilled()` to discriminate, then `physReg()` or `spillSlot()`
+// to read the active arm. Default-constructed slots (`vreg.id == 0`)
+// are the unfilled sentinel — used to pre-size the per-vreg vector
+// and recognized by `LirFuncAllocation::forVReg` via `vreg.id == 0`
+// alone (the assignment payload is irrelevant for the sentinel check).
+// The variant's default arm is `LirReg{}`; a downstream consumer must
+// NOT use `isSpilled() == false` as a "has-real-assignment" probe.
 //
 // Preconditions (process aborts on violation via the factories):
-//   makePhys:  vreg.isPhysical == 0; phys.isPhysical == 1;
-//              vreg.regClass() == phys.regClass()
-//   makeSpill: vreg.isPhysical == 0; slot != UINT32_MAX
+//   makePhys:    vreg.isPhysical == 0; phys.isPhysical == 1;
+//                vreg.regClass() == phys.regClass()
+//   makeSpill:   vreg.isPhysical == 0; slot.valid() (i.e. slot.v != 0)
+//
+// Accessor preconditions (`noexcept` — bad-arm access aborts via
+// std::bad_variant_access propagating through noexcept → terminate):
+//   physReg():   !isSpilled()
+//   spillSlot(): isSpilled()
 struct DSS_EXPORT LirRegAssignment {
-    LirReg        vreg{};          // input virtual register
-    LirReg        physReg{};       // output physical register (InvalidLirReg if spilled)
-    std::uint32_t spillSlot = UINT32_MAX;
+    LirReg                              vreg{};       // input virtual register
+    std::variant<LirReg, LirSpillSlot>  assignment{}; // phys reg OR spill slot
 
     [[nodiscard]] bool isSpilled() const noexcept {
-        return spillSlot != UINT32_MAX;
+        return std::holds_alternative<LirSpillSlot>(assignment);
+    }
+    [[nodiscard]] LirReg physReg() const noexcept {
+        return std::get<LirReg>(assignment);
+    }
+    [[nodiscard]] LirSpillSlot spillSlot() const noexcept {
+        return std::get<LirSpillSlot>(assignment);
     }
 
     [[nodiscard]] static LirRegAssignment makePhys(LirReg vreg, LirReg phys);
-    [[nodiscard]] static LirRegAssignment makeSpill(LirReg vreg, std::uint32_t slot);
+    [[nodiscard]] static LirRegAssignment makeSpill(LirReg vreg, LirSpillSlot slot);
 };
 
 // Per-function allocation result. `assignments[i]` is the assignment
 // for vreg id `i` (slot 0 is the default-constructed sentinel — every
 // well-formed vreg has id ≥ 1; the substrate guarantees dense vreg
 // ids from 1 so the vector indexed by id has no holes beyond the
-// sentinel). `numSpillSlots` is the total stack slot count needed for
-// this function (one slot per spilled vreg — coalescing not yet
-// implemented).
+// sentinel). `numSpillSlots` is the total stack slot count (one slot
+// per spilled vreg — coalescing not yet implemented).
+//
+// `ok` is set by `allocateFuncRegisters` from the per-function delta
+// in `reporter.errorCount()` (false iff this function emitted any
+// error-severity diagnostic). Schema-config errors short-circuit
+// allocation: the result carries empty `assignments` and `ok = false`.
 struct DSS_EXPORT LirFuncAllocation {
     LirFuncId                     fn{};
     std::vector<LirRegAssignment> assignments;
     std::uint32_t                 numSpillSlots = 0;
+    bool                          ok            = true;
     // Cached index of the calling convention used to drive this
     // allocation. The downstream prologue/epilogue emitter reads this
-    // so it doesn't re-derive the cc choice. Currently always 0 —
-    // per-function cc selection requires functions to carry an
-    // explicit cc attribute and is not yet implemented; reordering
+    // so it doesn't re-derive the cc choice. Hazard: reordering
     // calling-convention entries in a target JSON file will change
-    // every function's allocation here.
+    // every function's allocation here unless callers also re-pin by
+    // name.
     std::uint16_t                 callingConventionIndex = 0;
 
     // Find the assignment for the given vreg id, or nullptr if none.
@@ -98,29 +124,45 @@ struct DSS_EXPORT LirFuncAllocation {
 };
 
 // Module-level wrapper. Per-function entries in the same order as
-// `lir.funcAt(i)`.
+// `lir.funcAt(i)`. `ok()` is a derived property — true iff every
+// per-function allocation succeeded. Computed on access rather than
+// stored so the value cannot drift from the per-function results.
 struct DSS_EXPORT LirAllocation {
     std::vector<LirFuncAllocation> perFunc;
 
+    [[nodiscard]] bool ok() const noexcept;
     [[nodiscard]] LirFuncAllocation const* forFunc(LirFuncId fn) const noexcept;
 };
 
 // Allocate physical registers for every function in `lir`. Reads
 // `schema.registers()` + `schema.callingConventions()` and the
-// liveness side-tables. Returns a freshly-allocated per-function
-// side-table; the caller owns the result. The LIR module is NOT
-// mutated — a separate rewrite pass + spill-load/store insertion
-// consumes the side-table.
+// liveness side-tables. Schema-wide validity (≥1 calling convention
+// declared) is checked ONCE at the top — failure short-circuits the
+// per-function loop, and every `LirFuncAllocation` carries the
+// schema-level error visible via its own `ok` flag.
+//
+// Producer-side errors (None-class vreg slipping past LirVerifier)
+// are emitted via the reporter as `R_*` Error diagnostics; each
+// affected function's `ok` flips to false. Spill decisions emit one
+// `R_SpillSummary` Info note per function with non-zero spills —
+// granular per-vreg spill data lives in `numSpillSlots` rather than
+// in the reporter stream (which has a per-code cap).
+//
+// The LIR module is NOT mutated.
 [[nodiscard]] DSS_EXPORT LirAllocation
 allocateRegisters(Lir const&          lir,
                   TargetSchema const& schema,
-                  LirLiveness const&  liveness);
+                  LirLiveness const&  liveness,
+                  DiagnosticReporter& reporter);
 
 // Allocate for a single function. The caller must supply the matching
-// `LirFuncLiveness` produced over the same `lir`.
+// `LirFuncLiveness` produced over the same `lir`. The schema-wide
+// validity check (≥1 calling convention) is repeated here for callers
+// that bypass `allocateRegisters`.
 [[nodiscard]] DSS_EXPORT LirFuncAllocation
 allocateFuncRegisters(Lir const&             lir,
                       TargetSchema const&    schema,
-                      LirFuncLiveness const& flow);
+                      LirFuncLiveness const& flow,
+                      DiagnosticReporter&    reporter);
 
 } // namespace dss

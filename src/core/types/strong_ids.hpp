@@ -134,6 +134,15 @@ DSS_ARENA_ID(LirInstId);
 DSS_ARENA_ID(LirBlockId);
 DSS_ARENA_ID(LirFuncId);
 
+// `LirSpillSlot` is the strong-typed stack-slot id minted by the
+// register allocator's spill path (ML6). A bare `std::uint32_t` would
+// alias every other count/ordinal in scope; the strong id makes the
+// variant arm of `LirRegAssignment` nominally distinct from physical
+// register ordinals. Allocator counts spills via a plain `uint32_t`
+// counter (a cardinality, not an identity) and mints `LirSpillSlot{n}`
+// values from it.
+DSS_STRONG_ID(LirSpillSlot);
+
 #undef DSS_STRONG_ID
 #undef DSS_ARENA_ID
 
@@ -164,6 +173,7 @@ inline constexpr LirModuleId     InvalidLirModule{};
 inline constexpr LirInstId       InvalidLirInst{};
 inline constexpr LirBlockId      InvalidLirBlock{};
 inline constexpr LirFuncId       InvalidLirFunc{};
+inline constexpr LirSpillSlot    InvalidLirSpillSlot{};
 inline constexpr TargetSchemaId  InvalidTargetSchema{};
 inline constexpr MirFuncId       InvalidMirFunc{};
 inline constexpr MirGlobalId     InvalidMirGlobal{};
