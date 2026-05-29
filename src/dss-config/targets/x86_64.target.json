@@ -355,6 +355,20 @@
       "isTerminator": false, "hasSideEffects": true, "isCall": true,
       "minOperands": 0, "maxOperands": 255,
       "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Spill reload pseudo-op. Payload = spill-slot index (LirSpillSlot.v). Result = the reloaded value's physical reg. The encoder/ML7 materializes this as `mov result, [stackPointer + slotOffset]`; the exact stackPointer + offset come from per-target callconv lowering. Target-blind at LIR tier.",
+      "mnemonic": "frame_load", "result": "value",
+      "isTerminator": false, "hasSideEffects": false,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Spill store pseudo-op. Payload = spill-slot index. Operand[0] = the physical reg whose value is being stored. The encoder/ML7 materializes this as `mov [stackPointer + slotOffset], operand`. Target-blind at LIR tier.",
+      "mnemonic": "frame_store", "result": "none",
+      "isTerminator": false, "hasSideEffects": true,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
     }
   ],
   "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal the assembler/encoder will read.",

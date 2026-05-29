@@ -351,6 +351,8 @@ enum class DiagnosticCode : std::uint16_t {
     // codes (e.g. verifier failures) belong to this family.
     L_UnsupportedLoweringForOpcode = 0xB001,
     L_RequiredLirOpcodeMissing     = 0xB002,
+    L_VirtualRegInPostRegalloc     = 0xB003,
+    L_InvalidSpillSlotSentinel     = 0xB004,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

@@ -12,14 +12,16 @@
 #include <span>
 #include <vector>
 
-// `LirVerifier` (plan 12 §2.9, ML5 cycle 3e) — substrate-tier
-// invariant checker for the frozen `Lir` module. Mirrors `MirVerifier`
-// (ML3 cycle 1): runs a sequence of rule families, emits
-// `L_VerifierFailure`-shaped diagnostics into the reporter, returns
-// `true` iff no error-severity diagnostics were added during the run.
+// `LirVerifier` (plan 12 §2.9) — substrate-tier invariant checker
+// for the frozen `Lir` module. Mirrors `MirVerifier`: runs a sequence
+// of rule families, emits `L_*`-family diagnostics into the reporter,
+// returns `true` iff no error-severity diagnostics were added during
+// the run. Pre-regalloc rules emit `L_UnsupportedLoweringForOpcode`
+// (the existing rule-family code); the post-regalloc rule emits
+// `L_VirtualRegInPostRegalloc` for virtual-reg violations and
+// `L_InvalidSpillSlotSentinel` for frame-op payload-0 violations.
 //
-// Cycle 3e ships THREE rule families anchored by the cycle-3c review
-// and the cycle-3d FPR-class plumbing review:
+// Three rule families:
 //
 //   1. `checkMemOperandPairing` — every LIR memory-bearing instruction
 //      (Load/Store/Lea) must end with the `[MemBase, MemOffset]`
@@ -65,5 +67,17 @@ verifyLir(Lir const&             lir,
           TargetSchema const&    schema,
           std::span<MirInstId const> lirToMirMap,
           DiagnosticReporter&    reporter);
+
+// Post-regalloc verifier. Checks that the LIR module contains no
+// virtual registers in any result or operand position AND that every
+// `frame_load`/`frame_store` carries a non-zero `LirSpillSlot` payload
+// (slot 0 is the invalid sentinel). Returns `false` on any violation;
+// emits `L_VirtualRegInPostRegalloc` for virtual-reg violations and
+// `L_InvalidSpillSlotSentinel` for frame-op payload-0 violations.
+// Separate from `verifyLir` because pre-rewrite LIR legitimately
+// contains virtuals.
+[[nodiscard]] DSS_EXPORT bool
+verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
+                      DiagnosticReporter& reporter);
 
 } // namespace dss

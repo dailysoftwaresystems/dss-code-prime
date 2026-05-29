@@ -3,6 +3,7 @@ add_library(lir OBJECT
     lir_literal_pool.cpp
     lir_liveness.cpp
     lir_regalloc.cpp
+    lir_rewrite.cpp
     lir_verifier.cpp
 )
 

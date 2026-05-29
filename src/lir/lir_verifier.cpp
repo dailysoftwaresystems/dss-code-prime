@@ -192,4 +192,61 @@ LirVerifyResult verifyLir(Lir const&                  lir,
     return {reporter.errorCount() == baseline};
 }
 
+// ── post-regalloc verifier ─────────────────────────────────────────
+
+bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
+                           DiagnosticReporter& reporter) {
+    auto const baseline = reporter.errorCount();
+    auto const frameLoadOp  = schema.opcodeByMnemonic("frame_load");
+    auto const frameStoreOp = schema.opcodeByMnemonic("frame_store");
+    auto checkPhys = [&](LirReg r, char const* what, std::uint32_t instV) {
+        if (r.valid() && r.isPhysical == 0) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_VirtualRegInPostRegalloc;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format("verifyLirPostRegalloc: inst {} has a "
+                                     "virtual {} reg (vreg id {})",
+                                     instV, what,
+                                     static_cast<std::uint32_t>(r.id));
+            reporter.report(std::move(d));
+        }
+    };
+    std::size_t const fnCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            std::uint32_t const n = lir.blockInstCount(b);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const inst = lir.blockInstAt(b, i);
+                checkPhys(lir.instResult(inst), "result", inst.v);
+                auto const ops = lir.instOperands(inst);
+                for (auto const& op : ops) {
+                    if (op.kind == LirOperandKind::Reg) {
+                        checkPhys(op.reg, "operand", inst.v);
+                    }
+                }
+                // Frame pseudo-op slot sentinel: payload must be a
+                // valid `LirSpillSlot` (non-zero per the strong-id
+                // sentinel convention).
+                std::uint16_t const op = lir.instOpcode(inst);
+                bool const isFrame =
+                    (frameLoadOp.has_value()  && op == *frameLoadOp)
+                 || (frameStoreOp.has_value() && op == *frameStoreOp);
+                if (isFrame && lir.instPayload(inst) == 0) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::L_InvalidSpillSlotSentinel;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "verifyLirPostRegalloc: inst {} (frame_load/frame_store) "
+                        "has payload 0 — invalid LirSpillSlot sentinel", inst.v);
+                    reporter.report(std::move(d));
+                }
+            }
+        }
+    }
+    return reporter.errorCount() == baseline;
+}
+
 } // namespace dss
