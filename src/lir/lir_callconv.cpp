@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
+#include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,14 +19,8 @@ namespace dss {
 
 namespace {
 
-void report(DiagnosticReporter& reporter, DiagnosticCode code,
-            DiagnosticSeverity severity, std::string actual) {
-    ParseDiagnostic d;
-    d.code     = code;
-    d.severity = severity;
-    d.actual   = std::move(actual);
-    reporter.report(std::move(d));
-}
+// Shorthand: shared diagnostic helper from lir_pass_util.
+using lir_pass_util::report;
 
 // Per-class width in bytes. The cc's saved-reg and spill-slot areas
 // use the widest declared width per class as a uniform slot size —
@@ -130,29 +125,20 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     return layout;
 }
 
-// Emit `sub SP, bytes` — destructive 2-operand form. Both helpers
-// take the resolved opcode directly so the call site cannot pass a
-// stale/invalid opcode by mistake (the previous unified helper passed
-// `0` for the unused arm, which would dispatch to the schema's
-// invalid sentinel opcode if the sign ever flipped).
-void emitSpSub(LirBuilder& b, std::uint16_t subOp, LirReg sp,
-               std::uint32_t bytes) {
+// Emit `<op> SP, bytes` — destructive 2-operand form. Caller supplies
+// the resolved opcode directly (sub for prologue, add for epilogue);
+// the call site cannot pass a stale/invalid opcode by mistake (the
+// pre-fold unified helper passed `0` for the unused arm, which would
+// have dispatched to the schema's invalid-sentinel opcode if the sign
+// ever flipped). One helper, one operation, no sentinel arm.
+void emitSpAdjust(LirBuilder& b, std::uint16_t op, LirReg sp,
+                  std::uint32_t bytes) {
     if (bytes == 0) return;
     std::array<LirOperand, 2> ops{
         LirOperand::makeReg(sp),
         LirOperand::makeImmInt32(static_cast<std::int32_t>(bytes))
     };
-    b.addInst(subOp, sp, ops);
-}
-
-void emitSpAdd(LirBuilder& b, std::uint16_t addOp, LirReg sp,
-               std::uint32_t bytes) {
-    if (bytes == 0) return;
-    std::array<LirOperand, 2> ops{
-        LirOperand::makeReg(sp),
-        LirOperand::makeImmInt32(static_cast<std::int32_t>(bytes))
-    };
-    b.addInst(addOp, sp, ops);
+    b.addInst(op, sp, ops);
 }
 
 // Emit `store reg, [SP + offset]` (saved-reg store, or frame-store
@@ -183,7 +169,7 @@ void emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
 
 void emitPrologue(LirBuilder& b, FrameLayout const& layout,
                   LirReg sp, std::uint16_t subOp, std::uint16_t storeOp) {
-    emitSpSub(b, subOp, sp, layout.totalFrameSize);
+    emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
     for (std::size_t i = 0; i < layout.savedRegs.size(); ++i) {
         // saved reg carries its own class (set by collectUsedCalleeSaved
         // via schema.registerInfo) — FPR callee-saves (MS-x64 xmm6..15)
@@ -201,7 +187,7 @@ void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
         emitFrameLoad(b, loadOp, layout.savedRegs[i], sp,
                       static_cast<std::int32_t>(i * layout.slotSize));
     }
-    emitSpAdd(b, addOp, sp, layout.totalFrameSize);
+    emitSpAdjust(b, addOp, sp, layout.totalFrameSize);
 }
 
 struct OpcodeHandles {
@@ -216,81 +202,41 @@ struct OpcodeHandles {
 
 [[nodiscard]] std::optional<OpcodeHandles>
 resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
-    auto lookup = [&](std::string_view mnem,
-                      std::string const& what) -> std::optional<std::uint16_t> {
+    OpcodeHandles h{};
+    // Field-pointer + mnemonic pairs drive the lookup loop. The fixed
+    // ones are compile-time literals; the frame-{load,store} mnemonics
+    // are schema-configurable so the target may rename them. Single
+    // diagnostic-emission site beats seven copy-pasted if-let-else
+    // ladders (simplifier M6).
+    struct Entry {
+        std::uint16_t OpcodeHandles::* field;
+        std::string_view mnem;
+    };
+    std::array<Entry, 7> const table{{
+        {&OpcodeHandles::mov,        "mov"},
+        {&OpcodeHandles::add,        "add"},
+        {&OpcodeHandles::sub,        "sub"},
+        {&OpcodeHandles::load,       "load"},
+        {&OpcodeHandles::store,      "store"},
+        {&OpcodeHandles::frameLoad,  schema.frameLoadMnemonic()},
+        {&OpcodeHandles::frameStore, schema.frameStoreMnemonic()},
+    }};
+    for (auto const& [field, mnem] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
         if (!op.has_value()) {
             report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                    DiagnosticSeverity::Error,
-                   std::format("target schema missing '{}' opcode required for {}",
-                               mnem, what));
+                   std::format("target schema missing '{}' opcode required for "
+                               "callconv lowering",
+                               mnem));
             return std::nullopt;
         }
-        return *op;
-    };
-    OpcodeHandles h{};
-    if (auto v = lookup("mov", "callconv lowering"); v) h.mov = *v; else return std::nullopt;
-    if (auto v = lookup("add", "callconv lowering"); v) h.add = *v; else return std::nullopt;
-    if (auto v = lookup("sub", "callconv lowering"); v) h.sub = *v; else return std::nullopt;
-    if (auto v = lookup("load", "callconv lowering"); v) h.load = *v; else return std::nullopt;
-    if (auto v = lookup("store", "callconv lowering"); v) h.store = *v; else return std::nullopt;
-    if (auto v = lookup(schema.frameLoadMnemonic(), "callconv lowering"); v)
-        h.frameLoad = *v;
-    else return std::nullopt;
-    if (auto v = lookup(schema.frameStoreMnemonic(), "callconv lowering"); v)
-        h.frameStore = *v;
-    else return std::nullopt;
+        h.*field = *op;
+    }
     return h;
 }
 
-// Translate a non-branch operand: BlockRef gets remapped to dest-side
-// block ids; everything else passes through.
-[[nodiscard]] LirOperand
-remapOperand(LirOperand const& op,
-             std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst) {
-    if (op.kind == LirOperandKind::BlockRef) {
-        auto it = srcToDst.find(op.blockSlot);
-        if (it != srcToDst.end()) return LirOperand::makeBlockRef(it->second.v);
-    }
-    return op;
-}
-
-[[nodiscard]] bool
-emitTerminator(LirBuilder& b, std::uint16_t op, TargetOpcodeInfo const* info,
-               std::span<LirBlockId const> succs,
-               std::span<LirOperand const> newOps,
-               std::uint32_t payload,
-               std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst,
-               DiagnosticReporter& reporter) {
-    switch (succs.size()) {
-        case 0:
-            if (info != nullptr
-                && info->minSuccessors == 0 && info->maxSuccessors == 0
-                && info->result == TargetResultRule::None
-                && newOps.empty()) {
-                b.addUnreachable(op);
-            } else {
-                b.addReturn(op, newOps);
-            }
-            return true;
-        case 1:
-            b.addBr(op, srcToDst.at(succs[0].v));
-            return true;
-        case 2:
-            b.addCondBr(op, newOps,
-                        srcToDst.at(succs[0].v),
-                        srcToDst.at(succs[1].v), payload);
-            return true;
-        default:
-            report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                   DiagnosticSeverity::Error,
-                   std::format("callconv: terminator opcode {} has {} "
-                               "successors; only 0/1/2 supported",
-                               static_cast<unsigned>(op),
-                               static_cast<unsigned>(succs.size())));
-            return false;
-    }
-}
+// remapOperand + emitTerminator are now in lir_pass_util.
 
 [[nodiscard]] bool
 materializeOneFunc(Lir const& src, LirFuncId fn,
@@ -373,7 +319,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
             std::vector<LirOperand> newOps;
             newOps.reserve(ops.size());
-            for (auto const& o : ops) newOps.push_back(remapOperand(o, srcToDst));
+            for (auto const& o : ops) newOps.push_back(lir_pass_util::remapBlockRef(o, srcToDst));
 
             if (isTerm) {
                 bool const isReturn =
@@ -385,8 +331,9 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // Emit epilogue BEFORE the return.
                     emitEpilogue(b, outLayout, sp, h.add, h.load);
                 }
-                if (!emitTerminator(b, op, info, succs, newOps, payload,
-                                    srcToDst, reporter)) {
+                if (!lir_pass_util::emitTerminator(b, op, info, succs, newOps,
+                                                   payload, srcToDst,
+                                                   "callconv", reporter)) {
                     return false;
                 }
             } else {

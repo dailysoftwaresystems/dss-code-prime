@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
+#include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,14 +19,7 @@ namespace dss {
 
 namespace {
 
-void report(DiagnosticReporter& reporter, DiagnosticCode code,
-            DiagnosticSeverity severity, std::string actual) {
-    ParseDiagnostic d;
-    d.code     = code;
-    d.severity = severity;
-    d.actual   = std::move(actual);
-    reporter.report(std::move(d));
-}
+using lir_pass_util::report;
 
 // Per-class scratch register pool. Each class holds the ordered list
 // of physical registers that:
@@ -168,55 +162,8 @@ resolveReg(LirReg r, LirFuncAllocation const& alloc,
     return {s, a->spillSlot()};
 }
 
-[[nodiscard]] LirOperand
-translateNonVregOperand(LirOperand const& op,
-                        std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst) {
-    if (op.kind == LirOperandKind::BlockRef) {
-        auto it = srcToDst.find(op.blockSlot);
-        if (it != srcToDst.end()) return LirOperand::makeBlockRef(it->second.v);
-    }
-    return op;
-}
-
-// Emit the rewritten terminator. Mutates `b` (NOT a pure function —
-// the per-inst loop translates `newOps`, then this routes to the
-// matching `LirBuilder` entrypoint per successor count).
-[[nodiscard]] bool
-emitTerminator(LirBuilder& b, std::uint16_t op, TargetOpcodeInfo const* info,
-               std::span<LirBlockId const> succs,
-               std::span<LirOperand const> newOps,
-               std::uint32_t payload,
-               std::unordered_map<std::uint32_t, LirBlockId> const& srcToDst,
-               DiagnosticReporter& reporter) {
-    switch (succs.size()) {
-        case 0:
-            if (info != nullptr
-                && info->minSuccessors == 0 && info->maxSuccessors == 0
-                && info->result == TargetResultRule::None
-                && newOps.empty()) {
-                b.addUnreachable(op);
-            } else {
-                b.addReturn(op, newOps);
-            }
-            return true;
-        case 1:
-            b.addBr(op, srcToDst.at(succs[0].v));
-            return true;
-        case 2:
-            b.addCondBr(op, newOps,
-                        srcToDst.at(succs[0].v),
-                        srcToDst.at(succs[1].v), payload);
-            return true;
-        default:
-            report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                   DiagnosticSeverity::Error,
-                   std::format("rewrite: terminator opcode {} has {} "
-                               "successors; only 0/1/2 supported",
-                               static_cast<unsigned>(op),
-                               static_cast<unsigned>(succs.size())));
-            return false;
-    }
-}
+// translateNonVregOperand + emitTerminator are now in lir_pass_util
+// (D-ML7-1.1 fold — shared with lir_callconv).
 
 [[nodiscard]] bool
 rewriteOneFunc(Lir const&               src,
@@ -290,7 +237,7 @@ rewriteOneFunc(Lir const&               src,
                     if (rr.spillSlot) loads.push_back({rr.phys, *rr.spillSlot});
                     newOps.push_back(LirOperand::makeReg(rr.phys));
                 } else {
-                    newOps.push_back(translateNonVregOperand(o, srcToDst));
+                    newOps.push_back(lir_pass_util::remapBlockRef(o, srcToDst));
                 }
             }
 
@@ -315,8 +262,9 @@ rewriteOneFunc(Lir const&               src,
             bool const isTerm = (info != nullptr && info->isTerminator);
             if (isTerm) {
                 auto const succs = src.blockSuccessors(srcBlock);
-                if (!emitTerminator(b, op, info, succs, newOps, payload,
-                                    srcToDst, reporter)) {
+                if (!lir_pass_util::emitTerminator(b, op, info, succs, newOps,
+                                                   payload, srcToDst,
+                                                   "rewrite", reporter)) {
                     return false;
                 }
             } else {

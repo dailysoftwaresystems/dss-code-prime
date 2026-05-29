@@ -3,8 +3,10 @@ add_library(lir OBJECT
     lir_callconv.cpp
     lir_literal_pool.cpp
     lir_liveness.cpp
+    lir_pass_util.cpp
     lir_regalloc.cpp
     lir_rewrite.cpp
+    lir_text.cpp
     lir_verifier.cpp
 )
 

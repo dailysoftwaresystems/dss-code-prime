@@ -27,7 +27,12 @@ enum class LirOperandKind : std::uint8_t {
     None       = 0,
     Reg        = 1,  // virtual or physical register (pre/post regalloc)
     ImmInt     = 2,  // sign-extended int64 immediate
-    ImmFloat   = 3,  // double immediate (passed verbatim to encoder)
+    // Slot 3 reserved — was `ImmFloat` (never minted, no union arm, no
+    // payload field). Wide floats flow through the literal pool via
+    // `LiteralIndex` (cycle 3c). Leaving the slot reserved keeps the
+    // numeric values stable for callers that already serialized the
+    // enum (none currently exist, but the enum value space is part of
+    // the substrate contract).
     BlockRef   = 4,  // basic-block reference (br targets, etc.)
     SymbolRef  = 5,  // symbol reference (call targets, GlobalAddr)
     // Memory addressing modes (base + index + scale + displacement)

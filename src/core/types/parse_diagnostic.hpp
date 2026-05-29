@@ -353,6 +353,12 @@ enum class DiagnosticCode : std::uint16_t {
     L_RequiredLirOpcodeMissing     = 0xB002,
     L_VirtualRegInPostRegalloc     = 0xB003,
     L_InvalidSpillSlotSentinel     = 0xB004,
+    // Producer-side register-table integrity failure surfaced by the
+    // LIR text emitter: an instruction references a physical-register
+    // ordinal that is not in the target schema's register table. This
+    // is distinct from "unsupported lowering" (which is an inability to
+    // map a MIR opcode); the register is the bug, not the opcode.
+    L_PhysRegOrdinalOutOfRange     = 0xB005,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

@@ -205,34 +205,31 @@ struct DSS_EXPORT TargetCallingConvention {
     std::uint16_t shadowSpaceBytes = 0;   // MS x64: 32 bytes of home space; SysV: 0
     std::uint16_t redZoneBytes     = 0;   // SysV leaf-fn red zone (128); MS x64: 0
 
+    // Named register reference. Used for distinguished-role registers
+    // (link register, stack pointer, frame pointer in future cycles).
+    // The struct shape co-locates the JSON-side `name` (kept for
+    // diagnostics) with the loader-resolved `ordinal` (cached at JSON
+    // load time so consumers don't re-resolve per use). Both fields
+    // are populated atomically by the loader: the type cannot represent
+    // a "name set, ordinal unset" state. `validate()` guarantees the
+    // resolution succeeded when the optional is engaged.
+    struct NamedRegisterRef {
+        std::string   name;
+        std::uint16_t ordinal = 0;
+    };
+
     // ARM64 AAPCS64 carries the return address in a dedicated link
     // register (LR / x30) rather than on the stack; ML7 callconv
     // lowering checks `linkRegister.has_value()` to decide whether
     // to spill LR in the prologue. Empty for x86_64.
-    //
-    // The struct shape co-locates the JSON-side `name` (kept for
-    // diagnostics) with the loader-resolved `ordinal` (cached at JSON
-    // load time so ML7 does not re-resolve per function). Both fields
-    // are populated atomically by the loader: the type cannot represent
-    // a "name set, ordinal unset" state. `validate()` guarantees the
-    // resolution succeeded when the optional is engaged.
-    struct LinkRegisterRef {
-        std::string   name;
-        std::uint16_t ordinal = 0;
-    };
-    std::optional<LinkRegisterRef> linkRegister;
+    std::optional<NamedRegisterRef> linkRegister;
 
     // Stack-pointer register. Required for any register-machine ABI —
     // ML7 callconv lowering uses this register's ordinal as the base
     // for prologue/epilogue stack adjustments and frame_load/store
-    // memory addressing. Name + ordinal are populated atomically by
-    // the loader (same discipline as `linkRegister`); empty optional
-    // means a stack-pointer-less target (operand-stack VMs).
-    struct StackPointerRef {
-        std::string   name;
-        std::uint16_t ordinal = 0;
-    };
-    std::optional<StackPointerRef> stackPointer;
+    // memory addressing. Empty optional means a stack-pointer-less
+    // target (operand-stack VMs).
+    std::optional<NamedRegisterRef> stackPointer;
 };
 
 // Per-opcode descriptor — populated from the JSON `opcodes` array.

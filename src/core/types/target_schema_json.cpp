@@ -351,7 +351,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         // prevents a "name set, ordinal unset" state.
                         auto it = data.registerIndex.find(name);
                         if (it != data.registerIndex.end()) {
-                            cc.linkRegister = TargetCallingConvention::LinkRegisterRef{
+                            cc.linkRegister = TargetCallingConvention::NamedRegisterRef{
                                 name, it->second
                             };
                         } else {
@@ -371,7 +371,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         auto const name = c.at("stackPointer").get<std::string>();
                         auto it = data.registerIndex.find(name);
                         if (it != data.registerIndex.end()) {
-                            cc.stackPointer = TargetCallingConvention::StackPointerRef{
+                            cc.stackPointer = TargetCallingConvention::NamedRegisterRef{
                                 name, it->second
                             };
                         } else {
