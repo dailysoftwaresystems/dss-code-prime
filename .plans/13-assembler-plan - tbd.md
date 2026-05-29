@@ -1,13 +1,13 @@
 # In-tree Assembler — Sub-Plan (13)
 
-> Owns instruction encoding for v1 ISAs. Translates [LIR](./12-mir-lir-plan%20-%20tbd.md) (post-regalloc, post-frame-materialization, physical-register-only) into raw machine bytes + relocation records consumed by the [in-tree linker](./14-linker-plan%20-%20tbd.md). Per the hermetic-compiler invariant, **no GAS / MASM / llvm-mc invocation** — we own every byte.
+> Owns instruction encoding for v1 ISAs. Translates [LIR](./12-mir-lir-plan%20-%20ok.md) (post-regalloc, post-frame-materialization, physical-register-only) into raw machine bytes + relocation records consumed by the [in-tree linker](./14-linker-plan%20-%20tbd.md). Per the hermetic-compiler invariant, **no GAS / MASM / llvm-mc invocation** — we own every byte.
 
 ## 0. Status (snapshot)
 
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 production-critical. |
-| Predecessors  | ⏳ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) (LIR shape). |
+| Predecessors  | ✅ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) (LIR shape — ML1–ML8 closed 2026-05-29; `.dsslir` round-trip lossless; remaining ML7 cycle 2 = ARM64-stackPointer + ABI goldens, only blocking if AS1 targets ARM64 first). |
 | Successors    | ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) consumes (bytes, relocations) per section. ⏳ [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) consumes (byte-offset → SourceSpan) maps. |
 | Scope         | **Bounded.** AS1–AS6. v1 ISAs: x86_64 + ARM64. WASM bytecode + SPIR-V words live in their own plans (18 / 17). |
 
@@ -120,7 +120,7 @@ Reference outputs (objdump / llvm-mc) are TEST ORACLES only — golden hex snaps
 
 **Diagnostic namespace** for this plan: `A_*` — `A_EncodingInvalid` (operand-shape mismatch), `A_RelocationKindUnknown`, `A_RoundTripMismatch` (disassembler oracle disagrees with encoder), `A_InstructionUnimplemented` (LIR opcode not in the v1 subset). Fail-loud per `*Fatal` discipline.
 
-Alongside bytes + relocations, the encoder emits a `(byte_offset → LirInstId)` map per function. Combined with LIR's own `LirAttribute<SourceSpan>` (populated during MIR→LIR lowering per [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) §2.7), this gives us a `(byte_offset → SourceSpan)` chain consumed by [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md). Each IR layer owns its own per-arena attribute family — the chain composes via `byte_offset → LirInstId → SourceSpan`, never via cross-arena `HirAttribute` reads (which would violate the `treeTag` discipline from SH3).
+Alongside bytes + relocations, the encoder emits a `(byte_offset → LirInstId)` map per function. Combined with LIR's own `LirAttribute<SourceSpan>` (populated during MIR→LIR lowering per [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) §2.7), this gives us a `(byte_offset → SourceSpan)` chain consumed by [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md). Each IR layer owns its own per-arena attribute family — the chain composes via `byte_offset → LirInstId → SourceSpan`, never via cross-arena `HirAttribute` reads (which would violate the `treeTag` discipline from SH3).
 
 ---
 

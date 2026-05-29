@@ -34,7 +34,7 @@ src/transpile/
 ├── cst_pretty_print.hpp / .cpp   # ST4: target schema-aware text emitter
 └── diagnostics.hpp               # T_* codes
 
-src/source-config/language-pairs/
+src/dss-config/language-pairs/
 ├── c-subset-to-javascript.map.json
 ├── c-subset-to-csharp.map.json
 └── ... (per-pair authoring per ST5)

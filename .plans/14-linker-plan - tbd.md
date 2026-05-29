@@ -4,7 +4,7 @@
 >
 > Per the user's mandate ("we will be the process from source to targets"), **no `ld` / `link.exe` / `ld64` / `lld` / `wasm-ld` invocation**. This is the single largest backend chunk of v1.
 >
-> **Universal-compiler thesis extension (rev 3 — 2026-05-29).** Object formats are **100% config-driven** — mirroring [`GrammarSchema`](./05-parser-plan%20-%20ok.md) on the frontend and [`TargetSchema`](./12-mir-lir-plan%20-%20tbd.md) on the backend ISA tier. Each object format (ELF, PE/COFF, Mach-O, WASM, SPIR-V) is a JSON file in `src/dss-config/object-formats/<name>.format.json` declaring section taxonomy, symbol-table layout, relocation kinds, per-format metadata sections, and (where applicable) dynamic-linking constructs. ONE language-blind C++ engine reads the JSON to emit bytes — there is NO per-format C++ writer. Adding a new object format = drop a new JSON file, no engine edits. Honors thesis decision #4 ("config-driven everything") end-to-end.
+> **Universal-compiler thesis extension (rev 3 — 2026-05-29).** Object formats are **100% config-driven** — mirroring [`GrammarSchema`](./05-parser-plan%20-%20ok.md) on the frontend and [`TargetSchema`](./12-mir-lir-plan%20-%20ok.md) on the backend ISA tier. Each object format (ELF, PE/COFF, Mach-O, WASM, SPIR-V) is a JSON file in `src/dss-config/object-formats/<name>.format.json` declaring section taxonomy, symbol-table layout, relocation kinds, per-format metadata sections, and (where applicable) dynamic-linking constructs. ONE language-blind C++ engine reads the JSON to emit bytes — there is NO per-format C++ writer. Adding a new object format = drop a new JSON file, no engine edits. Honors thesis decision #4 ("config-driven everything") end-to-end.
 
 ## 0. Status (snapshot)
 

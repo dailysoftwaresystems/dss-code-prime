@@ -102,7 +102,7 @@ typedef unsigned long size_t;
 - `signature` = core lattice `FnSig` with v1 calling convention default (`CcSysV` / `CcMS64` per platform)
 - `linkage` = strong default
 
-Full C99 preprocessor is **out of v1** — the header mode accepts typedef + struct + extern + simple macros only. Real headers (glibc / Windows SDK) often need the preprocessor; v1 accepts hand-curated reduced headers shipped under `src/source-config/ffi-headers/`.
+Full C99 preprocessor is **out of v1** — the header mode accepts typedef + struct + extern + simple macros only. Real headers (glibc / Windows SDK) often need the preprocessor; v1 accepts hand-curated reduced headers shipped under `src/dss-config/ffi-headers/`.
 
 Open question §4.3: full preprocessor in v1 or v1.x?
 
@@ -176,7 +176,7 @@ Substrate tier (5-agent review) for FF3 (ABI catalog).
 
 | # | Question | Default if unanswered |
 |---|----------|-----------------------|
-| 1 | Header sources for libc — ship pre-reduced headers or read system headers? | **Pre-reduced headers** in `src/source-config/ffi-headers/{libc,libsystem,msvcrt,kernel32}/*.h`. Hermetic + small + version-stable. System-header parsing reserved post-v1. |
+| 1 | Header sources for libc — ship pre-reduced headers or read system headers? | **Pre-reduced headers** in `src/dss-config/ffi-headers/{libc,libsystem,msvcrt,kernel32}/*.h`. Hermetic + small + version-stable. System-header parsing reserved post-v1. |
 | 2 | C++ FFI in v1? | **No.** C-only. C++ Itanium / MSVC demangling reserved post-v1. |
 | 3 | Preprocessor support in header mode? | **Limited** — typedef + struct + extern + simple `#define`-only-macros. No `#include` chasing (use the pre-reduced headers); no function-like macros. |
 | 4 | TLS variable ingestion from binaries? | **Yes** — TLS extern globals emit `ExternGlobal` with `linkage: Tls` flag; linker LK5 handles. |

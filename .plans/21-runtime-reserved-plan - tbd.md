@@ -31,7 +31,7 @@ This plan opens module-by-module:
 ### 2.1 GC
 
 - Algorithm choice: mark-and-sweep / generational / refcount / borrow-checked-static / hybrid.
-- Per [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) MIR `GcRoot` / `GcSafepoint` / `GcBarrier` intrinsics — reserved space in the MIR opcode table; full impl here.
+- Per [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) MIR `GcRoot` / `GcSafepoint` / `GcBarrier` intrinsics — reserved space in the MIR opcode table; full impl here.
 - Stack walking (interaction with debug-info CFI).
 - Object-header layout (vtable pointer, class id, mark bit, generation).
 

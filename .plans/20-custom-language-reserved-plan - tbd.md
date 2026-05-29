@@ -32,7 +32,7 @@ Until then: this plan exists to declare that **no new substrate work is required
 - **A core type lattice + extension registry.** Per [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md). The custom language declares its types as either core members or extensions.
 - **HIR as the pivot.** Lower CST → HIR via a custom-language-specific lowering pass.
 - **Same-source CPU + GPU.** The HIR shader-shape mechanism (per [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) §2.4) makes `[[shader.usable]] [[host.usable]]` functions dual-lowering targets.
-- **Multi-target codegen.** Native (3 OS × 2 arch via [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20tbd.md) + [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) + [`14-linker-plan`](./14-linker-plan%20-%20tbd.md)), shader (SPIR-V), web (WASM via [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md)), transpile (any other configured language via [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md)).
+- **Multi-target codegen.** Native (3 OS × 2 arch via [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) + [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) + [`14-linker-plan`](./14-linker-plan%20-%20tbd.md)), shader (SPIR-V), web (WASM via [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md)), transpile (any other configured language via [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md)).
 - **Debug info, codesign, FFI.** All in-tree, all hermetic — same machinery the shipped languages use.
 
 ---
