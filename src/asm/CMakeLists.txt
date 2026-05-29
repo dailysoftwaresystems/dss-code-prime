@@ -1,7 +1,10 @@
 add_library(asm OBJECT
     asm.cpp
+    disasm.cpp
     format/fixed32.cpp
+    format/fixed32_disasm.cpp
     format/x86_variable.cpp
+    format/x86_variable_disasm.cpp
 )
 
 target_include_directories(asm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

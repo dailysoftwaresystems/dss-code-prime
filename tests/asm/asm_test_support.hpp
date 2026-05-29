@@ -4,10 +4,19 @@
 // (simplifier review of AS2 cycle 2) so a future tests/asm/* file
 // gains the same convenience without re-rolling the boilerplate.
 
+#include "asm/disasm.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"
+#include "lir/lir.hpp"
+#include "lir/lir_node.hpp"
+#include "lir/lir_pass_util.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <format>
+#include <span>
+#include <string_view>
 
 namespace dss::test_support::asm_ {
 
@@ -24,4 +33,187 @@ countDiagnostics(DiagnosticReporter const& rep, DiagnosticCode code) noexcept {
     return n;
 }
 
+// Round-trip verification helper (plan 13 §2.9 + AS5).
+//
+// TEST-ONLY (architect AS5 review). The function is `inline` here so
+// each test TU emits its own copy; it explicitly does NOT live in
+// the production library because:
+//   * it takes a `Lir const&` reference — the linker (plan 14) does
+//     NOT hold a Lir and must not be tempted to invoke this;
+//   * the function's purpose is encoder-output verification, which
+//     is a test concern, not a runtime concern.
+//
+// After the encoder produces bytes for one instruction, this helper
+// re-extracts the per-slot operand values from those bytes (via
+// `disassembleInst`) and asserts they match what the LIR operand was
+// at encode time. Catches the silent-failure class where the encoder
+// produces valid-but-WRONG bytes.
+//
+// `encodedBytes` MUST be the exact byte window for ONE instruction
+// — caller strides through the function-level byte stream one inst
+// at a time. Returns true iff every slot value matched; emits
+// `A_RoundTripMismatch` into `reporter` on any disagreement.
+[[nodiscard]] inline bool
+roundTripVerify(TargetSchema const&            schema,
+                Lir const&                     lir,
+                LirInstId                      inst,
+                std::span<std::uint8_t const>  encodedBytes,
+                DiagnosticReporter&            reporter) {
+    using dss::lir_pass_util::report;
+
+    auto const opcode = lir.instOpcode(inst);
+    auto const result = disassembleInst(schema, opcode, encodedBytes, reporter);
+    if (!result.has_value()) {
+        return false;
+    }
+    if (result->bytesConsumed != encodedBytes.size()) {
+        report(reporter, DiagnosticCode::A_RoundTripMismatch,
+               DiagnosticSeverity::Error,
+               std::format("round-trip: opcode {} consumed {} bytes "
+                           "but encoded image is {} bytes",
+                           opcode, result->bytesConsumed,
+                           encodedBytes.size()));
+        return false;
+    }
+
+    auto const* info     = schema.opcodeInfo(opcode);
+    auto const& variant  = info->encoding.variants[result->variantIndex];
+    auto const  instOps  = lir.instOperands(inst);
+    LirReg const resultReg = lir.instResult(inst);
+
+    std::size_t cursor = 0;
+    auto const checkSlot = [&](DisassembledSlot const& slot,
+                                std::int64_t expected,
+                                std::string_view label) -> bool {
+        if (slot.value != expected) {
+            report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                   DiagnosticSeverity::Error,
+                   std::format("round-trip: opcode '{}' slot '{}' "
+                               "({}): expected value {} but disasm "
+                               "recovered {}",
+                               info->mnemonic,
+                               encodingSlotKindName(slot.kind),
+                               label, expected, slot.value));
+            return false;
+        }
+        return true;
+    };
+
+    if (variant.resultSlot.has_value()) {
+        if (cursor >= result->slots.size()) {
+            report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                   DiagnosticSeverity::Error,
+                   std::format("round-trip: opcode '{}' resultSlot "
+                               "declared but disasm produced no slot",
+                               info->mnemonic));
+            return false;
+        }
+        auto const* regInfo = schema.registerInfo(
+            static_cast<std::uint16_t>(resultReg.id));
+        if (regInfo == nullptr) {
+            report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                   DiagnosticSeverity::Error,
+                   std::format("round-trip: opcode '{}' result reg "
+                               "ordinal {} not in target's register "
+                               "table",
+                               info->mnemonic,
+                               static_cast<unsigned>(resultReg.id)));
+            return false;
+        }
+        if (!checkSlot(result->slots[cursor],
+                        static_cast<std::int64_t>(regInfo->hwEncoding),
+                        "result")) {
+            return false;
+        }
+        ++cursor;
+    }
+
+    for (auto const& wire : variant.wires) {
+        if (cursor >= result->slots.size()) {
+            report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                   DiagnosticSeverity::Error,
+                   std::format("round-trip: opcode '{}' variant has "
+                               "more wires than disasm produced slots",
+                               info->mnemonic));
+            return false;
+        }
+        auto const& slot   = result->slots[cursor];
+        auto const& srcOp  = instOps[wire.index];
+        std::int64_t expected = 0;
+        // Closed-enum switch (convergence-fix B, AS5 review): every
+        // new LirOperandKind must declare its disasm-comparison
+        // expectation. An if/elif chain silently treating unhandled
+        // kinds as expected=0 would spuriously match a slot value of
+        // 0 — the exact silent-failure class the oracle exists to catch.
+        switch (srcOp.kind) {
+            case LirOperandKind::Reg: {
+                auto const* regInfo = schema.registerInfo(
+                    static_cast<std::uint16_t>(srcOp.reg.id));
+                if (regInfo == nullptr) {
+                    report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                           DiagnosticSeverity::Error,
+                           std::format("round-trip: opcode '{}' wire {} "
+                                       "Reg operand ordinal {} not in "
+                                       "register table",
+                                       info->mnemonic, wire.index,
+                                       static_cast<unsigned>(srcOp.reg.id)));
+                    return false;
+                }
+                expected = static_cast<std::int64_t>(regInfo->hwEncoding);
+                break;
+            }
+            case LirOperandKind::ImmInt:
+                expected = static_cast<std::int64_t>(srcOp.immInt32);
+                break;
+            case LirOperandKind::SymbolRef:
+                // Symbol-bearing slots: encoder writes ZEROS. Full
+                // symbol-identity check is the caller's Relocation
+                // cross-reference, not this slot-value check.
+                expected = 0;
+                break;
+            case LirOperandKind::None:
+            case LirOperandKind::BlockRef:
+            case LirOperandKind::MemBase:
+            case LirOperandKind::MemOffset:
+            case LirOperandKind::LiteralIndex:
+                report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                       DiagnosticSeverity::Error,
+                       std::format("round-trip: opcode '{}' wire {} "
+                                   "LirOperandKind ordinal {} is not yet "
+                                   "covered by the oracle — substrate "
+                                   "drift, add a case arm when its "
+                                   "encoder consumer lands",
+                                   info->mnemonic, wire.index,
+                                   static_cast<unsigned>(srcOp.kind)));
+                return false;
+        }
+        if (!checkSlot(slot, expected,
+                       std::format("wire[index={}]", wire.index))) {
+            return false;
+        }
+        ++cursor;
+    }
+
+    if (cursor != result->slots.size()) {
+        report(reporter, DiagnosticCode::A_RoundTripMismatch,
+               DiagnosticSeverity::Error,
+               std::format("round-trip: opcode '{}' disasm produced {} "
+                           "slots but variant declared {}",
+                           info->mnemonic, result->slots.size(),
+                           cursor));
+        return false;
+    }
+
+    return true;
+}
+
 } // namespace dss::test_support::asm_
+
+// Pull `roundTripVerify` into the dss namespace as an inline alias
+// so existing test call sites continue to resolve `dss::round
+// TripVerify(...)` without a using-declaration. This is a header-
+// only convenience; production code (which doesn't include this
+// header) sees no such symbol.
+namespace dss {
+using dss::test_support::asm_::roundTripVerify;
+}

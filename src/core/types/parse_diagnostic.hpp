@@ -414,10 +414,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   the operand shape the LIR produces, or (b) adjust the LIR pre-
     //   pass (e.g. 2-address legalization) to produce a shape covered
     //   by the declared variants.
+    // A_RoundTripMismatch: the disassembler oracle (plan 13 AS5,
+    //   §2.9) re-extracted operand values from the encoded bytes
+    //   and they disagreed with what the encoder consumed. Catches
+    //   the silent-failure class where the encoder produces valid
+    //   but WRONG instructions (correct length, wrong reg/imm in a
+    //   slot). Test-only diagnostic — production assembler does
+    //   not run the round-trip pass.
     A_NoEncodingDeclared           = 0x1001,
     A_NoEncodingShapeWalker        = 0x1002,
     A_LirToMirSizeMismatch         = 0x1003,
     A_NoMatchingEncodingVariant    = 0x1004,
+    A_RoundTripMismatch            = 0x1005,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
