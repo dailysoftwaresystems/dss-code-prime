@@ -10,8 +10,10 @@
 
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <span>
@@ -798,6 +800,35 @@ private:
         return true;
     }
 
+    // Parse a numeric token; emit an `I_TextMalformed` diagnostic on
+    // `from_chars` failure (the silent-zero default that bare
+    // `std::from_chars` produces hides malformed numeric input from
+    // the user; verify-on-load might catch a downstream structural
+    // mismatch but loses the precise blame).
+    template <typename T>
+    [[nodiscard]] T parseNumber(std::string_view text,
+                                std::string_view what) {
+        T v{};
+        auto [ptr, ec] = std::from_chars(text.data(),
+                                         text.data() + text.size(), v);
+        if (ec != std::errc{} || ptr != text.data() + text.size()) {
+            emitMalformed(std::format("malformed {} value '{}'", what, text));
+        }
+        return v;
+    }
+    [[nodiscard]] double parseDouble(std::string_view text) {
+        // `std::from_chars` for float is not universally supported
+        // pre-GCC 11; fall back to strtod which signals via errno + endptr.
+        std::string buf{text};
+        char* end = nullptr;
+        errno = 0;
+        double const d = std::strtod(buf.c_str(), &end);
+        if (errno == ERANGE || end == buf.c_str()) {
+            emitMalformed(std::format("malformed float value '{}'", text));
+        }
+        return d;
+    }
+
     bool peekIdent(std::string_view name) {
         Tok t = lex_.peek();
         return t.kind == TokKind::Ident && t.text == name;
@@ -824,11 +855,7 @@ private:
             return v;
         }
         if (t.kind == TokKind::Integer) {
-            std::uint32_t v = 0;
-            auto [p, ec] = std::from_chars(
-                t.text.data(), t.text.data() + t.text.size(), v);
-            (void)p; (void)ec;
-            return v;
+            return parseNumber<std::uint32_t>(t.text, "% handle");
         }
         emitMalformed(std::format("expected handle after '%', got '{}'", t.text));
         return 0;
@@ -884,8 +911,7 @@ private:
                 emitMalformed("expected array length integer");
                 return InvalidType;
             }
-            std::int64_t lv = 0;
-            std::from_chars(len.text.data(), len.text.data() + len.text.size(), lv);
+            std::int64_t lv = parseNumber<std::int64_t>(len.text, "array length");
             (void)expect(TokKind::RAngle);
             return interner_.array(elem, lv);
         }
@@ -928,8 +954,8 @@ private:
             if (lex_.peek().kind == TokKind::Colon) {
                 lex_.take();
                 Tok n = lex_.take();
-                std::int64_t k = 0;
-                std::from_chars(n.text.data(), n.text.data() + n.text.size(), k);
+                std::int64_t const k = parseNumber<std::int64_t>(n.text,
+                    "enum underlying kind ordinal");
                 underlying = static_cast<TypeKind>(k);
             }
             return interner_.enumType(name.text, underlying);
@@ -971,18 +997,13 @@ private:
             lv.value = (v.text == "true");
         } else if (tag.text == "int") {
             Tok v = lex_.take();
-            std::int64_t i = 0;
-            std::from_chars(v.text.data(), v.text.data() + v.text.size(), i);
-            lv.value = i;
+            lv.value = parseNumber<std::int64_t>(v.text, "int literal");
         } else if (tag.text == "uint") {
             Tok v = lex_.take();
-            std::uint64_t u = 0;
-            std::from_chars(v.text.data(), v.text.data() + v.text.size(), u);
-            lv.value = u;
+            lv.value = parseNumber<std::uint64_t>(v.text, "uint literal");
         } else if (tag.text == "float") {
             Tok v = lex_.take();
-            double d = std::strtod(v.text.c_str(), nullptr);
-            lv.value = d;
+            lv.value = parseDouble(v.text);
         } else if (tag.text == "str") {
             Tok v = lex_.take();
             lv.value = v.text;
@@ -1218,8 +1239,8 @@ private:
             case MirOpcode::Arg: {
                 (void)expect(TokKind::LParen);
                 Tok n = lex_.take();
-                std::uint32_t idx = 0;
-                std::from_chars(n.text.data(), n.text.data() + n.text.size(), idx);
+                std::uint32_t const idx = parseNumber<std::uint32_t>(
+                    n.text, "arg index");
                 (void)expect(TokKind::RParen);
                 MirInstId const id = builder_.addArg(idx, resultType);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
@@ -1238,9 +1259,8 @@ private:
                 (void)expect(TokKind::LParen);
                 (void)expectIdent("intrinsic");
                 Tok idTok = lex_.take();
-                std::uint32_t intrinId = 0;
-                std::from_chars(idTok.text.data(),
-                    idTok.text.data() + idTok.text.size(), intrinId);
+                std::uint32_t const intrinId = parseNumber<std::uint32_t>(
+                    idTok.text, "intrinsic id");
                 std::vector<MirInstId> operands;
                 while (lex_.peek().kind == TokKind::Comma) {
                     lex_.take();
@@ -1354,7 +1374,7 @@ private:
                 if (peekIdent("payload")) {
                     lex_.take();
                     Tok n = lex_.take();
-                    std::from_chars(n.text.data(), n.text.data() + n.text.size(), payload);
+                    payload = parseNumber<std::uint32_t>(n.text, "payload");
                 }
                 MirInstId const id = builder_.addInst(op, operands, resultType, payload);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;

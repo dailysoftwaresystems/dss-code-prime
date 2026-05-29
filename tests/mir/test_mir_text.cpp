@@ -291,6 +291,41 @@ TEST(MirText, PointerAndArrayTypesRoundTrip) {
 
 // Symbol-name table with unnamed symbol — fallback to bare `%N` quote
 // must still round-trip.
+// A malformed numeric literal in an `int` literal must emit
+// I_TextMalformed (was silently zero in cycle 1). The text
+// `lit int abc` has a non-numeric token where an integer is
+// expected; the new parseNumber<T> helper catches this.
+TEST(MirText, MalformedNumericLiteralEmitsDiagnostic) {
+    // Build a malformed body. The lexer will tokenize `abc` as Ident,
+    // not Integer, so the parser's `lit int` branch will fail at the
+    // `lex_.take()` of the value token. But for any tokenized-as-
+    // Integer-but-out-of-range case (e.g. 9999999999999999999 as int32),
+    // parseNumber emits the malformed diagnostic. Use that case:
+    std::string text =
+        "dssir 1\n"
+        "symbols { %1 \"f\" }\n"
+        "module {\n"
+        "  function %1 : fn() -> i32 {\n"
+        "    block %b1 [entry] {\n"
+        "      %v2 = const : i32 (lit int 999999999999999999999 : i32)\n"
+        "      return %v2\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    DiagnosticReporter r;
+    auto res = parseMir(text, CompilationUnitId{1}, r);
+    EXPECT_FALSE(res->ok);
+    bool foundMalformed = false;
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::I_TextMalformed
+         && d.actual.find("int literal") != std::string::npos) {
+            foundMalformed = true; break;
+        }
+    }
+    EXPECT_TRUE(foundMalformed)
+        << "out-of-range int literal must emit I_TextMalformed";
+}
+
 TEST(MirText, UnnamedSymbolRoundTrips) {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const voidTy = ti.primitive(TypeKind::Void);
