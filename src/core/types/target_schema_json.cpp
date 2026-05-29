@@ -181,6 +181,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         if (o.contains("hasSideEffects") && o.at("hasSideEffects").is_boolean()) {
             info.hasSideEffects = o.at("hasSideEffects").get<bool>();
         }
+        if (o.contains("isCall") && o.at("isCall").is_boolean()) {
+            info.isCall = o.at("isCall").get<bool>();
+        }
         // Arity bounds (optional, default 0). Out-of-range values are
         // diagnosed (the schema is rejected by the final fatal-scan);
         // absent fields stay at the zero default. `validate()` enforces

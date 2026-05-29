@@ -237,6 +237,13 @@ struct DSS_EXPORT TargetOpcodeInfo {
     TargetResultRule result         = TargetResultRule::None;
     bool             isTerminator   = false;
     bool             hasSideEffects = false;
+    // True iff this opcode performs a function call (or an intrinsic
+    // dispatch). The register allocator uses this to determine which
+    // ranges cross a call boundary and therefore must avoid caller-
+    // saved registers. Promotes "call-detection" out of mnemonic
+    // matching (the allocator was previously matching "call" /
+    // "intrinsic_call" strings, breaking target-agnosticism).
+    bool             isCall         = false;
     std::uint8_t     minOperands    = 0;
     std::uint8_t     maxOperands    = 0;
     std::uint8_t     minSuccessors  = 0;

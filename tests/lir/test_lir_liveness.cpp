@@ -8,19 +8,13 @@
 //   * D-3e.1 lowerSwitch first-cmp + first-jcc block-placement pin
 //   * D-3e.9 ICmp dispatch across all 10 predicates
 
-#include "analysis/compilation_unit/compilation_unit.hpp"
-#include "analysis/semantic/semantic_analyzer.hpp"
-#include "analysis/semantic/semantic_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
-#include "core/types/grammar_schema.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
-#include "hir/hir.hpp"
-#include "hir/lowering/cst_to_hir.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
-#include "mir/lowering/hir_to_mir.hpp"
+#include "lowered_lir_fixture.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
@@ -31,52 +25,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdlib>
-#include <memory>
-#include <string>
-#include <utility>
 #include <vector>
 
 using namespace dss;
+using dss::test_support::lowerCSubsetToLir;
 
 namespace {
-
-struct LoweredLir {
-    SemanticModel                    model;
-    std::unique_ptr<CstToHirResult>  hir;
-    DiagnosticReporter               hirReporter;
-    HirToMirResult                   mir;
-    DiagnosticReporter               mirReporter;
-    std::shared_ptr<TargetSchema>    target;
-    DiagnosticReporter               lirReporter;
-    MirToLirResult                   lir;
-};
-
-[[nodiscard]] LoweredLir lowerCSubsetToLir(std::string src) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
-    builder.addInMemory(std::move(src), "<mem>");
-    auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    auto model = analyze(cu);
-    DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
-    DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
-                                    model.lattice().interner(), mirReporter,
-                                    &hir->sourceMap, mirCfg);
-    auto target = TargetSchema::loadShipped("x86_64");
-    if (!target) { ADD_FAILURE() << "loadShipped(x86_64) failed"; std::abort(); }
-    DiagnosticReporter lirReporter;
-    MirToLirResult lir = lowerToLir(mir.mir, **target,
-                                    model.lattice().interner(),
-                                    lirReporter);
-    return LoweredLir{std::move(model), std::move(hir), std::move(hirReporter),
-                      std::move(mir), std::move(mirReporter), std::move(*target),
-                      std::move(lirReporter), std::move(lir)};
-}
 
 // Count ranges with the given vreg id. Used to pin uniqueness.
 [[nodiscard]] std::size_t
