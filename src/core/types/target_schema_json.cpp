@@ -116,6 +116,17 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     if (target.contains("version") && target.at("version").is_string()) {
         data.version = target.at("version").get<std::string>();
     }
+    if (target.contains("abiModel") && target.at("abiModel").is_string()) {
+        auto const s = target.at("abiModel").get<std::string>();
+        if      (s == "register-machine") data.abiModel = TargetAbiModel::RegisterMachine;
+        else if (s == "operand-stack")    data.abiModel = TargetAbiModel::OperandStack;
+        else if (s == "result-id")        data.abiModel = TargetAbiModel::ResultId;
+        else {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/target/abiModel",
+                      "expected 'register-machine' / 'operand-stack' / 'result-id'");
+            return std::unexpected(std::move(coll.diagnostics));
+        }
+    }
 
     // ── opcodes ──
     if (!doc.contains("opcodes") || !doc.at("opcodes").is_array()) {
@@ -313,6 +324,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
                 readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);
                 readBoundedInt(c, coll, ccPath, "redZoneBytes",     cc.redZoneBytes);
+                if (c.contains("linkRegister")) {
+                    if (!c.at("linkRegister").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/linkRegister", ccPath),
+                                  "must be a register-name string");
+                    } else {
+                        cc.linkRegister = c.at("linkRegister").get<std::string>();
+                    }
+                }
 
                 std::uint16_t const idx =
                     static_cast<std::uint16_t>(data.callingConventions.size());

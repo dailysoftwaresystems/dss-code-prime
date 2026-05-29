@@ -20,6 +20,17 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op: 'this LirReg is the function's k-th input parameter' (payload = k). ML7 calling-convention lowering rewrites `arg` to the real mov-from-arg-register sequence; before that, it represents the parameter as a virtreg that ML5 cycle 3 MIR→LIR isel can consume directly. Every target backend needs SOME representation of 'i-th function parameter'; pre-regalloc this is the uniform shape.",
+      "mnemonic":      "arg",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "mnemonic":      "mov",
       "result":        "value",
       "isTerminator":  false,

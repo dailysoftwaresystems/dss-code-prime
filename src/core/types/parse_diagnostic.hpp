@@ -341,6 +341,16 @@ enum class DiagnosticCode : std::uint16_t {
     I_TextMalformed           = 0xA00D,
     I_TextVersionMismatch     = 0xA00E,
     I_TextUnknownName         = 0xA00F,
+
+    // ── LIR lowering + verifier (plan 12 ML5, renders as `L`) ──────────
+    //
+    // The MIR→LIR instruction-selection pass emits these when a MIR
+    // opcode has no per-target lowering rule (or the target schema does
+    // not declare the required LIR opcode). Same fail-loud-deferral
+    // discipline as `H_UnsupportedLoweringForKind` and ML8's verifier
+    // will join the family with `L_VerifierFailure` etc.
+    L_UnsupportedLoweringForOpcode = 0xB001,
+    L_RequiredLirOpcodeMissing     = 0xB002,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

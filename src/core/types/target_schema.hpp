@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/transparent_string_hash.hpp"
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
 #include "core/types/strong_ids.hpp"
 
@@ -11,7 +12,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 // `TargetSchema` (plan 12 §2.6 ML5 cycle 2 pivot) — JSON-configured
@@ -34,6 +34,32 @@
 // `src/dss-config/targets/<name>.target.json` (up to 8 levels).
 
 namespace dss {
+
+// ABI model — selects the lowering shape downstream consumers (ML6
+// regalloc, ML7 calling-convention lowering, AS1 assembler) expect.
+// `register-machine` is the x86/ARM/RISC-V shape: physical register
+// file, stack frame, calling conventions with arg-passing registers.
+// `operand-stack` is the WASM/JVM-bytecode shape: no physical regs,
+// values flow through a stack. `result-id` is the SPIR-V shape: typed
+// SSA result IDs, no physical regs, no stack.
+//
+// Cycle 2b registers + callingConventions sections are MEANINGFUL only
+// when `abiModel == register-machine`; for the other models they may
+// be empty without `validate()` flagging it.
+enum class TargetAbiModel : std::uint8_t {
+    RegisterMachine = 0,  // default — x86_64, ARM64, RISC-V
+    OperandStack    = 1,  // WASM, JVM bytecode
+    ResultId        = 2,  // SPIR-V
+};
+
+[[nodiscard]] constexpr std::string_view targetAbiModelName(TargetAbiModel m) noexcept {
+    switch (m) {
+        case TargetAbiModel::RegisterMachine: return "register-machine";
+        case TargetAbiModel::OperandStack:    return "operand-stack";
+        case TargetAbiModel::ResultId:        return "result-id";
+    }
+    return "register-machine";
+}
 
 // Result-type discipline mirrors MIR's `MirResultRule`.
 enum class TargetResultRule : std::uint8_t {
@@ -111,6 +137,12 @@ struct DSS_EXPORT TargetCallingConvention {
     std::uint16_t stackAlignment   = 0;   // alignment of RSP at call site (16 on SysV/MS x64)
     std::uint16_t shadowSpaceBytes = 0;   // MS x64: 32 bytes of home space; SysV: 0
     std::uint16_t redZoneBytes     = 0;   // SysV leaf-fn red zone (128); MS x64: 0
+
+    // ARM64 AAPCS64 carries the return address in a dedicated link
+    // register (LR / x30) rather than on the stack; ML7 callconv
+    // lowering checks `linkRegister.has_value()` to decide whether
+    // to spill LR in the prologue. Empty for x86_64.
+    std::optional<std::string> linkRegister;
 };
 
 // Per-opcode descriptor — populated from the JSON `opcodes` array.
@@ -135,34 +167,11 @@ struct DSS_EXPORT TargetOpcodeInfo {
 
 namespace detail {
 
-// Heterogeneous-lookup support for the schema's name→ordinal maps. Lets
-// every lookup (`opcodeByMnemonic`, `registerByName`, `callingConvention
-// ByName`) accept a `string_view` without allocating a `std::string` per
-// call — cycle 3 isel pattern matching hits these in tight loops.
-struct DSS_EXPORT TransparentStringHash {
-    using is_transparent = void;
-    std::size_t operator()(std::string_view sv) const noexcept {
-        return std::hash<std::string_view>{}(sv);
-    }
-    std::size_t operator()(std::string const& s) const noexcept {
-        return std::hash<std::string_view>{}(s);
-    }
-    std::size_t operator()(char const* s) const noexcept {
-        return std::hash<std::string_view>{}(s);
-    }
-};
-struct DSS_EXPORT TransparentStringEq {
-    using is_transparent = void;
-    bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
-};
-
-// One alias serves all three index maps (mnemonic / register-name /
-// calling-convention-name). The three were identical instantiations
-// in cycle 2b's first cut — collapsing avoids three places to update
-// if the hash policy ever changes.
-using TransparentNameIndex = std::unordered_map<
-    std::string, std::uint16_t,
-    TransparentStringHash, TransparentStringEq>;
+// Index maps reuse the project-wide `substrate::TransparentStringMap`
+// (heterogeneous `string_view` lookup with no `std::string` allocation
+// per call) — promoted to substrate in cycle 3a per the cycle-2b
+// deferred-item closure. The three indexes (mnemonic / register-name /
+// calling-convention-name) all instantiate it with `std::uint16_t`.
 
 // In-memory schema. Mirrors `detail::GrammarSchemaData` — owned-by-
 // value POD the loader builds + moves into the frozen `TargetSchema`.
@@ -174,6 +183,7 @@ struct DSS_EXPORT TargetSchemaData {
     TargetSchemaId          id{};
     std::string             name;             // "x86_64" / "arm64" / ...
     std::string             version;          // semantic version string
+    TargetAbiModel          abiModel = TargetAbiModel::RegisterMachine;
 
     // Opcode table — slot 0 carries the `"invalid"` sentinel mnemonic
     // (loader-enforced). Other slot-0 fields (terminator/result/arity)
@@ -181,18 +191,18 @@ struct DSS_EXPORT TargetSchemaData {
     // unconditionally invalid via the addInst guard, not via these
     // fields.
     std::vector<TargetOpcodeInfo> opcodes;
-    TransparentNameIndex          mnemonicIndex;
+    substrate::TransparentStringMap<std::uint16_t> mnemonicIndex;
 
     // Physical register file (cycle 2b). Empty when the target JSON
     // omits the `registers` array — keeps the cycle 2a-shape targets
     // valid until ML6 regalloc requires the section.
     std::vector<TargetRegisterInfo> registers;
-    TransparentNameIndex            registerIndex;
+    substrate::TransparentStringMap<std::uint16_t> registerIndex;
 
     // Calling conventions (cycle 2b). Same optional-for-now discipline
     // as `registers` — ML7 callconv lowering will require ≥1 entry.
     std::vector<TargetCallingConvention> callingConventions;
-    TransparentNameIndex                 callingConventionIndex;
+    substrate::TransparentStringMap<std::uint16_t> callingConventionIndex;
 
     // Cross-field invariants the per-field JSON parse cannot express.
     // Returns the list of problems as fully-shaped `ConfigDiagnostic`s
@@ -238,9 +248,10 @@ public:
     TargetSchema(TargetSchema&&) noexcept        = default;
     TargetSchema& operator=(TargetSchema&&) noexcept = default;
 
-    [[nodiscard]] TargetSchemaId    id()      const noexcept { return d_.id; }
-    [[nodiscard]] std::string_view  name()    const noexcept { return d_.name; }
-    [[nodiscard]] std::string_view  version() const noexcept { return d_.version; }
+    [[nodiscard]] TargetSchemaId    id()       const noexcept { return d_.id; }
+    [[nodiscard]] std::string_view  name()     const noexcept { return d_.name; }
+    [[nodiscard]] std::string_view  version()  const noexcept { return d_.version; }
+    [[nodiscard]] TargetAbiModel    abiModel() const noexcept { return d_.abiModel; }
 
     // ── Opcodes ─────────────────────────────────────────────────
     [[nodiscard]] std::span<TargetOpcodeInfo const> opcodes() const noexcept {

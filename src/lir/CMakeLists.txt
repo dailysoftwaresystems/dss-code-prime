@@ -9,7 +9,9 @@ target_include_directories(lir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # files produced here.
 target_compile_definitions(lir PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
-# ML5 cycle 1 sits on the SP1 arena substrate (core). No MIR dependency yet
-# — the MIR→LIR isel pass (ML5 cycle 2) lives in its own library and links
-# both mir and lir.
 target_link_libraries(lir PRIVATE core)
+
+# ML5 cycle 3: MIR→LIR isel pass lives in `lowering/`; separate OBJECT lib
+# so the LIR substrate itself stays MIR-free (the LIR module is target-
+# blind output; the lowerer is the dependency-direction bridge).
+add_subdirectory(lowering)

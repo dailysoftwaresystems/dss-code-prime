@@ -154,11 +154,18 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     }
 
     // ── Calling conventions ──────────────────────────────────────
-    // Gate ref-resolution on `registers.empty() && callingConventions.
-    // empty()` — i.e. cycle-2a-shape configs (BOTH empty) are accepted
-    // for back-compat, but the silent-failure trap "no registers + some
-    // callingConventions" is closed: that config will resolve nothing
-    // and validate() must flag it.
+    // Two gates here:
+    //  1) For non-register-machine ABIs (WASM operand-stack, SPIR-V
+    //     result-id), `registers`/`callingConventions` may legitimately
+    //     be empty (those models don't have physical registers). Skip
+    //     ref-resolution + alignment checks entirely.
+    //  2) For register-machine ABI, ref-resolution is gated on
+    //     `registers.empty() && callingConventions.empty()` — both empty
+    //     is cycle-2a-shape (back-compat); anything else means the
+    //     user opted into resolution.
+    if (abiModel != TargetAbiModel::RegisterMachine) {
+        return problems;
+    }
     bool const enforceRefs = !registers.empty() || !callingConventions.empty();
     auto checkRefs = [&](std::size_t       ccIdx,
                          char const*       field,
@@ -196,6 +203,13 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         checkRefs(i, "returnFprs",  cc.returnFprs,  TargetRegClass::FPR);
         checkRefs(i, "callerSaved", cc.callerSaved, TargetRegClass::None);
         checkRefs(i, "calleeSaved", cc.calleeSaved, TargetRegClass::None);
+
+        // Link register (AAPCS64-shape). When declared, must resolve to
+        // a GPR-class register — ML7 will spill it in the prologue.
+        if (cc.linkRegister.has_value()) {
+            std::span<std::string const> linkRefs{&*cc.linkRegister, 1};
+            checkRefs(i, "linkRegister", linkRefs, TargetRegClass::GPR);
+        }
 
         // Stack alignment must be a power of two when ANY ABI field is
         // set (since the call frame is meaningless without it). Zero is

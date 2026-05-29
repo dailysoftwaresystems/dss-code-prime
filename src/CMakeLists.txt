@@ -25,6 +25,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:mir>
     $<TARGET_OBJECTS:mir_lowering>
     $<TARGET_OBJECTS:lir>
+    $<TARGET_OBJECTS:lir_lowering>
     $<TARGET_OBJECTS:lsp>
     $<TARGET_OBJECTS:gen>
     $<TARGET_OBJECTS:program>)

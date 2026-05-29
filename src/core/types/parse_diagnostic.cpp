@@ -114,6 +114,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_TextMalformed:            return "I_TextMalformed";
         case DiagnosticCode::I_TextVersionMismatch:      return "I_TextVersionMismatch";
         case DiagnosticCode::I_TextUnknownName:          return "I_TextUnknownName";
+        case DiagnosticCode::L_UnsupportedLoweringForOpcode: return "L_UnsupportedLoweringForOpcode";
+        case DiagnosticCode::L_RequiredLirOpcodeMissing:     return "L_RequiredLirOpcodeMissing";
     }
     return "Unknown";
 }
@@ -125,6 +127,7 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0xCxxx → C0xxx     (config)
     //   0xDxxx → D0xxx     (driver / compilation-unit)
     //   0xAxxx → I0xxx     (MIR verifier / IR-gen mid-level, plan 12 ML3)
+    //   0xBxxx → L0xxx     (LIR lowering + verifier, plan 12 ML5+)
     //   0xExxx → S0xxx     (semantic analysis, plan 08.6)
     //   0xFxxx → H0xxx     (HIR verifier / lowering, plan 09)
     // Render as the 4-digit hex grouping the user actually sees.
@@ -133,6 +136,8 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     char letter = 'P';
     if (nibble == 0xA000u) {
         letter = 'I';
+    } else if (nibble == 0xB000u) {
+        letter = 'L';
     } else if (nibble == 0xC000u) {
         letter = 'C';
     } else if (nibble == 0xD000u) {
@@ -143,11 +148,11 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'H';
     }
     // Strip the high nibble for the numeric portion when it's a phase
-    // marker (C/D/S/H/I). The 9xxx range stays 9xxx so P_BuilderInvariant
+    // marker (C/D/S/H/I/L). The 9xxx range stays 9xxx so P_BuilderInvariant
     // prints as "P9000".
-    const bool hasNibbleMarker = (nibble == 0xA000u || nibble == 0xC000u
-                                  || nibble == 0xD000u || nibble == 0xE000u
-                                  || nibble == 0xF000u);
+    const bool hasNibbleMarker = (nibble == 0xA000u || nibble == 0xB000u
+                                  || nibble == 0xC000u || nibble == 0xD000u
+                                  || nibble == 0xE000u || nibble == 0xF000u);
     const std::uint16_t lo = hasNibbleMarker ? (v & 0x0FFFu) : v;
     return std::format("{}{:04X}", letter, lo);
 }
