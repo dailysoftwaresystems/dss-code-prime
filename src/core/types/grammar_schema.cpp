@@ -70,13 +70,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadShipped(std::strin
     const std::string leaf = std::string{name} + ".lang.json";
 
     // Walk up the directory tree from cwd looking for
-    // `src/source-config/languages/<name>.lang.json`. This works whether
+    // `src/dss-config/sources/<name>.lang.json`. This works whether
     // the binary is invoked from the repo root, from build/, or from a
     // nested tests/core build subdirectory — ctest's cwd varies.
     std::error_code ec;
     fs::path here = fs::current_path(ec);
     for (int i = 0; i < 8 && !here.empty(); ++i) {
-        const fs::path candidate = here / "src" / "source-config" / "languages" / leaf;
+        const fs::path candidate = here / "src" / "dss-config" / "sources" / leaf;
         if (fs::exists(candidate, ec)) {
             return loadFromFile(candidate);
         }
@@ -88,7 +88,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadShipped(std::strin
     return std::unexpected(std::vector<ConfigDiagnostic>{
         {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
          std::string{name},
-         "no shipped language config found in src/source-config/languages/"}});
+         "no shipped language config found in src/dss-config/sources/"}});
 }
 
 LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromText(

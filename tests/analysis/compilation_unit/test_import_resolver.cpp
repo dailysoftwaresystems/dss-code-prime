@@ -61,7 +61,7 @@ private:
 };
 
 // Read the shipped `<name>.lang.json` TEXT by walking up from cwd to the repo
-// `src/source-config/languages/` directory — mirrors GrammarSchema::loadShipped's
+// `src/dss-config/sources/` directory — mirrors GrammarSchema::loadShipped's
 // search so the genericity test reads the exact bytes the loader would.
 [[nodiscard]] std::string readShippedConfigText(std::string_view name) {
     namespace fs = std::filesystem;
@@ -69,7 +69,7 @@ private:
     std::error_code ec;
     fs::path here = fs::current_path(ec);
     for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "source-config" / "languages" / leaf;
+        fs::path const candidate = here / "src" / "dss-config" / "sources" / leaf;
         if (fs::exists(candidate, ec)) {
             std::ifstream in(candidate, std::ios::binary);
             return std::string(std::istreambuf_iterator<char>(in),

@@ -1,5 +1,4 @@
 #include "lir/lir.hpp"
-#include "lir/targets/x86_64.hpp"
 
 #include <array>
 #include <cstdio>
@@ -19,38 +18,9 @@ namespace {
 
 } // namespace
 
-// Per-target opcode-info dispatch. Forward-declared in lir_opcode.hpp;
-// definition here knows each target's header. A new target (ARM64,
-// etc.) adds its case to this switch + provides its own
-// `opcodeInfo()` overload in the target header.
-LirOpcodeInfo lirOpcodeInfo(TargetId target, std::uint16_t opcode) noexcept {
-    switch (target) {
-        case TargetId::X86_64: {
-            auto const op = static_cast<x86_64::Opcode>(opcode);
-            if (op < x86_64::Opcode::Invalid || op >= x86_64::Opcode::Count_) {
-                return LirOpcodeInfo{};
-            }
-            return x86_64::opcodeInfo(op);
-        }
-        case TargetId::ARM64:
-            // ARM64 backend lands in cycle 1b. Until then, return the
-            // sentinel so the verifier flags any ARM64 LIR module
-            // built via this substrate.
-            return LirOpcodeInfo{};
-        case TargetId::Invalid:
-            return LirOpcodeInfo{};
-    }
-    return LirOpcodeInfo{};
-}
-
-bool lirIsTerminator(TargetId target, std::uint16_t opcode) noexcept {
-    LirOpcodeInfo const info = lirOpcodeInfo(target, opcode);
-    return info.isTerminator;
-}
-
 // ── Lir ──────────────────────────────────────────────────────────
 
-Lir::Lir(TargetId target, InstArena instArena, BlockArena blockArena,
+Lir::Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
          FuncArena funcArena, std::vector<LirOperand> operandPool,
          std::vector<LirBlockId> succPool) noexcept
     : target_(target),
@@ -137,14 +107,17 @@ std::uint32_t mintLirModuleId() noexcept {
 }
 } // namespace
 
-LirBuilder::LirBuilder(TargetId target)
+LirBuilder::LirBuilder(TargetSchema const& schema)
     : moduleId_(mintLirModuleId()),
-      target_(target),
+      target_(schema),
       instArena_(moduleId_),
       blockArena_(moduleId_),
       funcArena_(moduleId_) {
-    if (target == TargetId::Invalid) {
-        lirFatal("LirBuilder: target cannot be Invalid");
+    if (!schema.id().valid()) {
+        lirFatal("LirBuilder: TargetSchema has an invalid id");
+    }
+    if (schema.opcodeCount() == 0) {
+        lirFatal("LirBuilder: TargetSchema has no opcodes (slot-0 sentinel required)");
     }
     // ArenaBuilder(Tag) already reserves slot 0 — no explicit add needed.
 }
@@ -243,12 +216,11 @@ LirInstId LirBuilder::addInst(std::uint16_t opcode, LirReg result,
                               std::uint32_t payload, std::uint8_t flags) {
     if (opcode == 0) lirFatal("LirBuilder::addInst: Invalid opcode");
     // Per-target opcode-range guard: a caller passing an opcode from
-    // a different target's enum (or a stale integer) silently freezes
-    // a mismatched module today; the dispatch returns a sentinel
-    // `LirOpcodeInfo{}` (mnemonic == "?") for out-of-range opcodes.
-    LirOpcodeInfo const info = lirOpcodeInfo(target_, opcode);
-    if (info.mnemonic.empty() || info.mnemonic == "?") {
-        lirFatal("LirBuilder::addInst: opcode not registered for the active target");
+    // outside the schema's opcode table silently freezes a mismatched
+    // module today; the schema's `opcodeInfo` returns nullptr for
+    // out-of-range opcodes.
+    if (target_.opcodeInfo(opcode) == nullptr) {
+        lirFatal("LirBuilder::addInst: opcode not registered for the active target schema");
     }
     detail::LirInst inst;
     inst.opcode       = opcode;
@@ -263,7 +235,7 @@ LirInstId LirBuilder::addInst(std::uint16_t opcode, LirReg result,
 }
 
 LirInstId LirBuilder::addBr(std::uint16_t opcode, LirBlockId target) {
-    if (!lirIsTerminator(target_, opcode)) {
+    if (!target_.isTerminator(opcode)) {
         lirFatal("LirBuilder::addBr: opcode is not a terminator for this target");
     }
     LirOperand ref;
@@ -280,7 +252,7 @@ LirInstId LirBuilder::addBr(std::uint16_t opcode, LirBlockId target) {
 LirInstId LirBuilder::addCondBr(std::uint16_t opcode,
                                 std::span<LirOperand const> operands,
                                 LirBlockId ifTrue, LirBlockId ifFalse) {
-    if (!lirIsTerminator(target_, opcode)) {
+    if (!target_.isTerminator(opcode)) {
         lirFatal("LirBuilder::addCondBr: opcode is not a terminator for this target");
     }
     LirInstId const id = addInst(opcode, InvalidLirReg, operands);
@@ -292,7 +264,7 @@ LirInstId LirBuilder::addCondBr(std::uint16_t opcode,
 
 LirInstId LirBuilder::addReturn(std::uint16_t opcode,
                                 std::span<LirOperand const> operands) {
-    if (!lirIsTerminator(target_, opcode)) {
+    if (!target_.isTerminator(opcode)) {
         lirFatal("LirBuilder::addReturn: opcode is not a terminator for this target");
     }
     LirInstId const id = addInst(opcode, InvalidLirReg, operands);
@@ -323,7 +295,7 @@ void LirBuilder::closeFunction_() {
         // invariant is enforced regardless of build path.
         std::uint32_t const lastSlot = blk.instStart + blk.instCount - 1;
         auto const& lastInst = instArena_.at(LirInstId{lastSlot, moduleId_.v});
-        if (!lirIsTerminator(target_, lastInst.opcode)) {
+        if (!target_.isTerminator(lastInst.opcode)) {
             lirFatal("LirBuilder::closeFunction: block's last instruction is not a terminator");
         }
     }
@@ -337,7 +309,7 @@ void LirBuilder::closeFunction_() {
 Lir LirBuilder::finish() && {
     if (openFunc_.valid()) closeFunction_();
     return Lir{
-        target_,
+        target_.id(),
         std::move(instArena_).finish(),
         std::move(blockArena_).finish(),
         std::move(funcArena_).finish(),

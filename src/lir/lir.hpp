@@ -4,8 +4,8 @@
 #include "core/substrate/arena_attribute.hpp"
 #include "core/substrate/arena_container.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/target_schema.hpp"
 #include "lir/lir_node.hpp"
-#include "lir/lir_opcode.hpp"
 #include "lir/lir_reg.hpp"
 
 #include <cstdint>
@@ -13,20 +13,25 @@
 #include <span>
 #include <vector>
 
-// `Lir` (ML5 cycle 1) — the frozen, immutable low-level IR module.
-// Per-target instruction set; the `TargetId` tag tells consumers
-// which per-target opcode enum the raw `opcode` integers belong to.
+// `Lir` (ML5) — the frozen, immutable low-level IR module. Per-target
+// instruction set carried as a `TargetSchemaId` (runtime tag minted
+// when the target's JSON config was loaded via `TargetSchema::
+// loadShipped`). Cycle 2 pivot: targets are config files in
+// `src/dss-config/targets/*.target.json`, NOT C++ code; the LIR
+// substrate is fully target-blind and looks up opcode info via the
+// schema attached to the module.
 //
 // Mirrors `Mir` (ML1): three arenas (instructions, blocks, functions)
 // tagged by one `LirModuleId`, module-owned pools for non-contiguous
 // lists (operand pool, succ pool). Build-once-freeze: `LirBuilder` is
 // single-use and `finish()` returns the immutable module.
 //
-// Cycle 1 scope (this file): just the substrate. No instruction
-// selection (cycle 2), no register allocation (ML6), no calling-
-// convention lowering (ML7), no text format (ML8). Production code
-// using LIR today would be: ML2's hir_to_mir → ML5's mir_to_lir
-// (cycle 2) → Lir → ML6's regalloc → encoded machine bytes.
+// Cycle 2 scope: substrate refactored to consume `TargetSchema`. No
+// instruction selection (cycle 3), no register allocation (ML6), no
+// calling-convention lowering (ML7), no text format (ML8). Production
+// code using LIR today would be:
+//   `TargetSchema::loadShipped("x86_64")` → LirBuilder(schema) →
+//   MIR→LIR isel (cycle 3) → Lir → ML6's regalloc → encoded bytes.
 
 namespace dss {
 
@@ -42,7 +47,7 @@ public:
     using TagType = LirModuleId;
 
     Lir() noexcept = default;
-    Lir(TargetId target, InstArena instArena, BlockArena blockArena,
+    Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
         FuncArena funcArena, std::vector<LirOperand> operandPool,
         std::vector<LirBlockId> succPool) noexcept;
 
@@ -52,8 +57,8 @@ public:
     Lir& operator=(Lir&&) noexcept;
 
     // ── identity / introspection ──
-    [[nodiscard]] LirModuleId id()         const noexcept { return instArena_.id(); }
-    [[nodiscard]] TargetId    targetId()   const noexcept { return target_; }
+    [[nodiscard]] LirModuleId    id()          const noexcept { return instArena_.id(); }
+    [[nodiscard]] TargetSchemaId targetId()    const noexcept { return target_; }
     [[nodiscard]] std::size_t nodeCount()  const noexcept { return instArena_.nodeCount(); }
     [[nodiscard]] bool        empty()      const noexcept { return instArena_.empty(); }
     [[nodiscard]] std::size_t instCount()  const noexcept { return nodeCount(); }
@@ -89,7 +94,7 @@ public:
     [[nodiscard]] LirFuncId   funcAt(std::uint32_t i) const;
 
 private:
-    TargetId                  target_ = TargetId::Invalid;
+    TargetSchemaId            target_{};
     InstArena                 instArena_;
     BlockArena                blockArena_;
     FuncArena                 funcArena_;
@@ -115,15 +120,20 @@ using LirFuncAttribute  = substrate::ArenaAttribute<Lir::FuncArena, T>;
 // target a block before its body is materialized.
 class DSS_EXPORT LirBuilder {
 public:
-    explicit LirBuilder(TargetId target);
+    // The builder must outlive the schema (the schema's opcode-info
+    // table is read on every `addInst`/terminator call to validate
+    // the opcode + classify terminator-ness). The schema's lifetime is
+    // typically managed by a `shared_ptr` higher up.
+    explicit LirBuilder(TargetSchema const& schema);
 
     LirBuilder(LirBuilder const&)            = delete;
     LirBuilder& operator=(LirBuilder const&) = delete;
     LirBuilder(LirBuilder&&) noexcept        = default;
     LirBuilder& operator=(LirBuilder&&) noexcept = default;
 
-    [[nodiscard]] LirModuleId id()       const noexcept { return moduleId_; }
-    [[nodiscard]] TargetId    targetId() const noexcept { return target_; }
+    [[nodiscard]] LirModuleId         id()       const noexcept { return moduleId_; }
+    [[nodiscard]] TargetSchemaId      targetId() const noexcept { return target_.id(); }
+    [[nodiscard]] TargetSchema const& schema()   const noexcept { return target_; }
 
     // Open a function. Closes the current function first (which
     // requires its current block be terminated + the function have
@@ -172,7 +182,7 @@ private:
     [[nodiscard]] std::uint32_t appendOperands_(std::span<LirOperand const> operands);
 
     LirModuleId             moduleId_;
-    TargetId                target_   = TargetId::Invalid;
+    TargetSchema const&     target_;
     substrate::ArenaBuilder<detail::LirInst,  LirInstId,  LirModuleId> instArena_;
     substrate::ArenaBuilder<detail::LirBlock, LirBlockId, LirModuleId> blockArena_;
     substrate::ArenaBuilder<detail::LirFunc,  LirFuncId,  LirModuleId> funcArena_;

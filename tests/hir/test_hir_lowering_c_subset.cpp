@@ -1966,7 +1966,7 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     fs::path here = fs::current_path();
     fs::path schemaPath;
     for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const cand = here / "src" / "source-config" / "languages" / "c-subset.lang.json";
+        fs::path const cand = here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
         if (fs::exists(cand)) { schemaPath = cand; break; }
         fs::path const par = here.parent_path();
         if (par == here) break;

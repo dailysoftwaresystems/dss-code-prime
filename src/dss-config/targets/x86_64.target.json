@@ -1,0 +1,102 @@
+{
+  "$comment": "x86_64 target descriptor (plan 12 §2.6 ML5 cycle 2 pivot — config-driven targets). Parallels src/dss-config/sources/*.lang.json: a compile target is a config file the LIR substrate reads, NOT C++ code. Adding a new target = drop a new .target.json. Loaded via TargetSchema::loadShipped(\"x86_64\").",
+  "dssTargetVersion": 1,
+  "target": {
+    "name": "x86_64",
+    "version": "0.1",
+    "description": "Minimal x86_64 opcode set for ML5 cycle 2. Cycle 3 (instruction selection) expands to full c-subset corpus coverage; cycle 2b adds the register file + ABI sections."
+  },
+  "opcodes": [
+    {
+      "$comment": "Slot 0 = the Invalid sentinel. Every target must declare it as the first opcode so the substrate's `opcode == 0` check (in LirBuilder::addInst) catches default-constructed insts loudly.",
+      "mnemonic":      "invalid",
+      "result":        "none",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "mov",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "add",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "sub",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "cmp",
+      "result":        "none",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "jmp",
+      "result":        "none",
+      "isTerminator":  true,
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 1,
+      "maxSuccessors": 1
+    },
+    {
+      "mnemonic":      "jcc",
+      "result":        "none",
+      "isTerminator":  true,
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   255,
+      "minSuccessors": 2,
+      "maxSuccessors": 2
+    },
+    {
+      "mnemonic":      "call",
+      "result":        "optional",
+      "isTerminator":  false,
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   255,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "mnemonic":      "ret",
+      "result":        "none",
+      "isTerminator":  true,
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    }
+  ]
+}
