@@ -130,7 +130,15 @@ struct Lowerer {
         : mir(m), target(t), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()) {
         baselineErrors = reporter.errorCount();
-        // Mnemonics in MnemonicSlot enum-declaration order.
+        // Mnemonics in MnemonicSlot enum-declaration order. The
+        // `static_assert` below closes the silent-drift hazard 4
+        // review agents converged on: if a developer adds a slot to
+        // `MnemonicSlot` but forgets to add its mnemonic here (or
+        // vice-versa), compilation fails LOUD rather than silently
+        // zero-filling the array and returning `nullopt` from every
+        // `opcodeByMnemonic("")` lookup. Each slot is positionally
+        // indexed; a single off-by-one would corrupt all subsequent
+        // opcode lookups.
         constexpr std::array<std::string_view, kMnemonicCount> kMnemonics{{
             "arg", "mov", "add", "sub", "mul",
             "cmp", "setcc", "jmp", "jcc",
@@ -138,6 +146,11 @@ struct Lowerer {
             "alloca", "load", "store", "lea",
             "sext", "zext", "trunc",
         }};
+        static_assert(kMnemonics.size() == kMnemonicCount,
+            "MnemonicSlot enum and kMnemonics array drifted — every slot "
+            "is positionally indexed; a missing or extra row would corrupt "
+            "every subsequent opcode lookup silently. Keep the two in "
+            "lockstep when adding opcodes.");
         for (std::size_t i = 0; i < kMnemonicCount; ++i) {
             cache_[i].mnemonic = kMnemonics[i];
             cache_[i].id       = target.opcodeByMnemonic(kMnemonics[i]);
@@ -260,6 +273,27 @@ struct Lowerer {
         defineValue(id, result);
     }
 
+    // Emit a single-operand `mov` and define the result vreg. Shared
+    // tail of `lowerConst`'s narrow + wide paths (the only difference
+    // between them is the operand-kind in `op`). Returns the result reg
+    // so callers can chain.
+    LirReg emitMovToFresh(MirInstId id, LirOperand op, LirRegClass cls) {
+        LirReg const result = lir.newVReg(cls);
+        std::array<LirOperand, 1> ops{op};
+        lir.addInst(*opcode(MnemonicSlot::Mov), result, ops);
+        defineValue(id, result);
+        return result;
+    }
+
+    // Define a poisoned-value vreg + return false so the caller can
+    // signal "lowering failed but downstream uses get a quiet
+    // placeholder, not a cascade of `regForValue` diagnostics". The
+    // diagnostic for the ROOT cause is the caller's responsibility.
+    void poisonValue(MirInstId id) {
+        LirReg const placeholder = lir.newVReg(LirRegClass::GPR);
+        valueToReg.set(id, placeholder);
+    }
+
     void lowerConst(MirInstId id) {
         if (!opcode(MnemonicSlot::Mov).has_value()) {
             reportMissingOpcode(MnemonicSlot::Mov, "MIR Const");
@@ -267,6 +301,8 @@ struct Lowerer {
         }
         std::uint32_t const litIdx = mir.constLiteralIndex(id);
         MirLiteralValue const& lit = mir.literalValue(litIdx);
+
+        // ── narrow integer path: inline ImmInt32 ──
         std::int32_t imm32 = 0;
         bool fits = false;
         if (auto const* i = std::get_if<std::int64_t>(&lit.value)) {
@@ -285,29 +321,47 @@ struct Lowerer {
             fits  = true;
         }
         if (fits) {
-            LirReg const result = lir.newVReg(LirRegClass::GPR);
-            std::array<LirOperand, 1> ops{LirOperand::makeImmInt32(imm32)};
-            lir.addInst(*opcode(MnemonicSlot::Mov), result, ops);
-            defineValue(id, result);
+            emitMovToFresh(id, LirOperand::makeImmInt32(imm32), LirRegClass::GPR);
             return;
         }
-        // Wide literal — route through the cycle-3c LirLiteralPool.
+
+        // ── wide-literal path: route through LirLiteralPool ──
+        //
+        // Routing: int32-fits → ImmInt (above); int64/uint64/string →
+        // pool with GPR-class result; double → DEFERRED to cycle 3d
+        // (needs FPR-class regalloc + ML6 movd/movq cross-class moves);
+        // monostate / aggregate → unsupported (cycle 3d's aggregate
+        // op flow will land MirAggregate). On the unsupported branch
+        // we still define a poisoned vreg so downstream uses surface
+        // ONE locatable diagnostic for the root cause rather than a
+        // cascade of "used before definition" diagnostics from each
+        // dependent use.
         LirLiteralValue lirLit;
         lirLit.core = lit.core;
+        LirRegClass resultCls = LirRegClass::GPR;
+        bool unsupportedVariant = false;
         if (auto const* i = std::get_if<std::int64_t>(&lit.value))       lirLit.value = *i;
         else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) lirLit.value = *u;
-        else if (auto const* d = std::get_if<double>(&lit.value))        lirLit.value = *d;
-        else if (auto const* b = std::get_if<bool>(&lit.value))          lirLit.value = *b;
         else if (auto const* s = std::get_if<std::string>(&lit.value))   lirLit.value = *s;
+        else if (std::get_if<double>(&lit.value) != nullptr) {
+            // Defer to cycle 3d: writing a double into a GPR-class
+            // vreg would silently corrupt the FPR-bound consumer that
+            // cycle-3d float arithmetic introduces. Cycle 3c does NOT
+            // have FPR-class machinery yet.
+            unsupportedVariant = true;
+        }
         else {
+            // monostate (malformed-source recovery), aggregate (cycle
+            // 3d), or any future variant arm: fail loud + poison.
+            unsupportedVariant = true;
+        }
+        if (unsupportedVariant) {
             reportUnsupported(MirOpcode::Const, id);
+            poisonValue(id);
             return;
         }
         std::uint32_t const lirLitIdx = lir.literalPoolAdd(std::move(lirLit));
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
-        std::array<LirOperand, 1> ops{LirOperand::makeLiteralIndex(lirLitIdx)};
-        lir.addInst(*opcode(MnemonicSlot::Mov), result, ops);
-        defineValue(id, result);
+        emitMovToFresh(id, LirOperand::makeLiteralIndex(lirLitIdx), resultCls);
     }
 
     // ── memory ops (cycle 3c) ────────────────────────────────────────
@@ -363,24 +417,26 @@ struct Lowerer {
     }
 
     void lowerGep(MirInstId id) {
-        if (!opcode(MnemonicSlot::Lea).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Lea, "MIR Gep");
-            return;
-        }
         auto const operands = mir.instOperands(id);
         if (operands.empty()) { reportUnsupported(MirOpcode::Gep, id); return; }
         std::optional<LirReg> const base = regForValue(operands[0]);
         if (!base.has_value()) return;
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
-        // Cycle 3c: degenerate no-index Gep → `lea result, [base + 0]`.
-        // Dynamic indices defer to cycle 3d.
-        std::array<LirOperand, 3> ops{
-            LirOperand::makeReg(*base),
-            LirOperand::makeMemBase(1),
-            LirOperand::makeMemOffset(0),
-        };
-        lir.addInst(*opcode(MnemonicSlot::Lea), result, ops);
-        defineValue(id, result);
+        // Cycle 3c handles ONLY the no-index degenerate (1 operand =
+        // just the base) — emit an explicit identity `mov result, base`
+        // rather than `lea result, [base + 0]`. The identity-mov makes
+        // the no-op visible at the LIR level + reuses ML6's coalescer
+        // path already required for cycle-3c Bitcast/IntToPtr/PtrToInt.
+        // Dynamic indices defer to cycle 3d's 4-operand `lea` arm.
+        if (operands.size() == 1) {
+            if (!opcode(MnemonicSlot::Mov).has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov, "MIR Gep (no-index)");
+                return;
+            }
+            emitMovToFresh(id, LirOperand::makeReg(*base), LirRegClass::GPR);
+            return;
+        }
+        // Dynamic-index Gep (≥2 operands) — anchor for cycle 3d.
+        reportUnsupported(MirOpcode::Gep, id);
     }
 
     // Single-operand value-producing cast. The result register class +

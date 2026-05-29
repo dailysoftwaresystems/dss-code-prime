@@ -144,7 +144,7 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Allocate a stack-frame slot (cycle 3c). Payload encodes (size << 16) | alignment; result is a pointer-class virtreg holding the slot's effective address. ML6/ML7 turns this into a real frame-relative `lea` once the frame layout is known.",
+      "$comment": "Allocate a stack-frame slot (cycle 3c). Cycle 3c is the pass-through layer: payload is threaded verbatim from MIR Alloca (currently 0 — MIR does not yet encode size/align; that lands when ML6's frame-layout phase pulls on it). Result is a pointer-class virtreg holding the slot's effective address. AS1 turns this into a frame-relative `lea` once the frame layout is known.",
       "mnemonic":      "alloca",
       "result":        "value",
       "isTerminator":  false,

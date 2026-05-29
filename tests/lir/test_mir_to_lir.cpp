@@ -649,10 +649,8 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
     ::dss::MirInstId const constInst = mb.addConst(lv, i64);
-    std::array<::dss::MirInstId, 1> retOps{constInst};
     mb.addReturn(constInst);
     ::dss::Mir m = std::move(mb).finish();
-    (void)retOps;
 
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(m, sch, rep);
@@ -682,6 +680,144 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
     EXPECT_TRUE(foundLitMov)
         << "wide-literal mov must use LirOperandKind::LiteralIndex (not ImmInt)";
     EXPECT_EQ(lir.literalPool().size(), 1u);
+}
+
+// ─── cycle 3c review fold-in: cast variant → opcode mapping ─────────────
+//
+// Cycle-3c review pr-test-analyzer (rating 8): cast lowering had zero
+// positive-path coverage — every MIR cast variant could regress its
+// mnemonic mapping silently. Each variant is exercised via synthetic
+// MIR + opcode-mnemonic assertion below.
+
+namespace {
+struct CastCase {
+    ::dss::MirOpcode mirOp;
+    char const*      expectedMnemonic;
+};
+}
+
+class MirToLirCastMapping : public ::testing::TestWithParam<CastCase> {};
+
+TEST_P(MirToLirCastMapping, EmitsExpectedMnemonic) {
+    auto const param = GetParam();
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    // Synthetic MIR: int32 arg → cast → return. Each variant must
+    // dispatch to its named LIR mnemonic per the cycle-3c table.
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32 = interner.primitive(::dss::TypeKind::I32);
+    auto const i64 = interner.primitive(::dss::TypeKind::I64);
+    std::array<::dss::TypeId, 1> params{i32};
+    auto const fnSig = interner.fnSig(params, i64, ::dss::CallConv::CcSysV);
+
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const argInst = mb.addArg(0, i32);
+    std::array<::dss::MirInstId, 1> castOps{argInst};
+    ::dss::MirInstId const castInst = mb.addInst(param.mirOp, castOps, i64);
+    mb.addReturn(castInst);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, rep);
+    ASSERT_TRUE(result.ok)
+        << "cast (MirOpcode " << static_cast<int>(param.mirOp) << ")"
+        << " must lower cleanly via mnemonic `" << param.expectedMnemonic << "`";
+
+    ::dss::Lir const& lir = result.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    auto const expectedOp = *sch.opcodeByMnemonic(param.expectedMnemonic);
+    bool foundCast = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        auto const o = lir.instOpcode(lir.blockInstAt(entry, i));
+        if (o == expectedOp) { foundCast = true; break; }
+    }
+    EXPECT_TRUE(foundCast)
+        << "cast (MirOpcode " << static_cast<int>(param.mirOp) << ")"
+        << " must emit LIR opcode `" << param.expectedMnemonic << "`";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllCastVariants, MirToLirCastMapping,
+    ::testing::Values(
+        CastCase{::dss::MirOpcode::Trunc,    "trunc"},
+        CastCase{::dss::MirOpcode::SExt,     "sext"},
+        CastCase{::dss::MirOpcode::ZExt,     "zext"},
+        CastCase{::dss::MirOpcode::Bitcast,  "mov"},
+        CastCase{::dss::MirOpcode::IntToPtr, "mov"},
+        CastCase{::dss::MirOpcode::PtrToInt, "mov"}
+    ));
+
+TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
+    // Parallel to WideLiteralRoutesThroughLiteralPool but for the string
+    // variant (rating 7 from pr-test-analyzer). Closes the cycle-3c
+    // float/string-untested gap; double defers to cycle 3d's FPR class.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const ptrT  = interner.primitive(::dss::TypeKind::Ptr);
+    auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, ptrT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    ::dss::MirLiteralValue lv;
+    lv.value = std::string{"hello world"};
+    lv.core  = ::dss::TypeKind::Ptr;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const constInst = mb.addConst(lv, ptrT);
+    mb.addReturn(constInst);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, rep);
+    ASSERT_TRUE(result.ok);
+    ::dss::Lir const& lir = result.lir;
+    ASSERT_EQ(lir.literalPool().size(), 1u);
+    auto const& lirLit = lir.literalValue(0);
+    auto const* asStr  = std::get_if<std::string>(&lirLit.value);
+    ASSERT_NE(asStr, nullptr);
+    EXPECT_EQ(*asStr, "hello world");
+}
+
+TEST(MirToLir, WideLiteralDoubleDefersToCycle3d) {
+    // Pin the cycle-3c double-deferral: a double literal must
+    // fail-loud rather than silently route to a GPR-class vreg
+    // (which would corrupt FPR-bound consumers once cycle 3d lands).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64   = interner.primitive(::dss::TypeKind::F64);
+    auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, f64, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    ::dss::MirLiteralValue lv;
+    lv.value = 3.14;
+    lv.core  = ::dss::TypeKind::F64;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const constInst = mb.addConst(lv, f64);
+    mb.addReturn(constInst);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, rep);
+    EXPECT_FALSE(result.ok)
+        << "double literal must fail-loud (cycle 3d adds FPR-class machinery)";
+    bool foundUnsupported = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == ::dss::DiagnosticCode::L_UnsupportedLoweringForOpcode) {
+            foundUnsupported = true; break;
+        }
+    }
+    EXPECT_TRUE(foundUnsupported);
 }
 
 TEST(MirToLir, LinkRegisterUnknownNameRejectedNegativePath) {

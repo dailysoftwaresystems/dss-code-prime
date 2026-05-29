@@ -30,11 +30,15 @@ enum class LirOperandKind : std::uint8_t {
     ImmFloat   = 3,  // double immediate (passed verbatim to encoder)
     BlockRef   = 4,  // basic-block reference (br targets, etc.)
     SymbolRef  = 5,  // symbol reference (call targets, GlobalAddr)
-    // Memory operands (base + index + scale + displacement) are a
-    // sequence of two pool entries (a `MemBase` followed by a
-    // `MemOffset`) so each pool slot stays a uniform 8 bytes. The
-    // builder emits them as a paired construct; the verifier checks
-    // the pairing.
+    // Memory addressing modes (base + index + scale + displacement)
+    // are spread across THREE pool entries to keep each pool slot a
+    // uniform 8 bytes: a leading `Reg` operand for the base, then a
+    // `MemBase` (the scale field), then a `MemOffset` (the displacement).
+    // Cycle 3d's 4-operand `lea` arm adds an optional `Reg` index
+    // operand between base and MemBase. The builder emits these as a
+    // paired construct (cycle 3c lowerLoad/lowerStore/lowerGep);
+    // `LirVerifier` will check the pairing once ML6 starts consuming
+    // memory addresses.
     MemBase    = 6,
     MemOffset  = 7,
     // Pool index for wide literals (int64/double/string/aggregate). The
