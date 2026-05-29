@@ -329,25 +329,45 @@ struct Lowerer {
 
     // ── terminator + phi resolution ──────────────────────────────────
 
-    // Emit the phi-edge moves for one (predecessor, successor) edge:
-    // walk every Phi in the successor block; for each, find the incoming
-    // whose `pred == currentMirBlock` and emit `mov phi_lir_reg,
-    // incoming_value_lir_reg`. Called BEFORE the predecessor's LIR
-    // terminator so the moves dominate every use in the successor.
+    // Emit the phi-edge moves for one (predecessor, successor) edge.
+    //
+    // Algorithm — parallel-copy resolution via temporaries:
+    //   For each phi P in `successorMir` with incoming I_P from
+    //   `currentMir`, build the pair (phiReg_P, incomingReg_P). Multiple
+    //   phis in the same block may form a copy graph where phi A's
+    //   incoming is phi B's pre-allocated result (the classic SSA-
+    //   destruction "swap" hazard). Naive sequential `mov phi, incoming`
+    //   would corrupt later reads of the overwritten incomingReg.
+    //
+    //   Two-step emission breaks all dependency cycles unconditionally:
+    //   (1) for each (phiReg, incomingReg) pair, mint a fresh `tmpReg`
+    //       and emit `mov tmpReg, incomingReg`. The incomingReg's value
+    //       is now captured in a vreg that no subsequent phi-move reads.
+    //   (2) for each pair, emit `mov phiReg, tmpReg`.
+    //
+    //   Trade-off: O(n) extra vregs vs O(n^2) cycle detection. Pre-
+    //   regalloc this is cheap; ML6 coalescing will collapse the temps
+    //   into direct copies where the dep-graph allows.
+    //
+    // The diagnostic shape pins:
+    //  - phi without a pre-allocated vreg (substrate bug) → loud
+    //  - incoming `value` resolves to a missing vreg → phi-specific
+    //    diagnostic (NOT just regForValue's generic one), and the move
+    //    is SKIPPED so a poisoned tmp does not silently propagate
+    //  - phi without an incoming for this predecessor → loud
     void emitPhiMovesForEdge(MirBlockId currentMir, MirBlockId successorMir) {
         if (!opMov.has_value()) {
             reportMissingOpcode(SlotMov, "mov", "MIR Phi edge");
             return;
         }
+        // Collect (phiReg, incomingReg) pairs for this edge.
+        struct Pair { LirReg phi; LirReg incoming; };
+        std::vector<Pair> pairs;
         std::uint32_t const n = mir.blockInstCount(successorMir);
         for (std::uint32_t i = 0; i < n; ++i) {
             MirInstId const inst = mir.blockInstAt(successorMir, i);
             if (mir.instOpcode(inst) != MirOpcode::Phi) continue;
-            // Phi result reg was pre-allocated by `prepassAllocatePhis`.
             if (!valueToReg.has(inst)) {
-                // Defensive: a phi without a pre-allocated vreg is a
-                // substrate bug. Diagnose and skip; the using-site will
-                // surface its own `regForValue` diagnostic.
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
                 d.severity = DiagnosticSeverity::Error;
@@ -359,17 +379,27 @@ struct Lowerer {
                 continue;
             }
             LirReg const phiReg = valueToReg.get(inst);
-            // Find the incoming whose pred matches the current MIR block.
-            // MIR pinches phi incomings to a fixed (value, pred) list; one
-            // entry per predecessor.
             bool matched = false;
             for (MirPhiIncoming const& inc : mir.phiIncomings(inst)) {
                 if (inc.pred != currentMir) continue;
                 matched = true;
                 std::optional<LirReg> const v = regForValue(inc.value);
-                if (!v.has_value()) break;
-                std::array<LirOperand, 1> ops{LirOperand::makeReg(*v)};
-                lir.addInst(*opMov, phiReg, ops);
+                if (!v.has_value()) {
+                    // regForValue already emitted a generic diagnostic;
+                    // add the phi-edge-specific context so the failure is
+                    // locally attributable.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "MIR Phi %{} edge from predecessor block %{} lost "
+                        "its incoming value %{} — phi result will be "
+                        "unwritten on this edge",
+                        inst.v, currentMir.v, inc.value.v);
+                    reporter.report(std::move(d));
+                    break;
+                }
+                pairs.push_back(Pair{phiReg, *v});
                 break;
             }
             if (!matched) {
@@ -381,6 +411,22 @@ struct Lowerer {
                     inst.v, currentMir.v);
                 reporter.report(std::move(d));
             }
+        }
+        if (pairs.empty()) return;
+        // Step 1: copy every incoming into a fresh temp. Breaks any
+        // dependency cycle on the phi-reg side unconditionally.
+        std::vector<LirReg> temps;
+        temps.reserve(pairs.size());
+        for (auto const& p : pairs) {
+            LirReg const tmp = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> ops{LirOperand::makeReg(p.incoming)};
+            lir.addInst(*opMov, tmp, ops);
+            temps.push_back(tmp);
+        }
+        // Step 2: write each phi-result from its captured temp.
+        for (std::size_t k = 0; k < pairs.size(); ++k) {
+            std::array<LirOperand, 1> ops{LirOperand::makeReg(temps[k])};
+            lir.addInst(*opMov, pairs[k].phi, ops);
         }
     }
 
@@ -484,16 +530,17 @@ struct Lowerer {
         }
         // Naive: compare the Bool value against 0, jcc-Ne taken when true.
         // Optimizer fuses adjacent ICmp + CondBr to a single cmp/jcc-cond.
+        // The jcc condition is written into the inst's `payload` field via
+        // the cycle-3b-extended `addCondBr(payload=...)` overload — closes
+        // the cycle-3b-review HIGH finding where the payload silently
+        // defaulted to 0 (= TargetCondCode::Eq) and inverted the branch.
         std::array<LirOperand, 2> cmpOps{
             LirOperand::makeReg(*cond), LirOperand::makeImmInt32(0)};
         lir.addInst(*opCmp, InvalidLirReg, cmpOps);
         lir.addCondBr(*opJcc, std::span<LirOperand const>{},
                       mirBlockToLirBlock.get(succs[0]),
-                      mirBlockToLirBlock.get(succs[1]));
-        // payload encodes condition for the jcc; addCondBr currently
-        // doesn't expose a payload setter — the condition is `Ne` and is
-        // documented by convention for cycle 3b. ML7+ will widen the
-        // builder to take an explicit condition payload.
+                      mirBlockToLirBlock.get(succs[1]),
+                      static_cast<std::uint32_t>(TargetCondCode::Ne));
         return true;
     }
 
@@ -558,6 +605,9 @@ struct Lowerer {
 
             // Allocate a "next compare" block unless this is the last
             // case (in which case we fall through to a `jmp default`).
+            // The jcc condition is `Eq` (case matches the constant).
+            std::uint32_t const eqCond =
+                static_cast<std::uint32_t>(TargetCondCode::Eq);
             LirBlockId nextBlock;
             bool const isLastCase = (i + 1 == caseCount);
             LirBlockId const caseTarget = mirBlockToLirBlock.get(succs[i]);
@@ -566,14 +616,14 @@ struct Lowerer {
                 // to a tiny "jmp default" block.
                 LirBlockId const defaultJump = lir.createBlock();
                 lir.addCondBr(*opJcc, std::span<LirOperand const>{},
-                              caseTarget, defaultJump);
+                              caseTarget, defaultJump, eqCond);
                 lir.beginBlock(defaultJump);
                 lir.addBr(*opJmp, mirBlockToLirBlock.get(defaultMir));
                 return true;
             }
             nextBlock = lir.createBlock();
             lir.addCondBr(*opJcc, std::span<LirOperand const>{},
-                          caseTarget, nextBlock);
+                          caseTarget, nextBlock, eqCond);
             lir.beginBlock(nextBlock);
         }
         // No cases (only default): jmp default.
@@ -586,15 +636,7 @@ struct Lowerer {
             reportMissingOpcode(SlotUnreachable, "unreachable", "MIR Unreachable");
             return false;
         }
-        // `unreachable` is a terminator opcode but the LirBuilder only has
-        // `addBr`/`addCondBr`/`addReturn` terminators today. Emit via
-        // `addReturn` whose contract is "seals the block with a terminator
-        // opcode of the caller's choice" — the schema says `unreachable` is
-        // a terminator, and the substrate's `addReturn` doesn't enforce
-        // 'must be ret'; it enforces 'opcode is terminator + operand-count
-        // matches'. Cycle 3b adds an explicit `addUnreachable` if a future
-        // consumer needs the cleaner spelling.
-        lir.addReturn(*opUnreachable, std::span<LirOperand const>{});
+        lir.addUnreachable(*opUnreachable);
         return true;
     }
 
@@ -629,12 +671,19 @@ struct Lowerer {
             return;
         }
         // Lower non-terminator instructions first.
+        //
+        // Two structural-violation guards run as we iterate:
+        //   - terminator in non-last position
+        //   - Phi at a non-leading position (Phi must precede every non-
+        //     Phi inst by MIR's structural rule; cycle 3b's `lowerInst`
+        //     no-ops Phi by design so we must catch mis-positioned Phis
+        //     loud here)
         MirInstId const term = mir.blockInstAt(mb, n - 1);
+        bool sawNonPhi = false;
         for (std::uint32_t i = 0; i + 1 < n; ++i) {
             MirInstId const inst = mir.blockInstAt(mb, i);
             MirOpcode const op = mir.instOpcode(inst);
             if (isMirTerminator(op)) {
-                // Terminator in non-last position is malformed MIR.
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
                 d.severity = DiagnosticSeverity::Error;
@@ -644,6 +693,17 @@ struct Lowerer {
                     mirOpcodeName(op), inst.v);
                 reporter.report(std::move(d));
             }
+            if (op == MirOpcode::Phi && sawNonPhi) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "MIR Phi (inst {}) follows a non-Phi instruction — "
+                    "structural violation (Phis must lead the block)",
+                    inst.v);
+                reporter.report(std::move(d));
+            }
+            if (op != MirOpcode::Phi) sawNonPhi = true;
             lowerInst(inst);
         }
         // Then the terminator (which is also responsible for emitting

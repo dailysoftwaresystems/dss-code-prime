@@ -93,7 +93,7 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Hard-trap / 'this code path is unreachable'. Cycle 3b lowers MIR Unreachable to this so a malformed CFG terminator is a runtime fault, not an empty block. AS1 maps to x86_64 ud2; ML6 keeps it block-sealing-equivalent.",
+      "$comment": "Hard-trap / 'this code path is unreachable'. Cycle 3b lowers MIR Unreachable via `LirBuilder::addUnreachable` (the dedicated zero-successor terminator API added in cycle 3b's review fix-up). AS1 maps to x86_64 ud2; ML6 keeps it block-sealing-equivalent.",
       "mnemonic":      "unreachable",
       "result":        "none",
       "isTerminator":  true,

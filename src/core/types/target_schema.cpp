@@ -218,8 +218,12 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
 
         // Link register (AAPCS64-shape). When declared, must resolve to
         // a GPR-class register — ML7 will spill it in the prologue.
+        // The loader pre-resolved name → ordinal atomically, so this
+        // check enforces the class invariant; the resolution invariant
+        // is enforced by the loader itself (an unresolved name emits a
+        // diagnostic at load time, before validate() runs).
         if (cc.linkRegister.has_value()) {
-            std::span<std::string const> linkRefs{&*cc.linkRegister, 1};
+            std::span<std::string const> linkRefs{&cc.linkRegister->name, 1};
             checkRefs(i, "linkRegister", linkRefs, TargetRegClass::GPR);
         }
 

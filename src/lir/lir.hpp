@@ -164,11 +164,20 @@ public:
 
     // ── terminators (each seals the current block) ──
     LirInstId addBr(std::uint16_t opcode, LirBlockId target);
+    // `payload` is the per-opcode scalar field on the emitted inst —
+    // for conditional branches it carries the `TargetCondCode` enum (jcc
+    // condition). Default 0 preserves the cycle-1/2 zero-payload contract
+    // for callers that don't care about the condition channel.
     LirInstId addCondBr(std::uint16_t opcode,
                         std::span<LirOperand const> operands,
-                        LirBlockId ifTrue, LirBlockId ifFalse);
+                        LirBlockId ifTrue, LirBlockId ifFalse,
+                        std::uint32_t payload = 0);
     LirInstId addReturn(std::uint16_t opcode,
                         std::span<LirOperand const> operands);
+    // Zero-successor terminator that is NOT a return — separated from
+    // `addReturn` so the call-site spelling matches the semantics. AS1
+    // maps to x86_64 ud2 / ARM64 brk / WASM unreachable.
+    LirInstId addUnreachable(std::uint16_t opcode);
 
     // Consume the builder, returning the frozen Lir module. Aborts
     // on any contract violation (open function with no terminated

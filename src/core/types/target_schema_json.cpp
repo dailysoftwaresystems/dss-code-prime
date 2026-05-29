@@ -330,18 +330,25 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   std::format("{}/linkRegister", ccPath),
                                   "must be a register-name string");
                     } else {
-                        cc.linkRegister = c.at("linkRegister").get<std::string>();
-                        // Cache the resolved ordinal at load time (cycle
-                        // 3b fold of the cycle-3a deferred item) so ML7
-                        // callconv lowering can index without re-looking-
-                        // up. `validate()` later verifies the name
-                        // resolves to a GPR-class register; if not, the
-                        // schema is rejected anyway, so the cached
-                        // ordinal is only consumed on successfully-loaded
-                        // schemas.
-                        auto it = data.registerIndex.find(*cc.linkRegister);
+                        auto const name = c.at("linkRegister").get<std::string>();
+                        // Atomic population: only engage the optional when
+                        // the name resolves. Validate() handles the
+                        // unresolved case fail-loud. The struct shape
+                        // prevents a "name set, ordinal unset" state.
+                        auto it = data.registerIndex.find(name);
                         if (it != data.registerIndex.end()) {
-                            cc.linkRegisterOrdinal = it->second;
+                            cc.linkRegister = TargetCallingConvention::LinkRegisterRef{
+                                name, it->second
+                            };
+                        } else {
+                            // Emit the diagnostic NOW so the cycle-3b
+                            // validate() catches it even when the name's
+                            // string is not retained. (Validate() also
+                            // re-checks via the optional's presence.)
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/linkRegister", ccPath),
+                                      std::format("link register '{}' is not "
+                                                  "in the register table", name));
                         }
                     }
                 }

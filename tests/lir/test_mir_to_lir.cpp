@@ -351,33 +351,192 @@ TEST(MirToLir, IfElseLowersToCondBrChain) {
     EXPECT_TRUE(foundSetcc) << "ICmpSgt must materialize a bool via setcc";
 }
 
-TEST(MirToLir, AllICmpVariantsAccepted) {
-    // Each ICmp variant lowers via cmp + setcc(condition); verify all 10
-    // variants accept and produce setcc with the right condition payload.
+TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
+    // C-subset's `int` is signed, so the surface-visible comparison ops
+    // (`==`/`!=`/`<`/`<=`/`>`/`>=`) lower to the signed conditions only.
+    // Each test source feeds the comparison through `if (...)` so the
+    // setcc is emitted (CondBr re-fetches via cmp+0; the setcc isn't the
+    // immediate predecessor of the jcc — but it MUST appear in the entry
+    // block carrying the right condition). Unsigned variants need a
+    // synthetic-MIR helper (deferred to cycle 3c).
     struct Case { char const* op; ::dss::TargetCondCode cond; };
-    std::array<Case, 10> cases{{
+    std::array<Case, 6> cases{{
         {"==", ::dss::TargetCondCode::Eq},
         {"!=", ::dss::TargetCondCode::Ne},
         {"<",  ::dss::TargetCondCode::Slt},
         {"<=", ::dss::TargetCondCode::Sle},
         {">",  ::dss::TargetCondCode::Sgt},
         {">=", ::dss::TargetCondCode::Sge},
-        // C-subset comparisons on `int` are signed; unsigned variants ride
-        // through the same Comparison lowering once Cast to unsigned is
-        // in scope — cycle 3a's HR Cast emission already produces these
-        // when the operands are unsigned-typed.
-        {"<",  ::dss::TargetCondCode::Slt},
-        {"<=", ::dss::TargetCondCode::Sle},
-        {">",  ::dss::TargetCondCode::Sgt},
-        {">=", ::dss::TargetCondCode::Sge},
     }};
+    auto const setccOp = []() {
+        auto sch = ::dss::TargetSchema::loadShipped("x86_64");
+        return *(*sch)->opcodeByMnemonic("setcc");
+    }();
     for (auto const& [op, expectedCond] : cases) {
         std::string src = std::string{"int f(int a, int b) { if (a "} +
                           op + " b) return 1; return 0; }";
         auto L = lowerCSubsetToLir(src);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok) << "ICmp `" << op << "` must lower cleanly";
+        // Find the entry-block setcc and read its payload — pins the
+        // `condCodeForICmp` mapping. A regression mapping (say)
+        // ICmpEq → Sle would silently pass without this check.
+        Lir const& lir = L.lir.lir;
+        LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+        bool foundCorrectSetcc = false;
+        for (std::uint32_t k = 0; k < lir.blockInstCount(entry); ++k) {
+            LirInstId const inst = lir.blockInstAt(entry, k);
+            if (lir.instOpcode(inst) != setccOp) continue;
+            EXPECT_EQ(lir.instPayload(inst),
+                      static_cast<std::uint32_t>(expectedCond))
+                << "setcc payload for `" << op << "` must be "
+                << ::dss::targetCondCodeName(expectedCond);
+            foundCorrectSetcc = true;
+            break;
+        }
+        EXPECT_TRUE(foundCorrectSetcc)
+            << "ICmp `" << op << "` must emit a setcc in the entry block";
     }
+}
+
+TEST(MirToLir, CondBrJccPayloadIsNe) {
+    // The cycle-3b review surfaced that the jcc condition was silently
+    // defaulting to payload 0 (= TargetCondCode::Eq) instead of the
+    // intended Ne (since CondBr lowers as cmp val,0 + jcc(ne)). The
+    // fix extended `addCondBr` to take a payload; this test pins the
+    // emitted jcc carries `Ne` so a regression would surface here, not
+    // in AS1's encoded bytes.
+    auto L = lowerCSubsetToLir(
+        "int sign(int x) { if (x > 0) return 1; return 0; }");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    LirInstId const term = lir.blockTerminator(entry);
+    ASSERT_EQ(lir.instOpcode(term), *sch.opcodeByMnemonic("jcc"));
+    EXPECT_EQ(lir.instPayload(term),
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Ne))
+        << "CondBr jcc payload must be Ne (jump-when-condition-is-true), "
+           "not the default 0 (Eq, which would invert the branch)";
+}
+
+TEST(MirToLir, TernaryProducesPhiResolutionMoves) {
+    // c-subset's `?:` lowers to a MIR Phi at the join block (per
+    // hir_to_mir.cpp). The cycle-3b phi resolution must emit `mov` at
+    // each predecessor BEFORE its terminator, writing the per-arm value
+    // into the phi's pre-allocated vreg.
+    //
+    // Note: the condition path may use MIR Cast (HR's implicit bool
+    // coercion), which cycle 3b does NOT yet lower — so `L.lir.ok` may
+    // be false. The Phi resolution itself runs INDEPENDENTLY of the
+    // condition path's Cast failure (pre-allocation + edge-mov emission
+    // happen in their own pass). The test pins the move shape, not the
+    // overall lowering success.
+    auto L = lowerCSubsetToLir(
+        "int f(int c) { return c ? 1 : 2; }");
+    assertUpstreamClean(L);
+    // Don't require L.lir.ok — Cast on the condition may surface
+    // L_UnsupportedLoweringForOpcode without preventing Phi resolution.
+
+    auto const& sch = *L.target;
+    auto const movOp = *sch.opcodeByMnemonic("mov");
+    Lir const& lir = L.lir.lir;
+    LirFuncId const fn = lir.funcAt(0);
+
+    // Phi resolution via parallel-copy-with-temps emits TWO movs per
+    // predecessor edge: `mov tmp, src` then `mov phi_reg, tmp`. With
+    // two predecessor arms in a ternary, the minimum mov-bearing blocks
+    // is 2 (the two arms), and the total mov count is ≥ 4 (2 movs per
+    // arm for Phi resolution + the Const-materialization mov per arm).
+    int movBearingBlocks = 0;
+    int totalMovs = 0;
+    for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+        LirBlockId const bb = lir.funcBlockAt(fn, b);
+        bool blockHasMov = false;
+        for (std::uint32_t k = 0; k < lir.blockInstCount(bb); ++k) {
+            if (lir.instOpcode(lir.blockInstAt(bb, k)) == movOp) {
+                blockHasMov = true;
+                ++totalMovs;
+            }
+        }
+        if (blockHasMov) ++movBearingBlocks;
+    }
+    EXPECT_GE(movBearingBlocks, 2)
+        << "Phi resolution must emit `mov` instructions in ≥2 blocks "
+           "(the two predecessor arms of the ternary)";
+    // Total movs ≥ 2 (parallel-copy temps for both arms; the const
+    // materialization movs may be absorbed by Const fold or merged).
+    EXPECT_GE(totalMovs, 2)
+        << "parallel-copy phi resolution must emit ≥2 mov instructions "
+           "(one per pre/post temp move per arm)";
+}
+
+TEST(MirToLir, SwitchLowersToCascadingCompares) {
+    auto L = lowerCSubsetToLir(
+        "int f(int x) {\n"
+        "  switch (x) {\n"
+        "    case 1: return 10;\n"
+        "    case 2: return 20;\n"
+        "    default: return 0;\n"
+        "  }\n"
+        "}\n");
+    assertUpstreamClean(L);
+    // Switch lowering uses Alloca/Load/Store for the discriminant only
+    // when c-subset's semantic phase actually materializes one; for a
+    // raw `switch (x)` over a param the MIR may or may not have a
+    // store-then-load. Either way the cycle 3b lowerer must produce the
+    // cascading compares. `ok` may be false if the discriminant path
+    // hits memory ops (cycle 3c) — assertion is structural.
+    auto const& sch = *L.target;
+    auto const cmpOp = *sch.opcodeByMnemonic("cmp");
+    auto const jccOp = *sch.opcodeByMnemonic("jcc");
+    auto const jmpOp = *sch.opcodeByMnemonic("jmp");
+    Lir const& lir = L.lir.lir;
+    LirFuncId const fn = lir.funcAt(0);
+    // Count cmp+jcc pairs sealing blocks (the cascading-compare shape).
+    int cmpJccPairs = 0;
+    int jmpTerminators = 0;
+    for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+        LirBlockId const bb = lir.funcBlockAt(fn, b);
+        LirInstId const term = lir.blockTerminator(bb);
+        if (lir.instOpcode(term) == jccOp) {
+            // Walk backwards to find an adjacent cmp.
+            std::uint32_t const n = lir.blockInstCount(bb);
+            if (n >= 2 && lir.instOpcode(lir.blockInstAt(bb, n - 2)) == cmpOp) {
+                ++cmpJccPairs;
+            }
+        }
+        if (lir.instOpcode(term) == jmpOp) ++jmpTerminators;
+    }
+    EXPECT_GE(cmpJccPairs, 2)
+        << "switch with 2 cases must emit ≥2 cmp+jcc pairs (one per case)";
+    EXPECT_GE(jmpTerminators, 1)
+        << "switch must emit a `jmp default` terminator in its tail block";
+}
+
+TEST(MirToLir, LinkRegisterUnknownNameRejectedNegativePath) {
+    // Negative path for the cycle-3a-deferred linkRegister ordinal cache:
+    // if the name does not resolve, the loader must reject the schema
+    // (NOT silently produce a `nullopt` ordinal). Pins the "atomic
+    // population" invariant of the new `LinkRegisterRef` struct.
+    auto r = ::dss::TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"arm64"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"x0","class":"gpr","widthBytes":8}],
+            "callingConventions":[
+              {"name":"aapcs","argGprs":["x0"],"linkRegister":"nonexistent",
+               "stackAlignment":16}
+            ]})");
+    ASSERT_FALSE(r.has_value())
+        << "linkRegister naming an undeclared register must reject the schema";
+    bool found = false;
+    for (auto const& d : r.error()) {
+        if (d.code == ::dss::DiagnosticCode::C_MalformedJson) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found);
 }
 
 TEST(MirToLir, WhileLoopLowersWithBackEdge) {

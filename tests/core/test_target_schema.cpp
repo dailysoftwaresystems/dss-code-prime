@@ -601,16 +601,13 @@ TEST(TargetSchema, LinkRegisterResolvesToDeclaredGpr) {
     auto const* cc = (*r)->callingConventionByName("aapcs64");
     ASSERT_NE(cc, nullptr);
     ASSERT_TRUE(cc->linkRegister.has_value());
-    EXPECT_EQ(*cc->linkRegister, "x30");
+    EXPECT_EQ(cc->linkRegister->name, "x30");
 
-    // Cycle 3b fold: ordinal is resolved at load time and matches the
-    // ordinal returned by `registerByName("x30")`.
-    ASSERT_TRUE(cc->linkRegisterOrdinal.has_value())
-        << "linkRegisterOrdinal must be populated at load time when the "
-           "name resolves";
+    // Cycle 3b fold: ordinal is resolved at load time (atomic with the
+    // name in the same struct) and matches `registerByName("x30")`.
     auto const expectedOrdinal = (*r)->registerByName("x30");
     ASSERT_TRUE(expectedOrdinal.has_value());
-    EXPECT_EQ(*cc->linkRegisterOrdinal, *expectedOrdinal);
+    EXPECT_EQ(cc->linkRegister->ordinal, *expectedOrdinal);
 }
 
 TEST(TargetSchema, LinkRegisterUnknownNameRejected) {

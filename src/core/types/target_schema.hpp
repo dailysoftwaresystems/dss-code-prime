@@ -61,6 +61,42 @@ enum class TargetAbiModel : std::uint8_t {
     return "register-machine";
 }
 
+// Universal integer-comparison condition codes (target-blind). Used by
+// LIR `jcc` (conditional branch) and `setcc` (materialize 0/1 from
+// FLAGS) opcodes via the LIR instruction's `payload` field. Every
+// register-machine target either has these natively (x86_64 jcc, ARM64
+// b.cond) or trivially synthesizes them by operand swap (RISC-V's
+// branch instructions). Float ordered/unordered variants (Oeq/Une/...)
+// will join this enum when MIR FCmp lowering lands in cycle 3c+.
+enum class TargetCondCode : std::uint8_t {
+    Eq  = 0,  // ==
+    Ne  = 1,  // !=
+    Slt = 2,  // signed <
+    Sle = 3,  // signed <=
+    Sgt = 4,  // signed >
+    Sge = 5,  // signed >=
+    Ult = 6,  // unsigned <
+    Ule = 7,  // unsigned <=
+    Ugt = 8,  // unsigned >
+    Uge = 9,  // unsigned >=
+};
+
+[[nodiscard]] constexpr std::string_view targetCondCodeName(TargetCondCode c) noexcept {
+    switch (c) {
+        case TargetCondCode::Eq:  return "eq";
+        case TargetCondCode::Ne:  return "ne";
+        case TargetCondCode::Slt: return "slt";
+        case TargetCondCode::Sle: return "sle";
+        case TargetCondCode::Sgt: return "sgt";
+        case TargetCondCode::Sge: return "sge";
+        case TargetCondCode::Ult: return "ult";
+        case TargetCondCode::Ule: return "ule";
+        case TargetCondCode::Ugt: return "ugt";
+        case TargetCondCode::Uge: return "uge";
+    }
+    return "<invalid>";  // fail-loud on enum drift (post-switch fallback)
+}
+
 // Result-type discipline mirrors MIR's `MirResultRule`.
 enum class TargetResultRule : std::uint8_t {
     None,      // never defines a value
@@ -142,15 +178,18 @@ struct DSS_EXPORT TargetCallingConvention {
     // register (LR / x30) rather than on the stack; ML7 callconv
     // lowering checks `linkRegister.has_value()` to decide whether
     // to spill LR in the prologue. Empty for x86_64.
-    std::optional<std::string> linkRegister;
-
-    // Resolved ordinal for `linkRegister`, cached at JSON load time so
-    // ML7 callconv lowering does not need to re-resolve via
-    // `schema.registerByName()` on every function entry. Populated by the
-    // loader iff `linkRegister.has_value()` AND the name resolved to a
-    // register entry; `validate()` guarantees the resolution succeeded
-    // when both fields are set. The string is kept for diagnostics.
-    std::optional<std::uint16_t> linkRegisterOrdinal;
+    //
+    // The struct shape co-locates the JSON-side `name` (kept for
+    // diagnostics) with the loader-resolved `ordinal` (cached at JSON
+    // load time so ML7 does not re-resolve per function). Both fields
+    // are populated atomically by the loader: the type cannot represent
+    // a "name set, ordinal unset" state. `validate()` guarantees the
+    // resolution succeeded when the optional is engaged.
+    struct LinkRegisterRef {
+        std::string   name;
+        std::uint16_t ordinal = 0;
+    };
+    std::optional<LinkRegisterRef> linkRegister;
 };
 
 // Per-opcode descriptor — populated from the JSON `opcodes` array.
