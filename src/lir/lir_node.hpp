@@ -55,12 +55,14 @@ namespace detail {
 
 // ── instruction POD ──────────────────────────────────────────────
 //
-// Cache-density 32 bytes. The `opcode` field is a raw `std::uint16_t`
-// that the `Lir::targetId()` selects between per-target enums
-// (`X86_64Opcode`, `ARM64Opcode`). Operands live in the module's
-// operand pool, addressed by `[operandStart, operandStart + operandCount)`.
-// The optional result register is in `result`; whether it's
-// meaningful is per-opcode (Result::Value / Optional).
+// Cache-density 32 bytes. The `opcode` field is a `std::uint16_t`
+// whose meaning is defined entirely by the `TargetSchema` the module
+// was built with (cycle 2 pivot: opcodes live in JSON, not C++ enums).
+// Consumers look up opcode semantics via `schema.opcodeInfo(opcode)`,
+// never via a C++ enum. Operands live in the module's operand pool,
+// addressed by `[operandStart, operandStart + operandCount)`. The
+// optional result register is in `result`; whether it's meaningful
+// is per-opcode (TargetResultRule::Value / Optional).
 struct LirInst {
     std::uint16_t opcode       = 0;          // 2 — Invalid sentinel = 0
     std::uint8_t  flags        = 0;          // 1

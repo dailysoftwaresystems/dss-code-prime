@@ -38,7 +38,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadShipped(
     const std::string leaf = std::string{name} + ".target.json";
 
     // cwd-walk: ctest's cwd varies (build/, build/tests/lir/, repo root).
-    // Same 8-level limit + same `src/source-config/...` discipline as
+    // Same 8-level limit + same `src/dss-config/...` discipline as
     // GrammarSchema::loadShipped.
     std::error_code ec;
     fs::path here = fs::current_path(ec);

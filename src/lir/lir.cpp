@@ -1,6 +1,7 @@
 #include "lir/lir.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -101,9 +102,12 @@ LirFuncId Lir::funcAt(std::uint32_t i) const {
 
 namespace {
 // Monotonic LirModuleId counter (one tag per builder lifetime).
+// Atomic so concurrent builders (e.g. cross-compile: one builder per
+// target) get distinct ids without a data race — symmetry with
+// `mintTargetSchemaId`.
 std::uint32_t mintLirModuleId() noexcept {
-    static std::uint32_t counter = 0;
-    return ++counter;
+    static std::atomic<std::uint32_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 } // namespace
 

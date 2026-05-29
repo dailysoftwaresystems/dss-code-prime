@@ -120,10 +120,11 @@ using LirFuncAttribute  = substrate::ArenaAttribute<Lir::FuncArena, T>;
 // target a block before its body is materialized.
 class DSS_EXPORT LirBuilder {
 public:
-    // The builder must outlive the schema (the schema's opcode-info
+    // The SCHEMA must outlive the builder (the schema's opcode-info
     // table is read on every `addInst`/terminator call to validate
-    // the opcode + classify terminator-ness). The schema's lifetime is
-    // typically managed by a `shared_ptr` higher up.
+    // the opcode + classify terminator-ness). The schema's lifetime
+    // is typically managed by a `shared_ptr` higher up; the builder
+    // holds a reference, NOT ownership.
     explicit LirBuilder(TargetSchema const& schema);
 
     LirBuilder(LirBuilder const&)            = delete;
