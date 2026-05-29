@@ -9,6 +9,14 @@
 # need to declare explicitly as `Whitespace` lexemes (see e.g. c-subset.lang.json).
 tests/corpus/** text eol=lf
 
+# Shipped language + target config JSONs. Pinned to LF for the same reason
+# as `tests/corpus/**`: the lexer treats `\r` as an explicit Whitespace lexeme,
+# and the `D5_5_LiftOptOutRespected` test (and similar) substring-match against
+# the file with bare `\n` separators. Without this pin, a Windows `core.autocrlf`
+# checkout rewrites configs to CRLF and the test fails on CI even though local
+# tests pass.
+src/dss-config/** text eol=lf
+
 # `.dsshir` HIR text-format goldens — emitted with LF by `emitHir` and compared
 # byte-exact by the HIR text + lowering golden tests (test_hir_text.cpp,
 # test_hir_lowering_*.cpp). Without this a Windows `core.autocrlf` checkout
