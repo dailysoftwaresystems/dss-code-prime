@@ -347,6 +347,13 @@
       "isTerminator": false, "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Intrinsic call. Payload = intrinsic id (per HirIntrinsicRegistry / MIR convention). Operands = args. Result is optional (some intrinsics produce values, some don't). AS1 maps the intrinsic id to its concrete sequence (e.g. memcpy, debugtrap, sqrt) per target. Cycle 3e lowers MIR IntrinsicCall to this opcode.",
+      "mnemonic": "intrinsic_call", "result": "optional",
+      "isTerminator": false, "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 255,
+      "minSuccessors": 0, "maxSuccessors": 0
     }
   ],
   "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal the assembler/encoder will read.",

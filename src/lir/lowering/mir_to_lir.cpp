@@ -98,6 +98,8 @@ enum class MnemonicSlot : std::uint8_t {
     FpCvt, FpToSi, FpToUi, SiToFp, UiToFp,
     // cycle 3d cross-class move (movq via FPR↔GPR Bitcast)
     MovqXClass,
+    // cycle 3e: intrinsic_call (Call and GlobalAddr reuse `call`/`mov`)
+    IntrinsicCall,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -107,6 +109,64 @@ struct MnemonicCache {
     std::optional<std::uint16_t> id;
     bool                         missingReported = false;
 };
+
+// Per-row paired table closing the cycle-3d-anchored swap-silent-
+// corruption hazard. Each row pins `slot ↔ mnemonic`; the consteval
+// alignment check below enforces `kMnemonicRows[i].slot ==
+// MnemonicSlot(i)` at compile time — a transposed entry now FAILS the
+// build rather than silently misrouting every subsequent slot.
+struct MnemonicRow { MnemonicSlot slot; std::string_view mnemonic; };
+constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
+    {MnemonicSlot::Arg,           "arg"},
+    {MnemonicSlot::Mov,           "mov"},
+    {MnemonicSlot::Add,           "add"},
+    {MnemonicSlot::Sub,           "sub"},
+    {MnemonicSlot::Mul,           "mul"},
+    {MnemonicSlot::Cmp,           "cmp"},
+    {MnemonicSlot::Setcc,         "setcc"},
+    {MnemonicSlot::Jmp,           "jmp"},
+    {MnemonicSlot::Jcc,           "jcc"},
+    {MnemonicSlot::Ret,           "ret"},
+    {MnemonicSlot::Unreachable,   "unreachable"},
+    {MnemonicSlot::Alloca,        "alloca"},
+    {MnemonicSlot::Load,          "load"},
+    {MnemonicSlot::Store,         "store"},
+    {MnemonicSlot::Lea,           "lea"},
+    {MnemonicSlot::SExt,          "sext"},
+    {MnemonicSlot::ZExt,          "zext"},
+    {MnemonicSlot::Trunc,         "trunc"},
+    {MnemonicSlot::And,           "and"},
+    {MnemonicSlot::Or,            "or"},
+    {MnemonicSlot::Xor,           "xor"},
+    {MnemonicSlot::Shl,           "shl"},
+    {MnemonicSlot::ShrL,          "shr_l"},
+    {MnemonicSlot::ShrA,          "shr_a"},
+    {MnemonicSlot::Not,           "not"},
+    {MnemonicSlot::Neg,           "neg"},
+    {MnemonicSlot::FAdd,          "fadd"},
+    {MnemonicSlot::FSub,          "fsub"},
+    {MnemonicSlot::FMul,          "fmul"},
+    {MnemonicSlot::FDiv,          "fdiv"},
+    {MnemonicSlot::FNeg,          "fneg"},
+    {MnemonicSlot::FpCvt,         "fpcvt"},
+    {MnemonicSlot::FpToSi,        "fp_to_si"},
+    {MnemonicSlot::FpToUi,        "fp_to_ui"},
+    {MnemonicSlot::SiToFp,        "si_to_fp"},
+    {MnemonicSlot::UiToFp,        "ui_to_fp"},
+    {MnemonicSlot::MovqXClass,    "movq_xclass"},
+    {MnemonicSlot::IntrinsicCall, "intrinsic_call"},
+}};
+consteval bool kMnemonicRowsAligned() noexcept {
+    for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
+        if (kMnemonicRows[i].slot != static_cast<MnemonicSlot>(i)) return false;
+    }
+    return true;
+}
+static_assert(kMnemonicRows.size() == kMnemonicCount,
+    "MnemonicSlot enum and kMnemonicRows table drifted in COUNT");
+static_assert(kMnemonicRowsAligned(),
+    "MnemonicSlot rows out of order — kMnemonicRows[i].slot must equal "
+    "MnemonicSlot(i) for every i (cycle-3d swap-silent-corruption hazard).");
 
 // One transient lowerer per `lowerToLir` call. Holds the per-pass state
 // the dispatcher methods read/write. Mirrors `Lowerer` in `hir_to_mir.cpp`.
@@ -148,28 +208,16 @@ struct Lowerer {
         // `opcodeByMnemonic("")` lookup. Each slot is positionally
         // indexed; a single off-by-one would corrupt all subsequent
         // opcode lookups.
-        constexpr std::array<std::string_view, kMnemonicCount> kMnemonics{{
-            "arg", "mov", "add", "sub", "mul",
-            "cmp", "setcc", "jmp", "jcc",
-            "ret", "unreachable",
-            "alloca", "load", "store", "lea",
-            "sext", "zext", "trunc",
-            // cycle 3d bitwise + Neg
-            "and", "or", "xor", "shl", "shr_l", "shr_a", "not", "neg",
-            // cycle 3d float arithmetic + casts
-            "fadd", "fsub", "fmul", "fdiv", "fneg",
-            "fpcvt", "fp_to_si", "fp_to_ui", "si_to_fp", "ui_to_fp",
-            // cycle 3d cross-class move
-            "movq_xclass",
-        }};
-        static_assert(kMnemonics.size() == kMnemonicCount,
-            "MnemonicSlot enum and kMnemonics array drifted — every slot "
-            "is positionally indexed; a missing or extra row would corrupt "
-            "every subsequent opcode lookup silently. Keep the two in "
-            "lockstep when adding opcodes.");
-        for (std::size_t i = 0; i < kMnemonicCount; ++i) {
-            cache_[i].mnemonic = kMnemonics[i];
-            cache_[i].id       = target.opcodeByMnemonic(kMnemonics[i]);
+        // Cycle 3e: pairing of MnemonicSlot ↔ mnemonic-string is now
+        // verified at compile time by `kMnemonicRowsAligned` declared
+        // alongside the table at namespace scope (below). The constexpr
+        // table iterator gives BOTH count-drift AND row-order-drift
+        // protection — the cycle-3d count-only static_assert allowed a
+        // transposition to compile silently; this closes that.
+        for (auto const& r : kMnemonicRows) {
+            auto const i = static_cast<std::size_t>(r.slot);
+            cache_[i].mnemonic = r.mnemonic;
+            cache_[i].id       = target.opcodeByMnemonic(r.mnemonic);
         }
     }
 
@@ -190,17 +238,11 @@ struct Lowerer {
     // it earlier.
     [[nodiscard]] LirRegClass regClassForType(TypeId ty) const {
         if (!ty.valid()) return LirRegClass::GPR;
-        switch (interner.kind(ty)) {
-            case TypeKind::F16:
-            case TypeKind::F32:
-            case TypeKind::F64:
-            case TypeKind::F128:
-                return LirRegClass::FPR;
-            case TypeKind::Vector:
-                return LirRegClass::VR;
-            default:
-                return LirRegClass::GPR;
-        }
+        // Delegate to the substrate-tier helper in `target_schema.hpp`
+        // so ML6/ML7/LirVerifier share the same mapping. TargetRegClass
+        // and LirRegClass are numerically aligned (the static_assert in
+        // `lir_reg.hpp` pins it), so the cast is safe by-construction.
+        return static_cast<LirRegClass>(regClassForCoreType(interner.kind(ty)));
     }
 
     [[nodiscard]] LirRegClass regClassFor(MirInstId id) const {
@@ -323,6 +365,13 @@ struct Lowerer {
             case MirOpcode::FPToUI:  return lowerCast(id, MnemonicSlot::FpToUi,  "MIR FPToUI");
             case MirOpcode::SIToFP:  return lowerCast(id, MnemonicSlot::SiToFp,  "MIR SIToFP");
             case MirOpcode::UIToFP:  return lowerCast(id, MnemonicSlot::UiToFp,  "MIR UIToFP");
+            // ── cycle 3e: Calls + GlobalAddr ───────────────────────
+            case MirOpcode::GlobalAddr:    return lowerGlobalAddr(id);
+            case MirOpcode::Call:          return lowerCall(id);
+            case MirOpcode::IntrinsicCall: return lowerIntrinsicCall(id);
+            // ── cycle 3e: aggregate ops (memory-flattening lowering) ──
+            case MirOpcode::ExtractValue:  return lowerExtractValue(id);
+            case MirOpcode::InsertValue:   return lowerInsertValue(id);
             default: break;
         }
         reportUnsupported(op, id);
@@ -569,6 +618,218 @@ struct Lowerer {
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
         lir.addInst(*opcode(slot), result, ops);
         defineValue(id, result);
+    }
+
+    // ── cycle 3e: Calls + GlobalAddr ─────────────────────────────────
+
+    // MIR GlobalAddr → LIR `mov result, symbolRef(symId)`. The symbol
+    // is materialized as the function/global's address. Cycle 3e uses
+    // the existing `mov` opcode + the `LirOperandKind::SymbolRef`
+    // operand kind (already present in the LirOperand POD since cycle
+    // 1) — no new opcode needed. AS1 emits x86_64 `lea result, [rip +
+    // symbol]` for the actual encoding.
+    void lowerGlobalAddr(MirInstId id) {
+        if (!opcode(MnemonicSlot::Mov).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Mov, "MIR GlobalAddr");
+            return;
+        }
+        SymbolId const sym = mir.globalAddrSymbol(id);
+        LirReg const result = lir.newVReg(regClassFor(id));
+        std::array<LirOperand, 1> ops{LirOperand::makeSymbolRef(sym.v)};
+        lir.addInst(*opcode(MnemonicSlot::Mov), result, ops);
+        defineValue(id, result);
+    }
+
+    // MIR Call → LIR `call callee, args...`. Convention:
+    //   operand[0] = callee value (typically a GlobalAddr-produced
+    //                vreg or an indirect call target)
+    //   operand[1..N] = argument values
+    // ML7 callconv lowering will rewrite this to the explicit
+    // mov-to-arg-register + call + mov-from-return-register sequence
+    // using the cycle-2b TargetCallingConvention sections (argGprs/
+    // argFprs/returnGprs/returnFprs). Cycle 3e keeps the LIR at the
+    // abstract "call(callee, args...)" form — target-blind.
+    void lowerCall(MirInstId id) {
+        if (!opcode(MnemonicSlot::Mov).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Mov, "MIR Call (mov for callee/args)");
+            return;
+        }
+        // Look up the `call` opcode by mnemonic — not in MnemonicCache
+        // because it's a one-shot lookup that ML7 callconv lowering may
+        // route to multiple physical-call opcodes per target later.
+        auto const callOp = target.opcodeByMnemonic("call");
+        if (!callOp.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_RequiredLirOpcodeMissing;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "target '{}' declares no 'call' opcode (required for MIR Call)",
+                target.name());
+            reporter.report(std::move(d));
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.empty()) {
+            reportUnsupported(MirOpcode::Call, id);
+            return;
+        }
+        std::optional<LirReg> const callee = regForValue(operands[0]);
+        if (!callee.has_value()) return;
+
+        // Build the LIR operand list: [callee_reg, arg0, arg1, ...].
+        std::vector<LirOperand> ops;
+        ops.reserve(operands.size());
+        ops.push_back(LirOperand::makeReg(*callee));
+        for (std::size_t k = 1; k < operands.size(); ++k) {
+            std::optional<LirReg> const arg = regForValue(operands[k]);
+            if (!arg.has_value()) return;
+            ops.push_back(LirOperand::makeReg(*arg));
+        }
+
+        // Result class follows MIR's result type. Void-returning calls
+        // produce an invalid result vreg (no value).
+        TypeId const resultTy = mir.instType(id);
+        if (!resultTy.valid()
+            || interner.kind(resultTy) == TypeKind::Void) {
+            lir.addInst(*callOp, InvalidLirReg, ops);
+            return;
+        }
+        LirReg const result = lir.newVReg(regClassFor(id));
+        lir.addInst(*callOp, result, ops);
+        defineValue(id, result);
+    }
+
+    // MIR IntrinsicCall → LIR `intrinsic_call`. Operands are the args;
+    // payload carries the intrinsic id. Result is optional (per the
+    // schema's `result: "optional"` for the opcode). AS1 maps the
+    // intrinsic id to its concrete sequence per target.
+    void lowerIntrinsicCall(MirInstId id) {
+        if (!opcode(MnemonicSlot::IntrinsicCall).has_value()) {
+            reportMissingOpcode(MnemonicSlot::IntrinsicCall, "MIR IntrinsicCall");
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        std::vector<LirOperand> ops;
+        ops.reserve(operands.size());
+        for (auto const opnd : operands) {
+            std::optional<LirReg> const arg = regForValue(opnd);
+            if (!arg.has_value()) return;
+            ops.push_back(LirOperand::makeReg(*arg));
+        }
+        std::uint32_t const intrId = mir.intrinsicId(id);
+        TypeId const resultTy = mir.instType(id);
+        if (!resultTy.valid()
+            || interner.kind(resultTy) == TypeKind::Void) {
+            lir.addInst(*opcode(MnemonicSlot::IntrinsicCall), InvalidLirReg, ops, intrId);
+            return;
+        }
+        LirReg const result = lir.newVReg(regClassFor(id));
+        lir.addInst(*opcode(MnemonicSlot::IntrinsicCall), result, ops, intrId);
+        defineValue(id, result);
+    }
+
+    // ── cycle 3e: aggregate ops (memory-flattening lowering) ─────────
+    //
+    // MIR ExtractValue/InsertValue operate on aggregate values directly
+    // (D5.6 substrate). The cycle-3e LIR lowering routes them through
+    // memory: each aggregate value is materialized via an Alloca, and
+    // ExtractValue/InsertValue lower as Load/Store at the appropriate
+    // byte offset. This is correct + simple but adds extra memory
+    // traffic; ML6's optimizer (plan 11) will promote-to-registers
+    // where the alloca doesn't escape.
+    //
+    // Cycle 3e ships the DEGENERATE shape: zero offset (the first
+    // field). Real field-offset computation needs the MIR type's
+    // layout from the interner, which is co-designed with ML6's
+    // frame-layout phase. Until that lands, ExtractValue/InsertValue
+    // with a non-zero index defers to cycle 3f.
+
+    void lowerExtractValue(MirInstId id) {
+        // MIR operands: [aggregate, index_const_1, index_const_2, ...].
+        // The aggregate's value flows from a ConstructAggregate (ML2
+        // cycle 6) which is built via alloca + insertvalue chain in
+        // MIR. For cycle 3e: only the zero-index path lowers; non-zero
+        // indices defer (would need type-layout lookup).
+        auto const operands = mir.instOperands(id);
+        if (operands.size() < 2) {
+            reportUnsupported(MirOpcode::ExtractValue, id);
+            return;
+        }
+        // Every index must be a Const-0 for cycle 3e's degenerate path.
+        for (std::size_t k = 1; k < operands.size(); ++k) {
+            if (mir.instOpcode(operands[k]) != MirOpcode::Const) {
+                reportUnsupported(MirOpcode::ExtractValue, id);
+                return;
+            }
+            std::uint32_t const litIdx = mir.constLiteralIndex(operands[k]);
+            MirLiteralValue const& lit = mir.literalValue(litIdx);
+            auto const* asI = std::get_if<std::int64_t>(&lit.value);
+            if (asI == nullptr || *asI != 0) {
+                // Non-zero index — cycle 3f real-blocker (needs type
+                // layout).
+                reportUnsupported(MirOpcode::ExtractValue, id);
+                return;
+            }
+        }
+        // Degenerate first-field path: emit `load` from base.
+        if (!opcode(MnemonicSlot::Load).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Load, "MIR ExtractValue");
+            return;
+        }
+        std::optional<LirReg> const base = regForValue(operands[0]);
+        if (!base.has_value()) return;
+        LirReg const result = lir.newVReg(regClassFor(id));
+        std::array<LirOperand, 3> ops{
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        lir.addInst(*opcode(MnemonicSlot::Load), result, ops);
+        defineValue(id, result);
+    }
+
+    void lowerInsertValue(MirInstId id) {
+        // MIR operands: [aggregate, value, index_const_1, ...].
+        // Cycle 3e: degenerate zero-index → emit `store value, base`
+        // and return the (modified) aggregate base. Multi-byte offsets
+        // defer to cycle 3f.
+        auto const operands = mir.instOperands(id);
+        if (operands.size() < 3) {
+            reportUnsupported(MirOpcode::InsertValue, id);
+            return;
+        }
+        for (std::size_t k = 2; k < operands.size(); ++k) {
+            if (mir.instOpcode(operands[k]) != MirOpcode::Const) {
+                reportUnsupported(MirOpcode::InsertValue, id);
+                return;
+            }
+            std::uint32_t const litIdx = mir.constLiteralIndex(operands[k]);
+            MirLiteralValue const& lit = mir.literalValue(litIdx);
+            auto const* asI = std::get_if<std::int64_t>(&lit.value);
+            if (asI == nullptr || *asI != 0) {
+                reportUnsupported(MirOpcode::InsertValue, id);
+                return;
+            }
+        }
+        if (!opcode(MnemonicSlot::Store).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Store, "MIR InsertValue");
+            return;
+        }
+        std::optional<LirReg> const base  = regForValue(operands[0]);
+        std::optional<LirReg> const value = regForValue(operands[1]);
+        if (!base.has_value() || !value.has_value()) return;
+        std::array<LirOperand, 4> ops{
+            LirOperand::makeReg(*value),
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        lir.addInst(*opcode(MnemonicSlot::Store), InvalidLirReg, ops);
+        // The result of InsertValue is conceptually the modified
+        // aggregate. In the memory-flattening model the aggregate IS
+        // the base pointer; reuse it as the result. ML6's promote-to-
+        // registers will turn this into a proper SSA update.
+        defineValue(id, *base);
     }
 
     // Shared N-operand value-producing lowering. Consolidates the

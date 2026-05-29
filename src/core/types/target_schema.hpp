@@ -4,6 +4,7 @@
 #include "core/substrate/transparent_string_hash.hpp"
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
 #include "core/types/strong_ids.hpp"
+#include "core/types/type_lattice/core_type.hpp"  // TypeKind for regClassForCoreType
 
 #include <cstdint>
 #include <filesystem>
@@ -97,6 +98,8 @@ enum class TargetCondCode : std::uint8_t {
     return "<invalid>";  // fail-loud on enum drift (post-switch fallback)
 }
 
+// (`regClassForCoreType` defined below `TargetRegClass`.)
+
 // Result-type discipline mirrors MIR's `MirResultRule`.
 enum class TargetResultRule : std::uint8_t {
     None,      // never defines a value
@@ -118,6 +121,11 @@ enum class TargetResultRule : std::uint8_t {
 // Mirrors `LirRegClass` in `src/lir/lir_reg.hpp` — kept as a separate
 // definition here so `core/types/target_schema.hpp` does not need to
 // pull in the LIR substrate (header-include direction is core ← LIR).
+//
+// The numeric values MUST stay in lockstep with `LirRegClass` (a
+// static_assert in `lir_reg.hpp` pins the alignment); both enums
+// declare the same set so callers can `static_cast` between them
+// when bridging from substrate-tier (this header) to LIR-tier types.
 enum class TargetRegClass : std::uint8_t {
     None  = 0,
     GPR   = 1,
@@ -135,6 +143,29 @@ enum class TargetRegClass : std::uint8_t {
         case TargetRegClass::Flags: return "flags";
     }
     return "none";
+}
+
+// Map a substrate-tier `TypeKind` to its `TargetRegClass`. Universal
+// across all register-machine targets — floats use the FPR envelope,
+// vectors use VR, integers/pointers/bool use GPR, and aggregates
+// (Struct/Union/Array/Enum/Tuple/Slice) default to GPR with the
+// caller responsible for further flattening (ML5 cycle 3e via memory
+// ops + multiple Loads/Stores). Promoted from the LIR lowerer
+// (cycle 3d) to substrate (cycle 3e) per the architect agent's
+// recommendation — ML6 regalloc, ML7 callconv lowering, and the
+// LirVerifier all consume the same mapping.
+[[nodiscard]] constexpr TargetRegClass regClassForCoreType(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::F16:
+        case TypeKind::F32:
+        case TypeKind::F64:
+        case TypeKind::F128:
+            return TargetRegClass::FPR;
+        case TypeKind::Vector:
+            return TargetRegClass::VR;
+        default:
+            return TargetRegClass::GPR;
+    }
 }
 
 // Per-physical-register descriptor. Position in the schema's `registers`

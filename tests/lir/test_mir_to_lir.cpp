@@ -18,6 +18,7 @@
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "lir/lir.hpp"
+#include "lir/lir_verifier.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
@@ -281,40 +282,57 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
 }
 
 TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
-    // Cycle 3d lowers bitwise + integer Neg + float arithmetic + float
-    // casts + cross-class Bitcast + dynamic-index Gep. Still-deferred:
-    // Call / IntrinsicCall / GlobalAddr (cycle 3e), ExtractValue /
-    // InsertValue aggregate ops (cycle 3e). A direct function call is
-    // the cleanest cycle-3e-deferred trigger.
-    auto L = lowerCSubsetToLir(
-        "int f(int x) { return x; }\n"
-        "int g(int y) { return f(y); }\n");
-    assertUpstreamClean(L);
-    EXPECT_FALSE(L.lir.ok);
+    // Cycle 3e lowers Call/IntrinsicCall/GlobalAddr + degenerate
+    // ExtractValue/InsertValue. Still-deferred: float comparisons
+    // (FCmp*) and SIMD vector ops (VAdd/VSub/etc — reserved post-v1
+    // per MirOpcode). Use synthetic-MIR with VAdd as the cleanest
+    // still-deferred trigger.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, i32, ::dss::CallConv::CcSysV);
+
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirLiteralValue lv;
+    lv.value = static_cast<std::int64_t>(0);
+    lv.core  = ::dss::TypeKind::I32;
+    ::dss::MirInstId const zero = mb.addConst(lv, i32);
+    std::array<::dss::MirInstId, 2> ops{zero, zero};
+    // VAdd is reserved SIMD — not lowered in any cycle yet.
+    ::dss::MirInstId const v = mb.addInst(::dss::MirOpcode::VAdd, ops, i32);
+    mb.addReturn(v);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_FALSE(result.ok);
     bool foundUnsupported = false;
-    for (auto const& d : L.lirReporter.all()) {
+    for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode) {
             foundUnsupported = true;
             break;
         }
     }
     EXPECT_TRUE(foundUnsupported)
-        << "cycle 3b must report L_UnsupportedLoweringForOpcode on memory "
-           "opcodes (Alloca/Store/Load); silent acceptance is a regression";
+        << "MirOpcode::VAdd (SIMD, reserved) must surface "
+           "L_UnsupportedLoweringForOpcode; silent acceptance is a regression";
 
-    // Every LIR block must end in a terminator. Fallback seal kicks in for
-    // blocks whose MIR terminator was deferred OR which contained an
-    // unsupported non-terminator inst that prevented the normal flow.
-    // We don't pin the specific terminator opcode (cycle 3b now produces
-    // jmp/jcc/ret depending on the function shape); just that the block
-    // has a terminator at all.
-    Lir const& lir = L.lir.lir;
+    // Every LIR block must end in a terminator (the fallback seal
+    // covers the case where the unsupported MIR opcode prevented the
+    // normal terminator emission). Pin terminator-presence.
+    ::dss::Lir const& lir = result.lir;
     for (std::uint32_t i = 0; i < lir.moduleFuncCount(); ++i) {
         LirFuncId const fn = lir.funcAt(i);
         for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
             LirBlockId const bb = lir.funcBlockAt(fn, b);
             LirInstId const term = lir.blockTerminator(bb);
-            EXPECT_TRUE(L.target->isTerminator(lir.instOpcode(term)))
+            EXPECT_TRUE(sch.isTerminator(lir.instOpcode(term)))
                 << "every LIR block must end in a terminator opcode";
         }
     }
@@ -1207,6 +1225,92 @@ TEST(MirToLir, WideLiteralDoubleRoutesThroughFprLiteralPool) {
         }
     }
     EXPECT_TRUE(foundFprMov);
+}
+
+// ─── cycle 3e: Calls + Aggregates + LirVerifier ─────────────────────────
+
+TEST(MirToLir, DirectCallEmitsCallOpcode) {
+    // Cycle-3e Call lowering: GlobalAddr → mov(symbolRef); Call(callee,
+    // args...) → call(callee_reg, arg_regs...). c-subset's `g() { f(); }`
+    // emits this MIR shape.
+    auto L = lowerCSubsetToLir(
+        "int f(int x) { return x; }\n"
+        "int g(int y) { return f(y); }\n");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "direct call must lower cleanly in cycle 3e";
+
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    // Both functions exist.
+    EXPECT_EQ(lir.moduleFuncCount(), 2u);
+
+    auto const movOp  = *sch.opcodeByMnemonic("mov");
+    auto const callOp = *sch.opcodeByMnemonic("call");
+    // The 2nd function `g` must contain:
+    //   - mov result, symbolRef(f)   ← GlobalAddr(f)
+    //   - call calleeReg, argReg     ← the actual Call
+    LirFuncId const gFn = lir.funcAt(1);
+    LirBlockId const entry = lir.funcEntry(gFn);
+    bool foundGlobalAddrMov = false, foundCall = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        auto const op = lir.instOpcode(inst);
+        if (op == movOp) {
+            auto const ops = lir.instOperands(inst);
+            if (ops.size() == 1 && ops[0].kind == LirOperandKind::SymbolRef) {
+                foundGlobalAddrMov = true;
+            }
+        }
+        if (op == callOp) foundCall = true;
+    }
+    EXPECT_TRUE(foundGlobalAddrMov)
+        << "GlobalAddr must emit `mov result, symbolRef(symId)`";
+    EXPECT_TRUE(foundCall)
+        << "Call must emit the `call` opcode";
+}
+
+TEST(MirToLir, VoidCallProducesNoResultReg) {
+    // A call to a void-returning function has no result vreg. Pin that
+    // the LIR `call` inst's result is InvalidLirReg.
+    auto L = lowerCSubsetToLir(
+        "void noop() {}\n"
+        "void main_() { noop(); }\n");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+    auto const callOp = *L.target->opcodeByMnemonic("call");
+    Lir const& lir = L.lir.lir;
+    LirFuncId const mainFn = lir.funcAt(1);
+    LirBlockId const entry = lir.funcEntry(mainFn);
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) != callOp) continue;
+        EXPECT_FALSE(lir.instResult(inst).valid())
+            << "void-returning Call must have InvalidLirReg result";
+        return;
+    }
+    ADD_FAILURE() << "no call inst found";
+}
+
+TEST(LirVerifier, AcceptsCleanCycle3aThroughCycle3dPipelines) {
+    // Smoke test: every c-subset corpus example that lowers cleanly
+    // through cycles 3a-3e must also pass the LirVerifier without
+    // any new diagnostics. This is the regression-lock for the
+    // "vreg-class-vs-MIR-type consistency" rule the cycle-3d review
+    // surfaced — a future regression to the cycle-3d FPR-class
+    // plumbing fixes would now fail the verifier even if the unit
+    // tests didn't catch it.
+    auto L = lowerCSubsetToLir(
+        "int add(int a, int b) { return a + b; }\n"
+        "int sign(int x) { if (x > 0) return 1; return 0; }\n");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+
+    ::dss::DiagnosticReporter rep;
+    auto const r = ::dss::verifyLir(L.lir.lir, L.mir.mir,
+                                    L.model.lattice().interner(), rep);
+    EXPECT_TRUE(r.ok)
+        << "LirVerifier must accept a clean cycle-3a-3d c-subset pipeline";
 }
 
 TEST(MirToLir, LinkRegisterUnknownNameRejectedNegativePath) {
