@@ -1,5 +1,6 @@
 #include "asm/asm.hpp"
 
+#include "asm/format/x86_variable.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -54,7 +55,7 @@ using lir_pass_util::report;
     // switch is unreachable since every arm `return`s.
     (void)lir; (void)inst; (void)out; (void)relocs; (void)srcMap; (void)lirToMir;
 
-    switch (info->encodingShape) {
+    switch (info->encoding.shape) {
         case TargetEncodingShape::None:
             report(reporter, DiagnosticCode::A_NoEncodingDeclared,
                    DiagnosticSeverity::Error,
@@ -63,19 +64,21 @@ using lir_pass_util::report;
                                info->mnemonic, schema.name()));
             return false;
 
-        // Cycle-1 substrate: shape-tag declared in the schema but no
-        // format walker registered. AS2 plugs in the X86Variable arm;
-        // AS3 plugs in Fixed32. Both arms produce identical diagnostics
-        // here so the substrate-shell behavior is uniform.
         case TargetEncodingShape::X86Variable:
+            return x86_variable::encode(lir, schema, inst, info,
+                                         lirToMir, out, relocs, srcMap,
+                                         reporter);
+
+        // Cycle-1 substrate: shape-tag declared in the schema but no
+        // format walker registered. AS3 plugs in Fixed32.
         case TargetEncodingShape::Fixed32:
             report(reporter, DiagnosticCode::A_NoEncodingShapeWalker,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': no format walker registered "
                                "for encoding shape '{}' (substrate cycle — "
-                               "AS2/AS3 plug in the walker)",
+                               "AS3 plugs in the walker)",
                                info->mnemonic,
-                               targetEncodingShapeName(info->encodingShape)));
+                               targetEncodingShapeName(info->encoding.shape)));
             return false;
     }
 
@@ -90,7 +93,7 @@ using lir_pass_util::report;
                        "value was added without updating the assembler "
                        "dispatch)",
                        info->mnemonic,
-                       static_cast<int>(info->encodingShape)));
+                       static_cast<int>(info->encoding.shape)));
     return false;
 }
 

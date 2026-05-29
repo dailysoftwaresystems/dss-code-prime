@@ -128,6 +128,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::A_NoEncodingDeclared:           return "A_NoEncodingDeclared";
         case DiagnosticCode::A_NoEncodingShapeWalker:        return "A_NoEncodingShapeWalker";
         case DiagnosticCode::A_LirToMirSizeMismatch:         return "A_LirToMirSizeMismatch";
+        case DiagnosticCode::A_NoMatchingEncodingVariant:    return "A_NoMatchingEncodingVariant";
     }
     return "Unknown";
 }

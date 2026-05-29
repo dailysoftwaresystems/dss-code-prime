@@ -406,9 +406,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   silently read out-of-bounds memory once AS2/AS3 wire the
     //   stamping. Fail loud at entry so the test fixture / pipeline
     //   builder catches the contract violation.
+    // A_NoMatchingEncodingVariant: the opcode declares a shape walker
+    //   that is registered, but the LIR instruction's operand kinds
+    //   match none of the variant guards in `encoding.variants[]`. The
+    //   substrate refuses to invent — there is no fallback variant. Fix
+    //   either: (a) add a variant to the target JSON whose guard matches
+    //   the operand shape the LIR produces, or (b) adjust the LIR pre-
+    //   pass (e.g. 2-address legalization) to produce a shape covered
+    //   by the declared variants.
     A_NoEncodingDeclared           = 0x1001,
     A_NoEncodingShapeWalker        = 0x1002,
     A_LirToMirSizeMismatch         = 0x1003,
+    A_NoMatchingEncodingVariant    = 0x1004,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

@@ -1,6 +1,7 @@
 # Assembler unit tests (plan 13 AS1).
 
-dss_add_test(NAME asm/test_asm_substrate SOURCES test_asm_substrate.cpp)
+dss_add_test(NAME asm/test_asm_substrate    SOURCES test_asm_substrate.cpp)
+dss_add_test(NAME asm/test_asm_x86_variable SOURCES test_asm_x86_variable.cpp)
 
 # Reuse the LIR lowering test fixture so substrate tests can exercise
 # the assembler on a real lowered c-subset program. The header includes

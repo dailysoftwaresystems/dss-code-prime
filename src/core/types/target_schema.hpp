@@ -39,6 +39,46 @@
 
 namespace dss {
 
+// ── Closed-enum name table (substrate) ────────────────────────────
+//
+// Eight closed enums in this header all carry `XxxName(e)` /
+// `XxxFromName(s)` constexpr helpers (TargetAbiModel,
+// TargetCondCode, TargetResultRule, TargetRegClass,
+// TargetTerminatorKind, TargetEncodingShape, OperandKindFilter,
+// EncodingSlotKind). Each helper pair is mechanical — a switch +
+// an `if/else if` chain — but the two halves are independent
+// sources of truth that must agree (simplifier review's "two ways
+// to parse an enum string").
+//
+// This template gives ONE source of truth (the `kXxxTable` array)
+// and derives both helpers from it. Adding a new enumerator: one
+// row in the table, no helper edits. The `entry == e` lookup is
+// linear but the enums are tiny (<= ~12 entries) and the helpers
+// are constexpr — the cost is one branch per entry, eliminated by
+// the compiler on constant evaluation.
+template <typename E, std::size_t N>
+struct EnumNameTable {
+    std::array<std::pair<E, std::string_view>, N> rows;
+
+    [[nodiscard]] constexpr std::string_view name(E e) const noexcept {
+        for (auto const& r : rows) {
+            if (r.first == e) return r.second;
+        }
+        // Fall-back returns the FIRST row's string — semantically a
+        // sentinel "unknown/invalid". Each enum's `name()` historically
+        // had its own fall-back string; using row 0 means each enum
+        // controls its fall-back by ordering the table.
+        return rows[0].second;
+    }
+
+    [[nodiscard]] constexpr std::optional<E> fromName(std::string_view s) const noexcept {
+        for (auto const& r : rows) {
+            if (r.second == s) return r.first;
+        }
+        return std::nullopt;
+    }
+};
+
 // ABI model — selects the lowering shape downstream consumers (ML6
 // regalloc, ML7 calling-convention lowering, AS1 assembler) expect.
 // `register-machine` is the x86/ARM/RISC-V shape: physical register
@@ -56,21 +96,18 @@ enum class TargetAbiModel : std::uint8_t {
     ResultId        = 2,  // SPIR-V
 };
 
-[[nodiscard]] constexpr std::string_view targetAbiModelName(TargetAbiModel m) noexcept {
-    switch (m) {
-        case TargetAbiModel::RegisterMachine: return "register-machine";
-        case TargetAbiModel::OperandStack:    return "operand-stack";
-        case TargetAbiModel::ResultId:        return "result-id";
-    }
-    return "register-machine";
-}
+inline constexpr EnumNameTable<TargetAbiModel, 3> kTargetAbiModelTable{{{
+    { TargetAbiModel::RegisterMachine, "register-machine" },
+    { TargetAbiModel::OperandStack,    "operand-stack"    },
+    { TargetAbiModel::ResultId,        "result-id"        },
+}}};
 
+[[nodiscard]] constexpr std::string_view targetAbiModelName(TargetAbiModel m) noexcept {
+    return kTargetAbiModelTable.name(m);
+}
 [[nodiscard]] constexpr std::optional<TargetAbiModel>
 targetAbiModelFromName(std::string_view s) noexcept {
-    if (s == "register-machine") return TargetAbiModel::RegisterMachine;
-    if (s == "operand-stack")    return TargetAbiModel::OperandStack;
-    if (s == "result-id")        return TargetAbiModel::ResultId;
-    return std::nullopt;
+    return kTargetAbiModelTable.fromName(s);
 }
 
 // Universal integer-comparison condition codes (target-blind). Used by
@@ -93,20 +130,21 @@ enum class TargetCondCode : std::uint8_t {
     Uge = 9,  // unsigned >=
 };
 
+inline constexpr EnumNameTable<TargetCondCode, 10> kTargetCondCodeTable{{{
+    { TargetCondCode::Eq,  "eq"  },
+    { TargetCondCode::Ne,  "ne"  },
+    { TargetCondCode::Slt, "slt" },
+    { TargetCondCode::Sle, "sle" },
+    { TargetCondCode::Sgt, "sgt" },
+    { TargetCondCode::Sge, "sge" },
+    { TargetCondCode::Ult, "ult" },
+    { TargetCondCode::Ule, "ule" },
+    { TargetCondCode::Ugt, "ugt" },
+    { TargetCondCode::Uge, "uge" },
+}}};
+
 [[nodiscard]] constexpr std::string_view targetCondCodeName(TargetCondCode c) noexcept {
-    switch (c) {
-        case TargetCondCode::Eq:  return "eq";
-        case TargetCondCode::Ne:  return "ne";
-        case TargetCondCode::Slt: return "slt";
-        case TargetCondCode::Sle: return "sle";
-        case TargetCondCode::Sgt: return "sgt";
-        case TargetCondCode::Sge: return "sge";
-        case TargetCondCode::Ult: return "ult";
-        case TargetCondCode::Ule: return "ule";
-        case TargetCondCode::Ugt: return "ugt";
-        case TargetCondCode::Uge: return "uge";
-    }
-    return "<invalid>";  // fail-loud on enum drift (post-switch fallback)
+    return kTargetCondCodeTable.name(c);
 }
 
 // (`regClassForCoreType` defined below `TargetRegClass`.)
@@ -118,13 +156,14 @@ enum class TargetResultRule : std::uint8_t {
     Optional,  // may define a value (e.g. a call to a non-void fn)
 };
 
+inline constexpr EnumNameTable<TargetResultRule, 3> kTargetResultRuleTable{{{
+    { TargetResultRule::None,     "none"     },
+    { TargetResultRule::Value,    "value"    },
+    { TargetResultRule::Optional, "optional" },
+}}};
+
 [[nodiscard]] constexpr std::string_view targetResultRuleName(TargetResultRule r) noexcept {
-    switch (r) {
-        case TargetResultRule::None:     return "none";
-        case TargetResultRule::Value:    return "value";
-        case TargetResultRule::Optional: return "optional";
-    }
-    return "none";
+    return kTargetResultRuleTable.name(r);
 }
 
 // Register-class envelope (universal — every target maps its concrete
@@ -145,25 +184,20 @@ enum class TargetRegClass : std::uint8_t {
     Flags = 4,
 };
 
-[[nodiscard]] constexpr std::string_view targetRegClassName(TargetRegClass c) noexcept {
-    switch (c) {
-        case TargetRegClass::None:  return "none";
-        case TargetRegClass::GPR:   return "gpr";
-        case TargetRegClass::FPR:   return "fpr";
-        case TargetRegClass::VR:    return "vr";
-        case TargetRegClass::Flags: return "flags";
-    }
-    return "none";
-}
+inline constexpr EnumNameTable<TargetRegClass, 5> kTargetRegClassTable{{{
+    { TargetRegClass::None,  "none"  },
+    { TargetRegClass::GPR,   "gpr"   },
+    { TargetRegClass::FPR,   "fpr"   },
+    { TargetRegClass::VR,    "vr"    },
+    { TargetRegClass::Flags, "flags" },
+}}};
 
+[[nodiscard]] constexpr std::string_view targetRegClassName(TargetRegClass c) noexcept {
+    return kTargetRegClassTable.name(c);
+}
 [[nodiscard]] constexpr std::optional<TargetRegClass>
 targetRegClassFromName(std::string_view s) noexcept {
-    if (s == "none")  return TargetRegClass::None;
-    if (s == "gpr")   return TargetRegClass::GPR;
-    if (s == "fpr")   return TargetRegClass::FPR;
-    if (s == "vr")    return TargetRegClass::VR;
-    if (s == "flags") return TargetRegClass::Flags;
-    return std::nullopt;
+    return kTargetRegClassTable.fromName(s);
 }
 
 // Map a substrate-tier `TypeKind` to its `TargetRegClass`. Universal
@@ -271,23 +305,170 @@ enum class TargetEncodingShape : std::uint8_t {
     Fixed32     = 2,    // 32-bit fixed word + bit-field slots (ARM64, RV32, MIPS-fixed)
 };
 
+inline constexpr EnumNameTable<TargetEncodingShape, 3> kTargetEncodingShapeTable{{{
+    { TargetEncodingShape::None,        "none"         },
+    { TargetEncodingShape::X86Variable, "x86-variable" },
+    { TargetEncodingShape::Fixed32,     "fixed32"      },
+}}};
+
 [[nodiscard]] constexpr std::string_view
 targetEncodingShapeName(TargetEncodingShape s) noexcept {
-    switch (s) {
-        case TargetEncodingShape::None:        return "none";
-        case TargetEncodingShape::X86Variable: return "x86-variable";
-        case TargetEncodingShape::Fixed32:     return "fixed32";
-    }
-    return "none";
+    return kTargetEncodingShapeTable.name(s);
 }
-
 [[nodiscard]] constexpr std::optional<TargetEncodingShape>
 targetEncodingShapeFromName(std::string_view s) noexcept {
-    if (s == "none")         return TargetEncodingShape::None;
-    if (s == "x86-variable") return TargetEncodingShape::X86Variable;
-    if (s == "fixed32")      return TargetEncodingShape::Fixed32;
-    return std::nullopt;
+    return kTargetEncodingShapeTable.fromName(s);
 }
+
+// Operand-kind filter (plan 13 AS2 — variant-guard vocabulary). A
+// `encoding.variants[k].guard.operandKinds[i]` entry declares what
+// kind of LIR operand the i-th source operand of the instruction
+// must be for this variant to match. Closed vocabulary, shape-keyed:
+// the walker dispatches on this enum, NEVER on per-target identity.
+//
+// Enum names mirror `LirOperandKind` (the substrate boundary) — a
+// filter is "the LIR operand pool slot's kind discriminator." JSON
+// names preserve historical width labels (e.g. `"imm32"` for the
+// `ImmInt` filter — current scope holds 32-bit immediates; a future
+// Imm8/Imm16/Imm64 widening WILL gain its own filter when its
+// consumer lands).
+enum class OperandKindFilter : std::uint8_t {
+    Reg    = 0,  // `LirOperand{kind == Reg}`
+    ImmInt = 1,  // `LirOperand{kind == ImmInt}` — current cycle's
+                 // immInt32 arm; future Imm8/Imm16/Imm64 join as
+                 // distinct filters when their walkers land.
+};
+
+inline constexpr EnumNameTable<OperandKindFilter, 2> kOperandKindFilterTable{{{
+    { OperandKindFilter::Reg,    "reg"   },
+    { OperandKindFilter::ImmInt, "imm32" },  // JSON-side width label
+}}};
+
+[[nodiscard]] constexpr std::string_view
+operandKindFilterName(OperandKindFilter f) noexcept {
+    return kOperandKindFilterTable.name(f);
+}
+[[nodiscard]] constexpr std::optional<OperandKindFilter>
+operandKindFilterFromName(std::string_view s) noexcept {
+    return kOperandKindFilterTable.fromName(s);
+}
+
+// Encoding slot — names WHERE a register/immediate value goes inside
+// the emitted byte sequence. Closed vocabulary. The x86-variable
+// walker reads this enum to project an operand (or the instruction's
+// `result` register) into the right slot of the encoded bytes:
+//   * `ModRmReg` → low 3 bits of the operand's `hwEncoding` fill
+//     the ModR/M byte's `reg` field (bits 3..5); the high bit
+//     drives REX.R.
+//   * `ModRmRm` → low 3 bits fill the ModR/M byte's `rm` field
+//     (bits 0..2); the high bit drives REX.B. For register-direct
+//     operands (mod=3) — current cycle's only shape; memory
+//     addressing modes land alongside their consumers.
+//   * `Imm32` → 4 immediate bytes appended after the ModR/M (and
+//     SIB, when present), little-endian.
+// Future: `Imm8` / `Imm64` / `Disp8` / `Disp32` / `OpcodePlusReg` /
+// `SibBase` / `SibIndex` ... — each gains a row when first walker
+// consumer lands.
+enum class EncodingSlotKind : std::uint8_t {
+    ModRmReg = 0,
+    ModRmRm  = 1,
+    Imm32    = 2,
+};
+
+inline constexpr EnumNameTable<EncodingSlotKind, 3> kEncodingSlotKindTable{{{
+    { EncodingSlotKind::ModRmReg, "modrm.reg" },
+    { EncodingSlotKind::ModRmRm,  "modrm.rm"  },
+    { EncodingSlotKind::Imm32,    "imm32"     },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+encodingSlotKindName(EncodingSlotKind s) noexcept {
+    return kEncodingSlotKindTable.name(s);
+}
+[[nodiscard]] constexpr std::optional<EncodingSlotKind>
+encodingSlotKindFromName(std::string_view s) noexcept {
+    return kEncodingSlotKindTable.fromName(s);
+}
+
+// One per-variant byte-emission template (plan 13 §2.5). The walker
+// reads this and emits: optional REX prefix (with W/R/B bits derived
+// from the wired registers' `hwEncoding`), opcode bytes, optional
+// ModR/M byte (with `modrmRegExt` filling the `reg` field when an
+// instruction uses the `/digit` ModR/M extension instead of a real
+// register), then SIB+disp+imm per the slot wiring.
+struct DSS_EXPORT TargetEncodingTemplate {
+    // REX.W bit (operand-size override: 1 for 64-bit operations on
+    // GPR opcodes; 0 for 32-bit). When ANY REX bit (W/R/B/X) is set,
+    // the walker emits a REX prefix byte (0x40 base + bits).
+    bool rexW = false;
+
+    // Fixed opcode bytes (e.g. `[0x03]` for `add r64, r/m64`; `[0x0F,
+    // 0xAF]` for `imul r64, r/m64`). Non-empty for any non-`None`
+    // variant.
+    std::vector<std::uint8_t> opcodeBytes;
+
+    // When the instruction uses a `/digit` ModR/M-reg extension (e.g.
+    // `/0` for the immediate form of `add` — opcode 0x81 reg=0 means
+    // ADD; reg=1 means OR; reg=5 means SUB; etc.), this field carries
+    // the 3-bit digit. When set, the variant has NO `ModRmReg` slot
+    // (the digit IS the reg field); the variant's `ModRmRm` slot
+    // wires the destination register.
+    std::optional<std::uint8_t> modrmRegExt;
+};
+
+// One operand-wire: "source operand at LIR-index `index` goes into
+// `slotKind` of the emitted bytes." The struct is intentionally named
+// `Wire` — the LIR-side `operands[]` are the things being wired (the
+// containing variant has both an `operandKinds` guard AND a `wires`
+// list; reusing `operands` for both made the role read ambiguously).
+struct DSS_EXPORT TargetEncodingWire {
+    std::uint8_t     index    = 0;
+    EncodingSlotKind slotKind = EncodingSlotKind::ModRmReg;
+};
+
+// One encoding variant — guard + template + slot-wiring. The walker
+// picks the FIRST variant whose `operandKinds` guard matches the LIR
+// instruction's actual operand-kind sequence (operand 0 against
+// operandKinds[0], etc.). No matching variant ⇒
+// `A_NoMatchingEncodingVariant`.
+//
+// `validate()` (in target_schema.cpp) enforces the load-time invariants:
+//   * Two variants with identical `operandKinds` are rejected
+//     (overlapping guards would silently first-match-win).
+//   * `result != None ⇒ either `resultSlot` is set OR the template
+//     declares `modrmRegExt`` (otherwise the destination register
+//     would be silently dropped from the encoding).
+//   * `modrmRegExt` is incompatible with ANY wire targeting ModRmReg
+//     (the `/digit` extension IS the reg field; co-declaring it with
+//     a wire would silently overwrite one or the other).
+//   * No two slots in `{resultSlot} ∪ wires[*].slotKind` may target
+//     the same ModR/M-byte slot (ModRmReg, ModRmRm) — would silently
+//     overwrite at encode time.
+//   * Every guard position must have a matching wire (or be unused
+//     by-design; the validator's positional check pins this).
+struct DSS_EXPORT TargetEncodingVariant {
+    std::vector<OperandKindFilter>     operandKinds;
+    TargetEncodingTemplate             tmpl;
+    // Where the instruction's RESULT register goes (when the inst
+    // has a result). Nullopt for value-less instructions (e.g.
+    // `ret`). Most binary/unary register opcodes use ModRmReg here;
+    // immediate-destination forms use ModRmRm with `modrmRegExt`
+    // filling the reg field.
+    std::optional<EncodingSlotKind>    resultSlot;
+    // Where each LIR source operand (`inst.operands[wire.index]`)
+    // goes in the emitted bytes.
+    std::vector<TargetEncodingWire>    wires;
+};
+
+// The full encoding facet on a `TargetOpcodeInfo`. Carries the shape
+// discriminator (closed enum, plan 13 §2.4 shape-keyed dispatch) and
+// the per-variant rows the walker consumes. `shape == None` means
+// "no encoding declared"; `variants.empty()` is only legal when
+// `shape == None`.
+struct DSS_EXPORT TargetEncodingInfo {
+    TargetEncodingShape                shape = TargetEncodingShape::None;
+    std::vector<TargetEncodingVariant> variants;
+};
 
 // One relocation kind declared by the target schema (plan 13 §2.6, the
 // bucket-1 reloc taxonomy facet). Each row defines an opaque
@@ -333,28 +514,22 @@ enum class TargetTerminatorKind : std::uint8_t {
 // Canonical string form used by `.target.json` and `.dsslir` text.
 // Single source of truth for the loader (string → enum) and any future
 // emit-side serializer (enum → string).
+inline constexpr EnumNameTable<TargetTerminatorKind, 6> kTargetTerminatorKindTable{{{
+    { TargetTerminatorKind::None,        "none"        },
+    { TargetTerminatorKind::Br,          "br"          },
+    { TargetTerminatorKind::CondBr,      "cond-br"     },
+    { TargetTerminatorKind::Switch,      "switch"      },
+    { TargetTerminatorKind::Return,      "return"      },
+    { TargetTerminatorKind::Unreachable, "unreachable" },
+}}};
+
 [[nodiscard]] constexpr std::string_view
 targetTerminatorKindName(TargetTerminatorKind k) noexcept {
-    switch (k) {
-        case TargetTerminatorKind::None:        return "none";
-        case TargetTerminatorKind::Br:          return "br";
-        case TargetTerminatorKind::CondBr:      return "cond-br";
-        case TargetTerminatorKind::Switch:      return "switch";
-        case TargetTerminatorKind::Return:      return "return";
-        case TargetTerminatorKind::Unreachable: return "unreachable";
-    }
-    return "none";
+    return kTargetTerminatorKindTable.name(k);
 }
-
 [[nodiscard]] constexpr std::optional<TargetTerminatorKind>
 targetTerminatorKindFromName(std::string_view s) noexcept {
-    if (s == "none")        return TargetTerminatorKind::None;
-    if (s == "br")          return TargetTerminatorKind::Br;
-    if (s == "cond-br")     return TargetTerminatorKind::CondBr;
-    if (s == "switch")      return TargetTerminatorKind::Switch;
-    if (s == "return")      return TargetTerminatorKind::Return;
-    if (s == "unreachable") return TargetTerminatorKind::Unreachable;
-    return std::nullopt;
+    return kTargetTerminatorKindTable.fromName(s);
 }
 
 // Per-kind contract: successor-count window the loader's `validate()`
@@ -420,15 +595,12 @@ struct DSS_EXPORT TargetOpcodeInfo {
     std::uint8_t         minSuccessors  = 0;
     std::uint8_t         maxSuccessors  = 0;
 
-    // Byte-encoding shape (plan 13 AS1). `None` is the default — an
-    // opcode without an `encoding` block in the target JSON stays at
-    // `None` and the assembler emits `A_NoEncodingDeclared` for it.
-    // Per-variant guard rows + template + slot wiring (the JSON
-    // `encoding.variants[]` substructure of §2.5) land alongside their
-    // consumers in AS2 (`x86-variable`) and AS3 (`fixed32`); the
-    // substrate carries only the shape discriminator today so the
-    // dispatch-on-shape in `assemble()` has a stable hook.
-    TargetEncodingShape  encodingShape  = TargetEncodingShape::None;
+    // Byte-encoding facet (plan 13 AS1 substrate + AS2 variant rows).
+    // `encoding.shape == None` (default) means no encoding declared —
+    // the assembler emits `A_NoEncodingDeclared`. A non-`None` shape
+    // requires a non-empty `encoding.variants[]` (validate()-enforced);
+    // each variant carries its guard + template + slot wiring.
+    TargetEncodingInfo   encoding;
 
     // Terminator-ness derives from `terminatorKind` — single source of
     // truth. Callers ported from the old `isTerminator` bool field

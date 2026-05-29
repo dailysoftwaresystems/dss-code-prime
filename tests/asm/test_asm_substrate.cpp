@@ -101,11 +101,14 @@ TEST(AsmSubstrate, AssembledModuleOkIsParallelIndexShapeCheck) {
 
 // ── Substrate surface: cycle-1 fail-loud diagnostics ──────────────────
 
-TEST(AsmSubstrate, EveryInstFiresNoEncodingDiagnosticInCycle1) {
+TEST(AsmSubstrate, EveryUnencodedInstFiresNoEncodingDiagnostic) {
     // Lower a trivial c-subset function all the way to LIR. The
-    // shipped x86_64.target.json declares opcodes without an
-    // `encoding` block (AS2 fills that in); cycle-1 substrate fires
-    // `A_NoEncodingDeclared` for every instruction.
+    // shipped x86_64.target.json declares `encoding` for `mov` and
+    // `ret` (AS2 cycle 2 scope); the remaining opcodes the LIR uses
+    // (`add` / `jmp` / `call` / etc.) still have no encoding row,
+    // so the assembler fires `A_NoEncodingDeclared` for them. The
+    // parallel-index discipline must remain — every LIR function
+    // produces a slot regardless of per-inst failure.
     auto bundle = lowerCSubsetToLir("int f(int x) { return x; }");
     ASSERT_TRUE(bundle.lir.ok);
     Lir const& lir = bundle.lir.lir;
@@ -113,46 +116,40 @@ TEST(AsmSubstrate, EveryInstFiresNoEncodingDiagnosticInCycle1) {
     DiagnosticReporter rep;
     auto result = assemble(lir, *bundle.target, bundle.lir.lirToMir, rep);
 
-    // Parallel-index discipline: one AssembledFunction per LIR
-    // function, regardless of per-instruction encoding failures.
     EXPECT_EQ(result.functions.size(), lir.moduleFuncCount());
     EXPECT_EQ(result.expectedFuncCount, lir.moduleFuncCount());
     EXPECT_TRUE(result.ok());
 
     // The originating function symbol must round-trip through
     // assemble() so the linker doesn't need to consult the upstream
-    // `Lir` to know where to place the function's bytes in the
-    // object-file symbol table.
+    // `Lir` to know where to place the function's bytes.
     for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
         EXPECT_EQ(result.functions[fi].symbol,
                   lir.funcSymbol(lir.funcAt(fi)));
     }
 
-    // Cycle-1: every inst is unencoded (no bytes accumulated, no
-    // relocations, no source-map entries) and produces a fail-loud
-    // diagnostic. The schema has no `encoding` blocks yet, so the
-    // diagnostic code is `A_NoEncodingDeclared`.
-    //
-    // Tightened to assert that diagnostic count EQUALS total inst
-    // count — the loose `> 0` form passes even if only the first
-    // inst is processed (a parallel-index continuity-broken
-    // regression that wouldn't otherwise surface).
-    std::size_t totalInsts = 0;
+    // Substrate guarantee: every instruction whose opcode lacks an
+    // encoding produces its OWN diagnostic — the parallel-index
+    // continuity invariant. Count unencoded insts and assert the
+    // diagnostic count matches.
+    std::size_t unencodedInsts = 0;
     for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
         LirFuncId const fn = lir.funcAt(fi);
         for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
-            totalInsts += lir.blockInstCount(lir.funcBlockAt(fn, bi));
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+                auto const* info = bundle.target->opcodeInfo(
+                    lir.instOpcode(lir.blockInstAt(blk, ii)));
+                if (info != nullptr
+                    && info->encoding.shape == TargetEncodingShape::None) {
+                    ++unencodedInsts;
+                }
+            }
         }
     }
-    for (auto const& fn : result.functions) {
-        EXPECT_TRUE(fn.bytes.empty());
-        EXPECT_TRUE(fn.relocations.empty());
-        EXPECT_TRUE(fn.sourceMap.empty());
-    }
     EXPECT_EQ(countDiagnostics(rep, DiagnosticCode::A_NoEncodingDeclared),
-              totalInsts)
-        << "every instruction must produce its own diagnostic — "
-           "parallel-index continuity guarantee";
+              unencodedInsts)
+        << "every unencoded instruction must produce its own diagnostic";
 }
 
 TEST(AsmSubstrate, LirToMirSizeMismatchFailsLoud) {
@@ -179,18 +176,26 @@ TEST(AsmSubstrate, LirToMirSizeMismatchFailsLoud) {
 }
 
 TEST(AsmSubstrate, EncodingShapeWalkerFiresWhenShapeDeclaredWithoutWalker) {
-    // Synthesize a target schema whose `add` opcode declares the
-    // `x86-variable` shape — but AS1 cycle 1 has no walker
-    // registered for it. `A_NoEncodingShapeWalker` is the expected
-    // diagnostic until AS2 plugs in the walker.
+    // Synthesize a target schema whose `trap` opcode declares the
+    // `fixed32` shape — AS2 cycle 2 wires the `x86-variable` walker,
+    // but `fixed32` still has no walker registered (AS3 plugs it in).
+    // `A_NoEncodingShapeWalker` is the expected diagnostic until then.
     constexpr char const* kJson = R"({
         "dssTargetVersion": 1,
-        "target": { "name": "synth_x86", "version": "0.1" },
+        "target": { "name": "synth_arm_like", "version": "0.1" },
         "opcodes": [
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "trap", "result": "none",
               "terminatorKind": "unreachable",
-              "encoding": { "format": "x86-variable" } }
+              "encoding": {
+                "format": "fixed32",
+                "variants": [
+                  {
+                    "guard":    { "operandKinds": [] },
+                    "template": { "opcode": [222] }
+                  }
+                ]
+              } }
         ]
     })";
     auto schema = TargetSchema::loadFromText(kJson, "synth.target.json");
@@ -426,21 +431,42 @@ TEST(TargetSchemaEncoding, OpcodeWithoutEncodingDefaultsToNoneShape) {
     ASSERT_TRUE(idx.has_value());
     auto const* info = (*schema)->opcodeInfo(*idx);
     ASSERT_NE(info, nullptr);
-    EXPECT_EQ(info->encodingShape, TargetEncodingShape::None);
+    EXPECT_EQ(info->encoding.shape, TargetEncodingShape::None);
 }
 
 TEST(TargetSchemaEncoding, X86VariableAndFixed32RoundTrip) {
+    // Validate() requires `variants` non-empty when shape != None,
+    // so each opcode gets a minimal placeholder variant. The test's
+    // purpose is shape-discriminator JSON round-trip, not encoder
+    // correctness — minimal variants suffice.
+    // result=none so the new convergence-fix G rule (result-value
+    // requires a destination slot) doesn't fire — this test pins
+    // shape ROUND-TRIP, not encoder semantics.
     constexpr char const* kJson = R"({
         "dssTargetVersion": 1,
         "target": { "name": "synth", "version": "0.1" },
         "opcodes": [
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "addx",
-              "result": "value",
-              "encoding": { "format": "x86-variable" } },
+              "result": "none",
+              "terminatorKind": "unreachable",
+              "encoding": {
+                "format": "x86-variable",
+                "variants": [
+                  { "guard": { "operandKinds": [] },
+                    "template": { "opcode": [1] } }
+                ]
+              } },
             { "mnemonic": "addr",
-              "result": "value",
-              "encoding": { "format": "fixed32" } }
+              "result": "none",
+              "terminatorKind": "unreachable",
+              "encoding": {
+                "format": "fixed32",
+                "variants": [
+                  { "guard": { "operandKinds": [] },
+                    "template": { "opcode": [2] } }
+                ]
+              } }
         ]
     })";
     auto schema = TargetSchema::loadFromText(kJson, "synth.target.json");
@@ -449,8 +475,8 @@ TEST(TargetSchemaEncoding, X86VariableAndFixed32RoundTrip) {
     auto const* r = (*schema)->opcodeInfo(*(*schema)->opcodeByMnemonic("addr"));
     ASSERT_NE(x, nullptr);
     ASSERT_NE(r, nullptr);
-    EXPECT_EQ(x->encodingShape, TargetEncodingShape::X86Variable);
-    EXPECT_EQ(r->encodingShape, TargetEncodingShape::Fixed32);
+    EXPECT_EQ(x->encoding.shape, TargetEncodingShape::X86Variable);
+    EXPECT_EQ(r->encoding.shape, TargetEncodingShape::Fixed32);
 }
 
 TEST(TargetSchemaEncoding, UnknownFormatIsLoadTimeFatal) {

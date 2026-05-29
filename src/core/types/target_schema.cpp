@@ -72,6 +72,213 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         problems.push_back(makeProblem(std::move(path), std::move(msg)));
     };
 
+    // ── Encoding facet (per-opcode variants) ──────────────────────
+    //
+    // Substrate-tier rules the per-row JSON parse cannot express:
+    //   * `shape != None` requires `variants` non-empty (otherwise
+    //     the dispatch arm has nothing to match against → the walker
+    //     would silently emit `A_NoMatchingEncodingVariant` for every
+    //     instruction).
+    //   * `shape == None` forbids non-empty `variants` (variants
+    //     without a shape walker are dead data).
+    //   * Each variant's `tmpl.opcodeBytes` MUST be non-empty (a
+    //     variant with no opcode is a contradiction).
+    //   * Each variant's `wires[k].index` must be `<
+    //     operandKinds.size()` — the index targets a position in the
+    //     variant's own guard tuple. (The LIR-side bound against the
+    //     opcode's `maxOperands` is implicit: `operandsMatchGuard`
+    //     at the walker entry requires `instOps.size() ==
+    //     operandKinds.size()`.)
+    //   * `modrmRegExt` (when set) must fit in 3 bits (0..7).
+    //   * `tmpl.opcodeBytes.size() <= 15` — the architectural cap
+    //     for x86 instructions (defense-in-depth against accidental
+    //     huge byte lists in JSON).
+    for (std::size_t i = 0; i < opcodes.size(); ++i) {
+        auto const& o = opcodes[i];
+        if (o.encoding.shape == TargetEncodingShape::None
+            && !o.encoding.variants.empty()) {
+            fail(std::format("/opcodes/{}/encoding/variants", i),
+                 std::format("opcode '{}': `encoding.shape` is 'none' "
+                             "but `variants` is non-empty (variant rows "
+                             "without a walker are dead data)",
+                             o.mnemonic));
+        }
+        if (o.encoding.shape != TargetEncodingShape::None
+            && o.encoding.variants.empty()) {
+            fail(std::format("/opcodes/{}/encoding/variants", i),
+                 std::format("opcode '{}': `encoding.shape` is '{}' "
+                             "but `variants` is empty (every "
+                             "instruction would fire "
+                             "A_NoMatchingEncodingVariant)",
+                             o.mnemonic,
+                             targetEncodingShapeName(o.encoding.shape)));
+        }
+        for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
+            auto const& v = o.encoding.variants[vi];
+            if (v.tmpl.opcodeBytes.empty()) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
+                     std::format("opcode '{}' variant {}: 'opcode' bytes "
+                                 "must be non-empty",
+                                 o.mnemonic, vi));
+            }
+            if (v.tmpl.opcodeBytes.size() > 15) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
+                     std::format("opcode '{}' variant {}: 'opcode' byte "
+                                 "count {} exceeds 15 (x86 instruction "
+                                 "length limit)",
+                                 o.mnemonic, vi, v.tmpl.opcodeBytes.size()));
+            }
+            if (v.tmpl.modrmRegExt.has_value() && *v.tmpl.modrmRegExt > 7) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", i, vi),
+                     std::format("opcode '{}' variant {}: 'modrmRegExt' "
+                                 "({}) must fit in 3 bits [0, 7]",
+                                 o.mnemonic, vi, *v.tmpl.modrmRegExt));
+            }
+            for (std::size_t oi = 0; oi < v.wires.size(); ++oi) {
+                if (v.wires[oi].index >= v.operandKinds.size()) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/wires/{}/index", i, vi, oi),
+                         std::format("opcode '{}' variant {}: operand "
+                                     "wire `index` {} is out of range "
+                                     "[0, {})",
+                                     o.mnemonic, vi,
+                                     v.wires[oi].index,
+                                     v.operandKinds.size()));
+                }
+            }
+
+            // ── Convergence-fix B: `modrmRegExt` + ModRmReg wire ─────
+            // The `/digit` extension fills the ModR/M.reg field; co-
+            // declaring a wire targeting ModRmReg would silently
+            // overwrite either the digit or the wired register at
+            // encode time. Reject at load.
+            if (v.tmpl.modrmRegExt.has_value()) {
+                bool const resultIsModRmReg =
+                    v.resultSlot == EncodingSlotKind::ModRmReg;
+                bool anyWireIsModRmReg = false;
+                for (auto const& w : v.wires) {
+                    if (w.slotKind == EncodingSlotKind::ModRmReg) {
+                        anyWireIsModRmReg = true;
+                        break;
+                    }
+                }
+                if (resultIsModRmReg || anyWireIsModRmReg) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", i, vi),
+                         std::format("opcode '{}' variant {}: 'modrmRegExt' "
+                                     "(/{} digit extension) conflicts with "
+                                     "a wire targeting 'modrm.reg' — the "
+                                     "digit IS the reg field, so the wired "
+                                     "register would be silently dropped",
+                                     o.mnemonic, vi, *v.tmpl.modrmRegExt));
+                }
+            }
+
+            // ── Convergence-fix C: every guard position needs a wire ─
+            // A variant whose `operandKinds` declares N positions but
+            // whose `wires` covers only K<N would match an N-operand
+            // LIR inst then silently drop the unwired operand.
+            {
+                std::vector<bool> covered(v.operandKinds.size(), false);
+                for (auto const& w : v.wires) {
+                    if (w.index < covered.size()) covered[w.index] = true;
+                }
+                for (std::size_t gi = 0; gi < covered.size(); ++gi) {
+                    if (!covered[gi]) {
+                        fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
+                             std::format("opcode '{}' variant {}: guard "
+                                         "position {} (operandKind '{}') "
+                                         "has no matching wire (the "
+                                         "operand would be silently "
+                                         "dropped from the encoding)",
+                                         o.mnemonic, vi, gi,
+                                         operandKindFilterName(v.operandKinds[gi])));
+                    }
+                }
+            }
+
+            // ── Convergence-fix A (validate half): slot uniqueness ────
+            // Two writers to the same ModR/M slot (ModRmReg or ModRmRm)
+            // would silently overwrite each other at encode time.
+            // Multi-Imm32 wires are legal (a future variant could
+            // append two immediates in sequence). Detect duplicate
+            // ModR/M-slot writers (resultSlot + each wire) here.
+            {
+                bool sawResultModRmReg = false;
+                bool sawResultModRmRm  = false;
+                if (v.resultSlot.has_value()) {
+                    if (*v.resultSlot == EncodingSlotKind::ModRmReg)
+                        sawResultModRmReg = true;
+                    if (*v.resultSlot == EncodingSlotKind::ModRmRm)
+                        sawResultModRmRm = true;
+                }
+                bool sawWireModRmReg = false;
+                bool sawWireModRmRm  = false;
+                for (auto const& w : v.wires) {
+                    if (w.slotKind == EncodingSlotKind::ModRmReg) {
+                        if (sawWireModRmReg || sawResultModRmReg) {
+                            fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
+                                 std::format("opcode '{}' variant {}: "
+                                             "two slot writes target "
+                                             "'modrm.reg' — the second "
+                                             "would silently overwrite "
+                                             "the first at encode time",
+                                             o.mnemonic, vi));
+                        }
+                        sawWireModRmReg = true;
+                    }
+                    if (w.slotKind == EncodingSlotKind::ModRmRm) {
+                        if (sawWireModRmRm || sawResultModRmRm) {
+                            fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
+                                 std::format("opcode '{}' variant {}: "
+                                             "two slot writes target "
+                                             "'modrm.rm' — the second "
+                                             "would silently overwrite "
+                                             "the first at encode time",
+                                             o.mnemonic, vi));
+                        }
+                        sawWireModRmRm = true;
+                    }
+                }
+            }
+
+            // ── Convergence-fix G: result requires a destination slot ─
+            // An opcode whose `result == Value/Optional` MUST route the
+            // result register somewhere — either an explicit
+            // `resultSlot`, or via `modrmRegExt` (the `/digit` form
+            // ALSO encodes the destination, via ModR/M.rm with the
+            // wired source). Otherwise the destination register is
+            // silently dropped from the encoding.
+            if (o.result != TargetResultRule::None
+                && !v.resultSlot.has_value()
+                && !v.tmpl.modrmRegExt.has_value()) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}", i, vi),
+                     std::format("opcode '{}' variant {}: opcode has "
+                                 "`result='{}'` but variant declares "
+                                 "neither `resultSlot` nor "
+                                 "`template.modrmRegExt` — destination "
+                                 "register would be silently dropped",
+                                 o.mnemonic, vi,
+                                 targetResultRuleName(o.result)));
+            }
+        }
+
+        // ── Convergence-fix D: overlapping variant guards ─────────
+        // Two variants with identical `operandKinds` would first-match
+        // silently win — the second is unreachable.
+        for (std::size_t a = 0; a < o.encoding.variants.size(); ++a) {
+            for (std::size_t b = a + 1; b < o.encoding.variants.size(); ++b) {
+                if (o.encoding.variants[a].operandKinds
+                    == o.encoding.variants[b].operandKinds) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}", i, b),
+                         std::format("opcode '{}': variant {} has the "
+                                     "same `operandKinds` as variant "
+                                     "{} — first-match dispatch makes "
+                                     "variant {} unreachable",
+                                     o.mnemonic, b, a, b));
+                }
+            }
+        }
+    }
+
     // ── Opcode arity ──────────────────────────────────────────────
     for (std::size_t i = 0; i < opcodes.size(); ++i) {
         auto const& o = opcodes[i];
@@ -241,7 +448,9 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     // From here, the target opted into the register-machine validation
     // surface by populating at least one of the two sections — even if
     // its declared abiModel is non-register-machine.
-    bool const enforceRefs = hasAbiContent;
+    // (`enforceRefs` was a tautological alias of `hasAbiContent` here
+    // — the early return above guarantees this branch is unreachable
+    // when `!hasAbiContent`. Removed per simplifier review.)
     auto checkRefs = [&](std::size_t       ccIdx,
                          char const*       field,
                          std::span<std::string const> refs,
@@ -251,11 +460,9 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             auto const& ref = refs[k];
             auto it = registerIndex.find(ref);
             if (it == registerIndex.end()) {
-                if (enforceRefs) {
-                    fail(std::format("/callingConventions/{}/{}/{}", ccIdx, field, k),
-                         std::format("callingConvention '{}'.{}: register '{}' is not in the register table",
-                                     cc.name, field, ref));
-                }
+                fail(std::format("/callingConventions/{}/{}/{}", ccIdx, field, k),
+                     std::format("callingConvention '{}'.{}: register '{}' is not in the register table",
+                                 cc.name, field, ref));
                 continue;
             }
             auto const& reg = registers[it->second];

@@ -1,5 +1,6 @@
 add_library(asm OBJECT
     asm.cpp
+    format/x86_variable.cpp
 )
 
 target_include_directories(asm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
