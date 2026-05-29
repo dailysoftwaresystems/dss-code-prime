@@ -65,7 +65,7 @@ auto fmt = ObjectFormatSchema::loadShipped("elf");
 LinkResult bin = link(input, *fmt, /*architecture=*/"x86_64", reporter);
 ```
 
-`O_*` diagnostic family at 0xC00x for object-format validation (mirrors `L_*` 0xB00x for LIR, `I_*` 0xA00x for MIR, `H_*` 0xF00x for HIR).
+`O_*` diagnostic family at **0x5xxx** for object-format validation (per the central nibble registry in [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1.2 — the shipped `parse_diagnostic.cpp` has explicitly reserved 0x5xxx for `O_*` since the cross-plan diagnostic-band cleanup). Earlier rev claimed `0xC00x` which silently collided with the shipped `C_*` config family (0xC001..0xC033 — already in production). The corrected allocation mirrors `L_*` 0xBxxx for LIR, `I_*` 0xAxxx for MIR, `H_*` 0xFxxx for HIR.
 
 **Cross-cutting consequence**: the v1 acceptance for "link c-subset to ELF/PE/Mach-O across {OS × arch}" is met by **3 JSON files + 1 engine**, not 3 separate C++ writers. Adding a new format (e.g., COFF for embedded; XCOFF for AIX; a-out for retro) = new JSON file, no engine edits.
 
@@ -169,7 +169,7 @@ v1: implement initial-exec model for static binaries; general-dynamic reserved p
 
 ### 2.10 Diagnostic namespace
 
-`K_*` (K for "linK") — `K_SymbolUndefined`, `K_SymbolRedefined`, `K_RelocationOverflow`, `K_RelocationKindMismatch`, `K_SectionOverlap`, `K_ImportUnresolved`, `K_InvalidLoadCommand` (Mach-O), `K_InvalidPeHeader`, `K_InvalidElfHeader`, `K_TlsModelUnsupported`. The engine emits these directly; the schema's `ObjectFormatSchema::validate()` separately emits `O_*` diagnostics at 0xC00x for malformed/incomplete format JSON.
+`K_*` (K for "linK") — `K_SymbolUndefined`, `K_SymbolRedefined`, `K_RelocationOverflow`, `K_RelocationKindMismatch`, `K_SectionOverlap`, `K_ImportUnresolved`, `K_InvalidLoadCommand` (Mach-O), `K_InvalidPeHeader`, `K_InvalidElfHeader`, `K_TlsModelUnsupported`. The engine emits these directly; the schema's `ObjectFormatSchema::validate()` separately emits `O_*` diagnostics at 0x5xxx for malformed/incomplete format JSON.
 
 ### 2.12 Cross-CU linking (v1.x — coupled with `08-compilation-unit-plan` CU6)
 

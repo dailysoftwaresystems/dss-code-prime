@@ -158,6 +158,35 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 
 > **Pre-HIR readiness:** none of the remaining items blocks opening **HR1** (HIR). After the 2026-05-26 closure pass the open set is: **D1** (pointer/array type-level — feature/grammar round, *when* a corpus needs typed pointers or HIR lowers them), **D3-residual** (`VARCHAR(N)` parameter — feature/grammar round, *when* tsql needs precise length typing), **D4-residual** (AP2–AP4 + CLI — owned by phase #12 `program-api`), **D5/D6** (c-subset and tsql language-surface expansion — v1.x feature rounds, *when* the credibility-as-real-language goal or a corpus needs them), **D7** (ternary/mixfix — its own schema-v3 round, *when* a shipped language needs it), **D9** (use-before-init / unreachable — *when* HIR's CFG exists), and **D10** (cross-CU / incremental — *when* an artifact profile needs multiple CUs). D9 is the only one HIR itself helps unblock.
 
+## 0.3 Diagnostic-code nibble registry (cross-plan authority)
+
+**Single authoritative table for the diagnostic-code high-nibble allocation.** The shipped implementation lives in `src/core/types/parse_diagnostic.cpp`'s `diagnosticCodePrefix()` switch (the runtime that maps the numeric code to its rendered prefix letter). This table mirrors that; **the cpp file is the source of truth, this is the planning view** so cross-plan PRs don't accidentally re-use a slot. Update both when a new family lands.
+
+| Nibble | Rendered prefix | Family | Owner plan | Status |
+|---|---|---|---|---|
+| `0x0xxx` | `P_` | Parse | [`05`](./05-parser-plan%20-%20ok.md) | ✅ shipped |
+| `0x1xxx` | — | (reserved — free) | — | available |
+| `0x2xxx` | — | (reserved — free) | — | available |
+| `0x3xxx` | — | (reserved — free) | — | available |
+| `0x4xxx` | `R_` | Register allocator | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML6 cycle 3a) |
+| `0x5xxx` | `O_` | Object format / linker | [`14`](./14-linker-plan%20-%20tbd.md) | ⏳ reserved (cpp comment cites this as the explicit hold) |
+| `0x6xxx` | `W_` | WAT/WASM verifier + emit-side | [`18`](./18-wasm-plan%20-%20tbd.md) §2.9b | ⏳ reserved (post-rev-3 allocation) |
+| `0x7xxx` | `V_` | SPIR-V verifier + emit-side | [`17`](./17-shader-gpu-plan%20-%20tbd.md) §2.9 | ⏳ reserved (post-rev-3 allocation) |
+| `0x8xxx` | — | (reserved — JVM IL / .NET IL post-v1) | future plan | available |
+| `0x9xxx` | `P_` | Parse (internal-invariant range, distinct from 0x0xxx user-facing) | [`05`](./05-parser-plan%20-%20ok.md) | ✅ shipped |
+| `0xAxxx` | `I_` | MIR (IR-gen mid-level + verifier) | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML3) |
+| `0xBxxx` | `L_` | LIR lowering + verifier | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML5–ML8) |
+| `0xCxxx` | `C_` | Config-loader (`.lang.json` / `.target.json` / future `.format.json`) | [`02`](./02-schema-expressiveness-v2-plan%20-%20ok.md) + cross-plan | ✅ shipped (0xC001..0xC033 in production) |
+| `0xDxxx` | `D_` | Driver / compilation-unit / import resolver | [`08`](./08-compilation-unit-plan%20-%20tbd.md) | ✅ shipped (CU2+ ImportResolver) |
+| `0xExxx` | `S_` | Semantic analysis | [`08.6`](./08.6-semantic-plan%20-%20ok.md) | ✅ shipped (SE1–SE7) |
+| `0xFxxx` | `H_` | HIR (verifier + text + lowering) | [`09`](./09-hir-plan%20-%20ok.md) | ✅ shipped (HR1–HR11) |
+
+**Allocation discipline:**
+- Each family owns its full nibble (4096 codes); cycles within a plan allocate codes incrementally without coordinating with other plans.
+- Before adding a new family, **claim the slot here AND in `parse_diagnostic.cpp`'s `diagnosticCodePrefix()` switch** in the same PR. Reading either in isolation is the failure mode.
+- Free slots: `0x1xxx` / `0x2xxx` / `0x3xxx` / `0x8xxx`. Post-v1 candidates (JVM IL, .NET IL, future shader-stage validators, future debug-info-emit) draw from these.
+- **DO NOT subdivide existing nibbles across families.** Pre-rev-3, plans 18 + 17 had each claimed sub-bands `0xC1xx` / `0xC2xx` within the `C_*` config nibble — silent collision with the shipped `C_001..C_033` range. Corrected to top-level nibble ownership.
+
 ## 1. Vision & Overview
 
 **DSS Code Prime** is a universal, configurable compiler written in C++. Its core design principle is that **both the source language and the target platform are configurable**, making it a single compiler engine capable of compiling _any_ defined language to _any_ supported target.

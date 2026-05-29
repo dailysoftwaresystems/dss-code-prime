@@ -216,7 +216,7 @@ The bypass-LIR WASM path doesn't get the `LirVerifier` correctness gate native t
 | `checkTableIndexBounds` | Every `call_indirect` table-index is in range; every `elem` segment offset is in range |
 | `checkSectionOrdering` | The module's section order matches the WebAssembly spec's mandated order (Type / Import / Function / Table / Memory / Global / Export / Start / Element / Code / Data / DataCount) |
 
-New `WT_*` diagnostic family at 0xC1xx (parallel to `L_*` 0xB00x for LIR; `SV_*` 0xC2xx for SPIR-V per plan 17 §2.9). The reference oracle `wasm-validate` REMAINS test-only — used to cross-check that every `WatVerifier`-clean module is also `wasm-validate`-clean. **The contract: every emitted .wasm must pass `WatVerifier` BEFORE the encoder writes bytes. A `wasm-validate` failure on a `WatVerifier`-clean module is a verifier-rule gap (file + fold), NOT a "ship it anyway" outcome.**
+New `W_*` diagnostic family at 0x6xxx (claims the WAT/WASM letter; parallel to `L_*` 0xBxxx for LIR; `V_*` 0x7xxx for SPIR-V verifier per plan 17 §2.9). **Allocation per the central nibble registry in [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1.2 — earlier draft proposed `WT_*` 0xC1xx which silently collided with the shipped `C_*` config family (0xC001..0xC033 in `parse_diagnostic.hpp`).** The reference oracle `wasm-validate` REMAINS test-only — used to cross-check that every `WatVerifier`-clean module is also `wasm-validate`-clean. **The contract: every emitted .wasm must pass `WatVerifier` BEFORE the encoder writes bytes. A `wasm-validate` failure on a `WatVerifier`-clean module is a verifier-rule gap (file + fold), NOT a "ship it anyway" outcome.**
 
 ### 2.10 Reserved post-v1.x
 
@@ -290,7 +290,7 @@ Output:
 | WA8 | Round-trip tests — emit `.wasm`, run `wasm-validate` (oracle), run `wasm2wat` and diff against our own `.wat` emitter. Golden `.wasm` byte snapshots for stable inputs. |
 | WA9 | End-to-end "hello, world" — a c-subset corpus program compiles to `.wasm`, runs under wasmtime in CI, prints expected output. |
 | WA10 | MIR → .wasm contract pin: same MIR input produces byte-identical WASM output across runs / platforms. Deterministic-output regression guard. |
-| WA11 | **`WatVerifier` substrate** (per §2.9b): 7 rule families. New `WT_*` diagnostic family at 0xC1xx. v1.x mandatory — production correctness gate, NOT test-only oracle. Same correctness tier `verifyLirText` occupies for `.dsslir`. |
+| WA11 | **`WatVerifier` substrate** (per §2.9b): 7 rule families. New `W_*` diagnostic family at 0x6xxx (per the central nibble registry in plan 00 §1.2). v1.x mandatory — production correctness gate, NOT test-only oracle. Same correctness tier `verifyLirText` occupies for `.dsslir`. |
 | WA12 | **Minifier substrate** (per §2.11): strip-rule schema + engine + the four `release`-profile rules (custom-section drop, local compaction, drop elision, local.tee folding). v1.x mandatory — gates "WASM backend done." |
 | WA13 | Minifier `minified`-profile rules (data-segment compaction, table compaction, full custom-section sweep). Closes the ≥ 30% size-reduction acceptance bar. |
 

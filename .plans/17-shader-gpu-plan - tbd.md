@@ -178,7 +178,7 @@ The bypass-LIR SPIR-V path doesn't get the `LirVerifier` correctness gate native
 | `checkStructuredCfBalance` | Every `OpLoopMerge`/`OpSelectionMerge` has matching merge-target + continue-target structure (parallel to plan 12 MirVerifier's `checkStructCfMarkers`) |
 | `checkEntryPointInterface` | Every `OpEntryPoint` interface-id list is well-formed (declared variables, storage-class IO matching stage) |
 
-New `SV_*` diagnostic family at 0xC2xx (parallel to `L_*` 0xB00x for LIR). The reference oracles `spirv-val` and `spirv-cross` REMAIN test-only — used to cross-check that every `SpirvVerifier`-clean module is also `spirv-val`-clean. **The contract is: every emitted .spv must pass `SpirvVerifier` BEFORE the encoder writes bytes. A spirv-val failure on a SpirvVerifier-clean module is a verifier-rule gap that gets filed and folded, not a "ship it anyway" outcome.**
+New `V_*` diagnostic family at 0x7xxx (V for SPIR-V verifier — `S_*` is already Semantic; parallel to `L_*` 0xBxxx for LIR, `W_*` 0x6xxx for WAT verifier per plan 18 §2.9b). **Allocation per the central nibble registry in [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1.2 — earlier draft proposed `SV_*` 0xC2xx which silently collided with the shipped `C_*` config family (0xC001..0xC033 in `parse_diagnostic.hpp`).** The reference oracles `spirv-val` and `spirv-cross` REMAIN test-only — used to cross-check that every `SpirvVerifier`-clean module is also `spirv-val`-clean. **The contract is: every emitted .spv must pass `SpirvVerifier` BEFORE the encoder writes bytes. A spirv-val failure on a SpirvVerifier-clean module is a verifier-rule gap that gets filed and folded, not a "ship it anyway" outcome.**
 
 ### 2.10 SPIR-V binary minifier (v1.x scope — NOT post-v1)
 
@@ -226,7 +226,7 @@ Same shape-keyed dispatch as the format encoder (closed strip-rule vocabulary; e
 | SG8 | Entry-point attribute parsing in HIR             | `[[shader.vertex]]` / `[[shader.fragment]]` / `[[shader.compute(x,y,z)]]`. |
 | SG9 | Round-trip + spirv-val oracle tests              | Emit → `spirv-val` (oracle) → assert valid. Round-trip via `spirv-as`/`spirv-dis` text. |
 | SG10| End-to-end "hello triangle" Vulkan harness       | Compile vertex + fragment shaders, render a triangle in a CI Vulkan harness, assert frame correctness. |
-| SG11| **`SpirvVerifier` substrate** (per §2.9)           | 7 rule families per §2.9 table. New `SV_*` diagnostic family at 0xC2xx. v1.x mandatory — production correctness gate, not test-only oracle. Same correctness tier `verifyLirText` occupies for `.dsslir`. |
+| SG11| **`SpirvVerifier` substrate** (per §2.9)           | 7 rule families per §2.9 table. New `V_*` diagnostic family at 0x7xxx (per the central nibble registry in plan 00 §1.2). v1.x mandatory — production correctness gate, not test-only oracle. Same correctness tier `verifyLirText` occupies for `.dsslir`. |
 | SG12| **SPIR-V minifier substrate** (per §2.10)          | Strip-rule schema + engine + the four `release`-profile rules (drop-opname-debug, drop-opstring, drop-opsource, dead-decoration-elim). v1.x mandatory — gates "shader backend done." |
 | SG13| Minifier `minified`-profile rules                | drop-opline + remap-result-ids (the size-aggressive rules). Closes the ≥ 25% size-reduction acceptance bar. |
 
