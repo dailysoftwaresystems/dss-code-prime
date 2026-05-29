@@ -52,6 +52,13 @@ struct LirReg {
     [[nodiscard]] constexpr LirRegClass regClass() const noexcept {
         return static_cast<LirRegClass>(classKind);
     }
+    // Validity discriminator is the CLASS only, not the id. Physical
+    // ordinals start at 0 (e.g., x86_64 rax = 0); a class-only check
+    // means rax post-regalloc remains valid. For virtual regs the
+    // builder mints ids starting at 1, so the convention `id == 0
+    // ⇔ virtual sentinel` is producer-enforced rather than type-
+    // enforced — code that distinguishes virtual from physical does
+    // so via `isPhysical`, not via id.
     [[nodiscard]] constexpr bool valid() const noexcept {
         return classKind != static_cast<std::uint32_t>(LirRegClass::None);
     }

@@ -146,6 +146,13 @@ public:
     [[nodiscard]] TargetSchemaId      targetId() const noexcept { return target_.id(); }
     [[nodiscard]] TargetSchema const& schema()   const noexcept { return target_; }
 
+    // Currently-open block, or default-constructed (invalid) id when
+    // no block is open. Mirrors `MirBuilder::currentlyOpenBlock` —
+    // exposed so lowerers can pin the "first emission must land in
+    // the entry-time block" invariant (ML5 cycle-3e deferral D-3e.1
+    // for switch-lowering's first compare).
+    [[nodiscard]] LirBlockId openBlock() const noexcept { return openBlock_; }
+
     // Open a function. Closes the current function first (which
     // requires its current block be terminated + the function have
     // ≥1 block). `symbol` is the declared SymbolId of the function.

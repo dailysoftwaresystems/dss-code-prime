@@ -343,8 +343,22 @@ struct Lowerer {
             case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
             case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
             case MirOpcode::ICmpUlt: case MirOpcode::ICmpUle:
-            case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge:
-                return lowerICmp(id, *condCodeForICmp(op));
+            case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge: {
+                // Even though this dispatch arm gates `op` to the
+                // ICmp* set, route through the optional return so a
+                // future MirOpcode added to this arm but NOT to
+                // `condCodeForICmp`'s switch surfaces as a loud
+                // diagnostic instead of UB blind-deref. The poison
+                // call prevents downstream `regForValue` from
+                // cascading "used before definition" diagnostics.
+                auto const cc = condCodeForICmp(op);
+                if (!cc.has_value()) {
+                    reportUnsupported(op, id);
+                    poisonValue(id);
+                    return;
+                }
+                return lowerICmp(id, *cc);
+            }
             case MirOpcode::Phi:    return;  // pre-pass-allocated; no body emission
             case MirOpcode::Alloca: return lowerAlloca(id);
             case MirOpcode::Load:   return lowerLoad(id);
@@ -1193,6 +1207,17 @@ struct Lowerer {
             return false;
         }
 
+        // Pin the implicit invariant that the FIRST compare AND its
+        // paired jcc both land in the switch-bearing block that was
+        // open when `lowerSwitch` was called. A future refactor that
+        // creates a new block between entry and the first compare —
+        // or between the first compare and its jcc — would shift
+        // emission into a different block and silently break
+        // dominance for the phi moves the cycle-3b prepass emitted on
+        // the ORIGINAL switch-bearing block. Two pin sites cover the
+        // pre-cmp and the pre-jcc emission boundaries.
+        LirBlockId const switchHeader = lir.openBlock();
+
         // Emit the first compare in-place; subsequent compares go in
         // freshly-allocated "next-compare" blocks that we register on the
         // open function.
@@ -1203,9 +1228,25 @@ struct Lowerer {
                 reportUnsupported(MirOpcode::Switch, id);
                 return false;
             }
+            // First-iteration pre-cmp pin: the open block must still
+            // be `switchHeader` when the first compare emits.
+            if (i == 0 && lir.openBlock() != switchHeader) {
+                reportUnsupported(MirOpcode::Switch, id);
+                return false;
+            }
             std::array<LirOperand, 2> cmpOps{
                 LirOperand::makeReg(*discrim), LirOperand::makeReg(*caseConst)};
             emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+
+            // First-iteration pre-jcc pin: the open block must still
+            // be `switchHeader` after the compare emits and before
+            // the jcc emits (the jcc is the terminator that seals the
+            // header block — anything between cmp and jcc must stay
+            // on the header for phi-move dominance).
+            if (i == 0 && lir.openBlock() != switchHeader) {
+                reportUnsupported(MirOpcode::Switch, id);
+                return false;
+            }
 
             // Allocate a "next compare" block unless this is the last
             // case (in which case we fall through to a `jmp default`).

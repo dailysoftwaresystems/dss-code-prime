@@ -1,6 +1,7 @@
 add_library(lir OBJECT
     lir.cpp
     lir_literal_pool.cpp
+    lir_liveness.cpp
     lir_verifier.cpp
 )
 

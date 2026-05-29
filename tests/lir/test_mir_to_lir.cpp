@@ -25,6 +25,7 @@
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "synthetic_fn.hpp"
 
 #include <gtest/gtest.h>
 
@@ -706,39 +707,15 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
 }
 
 // ─── cycle 3d: bitwise + float arithmetic + cross-class Bitcast ──────────
-
-namespace {
-
-// Helper for cycle-3d synthetic-MIR tests: build a one-block function
-// with given parameter types, body emitter, and return type. Used by
-// bitwise + float + Bitcast tests since c-subset doesn't naturally
-// emit MIR bitwise / float ops yet.
-struct SyntheticFn {
-    ::dss::Mir          mir;
-    ::dss::TypeInterner interner;
-};
-
-template <class BodyFn>
-SyntheticFn buildSyntheticFn(
-    std::span<::dss::TypeKind const> paramKinds,
-    ::dss::TypeKind                  returnKind,
-    BodyFn&&                         body) {
-    SyntheticFn out{::dss::Mir{}, ::dss::TypeInterner{::dss::CompilationUnitId{1}}};
-    std::vector<::dss::TypeId> params;
-    params.reserve(paramKinds.size());
-    for (auto k : paramKinds) params.push_back(out.interner.primitive(k));
-    auto const retT = out.interner.primitive(returnKind);
-    auto const sig  = out.interner.fnSig(params, retT, ::dss::CallConv::CcSysV);
-    ::dss::MirBuilder mb;
-    mb.addFunction(sig, ::dss::SymbolId{1});
-    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
-    mb.beginBlock(bb);
-    body(mb, out.interner, params, retT);
-    out.mir = std::move(mb).finish();
-    return out;
-}
-
-} // namespace
+//
+// `SyntheticFn` / `buildSyntheticFn` were promoted to `synthetic_fn.hpp`
+// (ML6 cycle 1, cycle-3e deferral D-3e.7) so the new
+// `test_lir_liveness` binary can share the same harness. The shared
+// namespace is `dss::test_support` (not `dss::testing` — gtest already
+// owns the `::testing` namespace and `using namespace dss;` would
+// otherwise make `testing::` ambiguous in the test files).
+using ::dss::test_support::SyntheticFn;
+using ::dss::test_support::buildSyntheticFn;
 
 TEST(MirToLir, IntegerBitwiseAndShiftLowerToBitwiseOpcodes) {
     // Cycle 3d bitwise lowering: each MIR bitwise/shift op → its named
@@ -898,6 +875,40 @@ TEST(MirToLir, BitcastCrossClassEmitsMovqXClass) {
     }
     EXPECT_TRUE(foundXClass)
         << "FPR→GPR Bitcast must emit `movq_xclass`, not plain `mov`";
+}
+
+TEST(MirToLir, BitcastCrossClassEmitsMovqXClassReverse) {
+    // Reverse direction of `BitcastCrossClassEmitsMovqXClass`
+    // (cycle-3e deferral D-3e.8 folded ML6 cycle 1). The lowerer's
+    // class-symmetric check at `lowerBitcast` is direction-agnostic
+    // — same operand-shape exercises the I64→F64 path with the
+    // source class flipped to GPR and the destination class flipped
+    // to FPR.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I64};
+    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::F64,
+        [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+            std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            std::array<::dss::MirInstId, 1> ops{a};
+            mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
+        });
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+    ASSERT_TRUE(result.ok);
+    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
+    ::dss::Lir const& lir = result.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    bool foundXClass = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(entry, i)) == movqOp) {
+            foundXClass = true; break;
+        }
+    }
+    EXPECT_TRUE(foundXClass)
+        << "GPR→FPR Bitcast must emit `movq_xclass`, not plain `mov`";
 }
 
 TEST(MirToLir, BitcastSameClassStaysAsMov) {
