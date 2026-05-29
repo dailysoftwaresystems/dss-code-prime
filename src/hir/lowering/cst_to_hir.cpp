@@ -1448,7 +1448,16 @@ struct Lowerer {
         // handles initChild + role-based discovery in one place,
         // keeping this site and the semantic-side resolver in lockstep.
         CstEvalEnvironment env;
-        env.resolveSymbolInit = [this](NodeId identTok) -> std::optional<NodeId> {
+        // HIR-lowering uses the frozen SemanticModel, whose `symbolAt`
+        // is already use-site-aware (Pass 2 resolved every reference
+        // at the CST position). Scope-context tracking via the engine
+        // is unused here — the identifier-token NodeId carries its
+        // own resolved binding. The scope arg is accepted to match
+        // the resolver signature; the returned `initScopeOpaque`
+        // is set to the symbol's own scope for parity with the
+        // semantic-side resolver.
+        env.resolveSymbolInit = [this](NodeId identTok, std::uint32_t /*curScope*/)
+            -> std::optional<CstResolvedSymbol> {
             SymbolId const sym = model.symbolAt(identTok);
             if (!sym.valid()) return std::nullopt;
             SymbolRecord const* rec = model.recordFor(sym);
@@ -1457,7 +1466,9 @@ struct Lowerer {
             if (rec->tree.v != tree().id().v) return std::nullopt;
             for (auto const& dr : sem.declarations) {
                 if (dr.rule.v == tree().rule(rec->declRuleNode).v) {
-                    return findInitExprInDecl(tree(), dr, rec->declRuleNode);
+                    auto initExpr = findInitExprInDecl(tree(), dr, rec->declRuleNode);
+                    if (!initExpr.has_value()) return std::nullopt;
+                    return CstResolvedSymbol{*initExpr, rec->scope.v};
                 }
             }
             return std::nullopt;

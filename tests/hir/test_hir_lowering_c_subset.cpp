@@ -1467,6 +1467,26 @@ TEST(HirLoweringCSubset, CstConstEval_CycleRefuses) {
         << "cyclic const-init chain must refuse to fold";
 }
 
+// D7 scope-context tracking: shadowing across scopes is NOT a cycle.
+// Outer `const X=1; const Y=X+1;` + inner `const X=Y;` — the inner X
+// shadows the outer X at use-site, but Y's init `X+1` must be
+// evaluated in MODULE scope (Y's scope), where it correctly resolves
+// to the OUTER X (= 1). Result: inner X = Y = 2; `xs[X+1]` = 3.
+//
+// Without scope-context tracking, evaluating Y's `X+1` would re-use
+// the function scope (the original use-site) and find the inner X
+// → false cycle or wrong value. The engine threads
+// `resolved->initScopeOpaque` through recursion to fix this.
+TEST(HirLoweringCSubset, CstConstEval_ShadowingResolvesCorrectScope) {
+    SemanticModel model = analyzeCSubset(
+        "const int X = 1;\n"
+        "const int Y = X + 1;\n"
+        "void f() { const int X = Y; int xs[X + 1]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(arrayLengthOfVar(model, "xs"), 3);
+}
+
 // Cross-scope ref chain (no shadowing): outer module consts referenced
 // from a function body. Two-deep const-ref chain. The engine resolves
 // `xs[N + 1]` → folds N (which is itself `M+1`=3) → fold to 4.

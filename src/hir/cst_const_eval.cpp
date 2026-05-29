@@ -78,6 +78,7 @@ evalImpl(NodeId                              expr,
          CstEvalContext const&               ctx,
          CstEvalEnvironment const&           env,
          EvalOptions const&                  options,
+         std::uint32_t                       currentScopeOpaque,
          std::unordered_set<std::uint32_t> & visitedInitNodes) {
     if (!expr.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     Tree const& tree = ctx.tree;
@@ -110,20 +111,21 @@ evalImpl(NodeId                              expr,
         // scopes; text-keying would false-positive a cycle on
         // legitimate cross-scope ref chains.
         if (env.resolveSymbolInit) {
-            // Engine contract: the resolver receives a token-kind
-            // identifier NodeId. Pin it in debug; release-builds skip
-            // the check (the engine only reaches here on Token kind).
             assert(tree.kind(expr) == NodeKind::Token);
-            auto initExpr = env.resolveSymbolInit(expr);
-            if (!initExpr.has_value() || !initExpr->valid()) {
+            auto resolved = env.resolveSymbolInit(expr, currentScopeOpaque);
+            if (!resolved.has_value() || !resolved->initExpr.valid()) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
-            if (visitedInitNodes.contains(initExpr->v)) {
+            if (visitedInitNodes.contains(resolved->initExpr.v)) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
-            visitedInitNodes.insert(initExpr->v);
-            ConstEvalResult inner = evalImpl(*initExpr, ctx, env, options, visitedInitNodes);
-            visitedInitNodes.erase(initExpr->v);
+            visitedInitNodes.insert(resolved->initExpr.v);
+            // Recurse with the SYMBOL's scope (resolved->initScopeOpaque),
+            // not the original use-site scope — closes D7 cross-scope
+            // shadowing.
+            ConstEvalResult inner = evalImpl(resolved->initExpr, ctx, env, options,
+                                             resolved->initScopeOpaque, visitedInitNodes);
+            visitedInitNodes.erase(resolved->initExpr.v);
             if (!inner.value.has_value()) inner.blamedNode = HirNodeId{expr.v};
             return inner;
         }
@@ -162,7 +164,7 @@ evalImpl(NodeId                              expr,
         // rhs until lhs's truthiness is known. Matches the HIR walker's
         // C99 semantics exactly.
         if (e->target == "LogicalAnd" || e->target == "LogicalOr") {
-            ConstEvalResult a = evalImpl(lhsN, ctx, env, options, visitedInitNodes);
+            ConstEvalResult a = evalImpl(lhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
             if (!a.value.has_value()) return a;
             auto aIsTrueOpt = asBool(*a.value, options.allowFloat);
             if (!aIsTrueOpt.has_value()) {
@@ -172,7 +174,7 @@ evalImpl(NodeId                              expr,
             bool const isAnd = (e->target == "LogicalAnd");
             bool const shortCircuits = isAnd ? !aIsTrue : aIsTrue;
             if (shortCircuits) return ok(makeBoolLiteral(aIsTrue ? 1 : 0));
-            ConstEvalResult b = evalImpl(rhsN, ctx, env, options, visitedInitNodes);
+            ConstEvalResult b = evalImpl(rhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
             if (!b.value.has_value()) return b;
             auto bIsTrueOpt = asBool(*b.value, options.allowFloat);
             if (!bIsTrueOpt.has_value()) {
@@ -185,9 +187,9 @@ evalImpl(NodeId                              expr,
         if (!opK.has_value()) {
             return fail(ConstEvalFailure::UnsupportedOperator, expr);
         }
-        ConstEvalResult a = evalImpl(lhsN, ctx, env, options, visitedInitNodes);
+        ConstEvalResult a = evalImpl(lhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         if (!a.value.has_value()) return a;
-        ConstEvalResult b = evalImpl(rhsN, ctx, env, options, visitedInitNodes);
+        ConstEvalResult b = evalImpl(rhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         if (!b.value.has_value()) return b;
         bool const eitherFloat = isFloatValue(*a.value) || isFloatValue(*b.value);
         if (eitherFloat) {
@@ -243,7 +245,7 @@ evalImpl(NodeId                              expr,
         if (!opK.has_value()) {
             return fail(ConstEvalFailure::UnsupportedOperator, expr);
         }
-        ConstEvalResult inner = evalImpl(operandN, ctx, env, options, visitedInitNodes);
+        ConstEvalResult inner = evalImpl(operandN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         if (!inner.value.has_value()) return inner;
         if (isFloatValue(*inner.value)) {
             if (!options.allowFloat) {
@@ -279,14 +281,14 @@ evalImpl(NodeId                              expr,
         if (!condN.valid() || !thenN.valid() || !elseN.valid()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        ConstEvalResult cond = evalImpl(condN, ctx, env, options, visitedInitNodes);
+        ConstEvalResult cond = evalImpl(condN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         if (!cond.value.has_value()) return cond;
         auto condTrueOpt = asBool(*cond.value, options.allowFloat);
         if (!condTrueOpt.has_value()) {
             return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         }
         NodeId const selected = *condTrueOpt ? thenN : elseN;
-        return evalImpl(selected, ctx, env, options, visitedInitNodes);
+        return evalImpl(selected, ctx, env, options, currentScopeOpaque, visitedInitNodes);
     }
 
     // Wrapper rule: any internal node with exactly one meaningful child
@@ -302,7 +304,7 @@ evalImpl(NodeId                              expr,
         }
     }
     if (internalCount == 1) {
-        return evalImpl(onlyInternal, ctx, env, options, visitedInitNodes);
+        return evalImpl(onlyInternal, ctx, env, options, currentScopeOpaque, visitedInitNodes);
     }
     // Zero internals: a single token-leaf wrapper (e.g. an `operand`
     // rule whose sole content is an integer-literal token or an
@@ -319,7 +321,7 @@ evalImpl(NodeId                              expr,
             }
         }
         if (tokCount == 1) {
-            return evalImpl(onlyTok, ctx, env, options, visitedInitNodes);
+            return evalImpl(onlyTok, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         }
     }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
@@ -327,12 +329,13 @@ evalImpl(NodeId                              expr,
 
 } // namespace
 
-ConstEvalResult evaluateConstantCst(NodeId               expr,
+ConstEvalResult evaluateConstantCst(NodeId                expr,
                                     CstEvalContext const& ctx,
-                                    CstEvalEnvironment   env,
-                                    EvalOptions          options) {
+                                    CstEvalEnvironment    env,
+                                    EvalOptions           options,
+                                    std::uint32_t         initialScopeOpaque) {
     std::unordered_set<std::uint32_t> visitedInitNodes;
-    return evalImpl(expr, ctx, env, options, visitedInitNodes);
+    return evalImpl(expr, ctx, env, options, initialScopeOpaque, visitedInitNodes);
 }
 
 std::optional<std::int64_t> asInt64Bridge(HirLiteralValue const& v) noexcept {

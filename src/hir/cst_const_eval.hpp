@@ -40,24 +40,37 @@ namespace dss {
 class GrammarSchema;
 class Tree;
 
+// Resolved-symbol record returned by the resolver. The engine
+// recurses into `initExpr` and threads `initScopeOpaque` as the
+// current scope context for any further identifier lookups inside
+// that subtree. The opaque-scope handle is meaningful only to the
+// resolver — the engine treats it as a uint32_t cookie carried
+// through recursion.
+struct CstResolvedSymbol {
+    NodeId        initExpr{};
+    std::uint32_t initScopeOpaque = 0;
+};
+
 // Caller-supplied identifier resolver: maps a CST identifier-token
-// node to the CST `NodeId` of its defining expression (e.g. the `5`
-// CST node in `const int N = 5;`). Return `nullopt` when the name
-// doesn't refer to a compile-time constant. The callback receives the
-// identifier-token CST node so it can dispatch via either:
-//   - semantic-time scope-chain walking (read `tree.text(identTok)`),
-//   - frozen-SemanticModel lookup (`model.symbolAt(identTok)`).
+// node + the current scope context to the CST `NodeId` of its
+// defining expression PLUS the scope-context to use when recursing
+// into it. Return `nullopt` when the name doesn't refer to a
+// compile-time constant.
+//
+// Scope-context tracking (plan 12.5 §0.2 D7): the engine threads
+// the resolver-supplied `initScopeOpaque` through recursion, so
+// when `const X=1; const Y=X+1; void f(){ const X=Y; int a[X+1]; }`
+// is evaluated, the inner-X's lookup uses the function scope (finds
+// the inner X → recurses into Y), then Y's init `X+1` is evaluated
+// with MODULE scope (where Y was declared) so the inner X is no
+// longer in view — the outer X correctly resolves to 1.
+//
 // The engine guarantees `identTok` is a token CST node. Closure-
 // carrying state goes through the std::function capture. Cycle
-// safety: the engine tracks a per-call visited-set keyed on the
-// RESOLVED init-expression NodeId (NOT on identifier text — text-
-// keyed detection produces false-positive cycles under shadowing
-// because the same name can refer to different symbols across
-// scopes). `const int a = b; const int b = a;` still surfaces
-// `NotAConstantExpression` at the second encounter because both
-// arms revisit the same init-NodeId.
+// safety: visited-set keyed on the RESOLVED init-NodeId so a chain
+// like `const a=b; const b=a;` still trips at the second encounter.
 using CstSymbolInitResolver =
-    std::function<std::optional<NodeId>(NodeId)>;
+    std::function<std::optional<CstResolvedSymbol>(NodeId, std::uint32_t)>;
 
 struct CstEvalEnvironment {
     CstSymbolInitResolver resolveSymbolInit{};
@@ -86,10 +99,11 @@ struct CstEvalContext {
 // `ConstEvalResult` shape the HIR-side engine uses so consumers can
 // share diagnostic-mapping code paths.
 [[nodiscard]] DSS_EXPORT ConstEvalResult
-evaluateConstantCst(NodeId               expr,
+evaluateConstantCst(NodeId                expr,
                     CstEvalContext const& ctx,
-                    CstEvalEnvironment   env     = {},
-                    EvalOptions          options = {});
+                    CstEvalEnvironment    env                = {},
+                    EvalOptions           options            = {},
+                    std::uint32_t         initialScopeOpaque = 0);
 
 // Bridge a folded `HirLiteralValue` into a plain `int64_t`. Handles
 // the three numeric variant arms (int64 / uint64 / bool); returns

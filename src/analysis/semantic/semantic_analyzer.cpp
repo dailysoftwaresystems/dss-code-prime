@@ -512,7 +512,7 @@ integerLiteralTokenSet(EngineState const& s) {
 // symbols can change at runtime — not foldable). The DeclarationRule's
 // `initChild` (already config-driven) gives the visible-child index
 // where the init expression lives.
-[[nodiscard]] std::optional<NodeId>
+[[nodiscard]] std::optional<CstResolvedSymbol>
 resolveConstSymbolInit(EngineState const& s, Tree const& tree,
                        SemanticConfig const& cfg,
                        ScopeId fromScope, std::string_view name) {
@@ -523,8 +523,14 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     if (rec.tree.v != tree.id().v) return std::nullopt;
     auto declIt = s.idx().declByRule.find(tree.rule(rec.declRuleNode).v);
     if (declIt == s.idx().declByRule.end()) return std::nullopt;
-    return findInitExprInDecl(tree, cfg.declarations[declIt->second],
-                              rec.declRuleNode);
+    auto initExpr = findInitExprInDecl(tree, cfg.declarations[declIt->second],
+                                       rec.declRuleNode);
+    if (!initExpr.has_value()) return std::nullopt;
+    // D7: return the SYMBOL's defining scope so the engine evaluates
+    // its init expression in the scope where the symbol was declared
+    // — not the original use-site scope. This is what makes shadowing
+    // work correctly across const ref chains.
+    return CstResolvedSymbol{*initExpr, rec.scope.v};
 }
 
 [[nodiscard]] std::optional<std::int64_t>
@@ -535,13 +541,19 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
     CstEvalEnvironment env;
     if (fromScope.valid() && cfg != nullptr) {
-        env.resolveSymbolInit = [&s, &tree, cfg, fromScope](NodeId identTok)
-            -> std::optional<NodeId> {
-            return resolveConstSymbolInit(s, tree, *cfg, fromScope,
+        // The resolver receives the CURRENT scope context (initially
+        // `fromScope`, but updated as the engine recurses into other
+        // symbols' init expressions). It looks up the identifier
+        // from that scope, returning the resolved symbol's init AND
+        // its declaring scope so the engine carries the right
+        // context into the recursive evaluation.
+        env.resolveSymbolInit = [&s, &tree, cfg](NodeId identTok, std::uint32_t curScopeOpaque)
+            -> std::optional<CstResolvedSymbol> {
+            return resolveConstSymbolInit(s, tree, *cfg, ScopeId{curScopeOpaque},
                                           tree.text(identTok));
         };
     }
-    ConstEvalResult const r = evaluateConstantCst(node, ctx, env);
+    ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
     return asInt64Bridge(*r.value);
 }
