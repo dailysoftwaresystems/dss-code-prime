@@ -61,6 +61,17 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "2-operand multiply. x86 has both 2-op `imul reg, reg` (writes the low half to the destination — what cycle 3a uses) and 1-op `mul/imul reg` (writes rdx:rax with the full double-width product — needed only when overflow detection or 128-bit results matter; cycle 3c/AS1 lower those via a different opcode pseudonym). Cycle 3a sticks to the low-half-only shape.",
+      "mnemonic":      "mul",
+      "result":        "value",
+      "isTerminator":  false,
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "mnemonic":      "cmp",
       "result":        "none",
       "isTerminator":  false,

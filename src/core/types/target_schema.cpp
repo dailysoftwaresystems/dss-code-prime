@@ -154,19 +154,31 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     }
 
     // ── Calling conventions ──────────────────────────────────────
-    // Two gates here:
-    //  1) For non-register-machine ABIs (WASM operand-stack, SPIR-V
-    //     result-id), `registers`/`callingConventions` may legitimately
-    //     be empty (those models don't have physical registers). Skip
-    //     ref-resolution + alignment checks entirely.
-    //  2) For register-machine ABI, ref-resolution is gated on
-    //     `registers.empty() && callingConventions.empty()` — both empty
-    //     is cycle-2a-shape (back-compat); anything else means the
-    //     user opted into resolution.
-    if (abiModel != TargetAbiModel::RegisterMachine) {
+    // Three gates here, in order:
+    //
+    //  1) Non-register-machine ABIs (WASM operand-stack, SPIR-V result-
+    //     id, etc.) that DECLARE empty registers + empty callingConventions
+    //     legitimately bypass the rest of the loop. But if a non-register-
+    //     machine target SHIPS calling-conventions or register entries
+    //     anyway (copy-paste error, leftover from a template), those
+    //     references must still resolve — otherwise typos hide in
+    //     unloadable-anyway data.
+    //
+    //  2) For register-machine ABI, a target that declared a calling-
+    //     convention WITHOUT registers is the silent-failure trap closed
+    //     in cycle 2b's review — references resolve to nothing. Enforce.
+    //
+    //  3) Cycle-2a-shape (registers AND callingConventions BOTH empty)
+    //     is the back-compat shape and validate has nothing to check.
+    bool const hasAbiContent =
+        !registers.empty() || !callingConventions.empty();
+    if (!hasAbiContent) {
         return problems;
     }
-    bool const enforceRefs = !registers.empty() || !callingConventions.empty();
+    // From here, the target opted into the register-machine validation
+    // surface by populating at least one of the two sections — even if
+    // its declared abiModel is non-register-machine.
+    bool const enforceRefs = hasAbiContent;
     auto checkRefs = [&](std::size_t       ccIdx,
                          char const*       field,
                          std::span<std::string const> refs,

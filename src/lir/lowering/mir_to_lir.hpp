@@ -16,14 +16,16 @@
 // MIR values map to fresh LIR virtual registers per-function. Physical
 // register assignment + spilling happen later in ML6 regalloc.
 //
-// This is the FIRST consumer of the cycle-2b `TargetSchema` opcode +
-// register-class machinery. All opcode dispatch goes through
-// `schema.opcodeByMnemonic("add")` etc.; nothing in the lowerer hardcodes
-// processor names. Adding ARM64 = drop `arm64.target.json` with a
-// compatible opcode vocabulary; the lowerer is target-blind.
+// First consumer of the cycle-2b `TargetSchema` opcode vocabulary. All
+// opcode dispatch goes through `schema.opcodeByMnemonic("add")` etc.;
+// nothing in the lowerer hardcodes processor names. Adding ARM64 = drop
+// `arm64.target.json` declaring `arg`/`mov`/`add`/`sub`/`mul`/`ret`
+// mnemonics; the lowerer is target-blind. (The register-file + calling-
+// convention sections of `TargetSchema` are the next-tier consumers —
+// ML6 regalloc + ML7 callconv lowering. Cycle 3a does not yet read them.)
 //
 // Cycle 3a scope (this revision): straight-line vertical slice — Function +
-// Block + Arg + Const + Add/Sub/Mul + Return. Control flow (Br/CondBr/
+// Block + Arg + Const + Add + Sub + Mul + Return. Control flow (Br/CondBr/
 // Switch), comparison (ICmp*/FCmp*), memory (Alloca/Load/Store/Gep),
 // calls (Call/IntrinsicCall/GlobalAddr), phi, casts, and aggregate ops
 // are deliberately fail-loud-deferred via `L_UnsupportedLoweringForOpcode`

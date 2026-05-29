@@ -526,6 +526,108 @@ TEST(TargetSchema, CallingConventionStackAlignmentMustBeInteger) {
 
 // ─── ShippedX86_64 — exact-count assertions ───────────────────────────────
 
+// ─── cycle 3a — abiModel ─────────────────────────────────────────────────
+
+TEST(TargetSchema, AbiModelDefaultsToRegisterMachine) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->abiModel(), ::dss::TargetAbiModel::RegisterMachine);
+}
+
+TEST(TargetSchema, AbiModelOperandStackAccepted) {
+    // WASM-shape schema: operand-stack ABI with empty registers/cc
+    // sections. Must load cleanly — the cycle-2b validate() short-circuit
+    // is the back-compat hook for non-register-machine targets.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"wasm","abiModel":"operand-stack"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})");
+    ASSERT_TRUE(r.has_value())
+        << "operand-stack target with empty register/cc sections must load";
+    EXPECT_EQ((*r)->abiModel(), ::dss::TargetAbiModel::OperandStack);
+}
+
+TEST(TargetSchema, AbiModelResultIdAccepted) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"spirv","abiModel":"result-id"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->abiModel(), ::dss::TargetAbiModel::ResultId);
+}
+
+TEST(TargetSchema, AbiModelInvalidStringRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X","abiModel":"register-typo"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, NonRegisterMachineWithCcStillValidatesRefs) {
+    // Silent-failure-hunter finding: a non-register-machine target that
+    // ships calling-convention entries anyway (copy-paste / leftover) must
+    // still have its references resolved — otherwise typos hide in
+    // unloadable-anyway data. Pin the failure mode.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"wasm","abiModel":"operand-stack"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "callingConventions":[{"name":"x","argGprs":["doesnotexist"]}]})");
+    ASSERT_FALSE(r.has_value())
+        << "non-register-machine target with populated cc must still validate "
+           "its register references (closes the silent-acceptance trap)";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ─── cycle 3a — linkRegister (ARM64 AAPCS64-shape) ──────────────────────
+
+TEST(TargetSchema, LinkRegisterResolvesToDeclaredGpr) {
+    // Fabricated ARM64-shape config: declare x30 as a GPR and reference it
+    // as the link register. Positive control.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"arm64"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[
+              {"name":"x0","class":"gpr","widthBytes":8},
+              {"name":"x30","class":"gpr","widthBytes":8}
+            ],
+            "callingConventions":[
+              {"name":"aapcs64","argGprs":["x0"],"linkRegister":"x30",
+               "stackAlignment":16}
+            ]})");
+    ASSERT_TRUE(r.has_value())
+        << "linkRegister resolving to a declared GPR must validate";
+    auto const* cc = (*r)->callingConventionByName("aapcs64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->linkRegister.has_value());
+    EXPECT_EQ(*cc->linkRegister, "x30");
+}
+
+TEST(TargetSchema, LinkRegisterUnknownNameRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"arm64"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"x0","class":"gpr","widthBytes":8}],
+            "callingConventions":[
+              {"name":"aapcs64","argGprs":["x0"],"linkRegister":"x999",
+               "stackAlignment":16}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, LinkRegisterMustBeString) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"arm64"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"x0","class":"gpr","widthBytes":8}],
+            "callingConventions":[
+              {"name":"aapcs64","linkRegister":42,"stackAlignment":16}
+            ]})");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
 TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // 16 GPRs + 16 FPRs + rflags = 33. EXPECT_EQ (not EXPECT_GE) so a
     // future accidental duplicate / addition trips the test rather than

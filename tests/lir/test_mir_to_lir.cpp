@@ -207,6 +207,70 @@ TEST(MirToLir, MultipleFunctionsEachIsolatedVRegSpace) {
     }
 }
 
+TEST(MirToLir, MulReturnLowersThreeInstructions) {
+    auto L = lowerCSubsetToLir("int m(int a, int b) { return a * b; }");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+
+    Lir const& lir = L.lir.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    ASSERT_EQ(lir.blockInstCount(bb), 4u);
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, 2)),
+              *L.target->opcodeByMnemonic("mul"));
+}
+
+// Cycle 3a wide-literal coverage (>INT32_MAX) is deferred to cycle 3b's
+// synthetic-MIR helper — the c-subset semantic phase rejects out-of-range
+// literals before they reach the LIR lowerer, so we can't exercise the
+// `fits == false` branch via an end-to-end pipeline yet. The branch
+// itself is live code; cycle 3b will land literal-pool wiring + a
+// synthetic-MIR fixture that pins it.
+
+TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
+    // Synthetic-target test: a schema declaring NO `mov` opcode against a
+    // MIR with a `Const` instruction must surface L_RequiredLirOpcodeMissing.
+    // Pins the cycle-3a "target schema author shipped an incomplete config"
+    // failure mode — without this test the missing-opcode diagnostics are
+    // dead code.
+    //
+    // The synthetic target deliberately omits `mov` AND `arg`; with `ret`
+    // present the fallback-seal still works so the LIR module finishes
+    // cleanly + the diagnostic surfaces.
+    auto incomplete = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"incomplete"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"add","result":"value","minOperands":2,"maxOperands":2},
+              {"mnemonic":"ret","result":"none","isTerminator":true,
+               "minOperands":0,"maxOperands":1}
+            ]})");
+    ASSERT_TRUE(incomplete.has_value());
+
+    // Drive MIR for `int f() { return 1; }`. The Const → mov path will hit
+    // the missing-opcode branch.
+    auto L = lowerCSubsetToLir("int f() { return 1; }");
+    assertUpstreamClean(L);
+
+    DiagnosticReporter rep;
+    auto result = lowerToLir(L.mir.mir, **incomplete, rep);
+    EXPECT_FALSE(result.ok);
+    bool found = false;
+    int  missingCount = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing) {
+            ++missingCount;
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "schema missing required `mov` opcode must surface "
+           "L_RequiredLirOpcodeMissing during MIR Const lowering";
+    // Per-mnemonic one-shot: 10k Consts must not produce 10k diagnostics.
+    // Test has 1 Const so 1 diagnostic is fine; pin "at most 1 per mnemonic".
+    EXPECT_LE(missingCount, 1)
+        << "L_RequiredLirOpcodeMissing must fire ONCE per mnemonic, not per inst";
+}
+
 TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
     // c-subset's `if/while` lowers to MIR control-flow (Br/CondBr); cycle 3a
     // deliberately does NOT yet lower these. The lowerer must report
@@ -227,4 +291,20 @@ TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
     EXPECT_TRUE(foundUnsupported)
         << "cycle 3a must report L_UnsupportedLoweringForOpcode on CondBr "
            "(or similar non-3a opcode); silent acceptance is a regression";
+
+    // The fallback-seal must have inserted a bare `ret` so the LIR module
+    // finishes — otherwise LirBuilder::finish() would have aborted. Pin
+    // the terminator shape so a future refactor that drops the fallback
+    // surfaces here, not at process-abort time.
+    Lir const& lir = L.lir.lir;
+    for (std::uint32_t i = 0; i < lir.moduleFuncCount(); ++i) {
+        LirFuncId const fn = lir.funcAt(i);
+        for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+            LirBlockId const bb = lir.funcBlockAt(fn, b);
+            EXPECT_EQ(lir.instOpcode(lir.blockTerminator(bb)),
+                      *L.target->opcodeByMnemonic("ret"))
+                << "every LIR block must end in `ret` after the cycle-3a "
+                   "fallback seal";
+        }
+    }
 }

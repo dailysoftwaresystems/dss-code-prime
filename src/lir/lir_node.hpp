@@ -47,6 +47,38 @@ struct LirOperand {
     };
 
     constexpr LirOperand() noexcept : kind(LirOperandKind::None), reg{} {}
+
+    // ── constexpr factories ────────────────────────────────────────
+    //
+    // Every operand-building call site (MIR→LIR isel cycles 3a-d, ARM64
+    // isel, AS1 assembler, golden-text emitter) ends up filling these
+    // exact union arms. Centralised so the discriminator + arm always
+    // stay in sync — accidentally setting `kind=Reg` while writing
+    // `immInt32` would otherwise be a quiet aliasing bug.
+    [[nodiscard]] static constexpr LirOperand makeReg(LirReg r) noexcept {
+        LirOperand o{};
+        o.kind = LirOperandKind::Reg;
+        o.reg  = r;
+        return o;
+    }
+    [[nodiscard]] static constexpr LirOperand makeImmInt32(std::int32_t v) noexcept {
+        LirOperand o{};
+        o.kind     = LirOperandKind::ImmInt;
+        o.immInt32 = v;
+        return o;
+    }
+    [[nodiscard]] static constexpr LirOperand makeBlockRef(std::uint32_t v) noexcept {
+        LirOperand o{};
+        o.kind      = LirOperandKind::BlockRef;
+        o.blockSlot = v;
+        return o;
+    }
+    [[nodiscard]] static constexpr LirOperand makeSymbolRef(std::uint32_t v) noexcept {
+        LirOperand o{};
+        o.kind     = LirOperandKind::SymbolRef;
+        o.symbolV  = v;
+        return o;
+    }
 };
 static_assert(sizeof(LirOperand) == 8, "LirOperand POD must stay 8 bytes");
 static_assert(std::is_trivially_copyable_v<LirOperand>);
