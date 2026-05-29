@@ -103,7 +103,13 @@ Both lowerings produce instructions with `HirSourceMap` (`HirAttribute<HirSource
 
 **HIR → MIR → SPIR-V** (default).
 
-Reuse the MIR optimizer (constant folding, DCE, copy propagation). Structured-CF markers from `12-mir-lir-plan §2.3` map 1:1 to SPIR-V:
+Reuse the MIR optimizer (constant folding, DCE, copy propagation). Structured-CF markers from `12-mir-lir-plan §2.3` map 1:1 to SPIR-V.
+
+**Shader decorations migrate to MIR via the `MirShaderAttribute` side-table** (per plan 12 §3.1 D-ML2-2.1). HIR carries shader metadata in `ShaderIntrinsic` + `HirShaderMap` (per §2.2 above); HIR→MIR lowering populates a parallel `MirShaderAttribute` side-table (mirror of `MirSourceMap`) so the MIR→SPIR-V walker reads its decoration vocabulary from MIR directly. The walker NEVER reaches back into HIR — that would violate the layering. Side-table contents: per-MIR-function entry-point stage + workgroup-size; per-MIR-symbol binding + descriptorSet + location + storage-class + builtin tag. This is the load-bearing prerequisite for the bypass-LIR SPIR-V path; without it the walker has nothing to decorate from.
+
+**`spirv.target.json` declares `abiModel: "result-id"`** (per plan 12 §3.1 D-ML5-X.1). The schema's validate() rules per-shape mandate `decorations[]` + `storageClasses[]` + `entryPoints[]` for result-id targets (parallel to register-machine's mandated `registers[]` + `callingConventions[]`). Lands when the second target class lands.
+
+Structured-CF markers from `12-mir-lir-plan §2.3` map 1:1 to SPIR-V:
 - `LoopHeader` / `LoopLatch` / `LoopExit` → `OpLoopMerge` + `OpBranchConditional`
 - `IfThen` / `IfElse` / `IfJoin` → `OpSelectionMerge` + `OpBranchConditional`
 - `SwitchHead` / `SwitchCase` / `SwitchJoin` → `OpSelectionMerge` + `OpSwitch` (the `SwitchJoin` block carries the merge label)
@@ -156,7 +162,25 @@ Sidecar `.spv.json` per `.spv`:
 
 Engine integration reads the sidecar to set up Vulkan descriptor set layouts.
 
-### 2.9 SPIR-V binary minifier (v1.x scope — NOT post-v1)
+### 2.9 `SpirvVerifier` — in-tree structural verifier (v1.x scope)
+
+The bypass-LIR SPIR-V path doesn't get the `LirVerifier` correctness gate native targets rely on. Production correctness must NOT depend solely on external oracles (`spirv-val`, reference drivers) — those are correctly excluded from the build per the hermetic invariant, but that means at compile time we have only "trust the walker" unless we add a structural verifier.
+
+`SpirvVerifier` runs **AFTER the MIR→SPIR-V walker emits a SPIR-V module** and **BEFORE the binary encoder serializes it**. Mirrors `LirVerifier`'s discipline (bucket-2 rules over a JSON-declared opcode vocabulary). v1.x mandatory — the same correctness tier `verifyLirText` occupies for `.dsslir`. Rule families:
+
+| Rule family | What it checks |
+|---|---|
+| `checkResultIdMintedBeforeUse` | Every `%result` referenced in an operand position was minted by an earlier producer instruction in the module |
+| `checkResultIdUniqueness` | Every `OpResultId` is unique across the module (no double-mints) |
+| `checkDecorationTargetValid` | Every `OpDecorate`/`OpMemberDecorate` target-id refers to an extant declaration |
+| `checkStorageClassCompatible` | `OpVariable`'s storage-class matches the pointer-type it produces (per SPIR-V §3.7) |
+| `checkCapabilityDeclared` | Every opcode that requires a capability (e.g. `OpControlBarrier` → `WorkgroupBarrier`) has `OpCapability` declared at module head |
+| `checkStructuredCfBalance` | Every `OpLoopMerge`/`OpSelectionMerge` has matching merge-target + continue-target structure (parallel to plan 12 MirVerifier's `checkStructCfMarkers`) |
+| `checkEntryPointInterface` | Every `OpEntryPoint` interface-id list is well-formed (declared variables, storage-class IO matching stage) |
+
+New `SV_*` diagnostic family at 0xC2xx (parallel to `L_*` 0xB00x for LIR). The reference oracles `spirv-val` and `spirv-cross` REMAIN test-only — used to cross-check that every `SpirvVerifier`-clean module is also `spirv-val`-clean. **The contract is: every emitted .spv must pass `SpirvVerifier` BEFORE the encoder writes bytes. A spirv-val failure on a SpirvVerifier-clean module is a verifier-rule gap that gets filed and folded, not a "ship it anyway" outcome.**
+
+### 2.10 SPIR-V binary minifier (v1.x scope — NOT post-v1)
 
 Parallel to plan 18 §2.11 (WASM minifier). v1.x mandatory — the consumer ecosystem (Vulkan loaders, Metal/DirectX translation layers, mobile GPU drivers) penalizes oversized SPIR-V modules at load time. We own the entire pipeline including stripping.
 
@@ -202,10 +226,11 @@ Same shape-keyed dispatch as the format encoder (closed strip-rule vocabulary; e
 | SG8 | Entry-point attribute parsing in HIR             | `[[shader.vertex]]` / `[[shader.fragment]]` / `[[shader.compute(x,y,z)]]`. |
 | SG9 | Round-trip + spirv-val oracle tests              | Emit → `spirv-val` (oracle) → assert valid. Round-trip via `spirv-as`/`spirv-dis` text. |
 | SG10| End-to-end "hello triangle" Vulkan harness       | Compile vertex + fragment shaders, render a triangle in a CI Vulkan harness, assert frame correctness. |
-| SG11| **SPIR-V minifier substrate** (per §2.9)          | Strip-rule schema + engine + the four `release`-profile rules (drop-opname-debug, drop-opstring, drop-opsource, dead-decoration-elim). v1.x mandatory — gates "shader backend done." |
-| SG12| Minifier `minified`-profile rules                | drop-opline + remap-result-ids (the size-aggressive rules). Closes the ≥ 25% size-reduction acceptance bar. |
+| SG11| **`SpirvVerifier` substrate** (per §2.9)           | 7 rule families per §2.9 table. New `SV_*` diagnostic family at 0xC2xx. v1.x mandatory — production correctness gate, not test-only oracle. Same correctness tier `verifyLirText` occupies for `.dsslir`. |
+| SG12| **SPIR-V minifier substrate** (per §2.10)          | Strip-rule schema + engine + the four `release`-profile rules (drop-opname-debug, drop-opstring, drop-opsource, dead-decoration-elim). v1.x mandatory — gates "shader backend done." |
+| SG13| Minifier `minified`-profile rules                | drop-opline + remap-result-ids (the size-aggressive rules). Closes the ≥ 25% size-reduction acceptance bar. |
 
-Substrate tier for SG1, SG6 (touch lattice + structured-CF contract), SG11 (strip-rule schema). **SG11/SG12 are mandatory v1.x deliverables, NOT deferred.**
+Substrate tier for SG1, SG6 (touch lattice + structured-CF contract), SG11 (`SpirvVerifier` rule families), SG12 (strip-rule schema). **SG11/SG12/SG13 are mandatory v1.x deliverables, NOT deferred.**
 
 ---
 
@@ -233,7 +258,8 @@ Substrate tier for SG1, SG6 (touch lattice + structured-CF contract), SG11 (stri
 - [ ] Shader verifier rejects all SPIR-V constraint violations with actionable `SH_*` diagnostics.
 - [ ] Same-source CPU + GPU function lowering: a function tagged both `[[shader.usable]]` and `[[host.usable]]` produces correct SPIR-V *and* correct native code referencing the same source span.
 - [ ] Hermetic acceptance: no `dxc` / `glslc` / `shaderc` / `spirv-tools` / `spirv-opt` / `spirv-cross` invocation in the production pipeline (oracles only in CI).
-- [ ] **Minifier acceptance** (per §2.9): `minified` profile reduces a custom-language compute-shader corpus `.spv` by ≥ 25% vs `debug`, with byte-identical execution under the spirv-val + reference-driver oracles. Hash-pinned in CI per SG12.
+- [ ] **`SpirvVerifier` acceptance** (per §2.9): every emitted SPIR-V module passes `SpirvVerifier`'s 7 rule families BEFORE the binary encoder writes bytes. Cross-check with `spirv-val` oracle in CI — any `SpirvVerifier`-clean module that fails `spirv-val` is a verifier-rule gap (file + fold), NOT a ship-it outcome.
+- [ ] **Minifier acceptance** (per §2.10): `minified` profile reduces a custom-language compute-shader corpus `.spv` by ≥ 25% vs `debug`, with byte-identical execution under the spirv-val + reference-driver oracles. Hash-pinned in CI per SG13.
 
 ---
 

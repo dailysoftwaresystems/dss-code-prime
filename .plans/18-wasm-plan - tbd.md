@@ -2,7 +2,7 @@
 
 > Hermetic WebAssembly backend: **MIR → WAT → .wasm** bytecode (bypassing LIR; structured-bytecode VMs don't use register allocation). No `wasm-ld` / `emscripten` / `binaryen` / `wasm-opt` in the build chain — we own every byte AND every minification pass. WASM is structurally divergent from native ISAs (stack machine, structured control flow, linear memory) which is why it skips LIR: register allocation + frame materialization don't apply. `wasm-validate` and `wasm2wat` are test oracles only; never invoked at compile time.
 >
-> **Rev 3 (2026-05-29).** Reframed per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) Decision #4's three-bucket rule: WASM is **MIR-downstream, not a LIR-equivalent**. The MIR optimizer (gen-optimizer step 11) runs upstream of WASM lowering — fully-optimized MIR is the input. Lowering is **MIR→WAT bucket-2 walker** (`wat.lang.json` declares WAT opcodes + types + section structure; one specialized walker consumes any MIR and produces WAT). Plus a **WAT→.wasm binary encoder** (LEB128 + section framing — bucket 2 over the section-shape vocabulary). Plus a **v1-scope minifier** (binary-level stripping — bucket 2 over a declared strip-rule schema). Earlier "WASM-LIR" framing retired; resolved former §4 Q1.
+> **Rev 3 (2026-05-29).** Reframed per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) Decision #4's three-bucket rule: WASM is **MIR-downstream, not a LIR-equivalent**. The MIR optimizer (gen-optimizer step 11) runs upstream of WASM lowering — fully-optimized MIR is the input. Lowering is **MIR→WAT bucket-2 walker** (`wasm.target.json` declares WAT opcodes + types + section structure; one specialized walker consumes any MIR and produces WAT). Plus a **WAT→.wasm binary encoder** (LEB128 + section framing — bucket 2 over the section-shape vocabulary). Plus a **v1.x-scope `WatVerifier`** (in-tree structural verifier — production correctness gate, not test-only oracle). Plus a **v1.x-scope minifier** (binary-level stripping — bucket 2 over a declared strip-rule schema). Earlier "WASM-LIR" framing retired; resolved former §4 Q1.
 
 ## 0. Status (snapshot)
 
@@ -65,7 +65,7 @@ The actual structural symmetry across all four target classes is at the **MIR pi
 HIR  ─►  MIR  ─►  optimized MIR  ─►  WAT  ─►  .wasm bytes  ─►  minified .wasm
        (structured-CF      (gen-optimizer    (bucket-2     (bucket-2          (bucket-2
         markers             step 11 — runs    walker over   binary encoder     post-pass
-        preserved           UPSTREAM of       wat.lang.json  over section-      over JSON-
+        preserved           UPSTREAM of       wasm.target.   over section-      over JSON-
         per plan 12)        ALL targets)      vocabulary)    shape vocab)       declared
                                                                                 strip rules)
 ```
@@ -75,9 +75,11 @@ Two load-bearing properties:
 1. **No arbitrary CFG flattening.** Structured-CF markers from MIR map 1:1 to WAT `block` / `loop` / `if` / `br_if` / `br_table`. If MIR loses the markers (plan 12 discipline regression), lowering breaks loudly — desired failure mode.
 2. **MIR optimizer runs UPSTREAM, not WASM-specific.** Same optimizer serves native + WASM + SPIR-V. No binaryen-equivalent post-pass — the heavy lifting (DCE, const fold, copy prop, dominator-based opts) happens once on MIR; the WASM-specific work (local-merge / `local.tee` heuristics / drop elimination) is folded into the MIR→WAT walker's pattern matcher.
 
-### 2.3 `wat.lang.json` — the JSON vocabulary the MIR→WAT walker consumes
+### 2.3 `wasm.target.json` — the JSON vocabulary the MIR→WAT walker consumes
 
 Declares WAT's opcode vocabulary + types + section structure as bucket-1 data. Same shape as `*.target.json` for native targets — the walker (bucket 2) reads opcode rows from JSON and emits WAT text. Lives at `src/dss-config/targets/wasm.target.json` (the `targets/` family covers anything-MIR-downstream, native or structured-bytecode — see plan 13 §0).
+
+**Declares `abiModel: "operand-stack"`** (per plan 12 §3.1 D-ML5-X.1 — `TargetAbiModel` is the canonical schema-shape discriminator). The schema's per-shape validate() rules require `valueTypes[]` + `sections[]` for operand-stack targets; they do NOT require `registers[]` or `callingConventions[]` (which are register-machine-only). Without the discriminated validate(), the loader would either reject WASM target schemas for missing register sections, or stop enforcing register-section invariants for native — see the linked deferred item.
 
 ```jsonc
 {
@@ -198,6 +200,24 @@ The structured-CF markers from plan 12 carry the labels needed to compute the br
 
 The structured-CF marker stack in MIR (plan 12) is the source of truth for the branch depth `N`. There is no need to re-derive structure in the WASM backend — if MIR is well-formed, lowering is mechanical.
 
+### 2.9b `WatVerifier` — in-tree structural verifier (v1.x scope)
+
+The bypass-LIR WASM path doesn't get the `LirVerifier` correctness gate native targets rely on. Production correctness must NOT depend solely on external oracles (`wasm-validate`) — those are correctly excluded from the build per the hermetic invariant, but that means at compile time we have only "trust the walker" unless we add a structural verifier.
+
+`WatVerifier` runs **AFTER the MIR→WAT walker emits a WAT module** and **BEFORE the binary encoder serializes it**. Mirrors `LirVerifier`'s discipline (bucket-2 rules over the JSON-declared opcode vocabulary). v1.x mandatory — the same correctness tier `verifyLirText` occupies for `.dsslir`. Rule families:
+
+| Rule family | What it checks |
+|---|---|
+| `checkTypeStackDiscipline` | Every WAT opcode's stack-effect (pop types + push types declared in `wasm.target.json::stackEffects`) is consistent across the function body |
+| `checkStructuredCfBalance` | Every `block`/`loop`/`if` has a matching `end`; `br N` / `br_if N` / `br_table` depths reference valid labels on the CF stack |
+| `checkLocalIndexBounds` | Every `local.get` / `local.set` / `local.tee` references a declared local within `func.locals[]` |
+| `checkFunctionSignatureMatch` | Every `call $f` operand stack matches `$f`'s declared signature (parallel to LirVerifier's Call-arg-vs-FnSig rule) |
+| `checkMemoryAccessAlignment` | Every `i32.load offset=N align=A` / `i32.store` has alignment ≤ value-type-width |
+| `checkTableIndexBounds` | Every `call_indirect` table-index is in range; every `elem` segment offset is in range |
+| `checkSectionOrdering` | The module's section order matches the WebAssembly spec's mandated order (Type / Import / Function / Table / Memory / Global / Export / Start / Element / Code / Data / DataCount) |
+
+New `WT_*` diagnostic family at 0xC1xx (parallel to `L_*` 0xB00x for LIR; `SV_*` 0xC2xx for SPIR-V per plan 17 §2.9). The reference oracle `wasm-validate` REMAINS test-only — used to cross-check that every `WatVerifier`-clean module is also `wasm-validate`-clean. **The contract: every emitted .wasm must pass `WatVerifier` BEFORE the encoder writes bytes. A `wasm-validate` failure on a `WatVerifier`-clean module is a verifier-rule gap (file + fold), NOT a "ship it anyway" outcome.**
+
 ### 2.10 Reserved post-v1.x
 
 - **SIMD** (`v128` + 200+ vector ops) — emit only when HIR uses vector types; default off. Gated by `target_features` declaration in custom section.
@@ -270,10 +290,11 @@ Output:
 | WA8 | Round-trip tests — emit `.wasm`, run `wasm-validate` (oracle), run `wasm2wat` and diff against our own `.wat` emitter. Golden `.wasm` byte snapshots for stable inputs. |
 | WA9 | End-to-end "hello, world" — a c-subset corpus program compiles to `.wasm`, runs under wasmtime in CI, prints expected output. |
 | WA10 | MIR → .wasm contract pin: same MIR input produces byte-identical WASM output across runs / platforms. Deterministic-output regression guard. |
-| WA11 | **Minifier substrate** (per §2.11): strip-rule schema + engine + the four `release`-profile rules (custom-section drop, local compaction, drop elision, local.tee folding). v1.x mandatory — gates "WASM backend done." |
-| WA12 | Minifier `minified`-profile rules (data-segment compaction, table compaction, full custom-section sweep). Closes the ≥ 30% size-reduction acceptance bar. |
+| WA11 | **`WatVerifier` substrate** (per §2.9b): 7 rule families. New `WT_*` diagnostic family at 0xC1xx. v1.x mandatory — production correctness gate, NOT test-only oracle. Same correctness tier `verifyLirText` occupies for `.dsslir`. |
+| WA12 | **Minifier substrate** (per §2.11): strip-rule schema + engine + the four `release`-profile rules (custom-section drop, local compaction, drop elision, local.tee folding). v1.x mandatory — gates "WASM backend done." |
+| WA13 | Minifier `minified`-profile rules (data-segment compaction, table compaction, full custom-section sweep). Closes the ≥ 30% size-reduction acceptance bar. |
 
-Sequencing: WA1 → WA2 → WA3 → WA4 is the critical path (encoder, then leaf funcs, then memory, then control flow). WA5 / WA6 / WA7 are parallel-able once WA4 lands. WA8 / WA9 / WA10 are validation PRs that gate "WASM backend done." **WA11 + WA12 are mandatory v1.x deliverables, NOT deferred** — uncompacted `.wasm` is uncompetitive payload.
+Sequencing: WA1 → WA2 → WA3 → WA4 is the critical path (encoder, then leaf funcs, then memory, then control flow). WA5 / WA6 / WA7 are parallel-able once WA4 lands. WA8 / WA9 / WA10 are validation PRs. **WA11 (WatVerifier) gates WA12/WA13 — verifier-clean is the prerequisite for shipping bytes.** **All of WA11/WA12/WA13 are mandatory v1.x deliverables, NOT deferred** — uncompacted, unverified `.wasm` is uncompetitive AND unsafe payload.
 
 ---
 
@@ -303,7 +324,8 @@ Sequencing: WA1 → WA2 → WA3 → WA4 is the critical path (encoder, then leaf
 - [ ] No `wasm-ld`, `emscripten`, `binaryen`, or `wasm-opt` invocation anywhere in the build chain. `wasm-validate` and `wasm2wat` appear only in test fixtures.
 - [ ] `name` custom section populated — `wasm2wat` output is human-readable (debug profile) / stripped (release+minified profiles).
 - [ ] `.imports.json` sidecar accurately reflects the emitted Import section.
-- [ ] **Minifier acceptance:** the `minified` profile reduces a c-subset corpus `.wasm` by ≥ 30% vs the `debug` profile, with byte-identical execution-trace under the wasmtime oracle. Hash-pinned in CI per WA12.
+- [ ] **`WatVerifier` acceptance** (per §2.9b): every emitted WAT module passes `WatVerifier`'s 7 rule families BEFORE the binary encoder writes bytes. Cross-check with `wasm-validate` oracle in CI — any `WatVerifier`-clean module that fails `wasm-validate` is a verifier-rule gap (file + fold), NOT a ship-it outcome.
+- [ ] **Minifier acceptance:** the `minified` profile reduces a c-subset corpus `.wasm` by ≥ 30% vs the `debug` profile, with byte-identical execution-trace under the wasmtime oracle. Hash-pinned in CI per WA13.
 - [ ] **No binaryen / wasm-opt** anywhere — minification is owned in-tree per §2.11.
 
 ---
