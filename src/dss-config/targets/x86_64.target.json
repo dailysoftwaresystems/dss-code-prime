@@ -56,32 +56,77 @@
       }
     },
     {
+      "$comment": "add reg-reg — REX.W 0x01 /r (ADD r/m64, r64). LIR is 3-address (dst, src1, src2); requires2Address=true makes the legalize pass insert `mov dst, src1` first when dst!=src1, then the assembler emits `add dst, src2` (writing into ModR/M.rm, which is dst).",
       "mnemonic":      "add",
       "result":        "value",
       "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands":   2,
       "maxOperands":   2,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "$comment": "2-address shape: `operands[0]` IS the destination after `lir_2addr_legalize` ensures result==operands[0]. So no resultSlot — the wire for operands[0] handles the destination placement (its hwEncoding goes into ModR/M.rm). validate() rule G has a `requires2Address` exception for exactly this shape.",
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "rexW": true, "opcode": [1] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
     },
     {
+      "$comment": "sub reg-reg — REX.W 0x29 /r (SUB r/m64, r64). Same 2-address shape as `add`.",
       "mnemonic":      "sub",
       "result":        "value",
       "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands":   2,
       "maxOperands":   2,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "rexW": true, "opcode": [41] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "2-operand multiply. x86 has both 2-op `imul reg, reg` (writes the low half to the destination — what cycle 3a uses) and 1-op `mul/imul reg` (writes rdx:rax with the full double-width product — needed only when overflow detection or 128-bit results matter; cycle 3c/AS1 lower those via a different opcode pseudonym). Cycle 3a sticks to the low-half-only shape.",
+      "$comment": "2-operand multiply. x86 has both 2-op `imul reg, reg` (writes the low half to the destination — what we emit) and 1-op `mul/imul reg` (rdx:rax full-width — needed only for overflow/128-bit results, future cycle). The 2-op form is REX.W 0x0F 0xAF /r — UNUSUAL among x86 binary arith because dest goes to ModR/M.reg (not r/m), source-1 goes to r/m. Wires reflect this: op[0]→modrm.reg (the destination per 2-address), op[1]→modrm.rm.",
       "mnemonic":      "mul",
       "result":        "value",
       "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands":   2,
       "maxOperands":   2,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "rexW": true, "opcode": [15, 175] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "mnemonic":      "cmp",

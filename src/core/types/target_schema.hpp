@@ -370,16 +370,56 @@ operandKindFilterFromName(std::string_view s) noexcept {
 // `SibBase` / `SibIndex` ... — each gains a row when first walker
 // consumer lands.
 enum class EncodingSlotKind : std::uint8_t {
-    ModRmReg = 0,
-    ModRmRm  = 1,
-    Imm32    = 2,
+    // ── x86-variable shape ────────────────────────────────────────
+    ModRmReg = 0,  // bits 3..5 of ModR/M byte; REX.R = hwEncoding bit 3
+    ModRmRm  = 1,  // bits 0..2 of ModR/M byte; REX.B = hwEncoding bit 3
+    Imm32    = 2,  // 4 immediate bytes appended after ModR/M, LE
+    // ── fixed32 shape (plan 13 AS3) ────────────────────────────────
+    // Names mirror AArch64 / RV32 register-field nomenclature: each
+    // entry pins a 5-bit-wide window inside the 32-bit fixed word
+    // where the operand's `hwEncoding` is OR'd. AArch64 GPR ordinals
+    // fit in 5 bits (X0..X30 + XZR=31); FPR likewise. The fixed-word
+    // template carries the base bit pattern; the walker just OR's
+    // the slot-positioned operand bits.
+    Rd       = 3,  // destination register, bits 0..4
+    Rn       = 4,  // first source register, bits 5..9
+    Rm       = 5,  // second source register, bits 16..20
+    // Future fixed32 slots (paired with their consumer cycle):
+    //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
+    //   ImmShift / Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 3> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 6> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg, "modrm.reg" },
     { EncodingSlotKind::ModRmRm,  "modrm.rm"  },
     { EncodingSlotKind::Imm32,    "imm32"     },
+    { EncodingSlotKind::Rd,       "rd"        },
+    { EncodingSlotKind::Rn,       "rn"        },
+    { EncodingSlotKind::Rm,       "rm"        },
 }}};
+
+// Architect AS3 followup: each `EncodingSlotKind` is tied to ONE
+// encoding shape — ModRm* and Imm32 are x86-variable; Rd/Rn are
+// fixed32. Returns the shape the slot belongs to, so `validate()`
+// can reject cross-shape variants (a fixed32 variant declaring
+// `modrm.rm`, or an x86-variable variant declaring `rd`).
+//
+// Future slots add a new row here when they join their walker's
+// vocabulary.
+[[nodiscard]] constexpr TargetEncodingShape
+slotShapeFor(EncodingSlotKind s) noexcept {
+    switch (s) {
+        case EncodingSlotKind::ModRmReg:
+        case EncodingSlotKind::ModRmRm:
+        case EncodingSlotKind::Imm32:
+            return TargetEncodingShape::X86Variable;
+        case EncodingSlotKind::Rd:
+        case EncodingSlotKind::Rn:
+        case EncodingSlotKind::Rm:
+            return TargetEncodingShape::Fixed32;
+    }
+    return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
+}
 
 [[nodiscard]] constexpr std::string_view
 encodingSlotKindName(EncodingSlotKind s) noexcept {
@@ -399,12 +439,13 @@ encodingSlotKindFromName(std::string_view s) noexcept {
 struct DSS_EXPORT TargetEncodingTemplate {
     // REX.W bit (operand-size override: 1 for 64-bit operations on
     // GPR opcodes; 0 for 32-bit). When ANY REX bit (W/R/B/X) is set,
-    // the walker emits a REX prefix byte (0x40 base + bits).
+    // the walker emits a REX prefix byte (0x40 base + bits). Only
+    // meaningful for the `x86-variable` shape.
     bool rexW = false;
 
     // Fixed opcode bytes (e.g. `[0x03]` for `add r64, r/m64`; `[0x0F,
     // 0xAF]` for `imul r64, r/m64`). Non-empty for any non-`None`
-    // variant.
+    // variant of the `x86-variable` shape.
     std::vector<std::uint8_t> opcodeBytes;
 
     // When the instruction uses a `/digit` ModR/M-reg extension (e.g.
@@ -412,8 +453,27 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // ADD; reg=1 means OR; reg=5 means SUB; etc.), this field carries
     // the 3-bit digit. When set, the variant has NO `ModRmReg` slot
     // (the digit IS the reg field); the variant's `ModRmRm` slot
-    // wires the destination register.
+    // wires the destination register. Only meaningful for the
+    // `x86-variable` shape.
     std::optional<std::uint8_t> modrmRegExt;
+
+    // Fixed-word template (plan 13 AS3 — `fixed32` shape). The 32-bit
+    // base bit pattern of an AArch64 / RV32-style instruction; the
+    // walker emits this word with each declared slot's `hwEncoding`
+    // OR'd into the slot's bit window, then writes the resulting
+    // word LE-encoded as 4 bytes. Only meaningful for the `fixed32`
+    // shape — non-`fixed32` variants leave this at 0 (the loader
+    // accepts but does not require the field; validate() flags
+    // `opcodeBytes` / `modrmRegExt` declared on a fixed32 variant
+    // since those ARE x86-only fields with no fixed32 meaning).
+    //
+    // Sentinel note: `fixedWord = 0` is the default. A legitimate
+    // fixed32 base of all-zeros (currently undefined on every
+    // shipped ISA — AArch64 reserves it as UDF, RV32 as illegal)
+    // is therefore indistinguishable from "default". When the
+    // first ISA needs the zero-base, promote this to
+    // `std::optional<std::uint32_t>`.
+    std::uint32_t fixedWord = 0;
 };
 
 // One operand-wire: "source operand at LIR-index `index` goes into
@@ -601,6 +661,17 @@ struct DSS_EXPORT TargetOpcodeInfo {
     // requires a non-empty `encoding.variants[]` (validate()-enforced);
     // each variant carries its guard + template + slot wiring.
     TargetEncodingInfo   encoding;
+
+    // 2-address legalization constraint (plan 13 AS3 — `lir_2addr_
+    // legalize.cpp`). When `true`, the LIR pre-assembly legalize
+    // pass ensures the instruction's `result` register equals
+    // `operands[0]` before the assembler sees it — by inserting an
+    // implicit `mov result, operands[0]` whenever they differ. x86's
+    // reg-reg arithmetic (add/sub/mul) needs this (REX.W 0x03 /r
+    // writes into r/m, so the dest IS one of the sources); ARM64's
+    // reg-reg arithmetic is 3-address natively and leaves this
+    // false.
+    bool                 requires2Address = false;
 
     // Terminator-ness derives from `terminatorKind` — single source of
     // truth. Callers ported from the old `isTerminator` bool field

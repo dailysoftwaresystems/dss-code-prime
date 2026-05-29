@@ -1,5 +1,6 @@
 #include "asm/asm.hpp"
 
+#include "asm/format/fixed32.hpp"
 #include "asm/format/x86_variable.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -69,17 +70,9 @@ using lir_pass_util::report;
                                          lirToMir, out, relocs, srcMap,
                                          reporter);
 
-        // Cycle-1 substrate: shape-tag declared in the schema but no
-        // format walker registered. AS3 plugs in Fixed32.
         case TargetEncodingShape::Fixed32:
-            report(reporter, DiagnosticCode::A_NoEncodingShapeWalker,
-                   DiagnosticSeverity::Error,
-                   std::format("opcode '{}': no format walker registered "
-                               "for encoding shape '{}' (substrate cycle — "
-                               "AS3 plugs in the walker)",
-                               info->mnemonic,
-                               targetEncodingShapeName(info->encoding.shape)));
-            return false;
+            return fixed32::encode(lir, schema, inst, info, lirToMir,
+                                    out, relocs, srcMap, reporter);
     }
 
     // Enum-drift fallback. A new `TargetEncodingShape` value added

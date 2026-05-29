@@ -1,5 +1,6 @@
 add_library(lir OBJECT
     lir.cpp
+    lir_2addr_legalize.cpp
     lir_callconv.cpp
     lir_literal_pool.cpp
     lir_liveness.cpp

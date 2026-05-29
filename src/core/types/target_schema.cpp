@@ -3,6 +3,7 @@
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -115,18 +116,43 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         }
         for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
             auto const& v = o.encoding.variants[vi];
-            if (v.tmpl.opcodeBytes.empty()) {
-                fail(std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
-                     std::format("opcode '{}' variant {}: 'opcode' bytes "
-                                 "must be non-empty",
-                                 o.mnemonic, vi));
-            }
-            if (v.tmpl.opcodeBytes.size() > 15) {
-                fail(std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
-                     std::format("opcode '{}' variant {}: 'opcode' byte "
-                                 "count {} exceeds 15 (x86 instruction "
-                                 "length limit)",
-                                 o.mnemonic, vi, v.tmpl.opcodeBytes.size()));
+            // `opcodeBytes` is meaningful only for the x86-variable
+            // shape. fixed32 carries the analog as `fixedWord` (a
+            // 32-bit base bit pattern). The "non-empty" rule
+            // therefore applies only when the variant declares a
+            // shape that consumes opcodeBytes.
+            if (o.encoding.shape == TargetEncodingShape::X86Variable) {
+                if (v.tmpl.opcodeBytes.empty()) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
+                         std::format("opcode '{}' variant {}: 'opcode' bytes "
+                                     "must be non-empty for x86-variable shape",
+                                     o.mnemonic, vi));
+                }
+                if (v.tmpl.opcodeBytes.size() > 15) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
+                         std::format("opcode '{}' variant {}: 'opcode' byte "
+                                     "count {} exceeds 15 (x86 instruction "
+                                     "length limit)",
+                                     o.mnemonic, vi, v.tmpl.opcodeBytes.size()));
+                }
+            } else if (o.encoding.shape == TargetEncodingShape::Fixed32) {
+                // fixed32 mirror: opcodeBytes / modrmRegExt are
+                // never meaningful; declaring them on a fixed32
+                // variant is dead data — flag for cleanliness.
+                if (!v.tmpl.opcodeBytes.empty()) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/template/opcode", i, vi),
+                         std::format("opcode '{}' variant {}: 'opcode' bytes "
+                                     "declared on a fixed32 variant — "
+                                     "fixed32 uses `fixedWord` instead",
+                                     o.mnemonic, vi));
+                }
+                if (v.tmpl.modrmRegExt.has_value()) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", i, vi),
+                         std::format("opcode '{}' variant {}: 'modrmRegExt' "
+                                     "declared on a fixed32 variant — "
+                                     "fixed32 has no ModR/M byte",
+                                     o.mnemonic, vi));
+                }
             }
             if (v.tmpl.modrmRegExt.has_value() && *v.tmpl.modrmRegExt > 7) {
                 fail(std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", i, vi),
@@ -144,6 +170,36 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      v.wires[oi].index,
                                      v.operandKinds.size()));
                 }
+            }
+
+            // ── Architect AS3 followup: shape-vs-slot cross-check ───
+            // Each `EncodingSlotKind` belongs to ONE shape. A variant
+            // declaring `modrm.rm` under a `fixed32`-shape opcode (or
+            // `rd` under an `x86-variable`-shape opcode) would silently
+            // misroute at encode time — the walker rejects the
+            // unknown slot, but the diagnostic shows up per-inst
+            // instead of per-row. Surface at load.
+            auto const checkSlotShape = [&](EncodingSlotKind slot,
+                                            std::string const& path) {
+                auto const owning = slotShapeFor(slot);
+                if (owning != o.encoding.shape) {
+                    fail(path,
+                         std::format("opcode '{}' variant {}: slot '{}' "
+                                     "belongs to encoding shape '{}', "
+                                     "but the opcode declares shape '{}'",
+                                     o.mnemonic, vi,
+                                     encodingSlotKindName(slot),
+                                     targetEncodingShapeName(owning),
+                                     targetEncodingShapeName(o.encoding.shape)));
+                }
+            };
+            if (v.resultSlot.has_value()) {
+                checkSlotShape(*v.resultSlot,
+                               std::format("/opcodes/{}/encoding/variants/{}/resultSlot", i, vi));
+            }
+            for (std::size_t wi = 0; wi < v.wires.size(); ++wi) {
+                checkSlotShape(v.wires[wi].slotKind,
+                               std::format("/opcodes/{}/encoding/variants/{}/wires/{}/slotKind", i, vi, wi));
             }
 
             // ── Convergence-fix B: `modrmRegExt` + ModRmReg wire ─────
@@ -196,66 +252,90 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             }
 
             // ── Convergence-fix A (validate half): slot uniqueness ────
-            // Two writers to the same ModR/M slot (ModRmReg or ModRmRm)
-            // would silently overwrite each other at encode time.
-            // Multi-Imm32 wires are legal (a future variant could
-            // append two immediates in sequence). Detect duplicate
-            // ModR/M-slot writers (resultSlot + each wire) here.
+            // Two writers to the same single-writer slot would silently
+            // overwrite each other at encode time. Multi-Imm32 wires
+            // are legal (a future variant could append two immediates
+            // in sequence). All other slots are single-writer.
+            // Convergence-fix D extension: fixed32 (Rd/Rn/Rm) slots
+            // are equally single-writer — extend the same rule there.
             {
-                bool sawResultModRmReg = false;
-                bool sawResultModRmRm  = false;
+                auto const isMultiWriterSlot = [](EncodingSlotKind s) noexcept {
+                    return s == EncodingSlotKind::Imm32;
+                };
+                // Track each non-multi-writer slot's first writer.
+                // 6 entries — one per EncodingSlotKind value.
+                bool sawSlot[6] = { false, false, false, false, false, false };
+                auto const markOrFail = [&](EncodingSlotKind slot,
+                                            std::string const& kindLabel,
+                                            std::string const& path) {
+                    if (isMultiWriterSlot(slot)) return;
+                    auto const idx = static_cast<std::size_t>(slot);
+                    if (idx < std::size(sawSlot) && sawSlot[idx]) {
+                        fail(path,
+                             std::format("opcode '{}' variant {}: "
+                                         "{} writer targets '{}' — "
+                                         "the second writer would "
+                                         "silently overwrite the "
+                                         "first at encode time",
+                                         o.mnemonic, vi, kindLabel,
+                                         encodingSlotKindName(slot)));
+                    } else if (idx < std::size(sawSlot)) {
+                        sawSlot[idx] = true;
+                    }
+                };
                 if (v.resultSlot.has_value()) {
-                    if (*v.resultSlot == EncodingSlotKind::ModRmReg)
-                        sawResultModRmReg = true;
-                    if (*v.resultSlot == EncodingSlotKind::ModRmRm)
-                        sawResultModRmRm = true;
+                    markOrFail(*v.resultSlot, "result",
+                               std::format("/opcodes/{}/encoding/variants/{}/resultSlot", i, vi));
                 }
-                bool sawWireModRmReg = false;
-                bool sawWireModRmRm  = false;
                 for (auto const& w : v.wires) {
-                    if (w.slotKind == EncodingSlotKind::ModRmReg) {
-                        if (sawWireModRmReg || sawResultModRmReg) {
-                            fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
-                                 std::format("opcode '{}' variant {}: "
-                                             "two slot writes target "
-                                             "'modrm.reg' — the second "
-                                             "would silently overwrite "
-                                             "the first at encode time",
-                                             o.mnemonic, vi));
-                        }
-                        sawWireModRmReg = true;
-                    }
-                    if (w.slotKind == EncodingSlotKind::ModRmRm) {
-                        if (sawWireModRmRm || sawResultModRmRm) {
-                            fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
-                                 std::format("opcode '{}' variant {}: "
-                                             "two slot writes target "
-                                             "'modrm.rm' — the second "
-                                             "would silently overwrite "
-                                             "the first at encode time",
-                                             o.mnemonic, vi));
-                        }
-                        sawWireModRmRm = true;
-                    }
+                    markOrFail(w.slotKind, "wire",
+                               std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi));
                 }
             }
 
             // ── Convergence-fix G: result requires a destination slot ─
             // An opcode whose `result == Value/Optional` MUST route the
-            // result register somewhere — either an explicit
-            // `resultSlot`, or via `modrmRegExt` (the `/digit` form
-            // ALSO encodes the destination, via ModR/M.rm with the
-            // wired source). Otherwise the destination register is
-            // silently dropped from the encoding.
+            // result register somewhere. Three accepted shapes:
+            //   (1) explicit `resultSlot`,
+            //   (2) `template.modrmRegExt` (the `/digit` form ALSO
+            //       encodes the destination, via ModR/M.rm with the
+            //       wired source),
+            //   (3) `requires2Address: true` AND a wire on operand 0
+            //       — after `lir_2addr_legalize` ensures `result ==
+            //       operands[0]`, the wire for operand 0 supplies
+            //       the destination's slot placement.
+            // Convergence-fix C: the `requires2Address` exception
+            // only counts when the operand-0 wire targets a
+            // DESTINATION-bearing slot. ModRmReg / ModRmRm (x86-
+            // variable destinations) and Rd (fixed32 destination)
+            // qualify. A wire to Imm32 / ModRm-source / Rn / Rm
+            // does NOT — those are source-only slots, and using the
+            // legalize-pass "operand 0 IS the destination" assumption
+            // there would silently route the destination to a
+            // non-destination position.
+            auto const isDestSlot = [](EncodingSlotKind s) noexcept {
+                return s == EncodingSlotKind::ModRmReg
+                    || s == EncodingSlotKind::ModRmRm
+                    || s == EncodingSlotKind::Rd;
+            };
+            bool const has2AddrDestWire = o.requires2Address
+                && std::any_of(v.wires.begin(), v.wires.end(),
+                               [&](TargetEncodingWire const& w) {
+                                   return w.index == 0
+                                       && isDestSlot(w.slotKind);
+                               });
             if (o.result != TargetResultRule::None
                 && !v.resultSlot.has_value()
-                && !v.tmpl.modrmRegExt.has_value()) {
+                && !v.tmpl.modrmRegExt.has_value()
+                && !has2AddrDestWire) {
                 fail(std::format("/opcodes/{}/encoding/variants/{}", i, vi),
                      std::format("opcode '{}' variant {}: opcode has "
                                  "`result='{}'` but variant declares "
-                                 "neither `resultSlot` nor "
-                                 "`template.modrmRegExt` — destination "
-                                 "register would be silently dropped",
+                                 "none of `resultSlot` / "
+                                 "`template.modrmRegExt` / "
+                                 "(`requires2Address` + wire on operand 0) "
+                                 "— destination register would be "
+                                 "silently dropped",
                                  o.mnemonic, vi,
                                  targetResultRuleName(o.result)));
             }
@@ -294,6 +374,69 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 }
             }
         }
+
+        // ── Convergence-fix F: `requires2Address` is reg-reg shape ──
+        // The 2-address legalize pass inserts `mov result,
+        // operands[0]` when result != operands[0] — but only if
+        // operand 0 IS a register and the opcode produces a result.
+        // A schema declaring `requires2Address` on:
+        //   * an opcode with `result: none` — would silently never
+        //     legalize (no result register to copy to);
+        //   * an opcode with `maxOperands < 1` — would never have an
+        //     operand 0 to copy from;
+        //   * a variant whose operandKinds[0] is NOT `reg` — would
+        //     trigger the pass's hard-fail at runtime; reject at
+        //     load instead.
+        if (o.requires2Address) {
+            if (o.result == TargetResultRule::None) {
+                fail(std::format("/opcodes/{}/requires2Address", i),
+                     std::format("opcode '{}': `requires2Address: true` "
+                                 "requires `result != none` — the "
+                                 "legalize pass copies operands[0] INTO "
+                                 "result, which doesn't exist when "
+                                 "result is `none`",
+                                 o.mnemonic));
+            }
+            if (o.maxOperands < 1) {
+                fail(std::format("/opcodes/{}/requires2Address", i),
+                     std::format("opcode '{}': `requires2Address: true` "
+                                 "requires `maxOperands >= 1` — "
+                                 "operand 0 must exist to be copied "
+                                 "to the destination",
+                                 o.mnemonic));
+            }
+            for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
+                auto const& v = o.encoding.variants[vi];
+                if (!v.operandKinds.empty()
+                    && v.operandKinds[0] != OperandKindFilter::Reg) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/0", i, vi),
+                         std::format("opcode '{}' variant {}: "
+                                     "`requires2Address: true` requires "
+                                     "operandKinds[0] to be 'reg' — the "
+                                     "legalize pass needs a Reg operand "
+                                     "to copy from",
+                                     o.mnemonic, vi));
+                }
+            }
+        }
+    }
+
+    // ── Convergence-fix A (schema-level): `mov` opcode required ────
+    // When ANY opcode declares `requires2Address`, the schema MUST
+    // also declare a `mov` opcode — the legalize pass synthesizes
+    // `mov result, operands[0]` to satisfy the 2-address constraint.
+    // Without `mov`, the pass would emit `L_RequiredLirOpcodeMissing`
+    // per-instruction at runtime; surfacing at schema-load time
+    // catches the misconfiguration once.
+    bool const anyRequires2Address = std::any_of(
+        opcodes.begin(), opcodes.end(),
+        [](TargetOpcodeInfo const& o) { return o.requires2Address; });
+    if (anyRequires2Address && mnemonicIndex.find("mov") == mnemonicIndex.end()) {
+        fail("/opcodes",
+             "at least one opcode declares `requires2Address: true` "
+             "but the schema lacks a 'mov' opcode — the 2-address "
+             "legalize pass uses `mov` to synthesize the implicit "
+             "register copy and cannot proceed without it");
     }
 
     // ── Opcode arity ──────────────────────────────────────────────
@@ -489,9 +632,6 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     // From here, the target opted into the register-machine validation
     // surface by populating at least one of the two sections — even if
     // its declared abiModel is non-register-machine.
-    // (`enforceRefs` was a tautological alias of `hasAbiContent` here
-    // — the early return above guarantees this branch is unreachable
-    // when `!hasAbiContent`. Removed per simplifier review.)
     auto checkRefs = [&](std::size_t       ccIdx,
                          char const*       field,
                          std::span<std::string const> refs,

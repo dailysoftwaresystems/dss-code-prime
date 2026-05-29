@@ -1,0 +1,150 @@
+{
+  "$comment": "ARM64 (AArch64) target descriptor (plan 13 AS3 + plan 12 D-ML7-2.1). 100% JSON-configured — the same target-blind LIR substrate that drives x86_64 reads this file. Adding ARM64 = drop this file; no C++ change. Encoding shape: `fixed32` (32-bit fixed word + bit-field slots). Calling convention: AAPCS64 (https://github.com/ARM-software/abi-aa).",
+  "dssTargetVersion": 1,
+  "target": {
+    "name":    "arm64",
+    "version": "0.1",
+    "abiModel": "register-machine",
+    "description": "ARM64 AArch64 — minimal opcode set + AAPCS64 calling convention + fixed32 byte-encoder. Cycle-3 scope: ret (0xD65F03C0) + mov reg-reg via ORR alias (0xAA0003E0 base + Rd + Rm)."
+  },
+  "opcodes": [
+    {
+      "$comment": "Slot 0 = the Invalid sentinel — same discipline as x86_64. Substrate's addInst guard rejects opcode 0 loudly.",
+      "mnemonic":      "invalid",
+      "result":        "none",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op — same role as x86's `arg`: 'this LirReg is the function's k-th input parameter'. ML7 callconv lowering rewrites to the real mov-from-arg-reg sequence.",
+      "mnemonic":      "arg",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "AAPCS64 has no native `mov reg, reg` instruction — the canonical encoding is `ORR Xd, XZR, Xm` (32-bit fixed word 0xAA0003E0 = base + Rn=XZR=31; Rd and Rm via slots). LIR's `mov` is 2-operand (result + 1 source); 3-address natively (no requires2Address).",
+      "mnemonic":      "mov",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "fixedWord": 2852127712 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "$comment": "ORR Xd, XZR, Xm — bits 16..20 hold Rm (the source register's encoding). The fixed word's bits 9..5 = 0b11111 (XZR) are baked in; the wire only adds Rm bits.",
+                "index": 0, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "AAPCS64 RET (X30 implicit) = 0xD65F03C0. No operands at LIR level; the link register x30 is implicit per the calling convention.",
+      "mnemonic":         "ret",
+      "result":           "none",
+      "terminatorKind":   "return",
+      "hasSideEffects":   true,
+      "minOperands":      0,
+      "maxOperands":      0,
+      "minSuccessors":    0,
+      "maxSuccessors":    0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "fixedWord": 3596551104 }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Hard-trap. AArch64 BRK #0 = 0xD4200000. Cycle-3 includes for completeness so a synthesized LIR can terminate without depending on `ret` semantics.",
+      "mnemonic":         "unreachable",
+      "result":           "none",
+      "terminatorKind":   "unreachable",
+      "hasSideEffects":   true,
+      "minOperands":      0,
+      "maxOperands":      0,
+      "minSuccessors":    0,
+      "maxSuccessors":    0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "fixedWord": 3558866944 }
+          }
+        ]
+      }
+    }
+  ],
+  "$registersComment": "AAPCS64 general-purpose registers x0..x30 + zero-register XZR (encoded as 31 in source operands; uses register's hwEncoding). Stack pointer `sp` is also encoded as 31 but in the SP-slot context — hwEncoding=31 with class GPR is shared between XZR and SP at the byte level. NEON/FP regs v0..v31 use the same 5-bit field but in a separate class. Cycle-3 declares enough registers for AAPCS64 callconv + the encoded mov/ret/brk subset.",
+  "registers": [
+    { "name": "x0",  "class": "gpr", "widthBytes": 8, "hwEncoding": 0 },
+    { "name": "x1",  "class": "gpr", "widthBytes": 8, "hwEncoding": 1 },
+    { "name": "x2",  "class": "gpr", "widthBytes": 8, "hwEncoding": 2 },
+    { "name": "x3",  "class": "gpr", "widthBytes": 8, "hwEncoding": 3 },
+    { "name": "x4",  "class": "gpr", "widthBytes": 8, "hwEncoding": 4 },
+    { "name": "x5",  "class": "gpr", "widthBytes": 8, "hwEncoding": 5 },
+    { "name": "x6",  "class": "gpr", "widthBytes": 8, "hwEncoding": 6 },
+    { "name": "x7",  "class": "gpr", "widthBytes": 8, "hwEncoding": 7 },
+    { "name": "x8",  "class": "gpr", "widthBytes": 8, "hwEncoding": 8 },
+    { "name": "x9",  "class": "gpr", "widthBytes": 8, "hwEncoding": 9 },
+    { "name": "x10", "class": "gpr", "widthBytes": 8, "hwEncoding": 10 },
+    { "name": "x11", "class": "gpr", "widthBytes": 8, "hwEncoding": 11 },
+    { "name": "x12", "class": "gpr", "widthBytes": 8, "hwEncoding": 12 },
+    { "name": "x13", "class": "gpr", "widthBytes": 8, "hwEncoding": 13 },
+    { "name": "x14", "class": "gpr", "widthBytes": 8, "hwEncoding": 14 },
+    { "name": "x15", "class": "gpr", "widthBytes": 8, "hwEncoding": 15 },
+    { "name": "x16", "class": "gpr", "widthBytes": 8, "hwEncoding": 16 },
+    { "name": "x17", "class": "gpr", "widthBytes": 8, "hwEncoding": 17 },
+    { "name": "x18", "class": "gpr", "widthBytes": 8, "hwEncoding": 18 },
+    { "name": "x19", "class": "gpr", "widthBytes": 8, "hwEncoding": 19 },
+    { "name": "x20", "class": "gpr", "widthBytes": 8, "hwEncoding": 20 },
+    { "name": "x21", "class": "gpr", "widthBytes": 8, "hwEncoding": 21 },
+    { "name": "x22", "class": "gpr", "widthBytes": 8, "hwEncoding": 22 },
+    { "name": "x23", "class": "gpr", "widthBytes": 8, "hwEncoding": 23 },
+    { "name": "x24", "class": "gpr", "widthBytes": 8, "hwEncoding": 24 },
+    { "name": "x25", "class": "gpr", "widthBytes": 8, "hwEncoding": 25 },
+    { "name": "x26", "class": "gpr", "widthBytes": 8, "hwEncoding": 26 },
+    { "name": "x27", "class": "gpr", "widthBytes": 8, "hwEncoding": 27 },
+    { "name": "x28", "class": "gpr", "widthBytes": 8, "hwEncoding": 28 },
+    { "name": "x29", "class": "gpr", "widthBytes": 8, "hwEncoding": 29 },
+    { "name": "x30", "class": "gpr", "widthBytes": 8, "hwEncoding": 30 },
+    { "name": "xzr", "class": "gpr", "widthBytes": 8, "hwEncoding": 31 },
+    { "$comment": "Stack pointer shares hwEncoding=31 with XZR at the byte level (the context determines which: SP-using addressing modes vs ZR-encoding instructions). The substrate treats them as distinct names with distinct ordinals; the JSON-side ordinal is what matters for the cc lookup.",
+      "name": "sp",  "class": "gpr", "widthBytes": 8, "hwEncoding": 31 }
+  ],
+  "$callingConventionsComment": "AAPCS64 (https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst). Integer args: x0..x7. FP args: v0..v7 — omitted in cycle-3 (no FP support yet at the asm-tier). Caller-saved: x0..x18 (incl. x16/x17 = IP0/IP1; PLT-clobberable). Callee-saved: x19..x28 + x29 (frame ptr) + x30 (link reg).",
+  "callingConventions": [
+    {
+      "name":             "aapcs64",
+      "argGprs":          ["x0","x1","x2","x3","x4","x5","x6","x7"],
+      "argFprs":          [],
+      "returnGprs":       ["x0","x1"],
+      "returnFprs":       [],
+      "callerSaved":      ["x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x18"],
+      "calleeSaved":      ["x19","x20","x21","x22","x23","x24","x25","x26","x27","x28","x29"],
+      "linkRegister":     "x30",
+      "stackPointer":     "sp",
+      "stackAlignment":   16,
+      "shadowSpaceBytes": 0,
+      "redZoneBytes":     0
+    }
+  ]
+}

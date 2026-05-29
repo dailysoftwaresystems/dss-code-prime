@@ -1,5 +1,6 @@
 add_library(asm OBJECT
     asm.cpp
+    format/fixed32.cpp
     format/x86_variable.cpp
 )
 

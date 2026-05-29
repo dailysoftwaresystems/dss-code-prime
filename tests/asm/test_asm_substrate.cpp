@@ -163,6 +163,16 @@ TEST(AsmSubstrate, LirToMirSizeMismatchFailsLoud) {
     EXPECT_EQ(countDiagnostics(rep, DiagnosticCode::A_LirToMirSizeMismatch), 1u);
 }
 
+// Test `EncodingShapeWalkerFiresWhenShapeDeclaredWithoutWalker`
+// removed AS3 cycle 3: both X86Variable and Fixed32 walkers are
+// now registered (cycle 1's no-walker substrate is fully populated).
+// The enum-drift fallback path still exists in asm.cpp + walkers'
+// switch statements; it's unreachable via valid JSON (the loader
+// rejects unknown shape strings) and is exercised only by future
+// enum additions where the static_assert / fall-through diagnostic
+// surfaces the maintenance gap.
+
+#if 0
 TEST(AsmSubstrate, EncodingShapeWalkerFiresWhenShapeDeclaredWithoutWalker) {
     // Synthesize a target schema whose `trap` opcode declares the
     // `fixed32` shape — AS2 cycle 2 wires the `x86-variable` walker,
@@ -212,6 +222,7 @@ TEST(AsmSubstrate, EncodingShapeWalkerFiresWhenShapeDeclaredWithoutWalker) {
     EXPECT_GT(countDiagnostics(rep, DiagnosticCode::A_NoEncodingShapeWalker), 0u);
     EXPECT_EQ(countDiagnostics(rep, DiagnosticCode::A_NoEncodingDeclared), 0u);
 }
+#endif
 
 // ── Schema surface: relocations[] taxonomy ────────────────────────────
 
@@ -452,7 +463,7 @@ TEST(TargetSchemaEncoding, X86VariableAndFixed32RoundTrip) {
                 "format": "fixed32",
                 "variants": [
                   { "guard": { "operandKinds": [] },
-                    "template": { "opcode": [2] } }
+                    "template": { "fixedWord": 2 } }
                 ]
               } }
         ]

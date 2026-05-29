@@ -166,6 +166,23 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             }
         }
     }
+    // `fixedWord` (plan 13 AS3 — `fixed32` shape) — 32-bit base bit
+    // pattern. JSON accepts unsigned 32-bit integer values.
+    if (t.contains("fixedWord")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/fixedWord", opIdx, vi);
+        if (!t.at("fixedWord").is_number_integer()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'fixedWord' must be a 32-bit unsigned integer");
+        } else {
+            std::int64_t const wv = t.at("fixedWord").get<std::int64_t>();
+            if (wv < 0 || wv > 0xFFFFFFFFLL) {
+                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                          std::format("'fixedWord' ({}) must fit in 32 bits", wv));
+            } else {
+                tmpl.fixedWord = static_cast<std::uint32_t>(wv);
+            }
+        }
+    }
 }
 
 void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
@@ -391,6 +408,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // silent disagreement bugs. Single source of truth wins.
         if (o.contains("hasSideEffects") && o.at("hasSideEffects").is_boolean()) {
             info.hasSideEffects = o.at("hasSideEffects").get<bool>();
+        }
+        if (o.contains("requires2Address") && o.at("requires2Address").is_boolean()) {
+            info.requires2Address = o.at("requires2Address").get<bool>();
         }
         if (o.contains("isCall") && o.at("isCall").is_boolean()) {
             info.isCall = o.at("isCall").get<bool>();
