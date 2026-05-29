@@ -78,4 +78,22 @@ struct LirOpcodeInfo {
 inline constexpr std::uint8_t kLirUnboundedOperands   = 0xFF;
 inline constexpr std::uint8_t kLirUnboundedSuccessors = 0xFF;
 
+// Universal per-target opcode-info dispatch. The builder/verifier
+// dispatches on the active `TargetId` and casts the raw `uint16_t`
+// opcode to the target's enum. Forward-declared here; defined in
+// lir.cpp (where it includes each target header). Returns
+// `LirOpcodeInfo{}` (sentinel — mnemonic=="?", result=None,
+// isTerminator=false) for an out-of-range opcode so the caller can
+// detect via the empty mnemonic.
+[[nodiscard]] DSS_EXPORT LirOpcodeInfo lirOpcodeInfo(TargetId target,
+                                                    std::uint16_t opcode) noexcept;
+
+// True iff `opcode` (under the given target) is a terminator.
+// Returns false for an unknown opcode (defensive — terminator
+// builders use this to reject non-terminators; an unknown opcode
+// should fail loud at the higher level, not silently pass as a
+// terminator).
+[[nodiscard]] DSS_EXPORT bool lirIsTerminator(TargetId target,
+                                              std::uint16_t opcode) noexcept;
+
 } // namespace dss

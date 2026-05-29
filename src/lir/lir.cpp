@@ -1,4 +1,5 @@
 #include "lir/lir.hpp"
+#include "lir/targets/x86_64.hpp"
 
 #include <array>
 #include <cstdio>
@@ -17,6 +18,35 @@ namespace {
 }
 
 } // namespace
+
+// Per-target opcode-info dispatch. Forward-declared in lir_opcode.hpp;
+// definition here knows each target's header. A new target (ARM64,
+// etc.) adds its case to this switch + provides its own
+// `opcodeInfo()` overload in the target header.
+LirOpcodeInfo lirOpcodeInfo(TargetId target, std::uint16_t opcode) noexcept {
+    switch (target) {
+        case TargetId::X86_64: {
+            auto const op = static_cast<x86_64::Opcode>(opcode);
+            if (op < x86_64::Opcode::Invalid || op >= x86_64::Opcode::Count_) {
+                return LirOpcodeInfo{};
+            }
+            return x86_64::opcodeInfo(op);
+        }
+        case TargetId::ARM64:
+            // ARM64 backend lands in cycle 1b. Until then, return the
+            // sentinel so the verifier flags any ARM64 LIR module
+            // built via this substrate.
+            return LirOpcodeInfo{};
+        case TargetId::Invalid:
+            return LirOpcodeInfo{};
+    }
+    return LirOpcodeInfo{};
+}
+
+bool lirIsTerminator(TargetId target, std::uint16_t opcode) noexcept {
+    LirOpcodeInfo const info = lirOpcodeInfo(target, opcode);
+    return info.isTerminator;
+}
 
 // ── Lir ──────────────────────────────────────────────────────────
 
@@ -139,7 +169,12 @@ LirFuncId LirBuilder::addFunction(SymbolId symbol) {
 LirBlockId LirBuilder::createBlock() {
     if (!openFunc_.valid()) lirFatal("LirBuilder::createBlock: no open function");
     detail::LirBlock blk;
-    blk.func = openFunc_.v;
+    blk.func      = openFunc_.v;
+    // Sentinel value for "block created but never `beginBlock`'d".
+    // `beginBlock` sets the real `instStart` and resets `instCount` to 0;
+    // a second `beginBlock` on the same block is caught because
+    // `instStart` was already non-sentinel.
+    blk.instStart = UINT32_MAX;
     LirBlockId const id = blockArena_.addNode(blk);
     openFuncBlocks_.push_back(id);
     return id;
@@ -153,8 +188,14 @@ void LirBuilder::beginBlock(LirBlockId block) {
     if (block.arenaTag != moduleId_.v) {
         lirFatal("LirBuilder::beginBlock: cross-module block id");
     }
-    // Mutate the block's instStart to the current instArena position.
     auto& blk = blockArena_.at(block);
+    // Guard against a second `beginBlock` on an already-opened block:
+    // `createBlock` set `instStart = UINT32_MAX`; the first
+    // `beginBlock` writes the real arena position; a second call
+    // would silently clobber it and orphan previously-emitted insts.
+    if (blk.instStart != UINT32_MAX) {
+        lirFatal("LirBuilder::beginBlock: block has already been opened");
+    }
     blk.instStart = static_cast<std::uint32_t>(instArena_.size());
     blk.instCount = 0;
     openBlock_              = block;
@@ -201,6 +242,14 @@ LirInstId LirBuilder::addInst(std::uint16_t opcode, LirReg result,
                               std::span<LirOperand const> operands,
                               std::uint32_t payload, std::uint8_t flags) {
     if (opcode == 0) lirFatal("LirBuilder::addInst: Invalid opcode");
+    // Per-target opcode-range guard: a caller passing an opcode from
+    // a different target's enum (or a stale integer) silently freezes
+    // a mismatched module today; the dispatch returns a sentinel
+    // `LirOpcodeInfo{}` (mnemonic == "?") for out-of-range opcodes.
+    LirOpcodeInfo const info = lirOpcodeInfo(target_, opcode);
+    if (info.mnemonic.empty() || info.mnemonic == "?") {
+        lirFatal("LirBuilder::addInst: opcode not registered for the active target");
+    }
     detail::LirInst inst;
     inst.opcode       = opcode;
     inst.flags        = flags;
@@ -214,6 +263,9 @@ LirInstId LirBuilder::addInst(std::uint16_t opcode, LirReg result,
 }
 
 LirInstId LirBuilder::addBr(std::uint16_t opcode, LirBlockId target) {
+    if (!lirIsTerminator(target_, opcode)) {
+        lirFatal("LirBuilder::addBr: opcode is not a terminator for this target");
+    }
     LirOperand ref;
     ref.kind = LirOperandKind::BlockRef;
     ref.blockSlot = target.v;
@@ -228,6 +280,9 @@ LirInstId LirBuilder::addBr(std::uint16_t opcode, LirBlockId target) {
 LirInstId LirBuilder::addCondBr(std::uint16_t opcode,
                                 std::span<LirOperand const> operands,
                                 LirBlockId ifTrue, LirBlockId ifFalse) {
+    if (!lirIsTerminator(target_, opcode)) {
+        lirFatal("LirBuilder::addCondBr: opcode is not a terminator for this target");
+    }
     LirInstId const id = addInst(opcode, InvalidLirReg, operands);
     std::array<LirBlockId, 2> succs{ifTrue, ifFalse};
     recordSuccessors_(succs);
@@ -237,6 +292,9 @@ LirInstId LirBuilder::addCondBr(std::uint16_t opcode,
 
 LirInstId LirBuilder::addReturn(std::uint16_t opcode,
                                 std::span<LirOperand const> operands) {
+    if (!lirIsTerminator(target_, opcode)) {
+        lirFatal("LirBuilder::addReturn: opcode is not a terminator for this target");
+    }
     LirInstId const id = addInst(opcode, InvalidLirReg, operands);
     // No successors for return.
     auto& blk = blockArena_.at(openBlock_);
@@ -251,13 +309,22 @@ void LirBuilder::closeFunction_() {
     // Validate every created block is opened + terminated.
     for (LirBlockId const b : openFuncBlocks_) {
         auto const& blk = blockArena_.at(b);
-        // A block is "filled" iff its instCount > 0 AND its last
-        // instruction is its terminator (the open-block-has-terminator
-        // flag tracked at instruction time). Cycle 1 has no
-        // post-build verifier — the builder's invariant IS that
-        // closeFunction never sees an unterminated block.
+        if (blk.instStart == UINT32_MAX) {
+            lirFatal("LirBuilder::closeFunction: block created but never `beginBlock`'d");
+        }
         if (blk.instCount == 0) {
-            lirFatal("LirBuilder::closeFunction: block created but never filled");
+            lirFatal("LirBuilder::closeFunction: block opened but never filled");
+        }
+        // Verify the block's last instruction IS a terminator. The
+        // builder's per-instruction `openBlockHasTerminator_` flag is
+        // only meaningful for the currently-open block; older blocks
+        // might have been closed without ever calling a terminator-
+        // builder. Re-check via the opcode-info table here so the
+        // invariant is enforced regardless of build path.
+        std::uint32_t const lastSlot = blk.instStart + blk.instCount - 1;
+        auto const& lastInst = instArena_.at(LirInstId{lastSlot, moduleId_.v});
+        if (!lirIsTerminator(target_, lastInst.opcode)) {
+            lirFatal("LirBuilder::closeFunction: block's last instruction is not a terminator");
         }
     }
     // Set function's blockCount from the created list.

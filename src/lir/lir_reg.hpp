@@ -54,7 +54,13 @@ struct LirReg {
     [[nodiscard]] constexpr bool valid() const noexcept {
         return classKind != static_cast<std::uint32_t>(LirRegClass::None);
     }
-    constexpr bool operator==(LirReg const&) const noexcept = default;
+    // Compare semantic fields only — exclude the `_pad` bit. A
+    // defaulted `==` would include `_pad` in the comparison; if any
+    // future construction path failed to zero-initialize it, two
+    // semantically-identical registers would compare unequal.
+    constexpr bool operator==(LirReg const& o) const noexcept {
+        return id == o.id && classKind == o.classKind && isPhysical == o.isPhysical;
+    }
 };
 static_assert(sizeof(LirReg) == 4, "LirReg POD must stay 4 bytes");
 static_assert(std::is_trivially_copyable_v<LirReg>);

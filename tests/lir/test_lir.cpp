@@ -154,6 +154,55 @@ TEST(Lir, TargetIdRoundTrips) {
     EXPECT_EQ(targetName(TargetId::Invalid), "invalid");
 }
 
+// `LirReg::operator==` ignores the `_pad` bit so future helpers
+// that leave it uninitialised don't break equality.
+TEST(Lir, LirRegEqualityIgnoresPad) {
+    LirReg const a = makeVirtualReg(5, LirRegClass::GPR);
+    LirReg b = makeVirtualReg(5, LirRegClass::GPR);
+    // Manually flip `_pad` (semantically a no-op).
+    b._pad = 1;
+    EXPECT_TRUE(a == b)
+        << "LirReg equality must not depend on the unused _pad bit";
+}
+
+// Death test: calling addBr with a non-terminator opcode (e.g. Mov)
+// must abort, not silently corrupt the module.
+TEST(LirDeathTest, AddBrRejectsNonTerminatorOpcode) {
+    LirBuilder b{TargetId::X86_64};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const e = b.createBlock();
+    LirBlockId const t = b.createBlock();
+    b.beginBlock(e);
+    EXPECT_DEATH(b.addBr(op(X86::Mov), t), "not a terminator");
+}
+
+// Death test: calling beginBlock twice on the same block must abort.
+TEST(LirDeathTest, BeginBlockTwiceAborts) {
+    LirBuilder b{TargetId::X86_64};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const e = b.createBlock();
+    LirBlockId const t = b.createBlock();
+    b.beginBlock(e);
+    b.addBr(op(X86::Jmp), t);  // close e
+    b.beginBlock(t);
+    b.addReturn(op(X86::Ret), std::span<LirOperand const>{});
+    EXPECT_DEATH(b.beginBlock(e), "already been opened");
+}
+
+// Death test: a block that never gets a terminator must abort at
+// closeFunction (called by addFunction or finish).
+TEST(LirDeathTest, BlockWithoutTerminatorAborts) {
+    LirBuilder b{TargetId::X86_64};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const e = b.createBlock();
+    b.beginBlock(e);
+    LirReg const r = b.newVReg(LirRegClass::GPR);
+    std::array<LirOperand, 1> const ops{immOperand(1)};
+    b.addInst(op(X86::Mov), r, ops);
+    // No terminator emitted.
+    EXPECT_DEATH(std::move(b).finish(), "not a terminator");
+}
+
 TEST(Lir, LirAttributeBindsToInstructionTier) {
     LirBuilder b{TargetId::X86_64};
     (void)b.addFunction(SymbolId{1});
