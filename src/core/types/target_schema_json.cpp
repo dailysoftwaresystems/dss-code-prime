@@ -516,7 +516,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                               v, std::numeric_limits<std::uint32_t>::max()));
                         continue;
                     }
-                    info.kind = static_cast<std::uint32_t>(v);
+                    info.kind = RelocationKind{static_cast<std::uint32_t>(v)};
                 }
                 // `formula` (optional) is opaque to the substrate but
                 // type-strict: a present-but-wrong-type field is

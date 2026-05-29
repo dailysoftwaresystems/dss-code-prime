@@ -191,14 +191,14 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     //     an empty name would silently mis-resolve to whichever
     //     format-side row also has an empty key.
     {
-        std::unordered_map<std::uint32_t, std::size_t> seenKind;
+        std::unordered_map<RelocationKind, std::size_t> seenKind;
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             auto const& r = relocations[i];
             if (r.name.empty()) {
                 fail(std::format("/relocations/{}/name", i),
                      "relocation row: 'name' must be a non-empty string");
             }
-            if (r.kind == 0) {
+            if (!r.kind.valid()) {
                 fail(std::format("/relocations/{}/kind", i),
                      std::format("relocation '{}': 'kind' must be != 0 "
                                  "(slot 0 is reserved as the invalid sentinel)",
@@ -210,7 +210,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 fail(std::format("/relocations/{}/kind", i),
                      std::format("relocation '{}': duplicate 'kind' value {} "
                                  "(already declared by relocation '{}' at /relocations/{})",
-                                 r.name, r.kind,
+                                 r.name, r.kind.v,
                                  relocations[it->second].name, it->second));
             }
         }

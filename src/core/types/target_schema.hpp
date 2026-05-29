@@ -301,9 +301,12 @@ targetEncodingShapeFromName(std::string_view s) noexcept {
 // row MUST carry a `kind != 0` (loader-enforced). Two rows with the
 // same `kind` are also rejected.
 struct DSS_EXPORT TargetRelocationInfo {
-    std::string   name;     // canonical text key (e.g. "rel32", "abs64")
-    std::uint32_t kind = 0; // opaque tag — written into Relocation::kind
-    std::string   formula;  // human-readable formula (e.g. "S + A - P - 4")
+    std::string    name;            // canonical text key (e.g. "rel32", "abs64")
+    RelocationKind kind{};          // opaque tag — written into Relocation::kind;
+                                    // values flow ONLY from this field + the
+                                    // schema's `relocationInfo`/`relocationByName`
+                                    // accessors, never assembler-fabricated.
+    std::string    formula;         // human-readable formula (e.g. "S + A - P - 4")
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode
@@ -500,7 +503,7 @@ struct DSS_EXPORT TargetSchemaData {
     // there is an O(R·F) blowup at link time. validate() enforces
     // `kind` uniqueness across rows, so this index is safe to build
     // from the same monotonic loader path the name index uses.
-    std::unordered_map<std::uint32_t, std::uint16_t> relocationKindIndex;
+    std::unordered_map<RelocationKind, std::uint16_t> relocationKindIndex;
 
     // Cross-field invariants the per-field JSON parse cannot express.
     // Returns the list of problems as fully-shaped `ConfigDiagnostic`s
@@ -647,7 +650,7 @@ public:
     // `Relocation::kind`). Returns nullptr for an unknown kind so the
     // linker can fail loud at relocation-resolve time rather than
     // silently apply the wrong formula. O(1) via `relocationKindIndex`.
-    [[nodiscard]] TargetRelocationInfo const* relocationInfo(std::uint32_t kind) const noexcept {
+    [[nodiscard]] TargetRelocationInfo const* relocationInfo(RelocationKind kind) const noexcept {
         auto it = d_.relocationKindIndex.find(kind);
         if (it == d_.relocationKindIndex.end()) return nullptr;
         return &d_.relocations[it->second];

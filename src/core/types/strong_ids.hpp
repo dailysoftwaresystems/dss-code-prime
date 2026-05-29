@@ -143,6 +143,18 @@ DSS_ARENA_ID(LirFuncId);
 // values from it.
 DSS_STRONG_ID(LirSpillSlot);
 
+// `RelocationKind` is the opaque target-declared tag the assembler
+// writes onto `Relocation::kind` (plan 13 AS1 §2.6). Each target
+// schema declares its own kind set in `*.target.json::relocations[]`;
+// the substrate never branches on the value (read it via
+// `schema.relocationInfo(kind)`). The strong-id wrapper prevents the
+// assembler from fabricating an int and writing it directly —
+// values flow only through `TargetRelocationInfo::kind` and the
+// schema's lookup accessors. Slot 0 is the invalid sentinel
+// (`RelocationKind{}` default-constructs to invalid; loader rejects
+// any declared kind with `v == 0`).
+DSS_STRONG_ID(RelocationKind);
+
 #undef DSS_STRONG_ID
 #undef DSS_ARENA_ID
 
@@ -174,6 +186,7 @@ inline constexpr LirInstId       InvalidLirInst{};
 inline constexpr LirBlockId      InvalidLirBlock{};
 inline constexpr LirFuncId       InvalidLirFunc{};
 inline constexpr LirSpillSlot    InvalidLirSpillSlot{};
+inline constexpr RelocationKind  InvalidRelocationKind{};
 inline constexpr TargetSchemaId  InvalidTargetSchema{};
 inline constexpr MirFuncId       InvalidMirFunc{};
 inline constexpr MirGlobalId     InvalidMirGlobal{};
@@ -218,5 +231,6 @@ DSS_HASH_ID(LirInstId);
 DSS_HASH_ID(LirBlockId);
 DSS_HASH_ID(LirFuncId);
 DSS_HASH_ID(TargetSchemaId);
+DSS_HASH_ID(RelocationKind);
 
 #undef DSS_HASH_ID

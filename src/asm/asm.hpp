@@ -75,10 +75,14 @@ struct DSS_EXPORT SourceMapEntry {
 // on the max section size (consistent with ELF/COFF section-relative
 // reloc offsets being u32 in the wire format).
 struct DSS_EXPORT Relocation {
-    std::uint32_t offset = 0;     // byte offset within the function's bytes
-    SymbolId      target{};       // the unresolved symbol the linker resolves
-    std::uint32_t kind   = 0;     // opaque tag — meaning declared in schema
-    std::int64_t  addend = 0;     // ABI-specific (e.g. PC-relative bias)
+    std::uint32_t  offset = 0;    // byte offset within the function's bytes
+    SymbolId       target{};      // the unresolved symbol the linker resolves
+    RelocationKind kind{};        // opaque tag — value obtained from
+                                  // `schema.relocationByName(...)->kind` or
+                                  // `schema.relocations()[i].kind`; never
+                                  // assembler-fabricated. Default-constructed
+                                  // (invalid sentinel) means "uninitialized".
+    std::int64_t   addend = 0;    // ABI-specific (e.g. PC-relative bias)
 };
 
 // One assembled function — bytes + symbol-relative metadata. `symbol`

@@ -240,25 +240,31 @@ TEST(TargetSchemaRelocations, JsonRoundTripsThroughAccessors) {
 
     auto const* rel32 = (*schema)->relocationByName("rel32");
     ASSERT_NE(rel32, nullptr);
-    EXPECT_EQ(rel32->kind, 1u);
+    EXPECT_EQ(rel32->kind, RelocationKind{1});
     EXPECT_EQ(rel32->formula, "S + A - P - 4");
 
     auto const* abs64 = (*schema)->relocationByName("abs64");
     ASSERT_NE(abs64, nullptr);
-    EXPECT_EQ(abs64->kind, 2u);
+    EXPECT_EQ(abs64->kind, RelocationKind{2});
 
-    auto const* byKind1 = (*schema)->relocationInfo(1);
+    auto const* byKind1 = (*schema)->relocationInfo(RelocationKind{1});
     ASSERT_NE(byKind1, nullptr);
     EXPECT_EQ(byKind1->name, "rel32");
 
-    auto const* byKind2 = (*schema)->relocationInfo(2);
+    auto const* byKind2 = (*schema)->relocationInfo(RelocationKind{2});
     ASSERT_NE(byKind2, nullptr);
     EXPECT_EQ(byKind2->name, "abs64");
 
     // Unknown name / unknown kind → nullptr (fail-loud at the
     // consumer; substrate never invents).
     EXPECT_EQ((*schema)->relocationByName("nope"), nullptr);
-    EXPECT_EQ((*schema)->relocationInfo(0xDEADBEEFu), nullptr);
+    EXPECT_EQ((*schema)->relocationInfo(RelocationKind{0xDEADBEEF}), nullptr);
+
+    // Default-constructed RelocationKind is the slot-0 invalid
+    // sentinel — lookup must NEVER match a declared kind, even if
+    // the schema had a row with `kind: 0` (which validate() rejects).
+    EXPECT_EQ((*schema)->relocationInfo(RelocationKind{}), nullptr);
+    EXPECT_FALSE(RelocationKind{}.valid());
 }
 
 TEST(TargetSchemaRelocations, DuplicateKindIsLoadTimeFatal) {
@@ -400,7 +406,7 @@ TEST(TargetSchemaRelocations, AbsentSectionIsLegal) {
     auto schema = TargetSchema::loadFromText(kJson, "synth.target.json");
     ASSERT_TRUE(schema.has_value());
     EXPECT_EQ((*schema)->relocationCount(), 0u);
-    EXPECT_EQ((*schema)->relocationInfo(1), nullptr);
+    EXPECT_EQ((*schema)->relocationInfo(RelocationKind{1}), nullptr);
 }
 
 // ── Schema surface: encoding facet on opcode rows ─────────────────────
