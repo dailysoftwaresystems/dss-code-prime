@@ -2,7 +2,9 @@
 
 > Owns instruction encoding for v1 ISAs. Translates [LIR](./12-mir-lir-plan%20-%20ok.md) (post-regalloc, post-frame-materialization, physical-register-only) into raw machine bytes + relocation records consumed by the [in-tree linker](./14-linker-plan%20-%20tbd.md). Per the hermetic-compiler invariant, **no GAS / MASM / llvm-mc invocation** — we own every byte.
 >
-> **Rev 3 (2026-05-29) — config-driven encoding, mirroring the ML5 cycle 2a pivot.** Per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) Decision #4's three-bucket rule (canonicalized 2026-05-29): encoding rows are JSON-declared (bucket 1) on the per-target schema's `encoding` facet; the assembler is one engine reading them (bucket 2). NO per-arch `.cpp` directories. Rev 1/2's `src/asm/x86_64/` + `src/asm/arm64/` per-arch trees are deleted. Validated by 2-architect parallel pass before this rev landed (see §2.4 honest carve-outs).
+> **Rev 3 (2026-05-29) — config-driven encoding, mirroring the ML5 cycle 2a pivot.** Per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) Decision #4's three-bucket rule (canonicalized 2026-05-29): encoding rows are JSON-declared (bucket 1) on the per-target schema's `encoding` facet; the assembler is **shape-keyed dispatch** to one specialized format-encoder per encoding shape (bucket 2 — same pattern as `ChildLower` in the frontend). NO per-arch `.cpp` directories. Rev 1/2's `src/asm/x86_64/` + `src/asm/arm64/` per-arch trees are deleted. Validated by 2-architect parallel pass before this rev landed (see §2.4 honest carve-outs).
+>
+> **The headline test** (honest version, matches §2.4): adding a new target is **JSON if its encoding-format already has an encoder; else JSON + one new format-encoder function**. ARM64 reuses `fixed32` (the format ARM64 already uses) → pure JSON drop, zero C++. RISC-V 32-bit (RV32) reuses `fixed32` with different bit-field row data → pure JSON drop. A novel VLIW/DSP shape with bundle-encoded instructions → JSON + one new bucket-2 walker (`vliw_bundle.cpp`). Both are bucket-2 by the operative test (shape-keyed dispatch, never identity-keyed) — but the JSON-only case is the cheap one we should size the architecture for.
 
 ## 0. Status (snapshot)
 
@@ -29,10 +31,10 @@ Hermetic per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1.1
 src/asm/
 ├── asm.hpp / .cpp          # Public Assembler API + assemble() entrypoint
 ├── asm_buffer.hpp / .cpp   # Section bytes + reloc list
-├── format/                 # ONE bucket-2 function per encoding-format tag (NOT per arch)
+├── format/                 # ONE bucket-2 walker per encoding-shape tag (NOT per arch)
 │   ├── x86_variable.cpp    # x86-variable: prefix chain + ModR/M + SIB + imm
-│   ├── arm32_fixed.cpp     # arm32-fixed: 32-bit fixed word + bit-field slice composition
-│   └── (riscv32_fixed.cpp / wasm_leb.cpp / spirv_word.cpp deferred per §2.4)
+│   ├── fixed32.cpp         # fixed32: 32-bit fixed-word + bit-field slice composition (ARM64 + future RV32 + any future 32-bit-fixed ISA — name is shape-keyed, not arch-keyed)
+│   └── (vliw_bundle.cpp / variable_long.cpp etc. deferred until a target needs them)
 ├── disasm.hpp / .cpp       # Round-trip oracle (test-only) — same format-dispatched shape
 └── tests/
     └── (per-instruction hex roundtrip pins; format-blind golden harness)
@@ -47,7 +49,7 @@ src/dss-config/targets/arm64.target.json
 
 Rev 1/2's `src/asm/x86_64/` + `src/asm/arm64/` per-arch trees are DELETED — collapsed into:
 - **One JSON facet per target** (`*.target.json` gains an `encoding` sub-object on every opcode row + a top-level `relocations` array)
-- **One format-encoder function per encoding format** (`x86_variable.cpp`, `arm32_fixed.cpp`) — the function is selected by the row's `format` field, NOT by arch name. Adding ARM64 = drop the JSON file (x86 doesn't change); adding RISC-V = JSON file + new `riscv32_fixed.cpp` format function (existing format functions untouched).
+- **One format-encoder function per encoding-shape tag** (`x86_variable.cpp`, `fixed32.cpp`) — shape-keyed dispatch (NOT arch-keyed; same discipline as the frontend's `ChildLower` enum). Adding ARM64 = drop arm64.target.json declaring `format: "fixed32"` (no new walker — `fixed32` already exists). Adding RV32 = drop riscv32.target.json also declaring `format: "fixed32"` (no new walker — the bit-field row data differs, the walker doesn't). Adding a genuinely novel encoding shape (VLIW bundles, RISC-V compressed 16-bit) = JSON + one new walker keyed on a new shape tag.
 
 ### 2.2 Input contract
 
@@ -98,25 +100,20 @@ struct Relocation {
 
 The `Relocation::kind` is an **opaque `uint32_t` tag** whose meaning is declared in `TargetSchema::relocations[]` (the bucket-1 taxonomy facet — see §2.5). The assembler writes the tag; the linker reads the tag via `schema.relocationInfo(kind)`. Neither knows the other format's tags.
 
-### 2.4 Honest bucket-2 carve-outs (architect-validated 2026-05-29)
+### 2.4 Shape-keyed dispatch (bucket-2 done right, architect-validated 2026-05-29)
 
-The "one universal encoder" framing in earlier drafts overstated uniformity. The honest shape per the 2-architect validation pass is **one format-encoder function per encoding-format tag**, each function is data-driven from JSON rows, none of them branches on arch name. This is still bucket-2 (the engine has algorithms parameterized by JSON vocabulary; no identity branches), but the architectural fact deserves naming so we don't drift later.
+The "one universal encoder" framing in earlier drafts overstated uniformity. The honest shape per the 2-architect validation pass is **shape-keyed dispatch over a closed encoding-format vocabulary**: each `encoding.format` tag in the JSON maps to one specialized walker. Mirrors the frontend's `ChildLower` discipline (`src/core/types/hir_lowering_config.hpp` — a closed enum of lowering verbs, one walker per verb, JSON declares which verb to use). The walkers ARE specialized — x86's variable-length ModR/M-driven shape and the 32-bit fixed-word bit-field-driven shape are genuinely different algorithms — but they are **shape-keyed (closed vocabulary), not identity-keyed (open per-target)**. New target = JSON if its shape exists, JSON + one walker if a new shape is needed. Same bucket-2 pattern, no Decision #4 dilution.
 
-**Structural rules the format-encoder C++ must own (unconditional engine conventions, NOT arch branches):**
+**Structural rules each format walker must own (unconditional engine conventions, NOT arch branches):**
 
-- **x86_64 REX prefix extension bits** (`REX.R` / `REX.B`) — derived from operand `hwEncoding >> 3`, not an arch branch. The `x86_variable.cpp` encoder always computes these from the register table.
-- **x86_64 SIB byte forced presence** when `ModR/M.rm == 4` — architectural rule of the encoding format, not arch identity.
-- **x86_64 VEX/EVEX prefix field arithmetic** (for SSE/AVX) — the `vvvv` field is the bit-complement of the source register's hwEncoding. Mechanical derivation, not branching.
-- **ARM64 `sf` flag** (64-bit operand) — derived from the result register's width, not an arch branch.
+- **x86_64 REX prefix extension bits** (`REX.R` / `REX.B`) — derived from operand `hwEncoding >> 3`, not an arch branch. `x86_variable.cpp` always computes these from the register table.
+- **x86_64 SIB byte forced presence** when `ModR/M.rm == 4` — architectural rule of the encoding shape, not arch identity.
+- **x86_64 VEX/EVEX prefix field arithmetic** (for SSE/AVX) — the `vvvv` field is the bit-complement of the source register's hwEncoding. Mechanical derivation.
+- **`fixed32` `sf` flag** (64-bit operand selector on AArch64 instructions) — derived from the result register's width. Same walker handles RV32-style fixed-word encodings without a branch — the bit-field row data differs, the walker doesn't.
 
-These rules live in the format-encoder C++ as named functions (`encodeRexPrefix(reg, ...)`, `forcedSibByte(modrm)`, `derivedSf(resultWidth)`). They are bucket-2 by the operative test: zero identity branches.
+These rules live in the format walker as named functions (`encodeRexPrefix(reg, ...)`, `forcedSibByte(modrm)`, `derivedSizeFlag(resultWidth)`). They are bucket-2 by the operative test: zero identity branches.
 
-**Formats explicitly deferred to their own plans** (genuine bucket-2 boundary cases):
-
-- **WASM bytecode** — `block`/`loop`/`if` are structurally scoped (not address-targeted). The encoder needs a scope stack and `end`-opcode emission at scope boundaries — fundamentally procedural state, not a declarative row template. Owned by [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md); the WASM encoder is its own bucket-2 algorithm with its own state model.
-- **SPIR-V words** — every value-producing instruction has a `<result-id>` that's a sequentially-minted integer, not derivable from the LIR register. Result-id minting + LirReg→spirv-id mapping is global mutable state. Owned by [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md).
-
-For v1 (x86_64 + ARM64), the `format/x86_variable.cpp` + `format/arm32_fixed.cpp` model is sufficient. WASM + SPIR-V land in their own plans with their own format-encoder cousins consumed by the same top-level `assemble()` dispatch.
+**Structured-bytecode targets are NOT in plan 13.** WASM (block-scoped stack VM, structured CF, value stack — not registers) and SPIR-V (typed value stream with result-id minting, shader-bound) consume MIR DIRECTLY (per their plans 18 + 17) via MIR→structured-bytecode walkers — they bypass LIR entirely. The earlier draft's "WASM/SPIR-V are bucket-2 carve-outs in plan 13" framing was wrong: those targets aren't native-ISA byte-encoders at all, they're a different downstream-of-MIR family with their own pivot path. The MIR optimizer (gen-optimizer step 11) runs upstream of all four target classes (native ISAs via LIR, WASM via plan 18, SPIR-V via plan 17, future bytecode VMs).
 
 ### 2.5 Encoding facet on the target schema
 
@@ -166,7 +163,7 @@ For ARM64 (fixed 32-bit word + bit-field slots):
 {
   "mnemonic": "add",
   "encoding": {
-    "format": "arm32-fixed",
+    "format": "fixed32",
     "variants": [{
       "guard": { "operandKinds": ["reg", "reg", "imm"] },
       "template": { "fixedWord": "0x11000000", "sf": { "fromResultWidth": true } },
@@ -211,6 +208,15 @@ The assembler emits `Relocation{ kind = tag }`; the linker (plan 14) resolves it
 
 Object-format-specific reloc kinds (e.g., `R_X86_64_PC32` for ELF, `IMAGE_REL_AMD64_REL32` for PE, `X86_64_RELOC_BRANCH` for Mach-O) all map to the SAME bucket-1 formula (PC-relative 32-bit). The format-specific name + integer encoding lives in `*.format.json` (per plan 14's `relocations[]` mapping `format-name → schema-tag`); the assembler only knows the schema tag.
 
+**Ownership boundary** (cross-referenced from [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) §2.0, pinned so AS↔LK don't diverge at implementation time):
+
+| Schema | Owns | Consumed by |
+|---|---|---|
+| `*.target.json` `relocations[]` | The **formula+tag**: opaque `uint32_t tag → { isPCRelative, width, addendWidth, ... }` | Assembler emits the tag; linker applies the formula |
+| `*.format.json` `relocations[]` | The **format-name → tag** mapping: `"R_X86_64_PC32" → tag 1`, `"IMAGE_REL_AMD64_REL32" → tag 1`, etc. | Linker uses the format name when writing the object file's reloc table |
+
+Same opaque `uint32_t` tag joins both sides. Neither schema duplicates the other's data. AS4 (plan 13) authors the formula+tag table on the target schema; LK6 (plan 14 — reloc-apply integration) authors the format-name→tag mapping on each format schema. Cross-PR review pin: AS4 and LK6 land in the same review window so the integer assignments don't drift.
+
 ### 2.7 Diagnostics
 
 New `A_*` family at a fresh nibble (parallel to `H_*` HIR, `I_*` MIR, `L_*` LIR, `R_*` regalloc, `O_*` linker). Distinct from `L_*` because the assembler is the next tier after LIR — it consumes a frozen `Lir` and emits bytes, a different artifact class.
@@ -248,7 +254,7 @@ Row-count estimate per architect-1's validation: ~40 LIR mnemonic rows on each t
 
 Test-only. After encoding instruction `I` to bytes `B`, disassemble `B` and compare the mnemonic+operands to the original `I`. Catches encoder bugs that produce valid-but-wrong instructions.
 
-Same format-dispatched shape as the encoder: one disassembler-per-format function (`x86_variable_disasm.cpp`, `arm32_fixed_disasm.cpp`). Reference outputs (objdump / llvm-mc) are TEST ORACLES only — golden hex snapshots live in fixtures; the production pipeline does not invoke objdump.
+Same shape-keyed dispatch as the encoder: one disassembler-per-shape function (`x86_variable_disasm.cpp`, `fixed32_disasm.cpp`). Reference outputs (objdump / llvm-mc) are TEST ORACLES only — golden hex snapshots live in fixtures; the production pipeline does not invoke objdump.
 
 ---
 
@@ -258,7 +264,7 @@ Same format-dispatched shape as the encoder: one disassembler-per-format functio
 |-----|----------------------------------------------------|-------|
 | AS1 | Assembler skeleton + `assemble()` API + buffer + opaque `Relocation` tag + `A_*` diagnostic family | Public API per §2.2; `Relocation::kind` as opaque `uint32_t` (schema-declared); `AssembledModule`/`AssembledFunction` shape; SourceMapEntry-via-MirInstId; `A_*` codes at fresh nibble; ONE format-encoder dispatch table keyed on `encoding.format`. NO per-arch `.cpp` directories. |
 | AS2 | `format/x86_variable.cpp` engine + `encoding` facet authored on x86_64.target.json | Universal x86-variable encoder: REX/VEX prefix arithmetic (REX.R/B from `hwEncoding>>3`), SIB forced-presence, ModR/M assembly, displacement + imm widths. Encoding rows for §2.8 x86_64 subset. Per-instruction hex roundtrip pin. |
-| AS3 | `format/arm32_fixed.cpp` engine + `encoding` facet authored on arm64.target.json | Universal arm32-fixed encoder: fixed-word template, bit-field slot composition, `sf` width derivation. Encoding rows for §2.8 ARM64 subset. Per-instruction hex roundtrip pin. Lands alongside ML7 cycle 2 (ARM64 stackPointer + ABI goldens) per plan 12 §3.1 D-ML7-2.1. |
+| AS3 | `format/fixed32.cpp` walker + `encoding` facet authored on arm64.target.json | Universal fixed32 walker: fixed-word template, bit-field slot composition, size-flag derivation. Encoding rows for §2.8 ARM64 subset. Per-instruction hex roundtrip pin. Lands alongside ML7 cycle 2 (ARM64 stackPointer + ABI goldens) per plan 12 §3.1 D-ML7-2.1. RV32 lands later by JSON-only drop (no AS-cycle PR — uses the same walker). |
 | AS4 | Relocation taxonomy facet + assembler/linker integration | New `relocations[]` array in `*.target.json` (opaque tag → formula). Object-format-specific reloc name → tag mapping lives in `*.format.json` (per plan 14). Pin each kind against a known-good encoded image. |
 | AS5 | Format-dispatched disassembler harness + round-trip test | One `*_disasm.cpp` per format. Every AS2/AS3 instruction round-trips via disasm oracle. |
 | AS6 | LIR → bytes pipeline integration                   | End-to-end c-subset corpus: HIR→MIR→LIR→bytes+relocations; linker (LK4) consumes correctly via shared `TargetSchema::relocationInfo`. |
@@ -279,7 +285,7 @@ Substrate tier (5-agent review) for AS1 (interface contract + API shape + diag f
 | 6 | Instruction scheduling at this layer? | **No** — scheduling lives in LIR pre-encoding (or deferred entirely; v1 emits in LIR-given order). |
 | 7 | Inline-assembly support (custom-language `__asm__` blocks)? | **Out of v1.** No shipped language uses it. |
 | 8 | Position-independent code emission? | **Yes** — required for ELF `.so` / Mach-O dylibs. Default to PIC; `-fno-pic` reserved post-v1. |
-| 9 | Migration of WASM/SPIR-V into the assembler — same `assemble()` entrypoint or separate? | **Same entrypoint, separate format-encoders** per architect-1's bucket-2 carve-out. WASM's structured-CF and SPIR-V's result-id minting are bucket-2 algorithms with non-trivial state — they belong in `format/wasm_leb.cpp` and `format/spirv_word.cpp`, owned by plans 18 / 17 respectively. The top-level `assemble()` dispatches to them via the encoding-format tag, same as x86/ARM. |
+| 9 | ~~Migration of WASM/SPIR-V into the assembler~~ | **Resolved 2026-05-29: NOT in plan 13.** WASM (typed value stack, structured-CF, module sections) and SPIR-V (typed value stream, shader-bound, result-id minting) are **MIR-downstream targets bypassing LIR entirely** (per [`18-wasm-plan`](./18-wasm-plan%20-%20tbd.md) + [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md)). The assembler tier (plan 13) handles native ISAs only — instruction encoding from a register-allocated LIR. WASM/SPIR-V never produce LIR. |
 
 ---
 

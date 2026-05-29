@@ -1,6 +1,8 @@
 # WASM Backend — Sub-Plan
 
-> Hermetic WebAssembly backend: HIR/MIR → `.wasm` bytecode + module structure, with no `wasm-ld` / `emscripten` / `binaryen` / `wasm-opt` in the build chain. WASM is structurally divergent from native ISAs (stack machine, structured control flow, linear memory) — designing for it FIRST validates that the IR layering generalizes beyond x86/ARM. `wasm-validate` and `wasm2wat` are test oracles only; they are never invoked at compile time.
+> Hermetic WebAssembly backend: **MIR → WAT → .wasm** bytecode (bypassing LIR; structured-bytecode VMs don't use register allocation). No `wasm-ld` / `emscripten` / `binaryen` / `wasm-opt` in the build chain — we own every byte AND every minification pass. WASM is structurally divergent from native ISAs (stack machine, structured control flow, linear memory) which is why it skips LIR: register allocation + frame materialization don't apply. `wasm-validate` and `wasm2wat` are test oracles only; never invoked at compile time.
+>
+> **Rev 3 (2026-05-29).** Reframed per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) Decision #4's three-bucket rule: WASM is **MIR-downstream, not a LIR-equivalent**. The MIR optimizer (gen-optimizer step 11) runs upstream of WASM lowering — fully-optimized MIR is the input. Lowering is **MIR→WAT bucket-2 walker** (`wat.lang.json` declares WAT opcodes + types + section structure; one specialized walker consumes any MIR and produces WAT). Plus a **WAT→.wasm binary encoder** (LEB128 + section framing — bucket 2 over the section-shape vocabulary). Plus a **v1-scope minifier** (binary-level stripping — bucket 2 over a declared strip-rule schema). Earlier "WASM-LIR" framing retired; resolved former §4 Q1.
 
 ## 0. Status (snapshot)
 
@@ -42,30 +44,66 @@ The same MIR optimizer that runs ahead of native codegen also runs ahead of WASM
 
 ## 2. Design
 
-### 2.1 WASM as a "LIR-equivalent"
+### 2.1 WASM as MIR-downstream (rev 3)
 
-WASM bytecode IS the LIR for the `web-wasm` target. The mental model stays uniform with native:
+WASM **bypasses LIR entirely**. WAT IS WASM's bytecode form — a typed value stack with structured-CF instructions, NOT a register machine. Register allocation, frame materialization, and physical-register modeling (the entire purpose of LIR) do not apply. Forcing WASM through LIR (rev-1/2's "WASM-LIR" framing) was a category error — it bolted a register abstraction onto a stack machine for the sake of "symmetry with native," at the cost of inventing concepts that have no home in WASM.
 
-| Native | WASM |
-|---|---|
-| LIR (x86 / ARM ops) | WASM-LIR (stack-machine ops) |
-| Assembler (LIR → bytes) | WASM encoder (LEB128 + section framing) |
-| Linker (relocations + symbol table) | WASM "linker" (Function/Table renumber + Import/Export merge) |
+The actual structural symmetry across all four target classes is at the **MIR pivot**:
 
-There is no special "structured-MIR-to-bytes" path that bypasses LIR. The LIR layer for WASM is a thin wrapper over WASM opcodes — but conceptually it IS LIR. (See §4 open question 1 for the trade-off discussion.)
+| Target class | MIR pivot? | Optimizer? | Downstream | Owning plan |
+|---|---|---|---|---|
+| Native ISA (x86_64, ARM64, RV) | ✅ | ✅ | LIR (regalloc + frame) → assembler → bytes | 12 + 13 |
+| **WASM** (and future JVM*, .NET IL*) | ✅ | ✅ | **MIR→WAT walker → .wasm binary + minifier (NO LIR)** | **this plan (18)** |
+| Shader bytecode (SPIR-V; future DXIL*) | ✅ | ✅ | MIR→SPIR-V walker → .spv binary + minifier (NO LIR) | 17 |
+| Syntactic transpilation (C→JS, C++→C#) | ❌ | ❌ (off by design) | HIR walker → target-CST → pretty-print | 10 |
 
-### 2.2 Lowering path
+*Post-v1.
+
+### 2.2 Lowering path (rev 3)
 
 ```
-HIR  ─►  MIR  ─►  WASM-LIR  ─►  .wasm bytes
-        (structured-CF        (sectioned binary
-         markers preserved     module)
-         per plan 12)
+HIR  ─►  MIR  ─►  optimized MIR  ─►  WAT  ─►  .wasm bytes  ─►  minified .wasm
+       (structured-CF      (gen-optimizer    (bucket-2     (bucket-2          (bucket-2
+        markers             step 11 — runs    walker over   binary encoder     post-pass
+        preserved           UPSTREAM of       wat.lang.json  over section-      over JSON-
+        per plan 12)        ALL targets)      vocabulary)    shape vocab)       declared
+                                                                                strip rules)
 ```
 
-Critically: **no arbitrary CFG flattening**. The structured-CF markers from MIR map 1:1 to WASM `block` / `loop` / `if` / `br_if` / `br_table`. If MIR ever loses the markers (regression in plan 12 discipline), WASM lowering breaks loudly — which is the desired failure mode.
+Two load-bearing properties:
 
-### 2.3 WASM type system mapping
+1. **No arbitrary CFG flattening.** Structured-CF markers from MIR map 1:1 to WAT `block` / `loop` / `if` / `br_if` / `br_table`. If MIR loses the markers (plan 12 discipline regression), lowering breaks loudly — desired failure mode.
+2. **MIR optimizer runs UPSTREAM, not WASM-specific.** Same optimizer serves native + WASM + SPIR-V. No binaryen-equivalent post-pass — the heavy lifting (DCE, const fold, copy prop, dominator-based opts) happens once on MIR; the WASM-specific work (local-merge / `local.tee` heuristics / drop elimination) is folded into the MIR→WAT walker's pattern matcher.
+
+### 2.3 `wat.lang.json` — the JSON vocabulary the MIR→WAT walker consumes
+
+Declares WAT's opcode vocabulary + types + section structure as bucket-1 data. Same shape as `*.target.json` for native targets — the walker (bucket 2) reads opcode rows from JSON and emits WAT text. Lives at `src/dss-config/targets/wasm.target.json` (the `targets/` family covers anything-MIR-downstream, native or structured-bytecode — see plan 13 §0).
+
+```jsonc
+{
+  "$comment": "WebAssembly bytecode vocabulary — consumed by the MIR→WAT walker. Same schema family as native targets; differs in `class`: 'structured-bytecode'.",
+  "dssTargetVersion": 1,
+  "target": { "name": "wasm", "class": "structured-bytecode", "version": "0.1.0" },
+  "opcodes": [
+    { "mnemonic": "i32.add",      "result": "value", "minOperands": 0, "maxOperands": 0 /* stack-effect declared below */ },
+    { "mnemonic": "i32.const",    "result": "value", "minOperands": 0, "maxOperands": 0, "immediates": [{ "kind": "i32-leb" }] },
+    { "mnemonic": "block",        "result": "none",  "structuredCf": { "kind": "block",  "endsAt": "end" } },
+    { "mnemonic": "loop",         "result": "none",  "structuredCf": { "kind": "loop",   "endsAt": "end" } },
+    { "mnemonic": "if",           "result": "none",  "structuredCf": { "kind": "if",     "endsAt": "end", "hasElse": true } },
+    { "mnemonic": "br",           "result": "none",  "isTerminator": true, "immediates": [{ "kind": "u32-labelidx-leb" }] },
+    { "mnemonic": "br_if",        "result": "none",  "immediates": [{ "kind": "u32-labelidx-leb" }] },
+    { "mnemonic": "br_table",     "result": "none",  "isTerminator": true, "immediates": [{ "kind": "u32-vec-leb" }, { "kind": "u32-leb" }] }
+    // ... full WAT opcode catalog ...
+  ],
+  "valueTypes": ["i32", "i64", "f32", "f64", "v128", "funcref", "externref"],
+  "sections": [/* see §2.5 */],
+  "stackEffects": { /* per-opcode stack pop/push types, declared as data */ }
+}
+```
+
+The walker dispatches on `opcode.structuredCf.kind` (bucket-2 shape-keyed dispatch — same pattern as ChildLower) to emit `block`/`loop`/`if`/`end` constructs at structural points; everything else is mechanical opcode emission from the row.
+
+### 2.4 WASM type system mapping
 
 | HIR core lattice | WASM core type | Notes |
 |---|---|---|
@@ -81,7 +119,7 @@ Critically: **no arbitrary CFG flattening**. The structured-CF markers from MIR 
 
 Function signatures lower to WASM `func` types with explicit param-list / result-list. Multi-value returns (post-MVP WASM, now standard) are used directly — no return-via-pointer trick.
 
-### 2.4 Module structure (binary format, 12 sections)
+### 2.5 Module structure (binary format, 12 sections)
 
 The encoder emits sections in this fixed order:
 
@@ -109,7 +147,7 @@ Custom sections, emitted between standard sections:
 
 DWARF (post-v1.x — see plan 15) lands in further custom sections (`.debug_info`, `.debug_line`, etc.) when debug-info emission is enabled.
 
-### 2.5 Linear memory model
+### 2.6 Linear memory model
 
 - One default linear memory in v1.x. Pages are 64 KiB. Initial and max page counts come from project-config knobs (defaults: initial 1, max 16 — i.e. 64 KiB to 1 MiB).
 - **HIR pointers → `i32` offsets** into linear memory. Pointer arithmetic is `i32` arithmetic. Null is offset 0 (and offset 0 is reserved — never allocated).
@@ -117,7 +155,7 @@ DWARF (post-v1.x — see plan 15) lands in further custom sections (`.debug_info
 - **Stack pointer** is an `i32` mutable global, manually managed by codegen. Function prologue: `global.get $sp; i32.const N; i32.sub; global.set $sp`. Epilogue: restore. Locals that escape (address-taken) live on the linear-memory stack; non-escaping locals stay in WASM `local` slots.
 - **Heap** is reserved for post-v1.x. Two options to be decided: (a) custom-language allocator emitted in linear memory, (b) JS-host-provided `malloc`/`free` imports. Default leaning: (a) for the wasmtime profile, (b) for the browser profile — but the choice is a project-config switch, not hardcoded.
 
-### 2.6 Imports as FFI
+### 2.7 Imports as FFI
 
 The language's FFI mechanism (plan 11) is the user-facing way to declare imports. The WASM backend translates declared FFI imports into Section 2 entries.
 
@@ -125,7 +163,7 @@ The language's FFI mechanism (plan 11) is the user-facing way to declare imports
 - **WASI `preview1` profile** (wasmtime / wasmer / node `--experimental-wasi-modules`): imports take the shape `(import "wasi_snapshot_preview1" "fd_write" (func ...))`. The runtime fulfills them.
 - **Host-import shape** is selected by `artifactProfile` (plan 6). `web-wasm-browser` vs `web-wasm-wasi` are distinct profiles emitting different Import sections from the same source.
 
-### 2.7 WASM "linking"
+### 2.8 WASM "linking"
 
 WASM has no traditional symbol table. Linking is:
 
@@ -143,7 +181,7 @@ Multi-CU WASM build (post-v1.x for now; relevant once we ship multi-file WASM pr
 
 These duties live in [`14-linker-plan`](14-linker-plan%20-%20tbd.md) LK8 — coordinate there to keep the work in one place rather than splitting it.
 
-### 2.8 Structured-CF lowering — the critical correctness piece
+### 2.9 Structured-CF lowering — the critical correctness piece
 
 The structured-CF markers from plan 12 carry the labels needed to compute the branch depth (`N`) for each `br` / `br_if`.
 
@@ -160,7 +198,7 @@ The structured-CF markers from plan 12 carry the labels needed to compute the br
 
 The structured-CF marker stack in MIR (plan 12) is the source of truth for the branch depth `N`. There is no need to re-derive structure in the WASM backend — if MIR is well-formed, lowering is mechanical.
 
-### 2.9 Reserved post-v1.x
+### 2.10 Reserved post-v1.x
 
 - **SIMD** (`v128` + 200+ vector ops) — emit only when HIR uses vector types; default off. Gated by `target_features` declaration in custom section.
 - **Threads + atomics** — Vulkan-style relaxed memory model; reserved until we have a story for concurrent custom-language semantics.
@@ -169,7 +207,44 @@ The structured-CF marker stack in MIR (plan 12) is the source of truth for the b
 - **Exception handling** (`try`/`catch`/`throw` opcodes) — reserved; v1.x lowers exceptions to early-return / status-code (matches c-subset's reality of no exceptions).
 - **memory64** (`i64` pointers) — reserved; v1.x is `i32` linear memory.
 
-### 2.10 Driver integration
+### 2.11 Binary minifier (v1.x scope — NOT post-v1)
+
+Minification is a **named v1.x phase**, NOT a post-v1 flag. WASM consumers (browsers, edge runtimes) measure success in payload size; shipping unminified `.wasm` is uncompetitive. We own the entire pipeline including this pass — no `wasm-opt` / `binaryen` in the build chain.
+
+**The minifier runs AFTER the binary encoder, BEFORE writing the artifact.** Input: a `wasm-validate`-clean `.wasm` byte buffer from §2.5. Output: a smaller `wasm-validate`-clean `.wasm` byte buffer with the same observable runtime semantics. Bucket-2 algorithm over a JSON-declared strip-rule schema:
+
+```jsonc
+// src/dss-config/targets/wasm.target.json — extends with:
+{
+  "minifier": {
+    "stripRules": [
+      { "name": "drop-custom-section-by-name", "params": ["name"] /* drop `name` debug section */ },
+      { "name": "drop-custom-section-by-name", "params": ["producers"] },
+      { "name": "drop-custom-section-by-name", "params": ["target_features"] },
+      { "name": "compact-function-locals",     "params": [] /* merge locals with disjoint lifetimes */ },
+      { "name": "elide-redundant-drops",       "params": [] /* `i32.const N drop` → ε */ },
+      { "name": "fold-local-tee-vs-set-get",   "params": [] /* `local.set $x local.get $x` → `local.tee $x` */ },
+      { "name": "compact-data-segments",       "params": [] /* merge adjacent + overlapping segments */ },
+      { "name": "table-compaction",            "params": [] /* renumber sparse function-table indices to dense */ }
+    ],
+    "profiles": {
+      "debug":   { "enabled": [] },                                          // strip nothing
+      "release": { "enabled": ["drop-custom-section-by-name", "compact-function-locals", "elide-redundant-drops", "fold-local-tee-vs-set-get"] },
+      "minified":{ "enabled": ["*"] }                                        // everything
+    }
+  }
+}
+```
+
+Strip-rule definitions are **bucket-1 JSON** (one row per rule: name + parameter schema). The minifier engine (one C++ pass per rule kind) dispatches on `rule.name` — shape-keyed dispatch over a closed strip-rule vocabulary, same pattern as the format encoder. Adding a new minifier rule = new bucket-2 pass + new JSON row. NO `if (profile == "release")` branches in the engine — the engine consults the active `profile.enabled[]` list, also bucket-1 data.
+
+**Profile selection** flows from the artifactProfile: `web-wasm-debug` → minifier `debug` profile; `web-wasm-browser` → `release`; `web-wasm-cdn` → `minified` (maximum stripping). User can override per-rule via project config.
+
+**Acceptance** (folded into §5): the minifier reduces a c-subset corpus `.wasm` by ≥ 30% on the `minified` profile vs `debug`, with byte-identical execution-trace under the test oracle (wasmtime). Hashed in CI.
+
+**Why bucket-2, not bucket-3:** the engine has rule-implementation functions (one per declared rule name in the JSON catalog). New rules are written in C++ (it's an algorithm — see §2.11 example pattern), but the engine never branches on target/format/profile identity — it walks `profile.enabled[]` and invokes the named rule's implementation. Same discipline as `ChildLower` in the frontend.
+
+### 2.12 Driver integration
 
 Project config selects `target: "web-wasm"` (plus a profile sub-selector — `"browser"` or `"wasi"`). The driver dispatches to this backend.
 
@@ -194,15 +269,17 @@ Output:
 | WA7 | `name` custom section (function names, local names, type names). Massive `wasm2wat` readability boost for debugging codegen regressions. |
 | WA8 | Round-trip tests — emit `.wasm`, run `wasm-validate` (oracle), run `wasm2wat` and diff against our own `.wat` emitter. Golden `.wasm` byte snapshots for stable inputs. |
 | WA9 | End-to-end "hello, world" — a c-subset corpus program compiles to `.wasm`, runs under wasmtime in CI, prints expected output. |
-| WA10 | WASM-LIR ↔ MIR contract pin: same MIR input produces byte-identical WASM output across runs / platforms. Deterministic-output regression guard. |
+| WA10 | MIR → .wasm contract pin: same MIR input produces byte-identical WASM output across runs / platforms. Deterministic-output regression guard. |
+| WA11 | **Minifier substrate** (per §2.11): strip-rule schema + engine + the four `release`-profile rules (custom-section drop, local compaction, drop elision, local.tee folding). v1.x mandatory — gates "WASM backend done." |
+| WA12 | Minifier `minified`-profile rules (data-segment compaction, table compaction, full custom-section sweep). Closes the ≥ 30% size-reduction acceptance bar. |
 
-Sequencing: WA1 → WA2 → WA3 → WA4 is the critical path (encoder, then leaf funcs, then memory, then control flow). WA5 / WA6 / WA7 are parallel-able once WA4 lands. WA8 / WA9 / WA10 are validation PRs that gate "WASM backend done."
+Sequencing: WA1 → WA2 → WA3 → WA4 is the critical path (encoder, then leaf funcs, then memory, then control flow). WA5 / WA6 / WA7 are parallel-able once WA4 lands. WA8 / WA9 / WA10 are validation PRs that gate "WASM backend done." **WA11 + WA12 are mandatory v1.x deliverables, NOT deferred** — uncompacted `.wasm` is uncompetitive payload.
 
 ---
 
 ## 4. Open questions
 
-**(1) Model WASM as its own LIR target, or as "MIR-direct-to-bytes"?** Default: **own LIR target**, for symmetry with native. One mental model across all backends: LIR + assembler + linker. WASM happens to have a trivial "assembler" (LEB128 + section framing) and a trivial "linker" (index renumber + Import/Export merge), but the conceptual layering is the same. Re-evaluate if WASM-specific quirks (e.g. the operand stack vs registers gap) force enough special-casing that the LIR layer becomes a fiction. Decision deferred to WA4.
+**(1) ~~Model WASM as its own LIR target, or as "MIR-direct-to-bytes"?~~ Resolved rev 3 (2026-05-29):** **MIR-downstream, bypassing LIR.** The "WASM-LIR" framing forced a register abstraction onto a stack machine for the sake of symmetry — a category error. The actual structural symmetry across all target classes is at the **MIR pivot**, not at a uniform LIR layer. Native ISAs need LIR (regalloc + frame); structured bytecodes (WASM, SPIR-V) do not. MIR → WAT → .wasm + minifier is the path. See §2.1 table.
 
 **(2) Diagnostic namespace.** Default: **`W_*` standalone.** WASM is divergent enough from native ISAs that grouping its diagnostics with the linker (`K_*`) or generic assembler (`A_*`) namespaces would obscure the WASM-specific failure modes (validation errors, type-mismatch on the operand stack, structured-CF marker mismatches). `W_*` keeps WASM diagnostics together and discoverable. Reconsidered if the namespace stays small (<10 codes) for a long time — could fold into `K_*` then.
 
@@ -224,8 +301,10 @@ Sequencing: WA1 → WA2 → WA3 → WA4 is the critical path (encoder, then leaf
 - [ ] Imports resolve correctly against a sample JS host (browser profile) AND a sample WASI host (wasmtime profile). Both work from the same source via profile sub-selector.
 - [ ] **Deterministic output:** same input MIR → byte-identical `.wasm` across runs, across platforms (Windows / Linux / macOS build hosts). Hash-pinned in CI.
 - [ ] No `wasm-ld`, `emscripten`, `binaryen`, or `wasm-opt` invocation anywhere in the build chain. `wasm-validate` and `wasm2wat` appear only in test fixtures.
-- [ ] `name` custom section populated — `wasm2wat` output is human-readable.
+- [ ] `name` custom section populated — `wasm2wat` output is human-readable (debug profile) / stripped (release+minified profiles).
 - [ ] `.imports.json` sidecar accurately reflects the emitted Import section.
+- [ ] **Minifier acceptance:** the `minified` profile reduces a c-subset corpus `.wasm` by ≥ 30% vs the `debug` profile, with byte-identical execution-trace under the wasmtime oracle. Hash-pinned in CI per WA12.
+- [ ] **No binaryen / wasm-opt** anywhere — minification is owned in-tree per §2.11.
 
 ---
 
@@ -236,6 +315,7 @@ Sequencing: WA1 → WA2 → WA3 → WA4 is the critical path (encoder, then leaf
 - **Browser-host integration ergonomics.** Risk: we emit a `.wasm` that users can't easily consume from JS because the import surface is opaque. Mitigation: `.imports.json` sidecar (plan 17 precedent) describes the surface; document a minimal HTML+JS example per browser-profile release.
 - **Linear-memory stack-pointer corruption.** Bug class: a missed prologue/epilogue, or a wrong frame size, silently corrupts the linear-memory stack. Mitigation: stack-pointer guard pages (reserve linear memory below the initial SP and trap on access via `unreachable` sentinel writes); strict assertions in codegen on prologue/epilogue pairing.
 - **Index-space drift between Function / Table / Type / Memory / Global sections.** A bug renumbering Function indices but not their references in Element / Code / Export sections produces invalid modules. Mitigation: encoder owns ALL index assignment behind a typed-index API (`FuncIdx`, `TableIdx`, `TypeIdx`, `MemIdx`, `GlobalIdx` as distinct types — substrate-hardening discipline applies), so no caller can pass an `i32` where a typed index is expected.
+- **Minifier breaks semantics.** A strip rule that's correct in isolation (e.g. drop-redundant-local) becomes incorrect when composed with another (e.g. local-compaction). Mitigation: each strip rule MUST preserve execution-trace equivalence vs the pre-minifier `.wasm` on the corpus oracle (wasmtime). WA11/WA12 acceptance tests every profile-rule combination. The `minified` profile that fails the trace-equivalence check loud-rejects at compile time, never silently ships a broken artifact.
 
 ---
 

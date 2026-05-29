@@ -49,7 +49,14 @@ The schema vocabulary is universal: every format declares its `sections[]` (kind
 
 Bucket-3 drift (per-format `.cpp` directories) is the failure mode this plan explicitly rejected — see §2.1 below for the deleted `objfmt/elf/`, `objfmt/pe/`, `objfmt/macho/` trees.
 
-**Shared with plan 13 (assembler) — the relocation-taxonomy unifier:** the relocation taxonomy lives as a `relocations[]` facet on `*.target.json` (one row per opaque tag → bit-width + isPCRelative + addend-width formula), authored once in plan 13 cycle AS4. The assembler emits `Relocation{ kind: uint32_t tag }` (opaque); the linker consumes via `schema.relocationInfo(tag) → { isPCRelative, width, ... }` and applies the formula via `relocation_apply.cpp`. The object-format-specific reloc *names* (e.g. `R_X86_64_PC32` for ELF, `IMAGE_REL_AMD64_REL32` for PE, `X86_64_RELOC_BRANCH` for Mach-O) live in `*.format.json` as `format-name → schema-tag` mappings — so one bucket-1 formula (`PC-relative 32-bit signed`) serves every format that supports it. **No per-(arch×format) C++ enum anywhere.** The cross-cycle "linker engine mismatch with assembler relocation kinds" risk (rev 1/2's §6 High/High) is closed structurally by both sides reading from the same `TargetSchema` instance.
+**Shared with plan 13 (assembler) — the relocation-taxonomy unifier.** Two-schema decomposition of the (arch × format) relocation matrix, joined by an opaque `uint32_t` tag:
+
+| Schema | Owns | Consumed by |
+|---|---|---|
+| `*.target.json` `relocations[]` | The **formula+tag**: opaque `uint32_t tag → { isPCRelative, width, addendWidth, ... }` | Assembler (plan 13) emits the tag; linker applies the formula via `relocation_apply.cpp` |
+| `*.format.json` `relocations[]` (this plan) | The **format-name → tag** mapping: e.g. `"R_X86_64_PC32" → tag 1`, `"IMAGE_REL_AMD64_REL32" → tag 1`, `"X86_64_RELOC_BRANCH" → tag 1` (all three are PC-relative 32-bit signed — one formula, three names) | Linker (LK6 reloc-apply) uses the format name when writing the object file's reloc table |
+
+Same opaque `uint32_t` tag joins both sides. **No per-(arch×format) C++ enum anywhere.** Cross-referenced from plan 13 §2.6 — AS4 (target-schema reloc rows) and LK6 (format-schema name→tag mapping) land in the same review window so the integer assignments don't drift. The cross-cycle "linker engine mismatch with assembler relocation kinds" risk (rev 1/2's §6 High/High) is closed structurally by both sides reading from the same opaque-tag namespace.
 
 Loader pattern mirrors `TargetSchema::loadShipped`/`GrammarSchema::loadShipped`:
 

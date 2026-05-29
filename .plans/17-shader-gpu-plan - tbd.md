@@ -1,6 +1,8 @@
 # Shader / GPU Backend — Sub-Plan (17)
 
 > Owns **SPIR-V code generation** plus the **shader-shape extensions to HIR** (intrinsics, binding-resource model, entry-point attributes, GPU restrictions). Hermetic per [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) §1.1 — no `dxc` / `glslc` / `shaderc` / `spirv-tools` invocations.
+>
+> **Rev 3 (2026-05-29).** Aligned with [`00-master`](./00-compiler-implementation-plan%20-%20tbd.md) Decision #4's three-bucket rule: SPIR-V is **MIR-downstream, bypassing LIR** (same shape as plan 18's WASM). Register allocation + frame materialization don't apply to a typed-value-stream bytecode for a typed value VM. The MIR optimizer (gen-optimizer step 11) runs UPSTREAM of SPIR-V lowering — fully-optimized MIR is the input. Lowering is **MIR→SPIR-V bucket-2 walker** (`spirv.target.json` declares opcode + decoration + storage-class vocabulary; walker dispatches shape-keyed like `ChildLower`) + **SPIR-V binary encoder** (32-bit word stream serialization) + **v1.x-scope minifier** (binary stripping — bucket 2 over JSON-declared strip rules; same pattern as plan 18 §2.11). **What we DO NOT compile:** SPIR-V → GPU machine code. The GPU driver does that at load time (NVIDIA PTX, AMD GCN/RDNA, Apple Metal IR, Intel Xe IR). We ship SPIR-V; the driver/runtime is outside the hermetic boundary. Writing GPU-ISA backends is reserved post-v1 (probably never — proprietary-driver-equivalent work).
 
 ## 0. Status (snapshot)
 
@@ -154,6 +156,36 @@ Sidecar `.spv.json` per `.spv`:
 
 Engine integration reads the sidecar to set up Vulkan descriptor set layouts.
 
+### 2.9 SPIR-V binary minifier (v1.x scope — NOT post-v1)
+
+Parallel to plan 18 §2.11 (WASM minifier). v1.x mandatory — the consumer ecosystem (Vulkan loaders, Metal/DirectX translation layers, mobile GPU drivers) penalizes oversized SPIR-V modules at load time. We own the entire pipeline including stripping.
+
+**Runs AFTER the binary encoder, BEFORE writing the `.spv` artifact.** Bucket-2 algorithm over a JSON-declared strip-rule schema on `spirv.target.json`:
+
+```jsonc
+"minifier": {
+  "stripRules": [
+    { "name": "drop-opname-debug",    "params": [] /* drop `OpName` / `OpMemberName` decorations */ },
+    { "name": "drop-opstring",        "params": [] /* drop `OpString` source-file decorations */ },
+    { "name": "drop-opsource",        "params": [] /* drop `OpSource` / `OpSourceExtension` decorations */ },
+    { "name": "drop-opline",          "params": [] /* drop `OpLine` debug-info */ },
+    { "name": "remap-result-ids",     "params": [] /* renumber sparse result-ids to dense (smaller LEB-equivalent in v1.x = smaller word offsets in v2+) */ },
+    { "name": "dead-decoration-elim", "params": [] /* drop decorations on result-ids that don't appear in any instruction */ }
+  ],
+  "profiles": {
+    "debug":   { "enabled": [] },                                                                                          // full debug info
+    "release": { "enabled": ["drop-opname-debug", "drop-opstring", "drop-opsource", "dead-decoration-elim"] },
+    "minified":{ "enabled": ["*"] }                                                                                        // drop all debug + remap ids
+  }
+}
+```
+
+Same shape-keyed dispatch as the format encoder (closed strip-rule vocabulary; each rule has one bucket-2 implementation; engine consults `profile.enabled[]` data, no identity branches). Profile flows from artifactProfile: `gpu-debug` → `debug`; `gpu-release` → `release`; `gpu-mobile` → `minified`.
+
+**Acceptance** (folded into §5): `minified` profile reduces a custom-language compute-shader corpus `.spv` by ≥ 25% vs `debug`, with byte-identical execution under the spirv-val + reference-driver oracles. Hashed in CI.
+
+**Why NOT a `spv-opt`-equivalent dependency:** the hermetic invariant rules out `spirv-tools` invocations at compile time. The minifier is in-tree like plan 18's; `spirv-opt` / `spirv-cross` appear only in TEST fixtures as oracles.
+
 ---
 
 ## 3. PR breakdown
@@ -170,8 +202,10 @@ Engine integration reads the sidecar to set up Vulkan descriptor set layouts.
 | SG8 | Entry-point attribute parsing in HIR             | `[[shader.vertex]]` / `[[shader.fragment]]` / `[[shader.compute(x,y,z)]]`. |
 | SG9 | Round-trip + spirv-val oracle tests              | Emit → `spirv-val` (oracle) → assert valid. Round-trip via `spirv-as`/`spirv-dis` text. |
 | SG10| End-to-end "hello triangle" Vulkan harness       | Compile vertex + fragment shaders, render a triangle in a CI Vulkan harness, assert frame correctness. |
+| SG11| **SPIR-V minifier substrate** (per §2.9)          | Strip-rule schema + engine + the four `release`-profile rules (drop-opname-debug, drop-opstring, drop-opsource, dead-decoration-elim). v1.x mandatory — gates "shader backend done." |
+| SG12| Minifier `minified`-profile rules                | drop-opline + remap-result-ids (the size-aggressive rules). Closes the ≥ 25% size-reduction acceptance bar. |
 
-Substrate tier for SG1, SG6 (touch lattice + structured-CF contract).
+Substrate tier for SG1, SG6 (touch lattice + structured-CF contract), SG11 (strip-rule schema). **SG11/SG12 are mandatory v1.x deliverables, NOT deferred.**
 
 ---
 
@@ -179,7 +213,7 @@ Substrate tier for SG1, SG6 (touch lattice + structured-CF contract).
 
 | # | Question | Default if unanswered |
 |---|----------|-----------------------|
-| 1 | HIR→SPIR-V direct path (skip MIR for leaf shaders)? | **No** — always via MIR. Reuse the optimizer. Revisit if shader compile time becomes a problem. |
+| 1 | HIR→SPIR-V direct path (skip MIR for leaf shaders)? | **No — resolved by rev 3 framing.** Always via MIR. The MIR optimizer runs upstream of ALL structured-bytecode targets (WASM + SPIR-V) — that's the load-bearing claim. Skipping MIR for shaders would drop the optimizer for shaders specifically, which is exactly the failure mode plan 10's "syntactic source-to-source has its own opt-out" carve-out covers. Shader compile time has not been a problem with MIR in the loop. |
 | 2 | Target SPIR-V version? | **1.6** — covers Vulkan 1.3 baseline. |
 | 3 | Vulkan / Metal / D3D12 / WebGPU coverage? | Native SPIR-V; Metal/D3D12/WebGPU via post-v1 `10-source-translation-plan` transpile. |
 | 4 | Same-source CPU+GPU function dispatch? | **Yes** — `[[shader.usable]] [[host.usable]]` triggers dual lowering. |
@@ -198,7 +232,8 @@ Substrate tier for SG1, SG6 (touch lattice + structured-CF contract).
 - [ ] Compute shader compiles + dispatches + produces correct buffer output on a Vulkan-compute-capable CI runner.
 - [ ] Shader verifier rejects all SPIR-V constraint violations with actionable `SH_*` diagnostics.
 - [ ] Same-source CPU + GPU function lowering: a function tagged both `[[shader.usable]]` and `[[host.usable]]` produces correct SPIR-V *and* correct native code referencing the same source span.
-- [ ] Hermetic acceptance: no `dxc` / `glslc` / `shaderc` / `spirv-tools` invocation in the production pipeline (oracles only in CI).
+- [ ] Hermetic acceptance: no `dxc` / `glslc` / `shaderc` / `spirv-tools` / `spirv-opt` / `spirv-cross` invocation in the production pipeline (oracles only in CI).
+- [ ] **Minifier acceptance** (per §2.9): `minified` profile reduces a custom-language compute-shader corpus `.spv` by ≥ 25% vs `debug`, with byte-identical execution under the spirv-val + reference-driver oracles. Hash-pinned in CI per SG12.
 
 ---
 
