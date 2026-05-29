@@ -24,25 +24,19 @@ using lir_pass_util::report;
 // today; reserved for future fields like a `Mem` filter that
 // matches a leading `Reg + MemBase + MemOffset` triplet).
 // (`filterToLirKind`, `operandsMatchGuard`, and `hwEncodingOf`
-// hoisted to `asm/format/walker_util.hpp` per D-AS3-2 closure —
-// architect AS5 review.)
+// hoisted to `asm/format/walker_util.hpp` per D-AS3-2 closure.)
+using walker_util::hwEncodingOf;
 using walker_util::operandsMatchGuard;
 
-[[nodiscard]] inline std::optional<std::uint8_t>
-hwEncodingOf(LirReg reg, TargetSchema const& schema,
-             std::string_view mnemonic, DiagnosticReporter& reporter) {
-    return walker_util::hwEncodingOf(reg, schema, mnemonic,
-                                      /*maxBitWidth=*/4, reporter);
-}
+// x86 ModR/M register fields are 4 bits wide (3-bit ModR/M.reg/rm +
+// 1-bit REX extension). Declared at the call-site scope per
+// simplicity + code-review consensus: the shape constant belongs
+// next to the shape, not behind a passthrough shim.
+constexpr std::uint8_t kX86RegFieldBits = 4;
 
-// One pending symbol-relative slot. The walker emits 4 zero bytes
-// at the slot's position and a `Relocation` entry pointing the
-// linker at the symbol. Cycle-4 has one shape (Disp32 = 4 bytes
-// after the opcode/ModR/M).
-struct PendingRelocSlot {
-    RelocationKind kind;
-    SymbolId       target;
-};
+// (`PendingRelocSlot` hoisted to walker_util.hpp; alias kept
+// minimal.)
+using walker_util::PendingRelocSlot;
 
 // State accumulated while emitting one variant: the 3-bit codes
 // destined for ModR/M.reg / ModR/M.rm + their high bits for REX.R /
@@ -201,7 +195,8 @@ bool encode(Lir const&                  lir,
 
     // Wire the result register into its declared slot.
     if (selected->resultSlot.has_value()) {
-        auto const hw = hwEncodingOf(result, schema, info->mnemonic, reporter);
+        auto const hw = hwEncodingOf(result, schema, info->mnemonic,
+                                      kX86RegFieldBits, reporter);
         if (!hw.has_value()) return false;
         if (!wireSlot(st, *selected->resultSlot, *hw,
                       info->mnemonic, reporter)) {
@@ -225,7 +220,8 @@ bool encode(Lir const&                  lir,
         }
         auto const& srcOp = instOps[wire.index];
         if (srcOp.kind == LirOperandKind::Reg) {
-            auto const hw = hwEncodingOf(srcOp.reg, schema, info->mnemonic, reporter);
+            auto const hw = hwEncodingOf(srcOp.reg, schema, info->mnemonic,
+                                          kX86RegFieldBits, reporter);
             if (!hw.has_value()) return false;
             if (!wireSlot(st, wire.slotKind, *hw,
                           info->mnemonic, reporter)) {
@@ -354,12 +350,7 @@ bool encode(Lir const&                  lir,
     //    Cycle-4 addend is always 0 (no composite operands yet);
     //    plan 14 may later interpret a wire-declared addend bias.
     if (st.disp32.has_value()) {
-        relocs.push_back(Relocation{
-            static_cast<std::uint32_t>(out.size()),
-            st.disp32->target,
-            st.disp32->kind,
-            /*addend=*/0,
-        });
+        walker_util::appendPendingReloc(relocs, out, *st.disp32);
         // 4 placeholder bytes (linker patches these).
         asm_byte_emit::appendU32LE(out, 0u);
     }

@@ -19,19 +19,14 @@ namespace {
 using lir_pass_util::report;
 
 // (`filterToLirKind`, `operandsMatchGuard`, and `hwEncodingOf`
-// hoisted to `asm/format/walker_util.hpp` per D-AS3-2 closure —
-// architect AS5 review.)
+// hoisted to `asm/format/walker_util.hpp` per D-AS3-2 closure.)
+using walker_util::hwEncodingOf;
 using walker_util::operandsMatchGuard;
 
-[[nodiscard]] inline std::optional<std::uint8_t>
-hwEncodingOf(LirReg reg, TargetSchema const& schema,
-             std::string_view mnemonic, DiagnosticReporter& reporter) {
-    // fixed32 (AArch64-style) uses 5-bit register fields — capacity
-    // 0..31 (X0..X30 + XZR=31). Future SVE-style widening would gain
-    // its own slot vocabulary and a wider call here.
-    return walker_util::hwEncodingOf(reg, schema, mnemonic,
-                                      /*maxBitWidth=*/5, reporter);
-}
+// AArch64-style 5-bit register fields — capacity 0..31 (X0..X30 +
+// XZR=31). Future SVE-style widening would gain its own slot
+// vocabulary and a wider constant here.
+constexpr std::uint8_t kFixed32RegFieldBits = 5;
 
 // Per-slot bit-window descriptor. `lsb` is the bit position of the
 // slot's least-significant bit inside the 32-bit fixed word. `width`
@@ -41,14 +36,8 @@ struct SlotBitWindow {
     std::uint8_t width;
 };
 
-// Pending symbol-relative slot — the walker accumulates AT MOST ONE
-// of these per fixed32 instruction (cycle-4 scope: one symbol-bearing
-// wire per opcode). When set, the walker emits a Relocation entry
-// at the byte offset of the about-to-be-written word.
-struct PendingRelocSlot {
-    RelocationKind kind;
-    SymbolId       target;
-};
+// (`PendingRelocSlot` hoisted to walker_util.hpp; alias kept minimal.)
+using walker_util::PendingRelocSlot;
 
 // Map each fixed32 EncodingSlotKind to its bit window. The shape-vs-
 // slot validate rule guarantees only Fixed32 slots reach this
@@ -177,8 +166,8 @@ bool encode(Lir const&                  lir,
 
     // Wire the result register into its declared slot.
     if (selected->resultSlot.has_value()) {
-        auto const hw = hwEncodingOf(result, schema,
-                                      info->mnemonic, reporter);
+        auto const hw = hwEncodingOf(result, schema, info->mnemonic,
+                                      kFixed32RegFieldBits, reporter);
         if (!hw.has_value()) return false;
         if (!orInto(*selected->resultSlot, *hw)) return false;
     }
@@ -200,8 +189,8 @@ bool encode(Lir const&                  lir,
         }
         auto const& srcOp = instOps[wire.index];
         if (srcOp.kind == LirOperandKind::Reg) {
-            auto const hw = hwEncodingOf(srcOp.reg, schema,
-                                          info->mnemonic, reporter);
+            auto const hw = hwEncodingOf(srcOp.reg, schema, info->mnemonic,
+                                          kFixed32RegFieldBits, reporter);
             if (!hw.has_value()) return false;
             if (!orInto(wire.slotKind, *hw)) return false;
         } else if (srcOp.kind == LirOperandKind::SymbolRef) {
@@ -290,12 +279,7 @@ bool encode(Lir const&                  lir,
     // must move to a per-slot byte-offset table on the variant
     // template (anchored at plan 13 §3.1 D-AS4-3).
     if (pendingReloc.has_value()) {
-        relocs.push_back(Relocation{
-            static_cast<std::uint32_t>(out.size()),
-            pendingReloc->target,
-            pendingReloc->kind,
-            /*addend=*/0,
-        });
+        walker_util::appendPendingReloc(relocs, out, *pendingReloc);
     }
     asm_byte_emit::appendU32LE(out, word);
     return true;

@@ -88,20 +88,32 @@ disassemble(TargetSchema const&            schema,
 
         // Extract each slot's value from the bit field. The width
         // mask `((1 << width) - 1)` guarantees the recovered value
-        // is in-range for the slot's window — a wider-than-window
-        // value would silently truncate without it, masking a
-        // real encoder-write-too-wide bug. (`shapeOk` above
+        // is in-range for the slot's window. `shapeOk` above
         // guarantees `windowFor` returns a value for every slot
-        // this variant uses; the optional deref is safe inside
-        // this scope, NOT in general.)
+        // this variant uses — but `extract` is a private helper
+        // whose contract MUST be loud about extension violations
+        // (review consensus: a silent-zero return contradicts the
+        // file header's "no silent fallbacks" promise). If a
+        // future refactor calls `extract` with an out-of-shape
+        // slot, the assertion fires in debug + the diagnostic
+        // surfaces in release.
         auto const extract = [&](EncodingSlotKind kind) -> std::int64_t {
             auto const w = windowFor(kind);
-            // Defense-in-depth (silent-failure #5): if this is ever
-            // called with a slot kind outside the variant's
-            // declared set, the optional would be empty — return 0
-            // visibly so a future refactor that breaks the scoping
-            // doesn't UB.
-            if (!w.has_value()) return 0;
+            assert(w.has_value()
+                && "fixed32_disasm::extract: shapeOk gate must "
+                   "ensure windowFor returns a value");
+            if (!w.has_value()) {
+                report(reporter, DiagnosticCode::A_RoundTripMismatch,
+                       DiagnosticSeverity::Error,
+                       std::format("fixed32 disasm: extract called "
+                                   "with slot kind '{}' that has no "
+                                   "bit-window (internal-invariant: "
+                                   "shapeOk gate skipped or new "
+                                   "EncodingSlotKind added without "
+                                   "updating windowFor)",
+                                   encodingSlotKindName(kind)));
+                return 0;
+            }
             std::uint32_t const bits =
                 (word >> w->lsb) & ((1u << w->width) - 1u);
             return static_cast<std::int64_t>(bits);

@@ -20,8 +20,10 @@
 // VLIW bundle / etc., per D-AS3-2's trigger) reuses these directly
 // instead of forking a third copy.
 
+#include "asm/asm.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -32,6 +34,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <vector>
 
 namespace dss::walker_util {
 
@@ -120,6 +123,39 @@ readU32LE(std::span<std::uint8_t const> bytes, std::size_t offset) noexcept {
         | (static_cast<std::uint32_t>(bytes[offset + 1]) <<  8)
         | (static_cast<std::uint32_t>(bytes[offset + 2]) << 16)
         | (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
+}
+
+// One pending symbol-relative slot accumulated by an encoder walker
+// during slot-wiring. When the encoder reaches the emit step, it
+// calls `appendPendingReloc` to push a `Relocation` entry into the
+// AssembledFunction.relocations list AT THE BYTE OFFSET that the
+// linker will patch (the current `out.size()` — i.e. the position
+// the placeholder bytes are ABOUT to be written into). Cycle-4
+// encoders accumulate AT MOST ONE per instruction (one symbol-
+// relative wire per opcode — Disp32 on x86, Imm26 on fixed32);
+// `std::optional<PendingRelocSlot>` carries this cleanly.
+struct PendingRelocSlot {
+    RelocationKind kind;
+    SymbolId       target;
+};
+
+// Push a `Relocation` entry at the current end of `out`. The reloc's
+// `offset` points AT the bytes the linker will patch — capture
+// happens BEFORE the placeholder bytes are appended (cycle-4 scope:
+// the symbol slot is always at the trailing position of an
+// instruction; D-AS4-3 captures the per-slot byte-offset table for
+// future non-trailing symbol slots). `addend` is 0 in cycle scope
+// (D-AS4-4 anchors wire-declared addend bias).
+inline void
+appendPendingReloc(std::vector<Relocation>&   relocs,
+                   std::vector<std::uint8_t> const& out,
+                   PendingRelocSlot const&    pending) {
+    relocs.push_back(Relocation{
+        static_cast<std::uint32_t>(out.size()),
+        pending.target,
+        pending.kind,
+        /*addend=*/0,
+    });
 }
 
 } // namespace dss::walker_util
