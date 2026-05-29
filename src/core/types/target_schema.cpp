@@ -232,7 +232,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 }
             }
 
-            // ── Architect AS3 followup: shape-vs-slot cross-check ───
+            // ── Shape-vs-slot cross-check ──────────────────────────
             // Each `EncodingSlotKind` belongs to ONE shape. A variant
             // declaring `modrm.rm` under a `fixed32`-shape opcode (or
             // `rd` under an `x86-variable`-shape opcode) would silently
