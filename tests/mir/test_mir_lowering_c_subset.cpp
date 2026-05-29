@@ -11,6 +11,7 @@
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "mir/mir_text.hpp"
 #include "mir/mir_verifier.hpp"
 
 #include <gtest/gtest.h>
@@ -1489,4 +1490,31 @@ TEST(MirLoweringCSubset, Ml3VerifierAcceptsRealLoweredMir) {
     EXPECT_TRUE(v.verify(verifyReporter))
         << "MirVerifier rejected ML2-lowered MIR — "
         << (verifyReporter.all().empty() ? "" : verifyReporter.all()[0].actual);
+}
+
+// ML4 end-to-end: ML2-lowered MIR for a representative corpus
+// round-trips through the .dssir text format byte-identically.
+// Catches any emitter/parser asymmetry on production-shape MIR.
+TEST(MirLoweringCSubset, Ml4TextFormatRoundTripsRealMir) {
+    Lowered L = lowerCSubset(
+        "int add(int x, int y) { return x + y; }\n"
+        "int factorial(int n) {\n"
+        "  if (n <= 1) return 1;\n"
+        "  return n * (n - 1);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    DiagnosticReporter r1, r2, r3;
+    MirTextContext ctx1{&L.model.lattice().interner(), nullptr};
+    std::string first = emitMir(L.mir.mir, ctx1, r1);
+    auto parsed = parseMir(first, CompilationUnitId{1}, r2);
+    EXPECT_TRUE(parsed->ok)
+        << "parse failed: "
+        << (r2.all().empty() ? "" : r2.all()[0].actual);
+    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    std::string second = emitMir(parsed->mir, ctx2, r3);
+    EXPECT_EQ(first, second)
+        << "byte-equal round-trip failed\nfirst:\n" << first
+        << "\nsecond:\n" << second;
 }

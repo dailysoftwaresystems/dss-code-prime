@@ -111,6 +111,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
+        case DiagnosticCode::I_TextMalformed:            return "I_TextMalformed";
+        case DiagnosticCode::I_TextVersionMismatch:      return "I_TextVersionMismatch";
+        case DiagnosticCode::I_TextUnknownName:          return "I_TextUnknownName";
     }
     return "Unknown";
 }

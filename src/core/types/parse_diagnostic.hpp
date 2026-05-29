@@ -336,6 +336,11 @@ enum class DiagnosticCode : std::uint16_t {
     // entry block. Orphan CFG islands are a structural invariant
     // violation — every block must be reachable from entry.
     I_UnreachableBlock        = 0xA00C,
+    // ML4 — `.dssir` text format diagnostics (mirrors HR7's H_Text*
+    // family for HIR).
+    I_TextMalformed           = 0xA00D,
+    I_TextVersionMismatch     = 0xA00E,
+    I_TextUnknownName         = 0xA00F,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
