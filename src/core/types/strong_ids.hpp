@@ -121,6 +121,19 @@ DSS_ARENA_ID(MirBlockId);
 DSS_ARENA_ID(MirFuncId);
 DSS_ARENA_ID(MirGlobalId);
 
+// LIR ids (ML5). `LirModuleId` is the LIR module's identity tag — the
+// arena-tag stamped onto every LirInstId/LirBlockId/LirFuncId of that
+// module. Per-target enums live in `src/lir/lir_opcode.hpp`; the LIR
+// itself is shared across targets and carries a `TargetId` runtime
+// tag (plan 12 §2.6 mandates "per-target" — implemented via runtime
+// tag rather than C++ templates so the substrate stays simple and
+// the optimizer / verifier / text format can be target-blind where
+// it makes sense, target-aware where it doesn't).
+DSS_STRONG_ID(LirModuleId);
+DSS_ARENA_ID(LirInstId);
+DSS_ARENA_ID(LirBlockId);
+DSS_ARENA_ID(LirFuncId);
+
 #undef DSS_STRONG_ID
 #undef DSS_ARENA_ID
 
@@ -147,6 +160,10 @@ inline constexpr HirNodeId       InvalidHirNode{};
 inline constexpr MirModuleId     InvalidMirModule{};
 inline constexpr MirInstId       InvalidMirInst{};
 inline constexpr MirBlockId      InvalidMirBlock{};
+inline constexpr LirModuleId     InvalidLirModule{};
+inline constexpr LirInstId       InvalidLirInst{};
+inline constexpr LirBlockId      InvalidLirBlock{};
+inline constexpr LirFuncId       InvalidLirFunc{};
 inline constexpr MirFuncId       InvalidMirFunc{};
 inline constexpr MirGlobalId     InvalidMirGlobal{};
 
@@ -185,5 +202,9 @@ DSS_HASH_ID(MirInstId);
 DSS_HASH_ID(MirBlockId);
 DSS_HASH_ID(MirFuncId);
 DSS_HASH_ID(MirGlobalId);
+DSS_HASH_ID(LirModuleId);
+DSS_HASH_ID(LirInstId);
+DSS_HASH_ID(LirBlockId);
+DSS_HASH_ID(LirFuncId);
 
 #undef DSS_HASH_ID
