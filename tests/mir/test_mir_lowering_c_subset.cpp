@@ -11,6 +11,7 @@
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "mir/mir_verifier.hpp"
 
 #include <gtest/gtest.h>
 
@@ -1466,4 +1467,26 @@ TEST(MirLoweringCSubset, ConstructAggregateNestedAllConstFolds) {
     EXPECT_EQ(countOpcode(ops, MirOpcode::InsertValue), 0u)
         << "fully-const nested aggregate must const-fold to a single "
            "Const(nested MirAggregateValue), not a chain";
+}
+
+// ML3 end-to-end: ML2-lowered MIR for a representative c-subset
+// corpus passes the MirVerifier (with TypeInterner). Validates that
+// the verifier finds no false-positives in production-shape MIR.
+TEST(MirLoweringCSubset, Ml3VerifierAcceptsRealLoweredMir) {
+    Lowered L = lowerCSubset(
+        "int add(int x, int y) { return x + y; }\n"
+        "int branch(int x) { if (x > 0) return x; return 0 - x; }\n"
+        "int loopsum(int n) {\n"
+        "  int s = 0; int i = 0;\n"
+        "  while (i < n) { s = s + i; i = i + 1; }\n"
+        "  return s;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    DiagnosticReporter verifyReporter;
+    MirVerifier v{L.mir.mir, &L.model.lattice().interner()};
+    EXPECT_TRUE(v.verify(verifyReporter))
+        << "MirVerifier rejected ML2-lowered MIR — "
+        << (verifyReporter.all().empty() ? "" : verifyReporter.all()[0].actual);
 }

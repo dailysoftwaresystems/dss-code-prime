@@ -99,6 +99,17 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_TextVersionMismatch:      return "H_TextVersionMismatch";
         case DiagnosticCode::H_TextUnknownName:          return "H_TextUnknownName";
         case DiagnosticCode::H_UnsupportedLoweringForKind: return "H_UnsupportedLoweringForKind";
+        case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
+        case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
+        case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
+        case DiagnosticCode::I_EntryBlockNotFirst:       return "I_EntryBlockNotFirst";
+        case DiagnosticCode::I_BlockNotTerminated:       return "I_BlockNotTerminated";
+        case DiagnosticCode::I_PhiPredNotInCfg:          return "I_PhiPredNotInCfg";
+        case DiagnosticCode::I_NotDominated:             return "I_NotDominated";
+        case DiagnosticCode::I_TerminatorTypeMismatch:   return "I_TerminatorTypeMismatch";
+        case DiagnosticCode::I_ArgIndexOutOfRange:       return "I_ArgIndexOutOfRange";
+        case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
+        case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
     }
     return "Unknown";
 }
@@ -109,13 +120,16 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0x9xxx → P9xxx     (parse, internal-invariant range)
     //   0xCxxx → C0xxx     (config)
     //   0xDxxx → D0xxx     (driver / compilation-unit)
+    //   0xAxxx → I0xxx     (MIR verifier / IR-gen mid-level, plan 12 ML3)
     //   0xExxx → S0xxx     (semantic analysis, plan 08.6)
     //   0xFxxx → H0xxx     (HIR verifier / lowering, plan 09)
     // Render as the 4-digit hex grouping the user actually sees.
     const auto v          = static_cast<std::uint16_t>(c);
     const std::uint16_t nibble = v & 0xF000u;
     char letter = 'P';
-    if (nibble == 0xC000u) {
+    if (nibble == 0xA000u) {
+        letter = 'I';
+    } else if (nibble == 0xC000u) {
         letter = 'C';
     } else if (nibble == 0xD000u) {
         letter = 'D';
@@ -125,10 +139,11 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'H';
     }
     // Strip the high nibble for the numeric portion when it's a phase
-    // marker (C/D/S/H). The 9xxx range stays 9xxx so P_BuilderInvariant prints
-    // as "P9000".
-    const bool hasNibbleMarker = (nibble == 0xC000u || nibble == 0xD000u
-                                  || nibble == 0xE000u || nibble == 0xF000u);
+    // marker (C/D/S/H/I). The 9xxx range stays 9xxx so P_BuilderInvariant
+    // prints as "P9000".
+    const bool hasNibbleMarker = (nibble == 0xA000u || nibble == 0xC000u
+                                  || nibble == 0xD000u || nibble == 0xE000u
+                                  || nibble == 0xF000u);
     const std::uint16_t lo = hasNibbleMarker ? (v & 0x0FFFu) : v;
     return std::format("{}{:04X}", letter, lo);
 }

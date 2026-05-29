@@ -1,6 +1,7 @@
 add_library(mir OBJECT
     mir.cpp
     mir_literal_pool.cpp
+    mir_verifier.cpp
 )
 
 target_include_directories(mir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

@@ -290,6 +290,48 @@ enum class DiagnosticCode : std::uint16_t {
     //   a later plan). An `Error` HIR node is emitted as a recovery sentinel and
     //   lowering continues (collect-all); never a silent skip or a miscompile.
     H_UnsupportedLoweringForKind  = 0xF009,
+
+    // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
+    // for the IR-gen / mid-level layer). Each code names a structural-,
+    // dominance-, or type-consistency invariant on the frozen `Mir` module
+    // that `MirVerifier::verify()` checks AFTER the ML1 builder/freeze
+    // sweep. Re-running the ML1 invariants on the frozen module catches
+    // the direct-`Mir`-ctor path (test fixtures, future synthetic IR) that
+    // bypasses the builder; the dom-tree / interner-gated checks are
+    // genuinely beyond what ML1 can see.
+
+    // I_VerifierFailure: catch-all for structural invariants that don't
+    // have a dedicated code (re-run of ML1's opcode/arity/result-rule
+    // checks on the frozen module).
+    I_VerifierFailure         = 0xA001,
+    // Exactly one block per function has StructCfMarker::EntryBlock AND
+    // it is the function's first block (funcBlockAt(f, 0)).
+    I_NoEntryBlock            = 0xA002,
+    I_MultipleEntryBlocks     = 0xA003,
+    I_EntryBlockNotFirst      = 0xA004,
+    // The block's last instruction's opcode is not a terminator
+    // (defense-in-depth: ML1 already enforces this at build time).
+    I_BlockNotTerminated      = 0xA005,
+    // A Phi's incoming.pred is not in the CFG-predecessor set of the
+    // phi's enclosing block.
+    I_PhiPredNotInCfg         = 0xA006,
+    // An instruction's value operand is defined in a block that does
+    // NOT dominate the use site (SSA invariant; needs the dom tree).
+    I_NotDominated            = 0xA007,
+    // CondBr condition is not a Bool, or Return value type doesn't
+    // match the function's FnSig return type. Interner-gated.
+    I_TerminatorTypeMismatch  = 0xA008,
+    // Arg-instruction's argIndex is >= the function's FnSig.paramCount.
+    // Interner-gated.
+    I_ArgIndexOutOfRange      = 0xA009,
+    // An instruction's typeId resolves to a TypeKind::Extension —
+    // every extension type must have been resolved to a core lattice
+    // kind at the HIR→MIR boundary. Interner-gated.
+    I_ExtensionTypeInMir      = 0xA00A,
+    // StructCfMarker pairing — IfThen has matching IfElse/IfJoin;
+    // LoopHeader has matching LoopLatch/LoopExit; ExitBlock terminates
+    // in Return/Unreachable.
+    I_StructCfMismatch        = 0xA00B,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
