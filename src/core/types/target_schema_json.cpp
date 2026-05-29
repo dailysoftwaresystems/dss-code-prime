@@ -325,12 +325,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     } catch (json::parse_error const& e) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   std::format("JSON parse error: {}", e.what()));
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     // ── dssTargetVersion ──
@@ -339,13 +339,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         coll.emit(DiagnosticCode::C_VersionMismatch,
                   std::string{sourceLabel},
                   "missing or non-integer 'dssTargetVersion'");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     int const ver = doc.at("dssTargetVersion").get<int>();
     if (ver != 1) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssTargetVersion",
                   std::format("only version 1 supported (got {})", ver));
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     detail::TargetSchemaData data;
@@ -355,13 +355,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     if (!doc.contains("target") || !doc.at("target").is_object()) {
         coll.emit(DiagnosticCode::C_MissingField, std::string{sourceLabel},
                   "missing 'target' object");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     auto const& target = doc.at("target");
     if (!target.contains("name") || !target.at("name").is_string()) {
         coll.emit(DiagnosticCode::C_MissingField, "/target/name",
                   "missing or non-string 'name'");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     data.name = target.at("name").get<std::string>();
     if (target.contains("version") && target.at("version").is_string()) {
@@ -374,7 +374,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         } else {
             coll.emit(DiagnosticCode::C_MalformedJson, "/target/abiModel",
                       "expected 'register-machine' / 'operand-stack' / 'result-id'");
-            return std::unexpected(std::move(coll.diagnostics));
+            return std::unexpected(std::move(coll).release());
         }
     }
     // Optional frame-op mnemonic overrides (default "frame_load" /
@@ -404,15 +404,19 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
            Collector& c, std::size_t i) -> bool {
             // Target-side extension field: opaque `formula` text
             // (e.g. "S + A - P - 4"). Stored verbatim — the linker
-            // applies it; the substrate doesn't parse it.
+            // applies it; the substrate doesn't parse it. A non-
+            // string formula is a hard malformed-row case: returning
+            // false skips the row entirely so a partially-constructed
+            // TargetRelocationInfo (formula = empty) cannot escape
+            // into the dual indices (multi-agent review convergence).
             if (r.contains("formula")) {
                 if (!r.at("formula").is_string()) {
                     c.emit(DiagnosticCode::C_MalformedJson,
                            std::format("/relocations/{}/formula", i),
                            "'formula' must be a string");
-                } else {
-                    info.formula = r.at("formula").get<std::string>();
+                    return false;
                 }
+                info.formula = r.at("formula").get<std::string>();
             }
             return true;
         });
@@ -421,14 +425,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     if (!doc.contains("opcodes") || !doc.at("opcodes").is_array()) {
         coll.emit(DiagnosticCode::C_MissingField, "/opcodes",
                   "missing 'opcodes' array");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     auto const& ops = doc.at("opcodes");
     if (ops.empty()) {
         coll.emit(DiagnosticCode::C_MissingField, "/opcodes",
                   "opcodes array must be non-empty (first entry is the "
                   "Invalid sentinel)");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     data.opcodes.reserve(ops.size());
     for (std::size_t i = 0; i < ops.size(); ++i) {
@@ -758,11 +762,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // is instead of reshaping under a single sourceLabel path — the path
     // is the load-bearing locator for the user fixing the config.
     for (auto&& problem : data.validate()) {
-        coll.diagnostics.push_back(std::move(problem));
+        coll.emitRaw(std::move(problem));
     }
 
     if (coll.hasErrors()) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     return std::make_shared<TargetSchema>(std::move(data));

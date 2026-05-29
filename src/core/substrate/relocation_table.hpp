@@ -7,12 +7,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <concepts>
 #include <cstdint>
 #include <format>
-#include <functional>
 #include <limits>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -26,23 +27,36 @@
 // cross-side reloc-taxonomy unifier) and MAY include row-specific
 // extension fields (e.g. target's `formula`). This substrate hoists
 // the common loader + validator so the two sides cannot drift on the
-// `{name, kind}` contract — symmetry by construction, not by review.
+// `{name, kind}` contract — symmetry by construction.
 //
-// Refactor target: code-simplifier review of AS6 + LK4 (Findings 2 + 3).
-// The TargetSchema + ObjectFormatSchema callers populate row-specific
-// fields via the `extendRow` callback; everything else (uniqueness,
-// non-zero kind, non-empty name, dual indexing) lives here.
+// The substrate carries no target / format / linker knowledge. A
+// third consumer (e.g. a debug-info schema) plugs in by declaring a
+// `RowT` satisfying the `relocation_row` concept and a row-specific
+// `extendRow` callback.
 
 namespace dss::substrate {
 
+// Universal `{name, kind}` join key the substrate enforces. Any
+// `relocations[]` row type must expose at least these two fields.
+template <typename T>
+concept relocation_row = requires(T& t) {
+    { t.name } -> std::same_as<std::string&>;
+    { t.kind } -> std::same_as<RelocationKind&>;
+};
+
 // Load a `relocations[]` array from `doc` into `out`, populating
 // the dual O(1) lookup indices in parallel. `extendRow` runs after
-// the universal `{name, kind}` extraction; pass an empty lambda when
-// the row has no extension fields. `kindIndex.emplace` is intentionally
-// last-wins on the duplicate-kind path; cross-row uniqueness is
-// enforced upstream by `validateRelocationsTable()` so a duplicate kind
-// never escapes the loader.
-template <typename RowT, typename ExtendRowFn>
+// the universal `{name, kind}` extraction; **return false from
+// `extendRow` to SKIP the row** (no push to `out`, no index
+// insertion) when the row failed a row-specific shape check.
+// Return value is independent of whether `extendRow` emitted a
+// diagnostic — the caller decides.
+//
+// Duplicate `kind` is detected at the loader level (the
+// downstream `validateRelocationsTable` is the belt-and-suspenders
+// catch, but the loader fails loud here so a row with a duplicate
+// `kind` can never reach the dual indices).
+template <relocation_row RowT, typename ExtendRowFn>
 void loadRelocationsTable(
     nlohmann::json const& doc,
     std::vector<RowT>& out,
@@ -78,8 +92,8 @@ void loadRelocationsTable(
             coll.emit(DiagnosticCode::C_MissingField,
                       std::format("/relocations/{}/kind", i),
                       "missing or non-integer 'kind' (must be the non-zero "
-                      "uint32 tag that matches the cross-side "
-                      "TargetSchema / ObjectFormatSchema relocations[] table)");
+                      "uint32 tag that joins this row to its peer in the "
+                      "cross-side relocations[] table)");
             continue;
         }
         {
@@ -94,8 +108,24 @@ void loadRelocationsTable(
             }
             info.kind = RelocationKind{static_cast<std::uint32_t>(v)};
         }
+        // Loader-side duplicate-kind detection (defense-in-depth
+        // with `validateRelocationsTable`). `validate()` would
+        // catch the duplicate later, but a caller that bypasses
+        // the full loader (e.g. unit tests constructing schema
+        // data directly) would otherwise leave the dual indices
+        // pointing at the FIRST occurrence silently.
+        if (auto it = kindIndex.find(info.kind); it != kindIndex.end()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/relocations/{}/kind", i),
+                      std::format("duplicate 'kind' value {} (already "
+                                  "declared by relocation '{}' at "
+                                  "/relocations/{})",
+                                  info.kind.v,
+                                  out[it->second].name, it->second));
+            continue;
+        }
         // Row-specific extension fields (e.g. target's `formula`).
-        // Skips the row if the callback emits a fatal-flagged diagnostic.
+        // **Return false to SKIP the row** — neither push nor index.
         if (!extendRow(r, info, coll, i)) continue;
 
         std::uint16_t const idx = static_cast<std::uint16_t>(out.size());
@@ -106,18 +136,35 @@ void loadRelocationsTable(
                       std::format("duplicate relocation name '{}'", info.name));
             continue;
         }
-        (void)kindIndex.emplace(info.kind, idx);
+        kindIndex.emplace(info.kind, idx);
         out.push_back(std::move(info));
     }
 }
 
+// Convenience overload — for rows without extension fields. The
+// format-side `ObjectFormatRelocationInfo` is the canonical no-
+// extension consumer; eliminates the 4-line empty lambda at the
+// callsite.
+template <relocation_row RowT>
+void loadRelocationsTable(
+    nlohmann::json const& doc,
+    std::vector<RowT>& out,
+    TransparentStringMap<std::uint16_t>& nameIndex,
+    std::unordered_map<RelocationKind, std::uint16_t>& kindIndex,
+    DiagnosticCollector& coll) {
+    loadRelocationsTable(doc, out, nameIndex, kindIndex, coll,
+        [](nlohmann::json const&, RowT&,
+           DiagnosticCollector&, std::size_t) -> bool { return true; });
+}
+
 // Cross-row uniqueness + sentinel + non-empty validation. Shared
-// across both sides of the reloc-taxonomy unifier so a row that
-// passed the loader still gets the same cross-field discipline
-// regardless of which schema owns it. `fail` is the caller's
-// diagnostic-append callback (matches the per-callsite `fail` lambda
-// shape every `validate()` method already uses).
-template <typename RowT, typename FailFn>
+// across both sides of the reloc-taxonomy unifier. Runs DOWNSTREAM
+// of the loader as a belt-and-suspenders catch for rows that
+// reached `out` through a bypass path (e.g. unit tests constructing
+// schema data directly). `fail` is the caller's diagnostic-append
+// callback (matches the per-callsite `fail` lambda shape every
+// `validate()` method already uses).
+template <relocation_row RowT, typename FailFn>
 void validateRelocationsTable(std::span<RowT const> rels, FailFn fail) {
     std::unordered_map<RelocationKind, std::size_t> seenKind;
     for (std::size_t i = 0; i < rels.size(); ++i) {

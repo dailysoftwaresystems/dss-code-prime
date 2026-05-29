@@ -33,12 +33,12 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     } catch (json::parse_error const& e) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   std::format("JSON parse error: {}", e.what()));
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     // dssObjectFormatVersion — same per-schema-file version contract
@@ -48,13 +48,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
      || !doc.at("dssObjectFormatVersion").is_number_integer()) {
         coll.emit(DiagnosticCode::C_VersionMismatch, std::string{sourceLabel},
                   "missing or non-integer 'dssObjectFormatVersion'");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     int const ver = doc.at("dssObjectFormatVersion").get<int>();
     if (ver != 1) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssObjectFormatVersion",
                   std::format("only version 1 supported (got {})", ver));
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     detail::ObjectFormatData data;
@@ -63,13 +63,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     if (!doc.contains("format") || !doc.at("format").is_object()) {
         coll.emit(DiagnosticCode::C_MissingField, std::string{sourceLabel},
                   "missing 'format' object");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     auto const& format = doc.at("format");
     if (!format.contains("name") || !format.at("name").is_string()) {
         coll.emit(DiagnosticCode::C_MissingField, "/format/name",
                   "missing or non-string 'name'");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     data.name = format.at("name").get<std::string>();
     if (format.contains("version") && format.at("version").is_string()) {
@@ -79,14 +79,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         coll.emit(DiagnosticCode::C_MissingField, "/format/kind",
                   "missing or non-string 'kind' (one of 'elf' / 'pe' / "
                   "'macho' / 'wasm' / 'spirv')");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     auto const kindOpt = objectFormatKindFromName(
         format.at("kind").get<std::string>());
     if (!kindOpt.has_value()) {
         coll.emit(DiagnosticCode::C_MalformedJson, "/format/kind",
                   "expected 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     data.kind = *kindOpt;
 
@@ -98,16 +98,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // `formula`).
     substrate::loadRelocationsTable<ObjectFormatRelocationInfo>(
         doc, data.relocations, data.relocationNameIndex,
-        data.relocationKindIndex, coll,
-        [](nlohmann::json const&, ObjectFormatRelocationInfo&,
-           Collector&, std::size_t) -> bool { return true; });
+        data.relocationKindIndex, coll);
 
     for (auto&& problem : data.validate()) {
-        coll.diagnostics.push_back(std::move(problem));
+        coll.emitRaw(std::move(problem));
     }
 
     if (coll.hasErrors()) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     return std::make_shared<ObjectFormatSchema>(std::move(data));

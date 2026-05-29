@@ -1255,22 +1255,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         coll.emit(DiagnosticCode::C_MalformedJson,
                   std::string{sourceLabel},
                   std::format("JSON parse error: {}", e.what()));
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     // dssSchemaVersion ──
     if (!present(doc, "dssSchemaVersion", coll, std::string{sourceLabel})) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     if (!doc.at("dssSchemaVersion").is_number_integer()) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
                   "must be a positive integer");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     // Inclusive window of schema versions this loader understands. Bump
     // the upper bound only after the loader actually parses the new
@@ -1285,21 +1285,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
                   std::format("unsupported dssSchemaVersion {} (this build supports {}..{})",
                               schemaVer, kMinSchemaVersion, kMaxSchemaVersion));
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     // language ──
     if (!present(doc, "language", coll, std::string{sourceLabel})) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     json const& langObj = doc.at("language");
     if (!langObj.is_object()) {
         coll.emit(DiagnosticCode::C_MissingField, "/language", "must be an object");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     if (!present(langObj, "name",    coll, "/language") ||
         !present(langObj, "version", coll, "/language")) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     GrammarSchemaData data;
@@ -4797,7 +4797,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     if (coll.hasErrors()) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     return std::make_shared<GrammarSchema>(std::move(data));
 }
