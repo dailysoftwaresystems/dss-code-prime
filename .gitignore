@@ -44,6 +44,10 @@
 build/
 !scripts/build/
 
+# CTest leftover when ctest is invoked from the repo root (e.g. inside
+# a CI step that cd's wrong) — these are throwaway run artifacts.
+Testing/
+
 # Python bytecode cache (e.g. tools/refresh_landing_log.py)
 __pycache__/
 *.pyc
