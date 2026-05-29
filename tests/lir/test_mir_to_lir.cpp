@@ -27,10 +27,14 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdlib>
+#include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace dss;
 
@@ -913,34 +917,36 @@ TEST(MirToLir, BitcastSameClassStaysAsMov) {
 
 namespace {
 struct CastCase {
-    ::dss::MirOpcode mirOp;
-    char const*      expectedMnemonic;
+    ::dss::MirOpcode  mirOp;
+    char const*       expectedMnemonic;
+    ::dss::TypeKind   srcKind;
+    ::dss::TypeKind   dstKind;
+    LirRegClass       expectedResultClass;
 };
 }
 
 class MirToLirCastMapping : public ::testing::TestWithParam<CastCase> {};
 
-TEST_P(MirToLirCastMapping, EmitsExpectedMnemonic) {
+TEST_P(MirToLirCastMapping, EmitsExpectedMnemonicAndRegClass) {
     auto const param = GetParam();
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
 
-    // Synthetic MIR: int32 arg → cast → return. Each variant must
-    // dispatch to its named LIR mnemonic per the cycle-3c table.
+    // Synthetic MIR: single src-typed arg → cast → return dst-typed value.
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const i32 = interner.primitive(::dss::TypeKind::I32);
-    auto const i64 = interner.primitive(::dss::TypeKind::I64);
-    std::array<::dss::TypeId, 1> params{i32};
-    auto const fnSig = interner.fnSig(params, i64, ::dss::CallConv::CcSysV);
+    auto const srcT = interner.primitive(param.srcKind);
+    auto const dstT = interner.primitive(param.dstKind);
+    std::array<::dss::TypeId, 1> params{srcT};
+    auto const fnSig = interner.fnSig(params, dstT, ::dss::CallConv::CcSysV);
 
     ::dss::MirBuilder mb;
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
-    ::dss::MirInstId const argInst = mb.addArg(0, i32);
+    ::dss::MirInstId const argInst = mb.addArg(0, srcT);
     std::array<::dss::MirInstId, 1> castOps{argInst};
-    ::dss::MirInstId const castInst = mb.addInst(param.mirOp, castOps, i64);
+    ::dss::MirInstId const castInst = mb.addInst(param.mirOp, castOps, dstT);
     mb.addReturn(castInst);
     ::dss::Mir m = std::move(mb).finish();
 
@@ -955,8 +961,14 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonic) {
     auto const expectedOp = *sch.opcodeByMnemonic(param.expectedMnemonic);
     bool foundCast = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
-        auto const o = lir.instOpcode(lir.blockInstAt(entry, i));
-        if (o == expectedOp) { foundCast = true; break; }
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) == expectedOp) {
+            foundCast = true;
+            EXPECT_EQ(lir.instResult(inst).regClass(), param.expectedResultClass)
+                << "cast (MirOpcode " << static_cast<int>(param.mirOp)
+                << ") result reg class mismatch";
+            break;
+        }
     }
     EXPECT_TRUE(foundCast)
         << "cast (MirOpcode " << static_cast<int>(param.mirOp) << ")"
@@ -966,13 +978,150 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonic) {
 INSTANTIATE_TEST_SUITE_P(
     AllCastVariants, MirToLirCastMapping,
     ::testing::Values(
-        CastCase{::dss::MirOpcode::Trunc,    "trunc"},
-        CastCase{::dss::MirOpcode::SExt,     "sext"},
-        CastCase{::dss::MirOpcode::ZExt,     "zext"},
-        CastCase{::dss::MirOpcode::Bitcast,  "mov"},
-        CastCase{::dss::MirOpcode::IntToPtr, "mov"},
-        CastCase{::dss::MirOpcode::PtrToInt, "mov"}
+        // Integer casts (cycle 3c) — all GPR result.
+        CastCase{::dss::MirOpcode::Trunc,    "trunc", ::dss::TypeKind::I64, ::dss::TypeKind::I32, LirRegClass::GPR},
+        CastCase{::dss::MirOpcode::SExt,     "sext",  ::dss::TypeKind::I32, ::dss::TypeKind::I64, LirRegClass::GPR},
+        CastCase{::dss::MirOpcode::ZExt,     "zext",  ::dss::TypeKind::I32, ::dss::TypeKind::I64, LirRegClass::GPR},
+        CastCase{::dss::MirOpcode::IntToPtr, "mov",   ::dss::TypeKind::I64, ::dss::TypeKind::Ptr, LirRegClass::GPR},
+        CastCase{::dss::MirOpcode::PtrToInt, "mov",   ::dss::TypeKind::Ptr, ::dss::TypeKind::I64, LirRegClass::GPR},
+        // Bitcast same-class is mov; different test (BitcastCrossClass)
+        // pins the cross-class movq_xclass path.
+        CastCase{::dss::MirOpcode::Bitcast,  "mov",   ::dss::TypeKind::I64, ::dss::TypeKind::Ptr, LirRegClass::GPR},
+        // Cycle 3d float casts. fpcvt handles BOTH FPTrunc + FPExt.
+        // FPToSI/FPToUI: float → integer, result is GPR.
+        // SIToFP/UIToFP: integer → float, result is FPR.
+        // FPTrunc/FPExt: float → float, result is FPR.
+        CastCase{::dss::MirOpcode::FPTrunc,  "fpcvt",    ::dss::TypeKind::F64, ::dss::TypeKind::F32, LirRegClass::FPR},
+        CastCase{::dss::MirOpcode::FPExt,    "fpcvt",    ::dss::TypeKind::F32, ::dss::TypeKind::F64, LirRegClass::FPR},
+        CastCase{::dss::MirOpcode::FPToSI,   "fp_to_si", ::dss::TypeKind::F64, ::dss::TypeKind::I64, LirRegClass::GPR},
+        CastCase{::dss::MirOpcode::FPToUI,   "fp_to_ui", ::dss::TypeKind::F64, ::dss::TypeKind::I64, LirRegClass::GPR},
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR},
+        CastCase{::dss::MirOpcode::UIToFP,   "ui_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR}
     ));
+
+TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
+    // Cycle 3d added a 2-operand Gep case emitting
+    // `lea result, [base + index*1 + 0]` via the 4-operand operand
+    // tuple [base_reg, index_reg, MemBase(scale=1), MemOffset(disp=0)].
+    // Pin the operand kinds + count so a regression to a different
+    // shape surfaces here, not at AS1 encoding time.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const i64  = interner.primitive(::dss::TypeKind::I64);
+    std::array<::dss::TypeId, 2> params{ptrT, i64};
+    auto const fnSig = interner.fnSig(params, ptrT, ::dss::CallConv::CcSysV);
+
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const base  = mb.addArg(0, ptrT);
+    ::dss::MirInstId const index = mb.addArg(1, i64);
+    std::array<::dss::MirInstId, 2> gepOps{base, index};
+    ::dss::MirInstId const gepInst = mb.addInst(::dss::MirOpcode::Gep, gepOps, ptrT);
+    mb.addReturn(gepInst);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    ASSERT_TRUE(result.ok) << "dynamic-index Gep must lower cleanly";
+
+    auto const leaOp = *sch.opcodeByMnemonic("lea");
+    ::dss::Lir const& lir = result.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    bool foundLea = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) != leaOp) continue;
+        foundLea = true;
+        auto const ops = lir.instOperands(inst);
+        ASSERT_EQ(ops.size(), 4u);
+        EXPECT_EQ(ops[0].kind, LirOperandKind::Reg);        // base
+        EXPECT_EQ(ops[1].kind, LirOperandKind::Reg);        // index
+        EXPECT_EQ(ops[2].kind, LirOperandKind::MemBase);    // scale
+        EXPECT_EQ(ops[3].kind, LirOperandKind::MemOffset);  // disp
+        EXPECT_EQ(ops[2].scale, 1u);
+        EXPECT_EQ(ops[3].offset, 0);
+        break;
+    }
+    EXPECT_TRUE(foundLea);
+}
+
+TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
+    // Cycle-3d review (code-reviewer H2 + type-design + test-analyzer
+    // rating 9): prepassAllocatePhis previously hardcoded GPR for ALL
+    // phi results, silently mis-classing F64 phis. emitPhiMovesForEdge
+    // similarly hardcoded GPR for the parallel-copy temps.
+    //
+    // This test pins both: an F64-typed Phi MUST produce an FPR-class
+    // result vreg, and its parallel-copy temps MUST also be FPR-class.
+    // A regression to GPR would fail both assertions immediately rather
+    // than silently propagating to AS1's wrong-class register encoding.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f64  = interner.primitive(::dss::TypeKind::F64);
+    auto const boolT = interner.primitive(::dss::TypeKind::Bool);
+    std::array<::dss::TypeId, 1> params{boolT};
+    auto const fnSig = interner.fnSig(params, f64, ::dss::CallConv::CcSysV);
+
+    // Build: int param `c` → if (c) return 1.0 else 2.0 (diamond CFG
+    // with a Phi at the join). The Phi is F64-typed; the lowering must
+    // place it in FPR-class.
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const thenB = mb.createBlock(::dss::StructCfMarker::IfThen);
+    ::dss::MirBlockId const elseB = mb.createBlock(::dss::StructCfMarker::IfElse);
+    ::dss::MirBlockId const join  = mb.createBlock(::dss::StructCfMarker::IfJoin);
+    mb.beginBlock(entry);
+    ::dss::MirInstId const cond = mb.addArg(0, boolT);
+    mb.addCondBr(cond, thenB, elseB);
+    mb.beginBlock(thenB);
+    ::dss::MirLiteralValue lvOne;  lvOne.value  = 1.0;  lvOne.core  = ::dss::TypeKind::F64;
+    ::dss::MirInstId const constOne = mb.addConst(lvOne, f64);
+    mb.addBr(join);
+    mb.beginBlock(elseB);
+    ::dss::MirLiteralValue lvTwo;  lvTwo.value  = 2.0;  lvTwo.core  = ::dss::TypeKind::F64;
+    ::dss::MirInstId const constTwo = mb.addConst(lvTwo, f64);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    ::dss::MirInstId const phi = mb.addPhi(f64);
+    mb.addPhiIncoming(phi, ::dss::MirPhiIncoming{constOne, thenB});
+    mb.addPhiIncoming(phi, ::dss::MirPhiIncoming{constTwo, elseB});
+    mb.addReturn(phi);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    ASSERT_TRUE(result.ok) << "FPR-typed phi must lower cleanly";
+
+    ::dss::Lir const& lir = result.lir;
+    auto const retOp = *sch.opcodeByMnemonic("ret");
+
+    // The Return's operand must be a register, and that register must
+    // be FPR-class (the phi's pre-allocated vreg, now FPR per the fix).
+    LirFuncId const fn = lir.funcAt(0);
+    for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+        LirBlockId const bb = lir.funcBlockAt(fn, b);
+        LirInstId const term = lir.blockTerminator(bb);
+        if (lir.instOpcode(term) != retOp) continue;
+        auto const ops = lir.instOperands(term);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(ops[0].kind, LirOperandKind::Reg);
+        EXPECT_EQ(ops[0].reg.regClass(), LirRegClass::FPR)
+            << "F64 phi result must be FPR-class — regression to GPR "
+               "would silently mis-class downstream consumers";
+        return;
+    }
+    ADD_FAILURE() << "no ret block found";
+}
 
 TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     // Parallel to WideLiteralRoutesThroughLiteralPool but for the string

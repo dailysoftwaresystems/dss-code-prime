@@ -178,18 +178,26 @@ struct Lowerer {
     }
 
     // Map a MIR `TypeId` to the LIR register class that holds its
-    // values. Float types (F32/F64) flow through FPR; integer/pointer
-    // types flow through GPR; bool also stays in GPR (0/1 byte). The
-    // map is intentionally simple — extension types fail-loud at the
-    // call site rather than silently picking a class.
+    // values. F16/F32/F64/F128 → FPR; Vector/Matrix → VR (SIMD);
+    // integer/bool/pointer → GPR; default for aggregates (Struct/
+    // Union/Array/Enum/Tuple/Slice) and any future variant arm →
+    // GPR with explicit "scoped to ML5; cycle 3e aggregate-flattening
+    // will decide the real shape" note. Invalid TypeId is the only
+    // genuinely-unhandled case — we fail-loud-deferred those at the
+    // narrow-vs-wide gate in `lowerConst`, so reaching here with an
+    // invalid TypeId is itself a structural violation; we return GPR
+    // as a defensive default but the using-site should have flagged
+    // it earlier.
     [[nodiscard]] LirRegClass regClassForType(TypeId ty) const {
         if (!ty.valid()) return LirRegClass::GPR;
         switch (interner.kind(ty)) {
+            case TypeKind::F16:
             case TypeKind::F32:
             case TypeKind::F64:
-            case TypeKind::F16:
             case TypeKind::F128:
                 return LirRegClass::FPR;
+            case TypeKind::Vector:
+                return LirRegClass::VR;
             default:
                 return LirRegClass::GPR;
         }
@@ -443,7 +451,10 @@ struct Lowerer {
         if (operands.size() != 1) { reportUnsupported(MirOpcode::Load, id); return; }
         std::optional<LirReg> const base = regForValue(operands[0]);
         if (!base.has_value()) return;
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        // Cycle 3d FPR-class plumbing closure: a Load of an F64 must
+        // produce an FPR-class result, not GPR. Closes the silent-
+        // failure-hunter HIGH finding from cycle 3d's review.
+        LirReg const result = lir.newVReg(regClassFor(id));
         std::array<LirOperand, 3> ops{
             LirOperand::makeReg(*base),
             LirOperand::makeMemBase(1),
@@ -522,23 +533,11 @@ struct Lowerer {
     // Single-operand value-producing cast. The result register class
     // follows the MIR result type (FPR for float-result casts; GPR
     // otherwise). Cycle 3d's float casts (FpCvt/FpToSi/FpToUi/SiToFp/
-    // UiToFp) all land here.
-    void lowerCast(MirInstId id, MnemonicSlot slot, std::string_view context) {
-        if (!opcode(slot).has_value()) {
-            reportMissingOpcode(slot, context);
-            return;
-        }
-        auto const operands = mir.instOperands(id);
-        if (operands.size() != 1) {
-            reportUnsupported(mir.instOpcode(id), id);
-            return;
-        }
-        std::optional<LirReg> const src = regForValue(operands[0]);
-        if (!src.has_value()) return;
-        LirReg const result = lir.newVReg(regClassFor(id));
-        std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
-        lir.addInst(*opcode(slot), result, ops);
-        defineValue(id, result);
+    // UiToFp) all land here. Delegates to the shared lowerNAryOp; the
+    // `context` argument is now redundant with `mirOpcodeName` and
+    // dropped (simplifier review).
+    void lowerCast(MirInstId id, MnemonicSlot slot, std::string_view /*context*/) {
+        lowerNAryOp<1>(id, slot);
     }
 
     // Bitcast lowering — closes the cycle-3c-anchored hazard 3 review
@@ -572,48 +571,38 @@ struct Lowerer {
         defineValue(id, result);
     }
 
-    void lowerBinaryOp(MirInstId id, MnemonicSlot slot) {
+    // Shared N-operand value-producing lowering. Consolidates the
+    // identical scaffolding of `lowerCast`/`lowerBinaryOp`/`lowerUnaryOp`
+    // (opcode-resolve → operand-arity-check → regForValue each operand
+    // → newVReg(regClassFor(id)) → addInst → defineValue). Per the
+    // cycle-3d simplifier review.
+    template <std::size_t Arity>
+    void lowerNAryOp(MirInstId id, MnemonicSlot slot) {
         auto const op = opcode(slot);
         if (!op.has_value()) {
             reportMissingOpcode(slot, mirOpcodeName(mir.instOpcode(id)));
             return;
         }
         auto const operands = mir.instOperands(id);
-        if (operands.size() != 2) {
+        if (operands.size() != Arity) {
             reportUnsupported(mir.instOpcode(id), id);
             return;
         }
-        std::optional<LirReg> const a = regForValue(operands[0]);
-        std::optional<LirReg> const b = regForValue(operands[1]);
-        if (!a.has_value() || !b.has_value()) return;
-        // Cycle 3d: result reg class follows the MIR result type. F32/F64
-        // → FPR (float arithmetic); everything else → GPR.
+        std::array<LirOperand, Arity> ops;
+        for (std::size_t k = 0; k < Arity; ++k) {
+            std::optional<LirReg> const r = regForValue(operands[k]);
+            if (!r.has_value()) return;
+            ops[k] = LirOperand::makeReg(*r);
+        }
+        // Result reg class follows the MIR result type — FPR for float
+        // ops, VR for vector ops, GPR otherwise.
         LirReg const result = lir.newVReg(regClassFor(id));
-        std::array<LirOperand, 2> ops{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
         lir.addInst(*op, result, ops);
         defineValue(id, result);
     }
 
-    // Single-operand value-producing op (`not`, `neg`, `fneg`). Result
-    // reg class follows the MIR result type.
-    void lowerUnaryOp(MirInstId id, MnemonicSlot slot) {
-        auto const op = opcode(slot);
-        if (!op.has_value()) {
-            reportMissingOpcode(slot, mirOpcodeName(mir.instOpcode(id)));
-            return;
-        }
-        auto const operands = mir.instOperands(id);
-        if (operands.size() != 1) {
-            reportUnsupported(mir.instOpcode(id), id);
-            return;
-        }
-        std::optional<LirReg> const a = regForValue(operands[0]);
-        if (!a.has_value()) return;
-        LirReg const result = lir.newVReg(regClassFor(id));
-        std::array<LirOperand, 1> ops{LirOperand::makeReg(*a)};
-        lir.addInst(*op, result, ops);
-        defineValue(id, result);
-    }
+    void lowerBinaryOp(MirInstId id, MnemonicSlot slot) { lowerNAryOp<2>(id, slot); }
+    void lowerUnaryOp (MirInstId id, MnemonicSlot slot) { lowerNAryOp<1>(id, slot); }
 
     // MIR ICmp{Eq,Ne,Slt,...} → LIR `cmp` + `setcc(cond)` pair. Naive
     // (no peephole with subsequent CondBr); the optimizer's compare-flag
@@ -737,10 +726,14 @@ struct Lowerer {
         if (pairs.empty()) return;
         // Step 1: copy every incoming into a fresh temp. Breaks any
         // dependency cycle on the phi-reg side unconditionally.
+        // Cycle 3d FPR plumbing: each temp's class follows the phi's
+        // (which equals the incoming's, since SSA guarantees same-
+        // typed flow on each edge). An F64 phi must use FPR-class
+        // temps so the parallel-copy chain stays consistent.
         std::vector<LirReg> temps;
         temps.reserve(pairs.size());
         for (auto const& p : pairs) {
-            LirReg const tmp = lir.newVReg(LirRegClass::GPR);
+            LirReg const tmp = lir.newVReg(p.phi.regClass());
             std::array<LirOperand, 1> ops{LirOperand::makeReg(p.incoming)};
             lir.addInst(*opcode(MnemonicSlot::Mov), tmp, ops);
             temps.push_back(tmp);
@@ -975,7 +968,12 @@ struct Lowerer {
             for (std::uint32_t i = 0; i < n; ++i) {
                 MirInstId const inst = mir.blockInstAt(mb, i);
                 if (mir.instOpcode(inst) != MirOpcode::Phi) continue;
-                LirReg const r = lir.newVReg(LirRegClass::GPR);
+                // Cycle 3d FPR plumbing: phi result class follows the
+                // phi's MIR result type. An F64-typed phi (ternary
+                // join on doubles, loop-carried float) must use an
+                // FPR-class vreg so downstream FPR consumers see the
+                // right class.
+                LirReg const r = lir.newVReg(regClassFor(inst));
                 defineValue(inst, r);
             }
         }

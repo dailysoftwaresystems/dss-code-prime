@@ -219,7 +219,7 @@ TEST(LirDeathTest, BlockWithoutTerminatorAborts) {
     LirReg const r = b.newVReg(LirRegClass::GPR);
     std::array<LirOperand, 1> const ops{immOperand(1)};
     b.addInst(op("mov"), r, ops);
-    EXPECT_DEATH(std::move(b).finish(), "not a terminator");
+    EXPECT_DEATH((void)std::move(b).finish(), "not a terminator");
 }
 
 TEST(Lir, LirAttributeBindsToInstructionTier) {
