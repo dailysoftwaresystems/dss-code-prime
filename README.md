@@ -1,13 +1,16 @@
 # DSS Code Prime
 
-A **universal, configurable compiler** written in C++. Define any source language via JSON configuration, compile to any supported target platform — all through a single engine.
+A **universal, configurable compiler** written in C++. Define any source language via JSON configuration, compile to any target ISA via JSON configuration — all through a single engine.
+
+> **Status** — Frontend (lexer / parser / semantic / HIR) is complete. MIR + LIR closed end-to-end (HIR→MIR lowering, register allocation, calling-convention lowering, full IR text round-trip). Backend codegen (assembler / linker / driver) is in flight per plans 13–14; no end-to-end binary yet. See `.plans/00-compiler-implementation-plan - tbd.md` for the live status snapshot.
 
 ## Key Features
 
-- **Any Input Language** — Programming languages are defined via JSON config files describing lexical rules, grammar (BNF), type system, and semantic constraints. No recompilation needed to add a language.
-- **Any Target Platform** — Compile to Windows, Linux, macOS, iOS, Android, and Web (WASM) across x86_64, ARM64, and WASM architectures.
-- **Classical Compiler Pipeline** — Three-phase analysis (Lexical → Syntactic → Semantic), intermediate representation with optimization passes, and pluggable target code emitters.
-- **Cross-Platform** — Builds and runs natively on Windows, Linux, and macOS. Docker image provided for reproducible cross-compilation.
+- **Any Input Language** — Languages are defined via `.lang.json` configs (lexer / parser grammar / semantics / HIR-lowering / imports). Same engine, no per-language C++ branches. Shipped reference configs: c-subset, tsql-subset, toy.
+- **Any Target ISA** — Compile targets are `.target.json` configs (opcode set, register file, calling conventions, terminator kinds). Same engine, no per-target C++ branches. x86_64 ships; ARM64 is a JSON-drop away (substrate is target-blind).
+- **Three-tier IR** — HIR (language-neutral, typed) → MIR (SSA over CFG with structured-CF markers) → LIR (per-target, post-regalloc). Each tier has its own arena substrate, verifier, and round-trippable text format (`.dsshir` / `.dssir` / `.dsslir`).
+- **Hermetic toolchain** — Plan: own every byte from source to binary. No GAS / MASM / llvm-mc invocation; in-tree assembler + linker in flight (plans 13 + 14).
+- **Cross-Platform** — Builds natively on Windows, Linux, macOS. Docker image for reproducible builds.
 
 ## Architecture
 
@@ -15,17 +18,22 @@ A **universal, configurable compiler** written in C++. Define any source languag
 User Input (project / files / directory)
     │
     ▼
-┌─────────────────────────────────────────────────┐
-│  program        Public API & driver              │
-│  source-factory Language config loader (JSON)    │
-│  tokenizer      Characters → token stream        │
-│  analysis       Lexical → Syntactic → Semantic   │
-│  gen            IR generation → target emission   │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  program        Public API & driver                       │
+│  dss-config     Language + target JSON configs            │
+│  tokenizer      Characters → token stream                 │
+│  analysis       Lexical → Syntactic → Semantic            │
+│  hir            High-level IR (typed, language-neutral)   │
+│  mir            Mid-level IR (SSA over CFG)               │
+│  lir            Low-level IR (per-target, JSON-driven)    │
+│  gen            Codegen → assembler → linker              │
+└──────────────────────────────────────────────────────────┘
     │
     ▼
 Executables / Libraries / WASM modules
 ```
+
+The pipeline is **fully config-driven** end-to-end: the engine has zero per-language C++ branches. A `.lang.json` declares lexer/grammar/semantics/HIR-lowering, and a `.target.json` declares opcode/register/calling-convention vocabulary. Adding a new source language OR target ISA is a config-file drop, not an engine change.
 
 ## Usage
 
@@ -72,9 +80,17 @@ The compiler scans the directory recursively for files matching the language's c
 
 ## Defining a Language
 
-Languages are defined in JSON config files under `src/source-config/languages/`. Each file fully describes a language's rules and syntax across three sections: **lexical**, **syntactic**, and **semantic**.
+Languages are defined in JSON config files under `src/dss-config/sources/`. Each file describes a language's rules across four top-level blocks: `tokens` (lexer), `keywords` / `scopes` / `shapes` (parser grammar v2), `semantics` (symbol table + type system, schema v4), `hirLowering` (CST→HIR projection), and optional `imports` for cross-file resolution.
 
-### Example Language Configuration
+Shipped reference configs:
+
+- `src/dss-config/sources/c-subset.lang.json` — a substantial C subset (declarations, control flow, pointers, structs/unions/enums, designated initializers, `#include`)
+- `src/dss-config/sources/tsql-subset.lang.json` — T-SQL DDL + DML
+- `src/dss-config/sources/toy.lang.json` — a small typed expression language used as a genericity oracle
+
+The current schema spec lives in `docs/language-config-spec.md` (config format v4). The example below is a **simplified illustration of the v1 design intent** — the shipped schema is more compact and uses different block names; read the spec + a shipped config for the real shape.
+
+### Example Language Configuration (v1 design — illustrative only)
 
 ```jsonc
 {
@@ -202,47 +218,49 @@ Languages are defined in JSON config files under `src/source-config/languages/`.
 }
 ```
 
-> **Tip:** To add a new language, create a `.lang.json` file following this structure and place it in `src/source-config/languages/`. The compiler picks it up by name — no recompilation required.
-
-See `src/source-config/languages/example.lang.json` for the shipped reference implementation.
+> **Tip:** To add a new language, drop a `.lang.json` file under `src/dss-config/sources/` and the compiler picks it up by name — no recompilation required. Same discipline for adding a new target ISA: drop a `.target.json` under `src/dss-config/targets/`.
 
 ## Supported Targets
 
-| Target | OS | Architecture | Output Format |
-|---|---|---|---|
-| `linux-x86_64` | Linux | x86_64 | ELF |
-| `linux-arm64` | Linux | ARM64 | ELF |
-| `windows-x86_64` | Windows | x86_64 | PE/COFF (.exe) |
-| `macos-x86_64` | macOS | x86_64 | Mach-O |
-| `macos-arm64` | macOS | ARM64 (Apple Silicon) | Mach-O |
-| `ios-arm64` | iOS | ARM64 | Mach-O |
-| `android-arm64` | Android | ARM64 | ELF |
-| `web-wasm` | Web | WASM | WebAssembly (.wasm) |
+Targets are JSON-configured (`src/dss-config/targets/*.target.json`). The substrate is fully target-blind: opcode dispatch, register names, calling conventions, terminator shapes — all read from the target schema. Adding a new ISA is a config-file drop, zero C++.
+
+| Target | OS / Arch | Status |
+|---|---|---|
+| `x86_64` | Linux / Windows / macOS × x86_64 | Shipped — full opcode set + SysV AMD64 + Microsoft x64 calling conventions |
+| `arm64` | Linux / Windows / macOS / iOS / Android × ARM64 | JSON-drop ready (substrate target-blind); awaiting `.target.json` + ABI golden tests |
+| `wasm` | Web | Reserved — plan 18; consumes MIR with structured-CF markers |
+| Object formats (ELF / PE / Mach-O) | per target | Reserved — plan 14 (in-tree linker, also JSON-configured) |
 
 ## Project Structure
 
 ```
 src/
 ├── program/          Public API — project, file list, or directory input
-├── core/             Shared types (Token, AST, IR, Symbol) & utilities
-├── source-config/    Language definition JSON files & schema
-├── source-factory/   JSON config parser, models & validators
+├── core/             Shared types (Tree/HIR/MIR/LIR substrate, schemas, diagnostics)
+├── dss-config/       Language + target JSON configs
+│   ├── sources/      .lang.json — per-language grammar/semantics/lowering
+│   └── targets/      .target.json — per-target opcode/register/ABI
 ├── tokenizer/        Character stream → token stream
 ├── analysis/
-│   ├── lexical/      Token validation & classification
-│   ├── syntactic/    Parser → AST (recursive descent + Pratt)
-│   └── semantic/     Symbol table, type checker, scope resolver
-└── gen/
-    ├── intermediate/ AST → IR, optimization passes
-    └── link/         IR → target machine code, linking
+│   ├── syntactic/    Parser → CST (recursive descent + Pratt walker + LSP)
+│   ├── semantic/     Symbol table, type checker, scope resolver
+│   └── compilation_unit/  Multi-file CU + cross-file import resolution
+├── hir/              High-level IR (typed, language-neutral) + verifier + .dsshir text
+├── mir/              Mid-level IR (SSA over CFG, structured-CF markers) + .dssir text
+├── lir/              Low-level IR (per-target, post-regalloc) + .dsslir text + regalloc + callconv
+├── lsp/              Language Server Protocol (stdio JSON-RPC + diagnostics)
+└── gen/              Codegen / assembler / linker (in flight per plans 13–14)
 ```
+
+The IR layering is HIR → MIR → LIR. HIR is the language-neutral pivot (CST→HIR lowering is config-driven, no per-language C++); MIR is SSA over CFG with structured-CF markers preserved; LIR is target-specific (JSON-configured) with virtual + physical registers. Each layer ships its own arena substrate, verifier, and round-trippable text format.
 
 ## Building
 
 ### Prerequisites
 
-- C++20 compatible compiler (GCC 12+, Clang 14+, MSVC 2022+)
-- CMake 3.20+
+- C++23-capable compiler (MSVC 17.5+, GCC 13+, Clang 16+)
+- CMake 4.0+
+- Network access on first configure (FetchContent pulls nlohmann/json 3.12.0 + GoogleTest 1.17.0)
 
 ### Build
 
@@ -260,9 +278,14 @@ docker compose -f docker/docker-compose.yml up --build
 ### Run Tests
 
 ```bash
-cmake --build build --target test
+cd build && ctest --output-on-failure
 ```
 
 ## Documentation
 
-- [Implementation Plan](.plans/00-compiler-implementation-plan - tbd.md) — Full architecture, file structure, module docs, and JSON config spec
+- [Implementation Plan](.plans/00-compiler-implementation-plan%20-%20tbd.md) — Master plan, sub-plan index, gap catalog
+- [Plan 09 — HIR](.plans/09-hir-plan%20-%20ok.md) — High-level IR (language-neutral pivot)
+- [Plan 12 — MIR + LIR](.plans/12-mir-lir-plan%20-%20ok.md) — Mid + low-level IR
+- [Plan 12.5 — Const-eval](.plans/12.5-const-eval-plan%20-%20ok.md) — Shared constants-evaluation engine
+- `docs/language-config-spec.md` — Current `.lang.json` schema (v4)
+- `docs/tree-model.md` — Tree + arena substrate
