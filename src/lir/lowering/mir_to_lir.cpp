@@ -91,6 +91,13 @@ enum class MnemonicSlot : std::uint8_t {
     Ret, Unreachable,
     Alloca, Load, Store, Lea,        // cycle 3c memory ops
     SExt, ZExt, Trunc,                // cycle 3c cast lowering
+    // cycle 3d bitwise + integer Neg
+    And, Or, Xor, Shl, ShrL, ShrA, Not, Neg,
+    // cycle 3d float arithmetic + casts
+    FAdd, FSub, FMul, FDiv, FNeg,
+    FpCvt, FpToSi, FpToUi, SiToFp, UiToFp,
+    // cycle 3d cross-class move (movq via FPR↔GPR Bitcast)
+    MovqXClass,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -106,6 +113,7 @@ struct MnemonicCache {
 struct Lowerer {
     Mir const&          mir;
     TargetSchema const& target;
+    TypeInterner const& interner;
     DiagnosticReporter& reporter;
     LirBuilder          lir;
 
@@ -126,8 +134,9 @@ struct Lowerer {
         return reporter.errorCount() != baselineErrors;
     }
 
-    Lowerer(Mir const& m, TargetSchema const& t, DiagnosticReporter& r)
-        : mir(m), target(t), reporter(r), lir(t),
+    Lowerer(Mir const& m, TargetSchema const& t, TypeInterner const& i,
+            DiagnosticReporter& r)
+        : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()) {
         baselineErrors = reporter.errorCount();
         // Mnemonics in MnemonicSlot enum-declaration order. The
@@ -145,6 +154,13 @@ struct Lowerer {
             "ret", "unreachable",
             "alloca", "load", "store", "lea",
             "sext", "zext", "trunc",
+            // cycle 3d bitwise + Neg
+            "and", "or", "xor", "shl", "shr_l", "shr_a", "not", "neg",
+            // cycle 3d float arithmetic + casts
+            "fadd", "fsub", "fmul", "fdiv", "fneg",
+            "fpcvt", "fp_to_si", "fp_to_ui", "si_to_fp", "ui_to_fp",
+            // cycle 3d cross-class move
+            "movq_xclass",
         }};
         static_assert(kMnemonics.size() == kMnemonicCount,
             "MnemonicSlot enum and kMnemonics array drifted — every slot "
@@ -159,6 +175,28 @@ struct Lowerer {
 
     [[nodiscard]] std::optional<std::uint16_t> opcode(MnemonicSlot s) const {
         return cache_[static_cast<std::size_t>(s)].id;
+    }
+
+    // Map a MIR `TypeId` to the LIR register class that holds its
+    // values. Float types (F32/F64) flow through FPR; integer/pointer
+    // types flow through GPR; bool also stays in GPR (0/1 byte). The
+    // map is intentionally simple — extension types fail-loud at the
+    // call site rather than silently picking a class.
+    [[nodiscard]] LirRegClass regClassForType(TypeId ty) const {
+        if (!ty.valid()) return LirRegClass::GPR;
+        switch (interner.kind(ty)) {
+            case TypeKind::F32:
+            case TypeKind::F64:
+            case TypeKind::F16:
+            case TypeKind::F128:
+                return LirRegClass::FPR;
+            default:
+                return LirRegClass::GPR;
+        }
+    }
+
+    [[nodiscard]] LirRegClass regClassFor(MirInstId id) const {
+        return regClassForType(mir.instType(id));
     }
 
     // ── diagnostics ──────────────────────────────────────────────────
@@ -249,14 +287,34 @@ struct Lowerer {
             case MirOpcode::Trunc:  return lowerCast(id, MnemonicSlot::Trunc, "MIR Trunc");
             case MirOpcode::SExt:   return lowerCast(id, MnemonicSlot::SExt,  "MIR SExt");
             case MirOpcode::ZExt:   return lowerCast(id, MnemonicSlot::ZExt,  "MIR ZExt");
-            case MirOpcode::Bitcast:
+            case MirOpcode::Bitcast:    return lowerBitcast(id);
             case MirOpcode::IntToPtr:
             case MirOpcode::PtrToInt:
-                // These are bit-pattern-preserving identity casts on
-                // x86_64 (pointers are 64-bit registers like int64). The
-                // LIR substrate lowers them as a single `mov` (or as the
-                // direct vreg pass-through ML6 will coalesce away).
-                return lowerCast(id, MnemonicSlot::Mov, "MIR Bitcast/IntToPtr/PtrToInt");
+                // Identity cast between integer and pointer on x86_64
+                // — both are 64-bit GPR-class values. Single `mov`.
+                return lowerCast(id, MnemonicSlot::Mov, "MIR IntToPtr/PtrToInt");
+            // ── cycle 3d bitwise + Neg ─────────────────────────────
+            case MirOpcode::And:    return lowerBinaryOp(id, MnemonicSlot::And);
+            case MirOpcode::Or:     return lowerBinaryOp(id, MnemonicSlot::Or);
+            case MirOpcode::Xor:    return lowerBinaryOp(id, MnemonicSlot::Xor);
+            case MirOpcode::Shl:    return lowerBinaryOp(id, MnemonicSlot::Shl);
+            case MirOpcode::LShr:   return lowerBinaryOp(id, MnemonicSlot::ShrL);
+            case MirOpcode::AShr:   return lowerBinaryOp(id, MnemonicSlot::ShrA);
+            case MirOpcode::Not:    return lowerUnaryOp(id, MnemonicSlot::Not);
+            case MirOpcode::Neg:    return lowerUnaryOp(id, MnemonicSlot::Neg);
+            // ── cycle 3d float arithmetic (FPR-class result) ───────
+            case MirOpcode::FAdd:   return lowerBinaryOp(id, MnemonicSlot::FAdd);
+            case MirOpcode::FSub:   return lowerBinaryOp(id, MnemonicSlot::FSub);
+            case MirOpcode::FMul:   return lowerBinaryOp(id, MnemonicSlot::FMul);
+            case MirOpcode::FDiv:   return lowerBinaryOp(id, MnemonicSlot::FDiv);
+            case MirOpcode::FNeg:   return lowerUnaryOp(id, MnemonicSlot::FNeg);
+            // ── cycle 3d float casts (the 6 conversion variants) ───
+            case MirOpcode::FPTrunc: return lowerCast(id, MnemonicSlot::FpCvt,   "MIR FPTrunc");
+            case MirOpcode::FPExt:   return lowerCast(id, MnemonicSlot::FpCvt,   "MIR FPExt");
+            case MirOpcode::FPToSI:  return lowerCast(id, MnemonicSlot::FpToSi,  "MIR FPToSI");
+            case MirOpcode::FPToUI:  return lowerCast(id, MnemonicSlot::FpToUi,  "MIR FPToUI");
+            case MirOpcode::SIToFP:  return lowerCast(id, MnemonicSlot::SiToFp,  "MIR SIToFP");
+            case MirOpcode::UIToFP:  return lowerCast(id, MnemonicSlot::UiToFp,  "MIR UIToFP");
             default: break;
         }
         reportUnsupported(op, id);
@@ -267,7 +325,11 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Arg, "MIR Arg");
             return;
         }
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        // Cycle 3d: Arg's result reg class follows the parameter type
+        // (F32/F64 → FPR; integer/ptr → GPR). ML7 callconv lowering
+        // reads the result class to pick the right arg-passing
+        // register per the cycle-2b TargetCallingConvention.
+        LirReg const result = lir.newVReg(regClassFor(id));
         lir.addInst(*opcode(MnemonicSlot::Arg), result, std::span<LirOperand const>{},
                     /*payload=*/mir.argIndex(id));
         defineValue(id, result);
@@ -321,6 +383,9 @@ struct Lowerer {
             fits  = true;
         }
         if (fits) {
+            // Narrow integer literal — GPR-class regardless of the
+            // declared MIR type since the immediate IS an integer.
+            // (Bool literals are also routed here as 0/1.)
             emitMovToFresh(id, LirOperand::makeImmInt32(imm32), LirRegClass::GPR);
             return;
         }
@@ -328,31 +393,22 @@ struct Lowerer {
         // ── wide-literal path: route through LirLiteralPool ──
         //
         // Routing: int32-fits → ImmInt (above); int64/uint64/string →
-        // pool with GPR-class result; double → DEFERRED to cycle 3d
-        // (needs FPR-class regalloc + ML6 movd/movq cross-class moves);
-        // monostate / aggregate → unsupported (cycle 3d's aggregate
-        // op flow will land MirAggregate). On the unsupported branch
-        // we still define a poisoned vreg so downstream uses surface
-        // ONE locatable diagnostic for the root cause rather than a
-        // cascade of "used before definition" diagnostics from each
-        // dependent use.
+        // pool with GPR-class result; double → pool with FPR-class
+        // result (cycle 3d enabled FPR consumption + the cross-class
+        // movq path for downstream Bitcast); monostate / aggregate →
+        // unsupported + poison so dependent uses surface ONE root-cause
+        // diagnostic rather than a cascade of "used before definition".
         LirLiteralValue lirLit;
         lirLit.core = lit.core;
-        LirRegClass resultCls = LirRegClass::GPR;
+        LirRegClass resultCls = regClassFor(id);
         bool unsupportedVariant = false;
         if (auto const* i = std::get_if<std::int64_t>(&lit.value))       lirLit.value = *i;
         else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) lirLit.value = *u;
+        else if (auto const* d = std::get_if<double>(&lit.value))        lirLit.value = *d;
         else if (auto const* s = std::get_if<std::string>(&lit.value))   lirLit.value = *s;
-        else if (std::get_if<double>(&lit.value) != nullptr) {
-            // Defer to cycle 3d: writing a double into a GPR-class
-            // vreg would silently corrupt the FPR-bound consumer that
-            // cycle-3d float arithmetic introduces. Cycle 3c does NOT
-            // have FPR-class machinery yet.
-            unsupportedVariant = true;
-        }
         else {
             // monostate (malformed-source recovery), aggregate (cycle
-            // 3d), or any future variant arm: fail loud + poison.
+            // 3e), or any future variant arm: fail loud + poison.
             unsupportedVariant = true;
         }
         if (unsupportedVariant) {
@@ -421,12 +477,9 @@ struct Lowerer {
         if (operands.empty()) { reportUnsupported(MirOpcode::Gep, id); return; }
         std::optional<LirReg> const base = regForValue(operands[0]);
         if (!base.has_value()) return;
-        // Cycle 3c handles ONLY the no-index degenerate (1 operand =
-        // just the base) — emit an explicit identity `mov result, base`
-        // rather than `lea result, [base + 0]`. The identity-mov makes
-        // the no-op visible at the LIR level + reuses ML6's coalescer
-        // path already required for cycle-3c Bitcast/IntToPtr/PtrToInt.
-        // Dynamic indices defer to cycle 3d's 4-operand `lea` arm.
+        // No-index degenerate: emit explicit `mov result, base` rather
+        // than `lea result, [base + 0]` so the identity is visible at
+        // LIR and reuses ML6's coalescer path.
         if (operands.size() == 1) {
             if (!opcode(MnemonicSlot::Mov).has_value()) {
                 reportMissingOpcode(MnemonicSlot::Mov, "MIR Gep (no-index)");
@@ -435,14 +488,41 @@ struct Lowerer {
             emitMovToFresh(id, LirOperand::makeReg(*base), LirRegClass::GPR);
             return;
         }
-        // Dynamic-index Gep (≥2 operands) — anchor for cycle 3d.
+        // Cycle 3d: dynamic-index Gep with a single index. Emits
+        // `lea result, [base + index*1 + 0]` via the 4-operand `lea`
+        // form (`[base_reg, index_reg, MemBase(scale=1), MemOffset(0)]`).
+        // The scale defaults to 1 for cycle 3d; element-size-driven
+        // scales (sizeof(T) for typed-array Gep) co-design with ML6's
+        // address-mode synthesis. Multi-index Gep — multiple
+        // dereferences — folds into a chain at the optimizer layer.
+        if (operands.size() == 2) {
+            if (!opcode(MnemonicSlot::Lea).has_value()) {
+                reportMissingOpcode(MnemonicSlot::Lea, "MIR Gep (dynamic-index)");
+                return;
+            }
+            std::optional<LirReg> const index = regForValue(operands[1]);
+            if (!index.has_value()) return;
+            LirReg const result = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 4> ops{
+                LirOperand::makeReg(*base),
+                LirOperand::makeReg(*index),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            lir.addInst(*opcode(MnemonicSlot::Lea), result, ops);
+            defineValue(id, result);
+            return;
+        }
+        // Multi-index Gep (≥3 operands) — defer to cycle 3e (the
+        // optimizer or a Gep-flattening pass is the natural consumer
+        // since chains of dereferences need address-mode synthesis).
         reportUnsupported(MirOpcode::Gep, id);
     }
 
-    // Single-operand value-producing cast. The result register class +
-    // width come from the inst's MIR type (ML6/AS1 reads it); cycle 3c
-    // emits as `<slot> result, src` and lets the downstream encoder
-    // resolve to movsx/movzx/mov.
+    // Single-operand value-producing cast. The result register class
+    // follows the MIR result type (FPR for float-result casts; GPR
+    // otherwise). Cycle 3d's float casts (FpCvt/FpToSi/FpToUi/SiToFp/
+    // UiToFp) all land here.
     void lowerCast(MirInstId id, MnemonicSlot slot, std::string_view context) {
         if (!opcode(slot).has_value()) {
             reportMissingOpcode(slot, context);
@@ -455,7 +535,38 @@ struct Lowerer {
         }
         std::optional<LirReg> const src = regForValue(operands[0]);
         if (!src.has_value()) return;
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        LirReg const result = lir.newVReg(regClassFor(id));
+        std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
+        lir.addInst(*opcode(slot), result, ops);
+        defineValue(id, result);
+    }
+
+    // Bitcast lowering — closes the cycle-3c-anchored hazard 3 review
+    // agents flagged. If src + dst share a register class (GPR↔GPR or
+    // FPR↔FPR), emit a plain `mov` (bit-pattern-preserving). If they
+    // differ, emit `movq_xclass` (cycle-3d cross-class move that AS1
+    // maps to x86_64 `movq xmm,rax` or `movq rax,xmm`). A regression
+    // omitting the cross-class case would silently mis-lower float
+    // reinterpretation.
+    void lowerBitcast(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::Bitcast, id);
+            return;
+        }
+        std::optional<LirReg> const src = regForValue(operands[0]);
+        if (!src.has_value()) return;
+        LirRegClass const srcCls = src->regClass();
+        LirRegClass const dstCls = regClassFor(id);
+        MnemonicSlot const slot =
+            (srcCls == dstCls) ? MnemonicSlot::Mov : MnemonicSlot::MovqXClass;
+        char const* const ctx =
+            (srcCls == dstCls) ? "MIR Bitcast (same-class)" : "MIR Bitcast (cross-class)";
+        if (!opcode(slot).has_value()) {
+            reportMissingOpcode(slot, ctx);
+            return;
+        }
+        LirReg const result = lir.newVReg(dstCls);
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*src)};
         lir.addInst(*opcode(slot), result, ops);
         defineValue(id, result);
@@ -475,8 +586,31 @@ struct Lowerer {
         std::optional<LirReg> const a = regForValue(operands[0]);
         std::optional<LirReg> const b = regForValue(operands[1]);
         if (!a.has_value() || !b.has_value()) return;
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        // Cycle 3d: result reg class follows the MIR result type. F32/F64
+        // → FPR (float arithmetic); everything else → GPR.
+        LirReg const result = lir.newVReg(regClassFor(id));
         std::array<LirOperand, 2> ops{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
+        lir.addInst(*op, result, ops);
+        defineValue(id, result);
+    }
+
+    // Single-operand value-producing op (`not`, `neg`, `fneg`). Result
+    // reg class follows the MIR result type.
+    void lowerUnaryOp(MirInstId id, MnemonicSlot slot) {
+        auto const op = opcode(slot);
+        if (!op.has_value()) {
+            reportMissingOpcode(slot, mirOpcodeName(mir.instOpcode(id)));
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        std::optional<LirReg> const a = regForValue(operands[0]);
+        if (!a.has_value()) return;
+        LirReg const result = lir.newVReg(regClassFor(id));
+        std::array<LirOperand, 1> ops{LirOperand::makeReg(*a)};
         lir.addInst(*op, result, ops);
         defineValue(id, result);
     }
@@ -956,8 +1090,9 @@ struct Lowerer {
 
 MirToLirResult lowerToLir(Mir const&          mir,
                           TargetSchema const& target,
+                          TypeInterner const& interner,
                           DiagnosticReporter& reporter) {
-    Lowerer L{mir, target, reporter};
+    Lowerer L{mir, target, interner, reporter};
     return std::move(L).run();
 }
 

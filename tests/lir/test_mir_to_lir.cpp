@@ -65,7 +65,7 @@ struct Lowered {
     auto target = TargetSchema::loadShipped("x86_64");
     if (!target) { ADD_FAILURE() << "loadShipped(x86_64) failed"; std::abort(); }
     DiagnosticReporter lirReporter;
-    auto lir = lowerToLir(mir.mir, **target, lirReporter);
+    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -257,7 +257,7 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
     assertUpstreamClean(L);
 
     DiagnosticReporter rep;
-    auto result = lowerToLir(L.mir.mir, **incomplete, rep);
+    auto result = lowerToLir(L.mir.mir, **incomplete, L.model.lattice().interner(), rep);
     EXPECT_FALSE(result.ok);
     bool found = false;
     int  missingCount = 0;
@@ -277,10 +277,11 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
 }
 
 TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
-    // Cycle 3c lowers memory ops (Alloca/Load/Store/Gep) + cast (SExt/
-    // ZExt/Trunc/Bitcast/IntToPtr/PtrToInt). Still-deferred: Call (cycle
-    // 3d), bitwise ops (cycle 3d), float ops, aggregates. A direct
-    // function call is the cleanest cycle-3d-deferred trigger.
+    // Cycle 3d lowers bitwise + integer Neg + float arithmetic + float
+    // casts + cross-class Bitcast + dynamic-index Gep. Still-deferred:
+    // Call / IntrinsicCall / GlobalAddr (cycle 3e), ExtractValue /
+    // InsertValue aggregate ops (cycle 3e). A direct function call is
+    // the cleanest cycle-3e-deferred trigger.
     auto L = lowerCSubsetToLir(
         "int f(int x) { return x; }\n"
         "int g(int y) { return f(y); }\n");
@@ -653,7 +654,7 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
     ASSERT_TRUE(result.ok)
         << "wide-literal MIR Const must lower cleanly via the LIR literal pool";
 
@@ -680,6 +681,227 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
     EXPECT_TRUE(foundLitMov)
         << "wide-literal mov must use LirOperandKind::LiteralIndex (not ImmInt)";
     EXPECT_EQ(lir.literalPool().size(), 1u);
+}
+
+// ─── cycle 3d: bitwise + float arithmetic + cross-class Bitcast ──────────
+
+namespace {
+
+// Helper for cycle-3d synthetic-MIR tests: build a one-block function
+// with given parameter types, body emitter, and return type. Used by
+// bitwise + float + Bitcast tests since c-subset doesn't naturally
+// emit MIR bitwise / float ops yet.
+struct SyntheticFn {
+    ::dss::Mir          mir;
+    ::dss::TypeInterner interner;
+};
+
+template <class BodyFn>
+SyntheticFn buildSyntheticFn(
+    std::span<::dss::TypeKind const> paramKinds,
+    ::dss::TypeKind                  returnKind,
+    BodyFn&&                         body) {
+    SyntheticFn out{::dss::Mir{}, ::dss::TypeInterner{::dss::CompilationUnitId{1}}};
+    std::vector<::dss::TypeId> params;
+    params.reserve(paramKinds.size());
+    for (auto k : paramKinds) params.push_back(out.interner.primitive(k));
+    auto const retT = out.interner.primitive(returnKind);
+    auto const sig  = out.interner.fnSig(params, retT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    body(mb, out.interner, params, retT);
+    out.mir = std::move(mb).finish();
+    return out;
+}
+
+} // namespace
+
+TEST(MirToLir, IntegerBitwiseAndShiftLowerToBitwiseOpcodes) {
+    // Cycle 3d bitwise lowering: each MIR bitwise/shift op → its named
+    // LIR opcode. Synthetic MIR (2 params + bitwise op + return).
+    struct Case { ::dss::MirOpcode mir; char const* mnem; };
+    std::array<Case, 6> cases{{
+        {::dss::MirOpcode::And,  "and"},
+        {::dss::MirOpcode::Or,   "or"},
+        {::dss::MirOpcode::Xor,  "xor"},
+        {::dss::MirOpcode::Shl,  "shl"},
+        {::dss::MirOpcode::LShr, "shr_l"},
+        {::dss::MirOpcode::AShr, "shr_a"},
+    }};
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    for (auto const& c : cases) {
+        std::array<::dss::TypeKind, 2> paramKinds{::dss::TypeKind::I32, ::dss::TypeKind::I32};
+        auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::I32,
+            [&](::dss::MirBuilder& mb, ::dss::TypeInterner& itn,
+                std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
+                ::dss::MirInstId const a = mb.addArg(0, params[0]);
+                ::dss::MirInstId const b = mb.addArg(1, params[1]);
+                std::array<::dss::MirInstId, 2> ops{a, b};
+                ::dss::MirInstId const op = mb.addInst(c.mir, ops, retT);
+                mb.addReturn(op);
+                (void)itn;
+            });
+        ::dss::DiagnosticReporter rep;
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        ASSERT_TRUE(result.ok) << "bitwise " << c.mnem << " must lower cleanly";
+        auto const expectedOp = *sch.opcodeByMnemonic(c.mnem);
+        ::dss::Lir const& lir = result.lir;
+        LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+        bool found = false;
+        for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+            if (lir.instOpcode(lir.blockInstAt(entry, i)) == expectedOp) {
+                found = true;
+                EXPECT_EQ(lir.instResult(lir.blockInstAt(entry, i)).regClass(),
+                          LirRegClass::GPR)
+                    << "bitwise " << c.mnem << " must produce GPR-class result";
+                break;
+            }
+        }
+        EXPECT_TRUE(found) << "missing opcode `" << c.mnem << "`";
+    }
+}
+
+TEST(MirToLir, IntegerNotAndNegLowerToUnaryOpcodes) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    struct Case { ::dss::MirOpcode mir; char const* mnem; };
+    std::array<Case, 2> cases{{
+        {::dss::MirOpcode::Not, "not"},
+        {::dss::MirOpcode::Neg, "neg"},
+    }};
+    for (auto const& c : cases) {
+        std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I32};
+        auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::I32,
+            [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+                std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
+                ::dss::MirInstId const a = mb.addArg(0, params[0]);
+                std::array<::dss::MirInstId, 1> ops{a};
+                mb.addReturn(mb.addInst(c.mir, ops, retT));
+            });
+        ::dss::DiagnosticReporter rep;
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        ASSERT_TRUE(result.ok) << c.mnem;
+        ::dss::Lir const& lir = result.lir;
+        LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+        bool found = false;
+        for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+            if (lir.instOpcode(lir.blockInstAt(entry, i))
+                == *sch.opcodeByMnemonic(c.mnem)) { found = true; break; }
+        }
+        EXPECT_TRUE(found);
+    }
+}
+
+TEST(MirToLir, FloatArithmeticLowersToFPRClassResults) {
+    // Float arithmetic must produce FPR-class result vregs (cycle 3d's
+    // load-bearing claim — the LirRegClass dispatch hinges on
+    // `regClassForType` returning FPR for F64). Pin both the opcode
+    // mnemonic and the result reg class.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    struct Case { ::dss::MirOpcode mir; char const* mnem; std::size_t arity; };
+    std::array<Case, 5> cases{{
+        {::dss::MirOpcode::FAdd, "fadd", 2},
+        {::dss::MirOpcode::FSub, "fsub", 2},
+        {::dss::MirOpcode::FMul, "fmul", 2},
+        {::dss::MirOpcode::FDiv, "fdiv", 2},
+        {::dss::MirOpcode::FNeg, "fneg", 1},
+    }};
+    for (auto const& c : cases) {
+        std::vector<::dss::TypeKind> paramKinds(c.arity, ::dss::TypeKind::F64);
+        auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::F64,
+            [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+                std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
+                std::vector<::dss::MirInstId> args;
+                for (std::size_t i = 0; i < c.arity; ++i) args.push_back(mb.addArg(static_cast<std::uint32_t>(i), params[i]));
+                ::dss::MirInstId const op = mb.addInst(c.mir, args, retT);
+                mb.addReturn(op);
+            });
+        ::dss::DiagnosticReporter rep;
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        ASSERT_TRUE(result.ok) << c.mnem;
+        auto const expectedOp = *sch.opcodeByMnemonic(c.mnem);
+        ::dss::Lir const& lir = result.lir;
+        LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+        bool foundFprResult = false;
+        for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+            LirInstId const inst = lir.blockInstAt(entry, i);
+            if (lir.instOpcode(inst) == expectedOp) {
+                EXPECT_EQ(lir.instResult(inst).regClass(), LirRegClass::FPR)
+                    << "float arithmetic `" << c.mnem
+                    << "` must produce an FPR-class result";
+                foundFprResult = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(foundFprResult);
+    }
+}
+
+TEST(MirToLir, BitcastCrossClassEmitsMovqXClass) {
+    // The cycle-3c-anchored cross-class Bitcast hazard: F64 → I64 must
+    // emit `movq_xclass` (not plain `mov`) because the source register
+    // class differs from the destination class. The cycle-3c lowering
+    // unconditionally emitted `mov` regardless of class — silently
+    // wrong for cross-class. Cycle 3d closes this via the regClassFor
+    // check in `lowerBitcast`.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::F64};
+    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::I64,
+        [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+            std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            std::array<::dss::MirInstId, 1> ops{a};
+            mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
+        });
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+    ASSERT_TRUE(result.ok);
+    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
+    ::dss::Lir const& lir = result.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    bool foundXClass = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(entry, i)) == movqOp) {
+            foundXClass = true; break;
+        }
+    }
+    EXPECT_TRUE(foundXClass)
+        << "FPR→GPR Bitcast must emit `movq_xclass`, not plain `mov`";
+}
+
+TEST(MirToLir, BitcastSameClassStaysAsMov) {
+    // Positive control: I64 → Ptr (both GPR-class) emits `mov`, not
+    // `movq_xclass`. Pins the class-symmetry branch.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    std::array<::dss::TypeKind, 1> paramKinds{::dss::TypeKind::I64};
+    auto syn = buildSyntheticFn(paramKinds, ::dss::TypeKind::Ptr,
+        [&](::dss::MirBuilder& mb, ::dss::TypeInterner&,
+            std::vector<::dss::TypeId> const& params, ::dss::TypeId retT) {
+            ::dss::MirInstId const a = mb.addArg(0, params[0]);
+            std::array<::dss::MirInstId, 1> ops{a};
+            mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
+        });
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+    ASSERT_TRUE(result.ok);
+    auto const movqOp = *sch.opcodeByMnemonic("movq_xclass");
+    ::dss::Lir const& lir = result.lir;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        EXPECT_NE(lir.instOpcode(lir.blockInstAt(entry, i)), movqOp)
+            << "same-class Bitcast must use `mov`, not `movq_xclass`";
+    }
 }
 
 // ─── cycle 3c review fold-in: cast variant → opcode mapping ─────────────
@@ -723,7 +945,7 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonic) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
     ASSERT_TRUE(result.ok)
         << "cast (MirOpcode " << static_cast<int>(param.mirOp) << ")"
         << " must lower cleanly via mnemonic `" << param.expectedMnemonic << "`";
@@ -775,7 +997,7 @@ TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
     ASSERT_TRUE(result.ok);
     ::dss::Lir const& lir = result.lir;
     ASSERT_EQ(lir.literalPool().size(), 1u);
@@ -785,10 +1007,11 @@ TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     EXPECT_EQ(*asStr, "hello world");
 }
 
-TEST(MirToLir, WideLiteralDoubleDefersToCycle3d) {
-    // Pin the cycle-3c double-deferral: a double literal must
-    // fail-loud rather than silently route to a GPR-class vreg
-    // (which would corrupt FPR-bound consumers once cycle 3d lands).
+TEST(MirToLir, WideLiteralDoubleRoutesThroughFprLiteralPool) {
+    // Cycle 3d enabled double-literal lowering: F64 MIR Const flows
+    // through the LirLiteralPool with an FPR-class result register
+    // (the cycle-3c stub previously fail-loud-deferred this case
+    // because no FPR-class machinery existed). Pin the result is FPR.
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
@@ -808,16 +1031,33 @@ TEST(MirToLir, WideLiteralDoubleDefersToCycle3d) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, rep);
-    EXPECT_FALSE(result.ok)
-        << "double literal must fail-loud (cycle 3d adds FPR-class machinery)";
-    bool foundUnsupported = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == ::dss::DiagnosticCode::L_UnsupportedLoweringForOpcode) {
-            foundUnsupported = true; break;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "F64 literal must lower cleanly via FPR-class + LirLiteralPool";
+
+    // The pool must contain the double, and the mov's result must be
+    // FPR-class (regClassForType maps F64 → FPR).
+    ::dss::Lir const& lir = result.lir;
+    ASSERT_EQ(lir.literalPool().size(), 1u);
+    auto const* asDbl = std::get_if<double>(&lir.literalValue(0).value);
+    ASSERT_NE(asDbl, nullptr);
+    EXPECT_DOUBLE_EQ(*asDbl, 3.14);
+
+    auto const movOp = *sch.opcodeByMnemonic("mov");
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    bool foundFprMov = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        if (lir.instOpcode(inst) != movOp) continue;
+        auto const ops = lir.instOperands(inst);
+        if (ops.size() == 1 && ops[0].kind == LirOperandKind::LiteralIndex) {
+            EXPECT_EQ(lir.instResult(inst).regClass(), LirRegClass::FPR)
+                << "double literal must materialize into an FPR-class vreg";
+            foundFprMov = true;
+            break;
         }
     }
-    EXPECT_TRUE(foundUnsupported);
+    EXPECT_TRUE(foundFprMov);
 }
 
 TEST(MirToLir, LinkRegisterUnknownNameRejectedNegativePath) {

@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
 #include "mir/mir.hpp"
 
@@ -47,11 +48,19 @@ struct DSS_EXPORT MirToLirResult {
 // block with a `ret` terminator so `LirBuilder::finish()` does not abort
 // in error paths.
 //
+// `interner` is the CU's type interner — cycle 3d uses it to classify
+// MIR values into `LirRegClass` (Float/Double → FPR, everything else
+// → GPR), driving correct vreg allocation for float arithmetic, float
+// casts, and cross-class Bitcast. Read-only here (the lowerer never
+// mints new types); matches the pattern in `lowerToMir` from ML2.
+//
 // Threading: single-pass, single-threaded, no global state. The caller
-// owns `mir` + `target` + `reporter`; the returned `Lir` is move-owned.
+// owns `mir` + `target` + `interner` + `reporter`; the returned `Lir`
+// is move-owned.
 [[nodiscard]] DSS_EXPORT MirToLirResult
 lowerToLir(Mir const&          mir,
            TargetSchema const& target,
+           TypeInterner const& interner,
            DiagnosticReporter& reporter);
 
 } // namespace dss
