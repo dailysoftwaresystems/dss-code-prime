@@ -172,6 +172,30 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 }
             }
 
+            // ── Silent-failure M-1: fixed32 register-only guard ─────
+            // Cycle-3 fixed32 walker rejects non-Reg operands at
+            // runtime (it has no immediate-slot support yet — Imm12
+            // / ImmShift land alongside their ARM64 consumer cycle).
+            // Surfacing at schema-load time catches a misauthored
+            // variant once, not per-instruction.
+            if (o.encoding.shape == TargetEncodingShape::Fixed32) {
+                for (std::size_t ki = 0; ki < v.operandKinds.size(); ++ki) {
+                    if (v.operandKinds[ki] != OperandKindFilter::Reg) {
+                        fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", i, vi, ki),
+                             std::format("opcode '{}' variant {}: "
+                                         "fixed32 cycle-3 scope is "
+                                         "register-only — operand "
+                                         "kind '{}' at position {} "
+                                         "needs an immediate-slot "
+                                         "walker (Imm12 / ImmShift) "
+                                         "not yet shipped",
+                                         o.mnemonic, vi,
+                                         operandKindFilterName(v.operandKinds[ki]),
+                                         ki));
+                    }
+                }
+            }
+
             // ── Architect AS3 followup: shape-vs-slot cross-check ───
             // Each `EncodingSlotKind` belongs to ONE shape. A variant
             // declaring `modrm.rm` under a `fixed32`-shape opcode (or

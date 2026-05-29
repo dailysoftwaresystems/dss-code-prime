@@ -1,5 +1,6 @@
 #include "asm/format/fixed32.hpp"
 
+#include "asm/format/byte_emit.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -113,12 +114,8 @@ windowFor(EncodingSlotKind s) noexcept {
     return std::nullopt;
 }
 
-void appendWordLE(std::vector<std::uint8_t>& out, std::uint32_t v) {
-    out.push_back(static_cast<std::uint8_t>(v         & 0xFF));
-    out.push_back(static_cast<std::uint8_t>((v >>  8) & 0xFF));
-    out.push_back(static_cast<std::uint8_t>((v >> 16) & 0xFF));
-    out.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFF));
-}
+// (LE byte emission moved to `asm/format/byte_emit.hpp` — shared with
+// the x86_variable walker.)
 
 } // namespace
 
@@ -250,7 +247,7 @@ bool encode(Lir const&                  lir,
         }
     }
 
-    appendWordLE(out, word);
+    asm_byte_emit::appendU32LE(out, word);
     return true;
 }
 

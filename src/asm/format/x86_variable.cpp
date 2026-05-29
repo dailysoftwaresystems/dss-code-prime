@@ -1,5 +1,6 @@
 #include "asm/format/x86_variable.hpp"
 
+#include "asm/format/byte_emit.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -83,14 +84,8 @@ hwEncodingOf(LirReg reg, TargetSchema const& schema,
     return static_cast<std::uint8_t>(info->hwEncoding);
 }
 
-// Append an `int32_t` immediate in little-endian byte order.
-void appendImm32LE(std::vector<std::uint8_t>& out, std::int32_t v) {
-    auto const u = static_cast<std::uint32_t>(v);
-    out.push_back(static_cast<std::uint8_t>(u         & 0xFF));
-    out.push_back(static_cast<std::uint8_t>((u >>  8) & 0xFF));
-    out.push_back(static_cast<std::uint8_t>((u >> 16) & 0xFF));
-    out.push_back(static_cast<std::uint8_t>((u >> 24) & 0xFF));
-}
+// (LE byte emission moved to `asm/format/byte_emit.hpp` — shared with
+// the fixed32 walker.)
 
 // State accumulated while emitting one variant: the 3-bit codes
 // destined for ModR/M.reg / ModR/M.rm + their high bits for REX.R /
@@ -344,7 +339,7 @@ bool encode(Lir const&                  lir,
 
     // 7) Immediates: append in slot-wiring order.
     for (auto v : st.imm32s) {
-        appendImm32LE(out, v);
+        asm_byte_emit::appendImm32LE(out, v);
     }
 
     return true;
