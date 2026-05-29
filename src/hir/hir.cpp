@@ -1,11 +1,11 @@
 #include "hir/hir.hpp"
 
-#include <atomic>
+#include "core/substrate/mint_monotonic_id.hpp"
+
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <limits>
 #include <utility>
 #include <vector>
 
@@ -120,19 +120,13 @@ std::span<HirNodeId const> Hir::children(HirNodeId id) const {
 // ── HirBuilder ──────────────────────────────────────────────────────────────
 
 HirModuleId HirBuilder::nextModuleId() noexcept {
-    static std::atomic<std::uint32_t> sCounter{0};
-    // Overflow guard: a wrapped counter would mint HirModuleId{0} (==
-    // InvalidHirModule) and stamp `arenaTag = 0` on every emitted HirNodeId,
-    // which the cross-arena guard treats as "untagged" and lets pass —
-    // SILENTLY defeating cross-module isolation. Practically unreachable, but a
-    // standing fail-loud invariant.
-    std::uint32_t const prev = sCounter.load(std::memory_order_relaxed);
-    if (prev == std::numeric_limits<std::uint32_t>::max()) {
-        std::fputs("dss::HirBuilder fatal: nextModuleId counter exhausted "
-                   "(uint32 overflow)\n", stderr);
-        std::abort();
-    }
-    return HirModuleId{++sCounter};
+    // Overflow guard lives in `substrate::mintMonotonicId` — a wrapped
+    // counter would mint `HirModuleId{0}` (== `InvalidHirModule`) and
+    // stamp `arenaTag = 0` on every emitted HirNodeId, which the
+    // cross-arena guard treats as "untagged" and lets pass — SILENTLY
+    // defeating cross-module isolation. The shared minter aborts loud
+    // on uint32 overflow before that can happen.
+    return substrate::mintMonotonicId<HirModuleId>();
 }
 
 HirBuilder::HirBuilder(std::string sourceLanguage)

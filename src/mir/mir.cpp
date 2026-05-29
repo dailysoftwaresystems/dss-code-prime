@@ -1,9 +1,9 @@
 #include "mir/mir.hpp"
 
-#include <atomic>
+#include "core/substrate/mint_monotonic_id.hpp"
+
 #include <cstdio>
 #include <cstdlib>
-#include <limits>
 #include <utility>
 
 namespace dss {
@@ -299,14 +299,10 @@ MirGlobalId Mir::globalAt(std::uint32_t i) const {
 // ── MirBuilder ──────────────────────────────────────────────────────────────
 
 MirModuleId MirBuilder::nextModuleId() noexcept {
-    static std::atomic<std::uint32_t> sCounter{0};
-    std::uint32_t const prev = sCounter.load(std::memory_order_relaxed);
-    if (prev == std::numeric_limits<std::uint32_t>::max()) {
-        std::fputs("dss::MirBuilder fatal: nextModuleId counter exhausted (uint32 overflow)\n",
-                   stderr);
-        std::abort();
-    }
-    return MirModuleId{++sCounter};
+    // Overflow guard lives in `substrate::mintMonotonicId` — see
+    // `HirBuilder::nextModuleId` for the silent-defeat-of-cross-module-
+    // isolation rationale this guard exists for.
+    return substrate::mintMonotonicId<MirModuleId>();
 }
 
 MirBuilder::MirBuilder() : MirBuilder(nextModuleId()) {}

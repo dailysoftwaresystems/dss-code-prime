@@ -1,7 +1,8 @@
 #include "core/types/source_buffer.hpp"
 
+#include "core/substrate/mint_monotonic_id.hpp"
+
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -14,12 +15,6 @@
 namespace dss {
 
 namespace {
-
-// Monotonic BufferId counter. Starts at 1 so 0 stays the InvalidBuffer sentinel.
-std::uint32_t nextBufferIdValue() {
-    static std::atomic<std::uint32_t> counter{0};
-    return ++counter;
-}
 
 [[noreturn]] void bufferFatal(char const* what) {
     std::fputs("dss::SourceBuffer fatal: ", stderr);
@@ -86,7 +81,7 @@ std::shared_ptr<SourceBuffer> SourceBuffer::fromFile(std::filesystem::path const
     enforceSizeLimit(contents.size());
     // Use new-delete-friendly construction since the constructor is private.
     return std::shared_ptr<SourceBuffer>(
-        new SourceBuffer(BufferId{nextBufferIdValue()},
+        new SourceBuffer(substrate::mintMonotonicId<BufferId>(),
                          std::move(contents),
                          path.string()));
 }
@@ -94,7 +89,7 @@ std::shared_ptr<SourceBuffer> SourceBuffer::fromFile(std::filesystem::path const
 std::shared_ptr<SourceBuffer> SourceBuffer::fromString(std::string text, std::string name) {
     enforceSizeLimit(text.size());
     return std::shared_ptr<SourceBuffer>(
-        new SourceBuffer(BufferId{nextBufferIdValue()},
+        new SourceBuffer(substrate::mintMonotonicId<BufferId>(),
                          std::move(text),
                          std::move(name)));
 }

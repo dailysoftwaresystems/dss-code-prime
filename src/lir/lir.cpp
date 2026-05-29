@@ -1,7 +1,8 @@
 #include "lir/lir.hpp"
 
+#include "core/substrate/mint_monotonic_id.hpp"
+
 #include <array>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -100,19 +101,8 @@ LirFuncId Lir::funcAt(std::uint32_t i) const {
 
 // ── LirBuilder ──────────────────────────────────────────────────
 
-namespace {
-// Monotonic LirModuleId counter (one tag per builder lifetime).
-// Atomic so concurrent builders (e.g. cross-compile: one builder per
-// target) get distinct ids without a data race — symmetry with
-// `mintTargetSchemaId`.
-std::uint32_t mintLirModuleId() noexcept {
-    static std::atomic<std::uint32_t> counter{0};
-    return counter.fetch_add(1, std::memory_order_relaxed) + 1;
-}
-} // namespace
-
 LirBuilder::LirBuilder(TargetSchema const& schema)
-    : moduleId_(mintLirModuleId()),
+    : moduleId_(substrate::mintMonotonicId<LirModuleId>()),
       target_(schema),
       instArena_(moduleId_),
       blockArena_(moduleId_),

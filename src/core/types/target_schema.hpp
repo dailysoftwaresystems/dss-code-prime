@@ -21,13 +21,10 @@
 // `*.target.json` in `src/dss-config/targets/`; nothing in the
 // substrate or LIR builder changes.
 //
-// Why config-driven (vs the cycle-1 hardcoded `targets/x86_64.hpp`):
-// the standing project directive — "config-driven, no per-language
-// C++" — extends naturally to compile targets. A backend ISA is just
-// a schema like a frontend grammar: a closed opcode vocabulary with
-// per-opcode operand-arity / result-rule / terminator-flag, a
-// register file, a calling convention. Cycle 1 baked these into
-// C++ (`targets/x86_64.hpp`); cycle 2 lifts them into JSON.
+// Cycle 2a (commit 2609b70): opcode table + slot-0 invalid sentinel.
+// Cycle 2b (this revision):  physical register file + calling
+// conventions. ML6 regalloc consumes the register file; ML7 callconv
+// lowering consumes the calling-convention sections.
 //
 // Lifecycle: `loadShipped` / `loadFromFile` / `loadFromText` mirror
 // `GrammarSchema`'s loaders verbatim. Each call returns a freshly-
@@ -53,6 +50,68 @@ enum class TargetResultRule : std::uint8_t {
     return "none";
 }
 
+// Register-class envelope (universal — every target maps its concrete
+// register classes to this set; the LIR substrate sees only the envelope).
+// Mirrors `LirRegClass` in `src/lir/lir_reg.hpp` — kept as a separate
+// definition here so `core/types/target_schema.hpp` does not need to
+// pull in the LIR substrate (header-include direction is core ← LIR).
+enum class TargetRegClass : std::uint8_t {
+    None  = 0,
+    GPR   = 1,
+    FPR   = 2,
+    VR    = 3,
+    Flags = 4,
+};
+
+[[nodiscard]] constexpr std::string_view targetRegClassName(TargetRegClass c) noexcept {
+    switch (c) {
+        case TargetRegClass::None:  return "none";
+        case TargetRegClass::GPR:   return "gpr";
+        case TargetRegClass::FPR:   return "fpr";
+        case TargetRegClass::VR:    return "vr";
+        case TargetRegClass::Flags: return "flags";
+    }
+    return "none";
+}
+
+// Per-physical-register descriptor. Position in the schema's `registers`
+// vector is the register's numeric ordinal (consumed by `LirReg::id` once
+// regalloc lands in ML6). A register's mnemonic name (`"rdi"` / `"xmm0"`)
+// is the JSON-side identifier — calling-convention sections reference
+// registers by name.
+struct DSS_EXPORT TargetRegisterInfo {
+    std::string    name;          // canonical mnemonic ("rax" / "xmm0" / ...)
+    TargetRegClass regClass = TargetRegClass::None;
+    // `subOf` lets a target declare aliasing relationships ("eax" is the
+    // low 32 bits of "rax"). For ML6 regalloc to track full clobber sets
+    // correctly. Empty when this register is independent.
+    std::string    subOf;
+    // 16/8/4/1 etc. — width in bytes. Required so ML6 knows spill-slot
+    // sizing without re-deriving it from the regClass.
+    std::uint16_t  widthBytes = 0;
+    // Hardware encoding (e.g. ModR/M ordinal on x86) — opaque to the
+    // substrate; AS1 assembler reads this directly to emit machine code.
+    std::uint16_t  hwEncoding = 0;
+};
+
+// One calling convention. A target may declare multiple (SysV AMD64,
+// Microsoft x64, fastcall, ...); the front-end picks one via attribute /
+// driver flag. The `argGprs` / `argFprs` ordering is significant — the
+// caller must place int args in those registers in that order, spilling
+// to the stack when the register set is exhausted.
+struct DSS_EXPORT TargetCallingConvention {
+    std::string name;                     // "sysv_amd64" / "ms_x64" / ...
+    std::vector<std::string> argGprs;     // arg-passing integer registers, in order
+    std::vector<std::string> argFprs;     // arg-passing floating-point registers, in order
+    std::vector<std::string> returnGprs;  // integer-return registers (rax/rdx on SysV; rax on MS)
+    std::vector<std::string> returnFprs;  // float-return registers
+    std::vector<std::string> callerSaved; // volatile across calls (caller must spill if reused)
+    std::vector<std::string> calleeSaved; // non-volatile (callee must restore on return)
+    std::uint16_t stackAlignment   = 0;   // alignment of RSP at call site (16 on SysV/MS x64)
+    std::uint16_t shadowSpaceBytes = 0;   // MS x64: 32 bytes of home space; SysV: 0
+    std::uint16_t redZoneBytes     = 0;   // SysV leaf-fn red zone (128); MS x64: 0
+};
+
 // Per-opcode descriptor — populated from the JSON `opcodes` array.
 // One row per opcode; index in the vector IS the opcode's numeric
 // value (stored as `std::uint16_t` in the LIR instruction PODs).
@@ -75,6 +134,39 @@ struct DSS_EXPORT TargetOpcodeInfo {
 
 namespace detail {
 
+// Heterogeneous-lookup support for `mnemonicIndex`. Lets
+// `opcodeByMnemonic(string_view)` look up without allocating a
+// `std::string` per call (matters once cycle 3 isel pattern-matching
+// queries the index per emitted instruction).
+struct DSS_EXPORT TransparentStringHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+    std::size_t operator()(std::string const& s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+    std::size_t operator()(char const* s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+struct DSS_EXPORT TransparentStringEq {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
+};
+
+using MnemonicIndexMap = std::unordered_map<
+    std::string, std::uint16_t,
+    TransparentStringHash, TransparentStringEq>;
+
+using RegisterIndexMap = std::unordered_map<
+    std::string, std::uint16_t,
+    TransparentStringHash, TransparentStringEq>;
+
+using CallingConventionIndexMap = std::unordered_map<
+    std::string, std::uint16_t,
+    TransparentStringHash, TransparentStringEq>;
+
 // In-memory schema. Mirrors `detail::GrammarSchemaData` — owned-by-
 // value POD the loader builds + moves into the frozen `TargetSchema`.
 // Hidden in `detail::` so it can only be constructed by the loader
@@ -92,11 +184,26 @@ struct DSS_EXPORT TargetSchemaData {
     // unconditionally invalid via the addInst guard, not via these
     // fields.
     std::vector<TargetOpcodeInfo> opcodes;
+    MnemonicIndexMap              mnemonicIndex;
 
-    // Mnemonic → index lookup (for builder/text-format/isel consumers
-    // that have a string and need the numeric opcode). Built by the
-    // loader and frozen alongside `opcodes`.
-    std::unordered_map<std::string, std::uint16_t> mnemonicIndex;
+    // Physical register file (cycle 2b). Empty when the target JSON
+    // omits the `registers` array — keeps the cycle 2a-shape targets
+    // valid until ML6 regalloc requires the section.
+    std::vector<TargetRegisterInfo> registers;
+    RegisterIndexMap                registerIndex;
+
+    // Calling conventions (cycle 2b). Same optional-for-now discipline
+    // as `registers` — ML7 callconv lowering will require ≥1 entry.
+    std::vector<TargetCallingConvention> callingConventions;
+    CallingConventionIndexMap            callingConventionIndex;
+
+    // Cross-field invariants the loader cannot trivially express per
+    // field (operand min<=max; terminator implies minSuccessors>=1;
+    // register `subOf` references resolve; calling-convention register
+    // names resolve to entries in `registers`). Returns the list of
+    // problems; an empty result means the schema is well-formed. Called
+    // at the end of the JSON loader; never called by consumers.
+    [[nodiscard]] std::vector<std::string> validate() const;
 };
 
 } // namespace detail
@@ -118,6 +225,7 @@ public:
     [[nodiscard]] std::string_view  name()    const noexcept { return d_.name; }
     [[nodiscard]] std::string_view  version() const noexcept { return d_.version; }
 
+    // ── Opcodes ─────────────────────────────────────────────────
     [[nodiscard]] std::span<TargetOpcodeInfo const> opcodes() const noexcept {
         return d_.opcodes;
     }
@@ -138,16 +246,59 @@ public:
     }
 
     // Look up an opcode index by mnemonic. Returns nullopt for an
-    // unknown mnemonic. Used by isel pattern emission + text-format
-    // round-trip + tests.
+    // unknown mnemonic. Heterogeneous lookup — no `std::string`
+    // allocation per call.
     [[nodiscard]] std::optional<std::uint16_t> opcodeByMnemonic(
             std::string_view mnemonic) const noexcept {
-        auto it = d_.mnemonicIndex.find(std::string{mnemonic});
+        auto it = d_.mnemonicIndex.find(mnemonic);
         if (it == d_.mnemonicIndex.end()) return std::nullopt;
         return it->second;
     }
 
+    // ── Registers (cycle 2b) ────────────────────────────────────
+    [[nodiscard]] std::span<TargetRegisterInfo const> registers() const noexcept {
+        return d_.registers;
+    }
+    [[nodiscard]] std::size_t registerCount() const noexcept { return d_.registers.size(); }
+
+    // Look up by ordinal (index in the `registers` vector). Out-of-range
+    // returns nullptr.
+    [[nodiscard]] TargetRegisterInfo const* registerInfo(std::uint16_t ordinal) const noexcept {
+        return (ordinal < d_.registers.size()) ? &d_.registers[ordinal] : nullptr;
+    }
+
+    // Look up by name (heterogeneous; no allocation). Returns the
+    // ordinal that `registerInfo(ordinal)` expects.
+    [[nodiscard]] std::optional<std::uint16_t> registerByName(
+            std::string_view name) const noexcept {
+        auto it = d_.registerIndex.find(name);
+        if (it == d_.registerIndex.end()) return std::nullopt;
+        return it->second;
+    }
+
+    // ── Calling conventions (cycle 2b) ──────────────────────────
+    [[nodiscard]] std::span<TargetCallingConvention const> callingConventions() const noexcept {
+        return d_.callingConventions;
+    }
+    [[nodiscard]] std::size_t callingConventionCount() const noexcept {
+        return d_.callingConventions.size();
+    }
+
+    [[nodiscard]] TargetCallingConvention const* callingConvention(std::uint16_t i) const noexcept {
+        return (i < d_.callingConventions.size()) ? &d_.callingConventions[i] : nullptr;
+    }
+
+    [[nodiscard]] TargetCallingConvention const* callingConventionByName(
+            std::string_view name) const noexcept {
+        auto it = d_.callingConventionIndex.find(name);
+        if (it == d_.callingConventionIndex.end()) return nullptr;
+        return &d_.callingConventions[it->second];
+    }
+
     // ── Loaders ──────────────────────────────────────────────────
+    // `sourceLabel` defaults to `"<inline>"` for parity with
+    // `GrammarSchema::loadFromText`; callers parsing a file should pass
+    // the path so the diagnostic carries it.
     static LoadResult<std::shared_ptr<TargetSchema>> loadFromFile(
         std::filesystem::path const& path);
 
@@ -155,7 +306,7 @@ public:
         std::string_view name);
 
     static LoadResult<std::shared_ptr<TargetSchema>> loadFromText(
-        std::string_view jsonText, std::string_view sourceLabel);
+        std::string_view jsonText, std::string_view sourceLabel = "<inline>");
 
 private:
     detail::TargetSchemaData d_;

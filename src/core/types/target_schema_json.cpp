@@ -1,9 +1,10 @@
 #include "core/types/target_schema.hpp"
+
+#include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
 #include <nlohmann/json.hpp>
 
-#include <atomic>
 #include <cstdint>
 #include <format>
 #include <string>
@@ -28,11 +29,6 @@ struct Collector {
     if (s == "value")    return TargetResultRule::Value;
     if (s == "optional") return TargetResultRule::Optional;
     return std::nullopt;
-}
-
-[[nodiscard]] std::uint32_t mintTargetSchemaId() noexcept {
-    static std::atomic<std::uint32_t> counter{1};
-    return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace
@@ -70,7 +66,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     }
 
     detail::TargetSchemaData data;
-    data.id = TargetSchemaId{mintTargetSchemaId()};
+    data.id = substrate::mintMonotonicId<TargetSchemaId>();
 
     // ── target.name + target.version ──
     if (!doc.contains("target") || !doc.at("target").is_object()) {
@@ -181,6 +177,178 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       std::format("duplicate mnemonic '{}'", info.mnemonic));
         }
         data.opcodes.push_back(std::move(info));
+    }
+
+    // ── registers (cycle 2b — optional) ───────────────────────────
+    // Targets that haven't been promoted to a cycle-2b shape can omit
+    // `registers` entirely; ML6 regalloc rejects them at consumer time.
+    if (doc.contains("registers")) {
+        if (!doc.at("registers").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/registers",
+                      "'registers' must be an array");
+        } else {
+            auto const& regs = doc.at("registers");
+            data.registers.reserve(regs.size());
+            for (std::size_t i = 0; i < regs.size(); ++i) {
+                auto const& r = regs[i];
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registers/{}", i),
+                              "register entry must be an object");
+                    continue;
+                }
+                TargetRegisterInfo info;
+                if (!r.contains("name") || !r.at("name").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/registers/{}/name", i),
+                              "missing or non-string 'name'");
+                    continue;
+                }
+                info.name = r.at("name").get<std::string>();
+                if (r.contains("class") && r.at("class").is_string()) {
+                    auto const s = r.at("class").get<std::string>();
+                    if      (s == "gpr")   info.regClass = TargetRegClass::GPR;
+                    else if (s == "fpr")   info.regClass = TargetRegClass::FPR;
+                    else if (s == "vr")    info.regClass = TargetRegClass::VR;
+                    else if (s == "flags") info.regClass = TargetRegClass::Flags;
+                    else if (s == "none")  info.regClass = TargetRegClass::None;
+                    else {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/registers/{}/class", i),
+                                  "expected 'gpr' / 'fpr' / 'vr' / 'flags' / 'none'");
+                        continue;
+                    }
+                }
+                if (r.contains("subOf") && r.at("subOf").is_string()) {
+                    info.subOf = r.at("subOf").get<std::string>();
+                }
+                if (r.contains("widthBytes") && r.at("widthBytes").is_number_integer()) {
+                    std::int64_t const w = r.at("widthBytes").get<std::int64_t>();
+                    if (w < 0 || w > 0xFFFF) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/registers/{}/widthBytes", i),
+                                  "must fit in [0, 65535]");
+                        continue;
+                    }
+                    info.widthBytes = static_cast<std::uint16_t>(w);
+                }
+                if (r.contains("hwEncoding") && r.at("hwEncoding").is_number_integer()) {
+                    std::int64_t const e = r.at("hwEncoding").get<std::int64_t>();
+                    if (e < 0 || e > 0xFFFF) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/registers/{}/hwEncoding", i),
+                                  "must fit in [0, 65535]");
+                        continue;
+                    }
+                    info.hwEncoding = static_cast<std::uint16_t>(e);
+                }
+                std::uint16_t const ordinal =
+                    static_cast<std::uint16_t>(data.registers.size());
+                if (!data.registerIndex.emplace(info.name, ordinal).second) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registers/{}/name", i),
+                              std::format("duplicate register name '{}'", info.name));
+                }
+                data.registers.push_back(std::move(info));
+            }
+        }
+    }
+
+    // ── callingConventions (cycle 2b — optional) ───────────────────
+    if (doc.contains("callingConventions")) {
+        if (!doc.at("callingConventions").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/callingConventions",
+                      "'callingConventions' must be an array");
+        } else {
+            auto const& ccs = doc.at("callingConventions");
+            data.callingConventions.reserve(ccs.size());
+            auto readStringArray = [&](json const& root,
+                                       std::size_t  ci,
+                                       char const*  field,
+                                       std::vector<std::string>& out) {
+                if (!root.contains(field)) return;
+                if (!root.at(field).is_array()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/callingConventions/{}/{}", ci, field),
+                              "must be an array of strings");
+                    return;
+                }
+                for (auto const& s : root.at(field)) {
+                    if (!s.is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/callingConventions/{}/{}", ci, field),
+                                  "every entry must be a string");
+                        continue;
+                    }
+                    out.push_back(s.get<std::string>());
+                }
+            };
+            auto readU16 = [&](json const& root,
+                               std::size_t  ci,
+                               char const*  field,
+                               std::uint16_t& out) {
+                if (!root.contains(field)) return;
+                if (!root.at(field).is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/callingConventions/{}/{}", ci, field),
+                              "must be a non-negative integer");
+                    return;
+                }
+                std::int64_t const v = root.at(field).get<std::int64_t>();
+                if (v < 0 || v > 0xFFFF) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/callingConventions/{}/{}", ci, field),
+                              "must fit in [0, 65535]");
+                    return;
+                }
+                out = static_cast<std::uint16_t>(v);
+            };
+            for (std::size_t i = 0; i < ccs.size(); ++i) {
+                auto const& c = ccs[i];
+                if (!c.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/callingConventions/{}", i),
+                              "calling-convention entry must be an object");
+                    continue;
+                }
+                TargetCallingConvention cc;
+                if (!c.contains("name") || !c.at("name").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/callingConventions/{}/name", i),
+                              "missing or non-string 'name'");
+                    continue;
+                }
+                cc.name = c.at("name").get<std::string>();
+                readStringArray(c, i, "argGprs",     cc.argGprs);
+                readStringArray(c, i, "argFprs",     cc.argFprs);
+                readStringArray(c, i, "returnGprs",  cc.returnGprs);
+                readStringArray(c, i, "returnFprs",  cc.returnFprs);
+                readStringArray(c, i, "callerSaved", cc.callerSaved);
+                readStringArray(c, i, "calleeSaved", cc.calleeSaved);
+                readU16(c, i, "stackAlignment",   cc.stackAlignment);
+                readU16(c, i, "shadowSpaceBytes", cc.shadowSpaceBytes);
+                readU16(c, i, "redZoneBytes",     cc.redZoneBytes);
+
+                std::uint16_t const idx =
+                    static_cast<std::uint16_t>(data.callingConventions.size());
+                if (!data.callingConventionIndex.emplace(cc.name, idx).second) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/callingConventions/{}/name", i),
+                              std::format("duplicate calling-convention name '{}'", cc.name));
+                }
+                data.callingConventions.push_back(std::move(cc));
+            }
+        }
+    }
+
+    // ── Cross-field invariants (validate after per-field parse) ───
+    // Closes the gap the type-design review flagged: invariants that
+    // span multiple JSON paths (operand min<=max, terminator implies
+    // successor, register subOf resolution, calling-convention reg
+    // references) are enforced once at the end of parsing rather than
+    // smeared across per-field branches.
+    for (auto const& problem : data.validate()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel}, problem);
     }
 
     if (!coll.diagnostics.empty()) {

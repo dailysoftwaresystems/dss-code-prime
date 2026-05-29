@@ -1,9 +1,9 @@
 #include "core/types/tree_builder.hpp"
 
+#include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -133,8 +133,7 @@ TreeBuilder::Checkpoint::~Checkpoint() noexcept {
 // ─────────────────────────────────────────────────────────────────────────
 
 TreeId TreeBuilder::nextTreeId() noexcept {
-    static std::atomic<std::uint32_t> sCounter{0};
-    return TreeId{++sCounter};
+    return substrate::mintMonotonicId<TreeId>();
 }
 
 TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,

@@ -1,5 +1,6 @@
 #include "core/types/grammar_schema_json.hpp"
 
+#include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/rule_id.hpp"
@@ -10,7 +11,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <format>
@@ -1319,8 +1319,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     data.schemaVersion = schemaVer;
     // Per-instance monotonic schema id stamped onto every LexemeMeaning
     // so cross-schema misuse is catchable at the failing lookup.
-    static std::atomic<std::uint32_t> sNextSchemaId{1};
-    data.id            = SchemaId{sNextSchemaId.fetch_add(1, std::memory_order_relaxed)};
+    data.id            = substrate::mintMonotonicId<SchemaId>();
 
     if (langObj.contains("fileExtensions") && langObj.at("fileExtensions").is_array()) {
         for (auto const& ext : langObj.at("fileExtensions")) {

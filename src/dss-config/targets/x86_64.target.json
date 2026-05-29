@@ -3,8 +3,8 @@
   "dssTargetVersion": 1,
   "target": {
     "name": "x86_64",
-    "version": "0.1",
-    "description": "Minimal x86_64 opcode set for ML5 cycle 2. Cycle 3 (instruction selection) expands to full c-subset corpus coverage; cycle 2b adds the register file + ABI sections.",
+    "version": "0.2",
+    "description": "x86_64 opcode set + physical register file + SysV AMD64 / Microsoft x64 calling conventions. Cycle 2b: regfile/ABI added. Cycle 3 (instruction selection) expands the opcode set to full c-subset corpus coverage.",
     "$reservedFields": "The per-opcode minOperands/maxOperands/minSuccessors/maxSuccessors fields are documented in the JSON for completeness but are NOT yet enforced by the substrate — the LIR builder only checks terminator-ness against `isTerminator` today. Cycle 3 isel + the MIR verifier will start consuming the arity bounds; until then they are advisory metadata."
   },
   "opcodes": [
@@ -98,6 +98,78 @@
       "maxOperands":   1,
       "minSuccessors": 0,
       "maxSuccessors": 0
+    }
+  ],
+  "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal AS1 will read.",
+  "registers": [
+    { "name": "rax", "class": "gpr", "widthBytes": 8, "hwEncoding": 0 },
+    { "name": "rcx", "class": "gpr", "widthBytes": 8, "hwEncoding": 1 },
+    { "name": "rdx", "class": "gpr", "widthBytes": 8, "hwEncoding": 2 },
+    { "name": "rbx", "class": "gpr", "widthBytes": 8, "hwEncoding": 3 },
+    { "name": "rsp", "class": "gpr", "widthBytes": 8, "hwEncoding": 4 },
+    { "name": "rbp", "class": "gpr", "widthBytes": 8, "hwEncoding": 5 },
+    { "name": "rsi", "class": "gpr", "widthBytes": 8, "hwEncoding": 6 },
+    { "name": "rdi", "class": "gpr", "widthBytes": 8, "hwEncoding": 7 },
+    { "name": "r8",  "class": "gpr", "widthBytes": 8, "hwEncoding": 8 },
+    { "name": "r9",  "class": "gpr", "widthBytes": 8, "hwEncoding": 9 },
+    { "name": "r10", "class": "gpr", "widthBytes": 8, "hwEncoding": 10 },
+    { "name": "r11", "class": "gpr", "widthBytes": 8, "hwEncoding": 11 },
+    { "name": "r12", "class": "gpr", "widthBytes": 8, "hwEncoding": 12 },
+    { "name": "r13", "class": "gpr", "widthBytes": 8, "hwEncoding": 13 },
+    { "name": "r14", "class": "gpr", "widthBytes": 8, "hwEncoding": 14 },
+    { "name": "r15", "class": "gpr", "widthBytes": 8, "hwEncoding": 15 },
+
+    { "name": "xmm0",  "class": "fpr", "widthBytes": 16, "hwEncoding": 0 },
+    { "name": "xmm1",  "class": "fpr", "widthBytes": 16, "hwEncoding": 1 },
+    { "name": "xmm2",  "class": "fpr", "widthBytes": 16, "hwEncoding": 2 },
+    { "name": "xmm3",  "class": "fpr", "widthBytes": 16, "hwEncoding": 3 },
+    { "name": "xmm4",  "class": "fpr", "widthBytes": 16, "hwEncoding": 4 },
+    { "name": "xmm5",  "class": "fpr", "widthBytes": 16, "hwEncoding": 5 },
+    { "name": "xmm6",  "class": "fpr", "widthBytes": 16, "hwEncoding": 6 },
+    { "name": "xmm7",  "class": "fpr", "widthBytes": 16, "hwEncoding": 7 },
+    { "name": "xmm8",  "class": "fpr", "widthBytes": 16, "hwEncoding": 8 },
+    { "name": "xmm9",  "class": "fpr", "widthBytes": 16, "hwEncoding": 9 },
+    { "name": "xmm10", "class": "fpr", "widthBytes": 16, "hwEncoding": 10 },
+    { "name": "xmm11", "class": "fpr", "widthBytes": 16, "hwEncoding": 11 },
+    { "name": "xmm12", "class": "fpr", "widthBytes": 16, "hwEncoding": 12 },
+    { "name": "xmm13", "class": "fpr", "widthBytes": 16, "hwEncoding": 13 },
+    { "name": "xmm14", "class": "fpr", "widthBytes": 16, "hwEncoding": 14 },
+    { "name": "xmm15", "class": "fpr", "widthBytes": 16, "hwEncoding": 15 },
+
+    { "name": "rflags", "class": "flags", "widthBytes": 8, "hwEncoding": 0 }
+  ],
+  "$callingConventionsComment": "Per-platform x86_64 ABIs. ML7 callconv lowering selects one based on driver flag / function attribute. SysV AMD64 = Linux/macOS/BSD; ms_x64 = Windows. argGprs/argFprs ordering is significant (caller MUST place int args in those registers in that order, then spill to stack).",
+  "callingConventions": [
+    {
+      "name": "sysv_amd64",
+      "$comment": "System V AMD64 ABI (Linux, macOS, BSD). Integer args: RDI/RSI/RDX/RCX/R8/R9 then stack. Float args: XMM0..7 then stack. Integer return: RAX (low 64 bits) + RDX (high 64 bits if >64-bit aggregate). Float return: XMM0/XMM1. Stack 16-byte aligned BEFORE call (RSP%16==0); the call instruction pushes RIP, leaving RSP%16==8 at callee entry. 128-byte red zone below RSP for leaf functions.",
+      "argGprs":     ["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
+      "argFprs":     ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"],
+      "returnGprs":  ["rax", "rdx"],
+      "returnFprs":  ["xmm0", "xmm1"],
+      "callerSaved": ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                      "xmm0", "xmm1", "xmm2",  "xmm3",  "xmm4",  "xmm5",  "xmm6",  "xmm7",
+                      "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"],
+      "calleeSaved": ["rbx", "rbp", "r12", "r13", "r14", "r15"],
+      "stackAlignment":   16,
+      "shadowSpaceBytes": 0,
+      "redZoneBytes":     128
+    },
+    {
+      "name": "ms_x64",
+      "$comment": "Microsoft x64 ABI (Windows). First 4 args in RCX/RDX/R8/R9 regardless of int-vs-float (slot-aligned: an XMM arg in slot N uses XMM_N AND consumes the matching GPR slot, even if the GPR is unused). Integer return: RAX. Float return: XMM0. Stack 16-byte aligned before call; 32-byte shadow space (home space) always allocated by caller for callee to spill arg registers. No red zone.",
+      "argGprs":     ["rcx", "rdx", "r8", "r9"],
+      "argFprs":     ["xmm0", "xmm1", "xmm2", "xmm3"],
+      "returnGprs":  ["rax"],
+      "returnFprs":  ["xmm0"],
+      "callerSaved": ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11",
+                      "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"],
+      "calleeSaved": ["rbx", "rbp", "rdi", "rsi", "r12", "r13", "r14", "r15",
+                      "xmm6", "xmm7", "xmm8",  "xmm9",  "xmm10",
+                      "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"],
+      "stackAlignment":   16,
+      "shadowSpaceBytes": 32,
+      "redZoneBytes":     0
     }
   ]
 }
