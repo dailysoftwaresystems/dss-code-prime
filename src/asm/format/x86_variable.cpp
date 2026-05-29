@@ -156,6 +156,12 @@ bool encode(Lir const&                  lir,
             TargetSchema const&         schema,
             LirInstId                   inst,
             TargetOpcodeInfo const*     info,
+            // `lirToMir` + `srcMap` reserved for future per-byte-range
+            // stamping (e.g. if a single LIR inst encodes to multiple
+            // discontinuous byte ranges — currently never the case).
+            // The whole-instruction SourceMapEntry stamp happens at
+            // the dispatch level in `asm.cpp::encodeInst` so each
+            // walker sees only the bytes/relocs it directly produces.
             std::span<MirInstId const>  /*lirToMir*/,
             std::vector<std::uint8_t>&  out,
             std::vector<Relocation>&    relocs,

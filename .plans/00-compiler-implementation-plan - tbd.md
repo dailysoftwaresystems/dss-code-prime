@@ -172,7 +172,7 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 | `0x5xxx` | `O_` | Object format / linker | [`14`](./14-linker-plan%20-%20tbd.md) | ⏳ reserved (cpp comment cites this as the explicit hold) |
 | `0x6xxx` | `W_` | WAT/WASM verifier + emit-side | [`18`](./18-wasm-plan%20-%20tbd.md) §2.9b | ⏳ reserved (post-rev-3 allocation) |
 | `0x7xxx` | `V_` | SPIR-V verifier + emit-side | [`17`](./17-shader-gpu-plan%20-%20tbd.md) §2.9 | ⏳ reserved (post-rev-3 allocation) |
-| `0x8xxx` | — | (reserved — JVM IL / .NET IL post-v1) | future plan | available |
+| `0x8xxx` | `K_` | Linker (object format engine + reloc apply) | [`14`](./14-linker-plan%20-%20tbd.md) | ✅ shipped (LK4 substrate — 2026-05-29) |
 | `0x9xxx` | `P_` | Parse (internal-invariant range, distinct from 0x0xxx user-facing) | [`05`](./05-parser-plan%20-%20ok.md) | ✅ shipped |
 | `0xAxxx` | `I_` | MIR (IR-gen mid-level + verifier) | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML3) |
 | `0xBxxx` | `L_` | LIR lowering + verifier | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML5–ML8) |
@@ -184,7 +184,7 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 **Allocation discipline:**
 - Each family owns its full nibble (4096 codes); cycles within a plan allocate codes incrementally without coordinating with other plans.
 - Before adding a new family, **claim the slot here AND in `parse_diagnostic.cpp`'s `diagnosticCodePrefix()` switch** in the same PR. Reading either in isolation is the failure mode.
-- Free slots: `0x2xxx` / `0x3xxx` / `0x8xxx`. Post-v1 candidates (JVM IL, .NET IL, future shader-stage validators, future debug-info-emit) draw from these.
+- Free slots: `0x2xxx` / `0x3xxx`. Post-v1 candidates (JVM IL, .NET IL, future shader-stage validators, future debug-info-emit) draw from these.
 - **DO NOT subdivide existing nibbles across families.** Pre-rev-3, plans 18 + 17 had each claimed sub-bands `0xC1xx` / `0xC2xx` within the `C_*` config nibble — silent collision with the shipped `C_001..C_033` range. Corrected to top-level nibble ownership.
 
 ## 1. Vision & Overview

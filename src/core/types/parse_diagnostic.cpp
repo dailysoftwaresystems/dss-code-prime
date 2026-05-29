@@ -130,6 +130,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::A_LirToMirSizeMismatch:         return "A_LirToMirSizeMismatch";
         case DiagnosticCode::A_NoMatchingEncodingVariant:    return "A_NoMatchingEncodingVariant";
         case DiagnosticCode::A_RoundTripMismatch:            return "A_RoundTripMismatch";
+        case DiagnosticCode::K_SymbolUndefined:              return "K_SymbolUndefined";
+        case DiagnosticCode::K_RelocationKindMismatch:       return "K_RelocationKindMismatch";
     }
     return "Unknown";
 }
@@ -152,10 +154,11 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0xDxxx → D0xxx     (driver / compilation-unit)
     //   0xAxxx → I0xxx     (MIR verifier / IR-gen mid-level)
     //   0xBxxx → L0xxx     (LIR lowering + verifier)
+    //   0x8xxx → K0xxx     (linker — plan 14 LK4)
     //   0xExxx → S0xxx     (semantic analysis)
     //   0xFxxx → H0xxx     (HIR verifier / lowering)
-    // Free for future families: 0x2xxx, 0x3xxx, 0x8xxx (reserve for JVM
-    // IL / .NET IL / future shader-stage validators post-v1).
+    // Free for future families: 0x2xxx, 0x3xxx (reserve for JVM IL /
+    // .NET IL / future shader-stage validators post-v1).
     // Render as the 4-digit hex grouping the user actually sees.
     const auto v          = static_cast<std::uint16_t>(c);
     const std::uint16_t nibble = v & 0xF000u;
@@ -164,6 +167,8 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'A';
     } else if (nibble == 0x4000u) {
         letter = 'R';
+    } else if (nibble == 0x8000u) {
+        letter = 'K';
     } else if (nibble == 0xA000u) {
         letter = 'I';
     } else if (nibble == 0xB000u) {
@@ -178,9 +183,10 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'H';
     }
     // Strip the high nibble for the numeric portion when it's a phase
-    // marker (A/R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
+    // marker (A/K/R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
     // P_BuilderInvariant prints as "P9000".
     const bool hasNibbleMarker = (nibble == 0x1000u || nibble == 0x4000u
+                                  || nibble == 0x8000u
                                   || nibble == 0xA000u || nibble == 0xB000u
                                   || nibble == 0xC000u || nibble == 0xD000u
                                   || nibble == 0xE000u || nibble == 0xF000u);

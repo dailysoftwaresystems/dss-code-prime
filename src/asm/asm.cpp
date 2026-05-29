@@ -50,13 +50,19 @@ using lir_pass_util::report;
         return false;
     }
 
-    // Parameters reserved for AS2/AS3 plug-in arms; the cycle-1
-    // signature is stable so future arm-fills don't perturb the
-    // dispatch entry. Suppressions live ABOVE the switch — after the
-    // switch is unreachable since every arm `return`s.
-    (void)lir; (void)inst; (void)out; (void)relocs; (void)srcMap; (void)lirToMir;
+    // SourceMapEntry stamping (plan 13 AS6). Capture the byte
+    // offset BEFORE any encoding write so the entry points at the
+    // instruction's first byte. We capture the pre-encode byte
+    // position now, stamp AFTER the walker succeeds (so a walker
+    // failure doesn't leave behind a dangling entry pointing at
+    // bytes that were never written). `assemble()`'s entry-time
+    // bounds check guarantees `lirToMir.size() == lir.instCount()`,
+    // so `inst.v` is always in range here.
+    std::uint32_t const preEncodeOffset =
+        static_cast<std::uint32_t>(out.size());
 
-    switch (info->encoding.shape) {
+    bool const encoded = [&]() -> bool {
+        switch (info->encoding.shape) {
         case TargetEncodingShape::None:
             report(reporter, DiagnosticCode::A_NoEncodingDeclared,
                    DiagnosticSeverity::Error,
@@ -73,21 +79,56 @@ using lir_pass_util::report;
         case TargetEncodingShape::Fixed32:
             return fixed32::encode(lir, schema, inst, info, lirToMir,
                                     out, relocs, srcMap, reporter);
-    }
+        }
 
-    // Enum-drift fallback. A new `TargetEncodingShape` value added
-    // without a matching switch arm would otherwise silently `return
-    // false` with no diagnostic — a future silent-skip the
-    // silent-failure review specifically called out. Surface it.
-    report(reporter, DiagnosticCode::A_NoEncodingShapeWalker,
-           DiagnosticSeverity::Error,
-           std::format("opcode '{}': unknown encoding-shape ordinal {} "
-                       "(internal-invariant: a new TargetEncodingShape "
-                       "value was added without updating the assembler "
-                       "dispatch)",
-                       info->mnemonic,
-                       static_cast<int>(info->encoding.shape)));
-    return false;
+        // Enum-drift fallback. A new `TargetEncodingShape` value
+        // added without a matching switch arm would otherwise
+        // silently `return false` with no diagnostic — a future
+        // silent-skip the silent-failure review specifically
+        // called out. Surface it.
+        report(reporter, DiagnosticCode::A_NoEncodingShapeWalker,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': unknown encoding-shape ordinal {} "
+                           "(internal-invariant: a new TargetEncodingShape "
+                           "value was added without updating the assembler "
+                           "dispatch)",
+                           info->mnemonic,
+                           static_cast<int>(info->encoding.shape)));
+        return false;
+    }();
+
+    // Plan 13 AS6: stamp SourceMapEntry IFF the walker actually
+    // wrote bytes. A walker that returned false (no matching
+    // variant, malformed input, etc.) has not advanced `out`, so
+    // a stamp here would point at the NEXT instruction's bytes
+    // instead — silently corrupting the source-map.
+    //
+    // A walker that returns true MUST write at least one byte —
+    // that's the encoder contract for the assembler tier. A
+    // walker-returns-true-with-zero-bytes case is a hard substrate
+    // invariant violation; surface it loudly (multi-agent review
+    // convergence: silent-failure + code-reviewer + architect).
+    // Without this gate, a future regression in any walker that
+    // claims success without emission would desynchronize the
+    // parallel-index `srcMap.size() == encodedInsts` invariant the
+    // round-trip oracle relies on (test_asm_roundtrip.cpp).
+    if (encoded) {
+        if (out.size() <= preEncodeOffset) {
+            report(reporter, DiagnosticCode::A_NoEncodingShapeWalker,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': walker reported success but "
+                               "emitted zero bytes (substrate-invariant "
+                               "violation — every encoded instruction must "
+                               "produce at least one output byte)",
+                               info->mnemonic));
+            return false;
+        }
+        srcMap.push_back(SourceMapEntry{
+            preEncodeOffset,
+            lirToMir[inst.v]
+        });
+    }
+    return encoded;
 }
 
 } // namespace

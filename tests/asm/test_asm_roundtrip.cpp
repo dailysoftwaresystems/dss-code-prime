@@ -59,57 +59,70 @@ buildAndAssemble(TargetSchema const& schema, Emit emit) {
 }
 
 // Round-trip every inst in the first function of `bundle.legalized`
-// against the encoded bytes of `bundle.result.functions[0]`. The
-// `bytePositions` list names where each LIR inst's bytes start.
+// against the encoded bytes of `bundle.result.functions[0]`.
 //
-// Since walkers don't yet stamp SourceMapEntry (cycle scope), we
-// peel bytes one inst at a time by re-disassembling and consuming
-// the reported `bytesConsumed`. This is the same shape the linker
-// will use when applying relocations: stride through the function's
-// byte stream, opcode by opcode.
+// Plan 13 AS6: stride via the encoder-stamped SourceMapEntry table.
+// Closes the architect AS5 circular dependency (the prior fixture
+// asked the disasm to find where instructions start, then asked the
+// disasm to verify those same byte windows — if the disasm returned
+// a wrong bytesConsumed for one instruction, the cursor misaligned
+// and the failure diagnostic would name the wrong opcode). The
+// encoder-stamped boundaries break the cycle.
 void assertRoundTripsClean(AsmBundle& bundle, TargetSchema const& schema) {
     ASSERT_TRUE(bundle.result.ok());
     ASSERT_EQ(bundle.result.functions.size(), 1u);
-    auto const& bytes = bundle.result.functions[0].bytes;
+    auto const& fn0    = bundle.result.functions[0];
+    auto const& bytes  = fn0.bytes;
+    auto const& srcMap = fn0.sourceMap;
     Lir const& lir = bundle.legalized;
-    LirFuncId const fn = lir.funcAt(0);
-    std::size_t cursor = 0;
-    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
-        LirBlockId const blk = lir.funcBlockAt(fn, bi);
+
+    // Build a flat list of LIR insts (in encode order) for parallel
+    // walking with srcMap. srcMap is monotonically non-decreasing in
+    // byteOffset by construction (encoder appends both the entry and
+    // its bytes in one step). Insts whose opcode encoding is `None`
+    // are SKIPPED at stamp time, so srcMap and the encoded-inst list
+    // should be parallel-indexed.
+    std::vector<LirInstId> encodedInsts;
+    LirFuncId const lirFn = lir.funcAt(0);
+    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(lirFn); ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(lirFn, bi);
         for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
             LirInstId const inst = lir.blockInstAt(blk, ii);
             auto const opcode = lir.instOpcode(inst);
             auto const* info  = schema.opcodeInfo(opcode);
             if (info == nullptr
                 || info->encoding.shape == TargetEncodingShape::None) {
-                continue;  // unencoded inst (legalize-inserted mov on
-                           // a schema that doesn't encode it isn't our
-                           // case in cycle scope, but stay defensive)
+                continue;
             }
-            std::span<std::uint8_t const> tail{
-                bytes.data() + cursor, bytes.size() - cursor};
-            auto const result = disassembleInst(
-                schema, opcode, tail, bundle.reporter);
-            ASSERT_TRUE(result.has_value())
-                << "round-trip failed for opcode " << info->mnemonic
-                << " at byte " << cursor;
-            // Silent-failure guard (review #7): a future shape that
-            // returns bytesConsumed=0 (a no-op marker, a label)
-            // would spin this loop or skip insts silently.
-            ASSERT_GT(result->bytesConsumed, 0u)
-                << "round-trip would loop: bytesConsumed=0 for "
-                << info->mnemonic;
-            DiagnosticReporter localRep;
-            std::span<std::uint8_t const> instBytes{
-                bytes.data() + cursor, result->bytesConsumed};
-            EXPECT_TRUE(roundTripVerify(schema, lir, inst, instBytes, localRep))
-                << "round-trip slot mismatch for " << info->mnemonic;
-            cursor += result->bytesConsumed;
+            encodedInsts.push_back(inst);
         }
     }
-    EXPECT_EQ(cursor, bytes.size())
-        << "round-trip consumed " << cursor << " of "
-        << bytes.size() << " encoded bytes";
+
+    ASSERT_EQ(srcMap.size(), encodedInsts.size())
+        << "srcMap entry count must equal encoded-inst count "
+           "(parallel-index discipline)";
+
+    for (std::size_t i = 0; i < srcMap.size(); ++i) {
+        std::uint32_t const start = srcMap[i].byteOffset;
+        std::uint32_t const end   =
+            (i + 1 < srcMap.size())
+                ? srcMap[i + 1].byteOffset
+                : static_cast<std::uint32_t>(bytes.size());
+        ASSERT_GE(end, start)
+            << "srcMap byteOffsets must be monotonically non-decreasing";
+        std::span<std::uint8_t const> instBytes{
+            bytes.data() + start, end - start};
+        DiagnosticReporter localRep;
+        LirInstId const inst = encodedInsts[i];
+        auto const opcode = lir.instOpcode(inst);
+        auto const* info  = schema.opcodeInfo(opcode);
+        EXPECT_TRUE(roundTripVerify(schema, lir, inst, instBytes, localRep))
+            << "round-trip slot mismatch for "
+            << (info ? info->mnemonic : std::string_view{"<unknown>"})
+            << " at byte " << start;
+    }
+    // The last entry's slice extends to bytes.size(); the assertion
+    // above guarantees we cover every byte in the function.
 }
 
 [[nodiscard]] LirReg gpr(TargetSchema const& s, std::string_view name) {

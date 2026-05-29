@@ -77,6 +77,8 @@ bool encode(Lir const&                  lir,
             TargetSchema const&         schema,
             LirInstId                   inst,
             TargetOpcodeInfo const*     info,
+            // `lirToMir` + `srcMap` stamped by dispatch (asm.cpp);
+            // reserved here for future per-byte-range stamping.
             std::span<MirInstId const>  /*lirToMir*/,
             std::vector<std::uint8_t>&  out,
             std::vector<Relocation>&    relocs,

@@ -9,6 +9,7 @@ add_subdirectory(mir)
 add_subdirectory(mir/lowering)
 add_subdirectory(lir)
 add_subdirectory(asm)
+add_subdirectory(link)
 add_subdirectory(lsp)
 add_subdirectory(gen)
 add_subdirectory(program)
@@ -28,6 +29,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:lir>
     $<TARGET_OBJECTS:lir_lowering>
     $<TARGET_OBJECTS:asm>
+    $<TARGET_OBJECTS:link>
     $<TARGET_OBJECTS:lsp>
     $<TARGET_OBJECTS:gen>
     $<TARGET_OBJECTS:program>)

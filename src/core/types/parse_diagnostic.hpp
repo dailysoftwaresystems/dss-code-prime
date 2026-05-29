@@ -426,6 +426,33 @@ enum class DiagnosticCode : std::uint16_t {
     A_LirToMirSizeMismatch         = 0x1003,
     A_NoMatchingEncodingVariant    = 0x1004,
     A_RoundTripMismatch            = 0x1005,
+
+    // ── Linker (renders as `K`) ───────────────────────────────────────
+    //
+    // The link pass (plan 14 LK4 substrate) emits these when an
+    // AssembledModule + ObjectFormatSchema combination is internally
+    // inconsistent. Substrate-tier — LK4 declares the family AND fires
+    // the cases the format-blind engine itself can detect; per-format
+    // codes (e.g. ELF header malformation, Mach-O load-command
+    // overflow) join in their respective LK* cycles alongside the
+    // format's JSON schema.
+    //
+    // K_SymbolUndefined: a Relocation's `target` symbol is not
+    //   declared by any AssembledFunction in the module (single-CU
+    //   resolution; cross-CU is LK11; FFI imports LK6).
+    // K_RelocationKindMismatch: a Relocation's opaque `kind` tag does
+    //   not resolve on BOTH sides of plan 13 §2.6's reloc unifier —
+    //   target schema's `relocations[]` row (the formula) AND
+    //   format schema's `relocations[]` row (the platform-native
+    //   name) must both be declared. The diagnostic message names
+    //   the missing side(s).
+    //
+    // Per-format codes (K_NoMatchingObjectFormat for artifact-profile
+    // dispatch, ELF header malformation, Mach-O load-command overflow,
+    // etc.) join the family alongside their LK* cycles. The substrate
+    // ships ONLY the codes the format-blind engine itself can fire.
+    K_SymbolUndefined              = 0x8001,
+    K_RelocationKindMismatch       = 0x8002,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
