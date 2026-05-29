@@ -10,10 +10,10 @@
 
 | | |
 |---|---|
-| Status        | ⏳ **planned (rev 3).** v1 production-critical. |
-| Predecessors  | ✅ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) (LIR shape — ML1–ML8 closed 2026-05-29; `.dsslir` round-trip lossless; remaining ML7 cycle 2 = ARM64-stackPointer + ABI goldens, only blocking if AS1 targets ARM64 first). |
-| Successors    | ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) consumes (bytes, relocations) per section. ⏳ [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) consumes (byte-offset → MirInstId) maps. |
-| Scope         | **Bounded.** AS1–AS6. v1 ISAs: x86_64 + ARM64. WASM bytecode + SPIR-V words live in their own plans (18 / 17) per architect §2.4 carve-out — those formats are genuine bucket-2 boundary cases. |
+| Status        | ✅ **CLOSED end-to-end 2026-05-29 (rev 3)** — AS1–AS6 all landed on `feature/as-1`. x86_64 + ARM64 byte encoding via shape-keyed walkers, round-trip oracle disassembler, relocation taxonomy unifier (target-side half of plan 13 §2.6 + format-side half in plan 14 LK4), source-map stamping at dispatch level. v1 production-critical. |
+| Predecessors  | ✅ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) (LIR shape — ML1–ML8 closed 2026-05-29; `.dsslir` round-trip lossless). |
+| Successors    | ⏳ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) consumes (bytes, relocations) per section — LK4 substrate ✅ landed 2026-05-29, per-format writers (LK1/LK2/LK3) ⏳ pending. ⏳ [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) consumes (byte-offset → MirInstId) maps. |
+| Scope         | **Bounded — done.** AS1–AS6. v1 ISAs: x86_64 + ARM64. WASM bytecode + SPIR-V words live in their own plans (18 / 17) per architect §2.4 carve-out — those formats are genuine bucket-2 boundary cases. |
 
 ---
 

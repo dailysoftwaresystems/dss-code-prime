@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| Status        | ⏳ **planned.** v1 production-critical. Largest single chunk of backend work. **Plan rev 3 (2026-05-29): object formats are JSON-configured** (mirrors `GrammarSchema` + `TargetSchema` pattern) — one engine, no per-format C++. |
-| Predecessors  | ⏳ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) (bytes + relocations). ⏳ [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) (extern symbol declarations from precompiled libs). |
+| Status        | ⏳ **in flight.** LK4 substrate ✅ landed 2026-05-29 on `feature/as-1` — `ObjectFormatSchema{Unknown=0,Elf,Pe,MachO,Wasm,Spirv}` + format-blind `link(AssembledModule, TargetSchema, ObjectFormatSchema, reporter) → LinkedImage` engine + cross-side reloc-taxonomy unifier (`src/core/substrate/relocation_table.hpp` shared with TargetSchema) + `K_*` diagnostic family at 0x8xxx. Per-format byte emission (LK1 ELF / LK2 PE / LK3 Mach-O) + LK5–LK10 ⏳ pending. **Plan rev 3 (2026-05-29): object formats are JSON-configured** (mirrors `GrammarSchema` + `TargetSchema` pattern) — one engine, no per-format C++. |
+| Predecessors  | ✅ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) (bytes + relocations) — AS1–AS6 closed 2026-05-29. ⏳ [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) (extern symbol declarations from precompiled libs). |
 | Successors    | ⏳ [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) (LC_CODE_SIGNATURE / PE security directory placeholders filled post-link). ⏳ [`15-debug-info-plan`](./15-debug-info-plan%20-%20tbd.md) (debug sections placed alongside code). |
 | Scope         | **Bounded.** v1: LK1–LK10. v1 acceptance: link c-subset corpus → ELF / PE / Mach-O on every {OS × arch}. WASM (LK8) + SPIR-V (LK9) post-v1 skeletons. **v1.x: LK11** — cross-CU linking (couples with [`08-compilation-unit-plan`](./08-compilation-unit-plan%20-%20tbd.md) CU6). |
 
