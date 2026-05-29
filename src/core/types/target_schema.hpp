@@ -15,6 +15,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 // `TargetSchema` (plan 12 §2.6 ML5 cycle 2 pivot) — JSON-configured
@@ -62,6 +63,14 @@ enum class TargetAbiModel : std::uint8_t {
         case TargetAbiModel::ResultId:        return "result-id";
     }
     return "register-machine";
+}
+
+[[nodiscard]] constexpr std::optional<TargetAbiModel>
+targetAbiModelFromName(std::string_view s) noexcept {
+    if (s == "register-machine") return TargetAbiModel::RegisterMachine;
+    if (s == "operand-stack")    return TargetAbiModel::OperandStack;
+    if (s == "result-id")        return TargetAbiModel::ResultId;
+    return std::nullopt;
 }
 
 // Universal integer-comparison condition codes (target-blind). Used by
@@ -145,6 +154,16 @@ enum class TargetRegClass : std::uint8_t {
         case TargetRegClass::Flags: return "flags";
     }
     return "none";
+}
+
+[[nodiscard]] constexpr std::optional<TargetRegClass>
+targetRegClassFromName(std::string_view s) noexcept {
+    if (s == "none")  return TargetRegClass::None;
+    if (s == "gpr")   return TargetRegClass::GPR;
+    if (s == "fpr")   return TargetRegClass::FPR;
+    if (s == "vr")    return TargetRegClass::VR;
+    if (s == "flags") return TargetRegClass::Flags;
+    return std::nullopt;
 }
 
 // Map a substrate-tier `TypeKind` to its `TargetRegClass`. Universal
@@ -232,6 +251,59 @@ struct DSS_EXPORT TargetCallingConvention {
     // memory addressing. Empty optional means a stack-pointer-less
     // target (operand-stack VMs).
     std::optional<NamedRegisterRef> stackPointer;
+};
+
+// Discriminates the byte-encoding shape an opcode commits to (plan 13
+// AS1). `None` is the default; opcodes without an `encoding` block in
+// the target JSON stay at `None` and the assembler emits
+// `A_NoEncodingDeclared` for them. Adding a new ISA family that fits
+// an existing shape (e.g. RV32 fixed-word + bit-field) = drop a new
+// `*.target.json` declaring `format: "fixed32"`, no substrate change.
+// Adding a genuinely novel encoding shape = one new enum entry here
+// and one new format walker in the assembler.
+//
+// Cross-plan: this enum is the **shape-keyed dispatch vocabulary** for
+// plan 13 §2.4. The assembler's format-walker registry keys on this
+// enum (NOT on target name / arch identity).
+enum class TargetEncodingShape : std::uint8_t {
+    None        = 0,    // no encoding declared (substrate refuses to guess)
+    X86Variable = 1,    // x86 variable-length: REX/VEX/EVEX prefix + opcode + ModR/M + SIB + imm
+    Fixed32     = 2,    // 32-bit fixed word + bit-field slots (ARM64, RV32, MIPS-fixed)
+};
+
+[[nodiscard]] constexpr std::string_view
+targetEncodingShapeName(TargetEncodingShape s) noexcept {
+    switch (s) {
+        case TargetEncodingShape::None:        return "none";
+        case TargetEncodingShape::X86Variable: return "x86-variable";
+        case TargetEncodingShape::Fixed32:     return "fixed32";
+    }
+    return "none";
+}
+
+[[nodiscard]] constexpr std::optional<TargetEncodingShape>
+targetEncodingShapeFromName(std::string_view s) noexcept {
+    if (s == "none")         return TargetEncodingShape::None;
+    if (s == "x86-variable") return TargetEncodingShape::X86Variable;
+    if (s == "fixed32")      return TargetEncodingShape::Fixed32;
+    return std::nullopt;
+}
+
+// One relocation kind declared by the target schema (plan 13 §2.6, the
+// bucket-1 reloc taxonomy facet). Each row defines an opaque
+// `uint32_t kind` tag whose meaning is the row itself — the assembler
+// writes the tag onto `Relocation::kind`; the linker (plan 14) reads
+// it via `schema.relocationInfo(kind)` to resolve the formula. The
+// `formula` is documentation for humans (and future debug tooling) —
+// the substrate treats it as opaque text.
+//
+// `kind` slot-0 is reserved as an invalid sentinel: every declared
+// row MUST carry a `kind != 0` (loader-enforced). Two rows with the
+// same `kind` are also rejected.
+struct DSS_EXPORT TargetRelocationInfo {
+    std::string   name;     // canonical text key (e.g. "rel32", "abs64")
+    std::uint32_t kind = 0; // opaque tag — written into Relocation::kind
+    std::string   formula;  // human-readable formula (e.g. "S + A - P - 4")
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode
@@ -345,6 +417,16 @@ struct DSS_EXPORT TargetOpcodeInfo {
     std::uint8_t         minSuccessors  = 0;
     std::uint8_t         maxSuccessors  = 0;
 
+    // Byte-encoding shape (plan 13 AS1). `None` is the default — an
+    // opcode without an `encoding` block in the target JSON stays at
+    // `None` and the assembler emits `A_NoEncodingDeclared` for it.
+    // Per-variant guard rows + template + slot wiring (the JSON
+    // `encoding.variants[]` substructure of §2.5) land alongside their
+    // consumers in AS2 (`x86-variable`) and AS3 (`fixed32`); the
+    // substrate carries only the shape discriminator today so the
+    // dispatch-on-shape in `assemble()` has a stable hook.
+    TargetEncodingShape  encodingShape  = TargetEncodingShape::None;
+
     // Terminator-ness derives from `terminatorKind` — single source of
     // truth. Callers ported from the old `isTerminator` bool field
     // gain a trailing `()` and keep working unchanged.
@@ -402,6 +484,24 @@ struct DSS_EXPORT TargetSchemaData {
     std::vector<TargetCallingConvention> callingConventions;
     substrate::TransparentStringMap<std::uint16_t> callingConventionIndex;
 
+    // Relocation taxonomy (plan 13 AS1 §2.6 — the bucket-1 reloc
+    // facet). Each row declares one relocation kind: a canonical text
+    // name (for the linker's `*.format.json` cross-reference per plan
+    // 14 §2.0) + an opaque `kind` tag the assembler stamps onto
+    // `Relocation::kind` + a human-readable formula. Empty is legal
+    // (a target that emits no relocations); a non-empty section must
+    // satisfy the `validate()` rules (unique `kind`, non-zero `kind`,
+    // non-empty `name`).
+    std::vector<TargetRelocationInfo> relocations;
+    substrate::TransparentStringMap<std::uint16_t> relocationNameIndex;
+    // Opaque-tag → row-index index for the assembler/linker hot path.
+    // Plan 14's relocation-apply pass calls `relocationInfo(kind)`
+    // once per relocation in every assembled object — a linear scan
+    // there is an O(R·F) blowup at link time. validate() enforces
+    // `kind` uniqueness across rows, so this index is safe to build
+    // from the same monotonic loader path the name index uses.
+    std::unordered_map<std::uint32_t, std::uint16_t> relocationKindIndex;
+
     // Cross-field invariants the per-field JSON parse cannot express.
     // Returns the list of problems as fully-shaped `ConfigDiagnostic`s
     // (each one carries its JSON path in `.path`); the loader stamps
@@ -428,6 +528,11 @@ struct DSS_EXPORT TargetSchemaData {
     //     - stackAlignment is a power of two (and >0 when ANY field set)
     //     - shadowSpaceBytes % stackAlignment == 0
     //     - redZoneBytes    % stackAlignment == 0
+    //   Relocations (AS1):
+    //     - every `kind` is non-zero (slot-0 reserved as invalid sentinel)
+    //     - every `kind` is unique across the section (collision rejection)
+    //     - every `name` is non-empty (the linker's *.format.json lookup
+    //       key cannot be the empty string)
     [[nodiscard]] std::vector<ConfigDiagnostic> validate() const;
 };
 
@@ -530,6 +635,32 @@ public:
         auto it = d_.callingConventionIndex.find(name);
         if (it == d_.callingConventionIndex.end()) return nullptr;
         return &d_.callingConventions[it->second];
+    }
+
+    // ── Relocations (AS1) ────────────────────────────────────────
+    [[nodiscard]] std::span<TargetRelocationInfo const> relocations() const noexcept {
+        return d_.relocations;
+    }
+    [[nodiscard]] std::size_t relocationCount() const noexcept { return d_.relocations.size(); }
+
+    // Look up by opaque `kind` tag (the value the assembler stamps onto
+    // `Relocation::kind`). Returns nullptr for an unknown kind so the
+    // linker can fail loud at relocation-resolve time rather than
+    // silently apply the wrong formula. O(1) via `relocationKindIndex`.
+    [[nodiscard]] TargetRelocationInfo const* relocationInfo(std::uint32_t kind) const noexcept {
+        auto it = d_.relocationKindIndex.find(kind);
+        if (it == d_.relocationKindIndex.end()) return nullptr;
+        return &d_.relocations[it->second];
+    }
+
+    // Look up by canonical text name (the linker's *.format.json
+    // cross-reference key per plan 14 §2.0). Heterogeneous lookup —
+    // no allocation per call.
+    [[nodiscard]] TargetRelocationInfo const* relocationByName(
+            std::string_view name) const noexcept {
+        auto it = d_.relocationNameIndex.find(name);
+        if (it == d_.relocationNameIndex.end()) return nullptr;
+        return &d_.relocations[it->second];
     }
 
     // ── Loaders ──────────────────────────────────────────────────

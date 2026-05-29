@@ -165,7 +165,7 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 | Nibble | Rendered prefix | Family | Owner plan | Status |
 |---|---|---|---|---|
 | `0x0xxx` | `P_` | Parse | [`05`](./05-parser-plan%20-%20ok.md) | ✅ shipped |
-| `0x1xxx` | — | (reserved — free) | — | available |
+| `0x1xxx` | `A_` | Assembler (byte-encoding pass) | [`13`](./13-assembler-plan%20-%20tbd.md) | ✅ shipped (AS1 cycle 1 — 2026-05-29) |
 | `0x2xxx` | — | (reserved — free) | — | available |
 | `0x3xxx` | — | (reserved — free) | — | available |
 | `0x4xxx` | `R_` | Register allocator | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML6 cycle 3a) |
@@ -184,7 +184,7 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 **Allocation discipline:**
 - Each family owns its full nibble (4096 codes); cycles within a plan allocate codes incrementally without coordinating with other plans.
 - Before adding a new family, **claim the slot here AND in `parse_diagnostic.cpp`'s `diagnosticCodePrefix()` switch** in the same PR. Reading either in isolation is the failure mode.
-- Free slots: `0x1xxx` / `0x2xxx` / `0x3xxx` / `0x8xxx`. Post-v1 candidates (JVM IL, .NET IL, future shader-stage validators, future debug-info-emit) draw from these.
+- Free slots: `0x2xxx` / `0x3xxx` / `0x8xxx`. Post-v1 candidates (JVM IL, .NET IL, future shader-stage validators, future debug-info-emit) draw from these.
 - **DO NOT subdivide existing nibbles across families.** Pre-rev-3, plans 18 + 17 had each claimed sub-bands `0xC1xx` / `0xC2xx` within the `C_*` config nibble — silent collision with the shipped `C_001..C_033` range. Corrected to top-level nibble ownership.
 
 ## 1. Vision & Overview

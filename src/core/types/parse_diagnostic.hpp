@@ -379,6 +379,36 @@ enum class DiagnosticCode : std::uint16_t {
     R_VRegHasNoClass               = 0x4003,
     R_SpilledDueToPressure         = 0x4004,
     R_SpilledDueToCrossCallExhaustion = 0x4005,
+
+    // ── Assembler (renders as `A`) ────────────────────────────────────
+    //
+    // The byte-encoding pass (plan 13 AS1) emits these when a LIR
+    // opcode arrives at the assembler without a usable `encoding`
+    // facet on its TargetOpcodeInfo. Substrate-tier — cycle 1 declares
+    // the family AND fires the two no-encoder cases below. Additional
+    // codes (variant-guard mismatch, relocation-kind-undeclared) land
+    // alongside their consumers in cycles AS2/AS3 — not pre-declared
+    // here so each new code travels with the path that produces it.
+    //
+    // A_NoEncodingDeclared: the opcode's `encoding.format` is `none`
+    //   (or the entire `encoding` block is absent). The substrate
+    //   refuses to guess — without a declared shape there is no
+    //   universal byte representation for the opcode.
+    // A_NoEncodingShapeWalker: the opcode declares a non-`none` shape
+    //   but the assembler has no registered walker for it. Fires for
+    //   every non-`none` opcode while AS1 cycle 1's substrate is
+    //   the only assembler code shipped; the walker registrations
+    //   land in AS2 (`x86_variable`) and AS3 (`fixed32`).
+    // A_LirToMirSizeMismatch: the caller passed a `lirToMir` span
+    //   whose length is not equal to the LIR module's instruction-
+    //   arena size. The substrate uses `lirToMir[LirInstId.v]` to
+    //   stamp `SourceMapEntry::mirInst`; a shorter span would
+    //   silently read out-of-bounds memory once AS2/AS3 wire the
+    //   stamping. Fail loud at entry so the test fixture / pipeline
+    //   builder catches the contract violation.
+    A_NoEncodingDeclared           = 0x1001,
+    A_NoEncodingShapeWalker        = 0x1002,
+    A_LirToMirSizeMismatch         = 0x1003,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

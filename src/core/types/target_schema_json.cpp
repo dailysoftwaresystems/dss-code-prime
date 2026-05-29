@@ -121,11 +121,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         data.version = target.at("version").get<std::string>();
     }
     if (target.contains("abiModel") && target.at("abiModel").is_string()) {
-        auto const s = target.at("abiModel").get<std::string>();
-        if      (s == "register-machine") data.abiModel = TargetAbiModel::RegisterMachine;
-        else if (s == "operand-stack")    data.abiModel = TargetAbiModel::OperandStack;
-        else if (s == "result-id")        data.abiModel = TargetAbiModel::ResultId;
-        else {
+        auto const m = targetAbiModelFromName(target.at("abiModel").get<std::string>());
+        if (m.has_value()) {
+            data.abiModel = *m;
+        } else {
             coll.emit(DiagnosticCode::C_MalformedJson, "/target/abiModel",
                       "expected 'register-machine' / 'operand-stack' / 'result-id'");
             return std::unexpected(std::move(coll.diagnostics));
@@ -232,6 +231,54 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         readBoundedInt(o, coll, opcPath, "maxOperands",   info.maxOperands);
         readBoundedInt(o, coll, opcPath, "minSuccessors", info.minSuccessors);
         readBoundedInt(o, coll, opcPath, "maxSuccessors", info.maxSuccessors);
+        // Encoding facet (plan 13 AS1 §2.5). Cycle 1 substrate carries
+        // only the shape discriminator — the variants/template
+        // sub-structure lands in AS2 (`x86-variable`) and AS3
+        // (`fixed32`), preserving the "no fields without consumers"
+        // discipline. An absent `encoding` block leaves the opcode at
+        // `TargetEncodingShape::None` and AS1's `assemble()` flags
+        // each affected instruction with `A_NoEncodingDeclared`.
+        //
+        // When the `encoding` block IS present, `format` is REQUIRED.
+        // Without this gate a typo like `"encoding": { "format2":
+        // "x86-variable" }` (or an empty `encoding: {}`) would
+        // silently leave the opcode at `None`, and the schema author's
+        // intent to declare an encoding would be silently dropped.
+        if (o.contains("encoding")) {
+            auto const& enc = o.at("encoding");
+            if (!enc.is_object()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/opcodes/{}/encoding", i),
+                          "'encoding' must be an object");
+            } else if (!enc.contains("format")) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          std::format("/opcodes/{}/encoding/format", i),
+                          "missing 'format' (required when an 'encoding' "
+                          "block is present; one of 'none' / 'x86-variable' "
+                          "/ 'fixed32')");
+            } else {
+                auto const& fmt = enc.at("format");
+                if (!fmt.is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/encoding/format", i),
+                              "'format' must be a string (one of "
+                              "'none' / 'x86-variable' / 'fixed32')");
+                } else {
+                    auto const shape =
+                        targetEncodingShapeFromName(fmt.get<std::string>());
+                    if (shape.has_value()) {
+                        info.encodingShape = *shape;
+                    } else {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/opcodes/{}/encoding/format", i),
+                                  "expected 'none' / 'x86-variable' / 'fixed32'");
+                    }
+                }
+            }
+            // `variants` / `template` / `operands` sub-fields are
+            // tolerated as forward-compat shape: AS2/AS3 add their
+            // schema validation when those sub-trees gain consumers.
+        }
         // Slot-0 Invalid-sentinel sanity check.
         if (i == 0 && info.mnemonic != "invalid") {
             coll.emit(DiagnosticCode::C_MalformedJson, "/opcodes/0",
@@ -277,13 +324,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 }
                 info.name = r.at("name").get<std::string>();
                 if (r.contains("class") && r.at("class").is_string()) {
-                    auto const s = r.at("class").get<std::string>();
-                    if      (s == "gpr")   info.regClass = TargetRegClass::GPR;
-                    else if (s == "fpr")   info.regClass = TargetRegClass::FPR;
-                    else if (s == "vr")    info.regClass = TargetRegClass::VR;
-                    else if (s == "flags") info.regClass = TargetRegClass::Flags;
-                    else if (s == "none")  info.regClass = TargetRegClass::None;
-                    else {
+                    auto const cls = targetRegClassFromName(r.at("class").get<std::string>());
+                    if (cls.has_value()) {
+                        info.regClass = *cls;
+                    } else {
                         coll.emit(DiagnosticCode::C_MalformedJson,
                                   std::format("/registers/{}/class", i),
                                   "expected 'gpr' / 'fpr' / 'vr' / 'flags' / 'none'");
@@ -421,6 +465,92 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.callingConventions.push_back(std::move(cc));
+            }
+        }
+    }
+
+    // ── relocations (AS1 §2.6 — optional) ─────────────────────────
+    // Empty/absent section is legal (cycle 2a targets emit no
+    // relocations yet); non-empty rows must satisfy the validate()
+    // contract: unique non-zero `kind`, non-empty `name`. The
+    // `formula` is opaque to the substrate — stored verbatim for
+    // diagnostic display and for the linker's `*.format.json`
+    // human-readable cross-reference.
+    if (doc.contains("relocations")) {
+        if (!doc.at("relocations").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/relocations",
+                      "'relocations' must be an array");
+        } else {
+            auto const& rels = doc.at("relocations");
+            data.relocations.reserve(rels.size());
+            for (std::size_t i = 0; i < rels.size(); ++i) {
+                auto const& r = rels[i];
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/relocations/{}", i),
+                              "relocation entry must be an object");
+                    continue;
+                }
+                TargetRelocationInfo info;
+                if (!r.contains("name") || !r.at("name").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/relocations/{}/name", i),
+                              "missing or non-string 'name'");
+                    continue;
+                }
+                info.name = r.at("name").get<std::string>();
+                if (!r.contains("kind") || !r.at("kind").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/relocations/{}/kind", i),
+                              "missing or non-integer 'kind' (must be a "
+                              "non-zero uint32 — the opaque tag the "
+                              "assembler stamps onto Relocation::kind)");
+                    continue;
+                }
+                {
+                    std::int64_t const v = r.at("kind").get<std::int64_t>();
+                    if (v < 0 || v > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/relocations/{}/kind", i),
+                                  std::format("'kind' ({}) must fit in [0, {}]",
+                                              v, std::numeric_limits<std::uint32_t>::max()));
+                        continue;
+                    }
+                    info.kind = static_cast<std::uint32_t>(v);
+                }
+                // `formula` (optional) is opaque to the substrate but
+                // type-strict: a present-but-wrong-type field is
+                // diagnosed, NOT silently dropped (mirrors the
+                // `terminatorKind` discipline above).
+                if (r.contains("formula")) {
+                    if (!r.at("formula").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/relocations/{}/formula", i),
+                                  "'formula' must be a string");
+                    } else {
+                        info.formula = r.at("formula").get<std::string>();
+                    }
+                }
+                std::uint16_t const idx =
+                    static_cast<std::uint16_t>(data.relocations.size());
+                bool const freshName =
+                    data.relocationNameIndex.emplace(info.name, idx).second;
+                if (!freshName) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/relocations/{}/name", i),
+                              std::format("duplicate relocation name '{}'", info.name));
+                    continue;  // skip push_back so vector & index stay in sync
+                }
+                // Parallel kind-index for the linker hot path. Uniqueness
+                // is also checked by validate() (it produces the user-
+                // facing diagnostic with cross-row blame); here we just
+                // need the index entry to exist so `relocationInfo(kind)`
+                // is O(1) for the rows that DID load. If a later row
+                // collides on `kind`, validate() will emit the error and
+                // load is rejected, so the index's "first writer wins"
+                // shape never reaches consumers.
+                (void)data.relocationKindIndex.emplace(info.kind, idx);
+                data.relocations.push_back(std::move(info));
             }
         }
     }

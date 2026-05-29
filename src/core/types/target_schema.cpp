@@ -7,6 +7,7 @@
 #include <format>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 namespace dss {
@@ -166,6 +167,51 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                      std::format("register '{}': subOf chain forms a cycle",
                                  registers[i].name));
                 break;  // one cycle finding per validate() — caller fixes & retries
+            }
+        }
+    }
+
+    // ── Relocation taxonomy (AS1 §2.6) ──────────────────────────
+    //
+    // Placed BEFORE the ABI gating below — relocations are
+    // independent of `abiModel`/register-file presence. A WASM /
+    // SPIR-V target with no registers can still declare a reloc
+    // taxonomy if its container format (custom-sections, output
+    // metadata) needs one. Empty section is legal; non-empty rows
+    // must satisfy three invariants the per-row JSON parse cannot
+    // catch:
+    //   * `kind != 0` — slot-0 reserved as the invalid sentinel so a
+    //     default-constructed `Relocation{}.kind == 0` is loudly
+    //     distinguishable from any declared kind.
+    //   * `kind` unique across all rows — two rows with the same tag
+    //     means the assembler+linker disagree on which formula a
+    //     relocation refers to (silent miscompile at link time).
+    //   * `name` non-empty — the linker's `*.format.json` cross-
+    //     reference uses `name` as the lookup key (plan 14 §2.0);
+    //     an empty name would silently mis-resolve to whichever
+    //     format-side row also has an empty key.
+    {
+        std::unordered_map<std::uint32_t, std::size_t> seenKind;
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            auto const& r = relocations[i];
+            if (r.name.empty()) {
+                fail(std::format("/relocations/{}/name", i),
+                     "relocation row: 'name' must be a non-empty string");
+            }
+            if (r.kind == 0) {
+                fail(std::format("/relocations/{}/kind", i),
+                     std::format("relocation '{}': 'kind' must be != 0 "
+                                 "(slot 0 is reserved as the invalid sentinel)",
+                                 r.name));
+                continue;  // skip the uniqueness check for the bad row
+            }
+            auto [it, fresh] = seenKind.emplace(r.kind, i);
+            if (!fresh) {
+                fail(std::format("/relocations/{}/kind", i),
+                     std::format("relocation '{}': duplicate 'kind' value {} "
+                                 "(already declared by relocation '{}' at /relocations/{})",
+                                 r.name, r.kind,
+                                 relocations[it->second].name, it->second));
             }
         }
     }
