@@ -230,7 +230,8 @@ LirInstId LirBuilder::addInst(std::uint16_t opcode, LirReg result,
                      moduleId_.v};
 }
 
-LirInstId LirBuilder::addBr(std::uint16_t opcode, LirBlockId target) {
+LirInstId LirBuilder::addBr(std::uint16_t opcode, LirBlockId target,
+                            std::uint32_t payload, std::uint8_t flags) {
     if (!target_.isTerminator(opcode)) {
         lirFatal("LirBuilder::addBr: opcode is not a terminator for this target");
     }
@@ -238,7 +239,7 @@ LirInstId LirBuilder::addBr(std::uint16_t opcode, LirBlockId target) {
     ref.kind = LirOperandKind::BlockRef;
     ref.blockSlot = target.v;
     std::array<LirOperand, 1> ops{ref};
-    LirInstId const id = addInst(opcode, InvalidLirReg, ops);
+    LirInstId const id = addInst(opcode, InvalidLirReg, ops, payload, flags);
     std::array<LirBlockId, 1> succs{target};
     recordSuccessors_(succs);
     openBlockHasTerminator_ = true;
@@ -248,11 +249,12 @@ LirInstId LirBuilder::addBr(std::uint16_t opcode, LirBlockId target) {
 LirInstId LirBuilder::addCondBr(std::uint16_t opcode,
                                 std::span<LirOperand const> operands,
                                 LirBlockId ifTrue, LirBlockId ifFalse,
-                                std::uint32_t payload) {
+                                std::uint32_t payload,
+                                std::uint8_t  flags) {
     if (!target_.isTerminator(opcode)) {
         lirFatal("LirBuilder::addCondBr: opcode is not a terminator for this target");
     }
-    LirInstId const id = addInst(opcode, InvalidLirReg, operands, payload);
+    LirInstId const id = addInst(opcode, InvalidLirReg, operands, payload, flags);
     std::array<LirBlockId, 2> succs{ifTrue, ifFalse};
     recordSuccessors_(succs);
     openBlockHasTerminator_ = true;
@@ -260,11 +262,12 @@ LirInstId LirBuilder::addCondBr(std::uint16_t opcode,
 }
 
 LirInstId LirBuilder::addReturn(std::uint16_t opcode,
-                                std::span<LirOperand const> operands) {
+                                std::span<LirOperand const> operands,
+                                std::uint32_t payload, std::uint8_t flags) {
     if (!target_.isTerminator(opcode)) {
         lirFatal("LirBuilder::addReturn: opcode is not a terminator for this target");
     }
-    LirInstId const id = addInst(opcode, InvalidLirReg, operands);
+    LirInstId const id = addInst(opcode, InvalidLirReg, operands, payload, flags);
     // No successors for return.
     auto& blk = blockArena_.at(openBlock_);
     blk.succStart = static_cast<std::uint32_t>(succPool_.size());
@@ -273,11 +276,14 @@ LirInstId LirBuilder::addReturn(std::uint16_t opcode,
     return id;
 }
 
-LirInstId LirBuilder::addUnreachable(std::uint16_t opcode) {
+LirInstId LirBuilder::addUnreachable(std::uint16_t opcode,
+                                     std::uint32_t payload,
+                                     std::uint8_t  flags) {
     if (!target_.isTerminator(opcode)) {
         lirFatal("LirBuilder::addUnreachable: opcode is not a terminator for this target");
     }
-    LirInstId const id = addInst(opcode, InvalidLirReg, std::span<LirOperand const>{});
+    LirInstId const id = addInst(opcode, InvalidLirReg,
+                                 std::span<LirOperand const>{}, payload, flags);
     auto& blk = blockArena_.at(openBlock_);
     blk.succStart = static_cast<std::uint32_t>(succPool_.size());
     blk.succCount = 0;

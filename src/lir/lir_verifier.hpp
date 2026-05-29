@@ -80,4 +80,15 @@ verifyLir(Lir const&             lir,
 verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
                       DiagnosticReporter& reporter);
 
+// Text-load verifier (ML8 cycle 2). Runs the subset of `verifyLir`
+// rules that don't require an MIR cross-reference — currently just
+// `checkMemOperandPairing` (Rule 1). Rules 2–4 are MIR-dependent and
+// are out of scope for a text-loaded module: the source MIR isn't
+// part of `.dsslir`, so cross-references would necessarily be empty.
+// Future rules added to `verifyLir` should join here too if they are
+// LIR-only. Returns `false` on any violation.
+[[nodiscard]] DSS_EXPORT bool
+verifyLirText(Lir const& lir, TargetSchema const& schema,
+              DiagnosticReporter& reporter);
+
 } // namespace dss

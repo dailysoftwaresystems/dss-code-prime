@@ -4,6 +4,8 @@
 #include "core/types/target_schema.hpp"   // TargetRegClass (synchrony assert)
 
 #include <cstdint>
+#include <optional>
+#include <string_view>
 #include <type_traits>
 
 // LIR register substrate (plan 12 §2.7). Registers carry a CLASS
@@ -37,6 +39,19 @@ enum class LirRegClass : std::uint8_t {
         case LirRegClass::Flags: return "flags";
     }
     return "none";
+}
+
+// Inverse of `lirRegClassName` — consumed by the `.dsslir` text
+// parser to recover the class from a `%v.<id>:<class>` suffix.
+// Returns `std::nullopt` on an unrecognized name (parser-side fatal).
+[[nodiscard]] constexpr std::optional<LirRegClass>
+lirRegClassFromName(std::string_view s) noexcept {
+    if (s == "none")  return LirRegClass::None;
+    if (s == "gpr")   return LirRegClass::GPR;
+    if (s == "fpr")   return LirRegClass::FPR;
+    if (s == "vr")    return LirRegClass::VR;
+    if (s == "flags") return LirRegClass::Flags;
+    return std::nullopt;
 }
 
 // A register operand. Pre-regalloc: `isPhysical == false`, `id` is

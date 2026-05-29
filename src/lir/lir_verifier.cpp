@@ -10,9 +10,10 @@ namespace dss {
 
 namespace {
 
-void report(DiagnosticReporter& reporter, std::string actual) {
+void report(DiagnosticReporter& reporter, std::string actual,
+            DiagnosticCode code = DiagnosticCode::L_UnsupportedLoweringForOpcode) {
     ParseDiagnostic d;
-    d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+    d.code     = code;
     d.severity = DiagnosticSeverity::Error;
     d.actual   = std::move(actual);
     reporter.report(std::move(d));
@@ -61,7 +62,8 @@ void checkMemOperandPairing(Lir const& lir, TargetSchema const& sch,
                         "LirVerifier: memory inst {} has malformed addressing-"
                         "mode operand pair; expected last two ops to be "
                         "MemBase then MemOffset",
-                        inst.v));
+                        inst.v),
+                        DiagnosticCode::L_MemOperandMalformed);
                 }
             }
         }
@@ -293,6 +295,19 @@ bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
             }
         }
     }
+    return reporter.errorCount() == baseline;
+}
+
+// ── text-load verifier (ML8 cycle 2) ─────────────────────────────────
+
+bool verifyLirText(Lir const& lir, TargetSchema const& schema,
+                   DiagnosticReporter& reporter) {
+    auto const baseline = reporter.errorCount();
+    // Currently the only LIR-only rule; future LIR-only rules added
+    // to `verifyLir` should join here too. The text-load path has no
+    // MIR cross-reference (the source MIR isn't part of `.dsslir`),
+    // so MIR-dependent rules (2–4) are deliberately not invoked.
+    checkMemOperandPairing(lir, schema, reporter);
     return reporter.errorCount() == baseline;
 }
 

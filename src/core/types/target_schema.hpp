@@ -354,6 +354,11 @@ public:
 
     [[nodiscard]] TargetSchemaId    id()       const noexcept { return d_.id; }
     [[nodiscard]] std::string_view  name()     const noexcept { return d_.name; }
+    // Semantic version string declared by the target JSON. Round-trip
+    // contracts (e.g. `.dsslir` preamble) emit this so a cross-version
+    // load is loudly rejected at parse time rather than silently
+    // mis-interpreting opcode numbers / register table layouts that a
+    // version bump might have permuted.
     [[nodiscard]] std::string_view  version()  const noexcept { return d_.version; }
     [[nodiscard]] TargetAbiModel    abiModel() const noexcept { return d_.abiModel; }
     [[nodiscard]] std::string_view  frameLoadMnemonic()  const noexcept {

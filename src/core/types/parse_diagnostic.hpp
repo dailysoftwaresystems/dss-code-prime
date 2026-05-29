@@ -359,6 +359,13 @@ enum class DiagnosticCode : std::uint16_t {
     // is distinct from "unsupported lowering" (which is an inability to
     // map a MIR opcode); the register is the bug, not the opcode.
     L_PhysRegOrdinalOutOfRange     = 0xB005,
+    // Memory addressing-mode operand pairing failure: a Load/Store/Lea
+    // instruction's operand list does not end with the required
+    // `[MemBase, MemOffset]` pair. Surfaced by `LirVerifier`'s Rule 1
+    // (verifyLir + verifyLirText). Distinct from
+    // L_UnsupportedLoweringForOpcode (which is about opcode-lowering
+    // coverage gaps): this code names the malformed substrate shape.
+    L_MemOperandMalformed          = 0xB006,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

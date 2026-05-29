@@ -180,21 +180,32 @@ public:
                       std::uint8_t  flags   = 0);
 
     // ── terminators (each seals the current block) ──
-    LirInstId addBr(std::uint16_t opcode, LirBlockId target);
-    // `payload` is the per-opcode scalar field on the emitted inst —
-    // for conditional branches it carries the `TargetCondCode` enum (jcc
-    // condition). Default 0 preserves the cycle-1/2 zero-payload contract
-    // for callers that don't care about the condition channel.
+    //
+    // ALL terminator builders accept optional `payload` + `flags` so the
+    // text format round-trip (ML8) is lossless across every opcode:
+    // `addBr`/`addReturn`/`addUnreachable` previously hard-coded these
+    // to 0, silently dropping any non-zero state on parse. Defaulted to
+    // 0 so existing in-process call sites stay source-compatible.
+    LirInstId addBr(std::uint16_t opcode, LirBlockId target,
+                    std::uint32_t payload = 0, std::uint8_t flags = 0);
+    // `payload` carries the per-opcode scalar (for conditional branches:
+    // the `TargetCondCode` enum / jcc condition). `flags` carries the
+    // 8-bit per-inst flag byte used by future annotation passes.
     LirInstId addCondBr(std::uint16_t opcode,
                         std::span<LirOperand const> operands,
                         LirBlockId ifTrue, LirBlockId ifFalse,
-                        std::uint32_t payload = 0);
+                        std::uint32_t payload = 0,
+                        std::uint8_t  flags   = 0);
     LirInstId addReturn(std::uint16_t opcode,
-                        std::span<LirOperand const> operands);
+                        std::span<LirOperand const> operands,
+                        std::uint32_t payload = 0,
+                        std::uint8_t  flags   = 0);
     // Zero-successor terminator that is NOT a return — separated from
     // `addReturn` so the call-site spelling matches the semantics. AS1
     // maps to x86_64 ud2 / ARM64 brk / WASM unreachable.
-    LirInstId addUnreachable(std::uint16_t opcode);
+    LirInstId addUnreachable(std::uint16_t opcode,
+                             std::uint32_t payload = 0,
+                             std::uint8_t  flags   = 0);
 
     // Append a wide literal to the module's pool; returns the index
     // suitable for `LirOperand::makeLiteralIndex(...)`. Cycle 3c uses
