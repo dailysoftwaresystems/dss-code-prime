@@ -1192,11 +1192,13 @@ private:
             return;
         }
         MirBlockId const b = it->second;
-        builder_.beginBlock(b);
-        // Bail on missing `{` for the block body — without it the
-        // following instructions cannot be parsed in a meaningful
-        // structural context.
+        // Bail BEFORE `beginBlock` — otherwise a missing `{` leaves
+        // the builder with an Open-state block that finalize()'s
+        // `errors_` short-circuit relies on to avoid `MirBuilder::
+        // finish()`'s abort. Bailing first keeps the builder in a
+        // clean state regardless of the finalize() path.
         if (!expect(TokKind::LBrace)) return;
+        builder_.beginBlock(b);
         while (true) {
             Tok pk = lex_.peek();
             if (pk.kind == TokKind::RBrace || pk.kind == TokKind::End) break;
