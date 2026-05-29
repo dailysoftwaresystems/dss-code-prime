@@ -106,7 +106,7 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
         if (!k.has_value()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", opIdx, vi, ki),
-                      "expected 'reg' / 'imm32'");
+                      "expected 'reg' / 'imm32' / 'symbol'");
             continue;
         }
         variant.operandKinds.push_back(*k);
@@ -197,7 +197,10 @@ void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
     auto const r = encodingSlotKindFromName(v.at("resultSlot").get<std::string>());
     if (!r.has_value()) {
         coll.emit(DiagnosticCode::C_MalformedJson, path,
-                  "expected 'modrm.reg' / 'modrm.rm' / 'imm32'");
+                  "expected one of: 'modrm.reg' / 'modrm.rm' / "
+                  "'imm32' (x86-variable) or 'rd' / 'rn' / 'rm' "
+                  "(fixed32) or 'disp32' (x86) / 'imm26' (fixed32, "
+                  "symbol-bearing)");
         return;
     }
     variant.resultSlot = *r;
@@ -248,7 +251,10 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
         if (!sk.has_value()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("{}/slotKind", wirePath),
-                      "expected 'modrm.reg' / 'modrm.rm' / 'imm32'");
+                      "expected one of: 'modrm.reg' / 'modrm.rm' / "
+                  "'imm32' (x86-variable) or 'rd' / 'rn' / 'rm' "
+                  "(fixed32) or 'disp32' (x86) / 'imm26' (fixed32, "
+                  "symbol-bearing)");
             continue;
         }
         wire.slotKind = *sk;

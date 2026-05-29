@@ -8,7 +8,6 @@
 //     0xE8 opcode byte).
 
 #include "asm/asm.hpp"
-#include "asm_test_support.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -20,7 +19,6 @@
 #include <vector>
 
 using namespace dss;
-using dss::test_support::asm_::countDiagnostics;
 
 TEST(X86Relocations, CallSymEmitsRel32Reloc) {
     auto schema = TargetSchema::loadShipped("x86_64");
@@ -192,6 +190,50 @@ TEST(X86Relocations, IsCallWithResultSlotIsRejected) {
         ]
     })";
     EXPECT_FALSE(TargetSchema::loadFromText(kJson, "synth.target.json").has_value());
+}
+
+TEST(X86Relocations, Requires2AddressWithoutWireOnOperand0IsRejected) {
+    // Rule G's `requires2Address` exception requires a wire on
+    // operand 0 targeting a destination-bearing slot. A
+    // `requires2Address: true` opcode whose wires omit operand 0
+    // would silently let the destination drop — validate() must
+    // reject.
+    constexpr char const* kJson = R"({
+        "dssTargetVersion": 1,
+        "target": { "name": "synth", "version": "0.1" },
+        "opcodes": [
+            { "mnemonic": "invalid", "result": "none" },
+            { "mnemonic": "mov", "result": "value",
+              "minOperands": 1, "maxOperands": 1,
+              "encoding": {
+                "format": "x86-variable",
+                "variants": [
+                  { "guard": { "operandKinds": ["reg"] },
+                    "template": { "rexW": true, "opcode": [139] },
+                    "resultSlot": "modrm.reg",
+                    "wires": [{ "index": 0, "slotKind": "modrm.rm" }]
+                  }
+                ]
+              } },
+            { "mnemonic": "bogus", "result": "value",
+              "requires2Address": true,
+              "minOperands": 2, "maxOperands": 2,
+              "encoding": {
+                "format": "x86-variable",
+                "variants": [
+                  { "guard": { "operandKinds": ["reg", "reg"] },
+                    "template": { "rexW": true, "opcode": [1] },
+                    "wires": [
+                      { "index": 1, "slotKind": "modrm.reg" }
+                    ]
+                  }
+                ]
+              } }
+        ]
+    })";
+    EXPECT_FALSE(TargetSchema::loadFromText(kJson, "synth.target.json").has_value())
+        << "requires2Address opcode whose wires omit operand 0 must "
+           "be rejected — destination would silently drop";
 }
 
 TEST(X86Relocations, IsCallWithoutSideEffectsIsRejected) {

@@ -5,7 +5,6 @@
 // call-with-link form which emits a `call26` relocation.
 
 #include "asm/asm.hpp"
-#include "asm_test_support.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -17,7 +16,6 @@
 #include <vector>
 
 using namespace dss;
-using dss::test_support::asm_::countDiagnostics;
 
 namespace {
 

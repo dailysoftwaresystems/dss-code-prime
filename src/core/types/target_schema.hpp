@@ -428,6 +428,18 @@ inline constexpr EnumNameTable<EncodingSlotKind, 8> kEncodingSlotKindTable{{{
 inline constexpr std::size_t kEncodingSlotKindCount =
     kEncodingSlotKindTable.rows.size();
 
+// Belt-and-suspenders: if a new EncodingSlotKind enumerator is
+// added without extending the table (or vice versa), the
+// `EnumNameTable<E, N>` template would let an ordinal escape
+// without a row. Pin the equation here so the build breaks
+// loudly at the next compile, not silently at first lookup.
+// (Each enumerator gets exactly one row; ordinals are
+// contiguous 0..N-1; both invariants are validated by the
+// table's `name()`/`fromName()` semantics.)
+static_assert(kEncodingSlotKindCount == 8,
+              "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
+              "add a row to the table or remove the enumerator");
+
 // Architect AS3 followup: each `EncodingSlotKind` is tied to ONE
 // encoding shape — ModRm* and Imm32 are x86-variable; Rd/Rn are
 // fixed32. Returns the shape the slot belongs to, so `validate()`

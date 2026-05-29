@@ -323,7 +323,6 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                     return s == EncodingSlotKind::Imm32;
                 };
                 // Track each non-multi-writer slot's first writer.
-                // 6 entries — one per EncodingSlotKind value.
                 // Sized from the shared `kEncodingSlotKindCount` so
                 // adding a new slot (Disp32 / Imm26 / etc.) is the
                 // SAME change as updating the enum table, no manual
