@@ -177,3 +177,133 @@ TEST(MirText, EmptyModuleParseRoundTripsToEmpty) {
     EXPECT_TRUE(res->ok);
     EXPECT_EQ(res->mir.moduleFuncCount(), 0u);
 }
+
+// Switch terminator round-trip — case/default arrow parsing was wrong
+// in cycle 1 (used Minus instead of Arrow); this test pins the fix.
+TEST(MirText, SwitchTerminatorRoundTrips) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const c0    = b.createBlock(StructCfMarker::SwitchCase);
+    MirBlockId const c1    = b.createBlock(StructCfMarker::SwitchCase);
+    MirBlockId const def   = b.createBlock(StructCfMarker::SwitchCase);
+    MirBlockId const join  = b.createBlock(StructCfMarker::SwitchJoin);
+    b.beginBlock(entry);
+    MirInstId const disc = b.addConst(intLit(1), i32);
+    MirInstId const v0   = b.addConst(intLit(0), i32);
+    MirInstId const v1   = b.addConst(intLit(1), i32);
+    std::array<std::pair<MirInstId, MirBlockId>, 2> const cases{
+        std::pair<MirInstId, MirBlockId>{v0, c0},
+        std::pair<MirInstId, MirBlockId>{v1, c1}};
+    b.addSwitch(disc, cases, def);
+    b.beginBlock(c0);  b.addBr(join);
+    b.beginBlock(c1);  b.addBr(join);
+    b.beginBlock(def); b.addBr(join);
+    b.beginBlock(join); b.addReturn(disc);
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "sw"};
+    auto rt = roundTrip(m, ti, names);
+    EXPECT_TRUE(rt.parseOk);
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+}
+
+// Loop round-trip — LoopHeader / LoopExit markers must survive
+// (the cycle-1 emitter rendered them but had no test).
+TEST(MirText, LoopRoundTrips) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32    = ti.primitive(TypeKind::I32);
+    TypeId const boolTy = ti.primitive(TypeKind::Bool);
+    TypeId const fnSig  = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = b.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const exit   = b.createBlock(StructCfMarker::LoopExit);
+    b.beginBlock(entry);  b.addBr(header);
+    b.beginBlock(header);
+    MirInstId const c1 = b.addConst(intLit(1, TypeKind::Bool), boolTy);
+    b.addCondBr(c1, body, exit);
+    b.beginBlock(body);   b.addBr(header);  // back-edge
+    b.beginBlock(exit);
+    MirInstId const rv = b.addConst(intLit(0), i32);
+    b.addReturn(rv);
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "loop"};
+    auto rt = roundTrip(m, ti, names);
+    EXPECT_TRUE(rt.parseOk);
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+}
+
+// Aggregate literal round-trip — `MirAggregateValue` nested rendering
+// (ML2 cycle 6 const-fold output for struct literals).
+TEST(MirText, AggregateLiteralRoundTrips) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 2> const fields{i32, i32};
+    TypeId const pointTy = ti.structType("Point", fields);
+    TypeId const fnSig   = ti.fnSig(std::span<TypeId const>{}, pointTy, CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    // Build an aggregate literal: { 1, 2 } typed as Struct.
+    MirAggregateValue agg;
+    agg.fields.push_back(intLit(1));
+    agg.fields.push_back(intLit(2));
+    MirLiteralValue aggLit;
+    aggLit.core  = TypeKind::Struct;
+    aggLit.value = std::move(agg);
+    MirInstId const cv = b.addConst(std::move(aggLit), pointTy);
+    b.addReturn(cv);
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "makePoint"};
+    auto rt = roundTrip(m, ti, names);
+    EXPECT_TRUE(rt.parseOk);
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+}
+
+// Pointer + Array type round-trip.
+TEST(MirText, PointerAndArrayTypesRoundTrip) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32      = ti.primitive(TypeKind::I32);
+    TypeId const ptrI32   = ti.pointer(i32);
+    TypeId const arrI32x4 = ti.array(i32, 4);
+    std::array<TypeId, 2> const params{ptrI32, arrI32x4};
+    TypeId const fnSig    = ti.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const c = b.addConst(intLit(7), i32);
+    b.addReturn(c);
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "f"};
+    auto rt = roundTrip(m, ti, names);
+    EXPECT_TRUE(rt.parseOk);
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+    EXPECT_NE(rt.firstEmit.find("ptr<i32>"), std::string::npos);
+    EXPECT_NE(rt.firstEmit.find("arr<i32, 4>"), std::string::npos);
+}
+
+// Symbol-name table with unnamed symbol — fallback to bare `%N` quote
+// must still round-trip.
+TEST(MirText, UnnamedSymbolRoundTrips) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const fnSig  = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{42});  // sym 42, no name supplied
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+    std::vector<std::string> emptyNames;  // no names at all
+    auto rt = roundTrip(m, ti, emptyNames);
+    EXPECT_TRUE(rt.parseOk);
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+    EXPECT_NE(rt.firstEmit.find("%42 \"\""), std::string::npos);
+}

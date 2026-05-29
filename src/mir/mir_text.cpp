@@ -737,6 +737,16 @@ private:
     std::vector<std::string> symbolNames_;     // SymbolId.v → name
     std::unordered_map<std::uint32_t, MirBlockId> blockMap_;  // text slot v → builder block id
     std::unordered_map<std::uint32_t, MirInstId>  valueMap_;  // text slot v → builder inst id
+    std::unordered_map<std::uint32_t, MirFuncId>  funcMap_;   // text slot v → builder func id
+    // Globals whose `initfunc` references a function-text-slot that
+    // wasn't yet parsed at the time the global was declared. Resolved
+    // at finalize() by replaying the global with the resolved MirFuncId.
+    struct PendingGlobalInit {
+        TypeId        ty;
+        SymbolId      sym;
+        std::uint32_t initFuncSlot;
+    };
+    std::vector<PendingGlobalInit> pendingInitFuncGlobals_;
     // Forward-reference book-keeping for phi incomings whose value or
     // pred wasn't yet emitted at parse time. Resolved at finalize().
     struct PendingPhi {
@@ -1016,13 +1026,15 @@ private:
         } else if (pk.kind == TokKind::Ident && pk.text == "initfunc") {
             lex_.take();
             std::uint32_t const fnSlot = parsePercentValue();
-            // initfunc references a function by its text slot. Functions
-            // were parsed earlier or will be — defer-resolve at finalize.
-            // Simplification: assume the init func text-id == its
-            // MirFuncId. Real implementation needs a deferred-resolve
-            // mechanism. For now, parse-time best-effort.
-            builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX,
-                MirFuncId{fnSlot, builder_.id().v});
+            // Resolve via funcMap_ if available (function declared before
+            // this global); else defer to finalize() — the function may
+            // appear later in the text.
+            auto it = funcMap_.find(fnSlot);
+            if (it != funcMap_.end()) {
+                builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, it->second);
+            } else {
+                pendingInitFuncGlobals_.push_back({ty, SymbolId{sym}, fnSlot});
+            }
         } else {
             MirLiteralValue lv = parseLiteral();
             std::uint32_t const litIdx = builder_.literalPoolAdd(std::move(lv));
@@ -1035,27 +1047,18 @@ private:
         (void)expect(TokKind::Colon);
         TypeId const sig = parseType();
         MirFuncId const f = builder_.addFunction(sig, SymbolId{sym});
-        (void)f;
+        // Text initfunc references use %f<MirFuncId.v>. Track in
+        // parse order so deferred-resolution at finalize works even
+        // when a global with `initfunc` precedes its target function.
+        funcMap_[f.v] = f;
         (void)expect(TokKind::LBrace);
         // Two-pass: first scan all block headers (with their markers)
         // and create them in declaration order, so forward refs from
         // branch instructions resolve to blocks with the correct
-        // marker. Then rewind and parse the bodies.
+        // marker. Then rewind via the Lexer's `setPos` and parse the
+        // bodies.
         std::size_t const bodyStart = lex_.pos();
         scanBlockHeaders();
-        // Rewind: re-lex from bodyStart. The Lexer has no rewind API,
-        // so we accomplish this by saving the entire remaining text
-        // and constructing a sub-lexer.
-        // Simpler approach: scanBlockHeaders only PEEKS at block
-        // markers; it doesn't consume past the next `block` keyword's
-        // header tokens. Instead, do a full forward scan that
-        // consumes through the whole function and records (slot,
-        // marker, body-token-range), then iterate the records.
-        // For cycle 1, use the simpler design: scanBlockHeaders
-        // creates all blocks with correct markers by consuming the
-        // whole function body, then we re-parse from bodyStart.
-        // Implementing rewind via a Lexer position setter is cleaner
-        // — added below.
         lex_.setPos(bodyStart);
         while (true) {
             Tok pk = lex_.peek();
@@ -1230,6 +1233,24 @@ private:
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }
+            case MirOpcode::IntrinsicCall: {
+                // Emitter wrote: `(intrinsic <id>, %v1, %v2, ...)`.
+                (void)expect(TokKind::LParen);
+                (void)expectIdent("intrinsic");
+                Tok idTok = lex_.take();
+                std::uint32_t intrinId = 0;
+                std::from_chars(idTok.text.data(),
+                    idTok.text.data() + idTok.text.size(), intrinId);
+                std::vector<MirInstId> operands;
+                while (lex_.peek().kind == TokKind::Comma) {
+                    lex_.take();
+                    operands.push_back(resolveValue(parsePercentValue()));
+                }
+                (void)expect(TokKind::RParen);
+                MirInstId const id = builder_.addInst(op, operands, resultType, intrinId);
+                if (resultSlot != 0) valueMap_[resultSlot] = id;
+                break;
+            }
             case MirOpcode::Phi: {
                 (void)expect(TokKind::LBracket);
                 std::vector<std::pair<std::uint32_t, std::uint32_t>> incs;
@@ -1280,12 +1301,7 @@ private:
                     Tok kw = lex_.take();
                     if (kw.kind == TokKind::Ident && kw.text == "case") {
                         std::uint32_t const caseVSlot = parsePercentValue();
-                        (void)expect(TokKind::Minus);  // tokenized as Unknown
-                        // arrow handled by lexer if we get -> via expect
-                        // we expect '->' as a single token here; the
-                        // dispatch flag was actually consumed by lex.
-                        // Simpler: just consume two tokens since lex
-                        // emits Arrow for '->'.
+                        (void)expect(TokKind::Arrow);
                         std::uint32_t const tgt = parsePercentValue();
                         MirInstId const cv = resolveValue(caseVSlot);
                         MirBlockId const tb = resolveBlockRef(tgt);
@@ -1348,6 +1364,19 @@ private:
     }
 
     [[nodiscard]] std::unique_ptr<MirParseResult> finalize() {
+        // Resolve any pending `initfunc` globals whose target function
+        // was declared after the global in the text.
+        for (auto const& pg : pendingInitFuncGlobals_) {
+            auto it = funcMap_.find(pg.initFuncSlot);
+            if (it == funcMap_.end()) {
+                emitUnknownName(std::format(
+                    "global %{}'s initfunc %f{} references a function "
+                    "that was never declared",
+                    pg.sym.v, pg.initFuncSlot));
+                continue;
+            }
+            builder_.addGlobal(pg.ty, pg.sym, UINT32_MAX, it->second);
+        }
         // Resolve phi incomings now that all blocks + values are known.
         for (auto& pp : pendingPhis_) {
             for (auto const& [vSlot, pSlot] : pp.incomings) {
@@ -1362,13 +1391,24 @@ private:
             }
         }
         std::size_t const errBefore = reporter_.errorCount();
+        // `MirBuilder::finish()` aborts on contract violations (e.g.
+        // a block was created but never `beginBlock`'d, or never
+        // terminated). If parse errors have already occurred we
+        // cannot trust the builder's invariants — return an empty
+        // module rather than aborting the process, so the user sees
+        // the parse diagnostics instead of a crash. Verify-on-load
+        // is skipped because there's nothing meaningful to verify.
+        if (errors_) {
+            return std::make_unique<MirParseResult>(
+                Mir{}, std::move(interner_), std::move(symbolNames_));
+        }
         Mir module = std::move(builder_).finish();
         auto result = std::make_unique<MirParseResult>(
             std::move(module), std::move(interner_), std::move(symbolNames_));
         // Verify-on-load.
         MirVerifier verifier{result->mir, &result->interner};
         (void)verifier.verify(reporter_);
-        result->ok = (reporter_.errorCount() == errBefore) && !errors_;
+        result->ok = (reporter_.errorCount() == errBefore);
         return result;
     }
 };
