@@ -1,5 +1,6 @@
 #include "core/types/grammar_schema.hpp"
 
+#include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema_json.hpp"
 
 #include <cassert>
@@ -55,40 +56,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromFile(
 }
 
 LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadShipped(std::string_view name) {
-    // Reject obviously-bad names (path-separators, dotfiles, empties) up
-    // front. The loader is only meant to resolve `csharp` / `dart` /
-    // `tsql` / `sqlite` / `toy` — never arbitrary paths.
-    if (name.empty() || name.find('/') != std::string_view::npos
-        || name.find('\\') != std::string_view::npos
-        || name.front() == '.') {
-        return std::unexpected(std::vector<ConfigDiagnostic>{
-            {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
-             std::string{name}, "invalid shipped-language name"}});
-    }
-
-    namespace fs = std::filesystem;
-    const std::string leaf = std::string{name} + ".lang.json";
-
-    // Walk up the directory tree from cwd looking for
-    // `src/dss-config/sources/<name>.lang.json`. This works whether
-    // the binary is invoked from the repo root, from build/, or from a
-    // nested tests/core build subdirectory — ctest's cwd varies.
-    std::error_code ec;
-    fs::path here = fs::current_path(ec);
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        const fs::path candidate = here / "src" / "dss-config" / "sources" / leaf;
-        if (fs::exists(candidate, ec)) {
-            return loadFromFile(candidate);
-        }
-        const fs::path parent = here.parent_path();
-        if (parent == here) break;     // hit the root
-        here = parent;
-    }
-
-    return std::unexpected(std::vector<ConfigDiagnostic>{
-        {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
-         std::string{name},
-         "no shipped language config found in src/dss-config/sources/"}});
+    auto path = findShippedConfig({name, "sources", ".lang.json", "language",
+                                   DiagnosticCode::C_InvalidLanguageName});
+    if (!path) return std::unexpected(std::move(path).error());
+    return loadFromFile(*path);
 }
 
 LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromText(

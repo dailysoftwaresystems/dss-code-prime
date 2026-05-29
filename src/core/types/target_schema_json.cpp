@@ -69,7 +69,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll.diagnostics));
     }
 
-    TargetSchemaData data;
+    detail::TargetSchemaData data;
     data.id = TargetSchemaId{mintTargetSchemaId()};
 
     // ── target.name + target.version ──
@@ -142,8 +142,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         if (o.contains("hasSideEffects") && o.at("hasSideEffects").is_boolean()) {
             info.hasSideEffects = o.at("hasSideEffects").get<bool>();
         }
-        // Arity bounds (optional, default 0). Stored as uint8 so >255 is
-        // clamped + diagnosed.
+        // Arity bounds (optional, default 0). Stored as uint8; values
+        // outside [0,255] are diagnosed and skipped (the field keeps
+        // its zero default rather than being silently truncated).
         auto readByte = [&](std::string_view field,
                             std::uint8_t& out) {
             if (!o.contains(field)) return;

@@ -16,9 +16,9 @@ namespace dss {
 
 // Universal register-class envelope. Each target maps its concrete
 // register classes (e.g. x86_64's GPR8/16/32/64 family) to this
-// envelope at the substrate level; finer-grained class info lives
-// in the target's `RegClass` enum (ML5 cycle 2). Cycle 1 uses the
-// universal envelope only.
+// envelope at the substrate level; finer-grained class info will
+// live in the target JSON's `regClasses` section (ML5 cycle 2b).
+// The LIR substrate only ever sees this envelope.
 enum class LirRegClass : std::uint8_t {
     None    = 0,
     GPR     = 1,  // general-purpose integer
@@ -65,8 +65,10 @@ struct LirReg {
 static_assert(sizeof(LirReg) == 4, "LirReg POD must stay 4 bytes");
 static_assert(std::is_trivially_copyable_v<LirReg>);
 
-// Factory helpers. Cycle 1 needs the virtual variant; cycle 2 (regalloc)
-// gates physical-reg creation behind a passkey.
+// Factory helpers. The substrate emits virtual regs only; physical-
+// reg creation will be gated behind a passkey when the ML6 regalloc
+// pass lands. (Cycle 2 of ML5 is the JSON-target pivot; regalloc is
+// a separate downstream plan.)
 [[nodiscard]] constexpr LirReg makeVirtualReg(std::uint32_t id,
                                               LirRegClass cls) noexcept {
     return LirReg{id, static_cast<std::uint32_t>(cls), 0, 0};

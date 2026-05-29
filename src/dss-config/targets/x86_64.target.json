@@ -4,7 +4,8 @@
   "target": {
     "name": "x86_64",
     "version": "0.1",
-    "description": "Minimal x86_64 opcode set for ML5 cycle 2. Cycle 3 (instruction selection) expands to full c-subset corpus coverage; cycle 2b adds the register file + ABI sections."
+    "description": "Minimal x86_64 opcode set for ML5 cycle 2. Cycle 3 (instruction selection) expands to full c-subset corpus coverage; cycle 2b adds the register file + ABI sections.",
+    "$reservedFields": "The per-opcode minOperands/maxOperands/minSuccessors/maxSuccessors fields are documented in the JSON for completeness but are NOT yet enforced by the substrate — the LIR builder only checks terminator-ness against `isTerminator` today. Cycle 3 isel + the MIR verifier will start consuming the arity bounds; until then they are advisory metadata."
   },
   "opcodes": [
     {

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/types/strong_ids.hpp"
-#include "lir/lir_opcode.hpp"
+#include "core/types/target_schema.hpp"
 #include "lir/lir_reg.hpp"
 
 #include <cstdint>

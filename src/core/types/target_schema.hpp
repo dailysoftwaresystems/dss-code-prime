@@ -56,6 +56,12 @@ enum class TargetResultRule : std::uint8_t {
 // Per-opcode descriptor — populated from the JSON `opcodes` array.
 // One row per opcode; index in the vector IS the opcode's numeric
 // value (stored as `std::uint16_t` in the LIR instruction PODs).
+//
+// The min/max arity fields are advisory metadata today: the substrate
+// only checks `isTerminator` (via `LirBuilder::add{Br,CondBr,Return}`
+// and the closeFunction terminator-required guard). Cycle 3 isel +
+// the MIR verifier will start consuming the operand/successor bounds;
+// until then they document expected shape without enforcing it.
 struct DSS_EXPORT TargetOpcodeInfo {
     std::string      mnemonic;
     TargetResultRule result         = TargetResultRule::None;
@@ -67,26 +73,41 @@ struct DSS_EXPORT TargetOpcodeInfo {
     std::uint8_t     maxSuccessors  = 0;
 };
 
-// In-memory schema. Mirrors `GrammarSchemaData` — owned-by-value POD
-// the loader builds + moves into the frozen `TargetSchema`.
+namespace detail {
+
+// In-memory schema. Mirrors `detail::GrammarSchemaData` — owned-by-
+// value POD the loader builds + moves into the frozen `TargetSchema`.
+// Hidden in `detail::` so it can only be constructed by the loader
+// path (which enforces opcode-table invariants); arbitrary callers
+// cannot hand-build a `TargetSchema` with a broken slot-0 sentinel
+// or a mnemonicIndex out of sync with `opcodes`.
 struct DSS_EXPORT TargetSchemaData {
     TargetSchemaId          id{};
     std::string             name;             // "x86_64" / "arm64" / ...
     std::string             version;          // semantic version string
 
-    // Opcode table — slot 0 MUST be the Invalid sentinel (the JSON
-    // file declares it explicitly; loader validates).
+    // Opcode table — slot 0 carries the `"invalid"` sentinel mnemonic
+    // (loader-enforced). Other slot-0 fields (terminator/result/arity)
+    // are NOT pinned by the loader; the substrate treats opcode 0 as
+    // unconditionally invalid via the addInst guard, not via these
+    // fields.
     std::vector<TargetOpcodeInfo> opcodes;
 
     // Mnemonic → index lookup (for builder/text-format/isel consumers
-    // that have a string and need the numeric opcode).
+    // that have a string and need the numeric opcode). Built by the
+    // loader and frozen alongside `opcodes`.
     std::unordered_map<std::string, std::uint16_t> mnemonicIndex;
 };
 
+} // namespace detail
+
 class DSS_EXPORT TargetSchema {
 public:
-    // Frozen — moved out of the loader.
-    explicit TargetSchema(TargetSchemaData data) noexcept : d_(std::move(data)) {}
+    // Frozen — moved out of the loader. Constructor is public so the
+    // JSON loader (in target_schema_json.cpp) can build the data POD
+    // and hand ownership over without a friend declaration.
+    explicit TargetSchema(detail::TargetSchemaData data) noexcept
+        : d_(std::move(data)) {}
 
     TargetSchema(TargetSchema const&)            = delete;
     TargetSchema& operator=(TargetSchema const&) = delete;
@@ -137,7 +158,7 @@ public:
         std::string_view jsonText, std::string_view sourceLabel);
 
 private:
-    TargetSchemaData d_;
+    detail::TargetSchemaData d_;
 };
 
 } // namespace dss
