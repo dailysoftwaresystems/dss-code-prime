@@ -181,10 +181,11 @@ encode(AssembledModule const&    module,
     // |(pcrel<<24); the walker ORs in (1<<27) for r_extern + the
     // 24-bit symbol index.
     //
-    // PE convention applies: addend lives in the patch bytes
-    // (Mach-O has no Rela addend column either). Fail loud on
-    // non-zero addend so a future ELF-shaped input cannot silently
-    // drop it.
+    // Same discipline as PE: Mach-O's `relocation_info` has no
+    // addend column (per `<mach-o/reloc.h>`); addends live in the
+    // section's patch bytes. ELF Rela is the outlier with its
+    // explicit `r_addend`. Fail loud on non-zero addend so an
+    // ELF-shaped input cannot silently drop the addend here.
 
     std::vector<std::uint8_t> textRelocs;
     std::uint32_t textRelocCount = 0;
@@ -373,9 +374,12 @@ encode(AssembledModule const&    module,
     appendU32LE(bytes, static_cast<std::uint32_t>(secText->addrAlign));
     appendU32LE(bytes, static_cast<std::uint32_t>(textRelocOffset));
     appendU32LE(bytes, textRelocCount);
-    appendU32LE(bytes, secText->type);  // section flags (S_REGULAR |
+    appendU32LE(bytes, secText->type);  // section flags from JSON
+                                         // (cycle 1 ships S_REGULAR |
                                          // S_ATTR_PURE_INSTRUCTIONS |
-                                         // S_ATTR_SOME_INSTRUCTIONS)
+                                         // S_ATTR_SOME_INSTRUCTIONS;
+                                         // future cycles read JSON-
+                                         // declared values verbatim)
     appendU32LE(bytes, 0);  // reserved1
     appendU32LE(bytes, 0);  // reserved2
     appendU32LE(bytes, 0);  // reserved3
