@@ -1,0 +1,50 @@
+{
+  "$comment": "PE/COFF relocatable object (.obj) for x86_64 Windows. Second shipped object-format JSON (plan 14 LK2 cycle 1, 2026-05-29). Consumed by `src/link/format/pe.cpp` via the format-blind linker engine. Section Characteristics + IMAGE_FILE_HEADER fields + IMAGE_RELOCATION type values follow the Microsoft PE/COFF spec (PE Format on Microsoft Learn).",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "pe64-x86_64-windows",
+    "version": "1.0",
+    "kind": "pe"
+  },
+
+  "pe": {
+    "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = 0 — relocatable .obj carries no file-level flags (link.exe sets image-level flags when producing the .exe/.dll).",
+    "machine": 34404,
+    "characteristics": 0
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code. PE Characteristics = IMAGE_SCN_CNT_CODE (0x20) | IMAGE_SCN_ALIGN_16BYTES (0x500000) | IMAGE_SCN_MEM_EXECUTE (0x20000000) | IMAGE_SCN_MEM_READ (0x40000000) = 0x60500020. PE's `type` field is repurposed to carry Characteristics (which encodes alignment via IMAGE_SCN_ALIGN_*BYTES bits); `flags` is unused; `addrAlign` MUST be 0 for PE rows (validate-rejected — PE encodes alignment in Characteristics, not the substrate's `addrAlign` field).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1615855648,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "32-bit PC-relative (call / jmp rel32). IMAGE_REL_AMD64_REL32 = 4. `kind` = 1 matches x86_64.target.json's `rel32` row. link.exe handles the rel32 RIP-bias intrinsically (PE convention: the patch site holds whatever bytes the assembler wrote; the linker computes `target_va - (section_va + VA + 4)` and ADDS the stored value). The assembler writes 0x00000000 at the patch site — addend=0 is the PE convention for call/jmp rel32.",
+      "name": "IMAGE_REL_AMD64_REL32",
+      "kind": 1,
+      "nativeId": 4
+    },
+    {
+      "$comment": "Absolute 64-bit. IMAGE_REL_AMD64_ADDR64 = 1. `kind` = 2 matches x86_64.target.json's `abs64` row.",
+      "name": "IMAGE_REL_AMD64_ADDR64",
+      "kind": 2,
+      "nativeId": 1
+    },
+    {
+      "$comment": "Absolute 32-bit. IMAGE_REL_AMD64_ADDR32 = 2. `kind` = 3 matches x86_64.target.json's `abs32` row.",
+      "name": "IMAGE_REL_AMD64_ADDR32",
+      "kind": 3,
+      "nativeId": 2
+    }
+  ]
+}

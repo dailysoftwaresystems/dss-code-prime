@@ -1,5 +1,6 @@
 #include "core/types/grammar_schema_json.hpp"
 
+#include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/operator_table.hpp"
@@ -76,19 +77,7 @@ constexpr std::string_view kBuiltinTokenKindNames[] = {
     "Newline",
 };
 
-struct Collector {
-    std::vector<ConfigDiagnostic> diagnostics;
-
-    void emit(DiagnosticCode code, std::string path, std::string message,
-              DiagnosticSeverity sev = DiagnosticSeverity::Error) {
-        diagnostics.push_back({code, sev, std::move(path), std::move(message)});
-    }
-
-    [[nodiscard]] bool hasErrors() const noexcept {
-        return std::ranges::any_of(diagnostics,
-            [](auto const& d) { return d.severity == DiagnosticSeverity::Error; });
-    }
-};
+using Collector = substrate::DiagnosticCollector;
 
 // Soft upper bound on how many entries a single scopeRequire list may
 // hold. Real configs use 1–4; anything larger is almost certainly a
@@ -187,7 +176,7 @@ void parseModeFields(json const& m,
 //     compiled at load time via std::regex to surface malformed patterns.
 inline std::optional<StringStyle> parseStringStyle(json const& obj,
                                                    std::string const& path,
-                                                   struct Collector& c);
+                                                   Collector& c);
 
 std::optional<StringStyle> parseStringStyle(json const& obj,
                                             std::string const& path,
@@ -1266,22 +1255,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         coll.emit(DiagnosticCode::C_MalformedJson,
                   std::string{sourceLabel},
                   std::format("JSON parse error: {}", e.what()));
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     if (!doc.is_object()) {
         coll.emit(DiagnosticCode::C_MalformedJson, std::string{sourceLabel},
                   "top-level value must be a JSON object");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     // dssSchemaVersion ──
     if (!present(doc, "dssSchemaVersion", coll, std::string{sourceLabel})) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     if (!doc.at("dssSchemaVersion").is_number_integer()) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
                   "must be a positive integer");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     // Inclusive window of schema versions this loader understands. Bump
     // the upper bound only after the loader actually parses the new
@@ -1296,21 +1285,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
                   std::format("unsupported dssSchemaVersion {} (this build supports {}..{})",
                               schemaVer, kMinSchemaVersion, kMaxSchemaVersion));
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     // language ──
     if (!present(doc, "language", coll, std::string{sourceLabel})) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     json const& langObj = doc.at("language");
     if (!langObj.is_object()) {
         coll.emit(DiagnosticCode::C_MissingField, "/language", "must be an object");
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     if (!present(langObj, "name",    coll, "/language") ||
         !present(langObj, "version", coll, "/language")) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
 
     GrammarSchemaData data;
@@ -4808,7 +4797,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     if (coll.hasErrors()) {
-        return std::unexpected(std::move(coll.diagnostics));
+        return std::unexpected(std::move(coll).release());
     }
     return std::make_shared<GrammarSchema>(std::move(data));
 }

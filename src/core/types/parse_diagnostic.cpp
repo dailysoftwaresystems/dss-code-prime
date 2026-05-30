@@ -125,30 +125,51 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";
         case DiagnosticCode::R_SpilledDueToPressure:          return "R_SpilledDueToPressure";
         case DiagnosticCode::R_SpilledDueToCrossCallExhaustion: return "R_SpilledDueToCrossCallExhaustion";
+        case DiagnosticCode::A_NoEncodingDeclared:           return "A_NoEncodingDeclared";
+        case DiagnosticCode::A_NoEncodingShapeWalker:        return "A_NoEncodingShapeWalker";
+        case DiagnosticCode::A_LirToMirSizeMismatch:         return "A_LirToMirSizeMismatch";
+        case DiagnosticCode::A_NoMatchingEncodingVariant:    return "A_NoMatchingEncodingVariant";
+        case DiagnosticCode::A_RoundTripMismatch:            return "A_RoundTripMismatch";
+        case DiagnosticCode::K_SymbolUndefined:              return "K_SymbolUndefined";
+        case DiagnosticCode::K_RelocationKindMismatch:       return "K_RelocationKindMismatch";
+        case DiagnosticCode::K_NoMatchingObjectFormat:       return "K_NoMatchingObjectFormat";
     }
     return "Unknown";
 }
 
 std::string diagnosticCodePrefix(DiagnosticCode c) {
-    // The numeric value carries the phase letter in its high nibble:
+    // The numeric value carries the phase letter in its high nibble.
+    // CROSS-PLAN AUTHORITY: this table mirrors plan 00 §0.3 — the two
+    // sources MUST stay in lockstep. When adding a new family, update
+    // BOTH in the same PR.
     //   0x0xxx → P0xxx     (parse)
+    //   0x1xxx → A0xxx     (assembler — plan 13 AS1; allocated 2026-05-29)
     //   0x4xxx → R0xxx     (register allocator)
-    //   0x5xxx → O0xxx     RESERVED — object format / linker (not yet shipped;
-    //                       holding the slot here so plan-14 doesn't accidentally
+    //   0x5xxx → O0xxx     RESERVED — object format / linker (plan 14;
+    //                       holding the slot so plan-14 doesn't accidentally
     //                       land on 0xCxxx (which is C_*) or 0xDxxx (D_*))
+    //   0x6xxx → W0xxx     RESERVED — WAT/WASM verifier (plan 18; allocated 2026-05-29)
+    //   0x7xxx → V0xxx     RESERVED — SPIR-V verifier  (plan 17; allocated 2026-05-29)
     //   0x9xxx → P9xxx     (parse, internal-invariant range)
     //   0xCxxx → C0xxx     (config)
     //   0xDxxx → D0xxx     (driver / compilation-unit)
     //   0xAxxx → I0xxx     (MIR verifier / IR-gen mid-level)
     //   0xBxxx → L0xxx     (LIR lowering + verifier)
+    //   0x8xxx → K0xxx     (linker — plan 14 LK4)
     //   0xExxx → S0xxx     (semantic analysis)
     //   0xFxxx → H0xxx     (HIR verifier / lowering)
+    // Free for future families: 0x2xxx, 0x3xxx (reserve for JVM IL /
+    // .NET IL / future shader-stage validators post-v1).
     // Render as the 4-digit hex grouping the user actually sees.
     const auto v          = static_cast<std::uint16_t>(c);
     const std::uint16_t nibble = v & 0xF000u;
     char letter = 'P';
-    if (nibble == 0x4000u) {
+    if (nibble == 0x1000u) {
+        letter = 'A';
+    } else if (nibble == 0x4000u) {
         letter = 'R';
+    } else if (nibble == 0x8000u) {
+        letter = 'K';
     } else if (nibble == 0xA000u) {
         letter = 'I';
     } else if (nibble == 0xB000u) {
@@ -163,12 +184,13 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'H';
     }
     // Strip the high nibble for the numeric portion when it's a phase
-    // marker (R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
+    // marker (A/K/R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
     // P_BuilderInvariant prints as "P9000".
-    const bool hasNibbleMarker = (nibble == 0x4000u || nibble == 0xA000u
-                                  || nibble == 0xB000u || nibble == 0xC000u
-                                  || nibble == 0xD000u || nibble == 0xE000u
-                                  || nibble == 0xF000u);
+    const bool hasNibbleMarker = (nibble == 0x1000u || nibble == 0x4000u
+                                  || nibble == 0x8000u
+                                  || nibble == 0xA000u || nibble == 0xB000u
+                                  || nibble == 0xC000u || nibble == 0xD000u
+                                  || nibble == 0xE000u || nibble == 0xF000u);
     const std::uint16_t lo = hasNibbleMarker ? (v & 0x0FFFu) : v;
     return std::format("{}{:04X}", letter, lo);
 }

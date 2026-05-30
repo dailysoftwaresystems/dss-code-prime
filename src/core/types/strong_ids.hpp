@@ -143,6 +143,26 @@ DSS_ARENA_ID(LirFuncId);
 // values from it.
 DSS_STRONG_ID(LirSpillSlot);
 
+// `RelocationKind` is the opaque target-declared tag the assembler
+// writes onto `Relocation::kind` (plan 13 AS1 §2.6). Each target
+// schema declares its own kind set in `*.target.json::relocations[]`;
+// the substrate never branches on the value (read it via
+// `schema.relocationInfo(kind)`). The strong-id wrapper prevents the
+// assembler from fabricating an int and writing it directly —
+// values flow only through `TargetRelocationInfo::kind` and the
+// schema's lookup accessors. Slot 0 is the invalid sentinel
+// (`RelocationKind{}` default-constructs to invalid; loader rejects
+// any declared kind with `v == 0`).
+DSS_STRONG_ID(RelocationKind);
+
+// `ObjectFormatSchemaId` is the monotonic identity tag minted by
+// the loader for each JSON-loaded `ObjectFormatSchema` (plan 14
+// LK4). Mirrors `TargetSchemaId` for the linker tier — the
+// substrate is target-blind AND format-blind; the schema's
+// identity is opaque to consumers, who hold a `shared_ptr` and
+// read via accessors.
+DSS_STRONG_ID(ObjectFormatSchemaId);
+
 #undef DSS_STRONG_ID
 #undef DSS_ARENA_ID
 
@@ -174,6 +194,8 @@ inline constexpr LirInstId       InvalidLirInst{};
 inline constexpr LirBlockId      InvalidLirBlock{};
 inline constexpr LirFuncId       InvalidLirFunc{};
 inline constexpr LirSpillSlot    InvalidLirSpillSlot{};
+inline constexpr RelocationKind         InvalidRelocationKind{};
+inline constexpr ObjectFormatSchemaId   InvalidObjectFormatSchema{};
 inline constexpr TargetSchemaId  InvalidTargetSchema{};
 inline constexpr MirFuncId       InvalidMirFunc{};
 inline constexpr MirGlobalId     InvalidMirGlobal{};
@@ -218,5 +240,7 @@ DSS_HASH_ID(LirInstId);
 DSS_HASH_ID(LirBlockId);
 DSS_HASH_ID(LirFuncId);
 DSS_HASH_ID(TargetSchemaId);
+DSS_HASH_ID(RelocationKind);
+DSS_HASH_ID(ObjectFormatSchemaId);
 
 #undef DSS_HASH_ID

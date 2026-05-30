@@ -29,41 +29,104 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "2-operand-shape mov: destination = result vreg, source = operands[0]. AS2 cycle 2 wires this to two encoding variants: REX.W 0x8B /r (mov r64, r64) when source is a register; REX.W 0xC7 /0 imm32 (mov r/m64, imm32 sign-extended to 64-bit) when source is an immediate.",
       "mnemonic":      "mov",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "rexW": true, "opcode": [139] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["imm32"] },
+            "template":   { "rexW": true, "opcode": [199], "modrmRegExt": 0 },
+            "resultSlot": "modrm.rm",
+            "wires":      [{ "index": 0, "slotKind": "imm32" }]
+          }
+        ]
+      }
     },
     {
+      "$comment": "add reg-reg — REX.W 0x01 /r (ADD r/m64, r64). LIR is 3-address (dst, src1, src2); requires2Address=true makes the legalize pass insert `mov dst, src1` first when dst!=src1, then the assembler emits `add dst, src2` (writing into ModR/M.rm, which is dst).",
       "mnemonic":      "add",
       "result":        "value",
       "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands":   2,
       "maxOperands":   2,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "$comment": "2-address shape: `operands[0]` IS the destination after `lir_2addr_legalize` ensures result==operands[0]. So no resultSlot — the wire for operands[0] handles the destination placement (its hwEncoding goes into ModR/M.rm). validate() rule G has a `requires2Address` exception for exactly this shape.",
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "rexW": true, "opcode": [1] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
     },
     {
+      "$comment": "sub reg-reg — REX.W 0x29 /r (SUB r/m64, r64). Same 2-address shape as `add`.",
       "mnemonic":      "sub",
       "result":        "value",
       "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands":   2,
       "maxOperands":   2,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "rexW": true, "opcode": [41] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "2-operand multiply. x86 has both 2-op `imul reg, reg` (writes the low half to the destination — what cycle 3a uses) and 1-op `mul/imul reg` (writes rdx:rax with the full double-width product — needed only when overflow detection or 128-bit results matter; cycle 3c/AS1 lower those via a different opcode pseudonym). Cycle 3a sticks to the low-half-only shape.",
+      "$comment": "2-operand multiply. x86 has both 2-op `imul reg, reg` (writes the low half to the destination — what we emit) and 1-op `mul/imul reg` (rdx:rax full-width — needed only for overflow/128-bit results, future cycle). The 2-op form is REX.W 0x0F 0xAF /r — UNUSUAL among x86 binary arith because dest goes to ModR/M.reg (not r/m), source-1 goes to r/m. Wires reflect this: op[0]→modrm.reg (the destination per 2-address), op[1]→modrm.rm.",
       "mnemonic":      "mul",
       "result":        "value",
       "hasSideEffects": false,
+      "requires2Address": true,
       "minOperands":   2,
       "maxOperands":   2,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "rexW": true, "opcode": [15, 175] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "mnemonic":      "cmp",
@@ -116,6 +179,7 @@
       "maxSuccessors": 2
     },
     {
+      "$comment": "call sym — direct near call to a symbol. Encoding: 0xE8 + 4-byte signed PC-relative displacement to the call target (filled with 0 by the assembler; the linker patches via the rel32 relocation). The schema's maxOperands=255 admits a call ABI where extra operands carry arg-register hints; cycle-4 wires the single-SymbolRef variant (the direct-call form). An indirect-call form (call rax, encoding REX 0xFF /2) is anchored as a future variant.",
       "mnemonic":      "call",
       "result":        "optional",
       "hasSideEffects": true,
@@ -123,9 +187,22 @@
       "minOperands":   1,
       "maxOperands":   255,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["symbol"] },
+            "template": { "opcode": [232] },
+            "wires":    [
+              { "index": 0, "slotKind": "disp32", "relocationKind": "rel32" }
+            ]
+          }
+        ]
+      }
     },
     {
+      "$comment": "ret — 0xC3 near-return. The schema's maxOperands=1 admits an optional return value carrier; AS2 cycle 2 wires the zero-operand variant only. The actual return value is materialized into the calling-convention's return register by ML7 callconv-lowering BEFORE the ret instruction is emitted (via a `mov` to rax/xmm0); the ret instruction itself never carries an operand at the byte level.",
       "mnemonic":      "ret",
       "result":        "none",
       "terminatorKind": "return",
@@ -133,7 +210,16 @@
       "minOperands":   0,
       "maxOperands":   1,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [195] }
+          }
+        ]
+      }
     },
     {
       "$comment": "Allocate a stack-frame slot (cycle 3c). Cycle 3c is the pass-through layer: payload is threaded verbatim from MIR Alloca (currently 0 — MIR does not yet encode size/align; that lands when ML6's frame-layout phase pulls on it). Result is a pointer-class virtreg holding the slot's effective address. AS1 turns this into a frame-relative `lea` once the frame layout is known.",
@@ -406,5 +492,11 @@
       "shadowSpaceBytes": 32,
       "redZoneBytes":     0
     }
+  ],
+  "$relocationsComment": "Relocation taxonomy (plan 13 AS4). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker (plan 14) reads via TargetSchema::relocationInfo(kind). `formula` is opaque text — documented in plan 14 §2.0 for human cross-reference + future linker-side decoder. Tag values are arbitrary per-target (only the names need to round-trip with format.json cross-reference).",
+  "relocations": [
+    { "name": "rel32", "kind": 1, "formula": "S + A - P - 4" },
+    { "name": "abs64", "kind": 2, "formula": "S + A"        },
+    { "name": "abs32", "kind": 3, "formula": "S + A"        }
   ]
 }

@@ -2,14 +2,14 @@
 
 A **universal, configurable compiler** written in C++. Define any source language via JSON configuration, compile to any target ISA via JSON configuration — all through a single engine.
 
-> **Status** — Frontend (lexer / parser / semantic / HIR) is complete. MIR + LIR closed end-to-end (HIR→MIR lowering, register allocation, calling-convention lowering, full IR text round-trip). Backend codegen (assembler / linker / driver) is in flight per plans 13–14; no end-to-end binary yet. See `.plans/00-compiler-implementation-plan - tbd.md` for the live status snapshot.
+> **Status** — Frontend (lexer / parser / semantic / HIR) is complete. MIR + LIR closed end-to-end (HIR→MIR lowering, register allocation, calling-convention lowering, full IR text round-trip). **In-tree assembler complete end-to-end** (AS1–AS6 landed 2026-05-29) — x86_64 + ARM64 byte encoding via shape-keyed walkers, round-trip oracle disassembler, relocation taxonomy, source-map stamping. **In-tree linker substrate landed** (LK4) — `ObjectFormatSchema` + format-blind engine; per-format writers (ELF / PE / Mach-O) ⏳ pending (LK1–LK3). See `.plans/00-compiler-implementation-plan - tbd.md` for the live status snapshot.
 
 ## Key Features
 
 - **Any Input Language** — Languages are defined via `.lang.json` configs (lexer / parser grammar / semantics / HIR-lowering / imports). Same engine, no per-language C++ branches. Shipped reference configs: c-subset, tsql-subset, toy.
-- **Any Target ISA** — Compile targets are `.target.json` configs (opcode set, register file, calling conventions, terminator kinds). Same engine, no per-target C++ branches. x86_64 ships; ARM64 is a JSON-drop away (substrate is target-blind).
+- **Any Target ISA** — Compile targets are `.target.json` configs (opcode set, register file, calling conventions, terminator kinds, encoding shapes, relocation taxonomy). Same engine, no per-target C++ branches. **x86_64 + ARM64 both ship** end-to-end through the assembler (byte encoding + round-trip oracle).
 - **Three-tier IR** — HIR (language-neutral, typed) → MIR (SSA over CFG with structured-CF markers) → LIR (per-target, post-regalloc). Each tier has its own arena substrate, verifier, and round-trippable text format (`.dsshir` / `.dssir` / `.dsslir`).
-- **Hermetic toolchain** — Plan: own every byte from source to binary. No GAS / MASM / llvm-mc invocation; in-tree assembler + linker in flight (plans 13 + 14).
+- **Hermetic toolchain** — Own every byte from source to binary. No GAS / MASM / llvm-mc invocation. In-tree assembler complete end-to-end (x86_64 + ARM64); in-tree linker substrate landed, per-format writers in flight (plans 13 ✅ + 14 ⏳).
 - **Cross-Platform** — Builds natively on Windows, Linux, macOS. Docker image for reproducible builds.
 
 ## Architecture
@@ -226,10 +226,10 @@ Targets are JSON-configured (`src/dss-config/targets/*.target.json`). The substr
 
 | Target | OS / Arch | Status |
 |---|---|---|
-| `x86_64` | Linux / Windows / macOS × x86_64 | Shipped — full opcode set + SysV AMD64 + Microsoft x64 calling conventions |
-| `arm64` | Linux / Windows / macOS / iOS / Android × ARM64 | JSON-drop ready (substrate target-blind); awaiting `.target.json` + ABI golden tests |
+| `x86_64` | Linux / Windows / macOS × x86_64 | Shipped — full opcode set + SysV AMD64 + Microsoft x64 calling conventions + byte encoding (`x86-variable` walker) + round-trip oracle |
+| `arm64` | Linux / Windows / macOS / iOS / Android × ARM64 | Shipped — AAPCS64 + binary ops + byte encoding (`fixed32` walker) + round-trip oracle. MS-ARM64 calling convention deferred (D-AS3-5) |
 | `wasm` | Web | Reserved — plan 18; consumes MIR with structured-CF markers |
-| Object formats (ELF / PE / Mach-O) | per target | Reserved — plan 14 (in-tree linker, also JSON-configured) |
+| Object formats (ELF / PE / Mach-O) | per target | LK4 substrate ✅ landed (`ObjectFormatSchema` + format-blind linker engine + K_* diagnostic family). Per-format JSON writers (`elf.format.json` / `pe.format.json` / `macho.format.json`) ⏳ pending — plan 14 LK1–LK3 |
 
 ## Project Structure
 
@@ -248,8 +248,10 @@ src/
 ├── hir/              High-level IR (typed, language-neutral) + verifier + .dsshir text
 ├── mir/              Mid-level IR (SSA over CFG, structured-CF markers) + .dssir text
 ├── lir/              Low-level IR (per-target, post-regalloc) + .dsslir text + regalloc + callconv
+├── asm/              In-tree assembler — shape-keyed byte encoders + round-trip oracle disassembler (plan 13 ✅)
+├── link/             In-tree linker — ObjectFormatSchema substrate + format-blind engine (plan 14 LK4 ✅)
 ├── lsp/              Language Server Protocol (stdio JSON-RPC + diagnostics)
-└── gen/              Codegen / assembler / linker (in flight per plans 13–14)
+└── gen/              Codegen driver glue
 ```
 
 The IR layering is HIR → MIR → LIR. HIR is the language-neutral pivot (CST→HIR lowering is config-driven, no per-language C++); MIR is SSA over CFG with structured-CF markers preserved; LIR is target-specific (JSON-configured) with virtual + physical registers. Each layer ships its own arena substrate, verifier, and round-trippable text format.
@@ -287,5 +289,7 @@ cd build && ctest --output-on-failure
 - [Plan 09 — HIR](.plans/09-hir-plan%20-%20ok.md) — High-level IR (language-neutral pivot)
 - [Plan 12 — MIR + LIR](.plans/12-mir-lir-plan%20-%20ok.md) — Mid + low-level IR
 - [Plan 12.5 — Const-eval](.plans/12.5-const-eval-plan%20-%20ok.md) — Shared constants-evaluation engine
+- [Plan 13 — Assembler](.plans/13-assembler-plan%20-%20tbd.md) — In-tree assembler (AS1–AS6 ✅ closed end-to-end)
+- [Plan 14 — Linker](.plans/14-linker-plan%20-%20tbd.md) — In-tree linker (LK4 substrate ✅; LK1–LK3 per-format writers ⏳)
 - `docs/language-config-spec.md` — Current `.lang.json` schema (v4)
 - `docs/tree-model.md` — Tree + arena substrate

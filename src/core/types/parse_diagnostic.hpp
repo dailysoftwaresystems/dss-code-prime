@@ -379,6 +379,97 @@ enum class DiagnosticCode : std::uint16_t {
     R_VRegHasNoClass               = 0x4003,
     R_SpilledDueToPressure         = 0x4004,
     R_SpilledDueToCrossCallExhaustion = 0x4005,
+
+    // ── Assembler (renders as `A`) ────────────────────────────────────
+    //
+    // The byte-encoding pass (plan 13 AS1) emits these when a LIR
+    // opcode arrives at the assembler without a usable `encoding`
+    // facet on its TargetOpcodeInfo. Substrate-tier — cycle 1 declares
+    // the family AND fires the two no-encoder cases below. Additional
+    // codes (variant-guard mismatch, relocation-kind-undeclared) land
+    // alongside their consumers in cycles AS2/AS3 — not pre-declared
+    // here so each new code travels with the path that produces it.
+    //
+    // A_NoEncodingDeclared: the opcode's `encoding.format` is `none`
+    //   (or the entire `encoding` block is absent). The substrate
+    //   refuses to guess — without a declared shape there is no
+    //   universal byte representation for the opcode.
+    // A_NoEncodingShapeWalker: the opcode declares a non-`none` shape
+    //   but the assembler has no registered walker for it. Fires for
+    //   every non-`none` opcode while AS1 cycle 1's substrate is
+    //   the only assembler code shipped; the walker registrations
+    //   land in AS2 (`x86_variable`) and AS3 (`fixed32`).
+    // A_LirToMirSizeMismatch: the caller passed a `lirToMir` span
+    //   whose length is not equal to the LIR module's instruction-
+    //   arena size. The substrate uses `lirToMir[LirInstId.v]` to
+    //   stamp `SourceMapEntry::mirInst`; a shorter span would
+    //   silently read out-of-bounds memory once AS2/AS3 wire the
+    //   stamping. Fail loud at entry so the test fixture / pipeline
+    //   builder catches the contract violation.
+    // A_NoMatchingEncodingVariant: the opcode declares a shape walker
+    //   that is registered, but the LIR instruction's operand kinds
+    //   match none of the variant guards in `encoding.variants[]`. The
+    //   substrate refuses to invent — there is no fallback variant. Fix
+    //   either: (a) add a variant to the target JSON whose guard matches
+    //   the operand shape the LIR produces, or (b) adjust the LIR pre-
+    //   pass (e.g. 2-address legalization) to produce a shape covered
+    //   by the declared variants.
+    // A_RoundTripMismatch: the disassembler oracle (plan 13 AS5,
+    //   §2.9) re-extracted operand values from the encoded bytes
+    //   and they disagreed with what the encoder consumed. Catches
+    //   the silent-failure class where the encoder produces valid
+    //   but WRONG instructions (correct length, wrong reg/imm in a
+    //   slot). Test-only diagnostic — production assembler does
+    //   not run the round-trip pass.
+    A_NoEncodingDeclared           = 0x1001,
+    A_NoEncodingShapeWalker        = 0x1002,
+    A_LirToMirSizeMismatch         = 0x1003,
+    A_NoMatchingEncodingVariant    = 0x1004,
+    A_RoundTripMismatch            = 0x1005,
+
+    // ── Linker (renders as `K`) ───────────────────────────────────────
+    //
+    // The link pass (plan 14 LK4 substrate) emits these when an
+    // AssembledModule + ObjectFormatSchema combination is internally
+    // inconsistent. Substrate-tier — LK4 declares the family AND fires
+    // the cases the format-blind engine itself can detect; per-format
+    // codes (e.g. ELF header malformation, Mach-O load-command
+    // overflow) join in their respective LK* cycles alongside the
+    // format's JSON schema.
+    //
+    // K_SymbolUndefined: a Relocation's `target` symbol is not
+    //   declared by any AssembledFunction in the module (single-CU
+    //   resolution; cross-CU is LK11; FFI imports LK6).
+    // K_RelocationKindMismatch: a Relocation's opaque `kind` tag does
+    //   not resolve on BOTH sides of plan 13 §2.6's reloc unifier —
+    //   target schema's `relocations[]` row (the formula) AND
+    //   format schema's `relocations[]` row (the platform-native
+    //   name) must both be declared. The diagnostic message names
+    //   the missing side(s).
+    //
+    // Per-format codes join the family alongside their LK* cycles.
+    //
+    // K_NoMatchingObjectFormat fires in four scenarios:
+    //   1. The linker engine's format-dispatch switch reaches
+    //      `ObjectFormatKind::Unknown` (the invalid sentinel was
+    //      not initialized by the format schema's loader path).
+    //   2. The switch reaches a format whose walker is not yet
+    //      registered (MachO / Wasm / Spirv until LK3 / plan 18 /
+    //      plan 17 plug them in). ELF + PE walkers landed at LK1
+    //      and LK2 respectively.
+    //   3. A format walker was invoked for a schema whose `kind()`
+    //      does not match the walker (e.g. `elf::encode` called
+    //      with a PE-tagged schema, or `pe::encode` called with an
+    //      ELF-tagged schema).
+    //   4. The format schema declares the right `kind()` but omits
+    //      a `sections[]` row the walker requires (e.g. ELF writer
+    //      requires SectionKind::Text/RelocTable/Symtab/Strtab/
+    //      ShStrtab — any missing row fires this code; PE writer
+    //      only requires SectionKind::Text since PE has no separate
+    //      section headers for symbol/string tables).
+    K_SymbolUndefined              = 0x8001,
+    K_RelocationKindMismatch       = 0x8002,
+    K_NoMatchingObjectFormat       = 0x8003,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
