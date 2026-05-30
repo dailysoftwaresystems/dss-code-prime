@@ -796,9 +796,7 @@ encodeExec(AssembledModule const&    module,
     // the .obj arm + ELF walker adopted (architect O3 + code-
     // reviewer #5 convergence). A future cycle adding .rdata /
     // .data simply pushes onto this vector; counts update.
-    auto roundUp = [](std::uint64_t v, std::uint64_t a) {
-        return (v + a - 1) & ~(a - 1);
-    };
+    using link::format::detail::alignUp;
     std::uint32_t const fileAlign    = oh.fileAlignment;
     std::uint32_t const sectionAlign = oh.sectionAlignment;
 
@@ -849,14 +847,14 @@ encodeExec(AssembledModule const&    module,
         headerBytesUnpaddedInitial
         + numSections * kSectionHeaderSize;
     std::uint32_t const sizeOfHeaders =
-        static_cast<std::uint32_t>(roundUp(headerBytesUnpadded, fileAlign));
+        static_cast<std::uint32_t>(alignUp(headerBytesUnpadded, fileAlign));
     std::uint32_t const textRawSize =
-        static_cast<std::uint32_t>(roundUp(text.size(), fileAlign));
+        static_cast<std::uint32_t>(alignUp(text.size(), fileAlign));
     std::uint32_t const textRawPointer = sizeOfHeaders;
     sectionHeaders[0].sizeOfRawData    = textRawSize;
     sectionHeaders[0].pointerToRawData = textRawPointer;
     std::uint32_t const idataRawSize = hasImports
-        ? static_cast<std::uint32_t>(roundUp(idataSize, fileAlign))
+        ? static_cast<std::uint32_t>(alignUp(idataSize, fileAlign))
         : 0u;
     std::uint32_t const idataRawPointer = hasImports
         ? textRawPointer + textRawSize
@@ -865,17 +863,17 @@ encodeExec(AssembledModule const&    module,
         sectionHeaders[1].sizeOfRawData    = idataRawSize;
         sectionHeaders[1].pointerToRawData = idataRawPointer;
     }
-    // SizeOfImage = roundUp(highest_section_va + virtualSize,
+    // SizeOfImage = alignUp(highest_section_va + virtualSize,
     // sectionAlignment) per PE/COFF §3.4. With .text + optional
     // .idata, the highest VA-extent is .idata when present.
     std::uint32_t const textVirtualSize = textVirtualSizeE;
     std::uint32_t const idataVirtualSize = hasImports
-        ? static_cast<std::uint32_t>(roundUp(idataSize, sectionAlign))
+        ? static_cast<std::uint32_t>(alignUp(idataSize, sectionAlign))
         : 0u;
     std::uint32_t const sizeOfImage = hasImports
-        ? static_cast<std::uint32_t>(roundUp(
+        ? static_cast<std::uint32_t>(alignUp(
               idataRva + idataVirtualSize, sectionAlign))
-        : static_cast<std::uint32_t>(roundUp(
+        : static_cast<std::uint32_t>(alignUp(
               secText.virtualAddress + textVirtualSize, sectionAlign));
     std::uint32_t const addressOfEntryPoint =
         static_cast<std::uint32_t>(secText.virtualAddress

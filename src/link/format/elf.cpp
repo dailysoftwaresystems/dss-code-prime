@@ -258,9 +258,7 @@ encodeElfExecDynamic(
     // fit in the first page of PT_LOAD #1, .text starts at
     // secText.virtualAddress = baseImageVa + pageAlign).
     std::uint64_t const baseImageVa = secText.virtualAddress - pageAlign;
-    auto const roundUp = [](std::uint64_t v, std::uint64_t a) {
-        return (v + a - 1) & ~(a - 1);
-    };
+    using link::format::detail::alignUp;
 
     // ── (a) Build .text + per-function offset table ────────────
     std::vector<std::uint8_t> text;
@@ -394,11 +392,11 @@ encodeElfExecDynamic(
 
     // Subsequent sections in PT_LOAD #1; VA = baseImageVa + fileOff
     // (PT_LOAD with fileoff=0 and vaddr=baseImageVa maps verbatim).
-    std::uint64_t const pltOff = roundUp(textOff + text.size(), 16);
+    std::uint64_t const pltOff = alignUp(textOff + text.size(), 16);
     std::uint64_t const pltVa  = baseImageVa + pltOff;
     std::uint64_t const pltSize = plt.size();
 
-    std::uint64_t const dynsymOff = roundUp(pltOff + pltSize, 8);
+    std::uint64_t const dynsymOff = alignUp(pltOff + pltSize, 8);
     std::uint64_t const dynsymVa  = baseImageVa + dynsymOff;
     std::uint64_t const dynsymSz  = dynsym.size();
 
@@ -406,24 +404,24 @@ encodeElfExecDynamic(
     std::uint64_t const dynstrVa  = baseImageVa + dynstrOff;
     std::uint64_t const dynstrSz  = dynstr.size();
 
-    std::uint64_t const hashOff = roundUp(dynstrOff + dynstrSz, 8);
+    std::uint64_t const hashOff = alignUp(dynstrOff + dynstrSz, 8);
     std::uint64_t const hashVa  = baseImageVa + hashOff;
     std::uint64_t const hashSz  = hashSec.size();
 
-    std::uint64_t const relaDynOff = roundUp(hashOff + hashSz, 8);
+    std::uint64_t const relaDynOff = alignUp(hashOff + hashSz, 8);
     std::uint64_t const relaDynVa  = baseImageVa + relaDynOff;
     std::uint64_t const relaDynSz  = numExterns * 24;
 
     std::uint64_t const ptLoad1End = relaDynOff + relaDynSz;
 
     // PT_LOAD #2 (R+W) — page-aligned in both file + VA.
-    std::uint64_t const ptLoad2Start = roundUp(ptLoad1End, pageAlign);
+    std::uint64_t const ptLoad2Start = alignUp(ptLoad1End, pageAlign);
     std::uint64_t const ptLoad2VaStart = baseImageVa + ptLoad2Start;
     std::uint64_t const gotOff = ptLoad2Start;
     std::uint64_t const gotVa  = ptLoad2VaStart;
     std::uint64_t const gotSz  = got.size();
 
-    std::uint64_t const dynamicOff = roundUp(gotOff + gotSz, 8);
+    std::uint64_t const dynamicOff = alignUp(gotOff + gotSz, 8);
     std::uint64_t const dynamicVa  = baseImageVa + dynamicOff;
 
     // ── (j) Build .plt bytes (now we have VAs)
@@ -536,13 +534,13 @@ encodeElfExecDynamic(
     auto const shsStrtab   = shstrtab.add(".strtab");
     auto const shsShStrtab = shstrtab.add(".shstrtab");
 
-    std::uint64_t const symtabOff = roundUp(ptLoad2End, 8);
+    std::uint64_t const symtabOff = alignUp(ptLoad2End, 8);
     std::uint64_t const symtabSz  = symtab.size();
     std::uint64_t const strtabOff = symtabOff + symtabSz;
     std::uint64_t const strtabSz  = strtab.size();
     std::uint64_t const shstrtabOff = strtabOff + strtabSz;
     std::uint64_t const shstrtabSz  = shstrtab.size();
-    std::uint64_t const shtOff = roundUp(shstrtabOff + shstrtabSz, 8);
+    std::uint64_t const shtOff = alignUp(shstrtabOff + shstrtabSz, 8);
 
     // ── (m) Apply intra-module + extern relocations.
     //

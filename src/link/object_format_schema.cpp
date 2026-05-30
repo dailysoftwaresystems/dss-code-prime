@@ -388,6 +388,35 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "(PE32+) or 0x10B (PE32). v1 ships PE32+ on "
                      "x86_64-windows.");
             }
+            // PE32+ EXECUTABLE (`.exe`) images MUST set
+            // `IMAGE_FILE_EXECUTABLE_IMAGE` (0x0002) in
+            // `IMAGE_FILE_HEADER.Characteristics` — without this bit
+            // the Windows loader silently refuses to execute the
+            // file with `ERROR_BAD_EXE_FORMAT` and no diagnostic.
+            // The shipped JSON sets this (combined with
+            // `LARGE_ADDRESS_AWARE` 0x0020 → 0x0022); a hand-rolled
+            // schema that omits it would silently produce an
+            // unrunnable binary. (architect post-fold review,
+            // LK7-readiness gap for LK10 hermetic e2e.)
+            //
+            // Scope is Exec-only. Dll is anchored at D-LK2-4 — the
+            // Dll arm will use `IMAGE_FILE_DLL` (0x2000) instead
+            // (the two bits are mutually exclusive per PE COFF
+            // §3.3.2). The guard widens when Dll lands.
+            constexpr std::uint16_t IMAGE_FILE_EXECUTABLE_IMAGE = 0x0002;
+            if (pe.objectType == PeObjectType::Exec
+             && (pe.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE) == 0u) {
+                fail("/pe/characteristics",
+                     std::format("PE32+ executable image (.exe) "
+                                 "requires IMAGE_FILE_EXECUTABLE_IMAGE "
+                                 "bit (0x0002) set in "
+                                 "'pe.characteristics' (got 0x{:04x}); "
+                                 "without it the Windows loader fails "
+                                 "ERROR_BAD_EXE_FORMAT at "
+                                 "CreateProcess with no user-visible "
+                                 "diagnostic.",
+                                 pe.characteristics));
+            }
             if (oh.imageBase == 0) {
                 fail("/optionalHeader/imageBase",
                      "PE32+ image requires non-zero 'imageBase' "

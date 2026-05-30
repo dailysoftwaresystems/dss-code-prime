@@ -154,6 +154,54 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
     EXPECT_TRUE(sawAnchor);
 }
 
+TEST(MachOCodeSignPlaceholder, StaticPathRejectsTakesPrecedenceOverBindNow) {
+    // Dispatch-ordering pin (pr-test-analyzer FOLD-NOW Gap 3,
+    // LK7 post-fold review): when codeSignatureSize > 0 AND
+    // externImports is empty AND bindNow = false, the codesign-
+    // on-static-path gate must fire BEFORE the bindNow gate. A
+    // future reorder of the gates would silently switch the
+    // diagnostic anchor — users would "fix" bindNow and be
+    // confused why codesign still fails.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-cs+lazy-no-externs","kind":"macho"},
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "bindNow": false,
+        "codeSignatureSize": 4096
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeTrivialModule();  // no externImports
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawD_LK7_1 = false;
+    bool sawD_LK6_13 = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport) {
+            if (d.actual.find("D-LK7-1") != std::string::npos)
+                sawD_LK7_1 = true;
+            if (d.actual.find("D-LK6-13") != std::string::npos)
+                sawD_LK6_13 = true;
+        }
+    }
+    EXPECT_TRUE(sawD_LK7_1)
+        << "Codesign-on-static-path gate must fire first; reorder "
+           "would silently mask this anchor.";
+    EXPECT_FALSE(sawD_LK6_13)
+        << "bindNow gate must NOT fire when externImports is empty.";
+}
+
 TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservation) {
     // 4096-byte SuperBlob reservation (typical Apple CodeDirectory
     // size) on the dynamic path. The walker must emit
@@ -362,6 +410,32 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
         ASSERT_EQ(bytes[certFileOff + i], 0u)
             << "cert table byte " << i << " must be zero";
     }
+}
+
+TEST(PeExecFormatJsonValidate,
+     ExecMissingExecutableImageCharacteristicRejected) {
+    // architect LK7-readiness gap: PE32+ Exec without
+    // IMAGE_FILE_EXECUTABLE_IMAGE (0x0002) in characteristics is
+    // unrunnable on Windows (loader returns ERROR_BAD_EXE_FORMAT
+    // with no user-visible diagnostic). Validate must reject at
+    // schema load so a hand-rolled JSON missing the bit can't
+    // silently produce a non-executable binary.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"pe-no-exec-bit","kind":"pe"},
+      "pe": { "machine": 34404, "characteristics": 0, "type": "exec" },
+      "optionalHeader": {
+        "magic": 523, "imageBase": 5368709120,
+        "sectionAlignment": 4096, "fileAlignment": 512,
+        "subsystem": 3, "dllCharacteristics": 0,
+        "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096,
+        "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096
+      },
+      "sections":[
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
+      ]
+    })");
+    ASSERT_FALSE(r.has_value());
 }
 
 TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {

@@ -49,6 +49,17 @@ inline void appendI64LE(std::vector<std::uint8_t>& out, std::int64_t v) {
     appendU64LE(out, static_cast<std::uint64_t>(v));
 }
 
+// Round `v` up to the nearest multiple of `a` (a must be > 0; not
+// required to be a power of two — handled with the modulo-cycle
+// form to keep the contract simple). Hoisted from per-walker
+// lambdas in `elf.cpp` / `pe.cpp` / `macho.cpp` (3+ consumers
+// trip the D-LK4-9 / D-LK4-11 hoist threshold; code-simplifier
+// REQUIRED fold, LK7 post-fold review).
+[[nodiscard]] inline constexpr std::uint64_t
+alignUp(std::uint64_t v, std::uint64_t a) noexcept {
+    return (v + a - 1) & ~(a - 1);
+}
+
 // Shared diagnostic-emit shorthand for format walkers. Identical
 // shape to ML6/ML7's pass-side helpers; centralizes `report` so
 // every walker speaks the same K_* dialect.

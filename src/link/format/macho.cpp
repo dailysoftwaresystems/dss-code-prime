@@ -54,6 +54,7 @@ namespace dss::macho {
 namespace {
 
 using lir_pass_util::report;
+using link::format::detail::alignUp;
 using link::format::detail::appendU8;
 using link::format::detail::appendU16LE;
 using link::format::detail::appendU32LE;
@@ -725,7 +726,7 @@ encodeExec(AssembledModule const&    module,
     // have offset = (their byte position in the file).
     constexpr std::uint64_t kPageSize = 0x1000;
     std::uint64_t const textFileOff =
-        (headerAndCmds + kPageSize - 1) & ~(kPageSize - 1);
+        alignUp(headerAndCmds, kPageSize);
     std::uint64_t const textFileSize = textBody.size();
     std::uint64_t const symtabOffset = textFileOff + textFileSize;
     std::uint64_t const stringTableOffset =
@@ -756,8 +757,7 @@ encodeExec(AssembledModule const&    module,
     std::uint64_t const textSegVmaddr = im.pageZeroSize;
     std::uint64_t const textSecOffsetInSeg = sectionVa - textSegVmaddr;
     std::uint64_t const textSegVmsize =
-        (textSecOffsetInSeg + textFileSize + kPageSize - 1)
-        & ~(kPageSize - 1);
+        alignUp(textSecOffsetInSeg + textFileSize, kPageSize);
     // __TEXT.filesize must NOT include the symtab/strtab bytes that
     // follow (those are outside any segment per Apple convention —
     // LC_SYMTAB references them by absolute file offset). Setting
@@ -1315,7 +1315,7 @@ encodeExecDynamic(AssembledModule const&    module,
     std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
 
     std::uint64_t const textFileOff =
-        (headerAndCmds + kPageSize - 1) & ~(kPageSize - 1);
+        alignUp(headerAndCmds, kPageSize);
     std::uint64_t const textFileSize = textBody.size();
     std::uint64_t const stubsFileOff = textFileOff + textFileSize;
     std::uint64_t const stubsFileSize =
@@ -1326,7 +1326,7 @@ encodeExecDynamic(AssembledModule const&    module,
     // offset on a page boundary above stubs (and above the
     // header/cmds region in VA via __DATA_CONST.vmaddr).
     std::uint64_t const gotFileOff =
-        (stubsFileOff + stubsFileSize + kPageSize - 1) & ~(kPageSize - 1);
+        alignUp(stubsFileOff + stubsFileSize, kPageSize);
     std::uint64_t const gotFileSize =
         static_cast<std::uint64_t>(numExterns) * kGotSlotSize;
     // gotVa derives from the file-offset delta because __TEXT.fileoff
@@ -1379,7 +1379,7 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // __LINKEDIT contents.
     std::uint64_t const linkeditFileOff =
-        (gotFileOff + gotFileSize + kPageSize - 1) & ~(kPageSize - 1);
+        alignUp(gotFileOff + gotFileSize, kPageSize);
     std::uint64_t const bindOff = linkeditFileOff;
     std::uint64_t const bindSize = bindStream.size();
     std::uint64_t const indirectSymtabOff = bindOff + bindSize;
@@ -1396,7 +1396,7 @@ encodeExecDynamic(AssembledModule const&    module,
     // filesize covers the reservation so dyld maps it into the
     // __LINKEDIT segment alongside the other linkedit payloads.
     std::uint64_t const codeSigFileOff = emitCodeSig
-        ? ((strtabOff + strtabSize + 7u) & ~std::uint64_t{7})
+        ? alignUp(strtabOff + strtabSize, 8u)
         : 0u;
     // LC_CODE_SIGNATURE's `dataoff` field is `uint32_t` per Apple's
     // `linkedit_data_command` definition. If the __LINKEDIT layout
@@ -1422,8 +1422,9 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const textSegVmaddr = im.pageZeroSize;
     std::uint64_t const textSecOffsetInSeg = sectionVa - textSegVmaddr;
     std::uint64_t const textSegVmsize =
-        ((stubsFileOff + stubsFileSize) - textFileOff +
-         textSecOffsetInSeg + kPageSize - 1) & ~(kPageSize - 1);
+        alignUp((stubsFileOff + stubsFileSize) - textFileOff
+                + textSecOffsetInSeg,
+                kPageSize);
     // __TEXT.fileoff = 0 by Apple convention (the mach header sits
     // inside __TEXT). The segment therefore spans [0, stubsEnd) in
     // the file — its filesize must equal stubsEnd, NOT
@@ -1433,13 +1434,13 @@ encodeExecDynamic(AssembledModule const&    module,
 
     std::uint64_t const dataConstSegVmaddr = gotVa;
     std::uint64_t const dataConstSegVmsize =
-        (gotFileSize + kPageSize - 1) & ~(kPageSize - 1);
+        alignUp(gotFileSize, kPageSize);
     std::uint64_t const dataConstSegFileSize = gotFileSize;
 
     std::uint64_t const linkeditSegVmaddr =
         dataConstSegVmaddr + dataConstSegVmsize;
     std::uint64_t const linkeditSegVmsize =
-        (linkeditFileSize + kPageSize - 1) & ~(kPageSize - 1);
+        alignUp(linkeditFileSize, kPageSize);
 
     // Indirect-symtab reserved1 indices: __stubs uses [0..numExterns),
     // __got uses [numExterns..2*numExterns).
