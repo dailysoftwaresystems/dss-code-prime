@@ -209,8 +209,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
-    // ELF identity block — read only when format kind is Elf (other
-    // formats' identity sub-blocks land alongside LK2/LK3).
+    // Per-format identity sub-block readers — each runs only when
+    // `format.kind` matches its arm. Mach-O (LK3) will add a third
+    // arm on the same pattern.
+
+    // ELF identity block — read only when format kind is Elf.
     if (data.kind == ObjectFormatKind::Elf && doc.contains("elf")) {
         auto const& e = doc.at("elf");
         if (!e.is_object()) {
@@ -263,6 +266,32 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             readU16("abiVersion", abiVerRaw, 255);
             data.elf.abiVersion = static_cast<std::uint8_t>(abiVerRaw);
             readU16("machine", data.elf.machine, 0xFFFF);
+        }
+    }
+
+    // PE/COFF identity block — read only when format kind is Pe.
+    if (data.kind == ObjectFormatKind::Pe && doc.contains("pe")) {
+        auto const& p = doc.at("pe");
+        if (!p.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/pe",
+                      "'pe' must be an object when format.kind == 'pe'");
+        } else {
+            auto readU16 = [&](char const* field, std::uint16_t& out,
+                               std::int64_t max) {
+                if (!p.contains(field) || !p.at(field).is_number_integer())
+                    return;
+                std::int64_t const v = p.at(field).get<std::int64_t>();
+                if (v < 0 || v > max) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/pe/{}", field),
+                              std::format("'{}' ({}) out of range [0, {}]",
+                                          field, v, max));
+                    return;
+                }
+                out = static_cast<std::uint16_t>(v);
+            };
+            readU16("machine", data.pe.machine, 0xFFFF);
+            readU16("characteristics", data.pe.characteristics, 0xFFFF);
         }
     }
 

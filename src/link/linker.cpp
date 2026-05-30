@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/elf.hpp"
+#include "link/format/pe.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <string>
@@ -143,11 +144,14 @@ LinkedImage link(AssembledModule const&    module,
                                   objectFormatSchema, reporter);
         break;
     case ObjectFormatKind::Pe:
+        image.bytes = pe::encode(module, targetSchema,
+                                 objectFormatSchema, reporter);
+        break;
     case ObjectFormatKind::MachO:
     case ObjectFormatKind::Wasm:
     case ObjectFormatKind::Spirv:
-        // Per-format walkers for these arrive in LK2 / LK3 / plan 18
-        // / plan 17. Fail loud rather than silently producing empty
+        // Per-format walkers for these arrive in LK3 / plan 18 /
+        // plan 17. Fail loud rather than silently producing empty
         // bytes — same substrate discipline the assembler's
         // `A_NoEncodingShapeWalker` enforces.
         report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -155,7 +159,7 @@ LinkedImage link(AssembledModule const&    module,
                std::string{"linker: no walker registered for object format "
                            "kind '"}
                    + std::string{objectFormatKindName(objectFormatSchema.kind())}
-                   + "' (plan 14 LK2/LK3/LK8/LK9)");
+                   + "' (plan 14 LK3/LK8/LK9)");
         break;
     }
 

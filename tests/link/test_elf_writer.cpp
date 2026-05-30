@@ -359,20 +359,10 @@ loadStubFormat(std::string_view kindName) {
 
 } // namespace
 
-TEST(LinkerEndToEnd, PeFormatDispatchEmitsK_NoMatchingObjectFormat) {
-    auto loaded = loadShipped();
-    auto pe = loadStubFormat("pe");
-    ASSERT_TRUE(pe);
-    AssembledModule mod = makeTrivialModule({0xC3}, 1);
-    DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *pe, rep);
-    EXPECT_TRUE(image.bytes.empty());
-    bool sawCode = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
-    }
-    EXPECT_TRUE(sawCode);
-}
+// Note: the Pe arm has a real walker now (`src/link/format/pe.cpp`,
+// LK2 cycle 1) — the no-walker-registered path is exercised by the
+// MachO/Wasm/Spirv arms below; PE end-to-end coverage lives in
+// `tests/link/test_pe_writer.cpp`.
 
 TEST(LinkerEndToEnd, MachOFormatDispatchEmitsK_NoMatchingObjectFormat) {
     auto loaded = loadShipped();

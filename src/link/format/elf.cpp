@@ -1,6 +1,7 @@
 #include "link/format/elf.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/format/byte_emit.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -35,6 +36,13 @@ namespace dss::elf {
 namespace {
 
 using lir_pass_util::report;
+using link::format::detail::appendU8;
+using link::format::detail::appendU16LE;
+using link::format::detail::appendU32LE;
+using link::format::detail::appendU64LE;
+using link::format::detail::appendI64LE;
+using link::format::detail::emit;
+using link::format::detail::requireSection;
 
 // ── Elf64 type constants (gABI Ch. 4 + <elf.h>) ─────────────────
 
@@ -60,26 +68,9 @@ constexpr std::uint64_t makeRelaInfo(std::uint32_t symIdx,
          | static_cast<std::uint64_t>(type);
 }
 
-// ── Byte appenders (LE) ─────────────────────────────────────────
-
-void appendU8(std::vector<std::uint8_t>& out, std::uint8_t v) {
-    out.push_back(v);
-}
-void appendU16LE(std::vector<std::uint8_t>& out, std::uint16_t v) {
-    out.push_back(static_cast<std::uint8_t>(v));
-    out.push_back(static_cast<std::uint8_t>(v >> 8));
-}
-void appendU32LE(std::vector<std::uint8_t>& out, std::uint32_t v) {
-    for (int i = 0; i < 4; ++i)
-        out.push_back(static_cast<std::uint8_t>(v >> (i * 8)));
-}
-void appendU64LE(std::vector<std::uint8_t>& out, std::uint64_t v) {
-    for (int i = 0; i < 8; ++i)
-        out.push_back(static_cast<std::uint8_t>(v >> (i * 8)));
-}
-void appendI64LE(std::vector<std::uint8_t>& out, std::int64_t v) {
-    appendU64LE(out, static_cast<std::uint64_t>(v));
-}
+// Byte-emit helpers + emit() + requireSection() now hoisted to
+// `src/link/format/byte_emit.hpp` (substrate shared with PE walker
+// and future Mach-O walker — simplifier fold-in #1+#3).
 
 void padTo(std::vector<std::uint8_t>& out, std::uint64_t alignment) {
     if (alignment <= 1) return;
@@ -146,31 +137,6 @@ void writeSectionHeader(std::vector<std::uint8_t>& out, SectionHeader const& h) 
     appendU64LE(out, h.entry_size);
 }
 
-void emit(DiagnosticReporter& reporter, DiagnosticCode code,
-          std::string msg) {
-    report(reporter, code, DiagnosticSeverity::Error, std::move(msg));
-}
-
-// Resolve a SectionKind row in the format schema, fail-loud if
-// missing. The walker treats absent section declarations as a
-// configuration error rather than substituting a default — silent
-// defaults are exactly the silent-failure class the substrate
-// discipline rejects.
-[[nodiscard]] ObjectFormatSectionInfo const*
-requireSection(ObjectFormatSchema const& fmt, SectionKind kind,
-               DiagnosticReporter& reporter) {
-    auto const* s = fmt.sectionByKind(kind);
-    if (s == nullptr) {
-        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-             std::string{"ELF writer requires section kind '"}
-                 + std::string{sectionKindName(kind)}
-                 + "' but object format '"
-                 + std::string{fmt.name()}
-                 + "' does not declare one");
-    }
-    return s;
-}
-
 } // namespace
 
 std::vector<std::uint8_t>
@@ -197,11 +163,11 @@ encode(AssembledModule const&    module,
 
     // Resolve the section schema rows we need. Failure here means
     // the format JSON is incomplete; we surface as K_* + bail.
-    auto const* secText      = requireSection(fmt, SectionKind::Text,      reporter);
-    auto const* secRela      = requireSection(fmt, SectionKind::RelocTable, reporter);
-    auto const* secSymtab    = requireSection(fmt, SectionKind::Symtab,    reporter);
-    auto const* secStrtab    = requireSection(fmt, SectionKind::Strtab,    reporter);
-    auto const* secShStrtab  = requireSection(fmt, SectionKind::ShStrtab,  reporter);
+    auto const* secText      = requireSection(fmt, SectionKind::Text,      "ELF writer", reporter);
+    auto const* secRela      = requireSection(fmt, SectionKind::RelocTable, "ELF writer", reporter);
+    auto const* secSymtab    = requireSection(fmt, SectionKind::Symtab,    "ELF writer", reporter);
+    auto const* secStrtab    = requireSection(fmt, SectionKind::Strtab,    "ELF writer", reporter);
+    auto const* secShStrtab  = requireSection(fmt, SectionKind::ShStrtab,  "ELF writer", reporter);
     if (!secText || !secRela || !secSymtab || !secStrtab || !secShStrtab) {
         return {};
     }

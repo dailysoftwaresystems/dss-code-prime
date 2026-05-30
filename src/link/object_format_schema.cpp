@@ -129,6 +129,38 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // PE/COFF identity: when format kind is Pe, machine must be
+    // declared. `Characteristics=0` is a legitimate value for
+    // relocatable .obj (the linker sets image-level flags), so we
+    // don't reject it here.
+    if (kind == ObjectFormatKind::Pe) {
+        if (pe.machine == 0) {
+            fail("/pe/machine", "PE format requires 'pe.machine' "
+                                "(IMAGE_FILE_MACHINE_* value, e.g. "
+                                "0x8664 for x86_64, 0xAA64 for arm64)");
+        }
+        // PE encodes section alignment in Characteristics bits
+        // IMAGE_SCN_ALIGN_*BYTES (which live in the substrate `type`
+        // field), so the `addrAlign` field is meaningless for PE
+        // rows. Reject explicitly to prevent the silent-mismatch
+        // hazard a future maintainer would hit when they edit a
+        // PE JSON's addrAlign expecting it to take effect (type-
+        // design Q3 + architect Decision 4 convergence).
+        for (std::size_t i = 0; i < sections.size(); ++i) {
+            if (sections[i].addrAlign != 0) {
+                fail(std::format("/sections/{}/addrAlign", i),
+                     std::format("section '{}': 'addrAlign' must be 0 "
+                                 "for PE format rows (PE encodes "
+                                 "alignment in Characteristics bits "
+                                 "IMAGE_SCN_ALIGN_*BYTES via the "
+                                 "substrate 'type' field; setting "
+                                 "addrAlign here would be silently "
+                                 "ignored)",
+                                 sections[i].name));
+            }
+        }
+    }
+
     return problems;
 }
 

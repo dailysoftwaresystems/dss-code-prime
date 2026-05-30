@@ -243,15 +243,34 @@ struct DSS_EXPORT ObjectFormatSectionInfo {
 //
 // Mirrors `Elf64_Ehdr::e_ident[EI_CLASS..EI_OSABI]` + `e_machine`.
 // Lives on `ObjectFormatData` so the ELF walker reads the values
-// from JSON instead of hardcoding them. Future PE/MachO format
-// files declare their own identity sub-block (`pe.peCoffHeader`,
-// `macho.machHeader`) when LK2/LK3 land — substrate stays generic.
+// from JSON instead of hardcoding them. Each format's identity
+// block is a parallel optional sub-struct on `ObjectFormatData`
+// (`elf{}` / `pe{}` / future `macho{}`); the architect-anchored
+// reason for NOT using `std::variant` is that variant would couple
+// every format's identity definition into a single header that
+// every walker transitively includes — re-creating the per-arch
+// coupling the shape-keyed-walker split was designed to avoid.
 struct DSS_EXPORT ElfIdentity {
     std::uint8_t  fileClass = 0;     // ELFCLASS64=2 / ELFCLASS32=1
     std::uint8_t  dataEncoding = 0;  // ELFDATA2LSB=1 / ELFDATA2MSB=2
     std::uint8_t  osabi = 0;         // ELFOSABI_NONE=0 / ELFOSABI_GNU=3 / …
     std::uint8_t  abiVersion = 0;
     std::uint16_t machine = 0;       // e_machine: EM_X86_64=62 / EM_AARCH64=183
+};
+
+// ── PE/COFF-specific identity block (loaded only when kind == Pe) ──
+//
+// Mirrors the load-bearing fields of `IMAGE_FILE_HEADER` (PE/COFF
+// spec §3.3). `TimeDateStamp` is omitted: deterministic builds
+// require it to be 0 and that's the substrate default already.
+// `SizeOfOptionalHeader` is omitted: relocatable `.obj` files use 0
+// (the optional header lives only in `.exe`/`.dll`, which arrive
+// in LK1 cycle 2 / LK5+).
+struct DSS_EXPORT PeIdentity {
+    std::uint16_t machine = 0;          // IMAGE_FILE_MACHINE_AMD64=0x8664
+                                        // / I386=0x014C / ARM64=0xAA64
+    std::uint16_t characteristics = 0;  // file-level flags; conventionally
+                                        // 0 for relocatable .obj
 };
 
 namespace detail {
@@ -275,10 +294,12 @@ struct DSS_EXPORT ObjectFormatData {
     std::vector<ObjectFormatSectionInfo> sections;
     std::unordered_map<SectionKind, std::uint16_t> sectionKindIndex;
 
-    // ELF identity (populated only when `kind == Elf`; zeroed
-    // otherwise). The ELF walker reads these from JSON, never
-    // hardcodes machine/class/data.
+    // Per-format identity sub-blocks. Each is populated ONLY when
+    // `kind` matches; otherwise zero-defaulted. The walker reads
+    // its arm from JSON; validate() enforces the per-kind
+    // populated-ness rule.
     ElfIdentity elf{};
+    PeIdentity  pe{};
 
     // Cross-field invariants:
     //   * relocations: kind != 0, kind unique cross-row, name unique
@@ -346,10 +367,11 @@ public:
         return &d_.sections[it->second];
     }
 
-    // ELF identity — populated only when `kind() == Elf`. Walker
-    // reads `machine` / `fileClass` / `dataEncoding` / `osabi` for
-    // the ELF header.
+    // Per-format identity accessors — each is populated only when
+    // `kind()` matches that arm. Walker reads the relevant block
+    // when it runs.
     [[nodiscard]] ElfIdentity const& elf() const noexcept { return d_.elf; }
+    [[nodiscard]] PeIdentity  const& pe()  const noexcept { return d_.pe; }
 
     // ── Loaders ───────────────────────────────────────────────
     static LoadResult<std::shared_ptr<ObjectFormatSchema>>
