@@ -4,6 +4,7 @@
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
 #include "link/format/pe.hpp"
+#include "link/format/wasm.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <string>
@@ -220,9 +221,16 @@ LinkedImage link(AssembledModule const&    module,
                                      objectFormatSchema, reporter);
         break;
     case ObjectFormatKind::Wasm:
+        // LK8 skeleton: emits the 8-byte module preamble (magic +
+        // version). Plan 18 fills the section emitters; this
+        // walker is the substrate plumb-through that proves the
+        // format-blind dispatch routes WASM correctly.
+        image.bytes = wasm::encode(module, targetSchema,
+                                   objectFormatSchema, reporter);
+        break;
     case ObjectFormatKind::Spirv:
-        // Wasm + SPIR-V walkers arrive in plan 18 / plan 17. Fail
-        // loud rather than silently producing empty bytes — same
+        // SPIR-V walker arrives in plan 17 (LK9). Fail loud
+        // rather than silently producing empty bytes — same
         // substrate discipline the assembler's
         // `A_NoEncodingShapeWalker` enforces.
         report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -230,7 +238,7 @@ LinkedImage link(AssembledModule const&    module,
                std::string{"linker: no walker registered for object format "
                            "kind '"}
                    + std::string{objectFormatKindName(objectFormatSchema.kind())}
-                   + "' (plan 14 LK8 / LK9)");
+                   + "' (plan 14 LK9 hook / plan 17 owner)");
         break;
     }
 

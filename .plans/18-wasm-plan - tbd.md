@@ -8,9 +8,9 @@
 
 | | |
 |---|---|
-| Status        | ⏳ **planned.** v1.x deliverable (post-v1 — not in the initial 6-combo native matrix). The IR design must NOT foreclose it from day one. |
-| Predecessors  | [`09-hir-plan`](09-hir-plan%20-%20ok.md) (HIR shape), [`12-mir-lir-plan`](12-mir-lir-plan%20-%20ok.md) (structured-CF markers preserved through MIR — load-bearing), [`06-artifact-profile-plan`](06-artifact-profile-plan%20-%20tbd.md) (`web-wasm` profile selection). |
-| Successors    | [`14-linker-plan`](14-linker-plan%20-%20tbd.md) LK8 (WASM "linking" — Function/Table index renumbering, Import/Export merge); [`15-debug-info-plan`](15-debug-info-plan%20-%20tbd.md) (WASM DWARF / custom-section debug names). |
+| Status        | ⏳ **planned.** v1.x deliverable (post-v1 — not in the initial 6-combo native matrix). The IR design must NOT foreclose it from day one. **Linker substrate ✅ landed 2026-05-30 (plan 14 LK8)**: `wasm32-v1.format.json` + `src/link/format/wasm.{hpp,cpp}` ship the 8-byte module preamble (magic + version) + dispatch routing. Plan 18 picks up at the section-emitter layer (MIR→WAT lowerer). |
+| Predecessors  | [`09-hir-plan`](09-hir-plan%20-%20ok.md) (HIR shape), [`12-mir-lir-plan`](12-mir-lir-plan%20-%20ok.md) (structured-CF markers preserved through MIR — load-bearing), [`06-artifact-profile-plan`](06-artifact-profile-plan%20-%20tbd.md) (`web-wasm` profile selection), [`14-linker-plan`](14-linker-plan%20-%20tbd.md) LK8 ✅ (linker substrate — preamble + dispatch). |
+| Successors    | [`14-linker-plan`](14-linker-plan%20-%20tbd.md) LK8 (substrate landed; "WASM linking" — Function/Table index renumbering, Import/Export merge — co-evolves with plan 18 WA-* phases); [`15-debug-info-plan`](15-debug-info-plan%20-%20tbd.md) (WASM DWARF / custom-section debug names). |
 | Scope         | **Bounded.** WA1–WA10 below. v1.x = MVP single-module, single-memory, JS-host + WASI `preview1`. Reserved post-v1.x: SIMD, threads, GC types, component model, exception handling. |
 
 ---

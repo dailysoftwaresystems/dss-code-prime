@@ -5,6 +5,7 @@ add_library(link OBJECT
     format/elf.cpp
     format/pe.cpp
     format/macho.cpp
+    format/wasm.cpp
 )
 
 target_include_directories(link PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

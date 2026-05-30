@@ -91,6 +91,42 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     }
     data.kind = *kindOpt;
 
+    // Cross-format identity-block validation (test-analyzer Gap 6
+    // fold, LK8 review): a schema's `kind` is the load-bearing
+    // dispatcher — every per-format identity block (`elf`, `pe`,
+    // `optionalHeader`, `macho`, `image`) is only consumed when
+    // its matching kind is set. A schema declaring `kind: wasm`
+    // with a stray `elf` / `pe` / `macho` block would silently
+    // drop the block. Reject loudly so a copy-paste-then-rename
+    // mistake surfaces at schema load.
+    struct CrossKindGuard {
+        ObjectFormatKind expectedKind;
+        char const*      blockName;
+    };
+    constexpr CrossKindGuard kCrossKindRules[] = {
+        { ObjectFormatKind::Elf,    "elf"            },
+        { ObjectFormatKind::Pe,     "pe"             },
+        { ObjectFormatKind::Pe,     "optionalHeader" },
+        { ObjectFormatKind::MachO,  "macho"          },
+        { ObjectFormatKind::MachO,  "image"          },
+    };
+    for (auto const& rule : kCrossKindRules) {
+        if (data.kind != rule.expectedKind
+         && doc.contains(rule.blockName)) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::string{"/"} + rule.blockName,
+                      std::string{"identity block '"} + rule.blockName
+                          + "' is only meaningful when format.kind == '"
+                          + std::string{
+                                objectFormatKindName(rule.expectedKind)}
+                          + "' (got kind '"
+                          + std::string{objectFormatKindName(data.kind)}
+                          + "'). A stray block of the wrong kind would "
+                            "be silently dropped — fix the block name or "
+                            "the format.kind.");
+        }
+    }
+
     // Top-level `entryPoint` — universal entry-symbol name for
     // executable artifacts (e.g. "_start" / "main" / Mach-O's
     // LC_MAIN target). Empty for relocatable artifacts. The walker

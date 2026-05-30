@@ -10,3 +10,6 @@ dss_add_test(NAME link/test_elf_exec_writer      SOURCES test_elf_exec_writer.cp
 
 # Plan 14 LK7 — codesign-placeholder reservation tests.
 dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)
+
+# Plan 14 LK8 — WebAssembly module writer (skeleton).
+dss_add_test(NAME link/test_wasm_writer          SOURCES test_wasm_writer.cpp)
