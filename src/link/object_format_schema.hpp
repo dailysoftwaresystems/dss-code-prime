@@ -332,6 +332,18 @@ struct DSS_EXPORT ElfIdentity {
     // the `.interp` section's contents and a PT_INTERP program
     // header pointing at it.
     std::string    interpreter;
+    // Eager-vs-lazy dynamic-binding choice. `true` (the v1 stance,
+    // plan 14 §5 risk row) emits `DT_FLAGS_1 = DF_1_NOW` so all
+    // GOT slots are resolved at load via `R_X86_64_GLOB_DAT` in
+    // `.rela.dyn` — simpler kernel surface, no PLT0 resolver stub
+    // needed. `false` is the lazy-binding upgrade path anchored at
+    // D-LK6-11 (route extern relocs to `.rela.plt` + JUMP_SLOT, emit
+    // 16-byte PLT0 resolver-trampoline, init GOT slots to "PLT entry
+    // + 6"); v1 walker fails loud `K_FormatLacksImportSupport` on
+    // `bindNow == false` until D-LK6-11 lands. Default `true`
+    // preserves cycle 2b.2's emitted image for schemas that omit
+    // the field.
+    bool           bindNow = true;
 };
 
 // ── PE/COFF-specific identity block (loaded only when kind == Pe) ──

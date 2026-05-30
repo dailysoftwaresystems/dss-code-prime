@@ -547,6 +547,84 @@ TEST(ElfExecWriter, ExternImportsProduceDynamicImage) {
     EXPECT_NE(fileView.find("printf"), std::string_view::npos);
 }
 
+// ── D-LK6-11 substrate (post-audit fold: bindNow JSON pin) ─────
+
+TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bindnow-wrong-type","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bindnow-default","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->elf().bindNow);
+}
+
+TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"elf-lazy-pending","kind":"elf"},
+      "entryPoint": "",
+      "elf": {
+        "class":"elf64","data":"lsb","machine":62,"type":"exec",
+        "pageAlign":4096,
+        "interpreter":"/lib64/ld-linux-x86-64.so.2",
+        "bindNow": false
+      },
+      "sections":[
+        {"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400},
+        {"kind":"symtab","name":".symtab","type":2,"flags":0,"addrAlign":8,"entrySize":24,"virtualAddress":0},
+        {"kind":"strtab","name":".strtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0},
+        {"kind":"shstrtab","name":".shstrtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0}
+      ],
+      "relocations":[
+        {"name":"R_X86_64_PC32","kind":1,"nativeId":2},
+        {"name":"R_X86_64_64","kind":2,"nativeId":1},
+        {"name":"R_X86_64_32","kind":3,"nativeId":10}
+      ]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol = SymbolId{99};
+    imp.mangledName = "printf";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    ASSERT_GE(rep.errorCount(), 1u);
+    bool sawAnchor = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport
+         && d.actual.find("D-LK6-11") != std::string::npos) {
+            sawAnchor = true;
+        }
+    }
+    EXPECT_TRUE(sawAnchor);
+}
+
 // ── ET_EXEC golden header bytes ────────────────────────────────
 
 TEST(ElfExecWriter, Elf64EhdrTypeIsETEXEC) {

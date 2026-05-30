@@ -231,6 +231,17 @@ encodeElfExecDynamic(
              "needs at least one entry function.");
         return {};
     }
+    if (!elfId.bindNow) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             "elf::encodeElfExecDynamic: schema requests lazy "
+             "binding ('elf.bindNow' = false) but ELF lazy "
+             "binding (`.rela.plt` + R_X86_64_JUMP_SLOT + 16-byte "
+             "PLT0 resolver-trampoline stub) has not yet landed. "
+             "Anchored at plan 14 §3.1 D-LK6-11. Set 'elf.bindNow' "
+             "= true (the v1 stance — DF_1_NOW + GLOB_DAT in "
+             "`.rela.dyn`) to proceed.");
+        return {};
+    }
     if (secText.virtualAddress < pageAlign) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              std::string{"elf::encodeElfExecDynamic: .text "
@@ -284,6 +295,23 @@ encodeElfExecDynamic(
     }
     std::size_t const numExterns = module.externImports.size();
     std::size_t const numLibs = libraryOrder.size();
+    // Defense-in-depth: the linker validates per-extern non-empty
+    // `libraryPath` before dispatch (LK6 cycle 2a substrate), so
+    // `numLibs == 0` cannot occur via the linker entry path. This
+    // guard makes that invariant explicit in case a future caller
+    // bypasses the linker (e.g. a writer-only test harness) — a
+    // dynamic image with zero DT_NEEDED entries fails at runtime
+    // (dyld has no library to resolve externs from), so failing
+    // loud here keeps the contract symmetric across entry paths.
+    if (numLibs == 0) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "elf::encodeElfExecDynamic: " +
+             std::to_string(numExterns) +
+             " extern(s) declared but every `libraryPath` is empty "
+             "— zero DT_NEEDED entries would ship; dyld cannot "
+             "resolve undefined symbols without a library.");
+        return {};
+    }
 
     // ── (c) .interp body (NUL-terminated dynamic-linker path)
     std::vector<std::uint8_t> interp;

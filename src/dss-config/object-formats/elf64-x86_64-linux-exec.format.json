@@ -21,7 +21,9 @@
     "machine": 62,
     "type": "exec",
     "pageAlign": 4096,
-    "interpreter": "/lib64/ld-linux-x86-64.so.2"
+    "interpreter": "/lib64/ld-linux-x86-64.so.2",
+    "$bindNowComment": "Eager binding — the v1 stance per plan 14 §5 risk row. Emits DT_FLAGS_1 = DF_1_NOW so dyld resolves every GOT slot at load via R_X86_64_GLOB_DAT in .rela.dyn. Lazy upgrade (.rela.plt + R_X86_64_JUMP_SLOT + 16-byte PLT0 resolver-trampoline) anchored at D-LK6-11; until then, the walker fails loud on bindNow=false.",
+    "bindNow": true
   },
 
   "sections": [

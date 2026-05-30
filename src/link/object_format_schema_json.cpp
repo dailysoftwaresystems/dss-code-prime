@@ -367,6 +367,24 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
             }
+            // `bindNow`: eager vs lazy dynamic-binding choice.
+            // Optional; defaults to `true` (v1 stance, plan 14 §5
+            // risk row). `false` is the lazy-binding upgrade path
+            // anchored at D-LK6-11 — v1 walker fails loud on
+            // `bindNow == false` until D-LK6-11 lands.
+            if (e.contains("bindNow")) {
+                if (!e.at("bindNow").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/elf/bindNow",
+                              "'bindNow' must be a boolean (true = "
+                              "eager / DF_1_NOW, false = lazy / "
+                              ".rela.plt + JUMP_SLOT — anchored at "
+                              "D-LK6-11, not yet implemented)");
+                } else {
+                    data.elf.bindNow =
+                        e.at("bindNow").get<bool>();
+                }
+            }
         }
     }
 
