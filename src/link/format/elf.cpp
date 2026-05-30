@@ -118,11 +118,11 @@ encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter) {
-    (void)targetSchema;  // Reserved: future cycles read the formula
-                         // text when applying relocations in-place
-                         // (currently the assembler stamped the
-                         // bytes; the ELF writer just serializes the
-                         // Rela record).
+    // `targetSchema` is consumed by the ET_EXEC reloc-application
+    // path (LK6 cycle 1) — the structured formula on each
+    // `TargetRelocationInfo` (pcRelative + addendBias + widthBytes)
+    // tells the walker how to compute and write patches. ET_REL
+    // mode emits Rela records and doesn't need it.
 
     auto const& fmt = objectFormatSchema;
     if (fmt.kind() != ObjectFormatKind::Elf) {
@@ -137,31 +137,10 @@ encode(AssembledModule const&    module,
 
     // Route between ET_REL and ET_EXEC based on the schema's
     // declared objectType. ET_REL keeps its .rela.text-bearing
-    // layout; ET_EXEC drops .rela.text (modules with relocations
-    // fail loud — cycle scope; LK6 owns relocation application)
-    // and adds a PT_LOAD program header.
+    // layout; ET_EXEC applies relocations in-place to `.text`
+    // (LK6 cycle 1 — see `applyExecRelocations` below) and adds a
+    // PT_LOAD program header.
     bool const isExec = (fmt.elf().objectType == ElfObjectType::Exec);
-
-    // ET_EXEC requires every AssembledFunction to have zero
-    // relocations (cycle scope: self-contained modules only).
-    // Externs surface as K_RelocationKindMismatch + halt rather
-    // than silently producing a corrupt executable.
-    if (isExec) {
-        for (auto const& fn : module.functions) {
-            if (!fn.relocations.empty()) {
-                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                     std::string{"ELF ET_EXEC writer: function symbol #"}
-                         + std::to_string(fn.symbol.v)
-                         + " carries " + std::to_string(fn.relocations.size())
-                         + " relocation(s); cycle-2 scope is self-contained "
-                           "modules only (zero relocations). Reloc "
-                           "application for ET_EXEC is anchored at plan 14 "
-                           "§3.1 D-LK1-3 / D-LK4-5 / D-LK4-6 (paired with "
-                           "LK6 dynamic linking).");
-                return {};
-            }
-        }
-    }
 
     // Resolve the section schema rows we need. ET_REL requires
     // RelocTable (.rela.text); ET_EXEC doesn't (relocs are either
@@ -201,6 +180,143 @@ encode(AssembledModule const&    module,
         funcSyms.push_back({fn.symbol, start,
                             static_cast<std::uint64_t>(fn.bytes.size())});
     }
+
+    // ── ET_EXEC: apply intra-module relocations in-place ───────
+    //
+    // For each `Relocation`, evaluate the linear formula declared
+    // on the target schema's `relocationInfo(kind)`:
+    //
+    //   value = S + A + (pcRelative ? -P : 0) + addendBias
+    //
+    // (S = resolved symbol VA, A = `Relocation::addend`, P = patch
+    // site VA = section.virtualAddress + Relocation::offset),
+    // range-check that `value` fits signed in `widthBytes` bytes,
+    // and write little-endian into `.text`. Each guard fails loud
+    // and halts encode() — silent half-patches would produce
+    // executables that link cleanly and crash at runtime.
+    //
+    // Anchors: extern symbols → D-LK6-2 (FFI / dynamic linking);
+    // non-linear formulas (`widthBytes==0`, e.g. ARM64 call26) →
+    // D-LK6-1 (closed-enum formula reshape).
+    auto const applyExecRelocations = [&]() -> bool {
+        if (text.empty()) {
+            // ET_EXEC with empty `.text` would produce an ELF that
+            // execve()'s but SIGSEGVs at entry. No real consumer.
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 "elf::encode (ET_EXEC): `.text` is empty — every "
+                 "AssembledFunction contributed zero bytes. "
+                 "Producing an executable with an empty `.text` "
+                 "would crash at entry.");
+            return false;
+        }
+
+        std::unordered_map<SymbolId, std::uint64_t> textOffsetBySym;
+        textOffsetBySym.reserve(funcSyms.size());
+        for (auto const& f : funcSyms) {
+            textOffsetBySym.emplace(f.symId, f.valueInText);
+        }
+        std::uint64_t const textVa = secText->virtualAddress;
+
+        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+            auto const& fn = module.functions[fi];
+            std::uint64_t const fnStart = funcTextStart[fi];
+            for (auto const& rel : fn.relocations) {
+                // ── (1) target must be intra-module
+                auto const tIt = textOffsetBySym.find(rel.target);
+                if (tIt == textOffsetBySym.end()) {
+                    emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                         std::string{"elf::encode (ET_EXEC): relocation target symbol #"}
+                             + std::to_string(rel.target.v)
+                             + " is not defined by any AssembledFunction. "
+                               "Extern / cross-module relocs are FFI / "
+                               "dynamic linking — see plan 14 §3.1 D-LK6-2.");
+                    return false;
+                }
+                // ── (2) reloc kind must be on the target schema
+                auto const* tri = targetSchema.relocationInfo(rel.kind);
+                if (tri == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::string{"elf::encode (ET_EXEC): relocation kind "}
+                             + std::to_string(rel.kind.v)
+                             + " has no TargetRelocationInfo on the "
+                               "target schema (assembler stamped an "
+                               "unregistered kind — substrate bug).");
+                    return false;
+                }
+                // ── (3) formula must fit the LK6 cycle-1 linear shape
+                if (tri->widthBytes == 0) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::string{"elf::encode (ET_EXEC): relocation kind '"}
+                             + tri->name
+                             + "' has no structured-formula widthBytes "
+                               "— the formula needs a non-linear "
+                               "transform (mask / shift / bit-field) "
+                               "the LK6 cycle 1 linear shape "
+                               "(S + A + (pcRelative ? -P : 0) + "
+                               "addendBias) cannot express. Anchored: "
+                               "plan 14 §3.1 D-LK6-1.");
+                    return false;
+                }
+                // ── (4) patch must fit inside the originating
+                //        function's bytes (not just .text). A stale
+                //        rel.offset would otherwise silently scribble
+                //        into the NEXT function's prologue.
+                if (static_cast<std::uint64_t>(rel.offset) + tri->widthBytes
+                        > fn.bytes.size()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::string{"elf::encode (ET_EXEC): relocation offset "}
+                             + std::to_string(rel.offset)
+                             + " + widthBytes "
+                             + std::to_string(static_cast<int>(tri->widthBytes))
+                             + " exceeds function symbol #"
+                             + std::to_string(fn.symbol.v)
+                             + "'s size " + std::to_string(fn.bytes.size())
+                             + " — would overrun into an adjacent "
+                               "function.");
+                    return false;
+                }
+                // ── (5) compute the structured value
+                std::uint64_t const patchOff = fnStart + rel.offset;
+                std::uint64_t const S = textVa + tIt->second;
+                std::int64_t  const A = rel.addend;
+                std::uint64_t const P = textVa + patchOff;
+                std::int64_t  const value =
+                    static_cast<std::int64_t>(S) + A
+                    + (tri->pcRelative ? -static_cast<std::int64_t>(P) : 0)
+                    + tri->addendBias;
+                // ── (6) value must fit signed in widthBytes. A
+                //        rel32 displacement >2 GiB or an abs32 high
+                //        VA would otherwise truncate silently and
+                //        produce wrong-target calls at runtime.
+                if (tri->widthBytes < 8) {
+                    std::int64_t const sMax =
+                        (std::int64_t{1} << (8 * tri->widthBytes - 1)) - 1;
+                    std::int64_t const sMin = -sMax - 1;
+                    if (value < sMin || value > sMax) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             std::string{"elf::encode (ET_EXEC): relocation '"}
+                                 + tri->name + "' value " + std::to_string(value)
+                                 + " does not fit signed in widthBytes="
+                                 + std::to_string(static_cast<int>(tri->widthBytes))
+                                 + " (range [" + std::to_string(sMin) + ", "
+                                 + std::to_string(sMax) + "]) — link layout "
+                                 + "would silently truncate to a wrong "
+                                   "target. Symbol layout or .text size "
+                                   "is past this reloc's reach.");
+                        return false;
+                    }
+                }
+                // ── (7) write `widthBytes` LE
+                auto const uVal = static_cast<std::uint64_t>(value);
+                for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
+                    text[patchOff + b] =
+                        static_cast<std::uint8_t>((uVal >> (8u * b)) & 0xFFu);
+                }
+            }
+        }
+        return true;
+    };
+    if (isExec && !applyExecRelocations()) return {};
 
     // ── Build .strtab + .symtab ────────────────────────────────
     //
@@ -251,18 +367,22 @@ encode(AssembledModule const&    module,
     }
 
     // Undefined extern symbols referenced by any relocation but not
-    // defined by any function.
-    for (auto const& fn : module.functions) {
-        for (auto const& rel : fn.relocations) {
-            if (symIdxBySymbol.contains(rel.target)) continue;
-            std::string const symName =
-                std::string{"sym_"} + std::to_string(rel.target.v);
-            std::uint32_t const nameOff = strtab.add(symName);
-            std::uint32_t const idx =
-                static_cast<std::uint32_t>(symtab.size() / 24);
-            appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_NOTYPE), 0,
-                      SHN_UNDEF, 0, 0);
-            symIdxBySymbol.emplace(rel.target, idx);
+    // defined by any function. ET_EXEC has no extern symbols at this
+    // point — the cycle-1 reloc-application pass above failed loud on
+    // any unresolved target (FFI / dynamic linking is LK6 cycle 2).
+    if (!isExec) {
+        for (auto const& fn : module.functions) {
+            for (auto const& rel : fn.relocations) {
+                if (symIdxBySymbol.contains(rel.target)) continue;
+                std::string const symName =
+                    std::string{"sym_"} + std::to_string(rel.target.v);
+                std::uint32_t const nameOff = strtab.add(symName);
+                std::uint32_t const idx =
+                    static_cast<std::uint32_t>(symtab.size() / 24);
+                appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_NOTYPE), 0,
+                          SHN_UNDEF, 0, 0);
+                symIdxBySymbol.emplace(rel.target, idx);
+            }
         }
     }
 
@@ -271,48 +391,53 @@ encode(AssembledModule const&    module,
     // For each AssembledFunction's relocations, compute the absolute
     // offset within .text (the function's range start + the local
     // offset) and translate `kind → nativeId` via the format schema.
+    // ET_EXEC applies relocations in-place (above) and emits no
+    // .rela.text — the build loop is skipped entirely.
 
     std::vector<std::uint8_t> relaText;
-    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
-        auto const& fn = module.functions[fi];
-        std::uint64_t const fnStart = funcTextStart[fi];
-        for (auto const& rel : fn.relocations) {
-            auto const* fmtReloc = fmt.relocationByKind(rel.kind);
-            if (fmtReloc == nullptr) {
-                // Should have been caught by `link()` substrate but
-                // re-check defensively — silent skip is exactly the
-                // failure class the substrate discipline rejects.
-                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                     "elf::encode: relocation kind "
-                         + std::to_string(rel.kind.v)
-                         + " not declared by ELF format '"
-                         + std::string{fmt.name()} + "'");
-                continue;
+    if (!isExec) {
+        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+            auto const& fn = module.functions[fi];
+            std::uint64_t const fnStart = funcTextStart[fi];
+            for (auto const& rel : fn.relocations) {
+                auto const* fmtReloc = fmt.relocationByKind(rel.kind);
+                if (fmtReloc == nullptr) {
+                    // Should have been caught by `link()` substrate
+                    // but re-check defensively — silent skip is
+                    // exactly the failure class the substrate
+                    // discipline rejects.
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         "elf::encode: relocation kind "
+                             + std::to_string(rel.kind.v)
+                             + " not declared by ELF format '"
+                             + std::string{fmt.name()} + "'");
+                    continue;
+                }
+                auto it = symIdxBySymbol.find(rel.target);
+                if (it == symIdxBySymbol.end()) {
+                    emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                         "elf::encode: relocation target symbol #"
+                             + std::to_string(rel.target.v)
+                             + " has no symtab entry");
+                    continue;
+                }
+                std::uint32_t const symIdx = it->second;
+                std::uint64_t const rOffset = fnStart + rel.offset;
+                appendU64LE(relaText, rOffset);
+                appendU64LE(relaText, makeRelaInfo(symIdx, fmtReloc->nativeId));
+                appendI64LE(relaText, rel.addend);
             }
-            auto it = symIdxBySymbol.find(rel.target);
-            if (it == symIdxBySymbol.end()) {
-                emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                     "elf::encode: relocation target symbol #"
-                         + std::to_string(rel.target.v)
-                         + " has no symtab entry");
-                continue;
-            }
-            std::uint32_t const symIdx = it->second;
-            std::uint64_t const rOffset = fnStart + rel.offset;
-            appendU64LE(relaText, rOffset);
-            appendU64LE(relaText, makeRelaInfo(symIdx, fmtReloc->nativeId));
-            appendI64LE(relaText, rel.addend);
         }
     }
 
     // ── Section ordering + .shstrtab ───────────────────────────
     //
     // ET_REL order: SHT_NULL, .text, .rela.text, .symtab, .strtab,
-    // .shstrtab. ET_EXEC order: same but .rela.text is replaced with
-    // a SHT_NULL placeholder (kept for IDX_* parity so the symtab's
-    // STT_SECTION entry still resolves IDX_TEXT=1). Future cycles
-    // (D-LK1-3) emit applied relocations into .text bytes; cycle 2
-    // ET_EXEC simply skips the section.
+    // .shstrtab. ET_EXEC drops `.rela.text` entirely (no SHT_NULL
+    // placeholder): intra-module relocations were applied in-place
+    // to `.text` by `applyExecRelocations` above (LK6 cycle 1,
+    // closes D-LK1-3); extern relocs (FFI / dynamic linking) are
+    // anchored at D-LK6-2 and don't reach this point.
     StringTable shstrtab;
     SectionHeader hNull{};
     SectionHeader hText{};

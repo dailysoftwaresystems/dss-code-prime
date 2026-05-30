@@ -695,6 +695,72 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     substrate::validateRelocationsTable<TargetRelocationInfo>(
         relocations, fail);
 
+    // Plan 14 LK6 cycle 1 structured-formula coherence. Four rules
+    // catch silent-misapply hazards at load time:
+    //
+    //   (b) `widthBytes != 0` is required whenever `pcRelative` is
+    //       true or `addendBias != 0` — otherwise the linker would
+    //       silently reject a row that DID declare structured
+    //       semantics (looks like a row author typo, not the
+    //       intended "decline to apply" sentinel).
+    //   (c) `addendBias != 0` ⇒ `pcRelative` — absolute relocations
+    //       with a non-zero constant bias have no real consumer
+    //       across x86_64 / ARM64 / PE / Mach-O. A row in this
+    //       shape is almost certainly a typo (bias on the wrong
+    //       row, or pcRelative dropped by accident). Reject at
+    //       load (type-design O2.a convergence).
+    //   (d) `widthBytes != 0` ⇒ `|addendBias|` fits signed in
+    //       `widthBytes` bytes. A bias that overflows the patch
+    //       slot would silently corrupt every patched site
+    //       (silent-failure M1 convergence).
+    //
+    // Rule (a) — `widthBytes ∈ {4, 8}` — is enforced by the JSON
+    // loader before this code runs.
+    for (std::size_t i = 0; i < relocations.size(); ++i) {
+        auto const& r = relocations[i];
+        bool const hasStructuredSemantics =
+            r.pcRelative || r.addendBias != 0;
+        if (hasStructuredSemantics && r.widthBytes == 0) {
+            fail(std::format("/relocations/{}/widthBytes", i),
+                 std::format("relocation '{}': 'widthBytes' must be "
+                             "declared (4 or 8) when 'pcRelative' is "
+                             "true or 'addendBias' is non-zero — the "
+                             "linker needs the width to apply the "
+                             "structured formula. Omit pcRelative + "
+                             "addendBias for relocations whose "
+                             "application is not yet supported (the "
+                             "LK6 in-place applier will reject them).",
+                             r.name));
+        }
+        if (r.addendBias != 0 && !r.pcRelative) {
+            fail(std::format("/relocations/{}/addendBias", i),
+                 std::format("relocation '{}': 'addendBias' is "
+                             "non-zero ({}) but 'pcRelative' is "
+                             "false — no x86_64 / ARM64 / PE / "
+                             "Mach-O relocation needs an absolute "
+                             "patch with a constant bias. This is "
+                             "almost certainly a typo (bias on the "
+                             "wrong row, or pcRelative dropped).",
+                             r.name, r.addendBias));
+        }
+        if (r.widthBytes != 0 && r.widthBytes < 8) {
+            std::int64_t const sMax =
+                (std::int64_t{1} << (8 * r.widthBytes - 1)) - 1;
+            std::int64_t const sMin = -sMax - 1;
+            if (r.addendBias < sMin || r.addendBias > sMax) {
+                fail(std::format("/relocations/{}/addendBias", i),
+                     std::format("relocation '{}': 'addendBias' "
+                                 "({}) does not fit signed in "
+                                 "widthBytes={} ({} ≤ bias ≤ {}). "
+                                 "A bias that overflows the patch "
+                                 "slot silently corrupts every "
+                                 "patched site.",
+                                 r.name, r.addendBias,
+                                 r.widthBytes, sMin, sMax));
+            }
+        }
+    }
+
     // ── Calling conventions ──────────────────────────────────────
     // Three gates here, in order:
     //

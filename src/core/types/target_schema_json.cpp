@@ -394,29 +394,80 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // lookup at opcode-parse time can resolve against the populated
     // `relocations[]` table. Empty/absent section is legal; non-
     // empty rows must satisfy the validate() contract: unique non-
-    // zero `kind`, non-empty `name`. `formula` is opaque to the
-    // substrate — stored verbatim for diagnostic display and for
-    // the linker's `*.format.json` human-readable cross-reference.
+    // zero `kind`, non-empty `name`.
+    //
+    // Target-side extension fields (all OPTIONAL):
+    //   * `formula` (string) — human documentation; **accepted and
+    //     discarded** by the loader (type-check only). The
+    //     structured triple below is the load-bearing input; the
+    //     human prose lived as a desync vector before being
+    //     dropped (LK6 cycle 1 review type-design O2.b +
+    //     comment-analyzer #3 convergence).
+    //   * `pcRelative` (bool), `addendBias` (i32), `widthBytes`
+    //     (u8 = 4 or 8) — LK6 cycle 1 linear-formula triple.
+    //     `widthBytes` absent ⇒ linker rejects this kind for
+    //     in-place application (ARM64 call26 etc. — anchored at
+    //     plan 14 §3.1 D-LK6-1).
     substrate::loadRelocationsTable<TargetRelocationInfo>(
         doc, data.relocations, data.relocationNameIndex,
         data.relocationKindIndex, coll,
         [](nlohmann::json const& r, TargetRelocationInfo& info,
            Collector& c, std::size_t i) -> bool {
-            // Target-side extension field: opaque `formula` text
-            // (e.g. "S + A - P - 4"). Stored verbatim — the linker
-            // applies it; the substrate doesn't parse it. A non-
-            // string formula is a hard malformed-row case: returning
-            // false skips the row entirely so a partially-constructed
-            // TargetRelocationInfo (formula = empty) cannot escape
-            // into the dual indices (multi-agent review convergence).
-            if (r.contains("formula")) {
-                if (!r.at("formula").is_string()) {
+            if (r.contains("formula") && !r.at("formula").is_string()) {
+                c.emit(DiagnosticCode::C_MalformedJson,
+                       std::format("/relocations/{}/formula", i),
+                       "'formula' must be a string (accepted as "
+                       "documentation; the structured triple "
+                       "pcRelative/addendBias/widthBytes drives "
+                       "the linker)");
+                return false;
+            }
+            // `widthBytes` absent ⇒ walker fails loud at apply
+            // time (anchored D-LK6-1, e.g. ARM64 call26).
+            if (r.contains("widthBytes")) {
+                if (!r.at("widthBytes").is_number_integer()) {
                     c.emit(DiagnosticCode::C_MalformedJson,
-                           std::format("/relocations/{}/formula", i),
-                           "'formula' must be a string");
+                           std::format("/relocations/{}/widthBytes", i),
+                           "'widthBytes' must be an integer (4 or 8)");
                     return false;
                 }
-                info.formula = r.at("formula").get<std::string>();
+                std::int64_t const wb = r.at("widthBytes").get<std::int64_t>();
+                if (wb != 4 && wb != 8) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/widthBytes", i),
+                           std::format("'widthBytes' must be 4 or 8 "
+                                       "(LK6 cycle 1 supports these "
+                                       "widths); got {}", wb));
+                    return false;
+                }
+                info.widthBytes = static_cast<std::uint8_t>(wb);
+            }
+            if (r.contains("pcRelative")) {
+                if (!r.at("pcRelative").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/pcRelative", i),
+                           "'pcRelative' must be a boolean");
+                    return false;
+                }
+                info.pcRelative = r.at("pcRelative").get<bool>();
+            }
+            if (r.contains("addendBias")) {
+                if (!r.at("addendBias").is_number_integer()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/addendBias", i),
+                           "'addendBias' must be an integer");
+                    return false;
+                }
+                std::int64_t const ab = r.at("addendBias").get<std::int64_t>();
+                if (ab < std::numeric_limits<std::int32_t>::min()
+                 || ab > std::numeric_limits<std::int32_t>::max()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/addendBias", i),
+                           std::format("'addendBias' ({}) out of "
+                                       "i32 range", ab));
+                    return false;
+                }
+                info.addendBias = static_cast<std::int32_t>(ab);
             }
             return true;
         });

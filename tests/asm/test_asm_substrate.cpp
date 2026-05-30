@@ -234,8 +234,8 @@ TEST(TargetSchemaRelocations, JsonRoundTripsThroughAccessors) {
             { "mnemonic": "invalid", "result": "none" }
         ],
         "relocations": [
-            { "name": "rel32",  "kind": 1, "formula": "S + A - P - 4" },
-            { "name": "abs64",  "kind": 2, "formula": "S + A"         }
+            { "name": "rel32",  "kind": 1, "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },
+            { "name": "abs64",  "kind": 2, "pcRelative": false, "addendBias":  0, "widthBytes": 8 }
         ]
     })";
     auto schema = TargetSchema::loadFromText(kJson, "synth.target.json");
@@ -245,7 +245,9 @@ TEST(TargetSchemaRelocations, JsonRoundTripsThroughAccessors) {
     auto const* rel32 = (*schema)->relocationByName("rel32");
     ASSERT_NE(rel32, nullptr);
     EXPECT_EQ(rel32->kind, RelocationKind{1});
-    EXPECT_EQ(rel32->formula, "S + A - P - 4");
+    EXPECT_TRUE(rel32->pcRelative);
+    EXPECT_EQ(rel32->addendBias, -4);
+    EXPECT_EQ(rel32->widthBytes, 4);
 
     auto const* abs64 = (*schema)->relocationByName("abs64");
     ASSERT_NE(abs64, nullptr);

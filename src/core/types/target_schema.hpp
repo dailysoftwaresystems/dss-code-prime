@@ -611,20 +611,58 @@ struct DSS_EXPORT TargetEncodingInfo {
 // bucket-1 reloc taxonomy facet). Each row defines an opaque
 // `uint32_t kind` tag whose meaning is the row itself — the assembler
 // writes the tag onto `Relocation::kind`; the linker (plan 14) reads
-// it via `schema.relocationInfo(kind)` to resolve the formula. The
-// `formula` is documentation for humans (and future debug tooling) —
-// the substrate treats it as opaque text.
+// it via `schema.relocationInfo(kind)` to resolve the formula.
 //
 // `kind` slot-0 is reserved as an invalid sentinel: every declared
 // row MUST carry a `kind != 0` (loader-enforced). Two rows with the
 // same `kind` are also rejected.
+//
+// The linker (LK6 cycle 1) computes the patch value as:
+//   value = S + A + (pcRelative ? -P : 0) + addendBias
+// and writes `widthBytes` of it (little-endian, two's complement)
+// into the section's bytes at `Relocation::offset`. S is the
+// resolved symbol's runtime VA; A is `Relocation::addend`; P is the
+// patch site's runtime VA (section.virtualAddress + Relocation::offset).
+//
+// This linear shape covers the v1 x86_64 relocations (rel32 / abs64
+// / abs32). Formulas that need a non-linear transform — ARM64
+// `call26` ((S+A-P) >> 2), `adr_prel_pg_hi21` (page-pair shift),
+// R_X86_64_TLS*, R_X86_64_GOTPCREL — leave the structured fields at
+// their `widthBytes=0` default; the walker fails loud
+// `K_RelocationKindMismatch` rather than silently mis-applying.
+// Closure of that gap is plan 14 §3.1 D-LK6-1 (closed-enum reshape
+// into `RelocFormulaLinear` / `RelocFormulaShifted` /
+// `RelocFormulaUnapplied`).
+//
+// JSON loader still ACCEPTS a `formula` text key (for human
+// documentation), but the value is discarded — the structured fields
+// below are the sole load-bearing input. Keeping `formula` as a C++
+// field invited desync between the human prose and the structured
+// triple (a typo in either side silently mis-applied at link time);
+// dropping it eliminates the desync vector entirely (type-design
+// O2.b + comment-analyzer #3 convergence, LK6 cycle 1 review).
+//
+// Coherence rules (enforced in `validate()`):
+//   (a) `widthBytes != 0` ⇒ `widthBytes ∈ {4, 8}` (JSON loader).
+//   (b) `pcRelative || addendBias != 0` ⇒ `widthBytes != 0`.
+//   (c) `addendBias != 0` ⇒ `pcRelative` (no absolute-with-bias).
+//   (d) `widthBytes != 0` ⇒ `|addendBias|` fits signed in widthBytes.
 struct DSS_EXPORT TargetRelocationInfo {
     std::string    name;            // canonical text key (e.g. "rel32", "abs64")
     RelocationKind kind{};          // opaque tag — written into Relocation::kind;
                                     // values flow ONLY from this field + the
                                     // schema's `relocationInfo`/`relocationByName`
                                     // accessors, never assembler-fabricated.
-    std::string    formula;         // human-readable formula (e.g. "S + A - P - 4")
+    bool         pcRelative  = false;  // include `-P` (PC-relative)
+    std::int32_t addendBias  = 0;      // implicit constant bias
+                                       // (e.g. -4 for x86 rel32 to
+                                       // skip past the 4-byte
+                                       // displacement field)
+    std::uint8_t widthBytes  = 0;      // 4 / 8 — bytes to write at
+                                       // the patch site. 0 means
+                                       // "linker rejects this kind"
+                                       // (non-linear formulas — see
+                                       // D-LK6-1).
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode
