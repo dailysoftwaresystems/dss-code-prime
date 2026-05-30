@@ -306,6 +306,37 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                               "'type' must be 'rel' / 'exec' / 'dyn'");
                 }
             }
+            // `interpreter`: PT_INTERP path (dynamic linker name).
+            // Optional in JSON. An empty-string literal (`""`) is
+            // rejected at load: the Linux kernel rejects ELFs with a
+            // zero-length PT_INTERP path, so `""` is unambiguously a
+            // config error (3-agent convergence: code-reviewer +
+            // silent-failure + comment-analyzer on LK6 cycle 2b.1
+            // review). Absent field = field stays at its default
+            // `""` and the walker treats it as "self-contained
+            // executable" (no PT_INTERP emission).
+            if (e.contains("interpreter")) {
+                if (!e.at("interpreter").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/elf/interpreter",
+                              "'interpreter' must be a string (e.g. "
+                              "'/lib64/ld-linux-x86-64.so.2')");
+                } else {
+                    auto const value =
+                        e.at("interpreter").get<std::string>();
+                    if (value.empty()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/elf/interpreter",
+                                  "'interpreter' must not be empty — "
+                                  "the Linux kernel rejects ELFs with "
+                                  "a zero-length PT_INTERP path. Omit "
+                                  "the field entirely for self-"
+                                  "contained executables.");
+                    } else {
+                        data.elf.interpreter = value;
+                    }
+                }
+            }
             // `pageAlign`: PT_LOAD p_align for Exec images. Required
             // for ET_EXEC at validate() — the kernel rejects ELF
             // exec'd images whose p_align is smaller than the

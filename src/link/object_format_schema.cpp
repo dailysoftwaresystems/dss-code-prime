@@ -184,6 +184,30 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "is mandatory per (arch × OS) — anchored at plan "
                      "14 §3.1 D-LK6-3.");
             }
+            // `interpreter` (PT_INTERP path) is OPTIONAL at schema
+            // load time. The JSON loader rejects an empty-string
+            // literal (`""`) at load (zero-length PT_INTERP paths
+            // are kernel-rejected at execve()), so we don't repeat
+            // the rule here — absent and populated are the only two
+            // observable states by the time validate() runs.
+            // The walker (LK6 cycle 2b — D-LK6-4) enforces non-empty
+            // when externImports is non-empty.
+        }
+        // ET_REL must NOT carry an interpreter path — `.interp` /
+        // PT_INTERP are exec-image concepts and have no role in
+        // relocatable objects. A non-empty `interpreter` on a
+        // .o-shaped schema is a copy-paste error from an exec
+        // schema (type-design symmetry with the virtualAddress=0
+        // rule below; LK6 cycle 2b.1 review type-design Concern #2
+        // convergence).
+        if (elf.objectType == ElfObjectType::Rel
+         && !elf.interpreter.empty()) {
+            fail("/elf/interpreter",
+                 std::format("ELF ET_REL format must not declare "
+                             "'elf.interpreter' (got '{}'). The "
+                             "PT_INTERP path is an exec-image "
+                             "concept; .o files leave it empty.",
+                             elf.interpreter));
         }
         // Conversely, ET_REL must NOT carry virtual addresses (they're
         // set by the LINKER at exec build time, not declared on the

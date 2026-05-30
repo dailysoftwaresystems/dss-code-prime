@@ -135,17 +135,43 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
-    // ELF GOT/PLT import-table emission anchored at plan 14 §3.1
-    // D-LK6-4 (LK6 cycle 2b). Until then, a module with non-empty
-    // externImports fails loud rather than silently producing an
-    // ELF missing its imports.
+    // ELF GOT/PLT import-table emission — substrate landed at LK6
+    // cycle 2b.1 (`ElfIdentity.interpreter` PT_INTERP path field +
+    // JSON loader + shipped exec JSON declares
+    // "/lib64/ld-linux-x86-64.so.2"). Walker emission of
+    // `.interp` / `.dynstr` / `.dynsym` / `.hash` / `.got.plt` /
+    // `.plt` / `.dynamic` / `.rela.plt` + PT_INTERP / PT_DYNAMIC
+    // program headers remains anchored at D-LK6-4 (LK6 cycle 2b.2,
+    // walker emission). A module with non-empty externImports
+    // fails loud here until that closes — silently producing an
+    // ELF missing its dynamic-linker contract would crash at exec.
     if (!module.externImports.empty()) {
-        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-             "elf::encode: extern imports present (" +
-             std::to_string(module.externImports.size()) +
-             " entries) but ELF GOT/PLT emission is not yet "
-             "implemented. Anchored at plan 14 §3.1 D-LK6-4 (LK6 "
-             "cycle 2b).");
+        // Two distinct fail-loud arms — the substrate-missing vs
+        // substrate-ready distinction tells a 2b.2 implementer
+        // whether to fix the schema or land walker emission. The
+        // populated path is included in the ready arm so it's
+        // searchable (and behaviorally distinguishable from the
+        // empty arm); the bare D-LK6-4 anchor stays in plan 14
+        // §3.1 rather than crowding the diagnostic with section-
+        // name minutiae (silent-failure MEDIUM #1 fold).
+        if (fmt.elf().interpreter.empty()) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 "elf::encode: extern imports present (" +
+                 std::to_string(module.externImports.size()) +
+                 " entries) but `elf.interpreter` is empty — declare "
+                 "a PT_INTERP path on the schema (e.g. "
+                 "'/lib64/ld-linux-x86-64.so.2') before the walker "
+                 "can emit a loadable dynamic image.");
+        } else {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 "elf::encode: extern imports present (" +
+                 std::to_string(module.externImports.size()) +
+                 " entries); PT_INTERP substrate is ready ('"
+                 + fmt.elf().interpreter
+                 + "') but ELF dynamic-linker section emission has "
+                   "not yet landed. Anchored at plan 14 §3.1 "
+                   "D-LK6-4.");
+        }
         return {};
     }
 

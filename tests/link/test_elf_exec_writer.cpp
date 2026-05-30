@@ -109,6 +109,131 @@ TEST(ElfExecFormatJson, ShippedFileLoadsCleanlyWithExecFields) {
     auto const* secText = loaded.format->sectionByKind(SectionKind::Text);
     ASSERT_NE(secText, nullptr);
     EXPECT_EQ(secText->virtualAddress, 0x401000u);
+    // LK6 cycle 2b.1 substrate: PT_INTERP path declared on the
+    // shipped exec schema. Walker emission (D-LK6-4) consumes
+    // this when emitting the .interp section + PT_INTERP program
+    // header.
+    EXPECT_EQ(loaded.format->elf().interpreter,
+              "/lib64/ld-linux-x86-64.so.2");
+}
+
+TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bad-interp","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": 42 },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
+    // 5-agent CRITICAL convergence (code-reviewer + silent-failure +
+    // comment-analyzer + type-design + architect): a literal
+    // `"interpreter": ""` in JSON is a config error (Linux kernel
+    // rejects zero-length PT_INTERP). Absent field is fine (default
+    // empty); explicit empty is not.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"empty-interp","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ElfRelFormatJson, InterpreterOnRelFormatRejectedAtLoad) {
+    // type-design Concern #2 + test-analyzer Gap 2 (2-agent): ET_REL
+    // must not carry an interpreter path (no PT_INTERP exists on
+    // relocatable .o files). Symmetric with the existing
+    // ET_REL/virtualAddress!=0 reject.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"rel-with-interp","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel", "interpreter": "/lib64/ld-linux-x86-64.so.2" }
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
+    // Cross-format symmetry with PE's fail-loud, but extended:
+    // when `elf.interpreter` is empty AND externImports is
+    // non-empty, the diagnostic surfaces the empty PT_INTERP
+    // path (not just the missing walker emission).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"exec-no-interp","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol = SymbolId{99};
+    imp.mangledName = "printf";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawSubstrateMention = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport
+         && d.actual.find("interpreter") != std::string::npos) {
+            sawSubstrateMention = true;
+        }
+    }
+    EXPECT_TRUE(sawSubstrateMention);
+}
+
+TEST(ElfExecWriter, ExternImportsDiagnosticDistinguishesByInterpreterPath) {
+    // When `elf.interpreter` IS populated (substrate ready), the
+    // diagnostic distinguishes substrate-ready from substrate-
+    // missing BY EMBEDDING THE PATH itself — the behavioral
+    // distinction a human reader and a future maintainer act on
+    // (test-analyzer Gap 3 fold: pin path asymmetry not anchor
+    // codes, which rot when D-LK6-4 closes).
+    //
+    // The shipped exec JSON has the path; the empty-interpreter
+    // diagnostic is asserted not to contain it.
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol = SymbolId{99};
+    imp.mangledName = "printf";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawPath = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport
+         && d.actual.find("/lib64/ld-linux-x86-64.so.2") != std::string::npos) {
+            sawPath = true;
+        }
+    }
+    EXPECT_TRUE(sawPath);
 }
 
 // ── ET_EXEC golden header bytes ────────────────────────────────

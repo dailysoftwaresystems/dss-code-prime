@@ -323,6 +323,15 @@ struct DSS_EXPORT ElfIdentity {
     // explicitly per (arch × OS). ET_REL leaves this 0 (no
     // program headers, value is unused).
     std::uint64_t  pageAlign = 0;
+    // PT_INTERP path — the dynamic linker the kernel `execve()`'s
+    // first when loading this executable. Typical Linux x86_64:
+    // "/lib64/ld-linux-x86-64.so.2". Required when objectType ==
+    // Exec AND `externImports` is non-empty (FFI / LK6 cycle 2b);
+    // empty for self-contained executables (LK1 cycle 2) and for
+    // ET_REL relocatable objects. The walker emits this string as
+    // the `.interp` section's contents and a PT_INTERP program
+    // header pointing at it.
+    std::string    interpreter;
 };
 
 // ── PE/COFF-specific identity block (loaded only when kind == Pe) ──

@@ -20,7 +20,8 @@
     "abiVersion": 0,
     "machine": 62,
     "type": "exec",
-    "pageAlign": 4096
+    "pageAlign": 4096,
+    "interpreter": "/lib64/ld-linux-x86-64.so.2"
   },
 
   "sections": [
