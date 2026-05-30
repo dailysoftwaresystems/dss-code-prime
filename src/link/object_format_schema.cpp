@@ -141,11 +141,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
         // PE encodes section alignment in Characteristics bits
         // IMAGE_SCN_ALIGN_*BYTES (which live in the substrate `type`
-        // field), so the `addrAlign` field is meaningless for PE
-        // rows. Reject explicitly to prevent the silent-mismatch
-        // hazard a future maintainer would hit when they edit a
-        // PE JSON's addrAlign expecting it to take effect (type-
-        // design Q3 + architect Decision 4 convergence).
+        // field), so neither `addrAlign` NOR `flags` is meaningful
+        // for PE rows. Reject both explicitly to prevent the silent-
+        // mismatch hazard a future maintainer would hit when they
+        // edit a PE JSON's addrAlign/flags expecting them to take
+        // effect (type-design Q3 + architect Decision 2/4 conv.).
         for (std::size_t i = 0; i < sections.size(); ++i) {
             if (sections[i].addrAlign != 0) {
                 fail(std::format("/sections/{}/addrAlign", i),
@@ -156,6 +156,16 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "substrate 'type' field; setting "
                                  "addrAlign here would be silently "
                                  "ignored)",
+                                 sections[i].name));
+            }
+            if (sections[i].flags != 0) {
+                fail(std::format("/sections/{}/flags", i),
+                     std::format("section '{}': 'flags' must be 0 for "
+                                 "PE format rows (PE folds ALL section "
+                                 "flags into Characteristics via the "
+                                 "substrate 'type' field; the 'flags' "
+                                 "field is meaningful only for ELF "
+                                 "sh_flags)",
                                  sections[i].name));
             }
         }

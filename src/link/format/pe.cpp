@@ -437,6 +437,20 @@ encode(AssembledModule const&    module,
         textRawPointer + textRawSize + textRelocSize;
     std::uint32_t const symtabSizeBytes =
         static_cast<std::uint32_t>(symtab.size());
+    // Substrate invariant: every `appendSym` writes exactly 18
+    // bytes. A future bug that dropped one byte would silently
+    // produce fewer symbols than expected (the integer division
+    // truncates the trailing partial record). Surface the
+    // violation rather than letting the symtab silently shrink
+    // (silent-failure-hunter H5).
+    if (symtab.size() % kSymbolRecordSize != 0) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::string{"PE writer: symbol-table byte size "}
+                 + std::to_string(symtab.size())
+                 + " is not a multiple of IMAGE_SYMBOL size (18) — "
+                   "substrate invariant violation in appendSym path");
+        return {};
+    }
     std::uint32_t const numberOfSymbols =
         static_cast<std::uint32_t>(symtab.size() / kSymbolRecordSize);
 
