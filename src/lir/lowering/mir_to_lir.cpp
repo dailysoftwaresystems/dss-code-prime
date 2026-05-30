@@ -1484,7 +1484,18 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::vector<ExternImport> externImports) {
     Lowerer L{mir, target, interner, reporter};
     MirToLirResult result = std::move(L).run();
-    result.externImports = std::move(externImports);
+    // Append (not overwrite) so any future LIR-tier extern synthesis
+    // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /
+    // decimal-runtime hooks the lowerer may need to materialize —
+    // is not silently clobbered. The inner `run()` initializes
+    // `result.externImports` to `{}` today (no LIR-side synthesis
+    // yet); if/when a future cycle starts emitting externs from
+    // the LIR lowerer, those rows will compose with the caller-
+    // supplied vector instead of being dropped. (silent-failure
+    // MEDIUM fold, LK6 cycle 2d post-fold review.)
+    result.externImports.insert(result.externImports.end(),
+                                std::make_move_iterator(externImports.begin()),
+                                std::make_move_iterator(externImports.end()));
     return result;
 }
 

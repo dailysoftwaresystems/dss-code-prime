@@ -1584,15 +1584,18 @@ struct Lowerer {
     // against `AssembledModule.externImports` instead of
     // `functions`. (LK6 cycle 2d — D-LK6-6 closure.)
     //
-    // If the FFI map is absent or the per-node entry is missing,
-    // `mangledName` falls back to the HIR-declared symbol name and
-    // `libraryPath` stays empty — the linker's per-extern non-
-    // empty-`libraryPath` validation then fires loud at link time,
-    // surfacing the missing metadata rather than shipping a half-
-    // built import table. We do NOT short-circuit here so that the
-    // diagnostic surface is concentrated at the linker (a single
-    // failure mode for "unresolved extern" instead of split across
-    // every IR tier).
+    // Fail-loud contract (the post-fold review verified this against
+    // the silent-failure rule): if the FFI map is absent OR a per-
+    // node entry is missing OR its `mangledName` / `importLibrary`
+    // is empty OR the extern's SymbolId collides with an intra-
+    // module function OR a prior extern in this module declares
+    // the same SymbolId OR the FnSig is invalid — the pre-pass
+    // emits `H_UnsupportedLoweringForKind` anchored at the HIR
+    // node's source span and the row is NOT pushed. Surfacing at
+    // the HIR tier preserves source-span context that the linker
+    // tier can no longer recover (which would otherwise reduce
+    // every metadata problem to "unresolved extern" with no
+    // pinpoint location).
     void collectExterns(HirNodeId moduleNode) {
         // Track extern SymbolIds we've already emitted a row for, to
         // catch duplicate-extern-declaration drift. The linker
@@ -1892,6 +1895,13 @@ struct Lowerer {
             unsupported(root, "HIR root is not a Module — cannot lower");
             return;
         }
+        // Pre-pass ordering invariant (architect LOW fold, LK6
+        // cycle 2d post-fold review): `collectFunctions` MUST run
+        // before `collectExterns` because the cross-table guard in
+        // `collectExterns` reads `functionSymbols` to detect a
+        // SymbolId owned by an intra-module function colliding with
+        // an extern declaration. Reordering would silently degrade
+        // the guard to "extern wins, prior function shadowed."
         collectFunctions(root);
         collectGlobals(root);
         collectExterns(root);
@@ -1960,8 +1970,20 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           MirLoweringConfig const& config,
                           HirFfiMap const*         ffiMap) {
     std::size_t const errorsBefore = reporter.errorCount();
-    Lowerer lwr{hir, literals, interner, reporter, sourceMap, config,
-                ffiMap, MirBuilder{}, {}, {}, {}, {}, {}, {}, {}};
+    // Designated initializers (code-simplifier REQUIRED fold, LK6
+    // cycle 2d post-fold review): a future field addition or
+    // reorder is a compile error rather than a silent position
+    // rebind. Trailing default-initialized fields are omitted.
+    Lowerer lwr{
+        .hir       = hir,
+        .literals  = literals,
+        .interner  = interner,
+        .reporter  = reporter,
+        .sourceMap = sourceMap,
+        .config    = config,
+        .ffiMap    = ffiMap,
+        .mir       = MirBuilder{},
+    };
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
