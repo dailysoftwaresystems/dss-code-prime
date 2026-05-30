@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/exec_reloc_apply.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -16,10 +17,10 @@
 #include <utility>
 #include <vector>
 
-// Mach-O 64-bit relocatable (.o, MH_OBJECT) writer — plan 14 LK3.
+// Mach-O 64-bit writer — plan 14 LK3 cycle 1 (.o) + cycle 2 (.exe).
 //
-// Byte layout (Apple OS X ABI Mach-O File Format Reference +
-// <mach-o/loader.h> + <mach-o/nlist.h> + <mach-o/reloc.h>):
+// MH_OBJECT (.o) byte layout (Apple OS X ABI Mach-O File Format
+// Reference + <mach-o/loader.h> + <mach-o/nlist.h> + <mach-o/reloc.h>):
 //   [0x00]      mach_header_64                  (32 B)
 //   [0x20]      LC_SEGMENT_64 + section_64[N]   (72 + 80*N B)
 //   [...]       LC_SYMTAB                       (24 B)
@@ -28,10 +29,25 @@
 //   [symoff]    nlist_64[]                      (16 B each)
 //   [stroff]    string table (NUL-seeded)
 //
+// MH_EXECUTE (.exe) byte layout (LK3 cycle 2, closes D-LK3-2's
+// MH_EXECUTE half — D-LK3-3 anchors MH_DYLIB):
+//   [0x00]      mach_header_64                  (32 B)
+//   [0x20]      LC_SEGMENT_64 __PAGEZERO        (72 B, 0 sections)
+//   [...]       LC_SEGMENT_64 __TEXT + sec_64   (72 + 80*N B)
+//   [...]       LC_LOAD_DYLINKER                (≥ 12 B, padded to 8)
+//   [...]       LC_MAIN                         (24 B)
+//   [...]       LC_LOAD_DYLIB[] (one per lib)   (≥ 24 B each, padded to 8)
+//   [...]       LC_SYMTAB                       (24 B)
+//   [...]       (pad to page)
+//   [...]       __text bytes (loaded at __TEXT.vmaddr)
+//   [symoff]    nlist_64[]   (16 B each — pointed to by LC_SYMTAB.symoff)
+//   [stroff]    string table (NUL-seeded — pointed to by LC_SYMTAB.stroff)
+//
 // The walker is target-blind in shape — every Mach-O-specific
 // number (cputype, cpusubtype, filetype, section flags, reloc
-// nativeId, section/segment names) is read from the format
-// schema. Only the binary record layout is hardcoded.
+// nativeId, section/segment names, dylinker / dylib paths) is
+// read from the format schema. Only the binary record layout is
+// hardcoded.
 
 namespace dss::macho {
 
@@ -83,14 +99,20 @@ void padTo(std::vector<std::uint8_t>& out, std::uint64_t alignment) {
 
 } // namespace
 
+namespace {
+[[nodiscard]] std::vector<std::uint8_t>
+encodeExec(AssembledModule const&    module,
+           TargetSchema const&       targetSchema,
+           ObjectFormatSchema const& fmt,
+           ObjectFormatSectionInfo const& secText,
+           DiagnosticReporter&       reporter);
+} // namespace
+
 std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter) {
-    (void)targetSchema;  // Reserved: future formula-application
-                         // path (LK6).
-
     auto const& fmt = objectFormatSchema;
     if (fmt.kind() != ObjectFormatKind::MachO) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -102,11 +124,21 @@ encode(AssembledModule const&    module,
         return {};
     }
 
-    // Mach-O MH_OBJECT requires `__text`; symtab/strtab live inside
-    // LC_SYMTAB, not as separate section headers.
+    // Mach-O requires `__text`; symtab/strtab live inside LC_SYMTAB,
+    // not as separate section headers.
     auto const* secText =
         requireSection(fmt, SectionKind::Text, "Mach-O writer", reporter);
     if (!secText) return {};
+
+    // Dispatch between MH_OBJECT (cycle 1) and MH_EXECUTE (cycle 2)
+    // based on the schema's declared filetype. validate() rejects
+    // any value outside {1, 2} so this switch is exhaustive.
+    if (fmt.macho().filetype == MachOObjectType::Execute) {
+        return encodeExec(module, targetSchema, fmt, *secText, reporter);
+    }
+    (void)targetSchema;  // MH_OBJECT path does not apply relocations;
+                         // the assembler stamped the bytes and the
+                         // .o writer just serializes them.
 
     // ── Build .text + per-function symbols ─────────────────────
     std::vector<std::uint8_t> textBody;
@@ -341,7 +373,7 @@ encode(AssembledModule const&    module,
     appendU32LE(bytes, MH_MAGIC_64);
     appendU32LE(bytes, id.cputype);
     appendU32LE(bytes, id.cpusubtype);
-    appendU32LE(bytes, id.filetype);
+    appendU32LE(bytes, static_cast<std::uint32_t>(id.filetype));
     appendU32LE(bytes, 2);  // ncmds: LC_SEGMENT_64 + LC_SYMTAB
     appendU32LE(bytes,
         static_cast<std::uint32_t>(kSegmentCommand64Size
@@ -405,5 +437,352 @@ encode(AssembledModule const&    module,
 
     return bytes;
 }
+
+// ── Mach-O MH_EXECUTE writer — plan 14 LK3 cycle 2 ─────────────
+//
+// Closes plan 14 §3.1 D-LK3-2. Emits a minimum-viable MH_EXECUTE
+// the macOS loader will accept:
+//   * __PAGEZERO segment at vmaddr=0 (catches null-deref).
+//   * __TEXT segment at vmaddr=imageBase, contains __text.
+//   * LC_LOAD_DYLINKER (/usr/lib/dyld).
+//   * LC_MAIN with entryoff = entry function offset.
+//   * LC_LOAD_DYLIB for each declared library.
+//   * LC_SYMTAB.
+//
+// Intra-module relocations are applied in-place via the LK6 cycle
+// 1 structured-formula triple — symmetric with PE / ELF EXEC.
+// LC_DYLD_INFO chained-fixups (the modern Mach-O reloc form for
+// MH_EXECUTE) arrive at LK6 cycle 2 paired with FFI.
+
+namespace {
+
+// LC_* command constants (<mach-o/loader.h>)
+constexpr std::uint32_t LC_LOAD_DYLINKER = 0x0E;
+constexpr std::uint32_t LC_MAIN          = 0x80000028u;  // |= LC_REQ_DYLD
+constexpr std::uint32_t LC_LOAD_DYLIB    = 0x0C;
+constexpr std::uint64_t kLoadCmdAlign    = 8;            // load commands
+                                                          // pad to 8 bytes
+
+// Pad load-command bytes to 8-byte boundary (LC alignment).
+void padLoadCmd(std::vector<std::uint8_t>& out) {
+    while (out.size() % kLoadCmdAlign != 0) out.push_back(0);
+}
+
+[[nodiscard]] std::vector<std::uint8_t>
+encodeExec(AssembledModule const&    module,
+           TargetSchema const&       targetSchema,
+           ObjectFormatSchema const& fmt,
+           ObjectFormatSectionInfo const& secText,
+           DiagnosticReporter&       reporter) {
+    auto const& id = fmt.macho();
+    auto const& im = fmt.machoImage();
+
+    // ── (a) Build .text body + per-function start map ─────────
+    std::vector<std::uint8_t> textBody;
+    std::vector<std::uint64_t> funcTextStart;
+    funcTextStart.reserve(module.functions.size());
+    std::unordered_map<SymbolId, std::uint64_t> textOffsetBySym;
+    textOffsetBySym.reserve(module.functions.size());
+    for (auto const& fn : module.functions) {
+        std::uint64_t const start = textBody.size();
+        funcTextStart.push_back(start);
+        textBody.insert(textBody.end(), fn.bytes.begin(), fn.bytes.end());
+        textOffsetBySym.emplace(fn.symbol, start);
+    }
+    if (textBody.empty()) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             "macho::encodeExec: `__text` is empty — every "
+             "AssembledFunction contributed zero bytes.");
+        return {};
+    }
+
+    // ── (b) Resolve entry function index from schema.entryPoint
+    std::size_t entryFnIdx = 0;
+    if (auto const ep = fmt.entryPoint(); !ep.empty()) {
+        bool found = false;
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            std::string const cand =
+                "_sym_" + std::to_string(module.functions[i].symbol.v);
+            if (cand == ep) { entryFnIdx = i; found = true; break; }
+        }
+        if (!found) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"macho::encodeExec: entryPoint '"}
+                     + std::string{ep}
+                     + "' not found among module function symbols.");
+            return {};
+        }
+    }
+
+    // ── (c) Apply intra-module relocations in-place ───────────
+    //
+    // Delegated to the shared `applyExecRelocations` kernel
+    // (`link/format/exec_reloc_apply.hpp`). Mach-O-specific input:
+    // sectionVa = secText.virtualAddress (section_64.addr; Mach-O
+    // stores absolute VAs on sections, not RVA-from-ImageBase like
+    // PE). Format-side fmt.relocationByKind check stays here.
+    for (auto const& fn : module.functions) {
+        for (auto const& rel : fn.relocations) {
+            if (fmt.relocationByKind(rel.kind) == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("macho::encodeExec: kind {} not "
+                                 "declared by object format '{}' — "
+                                 "substrate-invariant violation.",
+                                 rel.kind.v, fmt.name()));
+                return {};
+            }
+        }
+    }
+    std::uint64_t const sectionVa = secText.virtualAddress;
+    if (!link::format::applyExecRelocations(
+            textBody, module, funcTextStart, textOffsetBySym,
+            targetSchema, sectionVa, "macho::encodeExec", reporter)) {
+        return {};
+    }
+
+    // ── (d) Build LC_LOAD_DYLINKER + LC_LOAD_DYLIB sizes ──────
+    //
+    // Each path-bearing load command is `[u32 cmd][u32 cmdsize]
+    // [u32 name_offset = 0x0C or 0x18][path bytes NUL-terminated]
+    // [pad to 8]`. dyld reads cmdsize, finds the path at cmd+12 /
+    // cmd+24, and resolves it.
+    auto commandSizeWithPath = [](std::size_t fixedSize,
+                                   std::string const& path) {
+        std::size_t const raw = fixedSize + path.size() + 1;
+        return (raw + kLoadCmdAlign - 1) & ~(kLoadCmdAlign - 1);
+    };
+    std::size_t const dylinkerCmdSize =
+        commandSizeWithPath(12, im.dylinkerPath);
+    std::size_t totalDylibCmdSize = 0;
+    for (auto const& d : im.loadDylibs) {
+        totalDylibCmdSize += commandSizeWithPath(24, d.path);
+    }
+
+    // ── (e) Layout constants ──────────────────────────────────
+    //
+    // ncmds = 2 (__PAGEZERO + __TEXT) + 1 (LC_LOAD_DYLINKER)
+    //       + 1 (LC_MAIN) + N (LC_LOAD_DYLIB) + 1 (LC_SYMTAB).
+    constexpr std::size_t kSegCmdPageZeroSize = kSegmentCommand64Size;
+    constexpr std::size_t kSegCmdTextSize     =
+        kSegmentCommand64Size + kSection64Size;  // 1 section: __text
+    constexpr std::size_t kLcMainSize         = 24;
+
+    std::uint32_t const ncmds = static_cast<std::uint32_t>(
+        2u + 1u + 1u + im.loadDylibs.size() + 1u);
+    std::size_t const sizeofcmds =
+        kSegCmdPageZeroSize + kSegCmdTextSize + dylinkerCmdSize
+        + kLcMainSize + totalDylibCmdSize + kSymtabCommandSize;
+
+    // ── (f) Build nlist_64 + string table — defined symbols only.
+    //       Extern dyld symbols arrive at LK6 cycle 2 (D-LK6-2).
+    StringTable strtab;
+    std::vector<std::uint8_t> nlistBytes;
+    for (auto const& fn : module.functions) {
+        std::string const symName =
+            "_sym_" + std::to_string(fn.symbol.v);
+        std::uint32_t const nameOff = strtab.add(symName);
+        std::size_t const fi = static_cast<std::size_t>(&fn - module.functions.data());
+        appendU32LE(nlistBytes, nameOff);
+        appendU8(nlistBytes,
+                 static_cast<std::uint8_t>(N_SECT | N_EXT));
+        appendU8(nlistBytes, /*n_sect=*/1);
+        appendU16LE(nlistBytes, /*n_desc=*/0);
+        appendU64LE(nlistBytes,
+                    sectionVa + funcTextStart[fi]);  // n_value = runtime VA
+    }
+    std::uint32_t const numberOfSymbols =
+        static_cast<std::uint32_t>(module.functions.size());
+
+    std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
+
+    // .text body lives at file offset aligned to addrAlign (typical
+    // 16 for x86_64), AFTER all load commands. The vmaddr of __text
+    // (declared on the schema as virtualAddress) determines the
+    // congruence: vmaddr % pageSize must equal fileOffset % pageSize
+    // for the dyld mmap to map it correctly.
+    //
+    // Apple's loader convention: __TEXT segment's fileoff = 0 (the
+    // mach header itself is "inside" __TEXT — the segment covers
+    // [fileoff, fileoff+filesize) including the header). vmsize =
+    // page-aligned size of all sections. Sections within __TEXT
+    // have offset = (their byte position in the file).
+    constexpr std::uint64_t kPageSize = 0x1000;
+    std::uint64_t const textFileOff =
+        (headerAndCmds + kPageSize - 1) & ~(kPageSize - 1);
+    std::uint64_t const textFileSize = textBody.size();
+    std::uint64_t const symtabOffset = textFileOff + textFileSize;
+    std::uint64_t const stringTableOffset =
+        symtabOffset + nlistBytes.size();
+    std::uint64_t const stringTableSize = strtab.size();
+
+    // __TEXT segment vmsize: page-aligned size from segment start
+    // (vmaddr) covering all sections. Since __text starts at
+    // section.virtualAddress and is textFileSize bytes, vmsize =
+    // (section.virtualAddress - __TEXT.vmaddr) + textFileSize,
+    // page-aligned. __TEXT.vmaddr = im.pageZeroSize (right after
+    // __PAGEZERO).
+    //
+    // Defensive walker check (silent-failure H4 + code-reviewer C2
+    // convergence): validate() rejects schemas where sectionVa <
+    // pageZeroSize, but a programmatic / in-process construction
+    // path could bypass that. Surface the underflow rather than
+    // silently emitting a ~2^64 vmsize.
+    if (sectionVa < im.pageZeroSize) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExec: section VA 0x{:x} is "
+                         "below __TEXT vmaddr 0x{:x} (pageZeroSize) "
+                         "— __TEXT would overlap __PAGEZERO; loader "
+                         "rejects.",
+                         sectionVa, im.pageZeroSize));
+        return {};
+    }
+    std::uint64_t const textSegVmaddr = im.pageZeroSize;
+    std::uint64_t const textSecOffsetInSeg = sectionVa - textSegVmaddr;
+    std::uint64_t const textSegVmsize =
+        (textSecOffsetInSeg + textFileSize + kPageSize - 1)
+        & ~(kPageSize - 1);
+    // __TEXT.filesize must NOT include the symtab/strtab bytes that
+    // follow (those are outside any segment per Apple convention —
+    // LC_SYMTAB references them by absolute file offset). Setting
+    // filesize = vmsize (page-aligned) would silently make dyld
+    // map the symtab as if it were code (silent-failure C2 + code-
+    // reviewer C1 convergence). Use the byte-exact section span:
+    // textSecOffsetInSeg + textFileSize.
+    std::uint64_t const textSegFileSize = textSecOffsetInSeg + textFileSize;
+
+    // entryoff for LC_MAIN: per <mach-o/loader.h> entry_point_command,
+    // the offset is measured from the START of the __TEXT segment
+    // (relative to __TEXT.fileoff). This walker emits __TEXT.fileoff
+    // = 0 (Apple convention — the mach header itself sits inside
+    // __TEXT), so the value also equals the absolute file offset of
+    // the entry function. The dependency on `__TEXT.fileoff == 0`
+    // is load-bearing — if a future cycle prepends a fat-header
+    // wrapper or a signing prefix, this formula must subtract
+    // __TEXT.fileoff to stay correct (architect O2 fix-up).
+    std::uint64_t const entryOff = textFileOff + funcTextStart[entryFnIdx];
+
+    // ── (g) Emit bytes ────────────────────────────────────────
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(stringTableOffset + stringTableSize);
+
+    // mach_header_64
+    appendU32LE(bytes, MH_MAGIC_64);
+    appendU32LE(bytes, id.cputype);
+    appendU32LE(bytes, id.cpusubtype);
+    appendU32LE(bytes, static_cast<std::uint32_t>(id.filetype));
+    appendU32LE(bytes, ncmds);
+    appendU32LE(bytes, static_cast<std::uint32_t>(sizeofcmds));
+    appendU32LE(bytes, id.flags);
+    appendU32LE(bytes, 0);  // reserved (64-bit padding)
+
+    // LC_SEGMENT_64 __PAGEZERO (vmaddr=0, vmsize=pageZeroSize, no prot)
+    appendU32LE(bytes, LC_SEGMENT_64);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdPageZeroSize));
+    appendName16(bytes, "__PAGEZERO");
+    appendU64LE(bytes, 0);              // vmaddr
+    appendU64LE(bytes, im.pageZeroSize); // vmsize
+    appendU64LE(bytes, 0);              // fileoff
+    appendU64LE(bytes, 0);              // filesize
+    appendU32LE(bytes, 0);              // maxprot = 0
+    appendU32LE(bytes, 0);              // initprot = 0
+    appendU32LE(bytes, 0);              // nsects = 0
+    appendU32LE(bytes, 0);              // segment flags
+
+    // LC_SEGMENT_64 __TEXT (vmaddr=pageZeroSize, fileoff=0, R|X)
+    constexpr std::int32_t kVmProtRx = 5;  // R|X
+    appendU32LE(bytes, LC_SEGMENT_64);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdTextSize));
+    appendName16(bytes, "__TEXT");
+    appendU64LE(bytes, textSegVmaddr);
+    appendU64LE(bytes, textSegVmsize);
+    appendU64LE(bytes, 0);                // fileoff = 0 (mach header in __TEXT)
+    appendU64LE(bytes, textSegFileSize);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
+    appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
+    appendU32LE(bytes, 1);                // nsects = 1 (__text)
+    appendU32LE(bytes, 0);                // flags
+
+    // section_64 __text within __TEXT
+    appendName16(bytes, secText.name);     // "__text"
+    appendName16(bytes, secText.segment);  // "__TEXT"
+    appendU64LE(bytes, sectionVa);
+    appendU64LE(bytes, textFileSize);      // size
+    appendU32LE(bytes, static_cast<std::uint32_t>(textFileOff));
+    appendU32LE(bytes, static_cast<std::uint32_t>(secText.addrAlign));
+    appendU32LE(bytes, 0);                 // reloff (no .o-style relocs)
+    appendU32LE(bytes, 0);                 // nreloc
+    appendU32LE(bytes, secText.type);      // flags from JSON
+    appendU32LE(bytes, 0);                 // reserved1
+    appendU32LE(bytes, 0);                 // reserved2
+    appendU32LE(bytes, 0);                 // reserved3
+
+    // LC_LOAD_DYLINKER
+    {
+        std::size_t const cmdStart = bytes.size();
+        appendU32LE(bytes, LC_LOAD_DYLINKER);
+        appendU32LE(bytes, static_cast<std::uint32_t>(dylinkerCmdSize));
+        appendU32LE(bytes, 12);            // name offset = 12 (cmd+12)
+        for (char c : im.dylinkerPath) appendU8(bytes, static_cast<std::uint8_t>(c));
+        appendU8(bytes, 0);                // NUL terminator
+        while (bytes.size() - cmdStart < dylinkerCmdSize) appendU8(bytes, 0);
+    }
+
+    // LC_MAIN
+    appendU32LE(bytes, LC_MAIN);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kLcMainSize));
+    appendU64LE(bytes, entryOff);
+    appendU64LE(bytes, 0);                 // stacksize = 0 (use default)
+
+    // LC_LOAD_DYLIB[]
+    for (auto const& d : im.loadDylibs) {
+        std::size_t const cmdStart = bytes.size();
+        std::size_t const cmdSize  = commandSizeWithPath(24, d.path);
+        appendU32LE(bytes, LC_LOAD_DYLIB);
+        appendU32LE(bytes, static_cast<std::uint32_t>(cmdSize));
+        appendU32LE(bytes, 24);            // name offset = 24 (cmd+24)
+        appendU32LE(bytes, 0);             // timestamp = 0
+        appendU32LE(bytes, 0);             // current_version
+        appendU32LE(bytes, 0);             // compatibility_version
+        for (char c : d.path) appendU8(bytes, static_cast<std::uint8_t>(c));
+        appendU8(bytes, 0);                // NUL terminator
+        while (bytes.size() - cmdStart < cmdSize) appendU8(bytes, 0);
+    }
+
+    // LC_SYMTAB
+    appendU32LE(bytes, LC_SYMTAB);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kSymtabCommandSize));
+    appendU32LE(bytes, static_cast<std::uint32_t>(symtabOffset));
+    appendU32LE(bytes, numberOfSymbols);
+    appendU32LE(bytes, static_cast<std::uint32_t>(stringTableOffset));
+    appendU32LE(bytes, static_cast<std::uint32_t>(stringTableSize));
+
+    // Sanity-check that we emitted exactly sizeofcmds bytes of load
+    // commands after the mach header. A mismatch silently corrupts
+    // dyld's load-command parser; surface it.
+    if (bytes.size() != kMachHeader64Size + sizeofcmds) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::string{"macho::encodeExec: emitted "}
+                 + std::to_string(bytes.size() - kMachHeader64Size)
+                 + " bytes of load commands but sizeofcmds="
+                 + std::to_string(sizeofcmds)
+                 + " — substrate invariant violation.");
+        return {};
+    }
+
+    // Pad to textFileOff
+    while (bytes.size() < textFileOff) bytes.push_back(0);
+
+    // __text body
+    bytes.insert(bytes.end(), textBody.begin(), textBody.end());
+
+    // symbol table + string table
+    bytes.insert(bytes.end(), nlistBytes.begin(), nlistBytes.end());
+    auto strtabBytes = std::move(strtab).release();
+    bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
+
+    return bytes;
+}
+
+} // namespace
 
 } // namespace dss::macho

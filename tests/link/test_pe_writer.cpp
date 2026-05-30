@@ -28,6 +28,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -52,6 +53,13 @@ namespace {
 [[nodiscard]] std::int16_t readI16LE(std::span<std::uint8_t const> b,
                                       std::size_t off) {
     return static_cast<std::int16_t>(readU16LE(b, off));
+}
+[[nodiscard]] std::uint64_t readU64LE(std::span<std::uint8_t const> b,
+                                       std::size_t off) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+        v |= static_cast<std::uint64_t>(b[off + i]) << (i * 8);
+    return v;
 }
 
 struct Loaded {
@@ -424,4 +432,352 @@ TEST(LinkerEndToEnd, PeDispatchProducesNonEmptyBytes) {
     ASSERT_GE(image.bytes.size(), 2u);
     EXPECT_EQ(image.bytes[0], 0x64u);
     EXPECT_EQ(image.bytes[1], 0x86u);
+}
+
+// ── LK2 cycle 2: PE32+ executable image (.exe) writer ──────────
+
+namespace {
+[[nodiscard]] Loaded loadShippedExec() {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("x86_64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(x86_64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.target = std::move(t).value();
+    }
+    auto f = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    if (!f.has_value()) {
+        ADD_FAILURE() << "loadShipped(pe64-x86_64-windows-exec) failed";
+        for (auto const& d : f.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.format = std::move(f).value();
+    }
+    return out;
+}
+} // namespace
+
+TEST(PeExecFormatJson, ShippedFileLoadsCleanly) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    EXPECT_EQ(loaded.format->kind(), ObjectFormatKind::Pe);
+    EXPECT_EQ(loaded.format->pe().objectType, PeObjectType::Exec);
+    auto const& oh = loaded.format->peOptionalHeader();
+    EXPECT_EQ(oh.magic, 0x20Bu);                       // PE32+
+    EXPECT_EQ(oh.imageBase, 0x140000000ull);
+    EXPECT_EQ(oh.sectionAlignment, 0x1000u);
+    EXPECT_EQ(oh.fileAlignment, 0x200u);
+    EXPECT_EQ(oh.subsystem, 3u);                       // WINDOWS_CUI
+}
+
+TEST(PeExecWriter, DosHeaderMzSignature) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 0x40u);
+    EXPECT_EQ(bytes[0], 'M');
+    EXPECT_EQ(bytes[1], 'Z');
+    // e_lfanew at offset 0x3C points to PE signature at 0x80.
+    EXPECT_EQ(readU32LE(bytes, 0x3C), 0x80u);
+}
+
+TEST(PeExecWriter, PeSignatureAtZero80) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 0x84u);
+    EXPECT_EQ(bytes[0x80], 'P');
+    EXPECT_EQ(bytes[0x81], 'E');
+    EXPECT_EQ(bytes[0x82], 0);
+    EXPECT_EQ(bytes[0x83], 0);
+}
+
+TEST(PeExecWriter, OptionalHeaderFieldsByteForByte) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // IMAGE_FILE_HEADER at 0x84:
+    //   [0x84] Machine (u16) = 0x8664
+    //   [0x86] NumberOfSections (u16) = 1
+    //   [0x88] TimeDateStamp (u32) = 0
+    //   [0x8C] PointerToSymbolTable (u32) = 0
+    //   [0x90] NumberOfSymbols (u32) = 0
+    //   [0x94] SizeOfOptionalHeader (u16) = 240
+    //   [0x96] Characteristics (u16) = 0x22 (EXECUTABLE_IMAGE|LARGE_ADDR_AWARE)
+    EXPECT_EQ(readU16LE(bytes, 0x84), 0x8664u);
+    EXPECT_EQ(readU16LE(bytes, 0x86), 1u);
+    EXPECT_EQ(readU32LE(bytes, 0x88), 0u);
+    EXPECT_EQ(readU32LE(bytes, 0x8C), 0u);
+    EXPECT_EQ(readU32LE(bytes, 0x90), 0u);
+    EXPECT_EQ(readU16LE(bytes, 0x94), 240u);
+    EXPECT_EQ(readU16LE(bytes, 0x96), 0x22u);
+
+    // IMAGE_OPTIONAL_HEADER64 starts at 0x98.
+    //   [0x98] Magic (u16) = 0x20B (PE32+)
+    EXPECT_EQ(readU16LE(bytes, 0x98), 0x20Bu);
+    //   [0xA8] AddressOfEntryPoint (u32) = secText.RVA + 0 = 0x1000
+    EXPECT_EQ(readU32LE(bytes, 0xA8), 0x1000u);
+    //   [0xB0] ImageBase (u64) = 0x140000000
+    EXPECT_EQ(readU64LE(bytes, 0xB0), 0x140000000ull);
+    //   [0xB8] SectionAlignment (u32) = 0x1000
+    EXPECT_EQ(readU32LE(bytes, 0xB8), 0x1000u);
+    //   [0xBC] FileAlignment (u32) = 0x200
+    EXPECT_EQ(readU32LE(bytes, 0xBC), 0x200u);
+    //   [0xDC] Subsystem (u16) = 3 (WINDOWS_CUI) — after CheckSum(0xD8)
+    EXPECT_EQ(readU16LE(bytes, 0xDC), 3u);
+}
+
+TEST(PeExecWriter, IntraModuleRel32CallAppliedByteForByte) {
+    // Multi-function PE EXEC: fn[0] calls fn[1] via rel32.
+    // sectionVa = imageBase + secText.RVA = 0x140001000.
+    // fn[0] @ +0 (6 B: E8 ?? ?? ?? ?? C3); fn[1] @ +6 (1 B: C3).
+    // P = sectionVa + 1, S = sectionVa + 6, A = 0.
+    // value = S - P - 4 = 1.
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction f0;
+    f0.symbol = SymbolId{1};
+    f0.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{2};
+    rel.kind   = RelocationKind{1};
+    f0.relocations.push_back(rel);
+    mod.functions.push_back(std::move(f0));
+    AssembledFunction f1;
+    f1.symbol = SymbolId{2};
+    f1.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f1));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // Locate .text file offset from IMAGE_SECTION_HEADER at 0x188
+    //   [0x188 .. 0x188+8) Name
+    //   [0x190] virtualSize (u32)
+    //   [0x194] virtualAddress (u32)
+    //   [0x198] sizeOfRawData (u32)
+    //   [0x19C] pointerToRawData (u32) ← file offset of .text
+    std::uint32_t const textFileOff =
+        readU32LE(bytes, 0x188 + 20);
+    ASSERT_GE(bytes.size(), textFileOff + 6u);
+    EXPECT_EQ(bytes[textFileOff + 0], 0xE8u);
+    EXPECT_EQ(readU32LE(bytes, textFileOff + 1), 1u);
+    EXPECT_EQ(bytes[textFileOff + 5], 0xC3u);
+}
+
+TEST(PeExecWriter, ExternTargetFailsLoudAsUndefined) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{99};       // extern
+    rel.kind   = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}
+
+TEST(PeExecFormatJsonValidate, MissingImageBaseRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bad-pe-exec","kind":"pe"},
+      "pe": { "machine": 34404, "type": "exec" },
+      "optionalHeader": { "magic": 523, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(PeExecFormatJsonValidate, ObjWithOptionalHeaderRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"obj-with-opt-hdr","kind":"pe"},
+      "pe": { "machine": 34404, "type": "obj" },
+      "optionalHeader": { "magic": 523 }
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"odd-align","kind":"pe"},
+      "pe": { "machine": 34404, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 3000, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── New tests folded from 7-agent review of LK2 cycle 2 ────────
+
+TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {
+    // PE/COFF §3.4 + code-reviewer C3 + silent-failure C3: PE32+
+    // sectionAlignment must be >= 4096 (page size). Windows loader
+    // rejects sub-page alignment with STATUS_INVALID_IMAGE_FORMAT.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"sub-page","kind":"pe"},
+      "pe": { "machine": 34404, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 512, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(PeExecFormatJsonValidate, MissingSubsystemRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"no-subsystem","kind":"pe"},
+      "pe": { "machine": 34404, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(PeExecFormatJsonValidate, MissingStackHeapSizesRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"no-stack","kind":"pe"},
+      "pe": { "machine": 34404, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(PeExecFormatJsonValidate, SectionAlignmentLessThanFileAlignmentRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"sect-lt-file","kind":"pe"},
+      "pe": { "machine": 34404, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 8192, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentRejected) {
+    // code-reviewer C3: secText.virtualAddress must be a multiple
+    // of sectionAlignment per PE/COFF §3.4.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"misaligned-va","kind":"pe"},
+      "pe": { "machine": 34404, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4097}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(PeExecWriter, DllArmFailsLoud) {
+    // Anchored D-LK2-4: PE .dll arm not yet implemented; walker
+    // emits K_NoMatchingObjectFormat rather than silently producing
+    // a malformed DLL.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"a-dll","kind":"pe"},
+      "pe": { "machine": 34404, "type": "dll" },
+      "optionalHeader": { "magic": 523, "imageBase": 6442450944, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "dllCharacteristics": 0, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_TRUE(r.has_value());
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, **target, **r, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}
+
+TEST(PeExecWriter, EmptyTextFailsLoud) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // bytes intentionally empty
+    mod.functions.push_back(std::move(fn));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(PeExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction f0;
+    f0.symbol = SymbolId{1};
+    f0.bytes  = {0xC3};   // 1 byte
+    Relocation rel;
+    rel.offset = 4;       // past end
+    rel.target = SymbolId{2};
+    rel.kind   = RelocationKind{1};
+    f0.relocations.push_back(rel);
+    mod.functions.push_back(std::move(f0));
+    AssembledFunction f1;
+    f1.symbol = SymbolId{2};
+    f1.bytes  = {0xC3, 0xC3, 0xC3, 0xC3};
+    mod.functions.push_back(std::move(f1));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_RelocationKindMismatch) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}
+
+TEST(PeExecWriter, DisplacementOverflowFailsLoud) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{1};
+    rel.kind   = RelocationKind{1};
+    rel.addend = std::numeric_limits<std::int64_t>::max() / 2;
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_RelocationKindMismatch) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
 }

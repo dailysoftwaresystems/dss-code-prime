@@ -330,14 +330,76 @@ struct DSS_EXPORT ElfIdentity {
 // Mirrors the load-bearing fields of `IMAGE_FILE_HEADER` (PE/COFF
 // spec §3.3). `TimeDateStamp` is omitted: deterministic builds
 // require it to be 0 and that's the substrate default already.
-// `SizeOfOptionalHeader` is omitted: relocatable `.obj` files use 0
-// (the optional header lives only in `.exe`/`.dll`, which arrive
-// in LK1 cycle 2 / LK5+).
+// `SizeOfOptionalHeader` is omitted from the schema: it's
+// COMPUTED at emit time from the optional-header size when
+// objectType != Obj (Exec/Dll ship the optional header; Obj
+// always writes 0).
+//
+// `objectType` discriminates between PE/COFF object files
+// (`MH_OBJECT`-equivalent — `.obj` relocatable, LK2 cycle 1) and
+// executable images (`.exe` for Exec / `.dll` for Dll, LK2 cycle
+// 2). Mirrors the `ElfObjectType` closed-enum pattern. Dll is
+// declared but rejected by validate() until a future cycle ships
+// the .dll arm (anchored at plan 14 §3.1 — same shape as ELF
+// ET_DYN's D-LK1-4 anchor).
+enum class PeObjectType : std::uint16_t {
+    Obj  = 1,  // .obj relocatable — LK2 cycle 1 (default; preserves
+               //                    LK2 cycle 1 schemas unchanged).
+    Exec = 2,  // .exe executable — LK2 cycle 2 (closes D-LK2-1).
+    Dll  = 3,  // .dll dynamic library — anchored, not yet implemented.
+};
+
+inline constexpr EnumNameTable<PeObjectType, 3> kPeObjectTypeTable{{{
+    { PeObjectType::Obj,  "obj"  },
+    { PeObjectType::Exec, "exec" },
+    { PeObjectType::Dll,  "dll"  },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+peObjectTypeName(PeObjectType t) noexcept {
+    return kPeObjectTypeTable.name(t);
+}
+[[nodiscard]] constexpr std::optional<PeObjectType>
+peObjectTypeFromName(std::string_view s) noexcept {
+    return kPeObjectTypeTable.fromName(s);
+}
+
 struct DSS_EXPORT PeIdentity {
     std::uint16_t machine = 0;          // IMAGE_FILE_MACHINE_AMD64=0x8664
                                         // / I386=0x014C / ARM64=0xAA64
     std::uint16_t characteristics = 0;  // file-level flags; conventionally
                                         // 0 for relocatable .obj
+    PeObjectType  objectType = PeObjectType::Obj;
+};
+
+// ── PE32+ Optional Header (loaded only when PE objectType==Exec) ──
+//
+// Mirrors `IMAGE_OPTIONAL_HEADER64` (PE/COFF spec §3.4). Only the
+// load-bearing fields are declared — every field the Windows loader
+// requires for a minimal `.exe` is here; the deluxe data
+// directories (debug, security, etc.) are emitted as zero by the
+// walker (NumberOfRvaAndSizes=16, all entries zero — minimum
+// loadable image).
+//
+// Validate() requires all fields populated when objectType==Exec;
+// Obj rejects any non-zero field (config-error trap mirroring the
+// ELF ET_REL `virtualAddress=0` symmetry).
+struct DSS_EXPORT PeOptionalHeader {
+    std::uint16_t magic = 0;                // PE32+=0x20B / PE32=0x10B
+    std::uint64_t imageBase = 0;            // preferred load VA
+    std::uint32_t sectionAlignment = 0;     // virtual section align (≥ page)
+    std::uint32_t fileAlignment = 0;        // raw section align (512..64K)
+    std::uint16_t majorOperatingSystemVersion = 0;
+    std::uint16_t minorOperatingSystemVersion = 0;
+    std::uint16_t majorSubsystemVersion = 0;
+    std::uint16_t minorSubsystemVersion = 0;
+    std::uint16_t subsystem = 0;            // IMAGE_SUBSYSTEM_WINDOWS_CUI=3
+                                            // / WINDOWS_GUI=2
+    std::uint16_t dllCharacteristics = 0;   // DYNAMIC_BASE|HIGH_ENTROPY|NX_COMPAT
+    std::uint64_t sizeOfStackReserve = 0;
+    std::uint64_t sizeOfStackCommit = 0;
+    std::uint64_t sizeOfHeapReserve = 0;
+    std::uint64_t sizeOfHeapCommit = 0;
 };
 
 // ── Mach-O-specific identity block (loaded only when kind==MachO) ──
@@ -347,17 +409,87 @@ struct DSS_EXPORT PeIdentity {
 // (0xFEEDFACF) and not exposed on the schema — the substrate writes
 // it unconditionally for the 64-bit walker. `reserved` is zero by
 // definition.
+// Mach-O `mach_header_64.filetype` closed enum, mirroring
+// ElfObjectType / PeObjectType. Numeric values match
+// <mach-o/loader.h>'s MH_OBJECT / MH_EXECUTE / MH_DYLIB. The walker
+// supports the first two; Dylib is declared but rejected by
+// validate() until a future cycle ships the .dylib arm (anchored
+// at plan 14 §3.1 D-LK3-3).
+enum class MachOObjectType : std::uint32_t {
+    Object  = 1,   // MH_OBJECT  — relocatable .o
+    Execute = 2,   // MH_EXECUTE — executable image
+    Dylib   = 6,   // MH_DYLIB   — dynamic library (anchored D-LK3-3)
+};
+
+inline constexpr EnumNameTable<MachOObjectType, 3> kMachOObjectTypeTable{{{
+    { MachOObjectType::Object,  "object"  },
+    { MachOObjectType::Execute, "execute" },
+    { MachOObjectType::Dylib,   "dylib"   },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+machoObjectTypeName(MachOObjectType t) noexcept {
+    return kMachOObjectTypeTable.name(t);
+}
+[[nodiscard]] constexpr std::optional<MachOObjectType>
+machoObjectTypeFromName(std::string_view s) noexcept {
+    return kMachOObjectTypeTable.fromName(s);
+}
+
 struct DSS_EXPORT MachOIdentity {
     std::uint32_t cputype = 0;       // CPU_TYPE_X86_64=0x01000007
                                      // / CPU_TYPE_ARM64=0x0100000C
     std::uint32_t cpusubtype = 0;    // CPU_SUBTYPE_X86_64_ALL=3
                                      // / CPU_SUBTYPE_ARM64_ALL=0
-    std::uint32_t filetype = 0;      // MH_OBJECT=1 / MH_EXECUTE=2
-                                     // / MH_DYLIB=6. Substrate ships
-                                     // MH_OBJECT only this cycle.
+    MachOObjectType filetype = MachOObjectType::Object;
+                                     // LK3 cycle 1 ships MH_OBJECT;
+                                     // LK3 cycle 2 adds MH_EXECUTE
+                                     // (closes D-LK3-2). MH_DYLIB
+                                     // anchored at D-LK3-3.
     std::uint32_t flags = 0;         // MH_SUBSECTIONS_VIA_SYMBOLS=0x2000
-                                     // etc. Optional; 0 is legal for
-                                     // a minimal .o.
+                                     // / MH_PIE=0x200000 (mandatory for
+                                     //   modern macOS exec). Optional;
+                                     //   0 is legal for a minimal .o.
+};
+
+// ── Mach-O image block (loaded only when filetype==MH_EXECUTE) ──
+//
+// Carries the executable-only Mach-O identity fields. Mirrors LK1
+// cycle 2's universal pattern (`virtualAddress` on sections,
+// `entryPoint` on top-level schema) plus Mach-O-specific load
+// commands the walker emits: LC_LOAD_DYLINKER (the dynamic linker
+// path — `/usr/lib/dyld` on macOS) and LC_LOAD_DYLIB (each
+// declared library the executable needs at load time — libSystem
+// at minimum for any process that calls libc/exit).
+//
+// `pageZeroSize` is the size of the __PAGEZERO segment: a zero-
+// protection segment placed at vmaddr=0 of size 0x100000000 (4 GiB)
+// on x86_64-darwin / ARM64-darwin. Catches null-pointer derefs
+// at the kernel level — the loader rejects MH_EXECUTE without one.
+// Declared as a schema field rather than hardcoded because ARM64
+// configurations / debug builds may shrink it.
+//
+// validate() requires `pageZeroSize > 0`, non-empty `dylinkerPath`,
+// and at least one `loadDylibs` entry when filetype==MH_EXECUTE.
+//
+// `loadDylibs` is a `vector<MachODylibRef>` (row type), NOT a
+// `vector<string>` — `dylib_command` on the wire has three trailing
+// version u32 fields (timestamp, current_version, compatibility_
+// version) that the walker writes as zero today but future cycles
+// will populate. A row type avoids the parallel-vector anti-pattern
+// (type-design O3 fold-in, LK2 cycle 2 + LK3 cycle 2 review).
+struct DSS_EXPORT MachODylibRef {
+    std::string path;
+    // Reserved (zero today; populated when first consumer needs):
+    //   std::uint32_t timestamp = 0;
+    //   std::uint32_t currentVersion = 0;
+    //   std::uint32_t compatibilityVersion = 0;
+};
+
+struct DSS_EXPORT MachOImage {
+    std::uint64_t pageZeroSize = 0;        // __PAGEZERO vmsize
+    std::string   dylinkerPath;            // LC_LOAD_DYLINKER name
+    std::vector<MachODylibRef> loadDylibs; // each → LC_LOAD_DYLIB
 };
 
 namespace detail {
@@ -385,9 +517,13 @@ struct DSS_EXPORT ObjectFormatData {
     // `kind` matches; otherwise zero-defaulted. The walker reads
     // its arm from JSON; validate() enforces the per-kind
     // populated-ness rule.
-    ElfIdentity   elf{};
-    PeIdentity    pe{};
-    MachOIdentity macho{};
+    ElfIdentity      elf{};
+    PeIdentity       pe{};
+    PeOptionalHeader peOptionalHeader{};  // populated only when
+                                           //   pe.objectType != Obj
+    MachOIdentity    macho{};
+    MachOImage       machoImage{};        // populated only when
+                                           //   macho.filetype == MH_EXECUTE
 
     // ── Image-side fields (LK1 cycle 2+) ─────────────────────
     //
@@ -469,9 +605,11 @@ public:
     // Per-format identity accessors — each is populated only when
     // `kind()` matches that arm. Walker reads the relevant block
     // when it runs.
-    [[nodiscard]] ElfIdentity   const& elf()   const noexcept { return d_.elf; }
-    [[nodiscard]] PeIdentity    const& pe()    const noexcept { return d_.pe; }
-    [[nodiscard]] MachOIdentity const& macho() const noexcept { return d_.macho; }
+    [[nodiscard]] ElfIdentity      const& elf()              const noexcept { return d_.elf; }
+    [[nodiscard]] PeIdentity       const& pe()               const noexcept { return d_.pe; }
+    [[nodiscard]] PeOptionalHeader const& peOptionalHeader() const noexcept { return d_.peOptionalHeader; }
+    [[nodiscard]] MachOIdentity    const& macho()            const noexcept { return d_.macho; }
+    [[nodiscard]] MachOImage       const& machoImage()       const noexcept { return d_.machoImage; }
 
     // Image-side entry-point symbol name. Empty for relocatable
     // artifacts; non-empty for executables. The format walker

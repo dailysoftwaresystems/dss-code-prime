@@ -243,20 +243,154 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "sh_flags)",
                                  sections[i].name));
             }
-            // PE derives runtime virtual addresses from ImageBase +
-            // RVA in its IMAGE_OPTIONAL_HEADER (cycle-2 PE32+ path).
-            // The substrate `virtualAddress` field is meaningless
-            // for PE rows; reject explicitly so a future PE-row
-            // edit can't silently no-op (LK1-cycle-2 invariant).
-            if (sections[i].virtualAddress != 0) {
+            // PE virtualAddress semantics depend on objectType:
+            //   * Obj (.obj relocatable): must be 0 — the linker
+            //     binds section VAs at exec build time.
+            //   * Exec/Dll (PE32+ image): non-zero declares the
+            //     section's RVA (Relative Virtual Address — the
+            //     OFFSET from ImageBase, NOT the absolute VA). PE
+            //     stores `virtualAddress` field as the RVA in
+            //     IMAGE_SECTION_HEADER; the kernel maps
+            //     `ImageBase + RVA` at load time.
+            if (pe.objectType == PeObjectType::Obj
+             && sections[i].virtualAddress != 0) {
                 fail(std::format("/sections/{}/virtualAddress", i),
                      std::format("section '{}': 'virtualAddress' must "
-                                 "be 0 for PE format rows (PE derives "
-                                 "section VAs from "
-                                 "IMAGE_OPTIONAL_HEADER.ImageBase + "
-                                 "section RVA at link time, not from "
-                                 "the substrate field)",
+                                 "be 0 for PE .obj (relocatable) format "
+                                 "rows. .obj does NOT carry RVAs — the "
+                                 "linker binds VAs at exec build time. "
+                                 "For PE32+ executable images, set "
+                                 "pe.type = 'exec' and declare RVAs "
+                                 "explicitly.",
                                  sections[i].name));
+            }
+            if (pe.objectType != PeObjectType::Obj
+             && sections[i].kind == SectionKind::Text
+             && sections[i].virtualAddress == 0) {
+                fail(std::format("/sections/{}/virtualAddress", i),
+                     std::format("section '{}': PE32+ {} image requires "
+                                 "non-zero 'virtualAddress' (the RVA of "
+                                 ".text — typical 0x1000 for a minimal "
+                                 ".exe, immediately after the headers in "
+                                 "the first 4 KB page).",
+                                 sections[i].name,
+                                 std::string{peObjectTypeName(pe.objectType)}));
+            }
+            // PE/COFF §3.4: section RVAs must be multiples of
+            // SectionAlignment. The Windows loader silently rejects
+            // images whose section RVAs straddle alignment
+            // boundaries — surface at validate() time. (silent-
+            // failure C3 + code-reviewer C3 convergence)
+            if (pe.objectType != PeObjectType::Obj
+             && peOptionalHeader.sectionAlignment != 0
+             && sections[i].virtualAddress != 0
+             && sections[i].virtualAddress
+                    % peOptionalHeader.sectionAlignment != 0) {
+                fail(std::format("/sections/{}/virtualAddress", i),
+                     std::format("section '{}': PE32+ image section "
+                                 "'virtualAddress' (0x{:x}) must be a "
+                                 "multiple of 'sectionAlignment' "
+                                 "(0x{:x}) per PE/COFF §3.4.",
+                                 sections[i].name,
+                                 sections[i].virtualAddress,
+                                 peOptionalHeader.sectionAlignment));
+            }
+        }
+    }
+
+    // PE32+ optional header rules. Mirrors the ELF ET_REL/ET_EXEC
+    // symmetry on virtualAddress: a PE .obj must NOT declare an
+    // optional header (validate-reject any non-zero magic — the
+    // walker writes 0 for SizeOfOptionalHeader on .obj); a PE
+    // Exec/Dll image MUST declare every load-bearing field (Magic,
+    // ImageBase, alignments, subsystem, stack/heap sizes).
+    if (kind == ObjectFormatKind::Pe) {
+        auto const& oh = peOptionalHeader;
+        bool const isObj = pe.objectType == PeObjectType::Obj;
+        if (isObj) {
+            bool const anySet = oh.magic != 0 || oh.imageBase != 0
+                || oh.sectionAlignment != 0 || oh.fileAlignment != 0
+                || oh.subsystem != 0 || oh.sizeOfStackReserve != 0
+                || oh.sizeOfStackCommit != 0 || oh.sizeOfHeapReserve != 0
+                || oh.sizeOfHeapCommit != 0 || oh.dllCharacteristics != 0;
+            if (anySet) {
+                fail("/optionalHeader",
+                     "PE .obj (relocatable) format must NOT declare an "
+                     "'optionalHeader' — the optional header lives only "
+                     "in PE32+ executable images (.exe / .dll). Set "
+                     "pe.type = 'exec' if this schema describes an "
+                     "executable.");
+            }
+        } else {
+            // Exec/Dll: every load-bearing field must be set.
+            if (oh.magic != 0x10B && oh.magic != 0x20B) {
+                fail("/optionalHeader/magic",
+                     "PE32+ optional header 'magic' must be 0x20B "
+                     "(PE32+) or 0x10B (PE32). v1 ships PE32+ on "
+                     "x86_64-windows.");
+            }
+            if (oh.imageBase == 0) {
+                fail("/optionalHeader/imageBase",
+                     "PE32+ image requires non-zero 'imageBase' "
+                     "(preferred load address; typical 0x140000000 for "
+                     ".exe, 0x180000000 for .dll).");
+            }
+            // sectionAlignment / fileAlignment: power-of-two, and
+            // sectionAlignment >= fileAlignment (PE/COFF §3.4).
+            auto const isPow2 = [](std::uint64_t v) noexcept {
+                return v > 0 && (v & (v - 1)) == 0;
+            };
+            if (!isPow2(oh.sectionAlignment)) {
+                fail("/optionalHeader/sectionAlignment",
+                     "PE32+ 'sectionAlignment' must be a positive "
+                     "power-of-two (typical 4096 = 0x1000 — page size).");
+            }
+            // PE/COFF §3.4: sectionAlignment >= page size (4096 on
+            // x86_64). The Windows loader rejects sub-page section
+            // alignment with STATUS_INVALID_IMAGE_FORMAT. ARM64-
+            // Windows uses 4 KB pages too; this constant is uniform
+            // for current Windows targets (silent-failure C3 + code-
+            // reviewer C3 convergence).
+            if (oh.sectionAlignment != 0 && oh.sectionAlignment < 4096u) {
+                fail("/optionalHeader/sectionAlignment",
+                     std::format("PE32+ 'sectionAlignment' ({}) must "
+                                 "be >= 4096 (page size). Windows "
+                                 "loader rejects sub-page alignment "
+                                 "with STATUS_INVALID_IMAGE_FORMAT.",
+                                 oh.sectionAlignment));
+            }
+            if (!isPow2(oh.fileAlignment)) {
+                fail("/optionalHeader/fileAlignment",
+                     "PE32+ 'fileAlignment' must be a positive "
+                     "power-of-two in [512, 65536] per PE/COFF §3.4 "
+                     "(typical 512 = 0x200).");
+            }
+            if (oh.fileAlignment != 0
+             && (oh.fileAlignment < 512 || oh.fileAlignment > 65536)) {
+                fail("/optionalHeader/fileAlignment",
+                     std::format("PE32+ 'fileAlignment' ({}) must be in "
+                                 "[512, 65536] per PE/COFF §3.4.",
+                                 oh.fileAlignment));
+            }
+            if (oh.sectionAlignment != 0 && oh.fileAlignment != 0
+             && oh.sectionAlignment < oh.fileAlignment) {
+                fail("/optionalHeader/sectionAlignment",
+                     std::format("PE32+ requires sectionAlignment ({}) "
+                                 ">= fileAlignment ({}) per spec §3.4.",
+                                 oh.sectionAlignment, oh.fileAlignment));
+            }
+            if (oh.subsystem == 0) {
+                fail("/optionalHeader/subsystem",
+                     "PE32+ image requires non-zero 'subsystem' "
+                     "(IMAGE_SUBSYSTEM_WINDOWS_CUI=3 / WINDOWS_GUI=2).");
+            }
+            if (oh.sizeOfStackReserve == 0 || oh.sizeOfStackCommit == 0
+             || oh.sizeOfHeapReserve == 0 || oh.sizeOfHeapCommit == 0) {
+                fail("/optionalHeader",
+                     "PE32+ image requires non-zero "
+                     "sizeOfStackReserve / sizeOfStackCommit / "
+                     "sizeOfHeapReserve / sizeOfHeapCommit (typical "
+                     "0x100000 reserve / 0x1000 commit).");
             }
         }
     }
@@ -274,10 +408,20 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "value, e.g. 0x01000007 for x86_64, 0x0100000C for "
                  "arm64)");
         }
-        if (macho.filetype == 0) {
+        // LK3 cycle 1 + cycle 2 walker arms support MH_OBJECT (1)
+        // and MH_EXECUTE (2). MH_DYLIB (6) is declared on the closed
+        // enum but rejected at validate() until D-LK3-3 closes
+        // (paired with LK6 dynamic linking, same shape as ELF
+        // ET_DYN's D-LK1-4 anchor).
+        if (macho.filetype != MachOObjectType::Object
+         && macho.filetype != MachOObjectType::Execute) {
             fail("/macho/filetype",
-                 "Mach-O format requires 'macho.filetype' (MH_OBJECT=1 "
-                 "for relocatable .o; cycle 1 ships MH_OBJECT only)");
+                 std::format("Mach-O 'macho.filetype' = '{}' not yet "
+                             "supported by the walker; cycles 1+2 ship "
+                             "MH_OBJECT and MH_EXECUTE. MH_DYLIB is "
+                             "anchored at plan 14 §3.1 D-LK3-3 paired "
+                             "with LK6 dynamic linking.",
+                             std::string{machoObjectTypeName(macho.filetype)}));
         }
         for (std::size_t i = 0; i < sections.size(); ++i) {
             auto const& s = sections[i];
@@ -309,13 +453,14 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             // MH_EXECUTE will use virtualAddress; that arm lands at
             // D-LK3-2. For cycle 1 (filetype == MH_OBJECT), reject
             // non-zero virtualAddress to prevent silent drift.
-            if (macho.filetype == 1 && s.virtualAddress != 0) {
+            if (macho.filetype == MachOObjectType::Object
+             && s.virtualAddress != 0) {
                 fail(std::format("/sections/{}/virtualAddress", i),
                      std::format("section '{}': 'virtualAddress' must "
                                  "be 0 for Mach-O MH_OBJECT rows "
                                  "(section_64.addr in relocatable .o "
-                                 "is 0; exec-image VAs land at "
-                                 "D-LK3-2)",
+                                 "is 0; MH_EXECUTE rows declare VAs "
+                                 "explicitly — LK3 cycle 2)",
                                  s.name));
             }
         }
@@ -342,6 +487,75 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  r.name, r.nativeId));
             }
         }
+        // MH_EXECUTE / MH_DYLIB image rules. The walker emits
+        // LC_LOAD_DYLINKER (the dynamic linker path) and
+        // LC_LOAD_DYLIB (each library the image needs at load
+        // time). __PAGEZERO segment vmsize comes from
+        // machoImage.pageZeroSize. All three are mandatory for
+        // any loadable Mach-O image — the loader rejects the
+        // binary at exec time if they're missing or zero. Reject
+        // at load time instead.
+        auto const& mi = machoImage;
+        bool const isObj = macho.filetype == MachOObjectType::Object;
+        if (isObj) {
+            bool const anySet = mi.pageZeroSize != 0
+                || !mi.dylinkerPath.empty()
+                || !mi.loadDylibs.empty();
+            if (anySet) {
+                fail("/image",
+                     "Mach-O MH_OBJECT format must NOT declare an "
+                     "'image' block — pageZeroSize / dylinkerPath / "
+                     "loadDylibs live only in MH_EXECUTE / MH_DYLIB "
+                     "images. Set macho.filetype = 2 (MH_EXECUTE) if "
+                     "this schema describes an executable.");
+            }
+        } else if (macho.filetype == MachOObjectType::Execute) {
+            if (mi.pageZeroSize == 0) {
+                fail("/image/pageZeroSize",
+                     "Mach-O MH_EXECUTE image requires non-zero "
+                     "'image.pageZeroSize' (__PAGEZERO segment vmsize "
+                     "— typical 0x100000000 = 4 GiB on x86_64/ARM64 "
+                     "darwin; catches null-pointer derefs at the "
+                     "kernel level).");
+            }
+            if (mi.dylinkerPath.empty()) {
+                fail("/image/dylinkerPath",
+                     "Mach-O MH_EXECUTE image requires non-empty "
+                     "'image.dylinkerPath' (LC_LOAD_DYLINKER — "
+                     "typical '/usr/lib/dyld' on macOS).");
+            }
+            if (mi.loadDylibs.empty()) {
+                fail("/image/loadDylibs",
+                     "Mach-O MH_EXECUTE image requires at least one "
+                     "'image.loadDylibs' entry (typical "
+                     "'/usr/lib/libSystem.B.dylib' — libc / process "
+                     "start function provider).");
+            }
+            for (std::size_t i = 0; i < mi.loadDylibs.size(); ++i) {
+                if (mi.loadDylibs[i].path.empty()) {
+                    fail(std::format("/image/loadDylibs/{}/path", i),
+                         "loadDylibs entries must declare a non-empty "
+                         "path");
+                }
+            }
+            // __TEXT segment must sit at or above __PAGEZERO's end —
+            // otherwise the walker's `sectionVa - pageZeroSize`
+            // subtraction underflows silently to ~2^64 and the
+            // emitted segment vmsize wraps (silent-failure H4 + code-
+            // reviewer C2 convergence).
+            for (auto const& s : sections) {
+                if (s.kind == SectionKind::Text
+                 && s.virtualAddress < mi.pageZeroSize) {
+                    fail("/sections/<text>/virtualAddress",
+                         std::format("Mach-O MH_EXECUTE: __text "
+                                     "virtualAddress 0x{:x} is below "
+                                     "__PAGEZERO end 0x{:x} (pageZeroSize) "
+                                     "— __TEXT would overlap __PAGEZERO; "
+                                     "loader rejects.",
+                                     s.virtualAddress, mi.pageZeroSize));
+                }
+            }
+        }
     }
 
     // ELF + PE sections must NOT carry a segment name (the field is
@@ -364,18 +578,16 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     //   format declares "executable mode" ⟺ a Text-section row
     //   declares a non-zero virtualAddress (where to load it).
     // `entryPoint` is independent (empty defaults to functions[0];
-    // non-empty resolves by name) — NOT cross-tied here. This
-    // terminal pass survives PE PE32+ (D-LK2-1) and Mach-O
-    // MH_EXECUTE (D-LK3-2) landing — those cycles add their flavor
-    // markers to `isExecFlavor` below.
+    // non-empty resolves by name) — NOT cross-tied here. All three
+    // image arms (ELF ET_EXEC, PE PE32+ Exec/Dll, Mach-O MH_EXECUTE)
+    // inherit this gate uniformly.
     bool const isExecFlavor =
         (kind == ObjectFormatKind::Elf
          && elf.objectType == ElfObjectType::Exec)
-        // D-LK2-1: || (kind == ObjectFormatKind::Pe
-        //               && pe.optionalHeader.has_value())
-        // D-LK3-2: || (kind == ObjectFormatKind::MachO
-        //               && macho.filetype == MH_EXECUTE)
-        ;
+     || (kind == ObjectFormatKind::Pe
+         && pe.objectType != PeObjectType::Obj)
+     || (kind == ObjectFormatKind::MachO
+         && macho.filetype == MachOObjectType::Execute);
     if (isExecFlavor) {
         // Walker requires Text + virtualAddress != 0 to compute
         // e_entry / p_vaddr / IMAGE_OPTIONAL_HEADER.ImageBase. The

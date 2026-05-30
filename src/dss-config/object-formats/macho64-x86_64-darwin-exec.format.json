@@ -1,0 +1,64 @@
+{
+  "$comment": "Mach-O EXECUTABLE (MH_EXECUTE) for x86_64 Darwin/macOS. Second Mach-O schema (plan 14 LK3 cycle 2, 2026-05-30). Consumed by `src/link/format/macho.cpp` via the format-blind linker engine. Differs from `macho64-x86_64-darwin.format.json` (the MH_OBJECT schema) in: `macho.filetype = 2` (MH_EXECUTE); `macho.flags` includes MH_PIE (0x200000) + MH_NOUNDEFS (0x1) + MH_DYLDLINK (0x4) + MH_TWOLEVEL (0x80) = 0x200085 (modern macOS exec convention); sections carry `virtualAddress` (loaded at ImageBase + offset); top-level `entryPoint` names the LC_MAIN entry-function symbol; new `image` block carries __PAGEZERO size + LC_LOAD_DYLINKER path + LC_LOAD_DYLIB list.",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "macho64-x86_64-darwin-exec",
+    "version": "1.0",
+    "kind": "macho"
+  },
+
+  "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start, NOT to file offset.",
+  "entryPoint": "",
+
+  "macho": {
+    "$comment": "mach_header_64 identity. cputype = CPU_TYPE_X86_64 (0x01000007). cpusubtype = CPU_SUBTYPE_X86_64_ALL (3). filetype = 'execute' (MH_EXECUTE, closed enum). flags = MH_NOUNDEFS (0x1) | MH_DYLDLINK (0x4) | MH_TWOLEVEL (0x80) | MH_PIE (0x200000) = 0x200085 — modern macOS exec convention: no unresolved symbols at link time, uses dyld, two-level namespace lookup, position-independent.",
+    "cputype": 16777223,
+    "cpusubtype": 3,
+    "filetype": "execute",
+    "flags": 2097285
+  },
+
+  "image": {
+    "$comment": "Mach-O image fields for MH_EXECUTE. pageZeroSize = 0x100000000 (4 GiB) — the __PAGEZERO segment placed at vmaddr=0 catches null-pointer derefs at the kernel level. dylinkerPath = '/usr/lib/dyld' — the dynamic linker macOS always uses. loadDylibs = ['/usr/lib/libSystem.B.dylib'] — required for any user-space process (provides start function + libc + Mach traps). Future cycles add Foundation / AppKit / etc. as needed.",
+    "pageZeroSize": 4294967296,
+    "dylinkerPath": "/usr/lib/dyld",
+    "loadDylibs": [
+      "/usr/lib/libSystem.B.dylib"
+    ]
+  },
+
+  "sections": [
+    {
+      "$comment": "__text within __TEXT segment. virtualAddress = 0x100000000 + 0x1000 = 0x100001000 — __TEXT loads immediately after __PAGEZERO at the page boundary. flags (in substrate `type` field) = S_REGULAR (0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign = 16 (x86_64 instruction alignment).",
+      "kind": "text",
+      "name": "__text",
+      "segment": "__TEXT",
+      "type": 2147484672,
+      "flags": 0,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 4294971392
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "Mach-O image-side relocs reuse the same kinds as the .o schema (BRANCH/UNSIGNED_8/UNSIGNED_4). cycle-2 walker applies intra-module relocs in-place via the LK6 cycle 1 structured-formula triple; the relocation_info records are NOT emitted for MH_EXECUTE (dyld doesn't read .o-style relocs — it reads LC_DYLD_INFO chained-fixups, which arrive at LK6 cycle 2 paired with FFI). nativeId packs (type<<28)|(length<<25)|(pcrel<<24) — same as the .o schema. r_extern (bit 27) + r_symbolnum (bits 0..23) are walker-filled.",
+      "name": "X86_64_RELOC_BRANCH",
+      "kind": 1,
+      "nativeId": 369098752
+    },
+    {
+      "name": "X86_64_RELOC_UNSIGNED_8",
+      "kind": 2,
+      "nativeId": 100663296
+    },
+    {
+      "name": "X86_64_RELOC_UNSIGNED_4",
+      "kind": 3,
+      "nativeId": 33554432
+    }
+  ]
+}

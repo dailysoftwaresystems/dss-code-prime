@@ -362,6 +362,110 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             };
             readU16("machine", data.pe.machine, 0xFFFF);
             readU16("characteristics", data.pe.characteristics, 0xFFFF);
+            // `type`: closed-enum PeObjectType (obj/exec/dll).
+            // Default Obj keeps LK2 cycle 1 schemas unchanged.
+            if (p.contains("type") && p.at("type").is_string()) {
+                auto const tName = p.at("type").get<std::string>();
+                auto const tEnum = peObjectTypeFromName(tName);
+                if (tEnum.has_value()) {
+                    data.pe.objectType = *tEnum;
+                } else {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/pe/type",
+                              "'type' must be 'obj' / 'exec' / 'dll'");
+                }
+            }
+        }
+    }
+
+    // PE32+ Optional Header — read only when PE objectType != Obj.
+    // The walker emits the optional header for Exec/Dll; Obj schemas
+    // never carry it, and validate() rejects an `optionalHeader` key
+    // on an Obj schema as a load-time config error (symmetric with
+    // ELF ET_REL's virtualAddress=0 rejection).
+    if (data.kind == ObjectFormatKind::Pe && doc.contains("optionalHeader")) {
+        auto const& oh = doc.at("optionalHeader");
+        if (!oh.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/optionalHeader",
+                      "'optionalHeader' must be an object");
+        } else {
+            auto readU16 = [&](char const* field, std::uint16_t& out) {
+                if (!oh.contains(field)) return;
+                if (!oh.at(field).is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/optionalHeader/{}", field),
+                              std::format("'{}' must be an integer", field));
+                    return;
+                }
+                std::int64_t const v = oh.at(field).get<std::int64_t>();
+                if (v < 0 || v > 0xFFFF) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/optionalHeader/{}", field),
+                              std::format("'{}' ({}) out of u16 range",
+                                          field, v));
+                    return;
+                }
+                out = static_cast<std::uint16_t>(v);
+            };
+            auto readU32 = [&](char const* field, std::uint32_t& out) {
+                if (!oh.contains(field)) return;
+                if (!oh.at(field).is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/optionalHeader/{}", field),
+                              std::format("'{}' must be an integer", field));
+                    return;
+                }
+                std::int64_t const v = oh.at(field).get<std::int64_t>();
+                if (v < 0 || v > 0xFFFFFFFFLL) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/optionalHeader/{}", field),
+                              std::format("'{}' ({}) out of u32 range",
+                                          field, v));
+                    return;
+                }
+                out = static_cast<std::uint32_t>(v);
+            };
+            auto readU64 = [&](char const* field, std::uint64_t& out) {
+                if (!oh.contains(field)) return;
+                if (!oh.at(field).is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/optionalHeader/{}", field),
+                              std::format("'{}' must be an integer", field));
+                    return;
+                }
+                std::int64_t const v = oh.at(field).get<std::int64_t>();
+                if (v < 0) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/optionalHeader/{}", field),
+                              std::format("'{}' ({}) must be non-negative",
+                                          field, v));
+                    return;
+                }
+                out = static_cast<std::uint64_t>(v);
+            };
+            readU16("magic", data.peOptionalHeader.magic);
+            readU64("imageBase", data.peOptionalHeader.imageBase);
+            readU32("sectionAlignment",
+                    data.peOptionalHeader.sectionAlignment);
+            readU32("fileAlignment", data.peOptionalHeader.fileAlignment);
+            readU16("majorOperatingSystemVersion",
+                    data.peOptionalHeader.majorOperatingSystemVersion);
+            readU16("minorOperatingSystemVersion",
+                    data.peOptionalHeader.minorOperatingSystemVersion);
+            readU16("majorSubsystemVersion",
+                    data.peOptionalHeader.majorSubsystemVersion);
+            readU16("minorSubsystemVersion",
+                    data.peOptionalHeader.minorSubsystemVersion);
+            readU16("subsystem", data.peOptionalHeader.subsystem);
+            readU16("dllCharacteristics",
+                    data.peOptionalHeader.dllCharacteristics);
+            readU64("sizeOfStackReserve",
+                    data.peOptionalHeader.sizeOfStackReserve);
+            readU64("sizeOfStackCommit",
+                    data.peOptionalHeader.sizeOfStackCommit);
+            readU64("sizeOfHeapReserve",
+                    data.peOptionalHeader.sizeOfHeapReserve);
+            readU64("sizeOfHeapCommit",
+                    data.peOptionalHeader.sizeOfHeapCommit);
         }
     }
 
@@ -388,8 +492,110 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             };
             readU32("cputype",    data.macho.cputype);
             readU32("cpusubtype", data.macho.cpusubtype);
-            readU32("filetype",   data.macho.filetype);
             readU32("flags",      data.macho.flags);
+            // `filetype`: closed enum MachOObjectType. Accepts the
+            // string form ("object"/"execute"/"dylib") OR the
+            // integer wire value (1/2/6) for back-compat with
+            // pre-enum shipped JSONs. Unknown values fail loud.
+            if (m.contains("filetype")) {
+                auto const& ft = m.at("filetype");
+                if (ft.is_string()) {
+                    auto const tEnum = machoObjectTypeFromName(
+                        ft.get<std::string>());
+                    if (tEnum.has_value()) {
+                        data.macho.filetype = *tEnum;
+                    } else {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/macho/filetype",
+                                  "'filetype' must be 'object' / "
+                                  "'execute' / 'dylib'");
+                    }
+                } else if (ft.is_number_integer()) {
+                    std::int64_t const v = ft.get<std::int64_t>();
+                    if (v == 1) data.macho.filetype = MachOObjectType::Object;
+                    else if (v == 2) data.macho.filetype = MachOObjectType::Execute;
+                    else if (v == 6) data.macho.filetype = MachOObjectType::Dylib;
+                    else {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/macho/filetype",
+                                  std::format("'filetype' integer {} "
+                                              "not in {{1,2,6}}", v));
+                    }
+                } else {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/macho/filetype",
+                              "'filetype' must be a string or integer");
+                }
+            }
+        }
+    }
+
+    // Mach-O image block — read only when format kind is MachO and
+    // an `image` key is present. Validate() will reject the key on
+    // a MH_OBJECT schema, and require its full population for
+    // MH_EXECUTE (symmetric with PE's optionalHeader gate).
+    if (data.kind == ObjectFormatKind::MachO && doc.contains("image")) {
+        auto const& im = doc.at("image");
+        if (!im.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/image",
+                      "'image' must be an object");
+        } else {
+            if (im.contains("pageZeroSize")) {
+                if (!im.at("pageZeroSize").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/pageZeroSize",
+                              "'pageZeroSize' must be an integer");
+                } else {
+                    std::int64_t const v =
+                        im.at("pageZeroSize").get<std::int64_t>();
+                    if (v < 0) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/pageZeroSize",
+                                  "'pageZeroSize' must be non-negative");
+                    } else {
+                        data.machoImage.pageZeroSize =
+                            static_cast<std::uint64_t>(v);
+                    }
+                }
+            }
+            if (im.contains("dylinkerPath")) {
+                if (!im.at("dylinkerPath").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/dylinkerPath",
+                              "'dylinkerPath' must be a string");
+                } else {
+                    data.machoImage.dylinkerPath =
+                        im.at("dylinkerPath").get<std::string>();
+                }
+            }
+            if (im.contains("loadDylibs")) {
+                if (!im.at("loadDylibs").is_array()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/loadDylibs",
+                              "'loadDylibs' must be an array — each "
+                              "entry is either a bare string (path "
+                              "sugar) or an object {path: ...}");
+                } else {
+                    auto const& arr = im.at("loadDylibs");
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        if (arr[i].is_string()) {
+                            data.machoImage.loadDylibs.push_back(
+                                MachODylibRef{arr[i].get<std::string>()});
+                        } else if (arr[i].is_object()
+                                && arr[i].contains("path")
+                                && arr[i].at("path").is_string()) {
+                            data.machoImage.loadDylibs.push_back(
+                                MachODylibRef{arr[i].at("path")
+                                                  .get<std::string>()});
+                        } else {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("/image/loadDylibs/{}", i),
+                                      "each loadDylibs entry must be a "
+                                      "string or an object with 'path'");
+                        }
+                    }
+                }
+            }
         }
     }
 

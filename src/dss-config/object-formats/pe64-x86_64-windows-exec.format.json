@@ -1,0 +1,71 @@
+{
+  "$comment": "PE/COFF EXECUTABLE (PE32+) for x86_64 Windows. Second PE schema (plan 14 LK2 cycle 2, 2026-05-30). Consumed by `src/link/format/pe.cpp` via the format-blind linker engine. Differs from `pe64-x86_64-windows.format.json` (the .obj schema) in: `pe.type = exec`; sections carry `virtualAddress` (interpreted as RVA — offset from ImageBase); top-level `entryPoint` names the entry symbol (resolved against AssembledModule at link time); new `optionalHeader` block populated with IMAGE_OPTIONAL_HEADER64 fields. ImageBase = 0x140000000 (Windows x86_64 .exe convention per the MSVC linker default). Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI (3) — console subsystem; GUI exe would set 2. SectionAlignment = 0x1000 (4 KB page); FileAlignment = 0x200 (512 bytes, MSVC default).",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "pe64-x86_64-windows-exec",
+    "version": "1.0",
+    "kind": "pe"
+  },
+
+  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention — same as LK1 ELF ET_EXEC). Real-name resolution closes with D-LK1-1 (HIR→LIR symbol-name thread).",
+  "entryPoint": "",
+
+  "pe": {
+    "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = IMAGE_FILE_EXECUTABLE_IMAGE (0x0002) | IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) = 0x0022. type = exec.",
+    "machine": 34404,
+    "characteristics": 34,
+    "type": "exec"
+  },
+
+  "optionalHeader": {
+    "$comment": "IMAGE_OPTIONAL_HEADER64 (PE/COFF spec §3.4). magic = PE32+ (0x20B). imageBase = 0x140000000 (Windows x86_64 .exe default per MSVC). sectionAlignment = 0x1000 (4 KB virtual). fileAlignment = 0x200 (512 raw). subsystem = WINDOWS_CUI (3). dllCharacteristics = HIGH_ENTROPY_VA (0x0020) | DYNAMIC_BASE (0x0040) | NX_COMPAT (0x0100) | TERMINAL_SERVER_AWARE (0x8000) = 0x8160 (ASLR + DEP enabled). Stack/heap reserve = 1 MiB; commit = 4 KiB (MSVC defaults). OS/Subsystem versions = 6.0 (Windows Vista — minimum modern target).",
+    "magic": 523,
+    "imageBase": 5368709120,
+    "sectionAlignment": 4096,
+    "fileAlignment": 512,
+    "majorOperatingSystemVersion": 6,
+    "minorOperatingSystemVersion": 0,
+    "majorSubsystemVersion": 6,
+    "minorSubsystemVersion": 0,
+    "subsystem": 3,
+    "dllCharacteristics": 33120,
+    "sizeOfStackReserve": 1048576,
+    "sizeOfStackCommit": 4096,
+    "sizeOfHeapReserve": 1048576,
+    "sizeOfHeapCommit": 4096
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code section. virtualAddress = 0x1000 — first page after the headers (which occupy [0, sectionAlignment) inside the ImageBase mapping). Characteristics = IMAGE_SCN_CNT_CODE (0x00000020) | IMAGE_SCN_MEM_EXECUTE (0x20000000) | IMAGE_SCN_MEM_READ (0x40000000) | IMAGE_SCN_ALIGN_16BYTES (0x00500000) = 0x60500020. Same value as the .obj schema's `.text` Characteristics (alignment + read/execute) — the PE32+ image just adds the RVA via the substrate `virtualAddress` field.",
+      "kind": "text",
+      "name": ".text",
+      "type": 1616904224,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 4096
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "PE32+ image-side relocations: same kinds as the .obj schema. cycle-2 walker applies intra-module relocs in-place via the LK6 cycle 1 structured-formula triple (closes D-LK1-3-equivalent for PE). REL32 is PC-relative 32-bit; ADDR64/ADDR32 are absolute. PE32+ doesn't emit the .reloc base relocation section unless the image is rebased; ASLR-aware images that don't need rebase ship without it (cycle scope).",
+      "name": "IMAGE_REL_AMD64_REL32",
+      "kind": 1,
+      "nativeId": 4
+    },
+    {
+      "name": "IMAGE_REL_AMD64_ADDR64",
+      "kind": 2,
+      "nativeId": 1
+    },
+    {
+      "name": "IMAGE_REL_AMD64_ADDR32",
+      "kind": 3,
+      "nativeId": 2
+    }
+  ]
+}

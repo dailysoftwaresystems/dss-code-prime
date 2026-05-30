@@ -30,6 +30,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -105,7 +106,7 @@ TEST(MachOFormatJson, ShippedFileLoadsCleanly) {
     EXPECT_EQ(loaded.format->name(), "macho64-x86_64-darwin");
     EXPECT_EQ(loaded.format->macho().cputype, 0x01000007u);
     EXPECT_EQ(loaded.format->macho().cpusubtype, 3u);
-    EXPECT_EQ(loaded.format->macho().filetype, 1u);
+    EXPECT_TRUE(loaded.format->macho().filetype == MachOObjectType::Object);
     auto const* textRow = loaded.format->sectionByKind(SectionKind::Text);
     ASSERT_NE(textRow, nullptr);
     EXPECT_EQ(textRow->name, "__text");
@@ -426,4 +427,308 @@ TEST(LinkerEndToEnd, MachODispatchProducesNonEmptyBytes) {
     EXPECT_EQ(image.bytes[1], 0xFAu);
     EXPECT_EQ(image.bytes[2], 0xEDu);
     EXPECT_EQ(image.bytes[3], 0xFEu);
+}
+
+// ── LK3 cycle 2: MH_EXECUTE writer ────────────────────────────
+
+namespace {
+[[nodiscard]] Loaded loadShippedExec() {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("x86_64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(x86_64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.target = std::move(t).value();
+    }
+    auto f = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    if (!f.has_value()) {
+        ADD_FAILURE() << "loadShipped(macho64-x86_64-darwin-exec) failed";
+        for (auto const& d : f.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.format = std::move(f).value();
+    }
+    return out;
+}
+} // namespace
+
+TEST(MachOExecFormatJson, ShippedFileLoadsCleanly) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    EXPECT_EQ(loaded.format->kind(), ObjectFormatKind::MachO);
+    EXPECT_TRUE(loaded.format->macho().filetype == MachOObjectType::Execute);
+    auto const& im = loaded.format->machoImage();
+    EXPECT_EQ(im.pageZeroSize, 0x100000000ull);
+    EXPECT_EQ(im.dylinkerPath, "/usr/lib/dyld");
+    ASSERT_EQ(im.loadDylibs.size(), 1u);
+    EXPECT_EQ(im.loadDylibs[0].path, "/usr/lib/libSystem.B.dylib");
+}
+
+TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 32u);
+    // mach_header_64.filetype @ +12 = MH_EXECUTE = 2.
+    EXPECT_EQ(readU32LE(bytes, 12), 2u);
+    // flags @ +24 contains MH_PIE (0x200000) bit.
+    EXPECT_NE(readU32LE(bytes, 24) & 0x200000u, 0u);
+}
+
+TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // First load command at offset 32 is LC_SEGMENT_64 (0x19).
+    ASSERT_GE(bytes.size(), 32u + 72u);
+    EXPECT_EQ(readU32LE(bytes, 32), 0x19u);
+    // segname @ +40 = "__PAGEZERO"
+    EXPECT_EQ(bytes[40], '_');
+    EXPECT_EQ(bytes[41], '_');
+    EXPECT_EQ(bytes[42], 'P');
+    EXPECT_EQ(bytes[43], 'A');
+    // vmsize @ +64 = pageZeroSize
+    EXPECT_EQ(readU64LE(bytes, 64), 0x100000000ull);
+}
+
+TEST(MachOExecWriter, LcMainEntryOffPointsToFirstFunction) {
+    auto loaded = loadShippedExec();
+    // 2 functions: f[0] is some prelude (0x90 NOP + 0xC3 ret), f[1] is the entry.
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction a;
+    a.symbol = SymbolId{1};
+    a.bytes  = {0x90, 0xC3};
+    mod.functions.push_back(std::move(a));
+    AssembledFunction b;
+    b.symbol = SymbolId{42};
+    b.bytes  = {0xC3};
+    mod.functions.push_back(std::move(b));
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Default entryPoint = functions[0] (cycle-2 convention) — entryoff
+    // = textFileOff + 0. textFileOff = headerAndCmds page-aligned.
+    // No easy way to derive textFileOff in the test without parsing
+    // the load commands. Instead pin the property: LC_MAIN.entryoff
+    // is a multiple of the page size (because textFileOff is page-
+    // aligned and entryFnIdx=0 contributes 0).
+    // Locate LC_MAIN by scanning load commands.
+    std::size_t off = 32;  // start of load commands
+    bool sawLcMain = false;
+    while (off + 8 <= bytes.size()) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == 0x80000028u) {       // LC_MAIN
+            std::uint64_t const entryOff = readU64LE(bytes, off + 8);
+            EXPECT_EQ(entryOff % 0x1000u, 0u);
+            sawLcMain = true;
+            break;
+        }
+        off += cmdsize;
+    }
+    EXPECT_TRUE(sawLcMain);
+}
+
+TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
+    // Branch (rel32, kind 1) from fn[0] to fn[1].
+    // sectionVa = pageZeroSize + 0x1000 = 0x100001000.
+    // P = sectionVa + 1, S = sectionVa + 6, A = 0 → value = 1.
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction f0;
+    f0.symbol = SymbolId{1};
+    f0.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{2};
+    rel.kind   = RelocationKind{1};
+    f0.relocations.push_back(rel);
+    mod.functions.push_back(std::move(f0));
+    AssembledFunction f1;
+    f1.symbol = SymbolId{2};
+    f1.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f1));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // Locate __text file offset by parsing the __TEXT segment's
+    // __text section_64 record. __TEXT segment is the 2nd LC_SEGMENT_64.
+    std::size_t off = 32;
+    std::uint32_t textFileOff = 0;
+    int segIdx = 0;
+    while (off + 8 <= bytes.size()) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == 0x19u) {  // LC_SEGMENT_64
+            ++segIdx;
+            if (segIdx == 2) {
+                // section_64 starts at off + 72; section.offset @ +96.
+                textFileOff = readU32LE(bytes, off + 72 + 48);
+                break;
+            }
+        }
+        off += cmdsize;
+    }
+    ASSERT_NE(textFileOff, 0u);
+    EXPECT_EQ(bytes[textFileOff + 0], 0xE8u);
+    EXPECT_EQ(readU32LE(bytes, textFileOff + 1), 1u);
+    EXPECT_EQ(bytes[textFileOff + 5], 0xC3u);
+}
+
+TEST(MachOExecWriter, ExternTargetFailsLoudAsUndefined) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{99};
+    rel.kind   = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}
+
+TEST(MachOExecFormatJsonValidate, ObjWithImageBlockRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"obj-with-image","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": 1, "flags": 0 },
+      "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"exec-no-dylibs","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
+      "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld" },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── New tests folded from 7-agent review of LK3 cycle 2 ────────
+
+TEST(MachOExecFormatJsonValidate, DylibFiletypeRejected) {
+    // Anchored D-LK3-3: MH_DYLIB declared on closed enum but
+    // rejected by validate() until LK6 dynamic linking lands.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"a-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
+    // silent-failure H4 + code-reviewer C2: __text virtualAddress
+    // must be >= pageZeroSize, else sectionVa - pageZeroSize
+    // underflows.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"underflow","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
+      "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"no-dyld","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
+      "image": { "pageZeroSize": 4294967296, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(MachOExecWriter, EmptyTextFailsLoud) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    mod.functions.push_back(std::move(fn));
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction f0;
+    f0.symbol = SymbolId{1};
+    f0.bytes  = {0xC3};
+    Relocation rel;
+    rel.offset = 4;
+    rel.target = SymbolId{2};
+    rel.kind   = RelocationKind{1};
+    f0.relocations.push_back(rel);
+    mod.functions.push_back(std::move(f0));
+    AssembledFunction f1;
+    f1.symbol = SymbolId{2};
+    f1.bytes  = {0xC3, 0xC3, 0xC3, 0xC3};
+    mod.functions.push_back(std::move(f1));
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_RelocationKindMismatch) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}
+
+TEST(MachOExecWriter, DisplacementOverflowFailsLoud) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{1};
+    rel.kind   = RelocationKind{1};
+    rel.addend = std::numeric_limits<std::int64_t>::max() / 2;
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_RelocationKindMismatch) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
 }
