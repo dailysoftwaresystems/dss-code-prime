@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -294,6 +295,21 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  sections[i].name,
                                  sections[i].virtualAddress,
                                  peOptionalHeader.sectionAlignment));
+            }
+            // PE/COFF: RVAs are 32-bit (the entire IMAGE_OPTIONAL_
+            // HEADER64 storage for SizeOfImage / SizeOfHeaders /
+            // section RVAs is u32). A schema declaring a >4 GiB
+            // virtualAddress would silently narrow at emit time
+            // (silent-failure H2 post-audit fold).
+            if (pe.objectType != PeObjectType::Obj
+             && sections[i].virtualAddress
+                    > std::numeric_limits<std::uint32_t>::max()) {
+                fail(std::format("/sections/{}/virtualAddress", i),
+                     std::format("section '{}': PE32+ section "
+                                 "'virtualAddress' (0x{:x}) exceeds "
+                                 "u32 — PE/COFF RVAs are 32-bit.",
+                                 sections[i].name,
+                                 sections[i].virtualAddress));
             }
         }
     }

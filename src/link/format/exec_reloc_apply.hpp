@@ -45,7 +45,10 @@
 //
 // Fail-loud guards (each surfaces as a single diagnostic and
 // returns false):
-//   * unresolved symbol target       → K_SymbolUndefined  (D-LK6-2)
+//   * unresolved symbol target       → K_SymbolUndefined  (D-LK6-2 —
+//       per-format closure: PE half closed at LK6 cycle 2a; ELF
+//       half at D-LK6-4 / cycle 2b; Mach-O half at D-LK6-5 /
+//       cycle 2c; the kernel itself is ready for all three.)
 //   * kind unregistered (target)     → K_RelocationKindMismatch
 //   * widthBytes == 0                → K_RelocationKindMismatch (D-LK6-1)
 //   * rel.offset + width > fn.bytes  → K_RelocationKindMismatch
@@ -54,6 +57,17 @@
 // Format-side `fmt.relocationByKind(rel.kind)` is checked by the
 // caller (it's format-specific and the diagnostic wording differs);
 // the kernel here only checks the target schema's row.
+//
+// Per-format `symbolVa[sym]` population convention (cycle 2a+):
+//   * Functions:       imageBase (PE) / 0 (ELF/MachO) + section VA
+//                      + offset within `.text`.
+//   * PE externs:      imageBase + .idata IAT slot RVA.
+//   * ELF externs (cycle 2b, anchored D-LK6-4):
+//       - R_X86_64_PLT32 / call-to-extern  → PLT stub absolute VA
+//         (the PLT stub itself dispatches through the GOT slot).
+//       - R_X86_64_GOTPCREL / load-from-GOT → GOT slot absolute VA.
+//   * MachO externs (cycle 2c, anchored D-LK6-5):
+//       - X86_64_RELOC_GOT_LOAD → `__got` slot absolute VA.
 
 namespace dss::link::format {
 

@@ -638,8 +638,14 @@ encodeExec(AssembledModule const&    module,
     std::size_t const thunkBlockStart =
         (descriptorBlockSize + kThunkSize - 1) & ~(kThunkSize - 1);
     // Per-library ILT and IAT counts include a u64 zero terminator.
+    // The IAT-layout loop ALSO populates `externIatVaBySym` inline
+    // (simplifier #1 fold: was a separate 3rd "iterate libs × externs"
+    // pass with its own slotIdx counter; merged here so the slot
+    // RVA math has a single source of truth).
     std::vector<std::size_t> iltOffsets(numLibs);
     std::vector<std::size_t> iatOffsets(numLibs);
+    std::unordered_map<SymbolId, std::uint64_t> externIatVaBySym;
+    externIatVaBySym.reserve(module.externImports.size());
     std::size_t thunkCursor = thunkBlockStart;
     for (std::size_t li = 0; li < numLibs; ++li) {
         iltOffsets[li] = thunkCursor;
@@ -648,8 +654,15 @@ encodeExec(AssembledModule const&    module,
     }
     for (std::size_t li = 0; li < numLibs; ++li) {
         iatOffsets[li] = thunkCursor;
-        std::size_t const slots = externsByLib[libraryOrder[li]].size() + 1;
-        thunkCursor += slots * kThunkSize;
+        auto const& externs = externsByLib[libraryOrder[li]];
+        for (std::size_t k = 0; k < externs.size(); ++k) {
+            std::size_t const iatSlotOff =
+                thunkCursor + k * kThunkSize;
+            externIatVaBySym.emplace(
+                module.externImports[externs[k]].symbol,
+                oh.imageBase + idataRva + iatSlotOff);
+        }
+        thunkCursor += (externs.size() + 1) * kThunkSize;  // +1 terminator
     }
     // HINT/NAME table starts here. Per extern: 2 bytes hint + name +
     // NUL + optional padding to even.
@@ -675,22 +688,20 @@ encodeExec(AssembledModule const&    module,
         hintCursor += libraryOrder[li].size() + 1; // +NUL
     }
     std::size_t const idataSize = hintCursor;
-
-    // Per-extern IAT slot RVA — populated for symbol-VA map.
-    std::unordered_map<SymbolId, std::uint64_t> externIatVaBySym;
-    externIatVaBySym.reserve(module.externImports.size());
-    for (std::size_t li = 0; li < numLibs; ++li) {
-        std::size_t slotIdx = 0;
-        for (auto extIdx : externsByLib[libraryOrder[li]]) {
-            std::uint32_t const iatSlotRva =
-                idataRva
-                + static_cast<std::uint32_t>(iatOffsets[li])
-                + static_cast<std::uint32_t>(slotIdx * kThunkSize);
-            externIatVaBySym.emplace(
-                module.externImports[extIdx].symbol,
-                oh.imageBase + iatSlotRva);
-            ++slotIdx;
-        }
+    // u32 narrowing guard (silent-failure H2 post-audit fold):
+    // every downstream `.idata` cursor (descriptor RVA, ILT/IAT
+    // thunk offsets, HINT/NAME entry RVAs) is `static_cast<u32>(...)`
+    // from a `size_t` path. PE32+ RVAs are 32-bit per spec; an
+    // out-of-range idataSize would silently truncate at emit.
+    if (idataSize > std::numeric_limits<std::uint32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             std::string{"pe::encodeExec: synthesized .idata size "}
+                 + std::to_string(idataSize)
+                 + " exceeds u32 — PE32+ RVAs are 32-bit. The "
+                   "externImports list is pathologically large or "
+                   "carries names that overflow the section RVA "
+                   "space.");
+        return {};
     }
 
     // ── (d) Apply intra-module + extern relocations in-place ──
