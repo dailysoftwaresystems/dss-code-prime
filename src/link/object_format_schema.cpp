@@ -573,7 +573,12 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
-    // Cross-format exec-flavor invariant (type-design Q5 convergence).
+    // Cross-format exec-flavor invariant (type-design Q5 convergence
+    // + type-design O1 post-audit fold). The predicate mirrors
+    // `ObjectFormatSchema::isImageFlavor()` exactly — the schema
+    // and its private validate() helper share one disjunction (no
+    // drift surface).
+    //
     // A single source of truth tying the image-side triplet:
     //   format declares "executable mode" ⟺ a Text-section row
     //   declares a non-zero virtualAddress (where to load it).

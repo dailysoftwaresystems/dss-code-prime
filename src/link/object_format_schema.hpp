@@ -611,6 +611,29 @@ public:
     [[nodiscard]] MachOIdentity    const& macho()            const noexcept { return d_.macho; }
     [[nodiscard]] MachOImage       const& machoImage()       const noexcept { return d_.machoImage; }
 
+    // Cross-format image-flavor predicate. True iff the schema
+    // describes an executable / shared-library image (ELF ET_EXEC,
+    // PE Exec/Dll, Mach-O MH_EXECUTE) — i.e. the walker emits an
+    // image header (PT_LOAD / IMAGE_OPTIONAL_HEADER / LC_MAIN+
+    // LC_LOAD_DYLINKER) rather than relocatable section bytes.
+    // Mirrors the `isExecFlavor` rule inside `validate()` (the
+    // terminal cross-format Text-virtualAddress gate); exposing it
+    // as an accessor lets walker code branch on "am I image-side?"
+    // without duplicating the disjunction (type-design O1 fold-in,
+    // LK2 cycle 2 + LK3 cycle 2 post-audit).
+    [[nodiscard]] bool isImageFlavor() const noexcept {
+        switch (d_.kind) {
+            case ObjectFormatKind::Elf:
+                return d_.elf.objectType == ElfObjectType::Exec;
+            case ObjectFormatKind::Pe:
+                return d_.pe.objectType != PeObjectType::Obj;
+            case ObjectFormatKind::MachO:
+                return d_.macho.filetype == MachOObjectType::Execute;
+            default:
+                return false;
+        }
+    }
+
     // Image-side entry-point symbol name. Empty for relocatable
     // artifacts; non-empty for executables. The format walker
     // resolves this against `AssembledModule`'s symbol table at

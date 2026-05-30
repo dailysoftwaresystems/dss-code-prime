@@ -709,6 +709,114 @@ TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
     EXPECT_TRUE(sawCode);
 }
 
+TEST(MachOExecWriter, TextSegmentVmaddrEqualsPageZeroEnd) {
+    // Load-bearing invariant: __TEXT.vmaddr must equal pageZeroSize
+    // (otherwise __TEXT either overlaps __PAGEZERO or leaves a gap;
+    // dyld rejects both). The walker computes it; a future
+    // refactor that drifts this would silently produce a non-
+    // loadable image.
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Walk load commands until __TEXT (the 2nd LC_SEGMENT_64).
+    std::size_t off = 32;  // start of load commands
+    int segIdx = 0;
+    bool sawText = false;
+    while (off + 8 <= bytes.size()) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == 0x19u) {  // LC_SEGMENT_64
+            ++segIdx;
+            if (segIdx == 2) {
+                // segname @ +8 must be "__TEXT"
+                EXPECT_EQ(bytes[off + 8], '_');
+                EXPECT_EQ(bytes[off + 9], '_');
+                EXPECT_EQ(bytes[off + 10], 'T');
+                // vmaddr @ +24 must equal pageZeroSize (4 GiB)
+                EXPECT_EQ(readU64LE(bytes, off + 24), 0x100000000ull);
+                // fileoff @ +40 must equal 0 (mach header is in __TEXT)
+                EXPECT_EQ(readU64LE(bytes, off + 40), 0u);
+                // nsects @ +64 == 1 (just __text this cycle)
+                EXPECT_EQ(readU32LE(bytes, off + 64), 1u);
+                sawText = true;
+                break;
+            }
+        }
+        off += cmdsize;
+    }
+    EXPECT_TRUE(sawText);
+}
+
+TEST(MachOExecWriter, LcLoadDylibStructurePinnedByteForByte) {
+    // Load-bearing dyld invariant: LC_LOAD_DYLIB.name offset must
+    // be 24 (cmd+24 points at the dylib path string). If a future
+    // refactor changes the field layout, dyld silently looks for
+    // the path at the wrong offset, fails to find libSystem, and
+    // the process never starts. Pin the layout byte-for-byte.
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    std::size_t off = 32;
+    bool sawDylib = false;
+    while (off + 8 <= bytes.size()) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == 0x0Cu) {  // LC_LOAD_DYLIB
+            // name offset @ +8 must be 24 (cmd+24)
+            EXPECT_EQ(readU32LE(bytes, off + 8), 24u);
+            // timestamp / current_version / compat_version @ +12/+16/+20
+            // are 0 today (reserved for future cycle).
+            EXPECT_EQ(readU32LE(bytes, off + 12), 0u);
+            EXPECT_EQ(readU32LE(bytes, off + 16), 0u);
+            EXPECT_EQ(readU32LE(bytes, off + 20), 0u);
+            // path bytes @ +24 begin with "/usr/lib/libSystem"
+            EXPECT_EQ(bytes[off + 24], '/');
+            EXPECT_EQ(bytes[off + 25], 'u');
+            EXPECT_EQ(bytes[off + 26], 's');
+            EXPECT_EQ(bytes[off + 27], 'r');
+            sawDylib = true;
+            break;
+        }
+        off += cmdsize;
+    }
+    EXPECT_TRUE(sawDylib);
+}
+
+TEST(IsImageFlavorAccessor, ConsistentAcrossThreeFormats) {
+    // type-design O1 fold-in: the isImageFlavor() accessor exposes
+    // the cross-format triplet check beyond validate(). Pin it
+    // matches the shipped JSONs.
+    auto objE = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(objE.has_value());
+    EXPECT_FALSE((**objE).isImageFlavor());
+
+    auto execE = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(execE.has_value());
+    EXPECT_TRUE((**execE).isImageFlavor());
+
+    auto objP = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    ASSERT_TRUE(objP.has_value());
+    EXPECT_FALSE((**objP).isImageFlavor());
+
+    auto execP = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(execP.has_value());
+    EXPECT_TRUE((**execP).isImageFlavor());
+
+    auto objM = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin");
+    ASSERT_TRUE(objM.has_value());
+    EXPECT_FALSE((**objM).isImageFlavor());
+
+    auto execM = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(execM.has_value());
+    EXPECT_TRUE((**execM).isImageFlavor());
+}
+
 TEST(MachOExecWriter, DisplacementOverflowFailsLoud) {
     auto loaded = loadShippedExec();
     AssembledModule mod;

@@ -758,6 +758,43 @@ TEST(PeExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
     EXPECT_TRUE(sawCode);
 }
 
+TEST(PeExecWriter, LoadBearingOptionalHeaderFieldsPinnedByteForByte) {
+    // PE32+ field-ordering regression catcher. A future refactor
+    // that slides any IMAGE_OPTIONAL_HEADER64 u64 by 8 bytes
+    // silently shifts every subsequent field — e.g. stackReserve
+    // 0x100000 reads as a 4 GiB request → ENOMEM at process load.
+    // Pin every load-bearing field at its spec offset.
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Per PE/COFF §3.4 (PE32+ optional header layout):
+    //   [0xD0] SizeOfImage (u32) — must be ≥ secText.RVA + textVS.
+    //                              The shipped JSON ships 1-byte
+    //                              .text so SizeOfImage = 0x2000.
+    EXPECT_EQ(readU32LE(bytes, 0xD0), 0x2000u);
+    //   [0xD4] SizeOfHeaders (u32) — fileAlignment-aligned. Headers
+    //                              fit in 0x200 for the shipped JSON.
+    EXPECT_EQ(readU32LE(bytes, 0xD4), 0x200u);
+    //   [0xDE] DllCharacteristics (u16) — shipped JSON sets
+    //                              0x8160 (HIGH_ENTROPY|DYNAMIC_BASE|
+    //                              NX_COMPAT|TS_AWARE).
+    EXPECT_EQ(readU16LE(bytes, 0xDE), 0x8160u);
+    //   [0xE0] SizeOfStackReserve (u64) — 0x100000 (1 MiB).
+    EXPECT_EQ(readU64LE(bytes, 0xE0), 0x100000ull);
+    //   [0xE8] SizeOfStackCommit (u64) — 0x1000 (4 KiB).
+    EXPECT_EQ(readU64LE(bytes, 0xE8), 0x1000ull);
+    //   [0xF0] SizeOfHeapReserve (u64) — 0x100000 (1 MiB).
+    EXPECT_EQ(readU64LE(bytes, 0xF0), 0x100000ull);
+    //   [0xF8] SizeOfHeapCommit (u64) — 0x1000 (4 KiB).
+    EXPECT_EQ(readU64LE(bytes, 0xF8), 0x1000ull);
+    //   [0x100] LoaderFlags (u32) — reserved, must be 0.
+    EXPECT_EQ(readU32LE(bytes, 0x100), 0u);
+    //   [0x104] NumberOfRvaAndSizes (u32) — fixed at 16.
+    EXPECT_EQ(readU32LE(bytes, 0x104), 16u);
+}
+
 TEST(PeExecWriter, DisplacementOverflowFailsLoud) {
     auto loaded = loadShippedExec();
     AssembledModule mod;
