@@ -619,6 +619,22 @@ TEST(MachOExecFormatJsonValidate, ObjWithImageBlockRejected) {
     ASSERT_FALSE(r.has_value());
 }
 
+TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
+    // Symmetric reject: MH_OBJECT must not set image.bindNow=false.
+    // Eager-vs-lazy is an exec-image concept; .o files do not bind
+    // at all (the linker resolves at exec build time). Without this
+    // rule a JSON typo would silently load. (Type-design HIGH fold,
+    // LK6 cycle 2c post-fold review.)
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"obj-with-bindnow-false","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": 1, "flags": 0 },
+      "image": { "bindNow": false },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
 TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
@@ -985,6 +1001,131 @@ TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
     })");
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE((*r)->machoImage().bindNow);
+}
+
+TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
+    // Walker depends on pageZeroSize being page-aligned (vmaddr =
+    // pageZeroSize so mmap-congruence requires it). Validate must
+    // reject non-power-of-two values. (pr-test-analyzer Gap 1 fold
+    // — LK6 cycle 2c post-fold review.)
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-bad-pagezero","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 12884901888,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":17179869184}
+      ]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(MachOExecWriter, TextSegmentFilesizeCoversStubsEnd) {
+    // CRITICAL anti-regression for the __TEXT.filesize fix
+    // (code-reviewer C1 fold). The buggy formula was
+    // `stubsEnd - textFileOff` (would have truncated dyld's mmap
+    // before reaching .text); the correct formula is `stubsEnd`
+    // since __TEXT.fileoff = 0 by Apple convention.
+    // (pr-test-analyzer Gap 3 fold — LK6 cycle 2c post-fold review.)
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back({1, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    // Walk to LC_SEGMENT_64 __TEXT; read filesize + fileoff +
+    // section_64{__text/__stubs} to compute the expected
+    // (stubsFileOff + stubsFileSize) value, then assert filesize
+    // matches.
+    std::uint32_t ncmds =
+        static_cast<std::uint32_t>(bytes[16]) |
+        (static_cast<std::uint32_t>(bytes[17]) << 8) |
+        (static_cast<std::uint32_t>(bytes[18]) << 16) |
+        (static_cast<std::uint32_t>(bytes[19]) << 24);
+    std::size_t off = 32;
+    bool foundText = false;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t cmd =
+            static_cast<std::uint32_t>(bytes[off]) |
+            (static_cast<std::uint32_t>(bytes[off+1]) << 8) |
+            (static_cast<std::uint32_t>(bytes[off+2]) << 16) |
+            (static_cast<std::uint32_t>(bytes[off+3]) << 24);
+        std::uint32_t cmdsize =
+            static_cast<std::uint32_t>(bytes[off+4]) |
+            (static_cast<std::uint32_t>(bytes[off+5]) << 8) |
+            (static_cast<std::uint32_t>(bytes[off+6]) << 16) |
+            (static_cast<std::uint32_t>(bytes[off+7]) << 24);
+        if (cmd == 0x19u) {  // LC_SEGMENT_64
+            std::string segName(
+                reinterpret_cast<char const*>(&bytes[off + 8]),
+                strnlen(reinterpret_cast<char const*>(
+                            &bytes[off + 8]), 16));
+            if (segName == "__TEXT") {
+                std::uint64_t fileOff = 0, fileSize = 0;
+                for (int b = 0; b < 8; ++b) {
+                    fileOff |= static_cast<std::uint64_t>(
+                                   bytes[off + 40 + b]) << (b * 8);
+                    fileSize |= static_cast<std::uint64_t>(
+                                    bytes[off + 48 + b]) << (b * 8);
+                }
+                // __TEXT.fileoff = 0 (Apple convention — mach
+                // header lives inside __TEXT).
+                EXPECT_EQ(fileOff, 0u);
+                // Find __stubs section_64 to compute stubsEnd.
+                std::uint32_t nsects =
+                    static_cast<std::uint32_t>(bytes[off+64]) |
+                    (static_cast<std::uint32_t>(bytes[off+65]) << 8) |
+                    (static_cast<std::uint32_t>(bytes[off+66]) << 16) |
+                    (static_cast<std::uint32_t>(bytes[off+67]) << 24);
+                std::size_t secOff = off + 72;
+                std::uint64_t stubsEnd = 0;
+                for (std::uint32_t s = 0; s < nsects; ++s) {
+                    std::string secName(
+                        reinterpret_cast<char const*>(&bytes[secOff]),
+                        strnlen(reinterpret_cast<char const*>(
+                                    &bytes[secOff]), 16));
+                    std::uint64_t secSize = 0;
+                    for (int b = 0; b < 8; ++b)
+                        secSize |= static_cast<std::uint64_t>(
+                                       bytes[secOff + 40 + b]) << (b*8);
+                    std::uint32_t secFileOff =
+                        static_cast<std::uint32_t>(bytes[secOff + 48]) |
+                        (static_cast<std::uint32_t>(bytes[secOff + 49]) << 8) |
+                        (static_cast<std::uint32_t>(bytes[secOff + 50]) << 16) |
+                        (static_cast<std::uint32_t>(bytes[secOff + 51]) << 24);
+                    if (secName == "__stubs") {
+                        stubsEnd = static_cast<std::uint64_t>(secFileOff) + secSize;
+                    }
+                    secOff += 80;
+                }
+                ASSERT_NE(stubsEnd, 0u);
+                EXPECT_EQ(fileSize, stubsEnd)
+                    << "__TEXT.filesize must equal stubsEnd "
+                       "(buggy formula was stubsEnd - textFileOff "
+                       "which would have truncated dyld's mmap)";
+                foundText = true;
+                break;
+            }
+        }
+        off += cmdsize;
+    }
+    EXPECT_TRUE(foundText);
 }
 
 TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {

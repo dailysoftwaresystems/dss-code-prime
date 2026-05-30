@@ -209,6 +209,24 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                              "concept; .o files leave it empty.",
                              elf.interpreter));
         }
+        // Symmetric reject: ET_REL must NOT set `bindNow` (defaults
+        // to true; a JSON typo setting it to false on a .o is a
+        // copy-paste error from an exec schema). Eager-vs-lazy
+        // binding is an exec-image concept; .o files don't bind at
+        // all (the linker resolves at exec build time). Without
+        // this rule, a `.o` schema with `bindNow=false` would
+        // silently load, the field would be ignored at MH_OBJECT
+        // walker time, and the typo would mask itself until the
+        // schema was reused as an exec template. (Type-design
+        // HIGH, LK6 cycle 2c post-fold review.)
+        if (elf.objectType == ElfObjectType::Rel && !elf.bindNow) {
+            fail("/elf/bindNow",
+                 "ELF ET_REL format must not set 'elf.bindNow' to "
+                 "false. Eager-vs-lazy binding (DF_1_NOW / "
+                 "R_X86_64_GLOB_DAT) is an exec-image concept; "
+                 ".o files do not bind at all — the linker resolves "
+                 "at exec build time.");
+        }
         // Conversely, ET_REL must NOT carry virtual addresses (they're
         // set by the LINKER at exec build time, not declared on the
         // .o's section rows). A non-zero `virtualAddress` here would
@@ -538,16 +556,30 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         auto const& mi = machoImage;
         bool const isObj = macho.filetype == MachOObjectType::Object;
         if (isObj) {
+            // `bindNow` is included in the anySet check below: its
+            // default is `true`, so the user must have explicitly
+            // set it (to either true or false) on a .o schema for
+            // the field to read non-default. Either way the field
+            // is meaningless on MH_OBJECT — reject. (Symmetric with
+            // ELF ET_REL bindNow rule above; type-design HIGH, LK6
+            // cycle 2c post-fold review.) Note: MachOImage's
+            // default-constructed `bindNow = true` cannot be
+            // distinguished from "user set true" at this stage, so
+            // the reject fires only on `bindNow == false`. The
+            // `bindNow == true` case is structurally a no-op (the
+            // default) on .o paths.
             bool const anySet = mi.pageZeroSize != 0
                 || !mi.dylinkerPath.empty()
-                || !mi.loadDylibs.empty();
+                || !mi.loadDylibs.empty()
+                || !mi.bindNow;
             if (anySet) {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
                      "'image' block — pageZeroSize / dylinkerPath / "
-                     "loadDylibs live only in MH_EXECUTE / MH_DYLIB "
-                     "images. Set macho.filetype = 2 (MH_EXECUTE) if "
-                     "this schema describes an executable.");
+                     "loadDylibs / bindNow live only in MH_EXECUTE / "
+                     "MH_DYLIB images. Set macho.filetype = 2 "
+                     "(MH_EXECUTE) if this schema describes an "
+                     "executable.");
             }
         } else if (macho.filetype == MachOObjectType::Execute) {
             if (mi.pageZeroSize == 0) {

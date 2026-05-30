@@ -731,11 +731,33 @@ encodeExec(AssembledModule const&    module,
     symbolVa.reserve(module.functions.size()
                      + module.externImports.size());
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
-        symbolVa.emplace(module.functions[i].symbol,
-                         sectionVa + funcTextStart[i]);
+        if (!symbolVa.emplace(module.functions[i].symbol,
+                              sectionVa + funcTextStart[i]).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: duplicate function "
+                             "symbol #"}
+                 + std::to_string(module.functions[i].symbol.v)
+                 + " — caller must give each function a unique "
+                   "SymbolId.");
+            return {};
+        }
     }
     for (auto const& [sym, va] : externIatVaBySym) {
-        symbolVa.emplace(sym, va);
+        // Cross-format symmetry with ELF/MachO dynamic walkers
+        // (LK6 cycle 2c post-fold review — code-simplifier flagged
+        // PE as the asymmetric outlier). An extern SymbolId
+        // colliding with a function's SymbolId is a caller bug;
+        // silently overriding the in-text VA with the IAT slot VA
+        // would patch in-text rel32 to point at the wrong target.
+        if (!symbolVa.emplace(sym, va).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: extern SymbolId #"}
+                 + std::to_string(sym.v)
+                 + " collides with another symbol — caller must "
+                   "give each extern a unique SymbolId distinct "
+                   "from function ids.");
+            return {};
+        }
     }
     if (!link::format::applyExecRelocations(
             text, module, funcTextStart, symbolVa, targetSchema,

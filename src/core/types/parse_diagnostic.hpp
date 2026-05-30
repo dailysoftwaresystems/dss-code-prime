@@ -469,10 +469,15 @@ enum class DiagnosticCode : std::uint16_t {
     //      their symbol/string tables don't carry section headers).
     // K_FormatLacksImportSupport: a format walker received an
     //   AssembledModule with non-empty `externImports` but its
-    //   image-side arm doesn't yet emit import tables. LK6 cycle 2a
-    //   ships PE IAT only; ELF GOT/PLT arm anchored at D-LK6-4 and
-    //   Mach-O LC_DYLD_INFO arm anchored at D-LK6-5. Format walkers
-    //   that don't support extern imports fire this loud rather
+    //   image-side arm doesn't yet emit import tables. The three
+    //   eager-binding format arms are now all closed (PE IAT —
+    //   LK6 cycle 2a; ELF GOT/PLT — LK6 cycle 2b.2; Mach-O
+    //   LC_DYLD_INFO_ONLY — LK6 cycle 2c). This diagnostic now
+    //   fires only on the lazy-binding upgrade paths (D-LK6-11
+    //   ELF / D-LK6-12 PE delay-load / D-LK6-13 Mach-O lazy-bind)
+    //   and on the ARM64-darwin chained-fixups path (D-LK6-14)
+    //   until those anchors close. Format walkers that can't
+    //   support the requested binding mode fire this loud rather
     //   than silently producing a binary missing its import table.
     K_SymbolUndefined              = 0x8001,
     K_RelocationKindMismatch       = 0x8002,

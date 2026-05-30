@@ -155,6 +155,21 @@ TEST(ElfRelFormatJson, InterpreterOnRelFormatRejectedAtLoad) {
     ASSERT_FALSE(r.has_value());
 }
 
+TEST(ElfRelFormatJson, BindNowFalseOnRelFormatRejectedAtLoad) {
+    // Symmetric reject: ET_REL must not set bindNow=false. The
+    // eager-vs-lazy binding choice is an exec-image concept;
+    // .o files don't bind at all (the linker resolves at exec
+    // build time). A typo on a .o would otherwise be silently
+    // accepted. (Type-design HIGH fold, LK6 cycle 2c post-fold
+    // review.)
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"rel-with-bindnow-false","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel", "bindNow": false }
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
 TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
     // Cross-format symmetry with PE's fail-loud, but extended:
     // when `elf.interpreter` is empty AND externImports is
