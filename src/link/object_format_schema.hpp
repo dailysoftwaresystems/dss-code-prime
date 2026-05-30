@@ -189,17 +189,27 @@ symbolVisibilityFromName(std::string_view s) noexcept {
 // output bytes.
 //
 // `nativeId` is the FORMAT-SPECIFIC numeric tag the format engine
-// writes into its relocation record (e.g. ELF's `r_info` low 32 bits
-// = R_X86_64_PC32 = 2; PE's IMAGE_REL_AMD64_REL32 = 4; Mach-O's
-// X86_64_RELOC_BRANCH = 2). Distinct from the universal `kind`
-// (cross-side join key) — `kind` is opaque to all formats; `nativeId`
-// is the actual byte value embedded in the format's reloc record.
-// Validated as != 0 (slot-0 reserved as sentinel) when present.
+// writes into its relocation record:
+//   * ELF: `r_info` low 32 bits, e.g. R_X86_64_PC32 = 2.
+//   * PE:  Type field, e.g. IMAGE_REL_AMD64_REL32 = 4.
+//   * Mach-O: `r_type` 4-bit nibble in `r_info`, e.g.
+//     X86_64_RELOC_BRANCH = 2.
+//   * WASM: u32 LEB128 reloc type (fits u32 unchanged).
+//   * SPIR-V: no traditional relocation table (decoration-based);
+//     the field is unused on SPIR-V format schemas.
+// Distinct from the universal `kind` (cross-side join key) — `kind`
+// is opaque to all formats; `nativeId` is the actual byte value
+// embedded in the format's reloc record. Per-row invariant:
+// `nativeId != 0` on every relocation row (slot-0 reserved as the
+// invalid sentinel — emitting it would write a format-specific
+// `R_*_NONE`-shaped record that consumers treat as a no-op,
+// silently dropping the patch).
 struct DSS_EXPORT ObjectFormatRelocationInfo {
     std::string    name;            // e.g. "R_X86_64_PC32"
     RelocationKind kind{};          // matches assembler-side tag
-    std::uint32_t  nativeId = 0;    // ELF r_info type / PE characteristics
-                                    // / Mach-O type — format-specific
+    std::uint32_t  nativeId = 0;    // ELF r_info type / PE Type /
+                                    // Mach-O r_type / WASM reloc type
+                                    // — format-specific wire value
 };
 
 // ── Per-section row (plan 14 D-LK4-2) ───────────────────────────
@@ -210,11 +220,21 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
 // validates the universal `kind` join key + `name` non-empty +
 // `kind` unique cross-row; the format-specific numeric fields are
 // stored verbatim and interpreted by the format walker.
+//
+// **`name` is a single-level identifier** — ELF uses one (`.text`)
+// and PE uses one (`.text` / `.rdata`). Mach-O uses a two-level
+// `(segment, section)` tuple (`__TEXT,__text`). When LK3 lands the
+// Mach-O walker, this struct gains a parallel `segment` field —
+// anchored as plan 14 §3.1 **D-LK3-1**. Until then `name` carries
+// the section-only identifier and the segment relationship lives
+// implicit in the format walker.
 struct DSS_EXPORT ObjectFormatSectionInfo {
     SectionKind   kind{};            // universal kind enum
     std::string   name;              // e.g. ".text" / ".rela.text"
-    std::uint32_t type = 0;          // ELF sh_type / PE characteristics
+                                     // (D-LK3-1: gains `segment` at LK3)
+    std::uint32_t type = 0;          // ELF sh_type / PE Characteristics
     std::uint64_t flags = 0;         // ELF sh_flags / PE flags
+                                     // / Mach-O S_ATTR_* (LK3)
     std::uint64_t addrAlign = 0;     // sh_addralign or format equivalent
     std::uint64_t entrySize = 0;     // sh_entsize (0 for variable-size)
 };

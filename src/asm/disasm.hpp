@@ -50,6 +50,15 @@ namespace dss {
 //     distinction was sentinel-collision-prone in the previous
 //     `int64_t = 0` shape (D-AS5-3 closure).
 struct DSS_EXPORT DisassembledSlot {
+    // Default kind is the slot-0 ordinal (`ModRmReg`, an x86 slot)
+    // because `EncodingSlotKind` has no `None` sentinel and adding
+    // one would require switch-arm updates across every walker.
+    // This is a structural default that callers MUST overwrite —
+    // both disasm walkers set `kind` explicitly before returning
+    // each slot, and the result-vs-wires split in `DisassembledInst`
+    // means a default-constructed slot never escapes the walker.
+    // The aggregate-init paths at the walker emit sites are the
+    // single source of truth for `kind`.
     EncodingSlotKind             kind = EncodingSlotKind::ModRmReg;
     std::optional<std::int64_t>  value;
 };
