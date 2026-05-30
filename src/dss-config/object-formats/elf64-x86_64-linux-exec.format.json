@@ -24,7 +24,7 @@
 
   "sections": [
     {
-      "$comment": "Executable code section. virtualAddress = 0x401000 — conventional Linux x86_64 executable base (0x400000) plus 0x1000 (first page reserved for the ELF header + program headers). sh_addr is set to this; e_entry derives from this + entry-function offset. sh_flags = SHF_ALLOC | SHF_EXECINSTR (6); sh_addralign = 16 (x86_64 psABI).",
+      "$comment": "Executable code section. virtualAddress = 0x401000 — conventional Linux x86_64 base (0x400000) + 0x1000 to leave the first page for the Ehdr and program header table loaded alongside `.text` in the same PT_LOAD. This is a convention, not a kernel hard requirement: any page-aligned VA works as long as `p_vaddr % p_align == p_offset % p_align`. sh_addr is set to this; e_entry derives from this + entry-function offset. sh_flags = SHF_ALLOC | SHF_EXECINSTR (6); sh_addralign = 16 (x86_64 psABI).",
       "kind": "text",
       "name": ".text",
       "type": 1,

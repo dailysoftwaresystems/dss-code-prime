@@ -127,19 +127,19 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "(EM_* value, e.g. 62 for x86_64, "
                                  "183 for aarch64)");
         }
-        // e_type — the LK1 cycle 2 ELF walker supports ET_REL (1)
-        // and ET_EXEC (2). ET_DYN (3) is anchored at D-LK1-4 for
-        // PIE/shared-lib support paired with LK6 dynamic linking.
-        // Reject unknown values at load time so a typo in a JSON
-        // can't reach the walker.
-        if (elf.objectType != 1 && elf.objectType != 2) {
+        // e_type — the LK1 cycle 2 ELF walker supports ET_REL and
+        // ET_EXEC. ET_DYN is declared on the closed enum but
+        // rejected here until D-LK1-4 closes (PIE/.so paired with
+        // LK6 dynamic linking).
+        if (elf.objectType != ElfObjectType::Rel
+         && elf.objectType != ElfObjectType::Exec) {
             fail("/elf/type",
-                 std::format("ELF format 'elf.type' = {} not supported; "
-                             "cycle 2 ships 'rel' (=ET_REL=1) and 'exec' "
-                             "(=ET_EXEC=2). ET_DYN=3 (PIE / .so) is "
-                             "anchored at plan 14 §3.1 D-LK1-4 paired "
-                             "with LK6 dynamic linking.",
-                             elf.objectType));
+                 std::format("ELF format 'elf.type' = '{}' not yet "
+                             "supported by the walker; cycle 2 ships "
+                             "'rel' and 'exec'. 'dyn' (ET_DYN: PIE / "
+                             ".so) is anchored at plan 14 §3.1 D-LK1-4 "
+                             "paired with LK6 dynamic linking.",
+                             std::string{elfObjectTypeName(elf.objectType)}));
         }
         // ET_EXEC schemas must declare which sections are loaded and
         // at what virtual address. Today the walker uses sh_addr =
@@ -148,7 +148,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         // Text on an ET_EXEC schema, the walker would emit an
         // executable loaded at virtual address 0 — null-deref on
         // first instruction. Reject explicitly.
-        if (elf.objectType == 2) {
+        if (elf.objectType == ElfObjectType::Exec) {
             auto const* secText = [&]() -> ObjectFormatSectionInfo const* {
                 for (auto const& s : sections) {
                     if (s.kind == SectionKind::Text) return &s;
@@ -170,7 +170,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         // .o's section rows). A non-zero `virtualAddress` here would
         // be silently dropped when emitting `sh_addr = 0` for the
         // .o. Reject so a JSON edit can't no-op.
-        if (elf.objectType == 1) {
+        if (elf.objectType == ElfObjectType::Rel) {
             for (std::size_t i = 0; i < sections.size(); ++i) {
                 if (sections[i].virtualAddress != 0) {
                     fail(std::format("/sections/{}/virtualAddress", i),
@@ -337,6 +337,51 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "two-level (segment, section) naming)",
                                  sections[i].name));
             }
+        }
+    }
+
+    // Cross-format exec-flavor invariant (type-design Q5 convergence).
+    // A single source of truth tying the image-side triplet:
+    //   format declares "executable mode" ⟺ a Text-section row
+    //   declares a non-zero virtualAddress (where to load it).
+    // `entryPoint` is independent (empty defaults to functions[0];
+    // non-empty resolves by name) — NOT cross-tied here. This
+    // terminal pass survives PE PE32+ (D-LK2-1) and Mach-O
+    // MH_EXECUTE (D-LK3-2) landing — those cycles add their flavor
+    // markers to `isExecFlavor` below.
+    bool const isExecFlavor =
+        (kind == ObjectFormatKind::Elf
+         && elf.objectType == ElfObjectType::Exec)
+        // D-LK2-1: || (kind == ObjectFormatKind::Pe
+        //               && pe.optionalHeader.has_value())
+        // D-LK3-2: || (kind == ObjectFormatKind::MachO
+        //               && macho.filetype == MH_EXECUTE)
+        ;
+    if (isExecFlavor) {
+        // Walker requires Text + virtualAddress != 0 to compute
+        // e_entry / p_vaddr / IMAGE_OPTIONAL_HEADER.ImageBase. The
+        // per-format rule above already rejects ELF ET_EXEC with
+        // text.virtualAddress == 0; this terminal pass restates the
+        // contract uniformly so PE/MachO image arms inherit the
+        // gate the same way (one rule covers all 3 formats).
+        bool sawText = false;
+        for (auto const& s : sections) {
+            if (s.kind != SectionKind::Text) continue;
+            sawText = true;
+            if (s.virtualAddress == 0) {
+                fail("/sections/<text>/virtualAddress",
+                     "image-flavor format (ELF ET_EXEC / PE PE32+ / "
+                     "Mach-O MH_EXECUTE) requires the Text section "
+                     "row's `virtualAddress != 0`. The walker computes "
+                     "the entry-point VA from this field; a value of "
+                     "0 would emit an image loaded at virtual address "
+                     "0, which the runtime kernel rejects as ENOEXEC.");
+            }
+        }
+        if (!sawText) {
+            fail("/sections",
+                 "image-flavor format requires a Text section row "
+                 "(SectionKind::Text). No such row was declared.");
         }
     }
 

@@ -293,17 +293,18 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             readU16("abiVersion", abiVerRaw, 255);
             data.elf.abiVersion = static_cast<std::uint8_t>(abiVerRaw);
             readU16("machine", data.elf.machine, 0xFFFF);
-            // `type`: "rel" / "exec" / "dyn" — ET_REL=1 / ET_EXEC=2
-            // / ET_DYN=3 per the gABI ELF header `e_type` field.
-            // Default ET_REL keeps LK1 cycle 1 schemas working
-            // unchanged.
+            // `type`: closed-enum `ElfObjectType` (rel/exec/dyn)
+            // round-tripped through `EnumNameTable`. Default Rel
+            // keeps LK1 cycle 1 schemas working unchanged.
             if (e.contains("type") && e.at("type").is_string()) {
-                auto const t = e.at("type").get<std::string>();
-                if      (t == "rel")  data.elf.objectType = 1;
-                else if (t == "exec") data.elf.objectType = 2;
-                else if (t == "dyn")  data.elf.objectType = 3;
-                else coll.emit(DiagnosticCode::C_MalformedJson, "/elf/type",
-                               "'type' must be 'rel' / 'exec' / 'dyn'");
+                auto const tName = e.at("type").get<std::string>();
+                auto const tEnum = elfObjectTypeFromName(tName);
+                if (tEnum.has_value()) {
+                    data.elf.objectType = *tEnum;
+                } else {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/elf/type",
+                              "'type' must be 'rel' / 'exec' / 'dyn'");
+                }
             }
         }
     }

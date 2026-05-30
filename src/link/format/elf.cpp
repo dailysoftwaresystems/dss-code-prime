@@ -140,7 +140,7 @@ encode(AssembledModule const&    module,
     // layout; ET_EXEC drops .rela.text (modules with relocations
     // fail loud — cycle scope; LK6 owns relocation application)
     // and adds a PT_LOAD program header.
-    bool const isExec = (fmt.elf().objectType == 2);
+    bool const isExec = (fmt.elf().objectType == ElfObjectType::Exec);
 
     // ET_EXEC requires every AssembledFunction to have zero
     // relocations (cycle scope: self-contained modules only).
@@ -328,12 +328,19 @@ encode(AssembledModule const&    module,
     hStrtab.name_offset    = shstrtab.add(secStrtab->name);
     hShStrtab.name_offset  = shstrtab.add(secShStrtab->name);
 
+    // Section indices — IDX_TEXT==1 is pinned (the STT_SECTION sym
+    // emitted above hardcodes st_shndx=1). Other indices depend on
+    // whether the `.rela.text` slot is present:
+    //   ET_REL:  Null(0), Text(1), Rela(2), Symtab(3), Strtab(4), ShStrtab(5).
+    //   ET_EXEC: Null(0), Text(1), Symtab(2), Strtab(3), ShStrtab(4).
+    // The phantom SHT_NULL placeholder in ET_EXEC was an LK1-cycle-2
+    // first draft; architect convergence pulled it out so `readelf
+    // -S` doesn't show a blank slot at idx 2 and the index math is
+    // honest.
     constexpr std::uint16_t IDX_TEXT     = 1;
-    constexpr std::uint16_t IDX_SYMTAB   = 3;
-    constexpr std::uint16_t IDX_STRTAB   = 4;
-    constexpr std::uint16_t IDX_SHSTRTAB = 5;
-    // IDX_TEXT == 1 is the pinned ordering for the .text STT_SECTION
-    // symbol emitted above (its st_shndx field is set to 1 directly).
+    std::uint16_t const IDX_SYMTAB   = isExec ? 2u : 3u;
+    std::uint16_t const IDX_STRTAB   = isExec ? 3u : 4u;
+    std::uint16_t const IDX_SHSTRTAB = isExec ? 4u : 5u;
 
     hText.type       = secText->type;
     hText.flags      = secText->flags;
@@ -425,11 +432,20 @@ encode(AssembledModule const&    module,
     // (LK1 ELF executable adding .data/.rodata/.bss, LK6 dynamic
     // linking adding .dynamic/.dynsym/.dynstr) cannot drift between
     // the Ehdr's e_shnum and the actual table size.
-    SectionHeader const* const headers[] = {
-        &hNull, &hText, &hRela, &hSymtab, &hStrtab, &hShStrtab
-    };
+    // ET_REL keeps `.rela.text` in slot 2; ET_EXEC drops it entirely
+    // (no SHT_NULL placeholder). Section count derives from the
+    // actually-emitted slots — same architect B-LK1-2 / D-LK2-5
+    // discipline that LK1 cycle 1 + LK2 already adopt.
+    std::vector<SectionHeader const*> headers;
+    headers.reserve(6);
+    headers.push_back(&hNull);
+    headers.push_back(&hText);
+    if (!isExec) headers.push_back(&hRela);
+    headers.push_back(&hSymtab);
+    headers.push_back(&hStrtab);
+    headers.push_back(&hShStrtab);
     std::uint16_t const sectionCount =
-        static_cast<std::uint16_t>(std::size(headers));
+        static_cast<std::uint16_t>(headers.size());
     for (auto const* h : headers) writeSectionHeader(bytes, *h);
 
     // ── Elf64_Ehdr (overwrite the leading 64 zero bytes) ───────
@@ -439,9 +455,8 @@ encode(AssembledModule const&    module,
     // offset (cycle 2: entry function = module.functions[0] at
     // offset 0 in .text), e_phoff = sizeof(Ehdr) = 64, e_phnum = 1.
     auto const& id = fmt.elf();
-    std::uint16_t const eType = isExec
-        ? static_cast<std::uint16_t>(2)   // ET_EXEC
-        : ET_REL;
+    std::uint16_t const eType =
+        static_cast<std::uint16_t>(id.objectType);
     std::uint64_t eEntry = 0;
     std::uint64_t ePhoff = 0;
     std::uint16_t ePhnum = 0;
@@ -532,10 +547,13 @@ encode(AssembledModule const&    module,
     // ET_EXEC requires at least one PT_LOAD; the runtime loader
     // uses it to map the segment into the process address space.
     // PT_PHDR (pointing at the program header table itself) is
-    // CONVENTIONAL but not required — Linux's kernel ELF loader
-    // accepts ET_EXEC without it. Cycle 2 ships only PT_LOAD;
-    // PT_PHDR / PT_INTERP / PT_DYNAMIC arrive with LK6 dynamic
-    // linking.
+    // conventional but optional for STATIC executables — Linux's
+    // kernel ELF loader accepts ET_EXEC without it. **PT_PHDR
+    // becomes REQUIRED as soon as PT_INTERP appears**: the dynamic
+    // loader uses PT_PHDR to locate the program headers in the
+    // mapped process image (otherwise it has no way to find them).
+    // Cycle 2 ships only PT_LOAD; PT_PHDR / PT_INTERP / PT_DYNAMIC
+    // arrive together with LK6 dynamic linking.
     if (isExec) {
         std::vector<std::uint8_t> phdr;
         phdr.reserve(kProgramHeaderSize);

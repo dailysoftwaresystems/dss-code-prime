@@ -101,7 +101,7 @@ TEST(ElfExecFormatJson, ShippedFileLoadsCleanlyWithExecFields) {
     ASSERT_TRUE(loaded.format);
     EXPECT_EQ(loaded.format->kind(), ObjectFormatKind::Elf);
     EXPECT_EQ(loaded.format->name(), "elf64-x86_64-linux-exec");
-    EXPECT_EQ(loaded.format->elf().objectType, 2u);  // ET_EXEC
+    EXPECT_EQ(loaded.format->elf().objectType, ElfObjectType::Exec);
     // Empty entryPoint until D-LK1-1 closes (real symbol-name
     // thread); walker defaults to module.functions[0].
     EXPECT_EQ(loaded.format->entryPoint(), "");
@@ -190,20 +190,28 @@ TEST(ElfExecWriter, TextSectionHeaderShAddrEqualsVirtualAddress) {
 
 // ── Section ordering preserved (.rela.text slot is SHT_NULL) ───
 
-TEST(ElfExecWriter, RelaTextSlotIsShtNullForExec) {
+TEST(ElfExecWriter, RelaTextSlotDroppedForExec) {
+    // ET_REL: 6 sections (NULL, .text, .rela.text, .symtab, .strtab,
+    //                     .shstrtab).
+    // ET_EXEC: 5 sections (NULL, .text, .symtab, .strtab, .shstrtab)
+    //                     — no .rela.text slot at all (architect
+    //                     convergence — pre-fix had a phantom
+    //                     SHT_NULL placeholder).
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
+    // e_shnum @ +60 = 5 in ET_EXEC mode.
+    EXPECT_EQ(readU16LE(bytes, 60), 5u);
+    // e_shstrndx @ +62 = 4 in ET_EXEC mode.
+    EXPECT_EQ(readU16LE(bytes, 62), 4u);
+    // Section index 2 in ET_EXEC is .symtab (SHT_SYMTAB = 2), not
+    // SHT_NULL — verify by reading sh_type @ +4 within the header.
     std::uint64_t const shoff = readU64LE(bytes, 40);
-    // Section header 2 (.rela.text slot in ET_REL) is SHT_NULL in
-    // ET_EXEC — all-zero 64 bytes preserves IDX_* parity (the
-    // symtab's STT_SECTION entry still has st_shndx=1 = .text).
-    for (std::size_t i = 0; i < 64; ++i) {
-        EXPECT_EQ(bytes[shoff + 2 * 64 + i], 0u)
-            << "ET_EXEC .rela.text slot must be SHT_NULL (byte " << i << ")";
-    }
+    EXPECT_EQ(readU32LE(bytes, shoff + 2 * 64 + 4), 2u)
+        << "ET_EXEC section index 2 must be .symtab (SHT_SYMTAB=2), "
+           "not a phantom SHT_NULL placeholder";
 }
 
 // ── Cycle-2 fail-loud guards ───────────────────────────────────

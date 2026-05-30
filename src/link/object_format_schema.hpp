@@ -274,18 +274,44 @@ struct DSS_EXPORT ObjectFormatSectionInfo {
 // every format's identity definition into a single header that
 // every walker transitively includes — re-creating the per-arch
 // coupling the shape-keyed-walker split was designed to avoid.
+// e_type closed enum (gABI Fig. 4-2). ET_DYN (PIE / .so) is
+// declared but rejected by validate() until D-LK1-4 closes
+// (LK6 dynamic linking). ET_NONE / ET_CORE etc. are not declared
+// here — they have no use case in this substrate.
+enum class ElfObjectType : std::uint16_t {
+    Rel  = 1,  // ET_REL  — relocatable .o
+    Exec = 2,  // ET_EXEC — non-PIE executable
+    Dyn  = 3,  // ET_DYN  — PIE or shared library (anchored D-LK1-4)
+};
+
+inline constexpr EnumNameTable<ElfObjectType, 3> kElfObjectTypeTable{{{
+    { ElfObjectType::Rel,  "rel"  },
+    { ElfObjectType::Exec, "exec" },
+    { ElfObjectType::Dyn,  "dyn"  },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+elfObjectTypeName(ElfObjectType t) noexcept {
+    return kElfObjectTypeTable.name(t);
+}
+[[nodiscard]] constexpr std::optional<ElfObjectType>
+elfObjectTypeFromName(std::string_view s) noexcept {
+    return kElfObjectTypeTable.fromName(s);
+}
+
 struct DSS_EXPORT ElfIdentity {
-    std::uint8_t  fileClass = 0;     // ELFCLASS64=2 / ELFCLASS32=1
-    std::uint8_t  dataEncoding = 0;  // ELFDATA2LSB=1 / ELFDATA2MSB=2
-    std::uint8_t  osabi = 0;         // ELFOSABI_NONE=0 / ELFOSABI_GNU=3 / …
-    std::uint8_t  abiVersion = 0;
-    std::uint16_t machine = 0;       // e_machine: EM_X86_64=62 / EM_AARCH64=183
-    // e_type — ET_REL=1 (relocatable .o) / ET_EXEC=2 (executable)
-    // / ET_DYN=3 (shared lib or PIE exec). Default ET_REL keeps
-    // LK1 cycle 1 schemas working unchanged. The walker uses this
-    // to route between the relocatable-emit and executable-emit
-    // paths (LK1 cycle 2: ET_EXEC arm).
-    std::uint16_t objectType = 1;    // default = ET_REL (relocatable .o)
+    std::uint8_t   fileClass = 0;    // ELFCLASS64=2 / ELFCLASS32=1
+    std::uint8_t   dataEncoding = 0; // ELFDATA2LSB=1 / ELFDATA2MSB=2
+    std::uint8_t   osabi = 0;        // ELFOSABI_NONE=0 / ELFOSABI_GNU=3 / …
+    std::uint8_t   abiVersion = 0;
+    std::uint16_t  machine = 0;      // e_machine: EM_X86_64=62 / EM_AARCH64=183
+    // e_type — ET_REL/ET_EXEC walker arms ship at LK1 cycle 1+2;
+    // ET_DYN anchored at D-LK1-4 paired with LK6 dynamic linking.
+    // `validate()` rejects values outside {Rel, Exec}; ET_DYN
+    // accepted at load but rejected at walker dispatch until
+    // D-LK1-4 closes. Default = Rel preserves LK1 cycle 1
+    // schemas unchanged.
+    ElfObjectType  objectType = ElfObjectType::Rel;
 };
 
 // ── PE/COFF-specific identity block (loaded only when kind == Pe) ──
