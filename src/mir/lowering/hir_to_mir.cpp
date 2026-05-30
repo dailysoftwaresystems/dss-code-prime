@@ -50,7 +50,13 @@ struct Lowerer {
     DiagnosticReporter&      reporter;
     HirSourceMap const*      sourceMap;   // optional — diagnostics carry spans when bound
     MirLoweringConfig const& config;      // schema-driven knobs (plan 12.5 §0.2 D3)
+    HirFfiMap const*         ffiMap;      // optional — populated by CST→HIR or FF5
+                                           // (LK6 cycle 2d, D-LK6-6).
     MirBuilder               mir;
+    // Extern symbols extracted during the pre-pass. Each extern's
+    // SymbolId is also inserted into `functionSymbols` so a `Ref`
+    // to it routes through the existing GlobalAddr emission path.
+    std::vector<ExternImport> externImports;
     // Within one function: HIR `SymbolId.v` → SSA value producer. Used for
     // params that are NOT address-taken (those stay as raw `Arg` instructions);
     // an entry is set iff the symbol resolves as a plain rvalue. A symbol is
@@ -1566,6 +1572,137 @@ struct Lowerer {
         }
     }
 
+    // Pre-pass: collect extern function SymbolIds + build per-row
+    // `ExternImport` records by consulting the optional
+    // `HirAttribute<FfiMetadata>` side-table. Extern SymbolIds are
+    // ALSO inserted into `functionSymbols` so a `Ref` to an extern
+    // routes through the existing GlobalAddr emission path —
+    // structurally a direct call to an extern produces
+    // `Call GlobalAddr(externSym), args...`, the same MIR shape as
+    // intra-module calls. The downstream LIR + assembler emit a
+    // relocation against the SymbolId and the linker resolves it
+    // against `AssembledModule.externImports` instead of
+    // `functions`. (LK6 cycle 2d — D-LK6-6 closure.)
+    //
+    // If the FFI map is absent or the per-node entry is missing,
+    // `mangledName` falls back to the HIR-declared symbol name and
+    // `libraryPath` stays empty — the linker's per-extern non-
+    // empty-`libraryPath` validation then fires loud at link time,
+    // surfacing the missing metadata rather than shipping a half-
+    // built import table. We do NOT short-circuit here so that the
+    // diagnostic surface is concentrated at the linker (a single
+    // failure mode for "unresolved extern" instead of split across
+    // every IR tier).
+    void collectExterns(HirNodeId moduleNode) {
+        // Track extern SymbolIds we've already emitted a row for, to
+        // catch duplicate-extern-declaration drift. The linker
+        // (LK6 cycle 2a) also rejects extern-table duplicates, but
+        // surfacing here keeps the source span attached to the
+        // diagnostic (silent-failure HIGH fold, LK6 cycle 2d
+        // post-fold review).
+        std::unordered_set<std::uint32_t> seenExternSyms;
+        for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+            if (hir.kind(decl) != HirKind::ExternFunction) continue;
+            TypeId const sig = hir.externFunctionSignature(decl);
+            if (!sig.valid()) {
+                // Symmetric with `collectFunctions`'s `sig.valid()`
+                // guard: a malformed extern with no FnSig has no
+                // ABI shape the assembler / linker can resolve
+                // against. Fail loud rather than emit a half-built
+                // row. (silent-failure MEDIUM fold.)
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — invalid TypeId on "
+                    "FnSig; the semantic model failed to resolve "
+                    "this extern's signature.", decl.v));
+                continue;
+            }
+            SymbolId const sym = hir.externFunctionSymbol(decl);
+            if (!sym.valid()) {
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — missing SymbolId; "
+                    "the semantic model failed to bind a symbol to "
+                    "this extern declaration.", decl.v));
+                continue;
+            }
+            if (functionSymbols.contains(sym.v)) {
+                // Cross-table ambiguity: this SymbolId is already
+                // owned by an intra-module `Function`. The linker's
+                // `LK6 cycle 2a` cross-table reject catches this
+                // too, but anchoring the diagnostic at the HIR
+                // node here preserves source-span context that the
+                // linker tier can no longer recover. (silent-
+                // failure HIGH fold.)
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — SymbolId #{} is "
+                    "already declared as an intra-module function. "
+                    "Each SymbolId must belong to either a function "
+                    "OR an extern, never both.", decl.v, sym.v));
+                continue;
+            }
+            if (!seenExternSyms.insert(sym.v).second) {
+                // Two ExternFunction decls with the same SymbolId
+                // — likely a copy-paste in the test fixture or a
+                // multi-CU SymbolId collision the semantic phase
+                // failed to disambiguate. Fail loud.
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — SymbolId #{} is "
+                    "already declared by a prior ExternFunction in "
+                    "this module.", decl.v, sym.v));
+                continue;
+            }
+            FfiMetadata const* meta = (ffiMap != nullptr)
+                ? ffiMap->tryGet(decl)
+                : nullptr;
+            // FfiMetadata population is the caller's responsibility:
+            // - CST→HIR (today, cycle 2d): not yet populating;
+            //   tests build the FFI map manually until plan 11 FF5
+            //   lands the c-subset attribution syntax.
+            // - FF5 binary ingestion: populates from .so/.dll
+            //   reads.
+            // - Missing/empty `mangledName` (the linker-visible
+            //   symbol name) is a hard error: every extern MUST
+            //   carry a name the linker can resolve against.
+            // - Missing/empty `importLibrary` is a hard error too:
+            //   without a library path the linker can't emit a
+            //   DT_NEEDED / LC_LOAD_DYLIB / IMAGE_IMPORT_DESCRIPTOR
+            //   entry — the linker's per-extern validation
+            //   (`linker.cpp`) already enforces this, but we fail
+            //   loud here so the diagnostic anchors at the HIR
+            //   node (with its source span) rather than at the
+            //   linker (where the span has been lost).
+            if (meta == nullptr || meta->mangledName.empty()) {
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — `mangledName` is "
+                    "missing from the HirAttribute<FfiMetadata> "
+                    "side-table. Every extern symbol must carry a "
+                    "non-empty mangled name (the linker's import "
+                    "table key). Plan 11 FF5 populates this from "
+                    "binary ingestion; tests must attach the "
+                    "attribute manually until then.", decl.v));
+                continue;
+            }
+            if (meta->importLibrary.empty()) {
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — `importLibrary` "
+                    "is missing from the HirAttribute<FfiMetadata> "
+                    "side-table. Every extern symbol must declare "
+                    "the dynamic library that owns it (e.g. "
+                    "'libc.so.6', 'kernel32.dll', "
+                    "'/usr/lib/libSystem.B.dylib'). Without a "
+                    "library path the linker cannot emit the "
+                    "corresponding DT_NEEDED / LC_LOAD_DYLIB / "
+                    "IMAGE_IMPORT_DESCRIPTOR entry.", decl.v));
+                continue;
+            }
+            ExternImport row;
+            row.symbol      = sym;
+            row.mangledName = meta->mangledName;
+            row.libraryPath = meta->importLibrary;
+            externImports.push_back(std::move(row));
+            functionSymbols.insert(sym.v);
+        }
+    }
+
     // Pre-pass: collect the set of module-level global symbols so that a
     // `Ref` to a global resolves to a `GlobalAddr`-then-`Load` (rvalue) or
     // a `GlobalAddr` (lvalue address). Mirrors `collectFunctions`. The
@@ -1757,6 +1894,7 @@ struct Lowerer {
         }
         collectFunctions(root);
         collectGlobals(root);
+        collectExterns(root);
         classifyGlobals(root);
         for (HirNodeId decl : hir.moduleDecls(root)) {
             HirKind const dk = hir.kind(decl);
@@ -1771,10 +1909,17 @@ struct Lowerer {
                     // for ALL runtime-init globals.
                     break;
                 case HirKind::ExternFunction:
-                    unsupported(decl, std::format(
-                        "HIR ExternFunction (id {}) — FFI symbol ingestion "
-                        "is not yet lowered", decl.v));
-                    return;
+                    // Pre-pass (`collectExterns`) already registered
+                    // the SymbolId in `functionSymbols` and pushed
+                    // an `ExternImport` row. No MIR instructions
+                    // are emitted at the decl site itself — the
+                    // declaration is pure metadata that the linker
+                    // consumes via `AssembledModule.externImports`.
+                    // Call sites referencing this extern emit
+                    // `Call GlobalAddr(externSym), args...`, same
+                    // as intra-module calls. (LK6 cycle 2d —
+                    // D-LK6-6 closure.)
+                    break;
                 case HirKind::ExternGlobal:
                     unsupported(decl, std::format(
                         "HIR ExternGlobal (id {}) — FFI symbol ingestion is "
@@ -1812,13 +1957,15 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           TypeInterner&            interner,
                           DiagnosticReporter&      reporter,
                           HirSourceMap const*      sourceMap,
-                          MirLoweringConfig const& config) {
+                          MirLoweringConfig const& config,
+                          HirFfiMap const*         ffiMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     Lowerer lwr{hir, literals, interner, reporter, sourceMap, config,
-                MirBuilder{}, {}, {}, {}, {}, {}, {}};
+                ffiMap, MirBuilder{}, {}, {}, {}, {}, {}, {}, {}};
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
+    result.externImports = std::move(lwr.externImports);
     result.ok = (reporter.errorCount() == errorsBefore);
     return result;
 }

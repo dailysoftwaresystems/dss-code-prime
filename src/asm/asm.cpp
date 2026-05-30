@@ -136,8 +136,17 @@ using lir_pass_util::report;
 AssembledModule assemble(Lir const&                 lir,
                          TargetSchema const&        schema,
                          std::span<MirInstId const> lirToMir,
-                         DiagnosticReporter&        reporter) {
+                         DiagnosticReporter&        reporter,
+                         std::span<ExternImport const> externs) {
     AssembledModule result;
+    // Copy extern descriptors verbatim so the linker can consume
+    // them. The assembler itself does not validate the contents
+    // (per-extern non-empty `mangledName` + `libraryPath` checks
+    // live on the linker side); the upstream HIR→MIR pre-pass
+    // (`collectExterns` in `hir_to_mir.cpp`) is the canonical
+    // source of these rows when threading from real source
+    // declarations (LK6 cycle 2d — D-LK6-6 closure).
+    result.externImports.assign(externs.begin(), externs.end());
     std::size_t const funcCount = lir.moduleFuncCount();
     result.expectedFuncCount = funcCount;
 

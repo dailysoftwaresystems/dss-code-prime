@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
@@ -55,6 +56,13 @@ namespace dss {
 struct DSS_EXPORT MirToLirResult {
     Lir                    lir;
     std::vector<MirInstId> lirToMir;
+    // Extern symbol descriptors propagated from `HirToMirResult.
+    // externImports` (LK6 cycle 2d — D-LK6-6 closure). LIR does
+    // not consume these structurally (call sites carry SymbolRef
+    // operands keyed by SymbolId, the same shape as intra-module
+    // calls), but the assembler needs them to populate
+    // `AssembledModule.externImports`, so we propagate verbatim.
+    std::vector<ExternImport> externImports;
     bool                   ok = true;
 };
 
@@ -77,6 +85,13 @@ struct DSS_EXPORT MirToLirResult {
 lowerToLir(Mir const&          mir,
            TargetSchema const& target,
            TypeInterner const& interner,
-           DiagnosticReporter& reporter);
+           DiagnosticReporter& reporter,
+           // Extern symbols extracted by HIR→MIR lowering
+           // (`HirToMirResult.externImports`). Propagated verbatim
+           // through the returned `MirToLirResult.externImports`;
+           // the LIR lowerer itself does not consume them
+           // structurally. Defaults to empty for static modules
+           // (LK6 cycle 2d — D-LK6-6 closure).
+           std::vector<ExternImport> externImports = {});
 
 } // namespace dss

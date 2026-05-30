@@ -1462,7 +1462,16 @@ struct Lowerer {
         if (lirToMir.size() < frozen.nodeCount()) {
             lirToMir.resize(frozen.nodeCount());
         }
-        return MirToLirResult{ std::move(frozen), std::move(lirToMir), !hadError() };
+        // Designated initializers prevent a future field reorder
+        // from silently rebinding the positional `{}` for
+        // `externImports`. (code-simplifier + code-reviewer fold,
+        // LK6 cycle 2d post-fold review.)
+        return MirToLirResult{
+            .lir           = std::move(frozen),
+            .lirToMir      = std::move(lirToMir),
+            .externImports = {},
+            .ok            = !hadError()
+        };
     }
 };
 
@@ -1471,9 +1480,12 @@ struct Lowerer {
 MirToLirResult lowerToLir(Mir const&          mir,
                           TargetSchema const& target,
                           TypeInterner const& interner,
-                          DiagnosticReporter& reporter) {
+                          DiagnosticReporter& reporter,
+                          std::vector<ExternImport> externImports) {
     Lowerer L{mir, target, interner, reporter};
-    return std::move(L).run();
+    MirToLirResult result = std::move(L).run();
+    result.externImports = std::move(externImports);
+    return result;
 }
 
 } // namespace dss

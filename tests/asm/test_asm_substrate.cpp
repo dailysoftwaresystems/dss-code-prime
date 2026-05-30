@@ -48,6 +48,45 @@ TEST(AsmSubstrate, EmptyLirProducesEmptyAssembledModule) {
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
+// ── LK6 cycle 2d: externs span flows through `assemble()` ─────────────
+
+TEST(AsmSubstrate, ExternsSpanCopiesIntoAssembledModule) {
+    // `assemble()` accepts an `std::span<ExternImport const>` and
+    // copies it verbatim into the returned module's `externImports`.
+    // Cycle-2d thread-through: the HIR→MIR pre-pass builds the
+    // vector (`HirToMirResult.externImports`), MIR→LIR propagates
+    // it, the assembler bundles it for the linker. (D-LK6-6 closure.)
+    Lir empty{};
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    std::vector<ExternImport> externs;
+    externs.push_back(ExternImport{SymbolId{99}, "printf", "libc.so.6"});
+    externs.push_back(ExternImport{SymbolId{100},
+                                   "_objc_msgSend",
+                                   "/usr/lib/libobjc.A.dylib"});
+    DiagnosticReporter rep;
+    auto result = assemble(empty, **schema, {}, rep,
+                           std::span<ExternImport const>{externs});
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(result.externImports.size(), 2u);
+    EXPECT_EQ(result.externImports[0].symbol, SymbolId{99});
+    EXPECT_EQ(result.externImports[0].mangledName, "printf");
+    EXPECT_EQ(result.externImports[0].libraryPath, "libc.so.6");
+    EXPECT_EQ(result.externImports[1].mangledName, "_objc_msgSend");
+}
+
+TEST(AsmSubstrate, DefaultExternsSpanProducesEmptyExternImports) {
+    // Backward compatibility: the 4-argument call site continues
+    // to produce an empty `externImports` vector. Every existing
+    // cycle-2a/2b/2c test path is unchanged.
+    Lir empty{};
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    DiagnosticReporter rep;
+    auto result = assemble(empty, **schema, {}, rep);
+    EXPECT_TRUE(result.externImports.empty());
+}
+
 TEST(AsmSubstrate, ForFuncByIndexOutOfRangeReturnsNullptr) {
     AssembledModule m;
     m.functions.resize(2);

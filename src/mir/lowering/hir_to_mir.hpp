@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"
@@ -9,6 +10,7 @@
 #include "mir/mir.hpp"
 
 #include <memory>
+#include <vector>
 
 // HIR → MIR lowering (plan 12 / ML2). Public entry: takes a frozen HIR
 // module (+ its literal pool) plus the CU's TypeInterner (for type-driven
@@ -27,6 +29,23 @@ namespace dss {
 // error count, so prior reporter diagnostics don't taint it.
 struct DSS_EXPORT HirToMirResult {
     Mir  mir;
+    // Extern symbol descriptors extracted from HIR's
+    // `ExternFunction` nodes during the pre-pass (LK6 cycle 2d —
+    // D-LK6-6 closure). Each row's `mangledName` + `libraryPath`
+    // come from the per-node `HirAttribute<FfiMetadata>` side-
+    // table the caller passes in. **Fail-loud contract** (the
+    // post-fold review verified the stance against the silent-
+    // failure rule): any `ExternFunction` whose FfiMap entry is
+    // missing — OR whose entry carries an empty `mangledName` or
+    // empty `importLibrary` — produces an `H_UnsupportedLowering
+    // ForKind` diagnostic anchored at the HIR node's source span,
+    // and the row is NOT pushed. This surfaces the metadata
+    // problem at the IR tier that has source-span context rather
+    // than deferring to the linker (where the span has been
+    // lost). The vector is propagated forward through
+    // `MirToLirResult.externImports` → `assemble()` →
+    // `AssembledModule.externImports`.
+    std::vector<ExternImport> externImports;
     bool ok = true;
 };
 
@@ -57,6 +76,21 @@ lowerToMir(Hir const&               hir,
            TypeInterner&            interner,
            DiagnosticReporter&      reporter,
            HirSourceMap const*      sourceMap = nullptr,
-           MirLoweringConfig const& config    = {});
+           MirLoweringConfig const& config    = {},
+           // FFI side-table — populated by the CST→HIR lowerer
+           // (or by FF5 binary ingestion) with one entry per
+           // `HirKind::ExternFunction` / `ExternGlobal` node.
+           // Optional: if nullptr the lowering fails loud on
+           // every encountered `ExternFunction` with
+           // `H_UnsupportedLoweringForKind` (the post-fold review
+           // moved the fail-loud surface here so the diagnostic
+           // anchors at the HIR node's source span rather than at
+           // the linker). Same fail-loud applies if a per-node
+           // entry is missing OR its `mangledName` /
+           // `importLibrary` is empty. Modules with no extern
+           // declarations are unaffected by the parameter and
+           // produce an empty `HirToMirResult.externImports`.
+           // (LK6 cycle 2d — D-LK6-6 closure.)
+           HirFfiMap const*         ffiMap    = nullptr);
 
 } // namespace dss

@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
@@ -133,13 +134,10 @@ struct DSS_EXPORT AssembledFunction {
 // The HIR→AssembledFunction thread-through that populates
 // these fields is anchored at plan 14 §3.1 D-LK6-6 paired with
 // plan 11 FF5 (`ingest()` populating HirAttribute<FfiMetadata>);
-// LK6 cycle 2a accepts hand-constructed `externImports` for
-// substrate tests while the upstream thread lands separately.
-struct DSS_EXPORT ExternImport {
-    SymbolId    symbol{};       // matches Relocation::target
-    std::string mangledName;    // on-binary symbol name
-    std::string libraryPath;    // owning dylib / DLL / SO
-};
+// LK6 cycle 2a accepted hand-constructed `externImports` for
+// substrate tests; LK6 cycle 2d (D-LK6-6 closed) hoists the row to
+// `core/types/extern_import.hpp` and threads it from HIR via
+// `HirAttribute<FfiMetadata>` through MIR/LIR/assembler.
 
 struct DSS_EXPORT AssembledModule {
     std::vector<AssembledFunction> functions;  // parallel-index with lir.funcAt(i)
@@ -195,6 +193,14 @@ struct DSS_EXPORT AssembledModule {
 assemble(Lir const&                 lir,
          TargetSchema const&        schema,
          std::span<MirInstId const> lirToMir,
-         DiagnosticReporter&        reporter);
+         DiagnosticReporter&        reporter,
+         // Extern symbols propagated from `MirToLirResult.
+         // externImports`. Copied verbatim into
+         // `AssembledModule.externImports` for the linker to
+         // resolve against. Defaults to empty for static modules
+         // and for legacy test call sites that construct
+         // `externImports` directly on the returned
+         // `AssembledModule`. (LK6 cycle 2d — D-LK6-6 closure.)
+         std::span<ExternImport const> externs = {});
 
 } // namespace dss

@@ -159,7 +159,7 @@ When `artifactProfile: lib`, emit a `.h` file (C-style) describing exports. Rese
 | FF2 | C header mode + parser reuse                | c-subset frontend in header mode; HIR extern-decl emission. |
 | FF3 | ABI catalog                                 | Per-tuple calling convention + layout tables; drives type lowering. |
 | FF4 | C name mangling (per-platform underscoring) | Cross-platform smoke test against real libc symbols. |
-| FF5 | `ingest()` + `HirAttribute<FfiMetadata>`    | Public entry point; CU integration; linker hand-off. |
+| FF5 | `ingest()` + `HirAttribute<FfiMetadata>`    | Public entry point; CU integration; linker hand-off. **Hand-off half ✅ landed 2026-05-30 (LK6 cycle 2d)**: the HIR `HirAttribute<FfiMetadata>` → MIR pre-pass (`collectExterns`) → MIR/LIR side-tables → assembler → linker thread-through closed via plan 14 D-LK6-6. Tests build the FFI map manually through `HirFfiMap::set(...)`. **Ingestion half ⏳ pending FF1/FF2**: `ingest(libraries, ...)` reading `.so` / `.dll` / `.dylib` / `.a` / `.lib` headers to POPULATE the FFI map for real corpora — gated on FF1 (binary readers) + FF2 (C header parser). |
 | FF6 | libc smoke test                             | End-to-end: declare `extern printf(...)`; compile + link + run a c-subset program that calls it; assert correct output on all 6 (OS × arch) targets. |
 
 Post-v1 reserved:
