@@ -609,8 +609,33 @@ TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "format": {"name":"bad-exec","kind":"elf"},
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
+    // D-LK6-3: ET_EXEC schemas MUST declare `elf.pageAlign`. The
+    // Linux kernel rejects ELF executables whose PT_LOAD p_align
+    // is smaller than the runtime page size — ARM64 / Apple
+    // Silicon configurations declare 16384 or 65536 instead of
+    // 4096, so the value cannot be hardcoded in the walker.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"no-page-align","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"odd-page-align","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 3000 },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
 }
@@ -654,7 +679,7 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "format": {"name":"forge-exec","kind":"elf"},
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_42",
       "sections":[
         {"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400},
@@ -691,7 +716,7 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "format": {"name":"bad-entry","kind":"elf"},
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_99",
       "sections":[
         {"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400},

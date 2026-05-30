@@ -306,6 +306,36 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                               "'type' must be 'rel' / 'exec' / 'dyn'");
                 }
             }
+            // `pageAlign`: PT_LOAD p_align for Exec images. Required
+            // for ET_EXEC at validate() — the kernel rejects ELF
+            // exec'd images whose p_align is smaller than the
+            // runtime page size. Each (arch × OS) schema declares
+            // its own value (D-LK6-3).
+            if (e.contains("pageAlign")) {
+                if (!e.at("pageAlign").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/elf/pageAlign",
+                              "'pageAlign' must be an integer (PT_LOAD "
+                              "p_align, e.g. 4096 for x86_64 Linux or "
+                              "65536 for ARM64-64K)");
+                } else {
+                    std::int64_t const pa =
+                        e.at("pageAlign").get<std::int64_t>();
+                    if (pa <= 0
+                     || (static_cast<std::uint64_t>(pa) &
+                         (static_cast<std::uint64_t>(pa) - 1u)) != 0u) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/elf/pageAlign",
+                                  "'pageAlign' must be a positive "
+                                  "power of two (kernel constraint: "
+                                  "p_vaddr % p_align == p_offset % "
+                                  "p_align)");
+                    } else {
+                        data.elf.pageAlign =
+                            static_cast<std::uint64_t>(pa);
+                    }
+                }
+            }
         }
     }
 

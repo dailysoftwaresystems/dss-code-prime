@@ -164,6 +164,25 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "the first instruction. Typical Linux x86_64 base "
                      "is 0x400000 (per linker convention).");
             }
+            // PT_LOAD `p_align` — the Linux kernel rejects ELF
+            // executables whose `p_align` is smaller than the
+            // runtime page size (`ENOEXEC` at exec time, silent
+            // from the toolchain's POV). x86_64 Linux uses 4 KB;
+            // ARM64 Linux on Apple Silicon / certain Graviton
+            // kernels uses 16 KB or 64 KB. Each (arch × OS) ELF
+            // exec schema declares its own value — D-LK6-3.
+            if (elf.pageAlign == 0) {
+                fail("/elf/pageAlign",
+                     "ELF ET_EXEC format must declare 'elf.pageAlign' "
+                     "(PT_LOAD p_align). The kernel rejects exec'd "
+                     "images whose p_align is smaller than the "
+                     "runtime page size. Common values: 4096 "
+                     "(x86_64 Linux, ARM64 4K pages), 16384 (Apple "
+                     "Silicon Asahi 16K), 65536 (ARM64 64K pages on "
+                     "some Graviton / embedded kernels). Declaration "
+                     "is mandatory per (arch × OS) — anchored at plan "
+                     "14 §3.1 D-LK6-3.");
+            }
         }
         // Conversely, ET_REL must NOT carry virtual addresses (they're
         // set by the LINKER at exec build time, not declared on the

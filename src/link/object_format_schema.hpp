@@ -312,6 +312,17 @@ struct DSS_EXPORT ElfIdentity {
     // D-LK1-4 closes. Default = Rel preserves LK1 cycle 1
     // schemas unchanged.
     ElfObjectType  objectType = ElfObjectType::Rel;
+    // PT_LOAD `p_align` for Exec images. The Linux kernel rejects
+    // ELF executables whose `p_align` is smaller than the runtime
+    // page size (`ENOEXEC` at `execve()` time). Common values:
+    // 0x1000 (4 KB — x86_64, ARM64 with 4K pages); 0x4000 (16 KB —
+    // Apple Silicon Asahi configurations); 0x10000 (64 KB — ARM64
+    // with CONFIG_ARM64_64K_PAGES, some AWS Graviton kernels).
+    // Default 0 surfaces as a load-time validate failure for Exec
+    // (D-LK6-3 closure) — the schema author MUST declare it
+    // explicitly per (arch × OS). ET_REL leaves this 0 (no
+    // program headers, value is unused).
+    std::uint64_t  pageAlign = 0;
 };
 
 // ── PE/COFF-specific identity block (loaded only when kind == Pe) ──

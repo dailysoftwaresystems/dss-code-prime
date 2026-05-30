@@ -537,14 +537,17 @@ encode(AssembledModule const&    module,
     };
 
     // For ET_EXEC: pad .text's file offset up to the PT_LOAD page
-    // alignment (0x1000 on x86_64 Linux). The Linux kernel enforces
-    // `p_vaddr % p_align == p_offset % p_align` on every PT_LOAD —
-    // p_vaddr is page-aligned by virtualAddress=0x401000, so
-    // p_offset must also be a multiple of 0x1000 or execve() fails
-    // with ENOEXEC (silent rejection from the toolchain's POV).
-    // Cycle 1 ET_REL doesn't have program headers and is unaffected.
-    constexpr std::uint64_t kPageSize = 0x1000;
-    if (isExec) padTo(bytes, kPageSize);
+    // alignment declared on the format schema (`fmt.elf().pageAlign`,
+    // e.g. 0x1000 for x86_64 Linux / ARM64-4K, 0x4000 for Apple
+    // Silicon Asahi, 0x10000 for ARM64-64K). The Linux kernel
+    // enforces `p_vaddr % p_align == p_offset % p_align` on every
+    // PT_LOAD — execve() fails with ENOEXEC if violated (silent
+    // from the toolchain's POV). Cycle 1 ET_REL doesn't have
+    // program headers and is unaffected. `validate()` requires
+    // non-zero `pageAlign` for Exec (D-LK6-3) so the field is
+    // never absent here.
+    std::uint64_t const pageAlign = fmt.elf().pageAlign;
+    if (isExec) padTo(bytes, pageAlign);
     layoutSection(hText, text);
     if (secRela != nullptr) layoutSection(hRela, relaText);
     layoutSection(hSymtab, symtab);
@@ -694,9 +697,11 @@ encode(AssembledModule const&    module,
         // p_filesz / p_memsz = byte length of .text
         appendU64LE(phdr, text.size());
         appendU64LE(phdr, text.size());
-        // p_align = 0x1000 (4 KB page) — required by the kernel
-        // for PT_LOAD on x86_64 Linux.
-        appendU64LE(phdr, 0x1000);
+        // p_align — declared by the format schema per (arch × OS).
+        // See the `padTo(bytes, pageAlign)` call above; both must
+        // use the SAME value or the kernel's congruence check
+        // (p_vaddr % p_align == p_offset % p_align) fails.
+        appendU64LE(phdr, pageAlign);
         std::memcpy(bytes.data() + kEhdrSize, phdr.data(),
                     kProgramHeaderSize);
     }
