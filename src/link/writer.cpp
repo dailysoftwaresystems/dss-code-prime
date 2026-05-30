@@ -22,17 +22,27 @@ void emit(DiagnosticReporter& reporter,
                           std::move(msg));
 }
 
-// Windows-safe path-to-string for diagnostic messages. `path::
-// string()` performs narrowing from `wchar_t` on Windows and
-// throws `std::system_error` when the path contains code units
-// that can't be narrowed to the current locale's ANSI codepage.
-// A throw inside the failure-reporting path would silently abort
-// the writer mid-diagnostic. `generic_string()` returns the path
-// as UTF-8-style narrow string and does not throw on non-ANSI
-// content (silent-failure-hunter MEDIUM fold, LK10 cycle 1 post-
-// fold review).
+// Windows-safe path-to-string for diagnostic messages. Both
+// `path::string()` AND `path::generic_string()` perform narrowing
+// from `wchar_t` on MSVC and CAN THROW `std::system_error` when
+// the path contains code units that can't be narrowed to the
+// current locale's ANSI codepage. A throw inside the failure-
+// reporting path would silently abort the writer mid-diagnostic.
+//
+// Safe approach: try the narrow form first; on throw, fall back
+// to `u8string()` (returns `std::u8string`, guaranteed UTF-8, never
+// throws per the C++20 spec) and reinterpret to `std::string`.
+// (silent-failure-hunter HIGH fold #2, LK10 cycle 1 post-fold #2
+// review — the post-fold #1 `generic_string()`-only fix did not
+// fully close the Windows throw hazard.)
 [[nodiscard]] std::string pathForDiag(std::filesystem::path const& p) {
-    return p.generic_string();
+    try {
+        return p.generic_string();
+    } catch (...) {
+        auto const u8 = p.u8string();
+        return std::string(reinterpret_cast<char const*>(u8.data()),
+                           u8.size());
+    }
 }
 
 } // namespace
@@ -65,11 +75,15 @@ bool writeImage(LinkedImage const&             image,
     // true but bytes are empty, the walker is contract-broken.
     // Surface here.
     if (image.bytes.empty()) {
-        emit(reporter, DiagnosticCode::K_ImageNotOk,
+        emit(reporter, DiagnosticCode::K_ImageEmpty,
              std::string{"link::writeImage: LinkedImage.bytes is "
                          "empty despite ok() == true — the walker "
-                         "produced no output. Substrate invariant "
-                         "violation."});
+                         "returned success with no output. "
+                         "Substrate contract violation; fix the "
+                         "walker, not the caller. (Type-design "
+                         "split: distinct from K_ImageNotOk which "
+                         "signals upstream walker failure that "
+                         "already raised a diagnostic.)"});
         return false;
     }
     // Precondition 2: parent directory exists.

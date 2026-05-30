@@ -29,6 +29,11 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -48,11 +53,22 @@ class ScratchDir {
 public:
     ScratchDir() {
         static std::atomic<std::uint64_t> counter{0};
+        // PID-seed the path so parallel `ctest -j` runs (which
+        // execute test binaries in separate processes against the
+        // same `temp_directory_path()`) don't share scratch paths
+        // and race on `remove_all` in dtors. (silent-failure LOW
+        // fold, LK10 cycle 1 post-fold #2 review.)
+#ifdef _WIN32
+        auto const pid = static_cast<std::uint64_t>(_getpid());
+#else
+        auto const pid = static_cast<std::uint64_t>(getpid());
+#endif
         auto const base = fs::temp_directory_path()
                           / "dss-link-writer-test";
         std::error_code ec;
         fs::create_directories(base, ec);
-        path_ = base / std::to_string(counter.fetch_add(1));
+        path_ = base / (std::to_string(pid) + "-"
+                        + std::to_string(counter.fetch_add(1)));
         fs::create_directories(path_, ec);
     }
     ~ScratchDir() {
@@ -162,12 +178,15 @@ TEST(LinkWriter, RejectsImageWithOkFalse) {
 }
 
 TEST(LinkWriter, RejectsEmptyBytes) {
+    // Walker contract violation (ok() == true but no bytes) maps
+    // to K_ImageEmpty (0x800B) — type-design post-fold #2 split
+    // from K_ImageNotOk to give walker-bug-vs-caller-bug
+    // remediations distinct dispatchable codes.
     ScratchDir scratch;
     LinkedImage image;
     image.format = ObjectFormatKind::Elf;
     image.expectedFuncCount = 1;
     image.resolvedFuncCount = 1;
-    // bytes left empty — substrate invariant violation
     ASSERT_TRUE(image.ok());
     ASSERT_TRUE(image.bytes.empty());
 
@@ -175,7 +194,43 @@ TEST(LinkWriter, RejectsEmptyBytes) {
     EXPECT_FALSE(linker::writeImage(image, scratch.path() / "noop.bin", rep));
     bool sawCode = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_ImageNotOk) sawCode = true;
+        if (d.code == DiagnosticCode::K_ImageEmpty) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}
+
+TEST(LinkWriter, RejectsParentComponentIsAFile) {
+    // pr-test-analyzer FOLD-NOW: the `exists()` ec-error branch
+    // at writer.cpp's parent-dir check is distinct from `!exists`.
+    // Reached on most platforms when an intermediate path
+    // component is a regular file (e.g. `/tmp/file.txt/child.bin`).
+    // `exists()` returns false (not an error) on POSIX, but
+    // `parent_path()` of `file.txt/child.bin` IS `file.txt`,
+    // which exists as a non-directory — the subsequent open()
+    // will fail with K_ImageWriteOpenFailed. The ec arm is
+    // platform-specific; on Windows certain reserved names in
+    // the parent trigger it. This test pins the K_* code dispatch
+    // for the typical "parent is a file" case.
+    ScratchDir scratch;
+    auto const fileAsParent = scratch.path() / "regular.txt";
+    {
+        std::ofstream f(fileAsParent);
+        f << "i am a file, not a directory\n";
+    }
+    auto const bad = fileAsParent / "child.bin";
+    auto const image = makeImage({0x42});
+    DiagnosticReporter rep;
+    EXPECT_FALSE(linker::writeImage(image, bad, rep));
+    // Either ParentMissing (exists returns false for non-dir
+    // parent on some platforms) or OpenFailed (parent exists but
+    // open of child fails). Both are valid fail-loud outcomes —
+    // pin that one of them fires (NOT silent success).
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_ImageWriteParentMissing
+         || d.code == DiagnosticCode::K_ImageWriteOpenFailed) {
+            sawCode = true;
+        }
     }
     EXPECT_TRUE(sawCode);
 }

@@ -494,7 +494,14 @@ enum class DiagnosticCode : std::uint16_t {
     //   failed upstream). The walker already emitted a diagnostic
     //   for the actual failure — this code surfaces the
     //   contract-violation at the write surface so a misconfigured
-    //   build script can't bypass the gate.
+    //   build script can't bypass the gate. Remediation: check
+    //   `reporter.errorCount()` before calling writeImage.
+    // K_ImageEmpty: `linker::writeImage()` saw `ok() == true` but
+    //   `bytes.empty()` — distinct from K_ImageNotOk in that the
+    //   parallel-index gate PASSED, so this is a walker contract
+    //   violation (the walker returned success with no output).
+    //   Remediation: fix the walker, not the caller. Type-design
+    //   post-fold split (LK10 cycle 1 post-fold #2 review).
     // K_ImageWriteParentMissing: parent directory of the output
     //   path doesn't exist. Caller responsibility — the substrate
     //   does not auto-create paths (silent mkdir masks config
@@ -521,6 +528,7 @@ enum class DiagnosticCode : std::uint16_t {
     K_ImageWriteOpenFailed         = 0x8008,
     K_ImageWriteShort              = 0x8009,
     K_ImageWriteCloseFailed        = 0x800A,
+    K_ImageEmpty                   = 0x800B,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

@@ -39,9 +39,14 @@ namespace dss::linker {
 
 // Write `image.bytes` to `path`, truncating any existing file.
 // Returns `true` iff the bytes landed on disk. On failure, emits
-// `K_ImageWriteFailure` into `reporter` with a message naming the
-// specific failure mode (parent-dir-missing / open-failed /
-// write-failed / image-not-ok) and returns `false`.
+// one of six remediation-distinct K_* codes into `reporter` and
+// returns `false`:
+//   * `K_ImageNotOk`               — `image.ok() == false`
+//   * `K_ImageEmpty`               — `ok() == true` but bytes empty
+//   * `K_ImageWriteParentMissing`  — parent dir absent
+//   * `K_ImageWriteOpenFailed`     — open() failbit
+//   * `K_ImageWriteShort`          — write() mid-stream failbit
+//   * `K_ImageWriteCloseFailed`    — close() flush failbit
 //
 // Three preconditions enforced:
 //   * `image.ok()` — parallel-index gate. Writing a half-built
