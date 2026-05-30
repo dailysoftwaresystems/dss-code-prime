@@ -16,3 +16,6 @@ dss_add_test(NAME link/test_wasm_writer          SOURCES test_wasm_writer.cpp)
 
 # Plan 14 LK9 — SPIR-V module writer (skeleton).
 dss_add_test(NAME link/test_spirv_writer         SOURCES test_spirv_writer.cpp)
+
+# Plan 14 LK10 cycle 1 — file-emission substrate.
+dss_add_test(NAME link/test_link_writer          SOURCES test_link_writer.cpp)

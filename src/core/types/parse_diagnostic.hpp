@@ -489,11 +489,38 @@ enum class DiagnosticCode : std::uint16_t {
     //   for this kind") — the dispatch IS correct here, but the caller
     //   wired the wrong shape of input. (type-design fold, LK8
     //   post-fold review.)
+    // K_ImageNotOk: `linker::writeImage()` refused to write a
+    //   LinkedImage whose `ok()` is false (parallel-index gate
+    //   failed upstream). The walker already emitted a diagnostic
+    //   for the actual failure — this code surfaces the
+    //   contract-violation at the write surface so a misconfigured
+    //   build script can't bypass the gate.
+    // K_ImageWriteParentMissing: parent directory of the output
+    //   path doesn't exist. Caller responsibility — the substrate
+    //   does not auto-create paths (silent mkdir masks config
+    //   errors that ship artifacts to the wrong target dir).
+    // K_ImageWriteOpenFailed: `std::ofstream::open()` set failbit.
+    //   Causes: permission denied, path is a directory, invalid
+    //   filename, parent dir vanished post-`exists()`-check (TOCTOU
+    //   race).
+    // K_ImageWriteShort: write returned with failbit after starting
+    //   — disk full, I/O error mid-write.
+    // K_ImageWriteCloseFailed: `close()` set failbit while flushing
+    //   buffered writes. The bytes may be partially or fully on
+    //   disk; the file is in an unknown state.
+    // All five codes added plan 14 LK10 cycle 1; type-design
+    // post-fold split from one generic code into four
+    // remediation-distinct codes for log triage.
     K_SymbolUndefined              = 0x8001,
     K_RelocationKindMismatch       = 0x8002,
     K_NoMatchingObjectFormat       = 0x8003,
     K_FormatLacksImportSupport     = 0x8004,
     K_WalkerInputContractViolation = 0x8005,
+    K_ImageNotOk                   = 0x8006,
+    K_ImageWriteParentMissing      = 0x8007,
+    K_ImageWriteOpenFailed         = 0x8008,
+    K_ImageWriteShort              = 0x8009,
+    K_ImageWriteCloseFailed        = 0x800A,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

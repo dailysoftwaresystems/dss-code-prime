@@ -7,6 +7,7 @@ add_library(link OBJECT
     format/macho.cpp
     format/spirv.cpp
     format/wasm.cpp
+    writer.cpp
 )
 
 target_include_directories(link PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

@@ -1,0 +1,66 @@
+#pragma once
+
+#include "core/export.hpp"
+#include "core/types/diagnostic_reporter.hpp"
+#include "link/linker.hpp"
+
+#include <filesystem>
+
+// Linker image file emission — plan 14 LK10 cycle 1 substrate.
+//
+// Bridges `link()`'s in-memory `LinkedImage::bytes` to a real
+// on-disk artifact. The hermetic-acceptance gate (LK10 full) needs
+// this so the build pipeline can produce a runnable `.exe` /
+// `.o` / `.dylib` / `.wasm` / `.spv` file without shelling out to
+// a system linker; cycle 1 lands the substrate, cycle 2 wires it
+// into the driver's `compileFiles` / `compileProject` entry
+// points + CLI argument routing (anchored at plan 14 §3 LK10 row).
+//
+// Namespace `dss::linker` (NOT `dss::link` — the latter collides
+// with the `dss::link()` linker entry-point function in
+// `linker.hpp`). The architect-anchored D-LK9-2 fold will move
+// the free function to `dss::linker::link()` when LK10 cycle 2
+// wires the driver pipeline; until then, the writer co-exists
+// in this namespace alongside the future renamed `link()`.
+//
+// The function deliberately leaves three concerns to the caller:
+//   * Format/target selection — already encoded in the `Linked
+//     Image::format` discriminator + the JSON the caller loaded.
+//   * File-extension policy — `.exe` vs `.dll` vs `.o` etc. lives
+//     in the artifact profile (plan 6) / driver layer, not here.
+//     The caller hands us a fully-qualified path.
+//   * Parent-directory creation — `std::filesystem::create_
+//     directories` is the caller's responsibility. We fail loud
+//     rather than silently creating arbitrary paths (a substrate
+//     that silently mkdir's would mask config errors that ship
+//     binaries to the wrong target dir).
+
+namespace dss::linker {
+
+// Write `image.bytes` to `path`, truncating any existing file.
+// Returns `true` iff the bytes landed on disk. On failure, emits
+// `K_ImageWriteFailure` into `reporter` with a message naming the
+// specific failure mode (parent-dir-missing / open-failed /
+// write-failed / image-not-ok) and returns `false`.
+//
+// Three preconditions enforced:
+//   * `image.ok()` — parallel-index gate. Writing a half-built
+//     image would silently produce a corrupt artifact whose
+//     `expectedFuncCount != resolvedFuncCount`; we reject at the
+//     write surface.
+//   * `!image.bytes.empty()` — every shipping format produces at
+//     least a header (8 bytes for WASM, 20 for SPIR-V, 64+ for
+//     ELF/PE/MachO). Empty bytes are a substrate failure.
+//   * `path.parent_path()` exists (or `path` is in the current
+//     working directory).
+//
+// The format discriminator on `image.format` is NOT consulted to
+// pick a file extension — the caller fully owns the path. This
+// keeps the substrate format-blind in the same shape as the
+// rest of plan 14's substrate.
+[[nodiscard]] DSS_EXPORT bool
+writeImage(LinkedImage const&             image,
+           std::filesystem::path const&   path,
+           DiagnosticReporter&            reporter);
+
+} // namespace dss::linker
