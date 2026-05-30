@@ -5,6 +5,7 @@ add_library(link OBJECT
     format/elf.cpp
     format/pe.cpp
     format/macho.cpp
+    format/spirv.cpp
     format/wasm.cpp
 )
 

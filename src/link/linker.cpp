@@ -4,6 +4,7 @@
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
 #include "link/format/pe.hpp"
+#include "link/format/spirv.hpp"
 #include "link/format/wasm.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -229,16 +230,13 @@ LinkedImage link(AssembledModule const&    module,
                                    objectFormatSchema, reporter);
         break;
     case ObjectFormatKind::Spirv:
-        // SPIR-V walker arrives in plan 17 (LK9). Fail loud
-        // rather than silently producing empty bytes — same
-        // substrate discipline the assembler's
-        // `A_NoEncodingShapeWalker` enforces.
-        report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-               DiagnosticSeverity::Error,
-               std::string{"linker: no walker registered for object format "
-                           "kind '"}
-                   + std::string{objectFormatKindName(objectFormatSchema.kind())}
-                   + "' (plan 14 LK9 hook / plan 17 owner)");
+        // LK9 skeleton: emits the 5-word SPIR-V module header
+        // (magic + version + generator + bound + reserved) per
+        // SPIR-V Spec §2.3. Plan 17 fills the instruction stream;
+        // this walker is the substrate plumb-through that proves
+        // the format-blind dispatch routes SPIR-V correctly.
+        image.bytes = spirv::encode(module, targetSchema,
+                                    objectFormatSchema, reporter);
         break;
     }
 

@@ -1,0 +1,11 @@
+{
+  "$comment": "SPIR-V 1.6 module format. First SPIR-V schema (plan 14 LK9, 2026-05-30). Consumed by `src/link/format/spirv.cpp` via the format-blind linker engine. LK9 ships the linker SKELETON only — the walker emits the 5-word (20-byte) module header per SPIR-V Spec §2.3 (magic 0x07230203 + version 0x00010600 + generator 0 + bound 0 + reserved 0); plan 17 (MIR→SPIR-V) fills the OpCapability / OpExtension / OpMemoryModel / OpEntryPoint / OpTypeFunction / Op* instruction stream. No `sections[]` declared because SPIR-V emits no sections (the entire module after the header is one typed instruction stream); the universal-field reject in the JSON loader (added at LK8 post-fold) enforces this absence. No `relocations[]` because SPIR-V has no traditional native-style relocations — intra-module references are `<id>`s resolved by the GPU driver at module-load time.",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "spirv-1.6",
+    "version": "1.6",
+    "kind": "spirv"
+  }
+}

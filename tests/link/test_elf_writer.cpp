@@ -359,12 +359,15 @@ loadStubFormat(std::string_view kindName) {
 
 } // namespace
 
-// Note: the Pe arm has a real walker now (`src/link/format/pe.cpp`,
-// LK2 cycle 1); the MachO arm has a real walker (`src/link/format/
-// macho.cpp`, LK3 cycle 1). The no-walker-registered dispatch path
-// is exercised by the Wasm/Spirv arms below; PE end-to-end coverage
-// lives in `tests/link/test_pe_writer.cpp`; Mach-O coverage lives
-// in `tests/link/test_macho_writer.cpp`.
+// Note: ALL five `ObjectFormatKind` arms now have real walkers
+// (Pe: LK2 cycle 1; MachO: LK3 cycle 1; Wasm: LK8 skeleton; Spirv:
+// LK9 skeleton — both skeletons emit format-spec module headers
+// and route walker-input-contract violations to
+// `K_WalkerInputContractViolation`). The closed-enum dispatch in
+// `linker.cpp` has no no-walker-registered path other than the
+// `Unknown` sentinel. PE end-to-end coverage lives in
+// `tests/link/test_pe_writer.cpp`; Mach-O in `test_macho_writer.cpp`;
+// Wasm in `test_wasm_writer.cpp`; Spirv in `test_spirv_writer.cpp`.
 
 TEST(LinkerEndToEnd, WasmFormatDispatchRoutesToWalker) {
     // LK8 (landed 2026-05-30): Wasm arm now dispatches to the
@@ -389,7 +392,13 @@ TEST(LinkerEndToEnd, WasmFormatDispatchRoutesToWalker) {
     EXPECT_TRUE(sawCode);
 }
 
-TEST(LinkerEndToEnd, SpirvFormatDispatchEmitsK_NoMatchingObjectFormat) {
+TEST(LinkerEndToEnd, SpirvFormatDispatchRoutesToWalker) {
+    // LK9 (landed 2026-05-30): Spirv arm now dispatches to the
+    // spirv::encode walker (20-byte module header per SPIR-V Spec
+    // §2.3). A native-ISA-bytes-bearing AssembledModule routed
+    // here triggers K_WalkerInputContractViolation (0x8005) —
+    // the LK9 skeleton's input-contract guard for
+    // !functions.empty(). Symmetric with LK8's WASM gate.
     auto loaded = loadShipped();
     auto s = loadStubFormat("spirv");
     ASSERT_TRUE(s);
@@ -399,7 +408,8 @@ TEST(LinkerEndToEnd, SpirvFormatDispatchEmitsK_NoMatchingObjectFormat) {
     EXPECT_TRUE(image.bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
+        if (d.code == DiagnosticCode::K_WalkerInputContractViolation)
+            sawCode = true;
     }
     EXPECT_TRUE(sawCode);
 }

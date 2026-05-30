@@ -6,6 +6,8 @@
 // REQUIRED fold, post-fold review). Mirrors tests/asm/asm_test_
 // support.hpp precedent.
 
+#include "link_test_support.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -114,19 +116,18 @@ findSection(std::span<std::uint8_t const> bytes,
     return std::nullopt;
 }
 
-inline std::uint64_t readU64LE(std::span<std::uint8_t const> bytes,
-                                 std::size_t off) {
-    std::uint64_t v = 0;
-    for (int b = 0; b < 8; ++b)
-        v |= static_cast<std::uint64_t>(bytes[off + b]) << (b * 8);
-    return v;
-}
+// readU32LE / readU64LE re-exported from the shared
+// `link_test_support.hpp` substrate (LK9 post-fold review — 3rd-
+// consumer threshold reached via spirv test). Keeping the old
+// `dss::macho::test::readU32LE` symbol alive avoids breaking
+// existing Mach-O test files.
 inline std::uint32_t readU32LE(std::span<std::uint8_t const> bytes,
-                                 std::size_t off) {
-    return static_cast<std::uint32_t>(bytes[off]) |
-           (static_cast<std::uint32_t>(bytes[off+1]) << 8) |
-           (static_cast<std::uint32_t>(bytes[off+2]) << 16) |
-           (static_cast<std::uint32_t>(bytes[off+3]) << 24);
+                                std::size_t off) {
+    return dss::link_format::test::readU32LE(bytes, off);
+}
+inline std::uint64_t readU64LE(std::span<std::uint8_t const> bytes,
+                                std::size_t off) {
+    return dss::link_format::test::readU64LE(bytes, off);
 }
 
 }  // namespace dss::macho::test
