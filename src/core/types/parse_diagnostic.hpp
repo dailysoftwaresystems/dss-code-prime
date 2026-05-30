@@ -467,9 +467,17 @@ enum class DiagnosticCode : std::uint16_t {
     //      ShStrtab — any missing row fires this code; PE and
     //      Mach-O writers only require SectionKind::Text since
     //      their symbol/string tables don't carry section headers).
+    // K_FormatLacksImportSupport: a format walker received an
+    //   AssembledModule with non-empty `externImports` but its
+    //   image-side arm doesn't yet emit import tables. LK6 cycle 2a
+    //   ships PE IAT only; ELF GOT/PLT arm anchored at D-LK6-4 and
+    //   Mach-O LC_DYLD_INFO arm anchored at D-LK6-5. Format walkers
+    //   that don't support extern imports fire this loud rather
+    //   than silently producing a binary missing its import table.
     K_SymbolUndefined              = 0x8001,
     K_RelocationKindMismatch       = 0x8002,
     K_NoMatchingObjectFormat       = 0x8003,
+    K_FormatLacksImportSupport     = 0x8004,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

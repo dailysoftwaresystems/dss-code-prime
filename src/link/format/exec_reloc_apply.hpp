@@ -19,23 +19,33 @@
 // Mach-O MH_EXECUTE). Closes simplifier #1 + #2 + architect O5
 // 3-agent convergence from the LK2+LK3 cycle 2 review.
 //
+// LK6 cycle 2a generalisation: the caller now passes an
+// **absolute symbol-VA map** (`symbolVa: SymbolId → uint64_t`)
+// rather than a section-relative offset map + sectionVa add. This
+// is the substrate shape that supports extern imports: an
+// `ExternImport` symbol's VA points into `.idata` (PE) / `.got`
+// (ELF) / __got (Mach-O) — a different section than the patch
+// site's `.text`. With absolute VAs, the kernel doesn't care what
+// section a target lives in.
+//
 // The kernel reads exclusively from `TargetRelocationInfo` (the LK6
 // cycle 1 structured-formula triple: `pcRelative` + `addendBias` +
 // `widthBytes`). Object-format-specific knowledge stays in each
-// walker: the caller passes `sectionVa` (the runtime VA of the
-// section's base — ELF: `secText->virtualAddress`; PE: `ImageBase +
-// RVA`; Mach-O: `secText.virtualAddress`) and a `diagPrefix` that
-// fronts every diagnostic with the format's identity.
+// walker: the caller pre-computes `symbolVa` for both intra-module
+// functions AND extern imports, plus `patchSectionVa` (the runtime
+// VA of the section containing the patch sites — `.text` in cycle
+// scope), and a `diagPrefix` that fronts every diagnostic with the
+// format's identity.
 //
 // Patch formula (uniform across all 3 formats):
 //   value = S + A + (pcRelative ? -P : 0) + addendBias
-// where S = `sectionVa + offset(target)`, A = `Relocation::addend`,
-// P = `sectionVa + funcStart + Relocation::offset`. The `value` is
-// written `widthBytes` LE into `text` at the patch site.
+// where S = `symbolVa[target]`, A = `Relocation::addend`,
+// P = `patchSectionVa + funcStart + Relocation::offset`. The
+// `value` is written `widthBytes` LE into `text` at the patch site.
 //
 // Fail-loud guards (each surfaces as a single diagnostic and
 // returns false):
-//   * extern symbol target           → K_SymbolUndefined  (D-LK6-2)
+//   * unresolved symbol target       → K_SymbolUndefined  (D-LK6-2)
 //   * kind unregistered (target)     → K_RelocationKindMismatch
 //   * widthBytes == 0                → K_RelocationKindMismatch (D-LK6-1)
 //   * rel.offset + width > fn.bytes  → K_RelocationKindMismatch
@@ -51,9 +61,9 @@ namespace dss::link::format {
     std::vector<std::uint8_t>&  text,
     AssembledModule const&      module,
     std::span<std::uint64_t const> funcTextStart,
-    std::unordered_map<SymbolId, std::uint64_t> const& textOffsetBySym,
+    std::unordered_map<SymbolId, std::uint64_t> const& symbolVa,
     TargetSchema const&         targetSchema,
-    std::uint64_t               sectionVa,
+    std::uint64_t               patchSectionVa,
     std::string_view            diagPrefix,
     DiagnosticReporter&         reporter) {
     using ::dss::link::format::detail::emit;
@@ -72,9 +82,10 @@ namespace dss::link::format {
         auto const& fn = module.functions[fi];
         std::uint64_t const fnStart = funcTextStart[fi];
         for (auto const& rel : fn.relocations) {
-            // (1) intra-module target
-            auto const tIt = textOffsetBySym.find(rel.target);
-            if (tIt == textOffsetBySym.end()) {
+            // (1) target resolves in caller-provided VA map
+            //     (intra-module function + extern import slot)
+            auto const tIt = symbolVa.find(rel.target);
+            if (tIt == symbolVa.end()) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      prefixStr + ": relocation target symbol #"
                            + std::to_string(rel.target.v)
@@ -119,11 +130,15 @@ namespace dss::link::format {
                            + " — would overrun adjacent function.");
                 return false;
             }
-            // (5) compute value
+            // (5) compute value — S is absolute (caller pre-computed
+            //     the symbol VA, which may live in `.text` for
+            //     functions or `.idata` / GOT / __got for externs);
+            //     P is the patch site VA, always inside the
+            //     `patchSectionVa` section in cycle 2a scope.
             std::uint64_t const patchOff = fnStart + rel.offset;
-            std::uint64_t const S = sectionVa + tIt->second;
+            std::uint64_t const S = tIt->second;
             std::int64_t  const A = rel.addend;
-            std::uint64_t const P = sectionVa + patchOff;
+            std::uint64_t const P = patchSectionVa + patchOff;
             std::int64_t  const value =
                 static_cast<std::int64_t>(S) + A
                 + (tri->pcRelative ? -static_cast<std::int64_t>(P) : 0)

@@ -818,3 +818,373 @@ TEST(PeExecWriter, DisplacementOverflowFailsLoud) {
     }
     EXPECT_TRUE(sawCode);
 }
+
+// ── LK6 cycle 2a: FFI extern imports via .idata / IAT ──────────
+
+namespace {
+[[nodiscard]] AssembledModule makeModuleWithOneExtern(
+    std::vector<std::uint8_t> bytes,
+    std::uint32_t             fnSym,
+    std::uint32_t             externSym,
+    std::int64_t              relOffset) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{fnSym};
+    fn.bytes  = std::move(bytes);
+    Relocation rel;
+    rel.offset = relOffset;
+    rel.target = SymbolId{externSym};
+    rel.kind   = RelocationKind{1};  // rel32
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+
+    ExternImport imp;
+    imp.symbol      = SymbolId{externSym};
+    imp.mangledName = "ExitProcess";
+    imp.libraryPath = "kernel32.dll";
+    mod.externImports.push_back(std::move(imp));
+    return mod;
+}
+} // namespace
+
+TEST(PeExecWriter, ExternImportProducesIDataSectionAndPatchesReloc) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeModuleWithOneExtern(
+        {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3}, 1, 99, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // NumberOfSections = 2 (.text + .idata)
+    EXPECT_EQ(readU16LE(bytes, 0x86), 2u);
+
+    // IMAGE_DATA_DIRECTORY[1] (Import Table) RVA + Size populated.
+    std::uint32_t const importDirRva = readU32LE(bytes, 0x110);
+    EXPECT_NE(importDirRva, 0u);
+    EXPECT_EQ(readU32LE(bytes, 0x114), 40u);  // 1 lib + null = 40 B
+
+    // IMAGE_DATA_DIRECTORY[12] (IAT) RVA populated.
+    std::uint32_t const iatDirRva = readU32LE(bytes, 0x108 + 12*8);
+    EXPECT_NE(iatDirRva, 0u);
+
+    // ImageImportDescriptor[0].FirstThunk @ +16 == iatDirRva.
+    constexpr std::size_t kSecondSecHdr = 0x188 + 40;
+    std::uint32_t const idataFileOff =
+        readU32LE(bytes, kSecondSecHdr + 20);
+    ASSERT_NE(idataFileOff, 0u);
+    EXPECT_EQ(readU32LE(bytes, idataFileOff + 16), iatDirRva);
+
+    // Terminator descriptor — next 20 bytes all zero.
+    for (std::size_t i = 0; i < 20; ++i) {
+        EXPECT_EQ(bytes[idataFileOff + 20 + i], 0u);
+    }
+
+    // REL32 patched in .text: value = iatDirRva - 0x1001 - 4.
+    constexpr std::size_t kFirstSecHdr = 0x188;
+    std::uint32_t const textFileOff =
+        readU32LE(bytes, kFirstSecHdr + 20);
+    std::int32_t const expected =
+        static_cast<std::int32_t>(iatDirRva) - 0x1001 - 4;
+    EXPECT_EQ(readU32LE(bytes, textFileOff + 1),
+              static_cast<std::uint32_t>(expected));
+    EXPECT_EQ(bytes[textFileOff + 5], 0xC3u);
+}
+
+TEST(PeExecWriter, IDataContainsExitProcessNameAndKernel32DllName) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeModuleWithOneExtern(
+        {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    constexpr std::size_t kSecondSecHdr = 0x188 + 40;
+    std::uint32_t const idataFileOff =
+        readU32LE(bytes, kSecondSecHdr + 20);
+    std::uint32_t const idataSize =
+        readU32LE(bytes, kSecondSecHdr + 16);
+    std::string_view hay{
+        reinterpret_cast<char const*>(bytes.data() + idataFileOff),
+        idataSize};
+    EXPECT_NE(hay.find("ExitProcess"), std::string_view::npos);
+    EXPECT_NE(hay.find("kernel32.dll"), std::string_view::npos);
+}
+
+TEST(PeExecWriter, NoExternImportsEmitsSingleSection) {
+    // Regression: when externImports is empty, the walker emits
+    // ONLY .text (no .idata) and IMAGE_DATA_DIRECTORY[1] stays 0.
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(readU16LE(bytes, 0x86), 1u);
+    EXPECT_EQ(readU32LE(bytes, 0x110), 0u);
+    EXPECT_EQ(readU32LE(bytes, 0x114), 0u);
+}
+
+// ── Post-audit folds (test-analyzer + code-reviewer convergences) ──
+
+TEST(PeExecWriter, IltAndIatHoldIdenticalThunksAtFileImageTime) {
+    // PE/COFF §6.4: ILT[i] and IAT[i] hold the same HINT/NAME RVA
+    // at file image time; the loader patches IAT in-place at load.
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeModuleWithOneExtern(
+        {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Read ImageImportDescriptor[0] @ idata + 0:
+    //   OriginalFirstThunk (ILT RVA) @ +0
+    //   FirstThunk         (IAT RVA) @ +16
+    constexpr std::size_t kSecondSecHdr = 0x188 + 40;
+    std::uint32_t const idataFileOff =
+        readU32LE(bytes, kSecondSecHdr + 20);
+    std::uint32_t const idataVa =
+        readU32LE(bytes, kSecondSecHdr + 12);
+    std::uint32_t const iltRva = readU32LE(bytes, idataFileOff + 0);
+    std::uint32_t const iatRva = readU32LE(bytes, idataFileOff + 16);
+    std::size_t const iltFileOff = idataFileOff + (iltRva - idataVa);
+    std::size_t const iatFileOff = idataFileOff + (iatRva - idataVa);
+    // Both 8-byte thunks must be byte-identical (point to same
+    // HINT/NAME entry).
+    for (std::size_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(bytes[iltFileOff + i], bytes[iatFileOff + i]);
+    }
+    // ILT/IAT terminators (next u64 after the single thunk) are 0.
+    for (std::size_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(bytes[iltFileOff + 8 + i], 0u);
+        EXPECT_EQ(bytes[iatFileOff + 8 + i], 0u);
+    }
+}
+
+TEST(PeExecWriter, MultipleExternsInOneLibraryProduceDistinctIatSlots) {
+    // test-analyzer #1: with 2 externs in one library, slotIdx
+    // must advance by kThunkSize (=8). A bug that uses
+    // descriptor-size 20 instead of thunk-size 8 would land
+    // ExitProcess at the same IAT slot as GetStdHandle.
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8,0,0,0,0, 0xE8,0,0,0,0, 0xC3};
+    Relocation r1; r1.offset = 1; r1.target = SymbolId{10};
+    r1.kind = RelocationKind{1};
+    Relocation r2; r2.offset = 6; r2.target = SymbolId{11};
+    r2.kind = RelocationKind{1};
+    fn.relocations.push_back(r1);
+    fn.relocations.push_back(r2);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{10}, "ExitProcess",  "kernel32.dll"});
+    mod.externImports.push_back(
+        ExternImport{SymbolId{11}, "GetStdHandle", "kernel32.dll"});
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(readU16LE(bytes, 0x86), 2u);
+    // 1 lib + null terminator descriptor = 2 × 20 = 40
+    EXPECT_EQ(readU32LE(bytes, 0x114), 40u);
+    // IAT directory size = 2 externs + 1 terminator slot = 3 * 8.
+    EXPECT_EQ(readU32LE(bytes, 0x108 + 12*8 + 4), 24u);
+    // Two distinct HINT/NAME entries → ExitProcess and GetStdHandle.
+    constexpr std::size_t kSecondSecHdr = 0x188 + 40;
+    std::uint32_t const idataFileOff =
+        readU32LE(bytes, kSecondSecHdr + 20);
+    std::uint32_t const idataSize =
+        readU32LE(bytes, kSecondSecHdr + 16);
+    std::string_view hay{
+        reinterpret_cast<char const*>(bytes.data() + idataFileOff),
+        idataSize};
+    EXPECT_NE(hay.find("ExitProcess"),  std::string_view::npos);
+    EXPECT_NE(hay.find("GetStdHandle"), std::string_view::npos);
+}
+
+TEST(PeExecWriter, MultipleLibrariesEachWithOneExtern) {
+    // test-analyzer #2: with 2 libraries, descriptorBlockSize =
+    // 3 × 20 = 60 — NOT 8-aligned. code-reviewer #1: walker pads
+    // up to 8 before ILT/IAT (idata buffer zero-initialised, pad
+    // stays 0). Verify the IAT-block stride works and both DLL
+    // names land in the table.
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8,0,0,0,0, 0xE8,0,0,0,0, 0xC3};
+    Relocation r1; r1.offset = 1; r1.target = SymbolId{10};
+    r1.kind = RelocationKind{1};
+    Relocation r2; r2.offset = 6; r2.target = SymbolId{11};
+    r2.kind = RelocationKind{1};
+    fn.relocations.push_back(r1);
+    fn.relocations.push_back(r2);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{10}, "ExitProcess", "kernel32.dll"});
+    mod.externImports.push_back(
+        ExternImport{SymbolId{11}, "printf",      "msvcrt.dll"});
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // 2 libs + null terminator = 3 × 20 = 60
+    EXPECT_EQ(readU32LE(bytes, 0x114), 60u);
+    // IAT total: 2 libs × (1 extern + 1 terminator) × 8 = 32
+    EXPECT_EQ(readU32LE(bytes, 0x108 + 12*8 + 4), 32u);
+    constexpr std::size_t kSecondSecHdr = 0x188 + 40;
+    std::uint32_t const idataFileOff =
+        readU32LE(bytes, kSecondSecHdr + 20);
+    std::uint32_t const idataSize =
+        readU32LE(bytes, kSecondSecHdr + 16);
+    std::string_view hay{
+        reinterpret_cast<char const*>(bytes.data() + idataFileOff),
+        idataSize};
+    EXPECT_NE(hay.find("kernel32.dll"), std::string_view::npos);
+    EXPECT_NE(hay.find("msvcrt.dll"),   std::string_view::npos);
+    EXPECT_NE(hay.find("ExitProcess"),  std::string_view::npos);
+    EXPECT_NE(hay.find("printf"),       std::string_view::npos);
+}
+
+TEST(PeExecWriter, MixedExternAndIntraModuleCallInOneFunction) {
+    // test-analyzer #3: one function with TWO relocations — one
+    // to an intra-module function (resolves to .text VA) and one
+    // to an extern (resolves to .idata IAT slot VA). The shared
+    // symbolVa kernel must dispatch both correctly.
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction f0;
+    f0.symbol = SymbolId{1};
+    // call intra ; call extern ; ret
+    f0.bytes  = {0xE8,0,0,0,0, 0xE8,0,0,0,0, 0xC3};
+    Relocation rIntra;
+    rIntra.offset = 1;
+    rIntra.target = SymbolId{2};       // → fn[1]
+    rIntra.kind   = RelocationKind{1};
+    Relocation rExtern;
+    rExtern.offset = 6;
+    rExtern.target = SymbolId{99};     // → extern
+    rExtern.kind   = RelocationKind{1};
+    f0.relocations.push_back(rIntra);
+    f0.relocations.push_back(rExtern);
+    mod.functions.push_back(std::move(f0));
+    AssembledFunction f1;
+    f1.symbol = SymbolId{2};
+    f1.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f1));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "ExitProcess", "kernel32.dll"});
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Intra-call: from text @ +1 to fn[1] @ +11 (fn[0] is 11 bytes).
+    // value = 11 - 1 - 4 = 6.
+    constexpr std::size_t kFirstSecHdr = 0x188;
+    std::uint32_t const textFileOff =
+        readU32LE(bytes, kFirstSecHdr + 20);
+    EXPECT_EQ(readU32LE(bytes, textFileOff + 1), 6u);
+    // Extern call: patches to iatDirRva - 0x1006 - 4.
+    std::uint32_t const iatDirRva = readU32LE(bytes, 0x108 + 12*8);
+    std::int32_t const expectedExtern =
+        static_cast<std::int32_t>(iatDirRva) - 0x1006 - 4;
+    EXPECT_EQ(readU32LE(bytes, textFileOff + 6),
+              static_cast<std::uint32_t>(expectedExtern));
+}
+
+TEST(LinkerExternResolution, NeitherDefinedNorExternStillFailsLoud) {
+    // test-analyzer #4: a reloc target present in NEITHER
+    // functions NOR externImports still fires K_SymbolUndefined.
+    // The new diagnostic message mentions ExternImport explicitly.
+    auto loaded = loadShippedExec();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8,0,0,0,0, 0xC3};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{42};         // not in any table
+    rel.kind   = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    // externImports is empty AND fn's reloc target isn't fn.symbol.
+    DiagnosticReporter rep;
+    LinkedImage img = link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(img.bytes.empty());
+    bool sawCode = false;
+    bool sawExternMention = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined) {
+            sawCode = true;
+            if (d.actual.find("ExternImport") != std::string::npos)
+                sawExternMention = true;
+        }
+    }
+    EXPECT_TRUE(sawCode);
+    EXPECT_TRUE(sawExternMention);
+}
+
+TEST(LinkerExternResolution, EmptyMangledNameRejected) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "", "kernel32.dll"});
+    DiagnosticReporter rep;
+    LinkedImage img = link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(img.bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(LinkerExternResolution, EmptyLibraryPathRejected) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "ExitProcess", ""});
+    DiagnosticReporter rep;
+    LinkedImage img = link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(img.bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, /*fnSym=*/1);
+    mod.externImports.push_back(
+        ExternImport{SymbolId{1}, "ExitProcess", "kernel32.dll"});
+    DiagnosticReporter rep;
+    LinkedImage img = link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(img.bytes.empty());
+    bool sawAmbig = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+         && d.actual.find("ambiguous resolution") != std::string::npos) {
+            sawAmbig = true;
+        }
+    }
+    EXPECT_TRUE(sawAmbig);
+}
+
+TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
+    // architect O1: post-walker errorCount gate resets
+    // resolvedFuncCount so LinkedImage.ok() doesn't return true
+    // with empty bytes when the walker fail-loud'd.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "printf", "libc.so.6"});
+    DiagnosticReporter rep;
+    LinkedImage img = link(mod, **target, **fmt, rep);
+    EXPECT_TRUE(img.bytes.empty());
+    EXPECT_FALSE(img.ok());
+    EXPECT_EQ(img.resolvedFuncCount, 0u);
+}
+

@@ -135,6 +135,19 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
+    // ELF GOT/PLT import-table emission anchored at plan 14 §3.1
+    // D-LK6-4 (LK6 cycle 2b). Until then, a module with non-empty
+    // externImports fails loud rather than silently producing an
+    // ELF missing its imports.
+    if (!module.externImports.empty()) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             "elf::encode: extern imports present (" +
+             std::to_string(module.externImports.size()) +
+             " entries) but ELF GOT/PLT emission is not yet "
+             "implemented. Anchored at plan 14 §3.1 D-LK6-4 (LK6 "
+             "cycle 2b).");
+        return {};
+    }
 
     // Route between ET_REL and ET_EXEC based on the schema's
     // declared objectType. ET_REL keeps its .rela.text-bearing
@@ -190,13 +203,19 @@ encode(AssembledModule const&    module,
     // is the `sectionVa` (ELF: `secText->virtualAddress`) and the
     // diagnostic prefix.
     if (isExec) {
-        std::unordered_map<SymbolId, std::uint64_t> textOffsetBySym;
-        textOffsetBySym.reserve(funcSyms.size());
-        for (auto const& f : funcSyms) {
-            textOffsetBySym.emplace(f.symId, f.valueInText);
+        // Build absolute symbol-VA map: for every function, its
+        // runtime VA is `secText->virtualAddress + offsetInText`.
+        // ELF cycle 2a has no extern imports (anchored D-LK6-4);
+        // when externs land, they extend this same map with GOT
+        // / PLT slot VAs.
+        std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+        symbolVa.reserve(module.functions.size());
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            symbolVa.emplace(module.functions[i].symbol,
+                             secText->virtualAddress + funcTextStart[i]);
         }
         if (!link::format::applyExecRelocations(
-                text, module, funcTextStart, textOffsetBySym,
+                text, module, funcTextStart, symbolVa,
                 targetSchema, secText->virtualAddress,
                 "elf::encode (ET_EXEC)", reporter)) {
             return {};

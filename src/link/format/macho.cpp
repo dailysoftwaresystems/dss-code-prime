@@ -123,6 +123,18 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
+    // Mach-O LC_DYLD_INFO chained-fixups / bind opcodes for FFI
+    // resolution anchored at plan 14 §3.1 D-LK6-5 (LK6 cycle 2c).
+    // A module with non-empty externImports fails loud here.
+    if (!module.externImports.empty()) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             "macho::encode: extern imports present (" +
+             std::to_string(module.externImports.size()) +
+             " entries) but Mach-O chained-fixups / LC_DYLD_INFO "
+             "emission is not yet implemented. Anchored at plan 14 "
+             "§3.1 D-LK6-5 (LK6 cycle 2c).");
+        return {};
+    }
 
     // Mach-O requires `__text`; symtab/strtab live inside LC_SYMTAB,
     // not as separate section headers.
@@ -481,13 +493,10 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> textBody;
     std::vector<std::uint64_t> funcTextStart;
     funcTextStart.reserve(module.functions.size());
-    std::unordered_map<SymbolId, std::uint64_t> textOffsetBySym;
-    textOffsetBySym.reserve(module.functions.size());
     for (auto const& fn : module.functions) {
         std::uint64_t const start = textBody.size();
         funcTextStart.push_back(start);
         textBody.insert(textBody.end(), fn.bytes.begin(), fn.bytes.end());
-        textOffsetBySym.emplace(fn.symbol, start);
     }
     if (textBody.empty()) {
         emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
@@ -533,9 +542,18 @@ encodeExec(AssembledModule const&    module,
             }
         }
     }
+    // Build absolute symbol-VA map: function VA = section_64.addr
+    // + offsetInText. Mach-O cycle 2a has no extern imports
+    // (anchored D-LK6-5).
     std::uint64_t const sectionVa = secText.virtualAddress;
+    std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+    symbolVa.reserve(module.functions.size());
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        symbolVa.emplace(module.functions[i].symbol,
+                         sectionVa + funcTextStart[i]);
+    }
     if (!link::format::applyExecRelocations(
-            textBody, module, funcTextStart, textOffsetBySym,
+            textBody, module, funcTextStart, symbolVa,
             targetSchema, sectionVa, "macho::encodeExec", reporter)) {
         return {};
     }

@@ -538,13 +538,10 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> text;
     std::vector<std::uint64_t> funcTextStart;
     funcTextStart.reserve(module.functions.size());
-    std::unordered_map<SymbolId, std::uint64_t> textOffsetBySym;
-    textOffsetBySym.reserve(module.functions.size());
     for (auto const& fn : module.functions) {
         std::uint64_t const start = text.size();
         funcTextStart.push_back(start);
         text.insert(text.end(), fn.bytes.begin(), fn.bytes.end());
-        textOffsetBySym.emplace(fn.symbol, start);
     }
 
     if (text.empty()) {
@@ -578,13 +575,134 @@ encodeExec(AssembledModule const&    module,
         }
     }
 
-    // ── (c) Apply intra-module relocations in-place ───────────
+    // ── (c) Synthesize .idata section for extern imports (LK6
+    //         cycle 2a). PE32+ import-table layout per PE/COFF §6.4:
+    //         ImageImportDescriptor[N+1] (terminator) → ILT[] → IAT[]
+    //         → HINT/NAME table → DLL name strings. Each descriptor
+    //         is 20 B; each ILT/IAT slot is u64; HINT/NAME is u16
+    //         hint=0 + NUL-terminated symbol name (padded to even);
+    //         DLL names are NUL-terminated. The loader uses the IAT
+    //         slot at runtime: it overwrites IAT[i] with the
+    //         resolved function pointer (for PE32+, IAT and ILT are
+    //         identical at file-image time; loader patches IAT
+    //         in-place).
+    //
+    // Build a map `libraryPath → ordered list of extern symbols`
+    // (preserves declaration order within each library; deterministic
+    // build outputs). One ImageImportDescriptor per library.
+    std::vector<std::string> libraryOrder;  // libs in declaration order
+    std::unordered_map<std::string, std::vector<std::size_t>>
+        externsByLib;  // libraryPath → indices into module.externImports
+    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
+        auto const& ext = module.externImports[i];
+        auto const it = externsByLib.find(ext.libraryPath);
+        if (it == externsByLib.end()) {
+            libraryOrder.push_back(ext.libraryPath);
+            externsByLib.emplace(ext.libraryPath, std::vector<std::size_t>{i});
+        } else {
+            it->second.push_back(i);
+        }
+    }
+
+    bool const hasImports = !module.externImports.empty();
+    std::uint32_t const sectionAlignE = oh.sectionAlignment;
+    std::uint32_t const textVirtualSizeE =
+        static_cast<std::uint32_t>(
+            (text.size() + sectionAlignE - 1) & ~(sectionAlignE - 1ull));
+    std::uint32_t const idataRva =
+        hasImports
+            ? static_cast<std::uint32_t>(secText.virtualAddress)
+                + textVirtualSizeE
+            : 0u;
+
+    // Lay out .idata bytes (synthesized, NOT raw-data padded yet):
+    //   [0]               ImageImportDescriptor[N+1]
+    //   [...]             ILT/IAT (PE32+ uses identical layout at
+    //                     file-image time — loader patches IAT)
+    //   [hintNameStart]   HINT/NAME table
+    //   [dllNamesStart]   DLL name strings
+    //
+    // Compute offsets first so we know each IAT slot's RVA before
+    // building bytes (the symbol-VA map needs it for reloc apply).
+    constexpr std::size_t kImportDescriptorSize = 20;
+    constexpr std::size_t kThunkSize            = 8;   // PE32+
+    std::size_t const numLibs        = libraryOrder.size();
+    std::size_t const descriptorBlockSize =
+        (numLibs + 1) * kImportDescriptorSize;
+    // Pad to kThunkSize so u64 ILT/IAT slots stay naturally aligned.
+    // (numLibs+1)*20 is 8-aligned only when (numLibs+1) is even —
+    // breaks at numLibs≥2 (code-reviewer #1 convergence). The pad
+    // bytes stay zero in the idata buffer; the data-directory size
+    // for Import Table remains `descriptorBlockSize` (excludes
+    // pad).
+    std::size_t const thunkBlockStart =
+        (descriptorBlockSize + kThunkSize - 1) & ~(kThunkSize - 1);
+    // Per-library ILT and IAT counts include a u64 zero terminator.
+    std::vector<std::size_t> iltOffsets(numLibs);
+    std::vector<std::size_t> iatOffsets(numLibs);
+    std::size_t thunkCursor = thunkBlockStart;
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        iltOffsets[li] = thunkCursor;
+        std::size_t const slots = externsByLib[libraryOrder[li]].size() + 1;
+        thunkCursor += slots * kThunkSize;
+    }
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        iatOffsets[li] = thunkCursor;
+        std::size_t const slots = externsByLib[libraryOrder[li]].size() + 1;
+        thunkCursor += slots * kThunkSize;
+    }
+    // HINT/NAME table starts here. Per extern: 2 bytes hint + name +
+    // NUL + optional padding to even.
+    std::size_t const hintNameStart = thunkCursor;
+    std::vector<std::uint32_t> hintNameRvaBySym;  // per externImport index
+    hintNameRvaBySym.resize(module.externImports.size(), 0u);
+    std::size_t hintCursor = hintNameStart;
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        for (auto extIdx : externsByLib[libraryOrder[li]]) {
+            hintNameRvaBySym[extIdx] =
+                idataRva + static_cast<std::uint32_t>(hintCursor);
+            std::size_t const nameBytes =
+                module.externImports[extIdx].mangledName.size() + 1; // +NUL
+            hintCursor += 2 + nameBytes;                  // 2 = hint
+            if ((hintCursor - hintNameStart) & 1u) ++hintCursor;
+        }
+    }
+    std::size_t const dllNameStart = hintCursor;
+    std::vector<std::uint32_t> dllNameRvaByLib(numLibs, 0u);
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        dllNameRvaByLib[li] =
+            idataRva + static_cast<std::uint32_t>(hintCursor);
+        hintCursor += libraryOrder[li].size() + 1; // +NUL
+    }
+    std::size_t const idataSize = hintCursor;
+
+    // Per-extern IAT slot RVA — populated for symbol-VA map.
+    std::unordered_map<SymbolId, std::uint64_t> externIatVaBySym;
+    externIatVaBySym.reserve(module.externImports.size());
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        std::size_t slotIdx = 0;
+        for (auto extIdx : externsByLib[libraryOrder[li]]) {
+            std::uint32_t const iatSlotRva =
+                idataRva
+                + static_cast<std::uint32_t>(iatOffsets[li])
+                + static_cast<std::uint32_t>(slotIdx * kThunkSize);
+            externIatVaBySym.emplace(
+                module.externImports[extIdx].symbol,
+                oh.imageBase + iatSlotRva);
+            ++slotIdx;
+        }
+    }
+
+    // ── (d) Apply intra-module + extern relocations in-place ──
     //
     // Delegated to the shared `applyExecRelocations` kernel
     // (`link/format/exec_reloc_apply.hpp`). PE-specific input:
-    // sectionVa = ImageBase + secText.virtualAddress (RVA). Format-
-    // side fmt.relocationByKind(rel.kind) check stays here because
-    // its diagnostic wording cites the PE format name.
+    // patchSectionVa = ImageBase + secText.virtualAddress (RVA).
+    // The symbolVa map merges intra-module function VAs (.text +
+    // funcOffset) with extern import VAs (.idata + iatSlotOffset),
+    // so REL32 calls to either kind work uniformly. Format-side
+    // fmt.relocationByKind(rel.kind) check stays here because its
+    // diagnostic wording cites the PE format name.
     for (auto const& fn : module.functions) {
         for (auto const& rel : fn.relocations) {
             if (fmt.relocationByKind(rel.kind) == nullptr) {
@@ -598,8 +716,18 @@ encodeExec(AssembledModule const&    module,
         }
     }
     std::uint64_t const sectionVa = oh.imageBase + secText.virtualAddress;
+    std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+    symbolVa.reserve(module.functions.size()
+                     + module.externImports.size());
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        symbolVa.emplace(module.functions[i].symbol,
+                         sectionVa + funcTextStart[i]);
+    }
+    for (auto const& [sym, va] : externIatVaBySym) {
+        symbolVa.emplace(sym, va);
+    }
     if (!link::format::applyExecRelocations(
-            text, module, funcTextStart, textOffsetBySym, targetSchema,
+            text, module, funcTextStart, symbolVa, targetSchema,
             sectionVa, "pe::encodeExec", reporter)) {
         return {};
     }
@@ -642,23 +770,18 @@ encodeExec(AssembledModule const&    module,
     std::uint32_t const sectionAlign = oh.sectionAlignment;
 
     std::vector<PeSectionHeader> sectionHeaders;
-    sectionHeaders.reserve(1);  // .text only this cycle;
-                                 // future cycles push .rdata / .data here
+    sectionHeaders.reserve(hasImports ? 2 : 1);
     std::size_t const headerBytesUnpaddedInitial =
         kDosHeaderSize + kDosStubSize + kPeSigSize
         + kFileHeaderSize + kOptionalHeader64Size;
-    // sizeOfHeaders depends on numSections; build the section
-    // headers first then compute below.
 
-    // .text section header (single-section cycle scope; the
-    // derived-from-vector machinery is built so future sections
-    // just push back).
+    // .text section header (always present).
     {
         PeSectionHeader hText{};
         hText.name                  = encodeSectionName(secText.name, 0);
         hText.virtualSize           = static_cast<std::uint32_t>(text.size());
         hText.virtualAddress        = static_cast<std::uint32_t>(secText.virtualAddress);
-        // sizeOfRawData filled below once textRawSize is known.
+        // sizeOfRawData / pointerToRawData filled below.
         hText.pointerToRelocations  = 0;
         hText.pointerToLinenumbers  = 0;
         hText.numberOfRelocations   = 0;
@@ -666,6 +789,27 @@ encodeExec(AssembledModule const&    module,
         hText.characteristics       = secText.type;
         sectionHeaders.push_back(hText);
     }
+    // .idata section header (when externImports non-empty).
+    // Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) |
+    //                   IMAGE_SCN_MEM_READ (0x40000000) |
+    //                   IMAGE_SCN_MEM_WRITE (0x80000000)
+    //                 = 0xC0000040. PE32+ images keep the import
+    // table writable so the loader can patch IAT slots in-place.
+    constexpr std::uint32_t kIDataCharacteristics = 0xC0000040u;
+    if (hasImports) {
+        PeSectionHeader hIData{};
+        hIData.name                  = encodeSectionName(".idata", 0);
+        hIData.virtualSize           = static_cast<std::uint32_t>(idataSize);
+        hIData.virtualAddress        = idataRva;
+        // sizeOfRawData / pointerToRawData filled below.
+        hIData.pointerToRelocations  = 0;
+        hIData.pointerToLinenumbers  = 0;
+        hIData.numberOfRelocations   = 0;
+        hIData.numberOfLinenumbers   = 0;
+        hIData.characteristics       = kIDataCharacteristics;
+        sectionHeaders.push_back(hIData);
+    }
+
     std::uint32_t const numSections =
         static_cast<std::uint32_t>(sectionHeaders.size());
     std::size_t const headerBytesUnpadded =
@@ -678,17 +822,28 @@ encodeExec(AssembledModule const&    module,
     std::uint32_t const textRawPointer = sizeOfHeaders;
     sectionHeaders[0].sizeOfRawData    = textRawSize;
     sectionHeaders[0].pointerToRawData = textRawPointer;
-    // SizeOfImage = MAX over all sections of (section.virtualAddress
-    // + ceil(virtualSize / sectionAlignment) * sectionAlignment),
-    // rounded up to sectionAlignment per PE/COFF §3.4. With one
-    // section this collapses to ceil(secText.va + size, sectAlign).
-    // (code-reviewer C3 + silent-failure C3 convergence: must be
-    // multiple of sectionAlignment.)
-    std::uint32_t const textVirtualSize =
-        static_cast<std::uint32_t>(roundUp(text.size(), sectionAlign));
-    std::uint32_t const sizeOfImage =
-        static_cast<std::uint32_t>(roundUp(
-            secText.virtualAddress + textVirtualSize, sectionAlign));
+    std::uint32_t const idataRawSize = hasImports
+        ? static_cast<std::uint32_t>(roundUp(idataSize, fileAlign))
+        : 0u;
+    std::uint32_t const idataRawPointer = hasImports
+        ? textRawPointer + textRawSize
+        : 0u;
+    if (hasImports) {
+        sectionHeaders[1].sizeOfRawData    = idataRawSize;
+        sectionHeaders[1].pointerToRawData = idataRawPointer;
+    }
+    // SizeOfImage = roundUp(highest_section_va + virtualSize,
+    // sectionAlignment) per PE/COFF §3.4. With .text + optional
+    // .idata, the highest VA-extent is .idata when present.
+    std::uint32_t const textVirtualSize = textVirtualSizeE;
+    std::uint32_t const idataVirtualSize = hasImports
+        ? static_cast<std::uint32_t>(roundUp(idataSize, sectionAlign))
+        : 0u;
+    std::uint32_t const sizeOfImage = hasImports
+        ? static_cast<std::uint32_t>(roundUp(
+              idataRva + idataVirtualSize, sectionAlign))
+        : static_cast<std::uint32_t>(roundUp(
+              secText.virtualAddress + textVirtualSize, sectionAlign));
     std::uint32_t const addressOfEntryPoint =
         static_cast<std::uint32_t>(secText.virtualAddress
                                     + funcTextStart[entryFnIdx]);
@@ -735,7 +890,11 @@ encodeExec(AssembledModule const&    module,
     appendU8(bytes, 0);  // MajorLinkerVersion (not load-bearing)
     appendU8(bytes, 0);  // MinorLinkerVersion
     appendU32LE(bytes, textRawSize);           // SizeOfCode
-    appendU32LE(bytes, 0);                     // SizeOfInitializedData
+    // PE/COFF §3.4: SizeOfInitializedData is the sum of file-aligned
+    // sizes of all sections carrying IMAGE_SCN_CNT_INITIALIZED_DATA.
+    // The synthesized .idata section is the only such section in
+    // cycle scope.
+    appendU32LE(bytes, idataRawSize);
     appendU32LE(bytes, 0);                     // SizeOfUninitializedData
     appendU32LE(bytes, addressOfEntryPoint);   // AddressOfEntryPoint
     appendU32LE(bytes, baseOfCode);            // BaseOfCode
@@ -762,10 +921,44 @@ encodeExec(AssembledModule const&    module,
     appendU32LE(bytes, 0);                     // LoaderFlags (reserved)
     appendU32LE(bytes,
         static_cast<std::uint32_t>(kNumberOfRvaAndSizes));
-    // 16 data directories, all zero (minimum-loadable .exe needs none).
+    // 16 data directories. PE/COFF §3.4 indices we populate:
+    //   [1] Import Table — RVA to first ImageImportDescriptor;
+    //                       Size covers all descriptors + terminator.
+    //  [12] Import Address Table — RVA to IAT block; Size covers
+    //                       all IAT slots across libraries.
+    // Other directories (Export, Resource, Exception, etc.) remain
+    // zero — minimum-loadable image needs only Import for FFI.
+    std::uint32_t const importDirRva  = hasImports ? idataRva : 0u;
+    std::uint32_t const importDirSize = hasImports
+        ? static_cast<std::uint32_t>(descriptorBlockSize)
+        : 0u;
+    std::uint32_t const iatDirRva = hasImports
+        ? idataRva + static_cast<std::uint32_t>(iatOffsets[0])
+        : 0u;
+    // Sum IAT block sizes explicitly rather than subtracting cursors.
+    // Subtraction-based size silently misreports if a future cycle
+    // inserts data between IATs and the HINT/NAME block (silent-
+    // failure H1 fold). Each library's IAT spans (externCount+1) *
+    // kThunkSize bytes (including the u64-zero terminator slot).
+    std::size_t iatTotal = 0;
+    for (auto const& libName : libraryOrder) {
+        iatTotal +=
+            (externsByLib[libName].size() + 1) * kThunkSize;
+    }
+    std::uint32_t const iatDirSize = hasImports
+        ? static_cast<std::uint32_t>(iatTotal)
+        : 0u;
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
-        appendU32LE(bytes, 0);  // RVA
-        appendU32LE(bytes, 0);  // Size
+        if (i == 1u) {
+            appendU32LE(bytes, importDirRva);
+            appendU32LE(bytes, importDirSize);
+        } else if (i == 12u) {
+            appendU32LE(bytes, iatDirRva);
+            appendU32LE(bytes, iatDirSize);
+        } else {
+            appendU32LE(bytes, 0);
+            appendU32LE(bytes, 0);
+        }
     }
 
     // IMAGE_SECTION_HEADER table (derives from sectionHeaders vector)
@@ -781,6 +974,80 @@ encodeExec(AssembledModule const&    module,
     while (bytes.size() < static_cast<std::size_t>(textRawPointer)
                             + textRawSize) {
         bytes.push_back(0);
+    }
+
+    // .idata body (when externImports non-empty), padded to
+    // fileAlignment. Layout precomputed above; emit ImageImport
+    // Descriptors[N+1] + ILT/IAT thunks + HINT/NAME table + DLL
+    // name strings.
+    if (hasImports) {
+        std::vector<std::uint8_t> idata(idataSize, 0);
+        auto putU32 = [&](std::size_t off, std::uint32_t v) {
+            for (int i = 0; i < 4; ++i)
+                idata[off + i] =
+                    static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+        };
+        auto putU64 = [&](std::size_t off, std::uint64_t v) {
+            for (int i = 0; i < 8; ++i)
+                idata[off + i] =
+                    static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+        };
+        // ImageImportDescriptor[i] for each library; entry [numLibs]
+        // is the all-zero terminator.
+        for (std::size_t li = 0; li < numLibs; ++li) {
+            std::size_t const dOff = li * kImportDescriptorSize;
+            std::uint32_t const iltRva =
+                idataRva + static_cast<std::uint32_t>(iltOffsets[li]);
+            std::uint32_t const iatRva =
+                idataRva + static_cast<std::uint32_t>(iatOffsets[li]);
+            putU32(dOff +  0, iltRva);                  // OriginalFirstThunk
+            putU32(dOff +  4, 0);                       // TimeDateStamp
+            putU32(dOff +  8, 0);                       // ForwarderChain
+            putU32(dOff + 12, dllNameRvaByLib[li]);     // Name (DLL path RVA)
+            putU32(dOff + 16, iatRva);                  // FirstThunk (IAT RVA)
+        }
+        // ILT + IAT thunks (PE32+: u64 each; bit 63 = ordinal flag,
+        // we use by-name imports only — set RVA to HINT/NAME entry).
+        for (std::size_t li = 0; li < numLibs; ++li) {
+            std::size_t slotIdx = 0;
+            auto const& externs = externsByLib[libraryOrder[li]];
+            for (auto extIdx : externs) {
+                std::uint64_t const thunk =
+                    static_cast<std::uint64_t>(hintNameRvaBySym[extIdx]);
+                putU64(iltOffsets[li] + slotIdx * kThunkSize, thunk);
+                putU64(iatOffsets[li] + slotIdx * kThunkSize, thunk);
+                ++slotIdx;
+            }
+            // Zero terminator already in place (idata was 0-initialised).
+        }
+        // HINT/NAME table entries: u16 hint=0 + NUL-terminated name.
+        for (std::size_t li = 0; li < numLibs; ++li) {
+            for (auto extIdx : externsByLib[libraryOrder[li]]) {
+                std::uint32_t const rva = hintNameRvaBySym[extIdx];
+                std::size_t const off = rva - idataRva;
+                // hint = 0 (no symbol-table hint); idata already
+                // zero-initialised so we just write the name.
+                auto const& name = module.externImports[extIdx].mangledName;
+                for (std::size_t i = 0; i < name.size(); ++i) {
+                    idata[off + 2 + i] = static_cast<std::uint8_t>(name[i]);
+                }
+                // NUL + optional pad already zero.
+            }
+        }
+        // DLL name strings.
+        for (std::size_t li = 0; li < numLibs; ++li) {
+            std::uint32_t const rva = dllNameRvaByLib[li];
+            std::size_t const off = rva - idataRva;
+            auto const& dll = libraryOrder[li];
+            for (std::size_t i = 0; i < dll.size(); ++i) {
+                idata[off + i] = static_cast<std::uint8_t>(dll[i]);
+            }
+        }
+        bytes.insert(bytes.end(), idata.begin(), idata.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(idataRawPointer) + idataRawSize) {
+            bytes.push_back(0);
+        }
     }
 
     return bytes;

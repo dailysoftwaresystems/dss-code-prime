@@ -780,3 +780,70 @@ TEST(LinkerEndToEnd, ElfExecDispatchProducesValidExecutable) {
     // e_type = ET_EXEC
     EXPECT_EQ(readU16LE(image.bytes, 16), 2u);
 }
+
+// ── LK6 cycle 2a: extern imports fail loud (D-LK6-4 pending) ───
+
+TEST(ElfExecWriter, ExternImportsFailLoudPendingD_LK6_4) {
+    // ELF GOT/PLT support not yet implemented (D-LK6-4). A module
+    // with non-empty externImports must fail loud with
+    // K_FormatLacksImportSupport rather than silently producing an
+    // ELF that's missing its imports.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{99};
+    rel.kind   = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "printf";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}
+
+TEST(ElfRelWriter, ExternImportsFailLoudOnEtRelAlso) {
+    // test-analyzer #7: the externImports fail-loud gate runs BEFORE
+    // the isExec branch, so .o output also rejects non-empty
+    // externImports (relocatable objects don't carry imports either
+    // — those resolve at final-link time).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "puts";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}

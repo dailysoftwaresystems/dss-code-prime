@@ -840,3 +840,36 @@ TEST(MachOExecWriter, DisplacementOverflowFailsLoud) {
     }
     EXPECT_TRUE(sawCode);
 }
+
+// ── LK6 cycle 2a: extern imports fail loud (D-LK6-5 pending) ───
+
+TEST(MachOExecWriter, ExternImportsFailLoudPendingD_LK6_5) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{99};
+    rel.kind   = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "_printf";
+    imp.libraryPath = "/usr/lib/libSystem.B.dylib";
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}

@@ -108,9 +108,49 @@ struct DSS_EXPORT AssembledFunction {
 // Result::ok()` reads `lir.moduleFuncCount()` from a `Lir` reference
 // the result holds — but `AssembledModule` is deliberately Lir-free
 // (the linker consumes it without the Lir), so the count rides along.
+// One extern symbol the assembler emitted Relocations against
+// (declared in the source via `extern T fn(...)`, lowered through
+// HIR `ExternFunction` / `ExternGlobal` → MIR / LIR → assembler).
+// `symbol` matches `Relocation::target` for every reloc that
+// references this extern; the linker (plan 14 LK6 cycle 2)
+// consults `externImports` AFTER `functions` when resolving a
+// reloc target — defined symbols win; if not defined, externs
+// are looked up; if still unresolved, `K_SymbolUndefined` fires.
+//
+// `mangledName` is the on-binary symbol name the import-table
+// entry MUST carry verbatim (e.g. "printf" on Linux/ELF; "printf"
+// on x86_64 PE; "_printf" on legacy Mach-O i386). Per-platform
+// underscoring belongs upstream (plan 11 §2.5); the assembler
+// stamps whatever the HIR/MIR/LIR thread-through provided.
+//
+// `libraryPath` names the dynamic library that owns this symbol
+// (e.g. "kernel32.dll" / "msvcrt.dll" on Windows; "libc.so.6" on
+// Linux; "/usr/lib/libSystem.B.dylib" on macOS). Multiple
+// externs with the SAME `libraryPath` share one PE
+// IMAGE_IMPORT_DESCRIPTOR / ELF DT_NEEDED entry / Mach-O
+// LC_LOAD_DYLIB load command. The linker groups by this field.
+//
+// The HIR→AssembledFunction thread-through that populates
+// these fields is anchored at plan 14 §3.1 D-LK6-6 paired with
+// plan 11 FF5 (`ingest()` populating HirAttribute<FfiMetadata>);
+// LK6 cycle 2a accepts hand-constructed `externImports` for
+// substrate tests while the upstream thread lands separately.
+struct DSS_EXPORT ExternImport {
+    SymbolId    symbol{};       // matches Relocation::target
+    std::string mangledName;    // on-binary symbol name
+    std::string libraryPath;    // owning dylib / DLL / SO
+};
+
 struct DSS_EXPORT AssembledModule {
     std::vector<AssembledFunction> functions;  // parallel-index with lir.funcAt(i)
     std::size_t                    expectedFuncCount = 0;
+
+    // FFI extern imports (LK6 cycle 2 — closes D-LK6-2 partial).
+    // Populated by the assembler from upstream HIR `ExternFunction`
+    // / `ExternGlobal` declarations once the HIR→AS thread-through
+    // lands (D-LK6-6). Linker consults this AFTER `functions` for
+    // any unresolved `Relocation::target`.
+    std::vector<ExternImport>      externImports;
 
     // Derived: true iff `assemble()` ran on a non-empty LIR module AND
     // every function received its parallel-index slot. The reporter

@@ -36,13 +36,70 @@ LinkedImage link(AssembledModule const&    module,
     // only when the first passed.
     std::size_t const errorsAtEntry = reporter.errorCount();
 
-    // Index every function symbol the assembler declared. Single-CU
-    // resolution; cross-CU symbol-table merge is LK11; FFI import
-    // resolution is LK6 — D-LK4-3.
+    // Index every function symbol the assembler declared (defined
+    // intra-module) PLUS every extern import the assembler stamped
+    // for FFI resolution. Single-CU resolution; cross-CU symbol-
+    // table merge is LK11 (D-LK4-3). Externs are resolved against
+    // import-table emission in the per-format walker (LK6 cycle 2
+    // — PE IAT lands at cycle 2a; ELF GOT/PLT at 2b; Mach-O
+    // chained-fixups at 2c).
     std::unordered_set<SymbolId> declaredSymbols;
     declaredSymbols.reserve(module.functions.size());
     for (auto const& fn : module.functions) {
         declaredSymbols.insert(fn.symbol);
+    }
+    std::unordered_set<SymbolId> externSymbols;
+    externSymbols.reserve(module.externImports.size());
+    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
+        auto const& ext = module.externImports[i];
+        // Empty mangledName / libraryPath silently produce broken
+        // imports (Windows: GetProcAddress("") → null IAT slot;
+        // ELF: empty DT_SONAME; Mach-O: empty LC_LOAD_DYLIB path).
+        // The loaders accept the binary at link time and crash at
+        // first call. Fail loud here so the toolchain owns the
+        // diagnostic. (3-agent convergence: silent-failure C2 +
+        // type-design O1 + architect O4.)
+        if (ext.mangledName.empty()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "ExternImport[" + std::to_string(i) +
+                   "] (symbol #" + std::to_string(ext.symbol.v) +
+                   ") has empty mangledName — import-table entries "
+                   "require a non-empty symbol name.");
+        }
+        if (ext.libraryPath.empty()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "ExternImport[" + std::to_string(i) +
+                   "] (symbol #" + std::to_string(ext.symbol.v) +
+                   ") has empty libraryPath — import-table entries "
+                   "require a non-empty DLL / SO / dylib name.");
+        }
+        // Cross-table SymbolId uniqueness: a SymbolId cannot appear
+        // in BOTH `functions` and `externImports` — the resolution
+        // would silently pick whichever the walker's map-emplace
+        // saw first (silent-failure C1 + type-design O2 2-agent
+        // convergence).
+        if (declaredSymbols.contains(ext.symbol)) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "symbol #" + std::to_string(ext.symbol.v) +
+                   " is BOTH a defined AssembledFunction AND an "
+                   "ExternImport — ambiguous resolution; the same "
+                   "SymbolId cannot reference both an intra-module "
+                   "function and an external library symbol.");
+        }
+        // Within-table duplicate ExternImport: two ExternImports
+        // with the same SymbolId silently overwrite each other in
+        // the walker's emplace.
+        if (!externSymbols.insert(ext.symbol).second) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "ExternImport symbol #" +
+                   std::to_string(ext.symbol.v) +
+                   " is declared more than once in "
+                   "AssembledModule.externImports.");
+        }
     }
 
     for (auto const& fn : module.functions) {
@@ -90,11 +147,21 @@ LinkedImage link(AssembledModule const&    module,
             // — a misconfigured reloc whose kind is wrong AND whose
             // target is undefined should surface BOTH diagnostics
             // in one pass, not require two link attempts.
-            if (!declaredSymbols.contains(reloc.target)) {
+            //
+            // A reloc target resolves if EITHER:
+            //   (a) it names a defined function in this module, OR
+            //   (b) it names an extern import (LK6 cycle 2 —
+            //       resolved at link time via the per-format walker's
+            //       import-table emission).
+            // Anything else is a hard undefined.
+            if (!declaredSymbols.contains(reloc.target)
+             && !externSymbols.contains(reloc.target)) {
                 std::string msg = "relocation in symbol #";
                 msg += std::to_string(fn.symbol.v);
                 msg += " references undefined symbol #";
                 msg += std::to_string(reloc.target.v);
+                msg += " (not declared by any AssembledFunction "
+                       "nor by any ExternImport)";
                 report(reporter,
                        DiagnosticCode::K_SymbolUndefined,
                        DiagnosticSeverity::Error,
@@ -165,6 +232,17 @@ LinkedImage link(AssembledModule const&    module,
                    + std::string{objectFormatKindName(objectFormatSchema.kind())}
                    + "' (plan 14 LK8 / LK9)");
         break;
+    }
+
+    // Post-walker error gate (architect O1 fold from LK6 cycle 2a):
+    // a walker-side fail-loud (e.g. K_FormatLacksImportSupport on
+    // ELF/MachO when externImports is non-empty) registers errors
+    // on the reporter but leaves `resolvedFuncCount` at the value
+    // the pre-walker unifier set. Without this gate, `image.ok()`
+    // returns true while `image.bytes` is empty — silent contract
+    // violation. Same shape as the pre-walker gate above.
+    if (reporter.errorCount() != errorsAtEntry) {
+        image.resolvedFuncCount = 0;
     }
 
     return image;
