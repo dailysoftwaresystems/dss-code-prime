@@ -91,6 +91,20 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     }
     data.kind = *kindOpt;
 
+    // Top-level `entryPoint` — universal entry-symbol name for
+    // executable artifacts (e.g. "_start" / "main" / Mach-O's
+    // LC_MAIN target). Empty for relocatable artifacts. The walker
+    // resolves this against AssembledModule's symbols at emit time
+    // to compute the entry virtual address.
+    if (doc.contains("entryPoint")) {
+        if (!doc.at("entryPoint").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/entryPoint",
+                      "'entryPoint' must be a string");
+        } else {
+            data.entryPoint = doc.at("entryPoint").get<std::string>();
+        }
+    }
+
     // relocations[] — substrate-tier; shares the cross-side
     // `relocation_table.hpp` substrate with TargetSchema so the
     // `{name, kind}` shape of plan 13 §2.6's reloc-taxonomy unifier
@@ -205,6 +219,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 readU64("flags", info.flags);
                 readU64("addrAlign", info.addrAlign);
                 readU64("entrySize", info.entrySize);
+                readU64("virtualAddress", info.virtualAddress);
                 std::uint16_t const idx =
                     static_cast<std::uint16_t>(data.sections.size());
                 auto [it, fresh] =
@@ -278,6 +293,18 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             readU16("abiVersion", abiVerRaw, 255);
             data.elf.abiVersion = static_cast<std::uint8_t>(abiVerRaw);
             readU16("machine", data.elf.machine, 0xFFFF);
+            // `type`: "rel" / "exec" / "dyn" — ET_REL=1 / ET_EXEC=2
+            // / ET_DYN=3 per the gABI ELF header `e_type` field.
+            // Default ET_REL keeps LK1 cycle 1 schemas working
+            // unchanged.
+            if (e.contains("type") && e.at("type").is_string()) {
+                auto const t = e.at("type").get<std::string>();
+                if      (t == "rel")  data.elf.objectType = 1;
+                else if (t == "exec") data.elf.objectType = 2;
+                else if (t == "dyn")  data.elf.objectType = 3;
+                else coll.emit(DiagnosticCode::C_MalformedJson, "/elf/type",
+                               "'type' must be 'rel' / 'exec' / 'dyn'");
+            }
         }
     }
 

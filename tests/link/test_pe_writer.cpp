@@ -335,6 +335,23 @@ TEST(PeWriter, NonPeFormatKindEmitsK_NoMatchingObjectFormat) {
     EXPECT_TRUE(sawCode);
 }
 
+// ── PE section with `virtualAddress` field set rejected ──
+
+TEST(PeFormatJson, NonZeroVirtualAddressRejected) {
+    // PE derives runtime VAs from IMAGE_OPTIONAL_HEADER.ImageBase
+    // + section RVA at link time (cycle-2 PE32+ path D-LK2-1). The
+    // substrate `virtualAddress` field is meaningless for PE; pin
+    // the validate-rejection so a future PE-row edit can't silently
+    // no-op. Added in LK1 cycle 2 alongside the new field.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bad-pe-va","kind":"pe"},
+      "pe": { "machine": 34404 },
+      "sections":[{"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
 // ── PE section with `segment` field rejected (cross-format check) ──
 
 TEST(PeFormatJson, SegmentFieldRejectedOnPeSection) {

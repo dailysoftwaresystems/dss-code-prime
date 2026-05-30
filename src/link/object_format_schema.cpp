@@ -127,6 +127,62 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "(EM_* value, e.g. 62 for x86_64, "
                                  "183 for aarch64)");
         }
+        // e_type — the LK1 cycle 2 ELF walker supports ET_REL (1)
+        // and ET_EXEC (2). ET_DYN (3) is anchored at D-LK1-4 for
+        // PIE/shared-lib support paired with LK6 dynamic linking.
+        // Reject unknown values at load time so a typo in a JSON
+        // can't reach the walker.
+        if (elf.objectType != 1 && elf.objectType != 2) {
+            fail("/elf/type",
+                 std::format("ELF format 'elf.type' = {} not supported; "
+                             "cycle 2 ships 'rel' (=ET_REL=1) and 'exec' "
+                             "(=ET_EXEC=2). ET_DYN=3 (PIE / .so) is "
+                             "anchored at plan 14 §3.1 D-LK1-4 paired "
+                             "with LK6 dynamic linking.",
+                             elf.objectType));
+        }
+        // ET_EXEC schemas must declare which sections are loaded and
+        // at what virtual address. Today the walker uses sh_addr =
+        // section.virtualAddress directly (no relocation of
+        // virtualAddress). When `virtualAddress == 0` for SectionKind::
+        // Text on an ET_EXEC schema, the walker would emit an
+        // executable loaded at virtual address 0 — null-deref on
+        // first instruction. Reject explicitly.
+        if (elf.objectType == 2) {
+            auto const* secText = [&]() -> ObjectFormatSectionInfo const* {
+                for (auto const& s : sections) {
+                    if (s.kind == SectionKind::Text) return &s;
+                }
+                return nullptr;
+            }();
+            if (secText != nullptr && secText->virtualAddress == 0) {
+                fail("/sections/<text>/virtualAddress",
+                     "ELF ET_EXEC format requires `virtualAddress != 0` "
+                     "on the .text section row — the walker uses this "
+                     "as sh_addr and as the base for e_entry. Loading "
+                     ".text at virtual address 0 would null-deref on "
+                     "the first instruction. Typical Linux x86_64 base "
+                     "is 0x400000 (per linker convention).");
+            }
+        }
+        // Conversely, ET_REL must NOT carry virtual addresses (they're
+        // set by the LINKER at exec build time, not declared on the
+        // .o's section rows). A non-zero `virtualAddress` here would
+        // be silently dropped when emitting `sh_addr = 0` for the
+        // .o. Reject so a JSON edit can't no-op.
+        if (elf.objectType == 1) {
+            for (std::size_t i = 0; i < sections.size(); ++i) {
+                if (sections[i].virtualAddress != 0) {
+                    fail(std::format("/sections/{}/virtualAddress", i),
+                         std::format("section '{}': 'virtualAddress' "
+                                     "must be 0 for ELF ET_REL format "
+                                     "rows (sh_addr in relocatable .o "
+                                     "is unbound; the linker assigns "
+                                     "addresses at exec build time)",
+                                     sections[i].name));
+                }
+            }
+        }
     }
 
     // PE/COFF identity: when format kind is Pe, machine must be
@@ -166,6 +222,21 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "substrate 'type' field; the 'flags' "
                                  "field is meaningful only for ELF "
                                  "sh_flags)",
+                                 sections[i].name));
+            }
+            // PE derives runtime virtual addresses from ImageBase +
+            // RVA in its IMAGE_OPTIONAL_HEADER (cycle-2 PE32+ path).
+            // The substrate `virtualAddress` field is meaningless
+            // for PE rows; reject explicitly so a future PE-row
+            // edit can't silently no-op (LK1-cycle-2 invariant).
+            if (sections[i].virtualAddress != 0) {
+                fail(std::format("/sections/{}/virtualAddress", i),
+                     std::format("section '{}': 'virtualAddress' must "
+                                 "be 0 for PE format rows (PE derives "
+                                 "section VAs from "
+                                 "IMAGE_OPTIONAL_HEADER.ImageBase + "
+                                 "section RVA at link time, not from "
+                                 "the substrate field)",
                                  sections[i].name));
             }
         }
@@ -213,6 +284,20 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "16-char Mach-O section_64.segname "
                                  "field",
                                  s.segment, s.segment.size()));
+            }
+            // Mach-O MH_OBJECT files use section_64.addr = 0 (vmaddr
+            // assignment happens at exec build time via LC_SEGMENT_64).
+            // MH_EXECUTE will use virtualAddress; that arm lands at
+            // D-LK3-2. For cycle 1 (filetype == MH_OBJECT), reject
+            // non-zero virtualAddress to prevent silent drift.
+            if (macho.filetype == 1 && s.virtualAddress != 0) {
+                fail(std::format("/sections/{}/virtualAddress", i),
+                     std::format("section '{}': 'virtualAddress' must "
+                                 "be 0 for Mach-O MH_OBJECT rows "
+                                 "(section_64.addr in relocatable .o "
+                                 "is 0; exec-image VAs land at "
+                                 "D-LK3-2)",
+                                 s.name));
             }
         }
         // Mach-O nativeId packing reserves bit 27 (r_extern) and

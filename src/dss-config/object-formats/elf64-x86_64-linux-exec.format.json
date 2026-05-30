@@ -1,0 +1,86 @@
+{
+  "$comment": "ELF64 EXECUTABLE (ET_EXEC) for x86_64 Linux. Second ELF schema (plan 14 LK1 cycle 2, 2026-05-30). Consumed by `src/link/format/elf.cpp` via the format-blind linker engine. Differs from `elf64-x86_64-linux.format.json` (the .o schema) in: `elf.type = exec`, sections carry `virtualAddress` (used as sh_addr), top-level `entryPoint` names the entry symbol (resolved against AssembledModule at link time). Cycle-2 scope: self-contained modules (zero relocations). Modules with relocations fail loud — the cross-reference applier lives at LK6 (D-LK4-5 + D-LK4-6 + D-LK1-3).",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "elf64-x86_64-linux-exec",
+    "version": "1.0",
+    "kind": "elf"
+  },
+
+  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol (e.g. '_start' for Linux/glibc, 'main' for hand-rolled execs) and the walker will resolve it by name. For now, leave empty.",
+  "entryPoint": "",
+
+  "elf": {
+    "$comment": "Elf64_Ehdr identity for an executable. type = ET_EXEC (2). class = ELFCLASS64; data = ELFDATA2LSB; osabi = sysv; machine = EM_X86_64 (62).",
+    "class": "elf64",
+    "data": "lsb",
+    "osabi": "sysv",
+    "abiVersion": 0,
+    "machine": 62,
+    "type": "exec"
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code section. virtualAddress = 0x401000 — conventional Linux x86_64 executable base (0x400000) plus 0x1000 (first page reserved for the ELF header + program headers). sh_addr is set to this; e_entry derives from this + entry-function offset. sh_flags = SHF_ALLOC | SHF_EXECINSTR (6); sh_addralign = 16 (x86_64 psABI).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1,
+      "flags": 6,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 4198400
+    },
+    {
+      "$comment": "Symbol table — even in ET_EXEC files, .symtab is conventional for debugger support. sh_type = SHT_SYMTAB (2); sh_addralign = 8; sh_entsize = 24 (Elf64_Sym).",
+      "kind": "symtab",
+      "name": ".symtab",
+      "type": 2,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 24,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Symbol-name string table. sh_type = SHT_STRTAB (3); addrAlign = 1.",
+      "kind": "strtab",
+      "name": ".strtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Section-header string table. sh_type = SHT_STRTAB (3); addrAlign = 1.",
+      "kind": "shstrtab",
+      "name": ".shstrtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "Relocation kinds are declared so the linker engine's cross-reference unifier (plan 13 §2.6) accepts any relocation tag the assembler stamps. In ET_EXEC cycle 2, the walker rejects modules whose AssembledFunctions carry ANY relocation entries (cycle scope: self-contained only). Resolved at LK6 D-LK4-5/D-LK4-6 + plan 14 D-LK1-3.",
+      "name": "R_X86_64_PC32",
+      "kind": 1,
+      "nativeId": 2
+    },
+    {
+      "name": "R_X86_64_64",
+      "kind": 2,
+      "nativeId": 1
+    },
+    {
+      "name": "R_X86_64_32",
+      "kind": 3,
+      "nativeId": 10
+    }
+  ]
+}

@@ -251,6 +251,16 @@ struct DSS_EXPORT ObjectFormatSectionInfo {
                                      // unused on PE (validate-rejected)
     std::uint64_t entrySize = 0;     // ELF sh_entsize / unused on
                                      // PE + Mach-O
+    std::uint64_t virtualAddress = 0;// ELF sh_addr / Mach-O section_64.addr
+                                     // — the virtual address the section
+                                     // is loaded at in an executable
+                                     // image. Unused for relocatable
+                                     // artifacts (default 0); the LK1
+                                     // cycle 2 ET_EXEC walker reads this
+                                     // to populate sh_addr. PE folds the
+                                     // equivalent into its
+                                     // IMAGE_OPTIONAL_HEADER (LK2 cycle 2)
+                                     // and ignores this field.
 };
 
 // ── ELF-specific identity block (loaded only when kind == Elf) ──
@@ -270,6 +280,12 @@ struct DSS_EXPORT ElfIdentity {
     std::uint8_t  osabi = 0;         // ELFOSABI_NONE=0 / ELFOSABI_GNU=3 / …
     std::uint8_t  abiVersion = 0;
     std::uint16_t machine = 0;       // e_machine: EM_X86_64=62 / EM_AARCH64=183
+    // e_type — ET_REL=1 (relocatable .o) / ET_EXEC=2 (executable)
+    // / ET_DYN=3 (shared lib or PIE exec). Default ET_REL keeps
+    // LK1 cycle 1 schemas working unchanged. The walker uses this
+    // to route between the relocatable-emit and executable-emit
+    // paths (LK1 cycle 2: ET_EXEC arm).
+    std::uint16_t objectType = 1;    // default = ET_REL (relocatable .o)
 };
 
 // ── PE/COFF-specific identity block (loaded only when kind == Pe) ──
@@ -335,6 +351,17 @@ struct DSS_EXPORT ObjectFormatData {
     ElfIdentity   elf{};
     PeIdentity    pe{};
     MachOIdentity macho{};
+
+    // ── Image-side fields (LK1 cycle 2+) ─────────────────────
+    //
+    // Universal entry-point symbol name for executable artifacts
+    // (e.g. "_start" for Linux/glibc, "main" for hand-rolled
+    // executables, the macOS LC_MAIN entry-function name for
+    // Mach-O executables, the PE AddressOfEntryPoint symbol for
+    // Windows .exe). Empty for relocatable artifacts (.o). The
+    // walker resolves this against the AssembledModule's symbols
+    // to compute the entry virtual address.
+    std::string entryPoint;
 
     // Cross-field invariants:
     //   * relocations: kind != 0, kind unique cross-row, name unique
@@ -408,6 +435,14 @@ public:
     [[nodiscard]] ElfIdentity   const& elf()   const noexcept { return d_.elf; }
     [[nodiscard]] PeIdentity    const& pe()    const noexcept { return d_.pe; }
     [[nodiscard]] MachOIdentity const& macho() const noexcept { return d_.macho; }
+
+    // Image-side entry-point symbol name. Empty for relocatable
+    // artifacts; non-empty for executables. The format walker
+    // resolves this against `AssembledModule`'s symbol table at
+    // emit time to compute the runtime entry virtual address.
+    [[nodiscard]] std::string_view entryPoint() const noexcept {
+        return d_.entryPoint;
+    }
 
     // ── Loaders ───────────────────────────────────────────────
     static LoadResult<std::shared_ptr<ObjectFormatSchema>>

@@ -135,14 +135,45 @@ encode(AssembledModule const&    module,
         return {};
     }
 
-    // Resolve the section schema rows we need. Failure here means
-    // the format JSON is incomplete; we surface as K_* + bail.
+    // Route between ET_REL and ET_EXEC based on the schema's
+    // declared objectType. ET_REL keeps its .rela.text-bearing
+    // layout; ET_EXEC drops .rela.text (modules with relocations
+    // fail loud — cycle scope; LK6 owns relocation application)
+    // and adds a PT_LOAD program header.
+    bool const isExec = (fmt.elf().objectType == 2);
+
+    // ET_EXEC requires every AssembledFunction to have zero
+    // relocations (cycle scope: self-contained modules only).
+    // Externs surface as K_RelocationKindMismatch + halt rather
+    // than silently producing a corrupt executable.
+    if (isExec) {
+        for (auto const& fn : module.functions) {
+            if (!fn.relocations.empty()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::string{"ELF ET_EXEC writer: function symbol #"}
+                         + std::to_string(fn.symbol.v)
+                         + " carries " + std::to_string(fn.relocations.size())
+                         + " relocation(s); cycle-2 scope is self-contained "
+                           "modules only (zero relocations). Reloc "
+                           "application for ET_EXEC is anchored at plan 14 "
+                           "§3.1 D-LK1-3 / D-LK4-5 / D-LK4-6 (paired with "
+                           "LK6 dynamic linking).");
+                return {};
+            }
+        }
+    }
+
+    // Resolve the section schema rows we need. ET_REL requires
+    // RelocTable (.rela.text); ET_EXEC doesn't (relocs are either
+    // applied or rejected). Both modes share text/symtab/strtab/
+    // shstrtab.
     auto const* secText      = requireSection(fmt, SectionKind::Text,      "ELF writer", reporter);
-    auto const* secRela      = requireSection(fmt, SectionKind::RelocTable, "ELF writer", reporter);
+    auto const* secRela      = isExec ? nullptr
+                                       : requireSection(fmt, SectionKind::RelocTable, "ELF writer", reporter);
     auto const* secSymtab    = requireSection(fmt, SectionKind::Symtab,    "ELF writer", reporter);
     auto const* secStrtab    = requireSection(fmt, SectionKind::Strtab,    "ELF writer", reporter);
     auto const* secShStrtab  = requireSection(fmt, SectionKind::ShStrtab,  "ELF writer", reporter);
-    if (!secText || !secRela || !secSymtab || !secStrtab || !secShStrtab) {
+    if (!secText || (!isExec && !secRela) || !secSymtab || !secStrtab || !secShStrtab) {
         return {};
     }
 
@@ -276,7 +307,12 @@ encode(AssembledModule const&    module,
 
     // ── Section ordering + .shstrtab ───────────────────────────
     //
-    // Order: SHT_NULL, .text, .rela.text, .symtab, .strtab, .shstrtab.
+    // ET_REL order: SHT_NULL, .text, .rela.text, .symtab, .strtab,
+    // .shstrtab. ET_EXEC order: same but .rela.text is replaced with
+    // a SHT_NULL placeholder (kept for IDX_* parity so the symtab's
+    // STT_SECTION entry still resolves IDX_TEXT=1). Future cycles
+    // (D-LK1-3) emit applied relocations into .text bytes; cycle 2
+    // ET_EXEC simply skips the section.
     StringTable shstrtab;
     SectionHeader hNull{};
     SectionHeader hText{};
@@ -285,7 +321,9 @@ encode(AssembledModule const&    module,
     SectionHeader hStrtab{};
     SectionHeader hShStrtab{};
     hText.name_offset      = shstrtab.add(secText->name);
-    hRela.name_offset      = shstrtab.add(secRela->name);
+    if (secRela != nullptr) {
+        hRela.name_offset  = shstrtab.add(secRela->name);
+    }
     hSymtab.name_offset    = shstrtab.add(secSymtab->name);
     hStrtab.name_offset    = shstrtab.add(secStrtab->name);
     hShStrtab.name_offset  = shstrtab.add(secShStrtab->name);
@@ -302,14 +340,22 @@ encode(AssembledModule const&    module,
     hText.addr_align = secText->addrAlign;
     hText.entry_size = secText->entrySize;
     hText.size       = text.size();
+    // sh_addr — ET_EXEC fills from schema's virtualAddress; ET_REL
+    // leaves it 0 (unbound in .o).
+    hText.addr       = isExec ? secText->virtualAddress : 0;
 
-    hRela.type       = secRela->type;
-    hRela.flags      = secRela->flags;
-    hRela.addr_align = secRela->addrAlign;
-    hRela.entry_size = secRela->entrySize;  // 24 for Elf64_Rela
-    hRela.link       = IDX_SYMTAB;
-    hRela.info       = IDX_TEXT;
-    hRela.size       = relaText.size();
+    if (secRela != nullptr) {
+        hRela.type       = secRela->type;
+        hRela.flags      = secRela->flags;
+        hRela.addr_align = secRela->addrAlign;
+        hRela.entry_size = secRela->entrySize;  // 24 for Elf64_Rela
+        hRela.link       = IDX_SYMTAB;
+        hRela.info       = IDX_TEXT;
+        hRela.size       = relaText.size();
+    } else {
+        // ET_EXEC: slot remains SHT_NULL (all zeros). Section index
+        // stays in the header table to preserve IDX_* parity.
+    }
 
     hSymtab.type       = secSymtab->type;
     hSymtab.flags      = secSymtab->flags;
@@ -332,11 +378,21 @@ encode(AssembledModule const&    module,
     hShStrtab.size       = shstrtab.size();
 
     // ── Layout pass: compute sh_offset for each section ────────
+    //
+    // ET_REL: [Ehdr] + section bodies + SHT at end.
+    // ET_EXEC: [Ehdr] + [PHT (program headers)] + section bodies +
+    //          SHT at end. The PHT lives immediately after the Ehdr
+    //          so e_phoff = 64 and runtime loaders find it without
+    //          a seek.
     constexpr std::uint64_t kEhdrSize = 64;
+    constexpr std::uint64_t kProgramHeaderSize = 56;  // Elf64_Phdr
+    constexpr std::uint64_t kPtLoadCount = 1;         // cycle-2: just .text
+    std::uint64_t const phtSize = isExec ? (kPtLoadCount * kProgramHeaderSize) : 0;
+
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(kEhdrSize + text.size() + relaText.size()
+    bytes.reserve(kEhdrSize + phtSize + text.size() + relaText.size()
                   + symtab.size() + strtab.size() + shstrtab.size() + 6 * 64);
-    bytes.resize(kEhdrSize);  // placeholder; rewritten below
+    bytes.resize(kEhdrSize + phtSize);  // placeholder; rewritten below
 
     // Single layout lambda — `vector<uint8_t> const&` decays to
     // `span<uint8_t const>` so both the in-memory section bodies
@@ -348,8 +404,17 @@ encode(AssembledModule const&    module,
         bytes.insert(bytes.end(), body.begin(), body.end());
     };
 
+    // For ET_EXEC: pad .text's file offset up to the PT_LOAD page
+    // alignment (0x1000 on x86_64 Linux). The Linux kernel enforces
+    // `p_vaddr % p_align == p_offset % p_align` on every PT_LOAD —
+    // p_vaddr is page-aligned by virtualAddress=0x401000, so
+    // p_offset must also be a multiple of 0x1000 or execve() fails
+    // with ENOEXEC (silent rejection from the toolchain's POV).
+    // Cycle 1 ET_REL doesn't have program headers and is unaffected.
+    constexpr std::uint64_t kPageSize = 0x1000;
+    if (isExec) padTo(bytes, kPageSize);
     layoutSection(hText, text);
-    layoutSection(hRela, relaText);
+    if (secRela != nullptr) layoutSection(hRela, relaText);
     layoutSection(hSymtab, symtab);
     layoutSection(hStrtab, strtab.view());
     layoutSection(hShStrtab, shstrtab.view());
@@ -368,7 +433,70 @@ encode(AssembledModule const&    module,
     for (auto const* h : headers) writeSectionHeader(bytes, *h);
 
     // ── Elf64_Ehdr (overwrite the leading 64 zero bytes) ───────
+    //
+    // ET_REL: e_type = 1, e_entry = 0, e_phoff = 0, e_phnum = 0.
+    // ET_EXEC: e_type = 2, e_entry = virtualAddress + entry-fn
+    // offset (cycle 2: entry function = module.functions[0] at
+    // offset 0 in .text), e_phoff = sizeof(Ehdr) = 64, e_phnum = 1.
     auto const& id = fmt.elf();
+    std::uint16_t const eType = isExec
+        ? static_cast<std::uint16_t>(2)   // ET_EXEC
+        : ET_REL;
+    std::uint64_t eEntry = 0;
+    std::uint64_t ePhoff = 0;
+    std::uint16_t ePhnum = 0;
+    std::uint16_t ePhentsize = 0;
+    if (isExec) {
+        // e_entry: virtual address of the entry instruction.
+        //
+        // Resolution order:
+        //   * Empty `entryPoint`: use the first function. Cycle-2
+        //     default convention until real names land.
+        //   * Non-empty `entryPoint`: look up the named function in
+        //     the module. Function names are synthesized as
+        //     `sym_<id>` today (D-LK1-1 anchored — real names from
+        //     HIR→LIR→AssembledFunction land at LK7); the lookup
+        //     accepts that synthesized form. Unknown name = fail
+        //     loud K_SymbolUndefined.
+        if (module.functions.empty()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 "ELF ET_EXEC writer: cannot derive e_entry — the "
+                 "AssembledModule has zero functions; ET_EXEC requires "
+                 "at least one function to serve as the entry point");
+            return {};
+        }
+        std::size_t entryFnIdx = 0;
+        auto const ep = fmt.entryPoint();
+        if (!ep.empty()) {
+            bool found = false;
+            for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+                std::string const synthesized =
+                    "sym_" + std::to_string(module.functions[fi].symbol.v);
+                if (synthesized == ep) {
+                    entryFnIdx = fi;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"ELF ET_EXEC writer: entryPoint '"}
+                         + std::string{ep}
+                         + "' does not match any function in the module. "
+                           "Function names are synthesized as "
+                           "'sym_<symbolId.v>' today (real names arrive "
+                           "with D-LK1-1 / LK7). Leave entryPoint empty "
+                           "to default to the first function.");
+                return {};
+            }
+        }
+        std::uint64_t const entryOffsetInText = funcTextStart[entryFnIdx];
+        eEntry = secText->virtualAddress + entryOffsetInText;
+        ePhoff = kEhdrSize;
+        ePhnum = static_cast<std::uint16_t>(kPtLoadCount);
+        ePhentsize = static_cast<std::uint16_t>(kProgramHeaderSize);
+    }
+
     std::vector<std::uint8_t> ehdr;
     ehdr.reserve(kEhdrSize);
     // e_ident
@@ -381,22 +509,54 @@ encode(AssembledModule const&    module,
     ehdr.push_back(id.abiVersion);
     for (int i = 0; i < 7; ++i) ehdr.push_back(0);  // EI_PAD
     // e_type, e_machine, e_version
-    appendU16LE(ehdr, ET_REL);
+    appendU16LE(ehdr, eType);
     appendU16LE(ehdr, id.machine);
     appendU32LE(ehdr, EV_CURRENT);
     // e_entry, e_phoff, e_shoff
-    appendU64LE(ehdr, 0);
-    appendU64LE(ehdr, 0);
+    appendU64LE(ehdr, eEntry);
+    appendU64LE(ehdr, ePhoff);
     appendU64LE(ehdr, shoff);
     // e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx
     appendU32LE(ehdr, 0);
     appendU16LE(ehdr, static_cast<std::uint16_t>(kEhdrSize));
-    appendU16LE(ehdr, 0);
-    appendU16LE(ehdr, 0);
+    appendU16LE(ehdr, ePhentsize);
+    appendU16LE(ehdr, ePhnum);
     appendU16LE(ehdr, 64);  // sizeof(Elf64_Shdr)
     appendU16LE(ehdr, sectionCount);
     appendU16LE(ehdr, IDX_SHSTRTAB);
     std::memcpy(bytes.data(), ehdr.data(), kEhdrSize);
+
+    // ── PT_LOAD program header (ET_EXEC only) ──────────────────
+    //
+    // One PT_LOAD covering the .text region with R|X permissions.
+    // ET_EXEC requires at least one PT_LOAD; the runtime loader
+    // uses it to map the segment into the process address space.
+    // PT_PHDR (pointing at the program header table itself) is
+    // CONVENTIONAL but not required — Linux's kernel ELF loader
+    // accepts ET_EXEC without it. Cycle 2 ships only PT_LOAD;
+    // PT_PHDR / PT_INTERP / PT_DYNAMIC arrive with LK6 dynamic
+    // linking.
+    if (isExec) {
+        std::vector<std::uint8_t> phdr;
+        phdr.reserve(kProgramHeaderSize);
+        // p_type = PT_LOAD = 1
+        appendU32LE(phdr, 1);
+        // p_flags = PF_X | PF_R = 5 (.text is executable + readable)
+        appendU32LE(phdr, 5);
+        // p_offset = file offset of .text
+        appendU64LE(phdr, hText.offset);
+        // p_vaddr / p_paddr = virtual address of .text
+        appendU64LE(phdr, secText->virtualAddress);
+        appendU64LE(phdr, secText->virtualAddress);
+        // p_filesz / p_memsz = byte length of .text
+        appendU64LE(phdr, text.size());
+        appendU64LE(phdr, text.size());
+        // p_align = 0x1000 (4 KB page) — required by the kernel
+        // for PT_LOAD on x86_64 Linux.
+        appendU64LE(phdr, 0x1000);
+        std::memcpy(bytes.data() + kEhdrSize, phdr.data(),
+                    kProgramHeaderSize);
+    }
 
     return bytes;
 }

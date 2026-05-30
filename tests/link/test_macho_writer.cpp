@@ -331,6 +331,23 @@ TEST(ElfFormatJson, SegmentFieldRejectedOnElfSection) {
     ASSERT_FALSE(r.has_value());
 }
 
+// ── Mach-O MH_OBJECT section with non-zero virtualAddress rejected ──
+
+TEST(MachOFormatJson, NonZeroVirtualAddressRejectedOnMhObject) {
+    // Mach-O MH_OBJECT relocatable files use section_64.addr = 0
+    // (vmaddr assignment happens at exec build time via
+    // LC_SEGMENT_64). The MH_EXECUTE path will use virtualAddress
+    // — anchored at D-LK3-2. Pin the cycle-1 validate-rejection so
+    // a future MachO-row edit can't silently no-op.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bad-macho-va","kind":"macho"},
+      "macho": { "cputype": 16777223, "filetype": 1 },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
 // ── Non-zero addend fails loud (Mach-O has no Rela addend) ─────
 
 TEST(MachOWriter, NonZeroAddendFailsLoud) {
