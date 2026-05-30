@@ -50,7 +50,7 @@
 > - **[`11-ffi-plan - tbd.md`](./11-ffi-plan%20-%20tbd.md)** — **new (rev 2).** Hermetic FFI: in-tree ELF/PE/Mach-O/ar readers, C header mode parser, ABI catalog, name mangling, HIR extern-decl ingestion. Six v1 PRs (FF1–FF6). C++ mangling, full preprocessor reserved post-v1. **⏳ planned.**
 > - **[`12-mir-lir-plan - ok.md`](./12-mir-lir-plan%20-%20ok.md)** — **new (rev 2).** MIR (SSA over CFG + structured-CF markers preserved) + LIR (per-target JSON-configured ISA, virtual+physical regs, calling-conv lowered, frame materialized). Eight PRs (ML1–ML8). **✅ done 2026-05-27..29 — ML1–ML8 closed end-to-end** including ML8 cycle 3 substrate cleanup (TargetTerminatorKind enum + schema-driven dispatch; `isTerminator` field deleted, derived from `terminatorKind`). ML7 cycle 2 ARM64-stackPointer + ABI goldens still anchored as legitimate next-cycle work.
 > - **[`13-assembler-plan - tbd.md`](./13-assembler-plan%20-%20tbd.md)** — **new (rev 2).** In-tree machine-code encoder for x86_64 + ARM64. Hand-written encoding tables per Intel SDM / ARM ARM. Per-(arch×format) relocation taxonomy. Six PRs (AS1–AS6). **✅ done 2026-05-29 — AS1–AS6 closed end-to-end** (`feature/as-1`) including shape-keyed byte-encoder walkers (`x86-variable` + `fixed32`), round-trip oracle disassembler, relocation taxonomy unifier, SourceMapEntry stamping at dispatch level, end-to-end c-subset corpus pipeline.
-> - **[`14-linker-plan - tbd.md`](./14-linker-plan%20-%20tbd.md)** — **new (rev 2; config-driven shift rev 3 2026-05-29).** In-tree linker — JSON-configured object formats (`src/dss-config/object-formats/*.format.json` for ELF / PE / Mach-O / WASM-skeleton / SPIR-V-skeleton) + ONE format-blind engine + symbol resolution + relocation application + per-platform metadata + TLS lowering. Ten PRs (LK1–LK10). Mirrors the `GrammarSchema` (frontend) + `TargetSchema` (backend ISA) config-driven pattern — new object format = drop a JSON file, no engine edits. **Largest single chunk of backend work.** **🟢 in flight — LK4 substrate + LK1–LK3 writers (.o + executable images, ELF/PE/Mach-O) + LK6 c1 intra-module reloc-apply ✅ (2026-05-29..30, byte-validated in-memory); LK5 / LK6 c2 / LK7 / LK8–LK9 skeletons / LK10 hermetic on-disk file ⏳.**
+> - **[`14-linker-plan - tbd.md`](./14-linker-plan%20-%20tbd.md)** — **new (rev 2; config-driven shift rev 3 2026-05-29).** In-tree linker — JSON-configured object formats (`src/dss-config/object-formats/*.format.json` for ELF / PE / Mach-O / WASM-skeleton / SPIR-V-skeleton) + ONE format-blind engine + symbol resolution + relocation application + per-platform metadata + file emission + driver pipeline wiring. Ten PRs (LK1–LK10). Mirrors the `GrammarSchema` (frontend) + `TargetSchema` (backend ISA) config-driven pattern — new object format = drop a JSON file, no engine edits. **Largest single chunk of backend work.** **✅ LK1–LK10 CLOSED end-to-end 2026-05-30** on `feature/lk-111`: LK4 substrate + LK1/LK2/LK3 writers (.o + executable images ET_EXEC/.exe/MH_EXECUTE) + LK6 cycle 1 reloc-apply + LK6 cycle 2a–d dynamic linking (PE IAT / ELF GOT+PLT / Mach-O LC_DYLD_INFO_ONLY / HIR→AS extern thread-through) + LK7 codesign placeholders + LK8/LK9 WASM/SPIR-V skeletons + LK10 file emission (`dss::linker::writeImage`) + driver pipeline wiring (`Program::compileFiles` / `compileDirectory`). LK5 (TLS) deferred to first TLS-bearing corpus; LK11 (cross-CU) deferred to v1.x.
 > - **[`15-debug-info-plan - tbd.md`](./15-debug-info-plan%20-%20tbd.md)** — **new (rev 2).** DWARF 5 writer (ELF + Mach-O) + PDB writer (PE) + CFI / SEH / compact-unwind tables + source-position chain. Twelve PRs (DB1–DB12). **⏳ planned.**
 > - **[`16-codesign-publish-plan - tbd.md`](./16-codesign-publish-plan%20-%20tbd.md)** — **new (rev 2).** Hermetic codesign + publish: Apple Mach-O codesign + notarization stapling, iOS provisioning, Windows Authenticode + RFC 3161 TSA, Android APK v3 (skeleton). In-tree crypto substrate (BearSSL vendored). Nine PRs (CS1–CS9). Apple-host-free local dev. **⏳ planned.**
 > - **[`17-shader-gpu-plan - tbd.md`](./17-shader-gpu-plan%20-%20tbd.md)** — **new (rev 2).** SPIR-V codegen + shader-shape HIR extensions + binding-resource model + same-source CPU+GPU function dual-lowering. Ten PRs (SG1–SG10). v1.x — lit up for the custom language. **⏳ planned (reserved scope).**
@@ -70,7 +70,7 @@
 | Build system (CMake 4.0 floor, C++23, FetchContent of nlohmann/json 3.12.0 + GoogleTest 1.17.0) | ✅ working |
 | Core types — full sub-plan T0–T12 (tree/node/diagnostics/schema + `TreeBuilder` + `TreeCursor` + `tree_visitor` + `NodeAttribute<T>` + typed views + E2E + CMake wireup + onboarding docs) | ✅ **complete** |
 | Schema expressiveness v2 (sub-plan PR0–PR8) — c-subset + operator precedence (`OperatorTable`) + real `SchemaCursor` walker + contextual keywords + `scopeRequire` + `TreeBuilder::Checkpoint` + `lexerModes`/`LexerModeStack`/`modeOp` + `stringStyle` descriptor + tsql-subset empirical stress + cross-plan close-out | ✅ **done** — all 10 PRs (PR0, PR1, PR2a, PR2b, PR3–PR8) shipped + review-fixed |
-| **Total ctest cases** | **≈125 ctest suites, 100% pass** post the LK1–LK3 object/executable writers + LK1 ET_EXEC + LK6 cycle 1 reloc-apply (2026-05-30). Growth trace from 56 suites at SE1-pre baseline through HIR (HR1–HR11) → MIR (ML1–ML4) → LIR (ML5 cycle 1–3e) → ML6 (liveness + linear-scan + rewrite) → ML7 (callconv) → ML8 (`.dsslir` emitter + parser + round-trip) → AS1–AS6 (assembler) → LK4 (linker substrate) → LK1–LK3 + LK1 ET_EXEC + LK6 c1 (113 → 117 → ≈125). |
+| **Total ctest cases** | **124 ctest suites, 100% pass** post LK1–LK10 closure end-to-end (2026-05-30 — driver pipeline wiring, file emission, D-LK9-2 namespace rename, src/gen removal, heavy 7-agent fold). Growth trace: 56 suites at SE1-pre baseline → HIR (HR1–HR11) → MIR (ML1–ML4) → LIR (ML5–ML8) → AS1–AS6 (assembler) → LK4 substrate → LK1–LK3 + cycle 2 executable images + LK6 cycle 1–2d (dyn link) + LK7 (codesign) + LK8/LK9 (WASM/SPIR-V skeletons) + LK10 cycle 1 (file emission) + LK10 cycle 2 (driver pipeline + 24 new program tests). |
 | Substrate hardening (sub-plan SH1–SH4) — landing-log generator + Linux CI matrix + cross-tree `NodeId` guard + v2 follow-ups | ✅ **done** — all four PRs shipped. |
 | Tokenizer (sub-plan TZ1–TZ3 + review-fix round 1) — `SourceReader`, `Tokenizer`, `TokenStream`, `LexerModeStack`, `stringStyle` body handling, comment modes, `C_BodyDefaultKindInShape` loader guard, synthesis-allowlist assertion, fail-loud `E2EHarness`. **Post-TZ3: numeric lexing is now fully config-driven** (08.55 retired the hand-coded C-style `scanNumber()`; each language declares its `numberStyle` block, schema v4). | ✅ **done** — phase #5 closed; phase #6 (`analysis-lexical`) ✅ subsumed |
 | **Parser** (sub-plan PA0–PA5b + PA5a-prep + PA-Walker-LeftRec) — substrate `SchemaWalker` ✅; iterative RD driver ✅; Pratt walker ✅; recovery + diagnostic UX ✅; corpus stress ✅; c-subset readiness shapes ✅; postfix-chain walker redesign ✅; LSP server + LSP semantic-stub handlers ✅ | ✅ **all 7 PRs done — parser phase closed.** PA0–PA3 as before; PA4 onboarded real corpus programs (c-subset / tsql-subset / toy) and closed v2-gap-catalog rows 6/7/8/12 (postfix call/index/inc/dec, prefix deref). PA4 follow-ups (PA4-F1..F8) landed substrate refactors (`OperatorTable::Entry → optional<GroupedPostfix>`, `bodyDefaultTokenKinds` dedup), additional test coverage, and corpus golden harness. PA5a-prep closed v2-gap-catalog rows 12-declarator, 16 (compound assignment), 29 (`extern` declaration). PA-Walker-LeftRec added the `TreeBuilder::wrapLastChildInFrame` substrate primitive + rewrote the Pratt walker's postfix branch. PA5a shipped the LSP server skeleton + diagnostics (stdio JSON-RPC, UTF-16 position encoding, document store with monotonic parseGeneration stale-suppression, two-mode schema resolution, thread-pool executor); PA5b added the 6 semantic-stub method handlers (`textDocument/{hover,completion,definition,references,rename,signatureHelp}`) returning LSP-spec defaults. A cross-cutting 5-agent review on the integrated LSP stack closed 22 follow-up items in a single commit. Semantic-powered LSP methods land post-phase #8 in a spun-off `09-lsp-plan`. **Post-PA5: the Pratt walker now reads its wrapper-rule RuleIds from `schema.exprWrapperRules(exprRule)` (08.55), not from any hardcoded constants — thesis decision #4 end-to-end.** **56 ctest suites green** (post 08.55). |
@@ -78,8 +78,8 @@
 | **Semantic** — symbol table, scope resolution, type checking | ✅ **done (SE1–SE7)** (phase #8; sub-plan [`08.6-semantic-plan`](./08.6-semantic-plan%20-%20ok.md)). One language-agnostic `analyze()` engine driven by a `semantics` schema-v4 block produces a `SemanticModel` (symbol table + scope tree + node→SymbolId / node→TypeId side-tables + `S_*` diagnostics). Toy/c-subset/tsql onboarded purely by config; cross-file visibility is `crossRefs[]`-import-driven. SE4 const-correctness, SE5 typedefs, SE6 functions/calls/overloads (`kindByChild`/`callRules`/`builtinFunctions` facets), SE7 LSP wiring all shipped. **G-201..G-212 closed.** Two 5-agent review rounds; 64/64. |
 | **IR** — HIR + MIR + LIR (rev 2; replaces single-IR plan) | ✅ done — **HIR HR1–HR11 ✅ (plan 09 COMPLETE, 2026-05-26..28, `feature/hir-1`)**. **MIR ✅ ML1–ML4 done 2026-05-27..28** (`feature/mir-lir`): ML1 skeleton, ML2 HIR→MIR (6 cycles incl. Cast emission), ML3 MirVerifier (7 rule families + `I_*` 0xA00x), ML4 `.dssir` text + round-trip. **LIR ✅ ML5–ML8 done 2026-05-29**: ML5 JSON-configured targets (`src/dss-config/targets/*.target.json`; adding ARM64 = new JSON file) + register-file + calling conventions in JSON + MIR→LIR isel cycles 1–3e for arithmetic/cast/CFG/memory/wide-literal/float/bitwise/Calls/Aggregates with `LirVerifier`; ML6 liveness (`bc596ae`) + linear-scan + variant migration + R_* family + rewrite pass + `verifyLirPostRegalloc`; ML7 cycle 1 callconv + stack frame materialization (`5362766`); ML8 cycle 1 `.dsslir` EMITTER (`040d496`) + cycle 2 PARSER + verify-on-load + round-trip + schema version (`9622b38`). New diag codes: `L_*` 0xB00x family. **Remaining**: ML7 cycle 2 (ARM64 stackPointer + ABI goldens) + cross-CU type-import for HR Cast (downstream-of-HR real blocker) — both anchored as legitimate next-cycle work. 100/100 ctest. Production-readiness §3 (G-301a/b/c + G-302..G-310). Owned by [`09-hir-plan`](./09-hir-plan%20-%20ok.md) (HIR pivot; **HR1–HR11 ✅**) + [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) (MIR + LIR; **ML1–ML8 ✅**). |
 | **Optimizer** — multi-tier, config-driven (source/target/linker-agnostic): HIR-transpile + MIR + LIR + per-target. v1 mandatory subset: const folding + DCE + copy propagation + dominator tree + liveness | ⏳ planned — sub-plan [`22-optimizer-plan`](./22-optimizer-plan%20-%20tbd.md) (rev 1). **Sequenced right after the pipeline first emits a runnable executable file** (LK10 + driver — not yet; only in-memory `LinkedImage::bytes` today). Heuristics-as-data from PR1 → OPT10 autotuner. OPT3–OPT9 (inlining/CSE/LICM/scheduling/vectorization) roadmap; v1 = OPT1–OPT2. Production-readiness §4 (G-401..G-410). |
-| **Codegen + in-tree linker + assembler** — ELF + PE + Mach-O × x86_64 + ARM64 + per-platform ABI + **hermetic linker** (rev 2; replaces system-linker integration) | ⏳ in flight. Owners: [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) + [`14-linker-plan`](./14-linker-plan%20-%20tbd.md). **Assembler ✅ COMPLETE end-to-end (AS1–AS6 landed 2026-05-29 on `feature/as-1`)** — x86_64 + ARM64 byte encoding via shape-keyed walkers, round-trip oracle disassembler, relocation taxonomy unifier, source-map stamping. **Linker LK4 substrate ✅ landed 2026-05-29** — `ObjectFormatSchema` + format-blind engine + K_* diagnostic family at 0x8xxx + cross-side reloc unifier. **LK1–LK3 ✅ landed** (ELF / PE / Mach-O `.o`/`.obj` **and** executable images — ELF ET_EXEC, PE32+ `.exe`, Mach-O MH_EXECUTE — byte-validated in-memory) **+ LK6 cycle 1 intra-module reloc-apply ✅** (2026-05-29..30). Remaining: LK5 (TLS) / LK6 c2 (dynamic+extern) / LK7 (codesign hook) / LK8–LK9 (WASM/SPIR-V skeletons) / **LK10 (hermetic on-disk runnable FILE — not produced yet)** ⏳. Production-readiness §5 (G-501..G-571). |
-| **Driver / project config** — `dss-code-prime build my-project.dss-project.json` | ⏳ pending. Production-readiness §6 (G-601..G-609) + [`06-artifact-profile-plan - tbd.md`](./06-artifact-profile-plan - tbd.md) AP2. |
+| **Codegen + in-tree linker + assembler** — ELF + PE + Mach-O × x86_64 + ARM64 + per-platform ABI + **hermetic linker** (rev 2; replaces system-linker integration) | ✅ **CLOSED end-to-end 2026-05-30** for x86_64. Owners: [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) + [`14-linker-plan`](./14-linker-plan%20-%20tbd.md). **Assembler ✅ COMPLETE (AS1–AS6 landed 2026-05-29 on `feature/as-1`)** — x86_64 + ARM64 byte encoding via shape-keyed walkers, round-trip oracle disassembler, relocation taxonomy unifier, source-map stamping. **Linker ✅ COMPLETE (LK1–LK10 landed 2026-05-30 on `feature/lk-111`)** — `ObjectFormatSchema` + format-blind engine + 11 `K_*` codes at 0x8xxx + 5 `D_*` driver-tier codes at 0xD007–0xD00B + cross-side reloc unifier; per-format walkers for ELF / PE / Mach-O / WASM (skeleton) / SPIR-V (skeleton); relocatable .o/.obj/.o AND executable images ET_EXEC/.exe/MH_EXECUTE; dynamic linking (PE IAT / ELF GOT+PLT / Mach-O LC_DYLD_INFO_ONLY); codesign placeholders (LK7); file emission (`dss::linker::writeImage`); driver pipeline wired (`Program::compileFiles` / `compileDirectory`). Remaining v1 deferrals: LK5 (TLS — first TLS-bearing corpus trigger); LK11 (cross-CU — v1.x); plan 12 ML7 cycle 2 + plan 13 AS load/store/ret-variant cycles gate the FIRST byte-correct c-subset e2e (anchored D-LK10-2 in plan 14). Production-readiness §5 (G-501..G-571). |
+| **Driver / project config** — `dss-code-prime build my-project.dss-project.json` | 🟢 **partial — programmatic API landed.** `Program::compileFiles` / `compileDirectory` wired through the full pipeline at LK10 cycle 2 (2026-05-30); `compileProject` fails loud `D_PlanNotLanded` pending plan 06 `.dsp` parser. CLI argument routing (`--compile` / `--target` / `--output`) is LK10 cycle 3. Production-readiness §6 (G-601..G-609) + [`06-artifact-profile-plan - tbd.md`](./06-artifact-profile-plan - tbd.md) AP2. |
 | **`artifactProfile` mechanism** — language config declares supported profiles; project config picks one; codegen reads it | ⏳ pending. See [`06-artifact-profile-plan - tbd.md`](./06-artifact-profile-plan - tbd.md). Gates `gen-link` acceptance. |
 | **Debug info** — DWARF (ELF + Mach-O) + PDB (PE) | ⏳ pending. Production-readiness §5.4 (G-530..G-533). |
 | CI/CD pipelines | 🟦 Linux x86_64 + Windows x86_64 + macOS x86_64 ✅; **ARM64 across all three OS still pending** (G-704..G-706). Sanitizers partial. Fuzzing not yet wired. |
@@ -112,7 +112,7 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 | 10 | [12](./12-mir-lir-plan%20-%20ok.md) ML1–ML8 | MIR (SSA over CFG + structured-CF markers) + LIR (per-target ISA) | step 8 | ✅ **ML1–ML8 closed end-to-end 2026-05-27..29** (`feature/mir-lir`). **MIR ML1–ML4 ✅**: skeleton + HIR→MIR (6 cycles incl. Cast emission) + MirVerifier (7 rule families, `I_*` 0xA00x) + `.dssir` text round-trip. **D5 sub-arc ✅** (structs/unions/enums + designated init + brace-init + ConstructAggregate). **Plan 12.5 ✅** (CE1–CE5 + D6/D7). **LIR ML5–ML8 ✅**: ML5 JSON-configured targets (`src/dss-config/targets/*.target.json`) + register-file + calling conventions in JSON + MIR→LIR isel through cycle 3e; ML6 liveness + linear-scan + rewrite pass + `verifyLirPostRegalloc`; ML7 cycle 1 callconv + stack frame (`5362766`); ML8 cycle 1 `.dsslir` EMITTER (`040d496`) + cycle 2 PARSER + verify-on-load + round-trip + schema version (`9622b38`). New `L_*` 0xB00x diagnostic family. **Remaining**: ML7 cycle 2 (ARM64 stackPointer + ABI goldens) anchored as next-cycle work. 100/100 ctest. ML6–ML8 ✅ parallel-with step 9. |
 | 10.5 | [12.5](./12.5-const-eval-plan%20-%20ok.md) CE1–CE5 | **Shared constants-evaluation engine** in `src/hir/const_eval.{hpp,cpp}` (corrected location from initial draft — engine reads HIR so it cannot live in the lattice library below HIR). Lifts ML2's inline `tryConstFold` into one language-blind engine consumed by MIR-globals init, HIR verifier (array-length, future enum-bounds), D5.5 enum-value computation, and the optimizer's const-fold pass. Closes the float-arithmetic fold gap delimited by ML2 globals + the `Cast`-fold gap delimited by HR Cast emission. | step 10 | ✅ **CE1–CE5 done 2026-05-28** (engine + integer fold + Ref callback + target-aware Cast + commonType-tagged BinaryOp + short-circuit LogicalAnd/Or/Ternary + `allowFloat` IEEE 754 policy via host `<cmath>` with F32 narrowing, NaN-unordered comparisons, float→int unconditional refuse-on-out-of-int64; F16/F128 + lossy-conversion knob + schema-driven `allowFloat` + env/policy split + result cache delimited as plan-12.5 §0.2 deferred-by-design; 71 unit tests + 4 MIR end-to-end; 89/89). **Plan 12.5 CLOSED.** |
 | 12 | [13](./13-assembler-plan%20-%20tbd.md) AS1–AS6 | x86_64 + ARM64 hand-encoder + per-(arch×format) relocation taxonomy | step 10 | ✅ **AS1–AS6 closed end-to-end 2026-05-29** (`feature/as-1`). x86_64 + ARM64 byte encoding via shape-keyed walkers (`x86-variable` + `fixed32`); round-trip oracle disassembler; relocation taxonomy unifier (target-side); SourceMapEntry stamping at dispatch level; end-to-end c-subset corpus pipeline test. `A_*` diag family at 0x1xxx. |
-| 13 | [14](./14-linker-plan%20-%20tbd.md) LK1–LK10 | In-tree linker — JSON-configured object formats (`*.format.json` for ELF/PE/Mach-O) + format-blind engine + symbol resolution + relocs + TLS lowering | steps 9, 12, **P1** | ⏳ **LK4 substrate ✅ landed 2026-05-29** (`ObjectFormatSchema` + `linker.{hpp,cpp}` + closed enums via `EnumNameTable` + cross-side reloc-taxonomy unifier substrate at `src/core/substrate/relocation_table.hpp` + `K_*` 0x8xxx). **LK1–LK3 per-format writers ✅ landed** (`elf` / `pe` / `macho` `.format.json` + walkers — relocatable `.o`/`.obj` **and** executable images: ELF ET_EXEC, PE32+ `.exe`, Mach-O MH_EXECUTE; all byte-validated in-memory) **+ LK6 cycle 1 intra-module reloc-apply ✅** (2026-05-29..30). LK5 (TLS) / LK6 c2 (dynamic+extern) / LK7 (codesign hook) / LK8–LK9 (WASM/SPIR-V skeletons) / **LK10 (hermetic on-disk runnable FILE)** ⏳ pending. |
+| 13 | [14](./14-linker-plan%20-%20tbd.md) LK1–LK10 | In-tree linker — JSON-configured object formats (`*.format.json` for ELF/PE/Mach-O/WASM/SPIR-V) + format-blind engine + symbol resolution + relocs + dynamic linking + file emission + driver wiring | steps 9, 12, **P1** | ✅ **LK1–LK10 CLOSED end-to-end 2026-05-30** (`feature/lk-111`). LK4 substrate (`ObjectFormatSchema` + `linker.{hpp,cpp}` + `K_*` 0x8xxx) + LK1/LK2/LK3 per-format writers (.o/.obj/.o relocatable AND executable images ET_EXEC/.exe/MH_EXECUTE all byte-validated end-to-end) + LK6 cycle 1 intra-module reloc-apply + LK6 cycle 2a–d dynamic linking (PE IAT, ELF GOT+PLT, Mach-O LC_DYLD_INFO_ONLY, HIR→AS extern thread-through) + LK7 codesign placeholders (Mach-O LC_CODE_SIGNATURE, PE attribute-cert reservation) + LK8 WASM module-preamble skeleton + LK9 SPIR-V module-header skeleton + LK10 file emission (`dss::linker::writeImage`) + LK10 cycle 2 driver pipeline wiring (`Program::compileFiles` / `compileDirectory`). LK5 (TLS) deferred to first TLS-bearing corpus; LK11 (cross-CU) deferred to v1.x. |
 | 13.5 | [`22`](./22-optimizer-plan%20-%20tbd.md) OPT1–OPT10 | Multi-tier optimizer — HIR(transpile) / MIR / LIR / per-target passes, all **source/target/linker-agnostic** (config-driven). v1 mandatory: const-fold + DCE + copy-prop + dominator-tree + liveness (OPT1–OPT2). | **right after step 13 first emits a runnable executable FILE** (LK10 hermetic end-to-end + driver file-emission) | ⏳ **planned (plan 22, rev 1).** Deliberately sequenced right after the pipeline can write a runnable executable file — "runs everywhere" before "runs fast." **Accurate state 2026-05-30:** the config-driven linker today produces only **in-memory** `LinkedImage::bytes` (test-validated) + intra-module-reloc in-memory images (LK6 c1); **no on-disk executable FILE is emitted yet** — LK10 + driver wiring is the milestone this phase waits on. **Heuristics-as-data from PR1** (cost/machine/peephole + pipeline as JSON → OPT10 autotuner). **Linker-agnostic** via format-neutral `SymbolBinding`/`SymbolVisibility` threaded onto MIR. `X_*` diag at 0x2xxx. Reuses const-eval's scalar core (tier-neutral `scalar_eval`, OPT2). |
 | 14 | [15](./15-debug-info-plan%20-%20tbd.md) DB1–DB12 | DWARF 5 (ELF + Mach-O) + PDB (PE) + CFI / SEH / compact-unwind | steps 10, 13 | ⏳ |
 | 15 | [16](./16-codesign-publish-plan%20-%20tbd.md) CS1–CS9 | Apple codesign + notarization + Authenticode + RFC 3161 + APK v3 (in-tree crypto via vendored BearSSL) | steps 13, 14 | ⏳ |
@@ -172,7 +172,7 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 | `0x5xxx` | `O_` | Object format / linker | [`14`](./14-linker-plan%20-%20tbd.md) | ⏳ reserved (cpp comment cites this as the explicit hold) |
 | `0x6xxx` | `W_` | WAT/WASM verifier + emit-side | [`18`](./18-wasm-plan%20-%20tbd.md) §2.9b | ⏳ reserved (post-rev-3 allocation) |
 | `0x7xxx` | `V_` | SPIR-V verifier + emit-side | [`17`](./17-shader-gpu-plan%20-%20tbd.md) §2.9 | ⏳ reserved (post-rev-3 allocation) |
-| `0x8xxx` | `K_` | Linker (object format engine + reloc apply) | [`14`](./14-linker-plan%20-%20tbd.md) | ✅ shipped (LK4 substrate — 2026-05-29) |
+| `0x8xxx` | `K_` | Linker (object format engine + reloc apply + file emission) | [`14`](./14-linker-plan%20-%20tbd.md) | ✅ shipped (LK1–LK10 — 2026-05-30; 11 K_* codes 0x8001–0x800B) |
 | `0x9xxx` | `P_` | Parse (internal-invariant range, distinct from 0x0xxx user-facing) | [`05`](./05-parser-plan%20-%20ok.md) | ✅ shipped |
 | `0xAxxx` | `I_` | MIR (IR-gen mid-level + verifier) | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML3) |
 | `0xBxxx` | `L_` | LIR lowering + verifier | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML5–ML8) |
@@ -540,44 +540,44 @@ The API accepts three input modes:
 
 #### 4.1.2 `program.hpp/.cpp` — Public API
 
+**Status (2026-05-30): shipped at plan 14 LK10 cycle 2.** The v1 surface diverges from the historical TargetInfo-struct sketch — targets are passed as `"<targetName>:<formatName>"` strings (e.g. `"x86_64:elf64-x86_64-linux"`) so the C-ABI (`dss_compile_directory`) stays a flat `const char**` array. The richer `TargetInfo`-style struct will arrive when LK10 cycle 3 ships CLI flag routing (`--target`/`--format`) backed by `TargetSpec` parsing (see `src/program/target_spec.hpp`).
+
 ```cpp
 class Program {
 public:
-    Program();
-    ~Program();
+    Program() = default;
+    ~Program() = default;
+
+    /// CLI entry point — currently dispatches `--lsp` mode only.
+    int run(int argc, char* argv[]);
 
     /// Compile from a .dsp project file (self-contained — language, files, targets defined inside).
-    CompilationResult compileProject(const std::string& projectFilePath);
+    /// Cycle 2 stub: fails loud with `D_PlanNotLanded` until plan 06 (`.dsp` parser) ships.
+    int compileProject(const std::string& projectFilePath);
 
     /// Compile an explicit list of source files for the given language to the given target(s).
-    CompilationResult compileFiles(
+    /// Each target encodes "<targetName>:<formatName>" — both halves are `loadShipped` keys.
+    int compileFiles(
         const std::vector<std::string>& sourceFiles,
         const std::string& languageName,
-        const std::vector<TargetInfo>& targets
+        const std::vector<std::string>& targets
     );
 
-    /// Compile all matching source files found in a directory (recursive scan by extension).
-    CompilationResult compileDirectory(
+    /// Compile all matching source files found in a directory (recursive scan by language extension).
+    int compileDirectory(
         const std::string& directoryPath,
         const std::string& languageName,
-        const std::vector<TargetInfo>& targets
-    );
-
-private:
-    /// Shared implementation: compile resolved files for each target.
-    CompilationResult compileResolved(
-        const std::vector<std::string>& resolvedFiles,
-        const LanguageConfig& langConfig,
-        const std::vector<TargetInfo>& targets
+        const std::vector<std::string>& targets
     );
 };
 ```
 
-**Behavior:**
-- Loads the language config once (via `source-factory`), reuses it for all files
-- For each target in the targets list, runs the full pipeline (tokenize → analyze → gen) per source file
-- Collects per-file, per-target results into a single `CompilationResult`
-- Thread-safe: files can be compiled in parallel (future optimization)
+**Behavior (post-LK10 cycle 2):**
+- `compileFiles` loads the language schema once, builds ONE multi-file `CompilationUnit`, drains CU + per-Tree + SemanticModel diagnostics into the run-wide reporter, then per-target compiles through the full HIR → MIR → LIR → ASM → link → writeImage pipeline (`src/program/compile_pipeline.{hpp,cpp}::compileSingleUnit`).
+- Output path: `<cwd>/target/<formatName>/<stem><ext>`; extension derived from `ObjectFormatKind × objectType` via `TargetSpec::outputExtension`. Plan 06 will eventually own the artifact-profile-driven scheme (D-LK10-3).
+- `compileDirectory` recursively walks the directory, filters by the language schema's declared `fileExtensions`, sorts deterministically, delegates to `compileFiles`. (Plan 00 §4.1.3's `InputResolver` class is anchored at D-LK10-1 for LK10 cycle 3.)
+- Returns 0 on success; 1 on any tier failure with diagnostics drained to stderr.
+- Cycle 2 acceptance is WIRING (output directory creation proves the pipeline routed through every tier); byte-on-disk e2e auto-tightens when plan 12 ML7 cycle 2 + plan 13 AS load/store/ret-variant cycles close (D-LK10-2).
 
 #### 4.1.3 `input_resolver.hpp/.cpp` — Input Resolution
 
@@ -1281,18 +1281,16 @@ public:
 
 **Supported Targets:**
 
-| Target Class | OS | Architecture | Output Format |
-|---|---|---|---|
-| `TargetWindowsX86_64` | Windows | x86_64 | PE/COFF (.exe) |
-| `TargetLinuxX86_64` | Linux | x86_64 | ELF |
-| `TargetLinuxARM64` | Linux | ARM64 | ELF |
-| `TargetMacOSX86_64` | macOS | x86_64 | Mach-O |
-| `TargetMacOSARM64` | macOS | ARM64 (Apple Silicon) | Mach-O |
-| `TargetIOSARM64` | iOS | ARM64 | Mach-O |
-| `TargetAndroidARM64` | Android | ARM64 | ELF (Android NDK) |
-| `TargetWebWASM` | Web | WASM | WebAssembly (.wasm) |
+| Target spec | OS | Architecture | Object format | Status |
+|---|---|---|---|---|
+| `x86_64:elf64-x86_64-linux` / `-exec` | Linux | x86_64 | ELF (.o / executable) | ✅ shipped (LK1 + LK1 cycle 2 + LK6) |
+| `x86_64:pe64-x86_64-windows` / `-exec` | Windows | x86_64 | PE/COFF (.obj / .exe) | ✅ shipped (LK2 + LK2 cycle 2 + LK6 cycle 2a) |
+| `x86_64:macho64-x86_64-darwin` / `-exec` | macOS | x86_64 | Mach-O (.o / executable) | ✅ shipped (LK3 + LK3 cycle 2 + LK6 cycle 2c) |
+| `arm64:*` | Linux / macOS / iOS / Android | ARM64 | ELF / Mach-O | ⏳ first non-x86_64 cycle anchored at D-LK6-1 (assembler ✅ ARM64 already shipped at AS3) |
+| `*:wasm32-v1` | Web | WASM | WebAssembly (.wasm) | ⏳ skeleton walker shipped (LK8); section emitters land in plan 18 |
+| `*:spirv-1.6` | GPU shader | SPIR-V | SPIR-V module (.spv) | ⏳ skeleton walker shipped (LK9); instruction stream lands in plan 17 |
 
-**`TargetConfig`** — Maps `TargetInfo` (OS + arch) to the correct `TargetBase` subclass. Factory pattern.
+**Historical note (2026-05-30):** the v1 sketch listed `TargetWindowsX86_64` and sibling C++ classes; that hand-rolled `src/gen/` was retired at LK10 cycle 2 (config-driven `*.target.json` + `*.format.json` walkers superseded it). The `TargetConfig`/`TargetBase` factory abstraction never shipped — `TargetSchema::loadShipped(name)` + `ObjectFormatSchema::loadShipped(name)` are the substrate, called directly by the driver.
 
 ---
 

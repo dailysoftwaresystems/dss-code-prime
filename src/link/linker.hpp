@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <vector>
 
-// Linker engine (plan 14 LK4 substrate).
+// Linker engine (plan 14, LK1–LK10 closed end-to-end 2026-05-30).
 //
 // FORMAT-BLIND. The engine consumes an `AssembledModule` from the
 // assembler (plan 13) plus a `TargetSchema` (for relocation-formula
@@ -19,18 +19,24 @@
 // resolves symbols, and produces a `LinkedImage` — a byte buffer
 // laid out per the format's section conventions.
 //
-// LK4 substrate ships: parallel-index discipline, derived `ok()`,
-// the K_* diagnostic family (substrate-tier — per-format codes
-// land alongside their LK* cycles), the format-blind dispatch
-// shell that calls a per-format walker (none registered yet —
-// LK1/LK2/LK3 plug in).
+// LK4 substrate (the original 2026-05-29 land) shipped: parallel-
+// index discipline, derived `ok()`, the K_* diagnostic family
+// (substrate-tier — per-format codes land alongside their LK*
+// cycles), the format-blind dispatch shell that calls a per-format
+// walker. LK1/LK2/LK3 plugged in ELF / PE / Mach-O walkers (both
+// relocatable .o/.obj AND executable images); LK6 closed intra-
+// module reloc apply + dynamic linking (PE IAT / ELF GOT+PLT /
+// Mach-O LC_DYLD_INFO_ONLY) + HIR→AS extern thread-through; LK7
+// added codesign placeholders; LK8/LK9 added WASM/SPIR-V skeletons;
+// LK10 added file emission (`dss::linker::writeImage`) + driver
+// pipeline wiring.
 //
-// **Out of cycle scope** (anchored as plan 14 §3.1 deferred items):
-//   * Per-format walkers (ELF / PE / Mach-O). LK1-LK3.
-//   * Symbol-table merge across multiple CUs. LK11 + CU6.
-//   * TLS lowering. LK5.
-//   * Dynamic linking + imports. LK6.
-//   * Build-id placement. Part of LK1-LK3.
+// **Still deferred** (anchored as plan 14 §3.1 items):
+//   * Cross-CU symbol-table merge. LK11 + CU6 (v1.x).
+//   * TLS lowering. LK5 (first TLS-bearing corpus trigger).
+//   * Lazy-binding upgrade paths (D-LK6-11/12/13/14 — eager binding
+//     ships today via DF_1_NOW / IAT eager / LC_DYLD_INFO_ONLY).
+//   * ARM64 reloc-formula reshape (D-LK6-1 — first non-x86_64 arch).
 
 namespace dss {
 
