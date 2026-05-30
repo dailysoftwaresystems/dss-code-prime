@@ -479,10 +479,21 @@ enum class DiagnosticCode : std::uint16_t {
     //   until those anchors close. Format walkers that can't
     //   support the requested binding mode fire this loud rather
     //   than silently producing a binary missing its import table.
+    // K_WalkerInputContractViolation: a format walker received an
+    //   AssembledModule whose SHAPE (not whose imports) violates the
+    //   walker's input contract — e.g. non-empty `functions` on the
+    //   LK8 WASM skeleton (which produces a preamble-only output
+    //   that doesn't consume native-ISA bytes), or `expectedFuncCount
+    //   > 0` with empty `functions`. Distinct from
+    //   `K_NoMatchingObjectFormat` (which signals "no walker registered
+    //   for this kind") — the dispatch IS correct here, but the caller
+    //   wired the wrong shape of input. (type-design fold, LK8
+    //   post-fold review.)
     K_SymbolUndefined              = 0x8001,
     K_RelocationKindMismatch       = 0x8002,
     K_NoMatchingObjectFormat       = 0x8003,
     K_FormatLacksImportSupport     = 0x8004,
+    K_WalkerInputContractViolation = 0x8005,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

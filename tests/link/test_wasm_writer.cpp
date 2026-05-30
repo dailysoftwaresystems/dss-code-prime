@@ -5,7 +5,7 @@
 //   * Linker dispatch routes `ObjectFormatKind::Wasm` through the
 //     new walker (not the old fail-loud arm at LK8/LK9).
 //   * Walker emits exactly the 8-byte WebAssembly v1 preamble
-//     (magic '\0asm' + version 1) per WebAssembly spec §5.1.
+//     (magic '\0asm' + version 1) per WebAssembly spec §5.5.
 //   * Non-Wasm schema passed to `wasm::encode` fails loud.
 //   * Non-empty `AssembledModule.functions` fails loud (LK8
 //     skeleton contract: plan 18's MIR→WAT lowerer is the WASM-
@@ -75,6 +75,55 @@ TEST(WasmFormatJson, WasmKindWithMachoBlockRejected) {
     ASSERT_FALSE(r.has_value());
 }
 
+TEST(WasmFormatJson, WasmKindWithUniversalFieldRejected) {
+    // type-design Q3 fold: WASM has its own section vocabulary
+    // (Type / Function / Code sections, plan 18 owned) — a top-
+    // level `sections[]` / `relocations[]` / `entryPoint` would
+    // be silently ignored by the walker. Validate-reject at load.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"wasm-with-relocations","kind":"wasm"},
+      "relocations": [{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ObjectFormatJsonCrossKind, ElfKindWithPeBlockRejected) {
+    // pr-test-analyzer Gap 1 fold: cross-kind guard is generic
+    // (5 (kind, block) rules in `kCrossKindRules`); pin the
+    // reciprocal arms so a future enum-drift refactor that drops
+    // a rule fails fast.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"elf-with-pe-block","kind":"elf"},
+      "pe": { "machine": 34404, "type": "obj" }
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ObjectFormatJsonCrossKind, PeKindWithMachoBlockRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"pe-with-macho-block","kind":"pe"},
+      "pe": { "machine": 34404, "type": "obj" },
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 }
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ObjectFormatJsonCrossKind, MachoKindWithOptionalHeaderBlockRejected) {
+    // The 5th rule pair (Pe → optionalHeader) is the only one
+    // not previously exercised — wrap-around to ensure none of
+    // the 5 rules are unreachable.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-with-pe-oh-block","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 },
+      "optionalHeader": { "magic": 523 }
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
 // ── Walker emits the 8-byte WebAssembly v1 preamble ──────────────────
 
 TEST(WasmWriter, EmitsMagicAndVersion) {
@@ -117,6 +166,35 @@ TEST(WasmLinkerDispatch, RoutesWasmKindToWalker) {
     EXPECT_EQ(img.bytes[0], 0x00u);
     EXPECT_EQ(img.bytes[1], 0x61u);
     EXPECT_EQ(img.bytes[4], 0x01u);
+}
+
+TEST(WasmLinkerDispatch, EmptyModuleProducesPreambleButOkIsFalse) {
+    // pr-test-analyzer Gap 5 fold (refined): the universal linker
+    // contract `LinkedImage::ok() == (expectedFuncCount > 0 &&
+    // resolvedFuncCount == expectedFuncCount)` holds for WASM
+    // skeletons — `ok() == false` when expectedFuncCount == 0
+    // even though bytes are non-empty (the 8-byte preamble).
+    // WASM is the ONLY format today where `bytes.size() > 0` and
+    // `ok() == false` can co-exist; pin this invariant so a
+    // future caller doesn't conflate "got bytes" with "successful
+    // link." Plan 18 will lift this once functions populate.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("wasm32-v1");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 0;
+    DiagnosticReporter rep;
+    LinkedImage img = link(mod, **target, **fmt, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(img.bytes.size(), 8u);
+    EXPECT_EQ(img.resolvedFuncCount, 0u);
+    EXPECT_EQ(img.expectedFuncCount, 0u);
+    EXPECT_FALSE(img.ok())
+        << "ok() requires expectedFuncCount > 0; WASM-preamble-only "
+           "output has expectedFuncCount=0, so ok() is false even "
+           "though bytes are non-empty. This is the WASM-specific "
+           "(bytes ≠ {} ∧ ok() == false) case.";
 }
 
 // ── Failure modes (substrate discipline) ─────────────────────────────
@@ -171,6 +249,9 @@ TEST(WasmWriter, NonZeroExpectedFuncCountFailsLoud) {
     // would otherwise produce an 8-byte preamble whose ok() is
     // false only because the parallel-index gate disagrees. Fail
     // loud at the walker so the diagnostic anchors here.
+    // Uses K_WalkerInputContractViolation (0x8005, type-design Q1
+    // fold) — distinct from K_NoMatchingObjectFormat which signals
+    // "no walker for this kind".
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("wasm32-v1");
@@ -182,7 +263,7 @@ TEST(WasmWriter, NonZeroExpectedFuncCountFailsLoud) {
     EXPECT_TRUE(bytes.empty());
     bool saw = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat
+        if (d.code == DiagnosticCode::K_WalkerInputContractViolation
          && d.actual.find("expectedFuncCount") != std::string::npos) {
             saw = true;
         }
@@ -212,7 +293,7 @@ TEST(WasmWriter, NonEmptyFunctionsFailsLoud) {
     EXPECT_TRUE(bytes.empty());
     bool saw = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat
+        if (d.code == DiagnosticCode::K_WalkerInputContractViolation
          && d.actual.find("plan 18") != std::string::npos) {
             saw = true;
         }

@@ -126,6 +126,40 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             "the format.kind.");
         }
     }
+    // Universal-field positive assertion for Wasm + Spirv (type-
+    // design Q3 fold, LK8 post-fold review). WASM has no native
+    // relocations, no per-section file-layout knobs, and its
+    // entry-point lives inside the Start section's function index
+    // (not a top-level symbol name). Spirv's `OpEntryPoint` is
+    // similarly emitted inline as a typed module instruction, not
+    // declared as a substrate-tier symbol name. Skeleton schemas
+    // (`wasm32-v1.format.json`) ship with these fields ABSENT; a
+    // future plan-18 schema that declares them would be silently
+    // ignored by the walker. Reject loudly so a stray
+    // `sections` / `relocations` / `entryPoint` surfaces at load
+    // and gets re-anchored against plan 18 / plan 17 vocabulary.
+    if (data.kind == ObjectFormatKind::Wasm
+     || data.kind == ObjectFormatKind::Spirv) {
+        char const* const universalFields[] = {
+            "sections", "relocations", "entryPoint",
+        };
+        for (auto const* field : universalFields) {
+            if (doc.contains(field)) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::string{"/"} + field,
+                          std::string{"format kind '"}
+                              + std::string{objectFormatKindName(data.kind)}
+                              + "' must not declare a top-level '"
+                              + field
+                              + "' field — WASM / SPIR-V emit this "
+                                "information through their own format-"
+                                "native section vocabulary (plan 18 / "
+                                "plan 17). A top-level declaration "
+                                "would be silently ignored by the "
+                                "walker.");
+            }
+        }
+    }
 
     // Top-level `entryPoint` — universal entry-symbol name for
     // executable artifacts (e.g. "_start" / "main" / Mach-O's

@@ -16,7 +16,7 @@
 //   * Emits the WebAssembly v1 module preamble:
 //       magic   = 0x00 0x61 0x73 0x6d ('\0asm')
 //       version = 0x01 0x00 0x00 0x00 (binary format v1, "MVP")
-//     per WebAssembly spec §5.1.
+//     per WebAssembly spec §5.5.
 //   * No section bodies. Plan 18 (MIR→WAT walker) is what emits real
 //     type / import / function / table / memory / global / export /
 //     start / element / code / data sections from MIR. The skeleton

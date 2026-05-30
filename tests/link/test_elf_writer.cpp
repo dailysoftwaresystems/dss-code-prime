@@ -366,7 +366,14 @@ loadStubFormat(std::string_view kindName) {
 // lives in `tests/link/test_pe_writer.cpp`; Mach-O coverage lives
 // in `tests/link/test_macho_writer.cpp`.
 
-TEST(LinkerEndToEnd, WasmFormatDispatchEmitsK_NoMatchingObjectFormat) {
+TEST(LinkerEndToEnd, WasmFormatDispatchRoutesToWalker) {
+    // LK8 (landed 2026-05-30): Wasm arm now dispatches to the
+    // wasm::encode walker (8-byte module preamble per WASM spec
+    // §5.5). A native-ISA-bytes-bearing AssembledModule routed
+    // here triggers K_WalkerInputContractViolation (0x8005) —
+    // the LK8 skeleton's input-contract guard for
+    // !functions.empty(). The previous K_NoMatchingObjectFormat
+    // is reserved for the still-unimplemented Spirv arm.
     auto loaded = loadShipped();
     auto w = loadStubFormat("wasm");
     ASSERT_TRUE(w);
@@ -376,7 +383,8 @@ TEST(LinkerEndToEnd, WasmFormatDispatchEmitsK_NoMatchingObjectFormat) {
     EXPECT_TRUE(image.bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
+        if (d.code == DiagnosticCode::K_WalkerInputContractViolation)
+            sawCode = true;
     }
     EXPECT_TRUE(sawCode);
 }

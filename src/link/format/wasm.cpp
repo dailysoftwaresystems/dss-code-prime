@@ -4,12 +4,13 @@
 #include "link/format/byte_emit.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
 // WebAssembly module writer — plan 14 LK8 skeleton.
 //
-// Module preamble byte layout (WebAssembly spec §5.1):
+// Module preamble byte layout (WebAssembly spec §5.5):
 //   [0x00]  magic   = 0x00 0x61 0x73 0x6d ('\0' 'a' 's' 'm')
 //   [0x04]  version = 0x01 0x00 0x00 0x00 (binary format v1 — MVP)
 //   [0x08]  sections[] (each: id u8 + size LEB128 + payload bytes)
@@ -25,11 +26,15 @@ namespace dss::wasm {
 namespace {
 
 using lir_pass_util::report;
-using link::format::detail::appendU32LE;
+using link::format::detail::appendU8;
 using link::format::detail::emit;
 
-constexpr std::uint32_t kWasmMagic   = 0x6d736100u;  // "\0asm" LE
-constexpr std::uint32_t kWasmVersion = 0x00000001u;  // MVP
+// Spec-fidelity byte layout: reads left-to-right as the WebAssembly
+// spec §5.5 prints it ("\0asm" + version 1 LE), unlike a u32 literal
+// which would read byte-reversed to a casual reader. (type-design
+// fold, LK8 post-fold review.)
+constexpr std::array<std::uint8_t, 4> kWasmMagic   = {0x00, 0x61, 0x73, 0x6d};
+constexpr std::array<std::uint8_t, 4> kWasmVersion = {0x01, 0x00, 0x00, 0x00};
 
 } // namespace
 
@@ -59,7 +64,7 @@ encode(AssembledModule const&    module,
     // plan 18 §2.1). Plan 18 will replace this walker with a
     // MIR→WAT lowerer that produces its own bytes.
     if (!module.functions.empty()) {
-        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+        emit(reporter, DiagnosticCode::K_WalkerInputContractViolation,
              std::string{"wasm::encode: AssembledModule carries "}
                  + std::to_string(module.functions.size())
                  + " functions of native-ISA bytes, but the LK8 "
@@ -102,7 +107,7 @@ encode(AssembledModule const&    module,
     // diagnostic anchors to the WASM dispatch (silent-failure
     // HIGH + test-analyzer Gap 3 fold, LK8 review).
     if (module.expectedFuncCount != 0) {
-        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+        emit(reporter, DiagnosticCode::K_WalkerInputContractViolation,
              std::string{"wasm::encode: expectedFuncCount = "}
                  + std::to_string(module.expectedFuncCount)
                  + " but the LK8 skeleton requires "
@@ -114,8 +119,8 @@ encode(AssembledModule const&    module,
 
     std::vector<std::uint8_t> bytes;
     bytes.reserve(8);
-    appendU32LE(bytes, kWasmMagic);
-    appendU32LE(bytes, kWasmVersion);
+    for (std::uint8_t b : kWasmMagic)   appendU8(bytes, b);
+    for (std::uint8_t b : kWasmVersion) appendU8(bytes, b);
     return bytes;
 }
 
