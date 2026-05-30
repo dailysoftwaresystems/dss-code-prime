@@ -104,6 +104,8 @@ constexpr std::uint32_t LC_MAIN           = 0x80000028u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_LOAD_DYLIB     = 0x0C;
 constexpr std::uint32_t LC_DYLD_INFO_ONLY = 0x80000022u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_DYSYMTAB       = 0x0B;
+constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
+constexpr std::size_t   kCodeSigCommandSize = 16;  // linkedit_data_command
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
 
 // section_64.flags (S_*) — <mach-o/loader.h>
@@ -194,6 +196,35 @@ encode(AssembledModule const&    module,
     // externs; LK3 cycle 2) and the dynamic path (externs present;
     // LK6 cycle 2c).
     if (fmt.macho().filetype == MachOObjectType::Execute) {
+        // LK7 codesign-placeholder gate (silent-failure HIGH fold,
+        // architect anchor): the static `encodeExec` path emits no
+        // __LINKEDIT segment, so an LC_CODE_SIGNATURE pointing at
+        // file-tail bytes lies outside any LC_SEGMENT_64 — Apple's
+        // kernel `cs_validate_range` rejects such binaries because
+        // the CD blob must be mmap-able via a segment. Force the
+        // dynamic path (which DOES carry __LINKEDIT) whenever a
+        // codesign reservation is requested. Empty `externImports`
+        // with `codeSignatureSize > 0` is currently a no-realistic-
+        // use-case combination (a signed binary that imports nothing
+        // is degenerate); when first observed in practice, the
+        // dynamic-path arm will widen — anchored D-LK7-1 at plan 14
+        // §3.1.
+        if (fmt.machoImage().codeSignatureSize != 0
+         && module.externImports.empty()) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 "macho::encode: 'image.codeSignatureSize' is "
+                 "non-zero but the module has no externImports — "
+                 "the static encodeExec path emits no __LINKEDIT "
+                 "segment, so the LC_CODE_SIGNATURE reservation "
+                 "would land outside any LC_SEGMENT_64 and the "
+                 "kernel `cs_validate_range` would reject the "
+                 "binary at exec time. Add at least one extern "
+                 "import (which routes through encodeExecDynamic + "
+                 "synthesizes __LINKEDIT) OR clear "
+                 "'codeSignatureSize'. Anchored at plan 14 §3.1 "
+                 "D-LK7-1 (static-path __LINKEDIT synthesis).");
+            return {};
+        }
         if (!module.externImports.empty()) {
             if (!fmt.machoImage().bindNow) {
                 emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
@@ -638,6 +669,20 @@ encodeExec(AssembledModule const&    module,
         kSegmentCommand64Size + kSection64Size;  // 1 section: __text
     constexpr std::size_t kLcMainSize         = 24;
 
+    // LK7 codesign reservation is unreachable here — the dispatch
+    // in `encode()` gates `codeSignatureSize > 0` to the dynamic
+    // path (anchored D-LK7-1 for static-path __LINKEDIT synthesis).
+    // Keeping a defensive assertion so a future refactor that
+    // bypasses the gate fails loud rather than silently emitting
+    // an unsignable binary.
+    if (im.codeSignatureSize != 0) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             "macho::encodeExec: invariant violation — the dispatch "
+             "gate in macho::encode should have rejected non-zero "
+             "codeSignatureSize on the static path. Anchored at "
+             "plan 14 §3.1 D-LK7-1.");
+        return {};
+    }
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
         2u + 1u + 1u + im.loadDylibs.size() + 1u);
     std::size_t const sizeofcmds =
@@ -1250,15 +1295,23 @@ encodeExecDynamic(AssembledModule const&    module,
     constexpr std::size_t kSegCmdLinkeditSize = kSegmentCommand64Size;
     constexpr std::size_t kLcMainSize         = 24;
 
+    // LK7: when `codeSignatureSize > 0`, append LC_CODE_SIGNATURE
+    // (16-byte linkedit_data_command). The reservation lives at
+    // the tail of __LINKEDIT so plan 16 can fill it without
+    // disturbing earlier layout.
+    bool const emitCodeSig = im.codeSignatureSize != 0;
     // ncmds = 4 segments + LC_DYLD_INFO_ONLY + LC_LOAD_DYLINKER
-    //       + LC_MAIN + N × LC_LOAD_DYLIB + LC_SYMTAB + LC_DYSYMTAB.
+    //       + LC_MAIN + N × LC_LOAD_DYLIB + LC_SYMTAB + LC_DYSYMTAB
+    //       (+ LC_CODE_SIGNATURE when emitCodeSig).
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
-        4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u + 1u);
+        4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u + 1u
+        + (emitCodeSig ? 1u : 0u));
     std::size_t const sizeofcmds =
         kSegCmdPageZeroSize + kSegCmdTextSize + kSegCmdDataConstSize +
         kSegCmdLinkeditSize + kDyldInfoCommandSize + dylinkerCmdSize +
         kLcMainSize + totalDylibCmdSize + kSymtabCommandSize +
-        kDysymtabCommandSize;
+        kDysymtabCommandSize +
+        (emitCodeSig ? kCodeSigCommandSize : 0u);
     std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
 
     std::uint64_t const textFileOff =
@@ -1337,8 +1390,33 @@ encodeExecDynamic(AssembledModule const&    module,
         static_cast<std::uint64_t>(numberOfSymbols) * kNlist64Size;
     std::uint64_t const strtabOff = symtabOff + symtabSize;
     std::uint64_t const strtabSize = strtab.size();
-    std::uint64_t const linkeditFileSize =
-        (strtabOff + strtabSize) - linkeditFileOff;
+    // LK7: codesign placeholder lives at the tail of __LINKEDIT
+    // (8-byte aligned per Apple's `cs_blobs.h` SuperBlob alignment).
+    // Plan 16 fills the reserved bytes post-link. The segment's
+    // filesize covers the reservation so dyld maps it into the
+    // __LINKEDIT segment alongside the other linkedit payloads.
+    std::uint64_t const codeSigFileOff = emitCodeSig
+        ? ((strtabOff + strtabSize + 7u) & ~std::uint64_t{7})
+        : 0u;
+    // LC_CODE_SIGNATURE's `dataoff` field is `uint32_t` per Apple's
+    // `linkedit_data_command` definition. If the __LINKEDIT layout
+    // pushes the reservation past 4 GiB, the cast at the emit site
+    // below would silently truncate and the kernel would walk into
+    // invalid bytes. Surface the overflow rather than ship a corrupt
+    // signature directory. (silent-failure MEDIUM fold, LK7 review.)
+    if (emitCodeSig
+     && codeSigFileOff > std::numeric_limits<std::uint32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: codesign "
+                         "reservation file offset 0x{:x} exceeds "
+                         "u32 — LC_CODE_SIGNATURE.dataoff is u32 "
+                         "by Apple's linkedit_data_command spec.",
+                         codeSigFileOff));
+        return {};
+    }
+    std::uint64_t const linkeditFileSize = emitCodeSig
+        ? ((codeSigFileOff + im.codeSignatureSize) - linkeditFileOff)
+        : ((strtabOff + strtabSize) - linkeditFileOff);
 
     // Segment VAs:
     std::uint64_t const textSegVmaddr = im.pageZeroSize;
@@ -1553,6 +1631,19 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrel
     appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // locrel
 
+    // LK7: LC_CODE_SIGNATURE placeholder. linkedit_data_command =
+    // cmd(4) cmdsize(4) dataoff(4) datasize(4). Plan 16 fills the
+    // reserved bytes at codeSigFileOff post-link with the Apple
+    // SuperBlob (CodeDirectory + Requirements + Entitlements + CMS).
+    if (emitCodeSig) {
+        appendU32LE(bytes, LC_CODE_SIGNATURE);
+        appendU32LE(bytes,
+                    static_cast<std::uint32_t>(kCodeSigCommandSize));
+        appendU32LE(bytes,
+                    static_cast<std::uint32_t>(codeSigFileOff));
+        appendU32LE(bytes, im.codeSignatureSize);
+    }
+
     // Sanity: emitted exactly sizeofcmds bytes.
     if (bytes.size() != kMachHeader64Size + sizeofcmds) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -1594,6 +1685,14 @@ encodeExecDynamic(AssembledModule const&    module,
     // string table
     auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
+
+    // LK7: pad to 8-byte-aligned codesign reservation then append
+    // `codeSignatureSize` zero bytes inside __LINKEDIT. The
+    // segment's filesize was computed to include this region.
+    if (emitCodeSig) {
+        while (bytes.size() < codeSigFileOff) bytes.push_back(0);
+        bytes.insert(bytes.end(), im.codeSignatureSize, std::uint8_t{0});
+    }
 
     return bytes;
 }

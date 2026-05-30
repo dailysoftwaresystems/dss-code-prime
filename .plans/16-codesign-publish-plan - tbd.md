@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 production-shipping-critical. Closes the "no external tools" invariant across the final-mile signing step. |
-| Predecessors  | ⏳ Linker phase ([`14-linker-plan - tbd.md`](./14-linker-plan%20-%20tbd.md)) reserves the `LC_CODE_SIGNATURE` load command (LK7) for Mach-O and the `IMAGE_DIRECTORY_ENTRY_SECURITY` table for PE. Debug-info ([`15-debug-info-plan - tbd.md`](./15-debug-info-plan%20-%20tbd.md)) settles which sections fall under the signature. |
+| Predecessors  | ✅ Linker phase ([`14-linker-plan - tbd.md`](./14-linker-plan%20-%20tbd.md)) **LK7 landed 2026-05-30** — reserves the `LC_CODE_SIGNATURE` load command for Mach-O (schema field `image.codeSignatureSize`) and the `IMAGE_DIRECTORY_ENTRY_SECURITY` directory entry for PE (schema field `optionalHeader.attributeCertReserveSize`); both produce zero-filled regions at 8-byte-aligned offsets that CS2 / CS5 patch in place. Debug-info ([`15-debug-info-plan - tbd.md`](./15-debug-info-plan%20-%20tbd.md)) settles which sections fall under the signature. |
 | Successors    | None inside the compiler pipeline — codesign + publish is the terminal phase. Distribution / install layers (post-v1) consume the signed artifacts unchanged. |
 | Scope         | **Bounded.** CS1 cryptographic substrate. CS2–CS3 Apple codesign + notarization + stapling. CS4 iOS provisioning profile + `.app` bundle. CS5–CS6 Windows Authenticode + RFC 3161 timestamping. CS7 Android APK v3 (skeleton — full impl post-v1). CS8 `publish` driver subcommand. CS9 end-to-end CI signing tests. Linux package signing reserved post-v1. |
 

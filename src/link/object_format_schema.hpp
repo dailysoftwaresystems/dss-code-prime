@@ -421,6 +421,24 @@ struct DSS_EXPORT PeOptionalHeader {
     std::uint64_t sizeOfStackCommit = 0;
     std::uint64_t sizeOfHeapReserve = 0;
     std::uint64_t sizeOfHeapCommit = 0;
+    // Authenticode codesign placeholder reservation (plan 14 LK7
+    // — closes the PE half). Non-zero requests the walker to:
+    //  (1) append `attributeCertReserveSize` zero bytes at the end
+    //      of the emitted PE file, 8-byte aligned per PE COFF §5.9.1
+    //      (`WIN_CERTIFICATE.dwLength` is u32 8-byte-aligned);
+    //  (2) set `IMAGE_DIRECTORY_ENTRY_SECURITY[4]` (data directory
+    //      index 4) — its `VirtualAddress` field is OVERLOADED as a
+    //      raw FILE OFFSET (NOT an RVA) per PE COFF §3.4.6 (this is
+    //      the ONLY data directory with that semantic); the
+    //      attribute cert table sits OUTSIDE the loaded image and
+    //      is never mapped into the process VA. Size = u32 byte
+    //      count (`attributeCertReserveSize`).
+    //  Plan 16 (codesign + publish) fills the reserved bytes
+    //  post-link with the Authenticode PKCS#7 / RFC 3161 blob.
+    //  Default 0 = no reservation, no security directory entry.
+    //  Must be a multiple of 8 (PE COFF spec; the walker rejects
+    //  any other value at `validate()`).
+    std::uint32_t attributeCertReserveSize = 0;
 };
 
 // ── Mach-O-specific identity block (loaded only when kind==MachO) ──
@@ -523,6 +541,23 @@ struct DSS_EXPORT MachOImage {
     // D-LK6-13 on `bindNow == false`. Default `true` preserves
     // the eager-binding semantics across the format trio.
     bool          bindNow = true;
+    // Apple codesign placeholder reservation (plan 14 LK7 —
+    // closes the Mach-O half). Non-zero requests the walker to:
+    //  (1) reserve `codeSignatureSize` zero bytes at the end of
+    //      the `__LINKEDIT` segment (8-byte aligned per Apple's
+    //      `cs_blobs.h` — SuperBlob alignment matches `dwLength`'s
+    //      symmetric requirement on the PE side);
+    //  (2) emit an `LC_CODE_SIGNATURE` (cmd=0x1D, cmdsize=16) load
+    //      command pointing `dataoff` at the reserved file offset
+    //      and `datasize` at `codeSignatureSize`.
+    //  Plan 16 (codesign + publish) fills the reserved bytes
+    //  post-link with the Apple Code Directory SuperBlob (CodeDir
+    //  + Requirements + Entitlements + CMS signature).
+    //  Default 0 = no reservation, no LC_CODE_SIGNATURE load
+    //  command. Must be a multiple of 8 (Apple SuperBlob
+    //  alignment; the walker rejects any other value at
+    //  `validate()`).
+    std::uint32_t codeSignatureSize = 0;
 };
 
 namespace detail {

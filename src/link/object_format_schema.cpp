@@ -370,14 +370,15 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 || oh.sectionAlignment != 0 || oh.fileAlignment != 0
                 || oh.subsystem != 0 || oh.sizeOfStackReserve != 0
                 || oh.sizeOfStackCommit != 0 || oh.sizeOfHeapReserve != 0
-                || oh.sizeOfHeapCommit != 0 || oh.dllCharacteristics != 0;
+                || oh.sizeOfHeapCommit != 0 || oh.dllCharacteristics != 0
+                || oh.attributeCertReserveSize != 0;
             if (anySet) {
                 fail("/optionalHeader",
                      "PE .obj (relocatable) format must NOT declare an "
-                     "'optionalHeader' — the optional header lives only "
-                     "in PE32+ executable images (.exe / .dll). Set "
-                     "pe.type = 'exec' if this schema describes an "
-                     "executable.");
+                     "'optionalHeader' — the optional header (incl. "
+                     "attributeCertReserveSize) lives only in PE32+ "
+                     "executable images (.exe / .dll). Set pe.type = "
+                     "'exec' if this schema describes an executable.");
             }
         } else {
             // Exec/Dll: every load-bearing field must be set.
@@ -449,6 +450,24 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "sizeOfStackReserve / sizeOfStackCommit / "
                      "sizeOfHeapReserve / sizeOfHeapCommit (typical "
                      "0x100000 reserve / 0x1000 commit).");
+            }
+            // Plan 14 LK7 — attribute-cert reservation must be a
+            // multiple of 8 (PE COFF §5.9.1 — `WIN_CERTIFICATE.
+            // dwLength` is 8-byte-aligned; the table itself sits
+            // at an 8-byte-aligned file offset so its entries can
+            // be parsed as packed u32 fields). 0 = no reservation
+            // (default); any other value must align so plan 16's
+            // attribute-cert blob fills without padding mid-table.
+            if (oh.attributeCertReserveSize != 0
+             && (oh.attributeCertReserveSize % 8u) != 0u) {
+                fail("/optionalHeader/attributeCertReserveSize",
+                     std::format("'optionalHeader."
+                                 "attributeCertReserveSize' ({}) must "
+                                 "be a multiple of 8 (PE COFF §5.9.1 "
+                                 "attribute-cert table alignment; "
+                                 "plan 16 fills the reserved bytes "
+                                 "with WIN_CERTIFICATE entries).",
+                                 oh.attributeCertReserveSize));
             }
         }
     }
@@ -571,15 +590,16 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             bool const anySet = mi.pageZeroSize != 0
                 || !mi.dylinkerPath.empty()
                 || !mi.loadDylibs.empty()
-                || !mi.bindNow;
+                || !mi.bindNow
+                || mi.codeSignatureSize != 0;
             if (anySet) {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
                      "'image' block — pageZeroSize / dylinkerPath / "
-                     "loadDylibs / bindNow live only in MH_EXECUTE / "
-                     "MH_DYLIB images. Set macho.filetype = 2 "
-                     "(MH_EXECUTE) if this schema describes an "
-                     "executable.");
+                     "loadDylibs / bindNow / codeSignatureSize live "
+                     "only in MH_EXECUTE / MH_DYLIB images. Set "
+                     "macho.filetype = 2 (MH_EXECUTE) if this schema "
+                     "describes an executable.");
             }
         } else if (macho.filetype == MachOObjectType::Execute) {
             if (mi.pageZeroSize == 0) {
@@ -645,6 +665,22 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                      "loader rejects.",
                                      s.virtualAddress, mi.pageZeroSize));
                 }
+            }
+            // Plan 14 LK7 — codesign placeholder reservation must
+            // be a multiple of 8 (Apple SuperBlob alignment per
+            // `cs_blobs.h`). 0 = no reservation (default); any
+            // other value must align so plan 16's blob fills
+            // without padding mid-blob.
+            if (mi.codeSignatureSize != 0
+             && (mi.codeSignatureSize % 8u) != 0u) {
+                fail("/image/codeSignatureSize",
+                     std::format("'image.codeSignatureSize' ({}) must "
+                                 "be a multiple of 8 (Apple SuperBlob "
+                                 "alignment; plan 16 fills the "
+                                 "reserved bytes with a CodeDirectory "
+                                 "blob whose layout requires 8-byte "
+                                 "alignment).",
+                                 mi.codeSignatureSize));
             }
         }
     }

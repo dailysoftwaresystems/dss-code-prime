@@ -981,10 +981,54 @@ encodeExec(AssembledModule const&    module,
     std::uint32_t const iatDirSize = hasImports
         ? static_cast<std::uint32_t>(iatTotal)
         : 0u;
+    // LK7: Authenticode attribute-cert placeholder reservation.
+    // PE COFF §5.7 directory index 4 (IMAGE_DIRECTORY_ENTRY_SECURITY)
+    // carries a FILE-OFFSET reference (NOT an RVA) and pairs it with
+    // the cert-table byte size. Plan 16 (codesign + publish) fills
+    // the reserved bytes post-link with the WIN_CERTIFICATE table.
+    // Computed AFTER all section file offsets land below; the
+    // reservation sits at the end of the file (8-byte aligned per
+    // §5.9.1) so it doesn't disturb the section table layout.
+    bool const emitCertReservation = oh.attributeCertReserveSize != 0;
+    // sectionsEndFileOff = byte offset immediately after the last
+    // section's raw data. For the .text-only case this is
+    // textRawPointer + textRawSize; with .idata it's
+    // idataRawPointer + idataRawSize. Both raw sizes are
+    // fileAlignment-padded already; the cert table sits at the
+    // 8-byte-aligned offset past them.
+    std::uint64_t const sectionsEndFileOff = hasImports
+        ? (static_cast<std::uint64_t>(idataRawPointer) + idataRawSize)
+        : (static_cast<std::uint64_t>(textRawPointer) + textRawSize);
+    std::uint64_t const certTableFileOff64 = emitCertReservation
+        ? ((sectionsEndFileOff + 7u) & ~std::uint64_t{7})
+        : 0u;
+    // `IMAGE_DATA_DIRECTORY[4].VirtualAddress` is u32 per the PE
+    // COFF §3.4.6 attribute-cert table contract. If the section
+    // layout pushes the cert table past 4 GiB, a silent u32 cast
+    // would point the Windows loader at section bytes, corrupting
+    // the IAT. Fail loud rather than ship a malformed image.
+    // (silent-failure MEDIUM fold, LK7 review.)
+    if (emitCertReservation
+     && certTableFileOff64
+            > std::numeric_limits<std::uint32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encodeExec: attribute-cert table file "
+                         "offset 0x{:x} exceeds u32 — "
+                         "IMAGE_DATA_DIRECTORY[4].VirtualAddress is "
+                         "u32 by PE COFF §3.4.6.",
+                         certTableFileOff64));
+        return {};
+    }
+    std::uint32_t const certTableFileOff =
+        static_cast<std::uint32_t>(certTableFileOff64);
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
         if (i == 1u) {
             appendU32LE(bytes, importDirRva);
             appendU32LE(bytes, importDirSize);
+        } else if (i == 4u) {
+            // IMAGE_DIRECTORY_ENTRY_SECURITY: file offset, not RVA.
+            appendU32LE(bytes, certTableFileOff);
+            appendU32LE(bytes, oh.attributeCertReserveSize);
         } else if (i == 12u) {
             appendU32LE(bytes, iatDirRva);
             appendU32LE(bytes, iatDirSize);
@@ -1081,6 +1125,20 @@ encodeExec(AssembledModule const&    module,
                 < static_cast<std::size_t>(idataRawPointer) + idataRawSize) {
             bytes.push_back(0);
         }
+    }
+
+    // LK7: pad to 8-byte-aligned cert table file offset, then
+    // append `attributeCertReserveSize` zero bytes. Plan 16
+    // patches the bytes post-link with the WIN_CERTIFICATE
+    // entries (PE COFF §5.9.1). The reservation sits OUTSIDE
+    // the loaded image — the Windows loader maps sections by
+    // RVA, while the cert table is referenced exclusively via
+    // its file-offset directory entry.
+    if (emitCertReservation) {
+        while (bytes.size() < certTableFileOff) bytes.push_back(0);
+        bytes.insert(bytes.end(),
+                     oh.attributeCertReserveSize,
+                     std::uint8_t{0});
     }
 
     return bytes;

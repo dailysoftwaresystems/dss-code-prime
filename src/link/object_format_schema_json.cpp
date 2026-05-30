@@ -515,6 +515,12 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     data.peOptionalHeader.sizeOfHeapReserve);
             readU64("sizeOfHeapCommit",
                     data.peOptionalHeader.sizeOfHeapCommit);
+            // Plan 14 LK7 — Authenticode codesign placeholder
+            // reservation. Optional; defaults to 0 (no reservation,
+            // no security directory entry). Multiple-of-8 enforced
+            // at validate() (PE COFF §5.9.1 alignment).
+            readU32("attributeCertReserveSize",
+                    data.peOptionalHeader.attributeCertReserveSize);
         }
     }
 
@@ -660,6 +666,35 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 } else {
                     data.machoImage.bindNow =
                         im.at("bindNow").get<bool>();
+                }
+            }
+            // Plan 14 LK7 — Apple codesign placeholder reservation.
+            // Optional; defaults to 0 (no LC_CODE_SIGNATURE emitted).
+            // Multiple-of-8 enforced at validate() (Apple SuperBlob
+            // alignment).
+            if (im.contains("codeSignatureSize")) {
+                if (!im.at("codeSignatureSize").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/codeSignatureSize",
+                              "'codeSignatureSize' must be a "
+                              "non-negative integer (Apple SuperBlob "
+                              "reservation size in bytes; plan 16 "
+                              "fills the bytes post-link).");
+                } else {
+                    std::int64_t const v =
+                        im.at("codeSignatureSize").get<std::int64_t>();
+                    if (v < 0
+                     || v > static_cast<std::int64_t>(
+                                std::numeric_limits<std::uint32_t>::max())) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/codeSignatureSize",
+                                  std::format("'codeSignatureSize' "
+                                              "({}) out of u32 range",
+                                              v));
+                    } else {
+                        data.machoImage.codeSignatureSize =
+                            static_cast<std::uint32_t>(v);
+                    }
                 }
             }
         }
