@@ -88,9 +88,19 @@ public:
     // computed by `compileFiles` (cwd-rooted) land under here.
     // Safe because the scratch dir lives inside the repo tree —
     // the schema-loader cwd-walk still reaches the repo root.
+    //
+    // Post-fold review #1 (silent-failure-hunter F17): ASSERT on
+    // ec rather than swallow. A failed cwd-change would silently
+    // misroute artifacts to `<originalCwd>/target/...` (i.e. the
+    // build directory), then the test's "output dir exists" check
+    // would fail with a confusing diagnostic instead of naming the
+    // actual root cause.
     void useAsCwd() {
         std::error_code ec;
         fs::current_path(path_, ec);
+        ASSERT_FALSE(ec) << "useAsCwd: cwd change to '"
+                         << path_.generic_string()
+                         << "' failed: " << ec.message();
     }
 private:
     fs::path path_;
@@ -132,7 +142,7 @@ fs::path writeCSubsetSource(fs::path const& dir,
 // both schemas loaded and the target spec parsed cleanly. When the
 // upstream gaps close, the same tests tighten by asserting bytes —
 // the directory check is necessary, the byte check is the future
-// pin (anchored D-LK10-4).
+// pin (anchored D-LK10-2).
 
 TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
     ScratchDir scratch;
@@ -300,7 +310,7 @@ TEST(Program_CompileDirectory, WiresThroughForMatchingFiles) {
     // matching files into compileFiles which routes into the
     // pipeline. Same upstream gap as the zero-arg single-file
     // test — byte assertion is gated on plan 12 ML7 cycle 2 +
-    // plan 13 AS cycle gaps (anchored D-LK10-4).
+    // plan 13 AS cycle gaps (anchored D-LK10-2).
     ScratchDir scratch;
     writeCSubsetSource(scratch.path(), "a.c",
                         "int aaa() { return 1; }\n");

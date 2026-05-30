@@ -93,6 +93,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_InvalidTargetSpec:        return "D_InvalidTargetSpec";
         case DiagnosticCode::D_SchemaLoadFailed:         return "D_SchemaLoadFailed";
         case DiagnosticCode::D_PlanNotLanded:            return "D_PlanNotLanded";
+        case DiagnosticCode::D_OutputDirCreateFailed:    return "D_OutputDirCreateFailed";
+        case DiagnosticCode::D_DirectoryScanFailed:      return "D_DirectoryScanFailed";
         case DiagnosticCode::H_TypeUnresolved:           return "H_TypeUnresolved";
         case DiagnosticCode::H_InvalidBreak:             return "H_InvalidBreak";
         case DiagnosticCode::H_VerifierFailure:          return "H_VerifierFailure";

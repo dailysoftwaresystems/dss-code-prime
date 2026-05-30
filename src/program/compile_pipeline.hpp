@@ -33,6 +33,24 @@ namespace dss {
 
 class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full header
 
+// Drain every diagnostic from `src` into `dst`. Shared driver-tier
+// helper — used by `program.cpp::compileFiles` (drains CU +
+// per-Tree reporters) AND by `compile_pipeline.cpp::compileSingleUnit`
+// (drains the SemanticModel's reporter after `analyze`). Hoisted
+// out of the program-anon namespace at LK10 cycle 2 post-fold
+// review #1 (silent-failure-hunter F9 — eliminates the inline drain
+// duplicate that risked future divergence).
+//
+// **Latent hazard** (anchored D-LK10-7 — not load-bearing today):
+// `dst.report(d)` re-traverses `dst`'s `DiagnosticPolicy` (suppress
+// / overrides / warningsAsErrors), dedup window, per-code cap, and
+// hard cap. With the driver's default-constructed reporter (no
+// policy) the behavior is faithful. Once `Program` gains a policy
+// knob, callers must decide whether to drain through-policy (current
+// behavior) or by-passing it (a future `copyDiagnosticsRaw` variant).
+DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
+                                 DiagnosticReporter&       dst);
+
 // Compile a single CompilationUnit through the full HIR→write
 // pipeline for one (target, format) pair. Returns true iff every
 // tier succeeded AND `writeImage` committed bytes to disk.

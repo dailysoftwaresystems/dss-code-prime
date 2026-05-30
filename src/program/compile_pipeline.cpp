@@ -22,6 +22,11 @@
 
 namespace dss {
 
+void copyDiagnostics(DiagnosticReporter const& src,
+                     DiagnosticReporter&       dst) {
+    for (auto const& d : src.all()) dst.report(d);
+}
+
 namespace {
 
 // Snapshot-vs-current `errorCount` gate. Each tier shares `reporter`,
@@ -56,12 +61,12 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     //    stderr sees the S_* family. Without this drain, a semantic
     //    error (e.g. S_UndeclaredIdentifier) silently aborts the
     //    pipeline with no diagnostic surfacing. (code-reviewer F1
-    //    fold, LK10 cycle 2 post-audit review.)
+    //    fold + post-fold-1 architect: routed through the hoisted
+    //    `copyDiagnostics` helper to eliminate the inline-drain
+    //    duplicate.)
     auto const semEntry = reporter.errorCount();
     auto model = analyze(std::move(borrowed));
-    for (auto const& d : model.diagnostics().all()) {
-        reporter.report(d);
-    }
+    copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return false;
     }

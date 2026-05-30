@@ -256,6 +256,15 @@ enum class DiagnosticCode : std::uint16_t {
     D_InvalidTargetSpec           = 0xD007,
     D_SchemaLoadFailed            = 0xD008,
     D_PlanNotLanded               = 0xD009,
+    // LK10 cycle 2 post-fold review #1 split (silent-failure-hunter
+    // F12): the original cycle-2 fold reused `D_FileNotFound` at 3
+    // distinct sites (missing input dir / mid-scan iterator error /
+    // driver mkdir failure). Tools that route on the diagnostic
+    // code (not message text) couldn't triage which root cause
+    // fired. Splits below — `D_FileNotFound` retains its original
+    // meaning (input dir / input file missing).
+    D_OutputDirCreateFailed       = 0xD00A,
+    D_DirectoryScanFailed         = 0xD00B,
 
     // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

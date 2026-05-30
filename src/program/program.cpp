@@ -94,16 +94,9 @@ void emitDriver(DiagnosticReporter& rep,
                           std::move(msg));
 }
 
-// Copy every diagnostic from `src` into `dst`. Caller-side fold for
-// the "compileFiles must surface upstream tier diagnostics" rule
-// (code-reviewer F1 + silent-failure F1): UnitBuilder /
-// SemanticModel / lowering tiers carry their own reporters that the
-// driver's stderr-drain doesn't see by default. (LK10 cycle 2
-// post-audit review.)
-void copyDiagnostics(DiagnosticReporter const& src,
-                     DiagnosticReporter&       dst) {
-    for (auto const& d : src.all()) dst.report(d);
-}
+// `copyDiagnostics` is declared in `compile_pipeline.hpp` (hoisted at
+// post-fold review #1 to dedupe with the semantic-tier drain).
+// program.cpp uses it for CU + per-Tree reporter drains.
 
 // Forward every ConfigDiagnostic from a failed `loadShipped` into
 // the driver reporter. Mirrors `copyDiagnostics` for the per-row
@@ -117,9 +110,15 @@ void forwardConfigDiagnostics(std::span<ConfigDiagnostic const> diags,
         ParseDiagnostic p;
         p.code     = cd.code;
         p.severity = cd.severity;
-        p.actual   = cd.path;
+        // Post-fold review #1 (silent-failure-hunter F3): prefix
+        // `path` with "at " so downstream tooling can distinguish
+        // "JSON pointer to a bad field" (`at /sections/0`) from
+        // "free-form loader message" (`: missing required field`).
+        // Without the marker, an operator grepping for a JSON
+        // pointer can't tell which half of `actual` carries it.
+        if (!cd.path.empty()) p.actual = "at " + cd.path;
         if (!cd.message.empty()) {
-            if (!p.actual.empty()) p.actual += " — ";
+            if (!p.actual.empty()) p.actual += ": ";
             p.actual += cd.message;
         }
         dst.report(std::move(p));
@@ -219,13 +218,13 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     std::error_code ec;
     fs::create_directories(outDir, ec);
     if (ec) {
-        // Driver-tier mkdir failure — `D_FileNotFound` is the
-        // closest semantic match (the parent path's filesystem is
-        // unreachable / unwritable). NOT `K_ImageWriteParentMissing`
-        // (that code documents the linker writer's refuse-to-mkdir
-        // contract; semantically opposite of an auto-mkdir failure).
-        // (silent-failure-hunter F2 fold.)
-        emitDriver(reporter, DiagnosticCode::D_FileNotFound,
+        // Driver-tier mkdir failure — distinct from the linker's
+        // refuse-to-mkdir contract (which uses
+        // `K_ImageWriteParentMissing`). Post-fold review #1 split:
+        // `D_OutputDirCreateFailed` (this site) is remediation-
+        // distinct from `D_FileNotFound` (input missing) and
+        // `D_DirectoryScanFailed` (mid-scan failure on input dirs).
+        emitDriver(reporter, DiagnosticCode::D_OutputDirCreateFailed,
                    "failed to create output directory '"
                    + outDir.generic_string() + "': " + ec.message());
         return false;
@@ -404,7 +403,12 @@ int Program::compileDirectory(
     auto const exts = grammar->fileExtensions();
     fs::recursive_directory_iterator it(root, ec);
     if (ec) {
-        emitDriver(rep, DiagnosticCode::D_FileNotFound,
+        // Construction-time failure: the root iterator couldn't open
+        // even the first entry (permission on `root`, race delete).
+        // Post-fold review #1 split from `D_FileNotFound` (which now
+        // means "input path missing") to `D_DirectoryScanFailed`
+        // (this site + the mid-scan failure below).
+        emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                    "compileDirectory: failed to open directory '"
                    + directoryPath + "': " + ec.message());
         drainDiagnosticsToStderr(rep);
@@ -417,8 +421,8 @@ int Program::compileDirectory(
             // delete, ...) — surface loudly. Without this the scan
             // silently truncates and operator sees a partial build
             // with zero error indication. (silent-failure-hunter F6
-            // fold, LK10 cycle 2 post-audit review.)
-            emitDriver(rep, DiagnosticCode::D_FileNotFound,
+            // fold + post-fold review #1 code split.)
+            emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                        "compileDirectory: directory-scan interrupted "
                        "after partial enumeration of '" + directoryPath
                        + "': " + ec.message());
