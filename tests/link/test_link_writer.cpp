@@ -313,7 +313,7 @@ TEST(LinkWriter, EndToEndAssembleLinkWriteToDisk) {
     module.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto image = link(module, **target, **fmt, rep);
+    auto image = linker::link(module, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_TRUE(image.ok());
     ASSERT_FALSE(image.bytes.empty());

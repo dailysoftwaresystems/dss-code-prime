@@ -54,8 +54,16 @@ struct DSS_EXPORT LinkedImage {
     }
 };
 
+} // namespace dss
+
+namespace dss::linker {
+
 // Format-blind linker entrypoint. Same target-blind shape that
 // `assemble()` mirrors from ML5 cycle 2a's pivot.
+//
+// Lives in `dss::linker` (alongside `writeImage`) — D-LK9-2 closed
+// at LK10 cycle 2 (was historically `dss::link` until cycle 1's
+// writer pre-positioned the namespace).
 //
 // **Behavior**:
 //   * Walks every relocation in every `AssembledFunction`.
@@ -82,4 +90,4 @@ link(AssembledModule const&       module,
      ObjectFormatSchema const&    objectFormatSchema,
      DiagnosticReporter&          reporter);
 
-} // namespace dss
+} // namespace dss::linker

@@ -36,10 +36,13 @@ using namespace dss;
 namespace {
 
 // Wrapper so vector arguments implicitly convert to span at call
-// sites (LK9 post-fold — uses shared
-// `dss::link_format::test::readU32LE`; the `link_format`
-// namespace avoids collision with the `dss::link()` function in
-// `linker.hpp`, deferred to D-LK9-2).
+// sites. Uses shared `dss::link_format::test::readU32LE`; the
+// `link_format` namespace was originally introduced to avoid
+// collision with the historical `dss::link()` free function, now
+// renamed to `dss::linker::link()` (D-LK9-2 closed at LK10 cycle
+// 2). The `link_format` namespace is kept as-is — renaming it
+// would be churn-only and the prefix still cleanly distinguishes
+// per-format helpers from the `linker::` substrate.
 [[nodiscard]] std::uint32_t readU32LE(std::vector<std::uint8_t> const& bytes,
                                        std::size_t off) {
     return dss::link_format::test::readU32LE(
@@ -122,7 +125,7 @@ TEST(SpirvLinkerDispatch, RoutesSpirvKindToWalker) {
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod = makeEmptyModule();
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, **target, **fmt, rep);
+    LinkedImage img = linker::link(mod, **target, **fmt, rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     ASSERT_EQ(img.bytes.size(), 20u);
     EXPECT_EQ(readU32LE(img.bytes, 0), 0x07230203u);
@@ -138,7 +141,7 @@ TEST(SpirvLinkerDispatch, EmptyModuleProducesHeaderButOkIsFalse) {
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod = makeEmptyModule();
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, **target, **fmt, rep);
+    LinkedImage img = linker::link(mod, **target, **fmt, rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(img.bytes.size(), 20u);
     EXPECT_FALSE(img.ok());

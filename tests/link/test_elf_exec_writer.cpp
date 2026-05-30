@@ -1290,13 +1290,13 @@ TEST(ElfExecWriter, PtLoadFileOffsetIsPageAligned) {
            "or the Linux kernel will reject the executable with ENOEXEC";
 }
 
-// ── End-to-end via the format-blind link() dispatch ────────────
+// ── End-to-end via the format-blind linker::link() dispatch ────────────
 
 TEST(LinkerEndToEnd, ElfExecDispatchProducesValidExecutable) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.ok());
     EXPECT_EQ(image.format, ObjectFormatKind::Elf);
     EXPECT_FALSE(image.bytes.empty());

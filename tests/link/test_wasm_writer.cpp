@@ -160,7 +160,7 @@ TEST(WasmLinkerDispatch, RoutesWasmKindToWalker) {
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod = makeEmptyModule();
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, **target, **fmt, rep);
+    LinkedImage img = linker::link(mod, **target, **fmt, rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     ASSERT_EQ(img.bytes.size(), 8u);
     EXPECT_EQ(img.bytes[0], 0x00u);
@@ -185,7 +185,7 @@ TEST(WasmLinkerDispatch, EmptyModuleProducesPreambleButOkIsFalse) {
     AssembledModule mod;
     mod.expectedFuncCount = 0;
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, **target, **fmt, rep);
+    LinkedImage img = linker::link(mod, **target, **fmt, rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(img.bytes.size(), 8u);
     EXPECT_EQ(img.resolvedFuncCount, 0u);

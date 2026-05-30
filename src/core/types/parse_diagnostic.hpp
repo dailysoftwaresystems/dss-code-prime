@@ -233,6 +233,29 @@ enum class DiagnosticCode : std::uint16_t {
     // silently parse the file under the primary grammar. (A single-language CU
     // always routes to its one schema, so this never fires there.)
     D_UnknownFileExtension        = 0xD006,
+    // LK10 cycle 2 (plan 14): driver-tier codes emitted by
+    // `Program::compileFiles` / `compileDirectory` / `compileProject`
+    // when the caller's invocation cannot be honored.
+    //
+    // D_InvalidTargetSpec: a `targets[i]` string did not parse as
+    //   `"<targetName>:<formatName>"` — wrong separator count or
+    //   either half empty. The driver does not infer a default for
+    //   either half because that would silently route to an
+    //   unintended target/format pair on typo.
+    // D_SchemaLoadFailed: one of the three schema loads
+    //   (`GrammarSchema::loadShipped(languageName)`,
+    //   `TargetSchema::loadShipped(targetName)`,
+    //   `ObjectFormatSchema::loadShipped(formatName)`) returned an
+    //   unexpected result. The wrapped C_* / config-side diagnostic
+    //   has the structural detail; this code surfaces the
+    //   driver-tier failure so downstream tooling can route on it.
+    // D_PlanNotLanded: an entry point reached an arm whose backing
+    //   plan substrate is not yet shipped. Currently fires only on
+    //   `compileProject` (plan 06 `.dsp` parser pending); appending
+    //   future plan-gated arms re-uses this code.
+    D_InvalidTargetSpec           = 0xD007,
+    D_SchemaLoadFailed            = 0xD008,
+    D_PlanNotLanded               = 0xD009,
 
     // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

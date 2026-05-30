@@ -16,12 +16,10 @@
 // into the driver's `compileFiles` / `compileProject` entry
 // points + CLI argument routing (anchored at plan 14 §3 LK10 row).
 //
-// Namespace `dss::linker` (NOT `dss::link` — the latter collides
-// with the `dss::link()` linker entry-point function in
-// `linker.hpp`). The architect-anchored D-LK9-2 fold will move
-// the free function to `dss::linker::link()` when LK10 cycle 2
-// wires the driver pipeline; until then, the writer co-exists
-// in this namespace alongside the future renamed `link()`.
+// Namespace `dss::linker` — same namespace as `dss::linker::link()`
+// (the linker entry-point function in `linker.hpp`). The D-LK9-2
+// rename landed at LK10 cycle 2; both substrate functions now
+// share this single namespace.
 //
 // The function deliberately leaves three concerns to the caller:
 //   * Format/target selection — already encoded in the `Linked

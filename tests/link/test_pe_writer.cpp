@@ -423,7 +423,7 @@ TEST(LinkerEndToEnd, PeDispatchProducesNonEmptyBytes) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.ok());
     EXPECT_EQ(image.format, ObjectFormatKind::Pe);
     EXPECT_FALSE(image.bytes.empty());
@@ -1110,7 +1110,7 @@ TEST(LinkerExternResolution, NeitherDefinedNorExternStillFailsLoud) {
     mod.functions.push_back(std::move(fn));
     // externImports is empty AND fn's reloc target isn't fn.symbol.
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, *loaded.target, *loaded.format, rep);
+    LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.bytes.empty());
     bool sawCode = false;
     bool sawExternMention = false;
@@ -1131,7 +1131,7 @@ TEST(LinkerExternResolution, EmptyMangledNameRejected) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "", "kernel32.dll"});
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, *loaded.target, *loaded.format, rep);
+    LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.bytes.empty());
     EXPECT_GT(rep.errorCount(), 0u);
 }
@@ -1142,7 +1142,7 @@ TEST(LinkerExternResolution, EmptyLibraryPathRejected) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "ExitProcess", ""});
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, *loaded.target, *loaded.format, rep);
+    LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.bytes.empty());
     EXPECT_GT(rep.errorCount(), 0u);
 }
@@ -1153,7 +1153,7 @@ TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected)
     mod.externImports.push_back(
         ExternImport{SymbolId{1}, "ExitProcess", "kernel32.dll"});
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, *loaded.target, *loaded.format, rep);
+    LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.bytes.empty());
     bool sawAmbig = false;
     for (auto const& d : rep.all()) {
@@ -1207,7 +1207,7 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    LinkedImage img = link(mod, **target, **fmt, rep);
+    LinkedImage img = linker::link(mod, **target, **fmt, rep);
     EXPECT_TRUE(img.bytes.empty());
     EXPECT_FALSE(img.ok());
     EXPECT_EQ(img.resolvedFuncCount, 0u);

@@ -12,7 +12,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace dss {
+namespace dss::linker {
 
 namespace {
 
@@ -254,4 +254,4 @@ LinkedImage link(AssembledModule const&    module,
     return image;
 }
 
-} // namespace dss
+} // namespace dss::linker

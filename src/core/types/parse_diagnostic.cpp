@@ -90,6 +90,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_UnresolvedImport:         return "D_UnresolvedImport";
         case DiagnosticCode::D_UnresolvedReference:      return "D_UnresolvedReference";
         case DiagnosticCode::D_UnknownFileExtension:     return "D_UnknownFileExtension";
+        case DiagnosticCode::D_InvalidTargetSpec:        return "D_InvalidTargetSpec";
+        case DiagnosticCode::D_SchemaLoadFailed:         return "D_SchemaLoadFailed";
+        case DiagnosticCode::D_PlanNotLanded:            return "D_PlanNotLanded";
         case DiagnosticCode::H_TypeUnresolved:           return "H_TypeUnresolved";
         case DiagnosticCode::H_InvalidBreak:             return "H_InvalidBreak";
         case DiagnosticCode::H_VerifierFailure:          return "H_VerifierFailure";
@@ -134,6 +137,13 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_RelocationKindMismatch:       return "K_RelocationKindMismatch";
         case DiagnosticCode::K_NoMatchingObjectFormat:       return "K_NoMatchingObjectFormat";
         case DiagnosticCode::K_FormatLacksImportSupport:     return "K_FormatLacksImportSupport";
+        case DiagnosticCode::K_WalkerInputContractViolation: return "K_WalkerInputContractViolation";
+        case DiagnosticCode::K_ImageNotOk:                   return "K_ImageNotOk";
+        case DiagnosticCode::K_ImageWriteParentMissing:      return "K_ImageWriteParentMissing";
+        case DiagnosticCode::K_ImageWriteOpenFailed:         return "K_ImageWriteOpenFailed";
+        case DiagnosticCode::K_ImageWriteShort:              return "K_ImageWriteShort";
+        case DiagnosticCode::K_ImageWriteCloseFailed:        return "K_ImageWriteCloseFailed";
+        case DiagnosticCode::K_ImageEmpty:                   return "K_ImageEmpty";
     }
     return "Unknown";
 }

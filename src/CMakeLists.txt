@@ -11,7 +11,6 @@ add_subdirectory(lir)
 add_subdirectory(asm)
 add_subdirectory(link)
 add_subdirectory(lsp)
-add_subdirectory(gen)
 add_subdirectory(program)
 
 # ── Shared library (DLL / .so / .dylib) ──
@@ -31,13 +30,12 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:asm>
     $<TARGET_OBJECTS:link>
     $<TARGET_OBJECTS:lsp>
-    $<TARGET_OBJECTS:gen>
     $<TARGET_OBJECTS:program>)
 target_include_directories(dss-code-prime-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # PUBLIC propagates to consumers (the CLI exe, tests) so they see
 # __declspec(dllimport) at compile time. The matching DSS_BUILDING_DLL lives
-# on each OBJECT lib (core/gen/program) — not here — because this target has
+# on each OBJECT lib (core / program / ...) — not here — because this target has
 # no sources of its own, only aggregated $<TARGET_OBJECTS:...>.
 target_compile_definitions(dss-code-prime-lib PUBLIC DSS_SHARED_BUILD)
 

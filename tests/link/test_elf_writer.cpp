@@ -334,7 +334,7 @@ TEST(LinkerEndToEnd, LinkagePassedGateSkipsWalkerOnSymbolUndefined) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.bytes.empty())
         << "walker must not have run when linkagePassed=false";
     EXPECT_FALSE(image.ok())
@@ -382,7 +382,7 @@ TEST(LinkerEndToEnd, WasmFormatDispatchRoutesToWalker) {
     ASSERT_TRUE(w);
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *w, rep);
+    auto image = linker::link(mod, *loaded.target, *w, rep);
     EXPECT_TRUE(image.bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -404,7 +404,7 @@ TEST(LinkerEndToEnd, SpirvFormatDispatchRoutesToWalker) {
     ASSERT_TRUE(s);
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *s, rep);
+    auto image = linker::link(mod, *loaded.target, *s, rep);
     EXPECT_TRUE(image.bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -420,7 +420,7 @@ TEST(LinkerEndToEnd, ElfDispatchProducesNonEmptyBytes) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.ok());
     EXPECT_EQ(image.format, ObjectFormatKind::Elf);
     EXPECT_FALSE(image.bytes.empty()) << "linker dispatch should fire walker";
