@@ -645,6 +645,23 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
             }
+            // `bindNow`: eager vs lazy dynamic-binding choice on
+            // Mach-O — parallel to `elf.bindNow`. Optional; defaults
+            // to `true` (v1 stance, plan 14 §5 risk row). `false`
+            // is the lazy-binding upgrade path anchored at D-LK6-13.
+            if (im.contains("bindNow")) {
+                if (!im.at("bindNow").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/bindNow",
+                              "'bindNow' must be a boolean (true = "
+                              "eager / bind_off opcode stream, false "
+                              "= lazy / lazy_bind_off — anchored at "
+                              "D-LK6-13, not yet implemented)");
+                } else {
+                    data.machoImage.bindNow =
+                        im.at("bindNow").get<bool>();
+                }
+            }
         }
     }
 

@@ -841,9 +841,12 @@ TEST(MachOExecWriter, DisplacementOverflowFailsLoud) {
     EXPECT_TRUE(sawCode);
 }
 
-// ── LK6 cycle 2a: extern imports fail loud (D-LK6-5 pending) ───
+// ── LK6 cycle 2c: extern imports produce a dynamic Mach-O image ─
 
-TEST(MachOExecWriter, ExternImportsFailLoudPendingD_LK6_5) {
+TEST(MachOExecWriter, ExternImportsProduceDynamicImage) {
+    // Cycle 2c walker has landed: extern imports now produce a
+    // real Mach-O dynamic image (parallel to ELF cycle 2b.2). Pins
+    // MH_EXECUTE byte + non-empty bytes + dylib/symbol strings.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
@@ -866,10 +869,467 @@ TEST(MachOExecWriter, ExternImportsFailLoudPendingD_LK6_5) {
     mod.externImports.push_back(std::move(imp));
     DiagnosticReporter rep;
     auto bytes = macho::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    // filetype @ +12 = MH_EXECUTE (2)
+    EXPECT_EQ(static_cast<std::uint32_t>(bytes[12]) |
+              (static_cast<std::uint32_t>(bytes[13]) << 8) |
+              (static_cast<std::uint32_t>(bytes[14]) << 16) |
+              (static_cast<std::uint32_t>(bytes[15]) << 24), 2u);
+    std::string_view fileView{
+        reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+    EXPECT_NE(fileView.find("/usr/lib/libSystem.B.dylib"),
+              std::string_view::npos);
+    EXPECT_NE(fileView.find("_printf"), std::string_view::npos);
+}
+
+TEST(MachOExecWriter, DynamicImageEmitsExpectedSegments) {
+    // Dynamic Mach-O carries 4 segments: __PAGEZERO + __TEXT (with
+    // __text + __stubs) + __DATA_CONST (with __got) + __LINKEDIT.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    std::string_view fv{
+        reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+    EXPECT_NE(fv.find("__PAGEZERO"),   std::string_view::npos);
+    EXPECT_NE(fv.find("__TEXT"),       std::string_view::npos);
+    EXPECT_NE(fv.find("__stubs"),      std::string_view::npos);
+    EXPECT_NE(fv.find("__DATA_CONST"), std::string_view::npos);
+    EXPECT_NE(fv.find("__got"),        std::string_view::npos);
+    EXPECT_NE(fv.find("__LINKEDIT"),   std::string_view::npos);
+}
+
+TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
+    // The lazy-binding upgrade is anchored at D-LK6-13. Until it
+    // lands, the walker must fail loud on `image.bindNow = false`.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-lazy-pending","kind":"macho"},
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "bindNow": false
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
     EXPECT_TRUE(bytes.empty());
-    bool sawCode = false;
+    bool sawAnchor = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport
+         && d.actual.find("D-LK6-13") != std::string::npos) {
+            sawAnchor = true;
+        }
     }
-    EXPECT_TRUE(sawCode);
+    EXPECT_TRUE(sawAnchor);
+}
+
+TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-bindnow-default","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ]
+    })");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->machoImage().bindNow);
+}
+
+TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-bindnow-wrong","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "bindNow": "true"
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
+    // 2-extern × 2-library smoke test — both dylib paths appear
+    // in the file (both LC_LOAD_DYLIB strings + both bind opcode
+    // dylib ordinals).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-two-libs","kind":"macho"},
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": [
+          "/usr/lib/libSystem.B.dylib",
+          "/usr/lib/libobjc.A.dylib"
+        ]
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        {1, SymbolId{99}, RelocationKind{1}, 0});
+    fn.relocations.push_back(
+        {6, SymbolId{100}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    mod.externImports.push_back(
+        ExternImport{SymbolId{100}, "_objc_msgSend",
+                     "/usr/lib/libobjc.A.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    std::string_view fv{
+        reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+    EXPECT_NE(fv.find("/usr/lib/libSystem.B.dylib"),
+              std::string_view::npos);
+    EXPECT_NE(fv.find("/usr/lib/libobjc.A.dylib"),
+              std::string_view::npos);
+    EXPECT_NE(fv.find("_printf"), std::string_view::npos);
+    EXPECT_NE(fv.find("_objc_msgSend"), std::string_view::npos);
+}
+
+TEST(MachOExecWriter, BindStreamEmitsExpectedOpcodeShape) {
+    // Pin the bind opcode stream byte shape so a future regression
+    // in IMM/ULEB threshold, trailing NUL, opcode ordering, or
+    // segment-index miswiring shows up as a test failure rather
+    // than a dyld load-time crash (pr-test-analyzer FOLD-NOW #1).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back({1, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    // Walk to LC_DYLD_INFO_ONLY: header at +32, scan load cmds.
+    // Header layout: magic(4) cputype(4) cpusubtype(4) filetype(4)
+    //                ncmds(4) sizeofcmds(4) flags(4) reserved(4)
+    std::uint32_t ncmds =
+        static_cast<std::uint32_t>(bytes[16]) |
+        (static_cast<std::uint32_t>(bytes[17]) << 8) |
+        (static_cast<std::uint32_t>(bytes[18]) << 16) |
+        (static_cast<std::uint32_t>(bytes[19]) << 24);
+    std::size_t off = 32;
+    std::uint64_t bindOff = 0, bindSize = 0;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t cmd =
+            static_cast<std::uint32_t>(bytes[off]) |
+            (static_cast<std::uint32_t>(bytes[off+1]) << 8) |
+            (static_cast<std::uint32_t>(bytes[off+2]) << 16) |
+            (static_cast<std::uint32_t>(bytes[off+3]) << 24);
+        std::uint32_t cmdsize =
+            static_cast<std::uint32_t>(bytes[off+4]) |
+            (static_cast<std::uint32_t>(bytes[off+5]) << 8) |
+            (static_cast<std::uint32_t>(bytes[off+6]) << 16) |
+            (static_cast<std::uint32_t>(bytes[off+7]) << 24);
+        if (cmd == 0x80000022u) {
+            // dyld_info_command: cmd(4) cmdsize(4) rebase_off(4)
+            // rebase_size(4) bind_off(4) bind_size(4) ...
+            bindOff =
+                static_cast<std::uint64_t>(bytes[off+16]) |
+                (static_cast<std::uint64_t>(bytes[off+17]) << 8) |
+                (static_cast<std::uint64_t>(bytes[off+18]) << 16) |
+                (static_cast<std::uint64_t>(bytes[off+19]) << 24);
+            bindSize =
+                static_cast<std::uint64_t>(bytes[off+20]) |
+                (static_cast<std::uint64_t>(bytes[off+21]) << 8) |
+                (static_cast<std::uint64_t>(bytes[off+22]) << 16) |
+                (static_cast<std::uint64_t>(bytes[off+23]) << 24);
+            break;
+        }
+        off += cmdsize;
+    }
+    ASSERT_GT(bindSize, 0u);
+    ASSERT_LE(bindOff + bindSize, bytes.size());
+    // Expected stream prefix: SET_DYLIB_ORDINAL_IMM | 1 (lib #1),
+    // SET_SYMBOL_TRAILING_FLAGS_IMM | 0, "_printf\0",
+    // SET_TYPE_IMM | BIND_TYPE_POINTER (1),
+    // SET_SEGMENT_AND_OFFSET_ULEB | 2 (kSegIdxDataConst), ULEB(0),
+    // DO_BIND, DONE.
+    std::vector<std::uint8_t> expected = {
+        0x10u | 1u,               // SET_DYLIB_ORDINAL_IMM | 1
+        0x40u | 0u,               // SET_SYMBOL_TRAILING_FLAGS_IMM
+        '_','p','r','i','n','t','f', 0,
+        0x50u | 1u,               // SET_TYPE_IMM | BIND_TYPE_POINTER
+        0x70u | 2u,               // SET_SEGMENT_AND_OFFSET_ULEB | 2
+        0x00u,                    // ULEB128(0) — offset 0 into __got
+        0x90u,                    // DO_BIND
+        0x00u,                    // DONE
+    };
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(bytes[bindOff + i], expected[i])
+            << "bind-stream byte " << i << " mismatch";
+    }
+}
+
+TEST(MachOExecWriter, StubDispPointsAtGotSlot) {
+    // Pin the FF 25 disp32 → __got slot arithmetic. Cycle-2c
+    // correctness depends on disp32 = gotSlotVa - (stubVa + 6).
+    // (pr-test-analyzer FOLD-NOW #2.)
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back({1, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    // Walk LCs to find __stubs section (in __TEXT segment) and
+    // __got section (in __DATA_CONST). Each section_64 carries
+    // addr(u64) + size(u64) + offset(u32). For each LC_SEGMENT_64
+    // we read nsects from segment_command_64 (at +64 from cmd
+    // start). Section_64 records follow each LC_SEGMENT_64 header.
+    std::uint32_t ncmds =
+        static_cast<std::uint32_t>(bytes[16]) |
+        (static_cast<std::uint32_t>(bytes[17]) << 8) |
+        (static_cast<std::uint32_t>(bytes[18]) << 16) |
+        (static_cast<std::uint32_t>(bytes[19]) << 24);
+    std::size_t off = 32;
+    std::uint64_t stubsAddr = 0, stubsFileOff = 0;
+    std::uint64_t gotAddr = 0;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t cmd =
+            static_cast<std::uint32_t>(bytes[off]) |
+            (static_cast<std::uint32_t>(bytes[off+1]) << 8) |
+            (static_cast<std::uint32_t>(bytes[off+2]) << 16) |
+            (static_cast<std::uint32_t>(bytes[off+3]) << 24);
+        std::uint32_t cmdsize =
+            static_cast<std::uint32_t>(bytes[off+4]) |
+            (static_cast<std::uint32_t>(bytes[off+5]) << 8) |
+            (static_cast<std::uint32_t>(bytes[off+6]) << 16) |
+            (static_cast<std::uint32_t>(bytes[off+7]) << 24);
+        if (cmd == 0x19u) {  // LC_SEGMENT_64
+            std::uint32_t nsects =
+                static_cast<std::uint32_t>(bytes[off+64]) |
+                (static_cast<std::uint32_t>(bytes[off+65]) << 8) |
+                (static_cast<std::uint32_t>(bytes[off+66]) << 16) |
+                (static_cast<std::uint32_t>(bytes[off+67]) << 24);
+            std::size_t secOff = off + 72;
+            for (std::uint32_t s = 0; s < nsects; ++s) {
+                std::string secName(
+                    reinterpret_cast<char const*>(&bytes[secOff]),
+                    strnlen(reinterpret_cast<char const*>(
+                                &bytes[secOff]), 16));
+                std::uint64_t addr = 0;
+                for (int b = 0; b < 8; ++b)
+                    addr |= static_cast<std::uint64_t>(
+                                bytes[secOff + 32 + b]) << (b*8);
+                std::uint32_t fileOff =
+                    static_cast<std::uint32_t>(bytes[secOff + 48]) |
+                    (static_cast<std::uint32_t>(bytes[secOff + 49]) << 8) |
+                    (static_cast<std::uint32_t>(bytes[secOff + 50]) << 16) |
+                    (static_cast<std::uint32_t>(bytes[secOff + 51]) << 24);
+                if (secName == "__stubs") {
+                    stubsAddr = addr; stubsFileOff = fileOff;
+                } else if (secName == "__got") {
+                    gotAddr = addr;
+                }
+                secOff += 80;
+            }
+        }
+        off += cmdsize;
+    }
+    ASSERT_NE(stubsAddr, 0u);
+    ASSERT_NE(gotAddr, 0u);
+    ASSERT_NE(stubsFileOff, 0u);
+    // Stub byte 0..1 = FF 25; bytes 2..5 = disp32 (LE).
+    EXPECT_EQ(bytes[stubsFileOff], 0xFFu);
+    EXPECT_EQ(bytes[stubsFileOff + 1], 0x25u);
+    std::int32_t disp =
+        static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(bytes[stubsFileOff + 2]) |
+            (static_cast<std::uint32_t>(bytes[stubsFileOff + 3]) << 8) |
+            (static_cast<std::uint32_t>(bytes[stubsFileOff + 4]) << 16) |
+            (static_cast<std::uint32_t>(bytes[stubsFileOff + 5]) << 24));
+    // (stubAddr + 6) + disp = gotAddr (slot #0).
+    EXPECT_EQ(
+        static_cast<std::uint64_t>(
+            static_cast<std::int64_t>(stubsAddr) + 6 + disp),
+        gotAddr);
+}
+
+TEST(MachOExecWriter, DysymtabIundefsymNundefsymCorrect) {
+    // LC_DYSYMTAB.iundefsym / nundefsym must agree with nlist
+    // layout: defined externs first, undefined externs next. If
+    // these drift, dyld binds the wrong symbol slots.
+    // (pr-test-analyzer FOLD-NOW #3.)
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back({1, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    std::uint32_t ncmds =
+        static_cast<std::uint32_t>(bytes[16]) |
+        (static_cast<std::uint32_t>(bytes[17]) << 8) |
+        (static_cast<std::uint32_t>(bytes[18]) << 16) |
+        (static_cast<std::uint32_t>(bytes[19]) << 24);
+    std::size_t off = 32;
+    std::uint32_t iundefsym = 0xFFFFFFFFu, nundefsym = 0;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t cmd =
+            static_cast<std::uint32_t>(bytes[off]) |
+            (static_cast<std::uint32_t>(bytes[off+1]) << 8) |
+            (static_cast<std::uint32_t>(bytes[off+2]) << 16) |
+            (static_cast<std::uint32_t>(bytes[off+3]) << 24);
+        std::uint32_t cmdsize =
+            static_cast<std::uint32_t>(bytes[off+4]) |
+            (static_cast<std::uint32_t>(bytes[off+5]) << 8) |
+            (static_cast<std::uint32_t>(bytes[off+6]) << 16) |
+            (static_cast<std::uint32_t>(bytes[off+7]) << 24);
+        if (cmd == 0x0Bu) {  // LC_DYSYMTAB
+            // Field layout: cmd(4) cmdsize(4) ilocalsym(4)
+            // nlocalsym(4) iextdefsym(4) nextdefsym(4)
+            // iundefsym(4) nundefsym(4) ...
+            iundefsym =
+                static_cast<std::uint32_t>(bytes[off+24]) |
+                (static_cast<std::uint32_t>(bytes[off+25]) << 8) |
+                (static_cast<std::uint32_t>(bytes[off+26]) << 16) |
+                (static_cast<std::uint32_t>(bytes[off+27]) << 24);
+            nundefsym =
+                static_cast<std::uint32_t>(bytes[off+28]) |
+                (static_cast<std::uint32_t>(bytes[off+29]) << 8) |
+                (static_cast<std::uint32_t>(bytes[off+30]) << 16) |
+                (static_cast<std::uint32_t>(bytes[off+31]) << 24);
+            break;
+        }
+        off += cmdsize;
+    }
+    // 1 defined function + 1 undefined extern.
+    EXPECT_EQ(iundefsym, 1u);
+    EXPECT_EQ(nundefsym, 1u);
+}
+
+TEST(MachOExecWriter, UndeclaredDylibInExternImportFailsLoud) {
+    // Defense-in-depth: extern.libraryPath must be present in
+    // image.loadDylibs — dyld rejects bind opcodes whose ordinals
+    // point at an undeclared dylib.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped(
+        "macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        {1, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_undeclared",
+                     "/usr/lib/libNotDeclared.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    ASSERT_GE(rep.errorCount(), 1u);
 }

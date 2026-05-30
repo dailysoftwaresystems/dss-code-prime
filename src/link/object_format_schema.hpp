@@ -511,6 +511,18 @@ struct DSS_EXPORT MachOImage {
     std::uint64_t pageZeroSize = 0;        // __PAGEZERO vmsize
     std::string   dylinkerPath;            // LC_LOAD_DYLINKER name
     std::vector<MachODylibRef> loadDylibs; // each → LC_LOAD_DYLIB
+    // Eager-vs-lazy dynamic-binding choice (parallel to
+    // `ElfIdentity.bindNow` — same semantic across ELF + Mach-O).
+    // `true` (the v1 stance per plan 14 §5 risk row) emits the
+    // immediate `LC_DYLD_INFO_ONLY.bind_off` opcode stream and
+    // leaves `lazy_bind_off` zero — every __got slot is resolved at
+    // load. `false` is the lazy-binding upgrade path anchored at
+    // D-LK6-13 (route extern bindings to `lazy_bind_off` opcode
+    // stream resolved on first call via `dyld_stub_binder`). v1
+    // walker fails loud `K_FormatLacksImportSupport` citing
+    // D-LK6-13 on `bindNow == false`. Default `true` preserves
+    // the eager-binding semantics across the format trio.
+    bool          bindNow = true;
 };
 
 namespace detail {

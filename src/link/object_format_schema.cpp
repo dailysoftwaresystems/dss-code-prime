@@ -571,6 +571,25 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "'/usr/lib/libSystem.B.dylib' — libc / process "
                      "start function provider).");
             }
+            // Mach-O mmap-congruence: vmaddr % page == fileoff %
+            // page. __TEXT.fileoff = 0 by Apple convention, so
+            // __TEXT.vmaddr (= pageZeroSize) must be page-aligned.
+            // Common convention uses 0x1000 (x86_64) or 0x4000 /
+            // 0x10000 (ARM64 16K/64K page configs). Anything that
+            // isn't a positive power of two breaks the kernel's
+            // congruence check and the loader fails ENOEXEC.
+            // (silent-failure-hunter MEDIUM, LK6 cycle 2c review)
+            if (mi.pageZeroSize != 0
+             && ((mi.pageZeroSize & (mi.pageZeroSize - 1u)) != 0u)) {
+                fail("/image/pageZeroSize",
+                     std::format("'image.pageZeroSize' (0x{:x}) "
+                                 "must be a power of two so that "
+                                 "__TEXT.vmaddr (= pageZeroSize) "
+                                 "preserves the kernel's mmap "
+                                 "congruence (vmaddr % page == "
+                                 "fileoff % page).",
+                                 mi.pageZeroSize));
+            }
             for (std::size_t i = 0; i < mi.loadDylibs.size(); ++i) {
                 if (mi.loadDylibs[i].path.empty()) {
                     fail(std::format("/image/loadDylibs/{}/path", i),

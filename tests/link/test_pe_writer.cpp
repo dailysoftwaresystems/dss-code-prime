@@ -1168,13 +1168,35 @@ TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected)
 TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     // architect O1: post-walker errorCount gate resets
     // resolvedFuncCount so LinkedImage.ok() doesn't return true
-    // with empty bytes when the walker fail-loud'd. Uses Mach-O
-    // (D-LK6-5 anchored — externs still fail loud until cycle 2c
-    // lands). ELF lost this capability when cycle 2b.2 landed
-    // the GOT/PLT walker (now produces valid bytes for externs).
+    // with empty bytes when the walker fail-loud'd. Both ELF +
+    // Mach-O dynamic walkers now succeed for externs (cycles
+    // 2b.2 + 2c). To exercise the fail-loud gate we use an ELF
+    // schema with `bindNow=false` (lazy binding anchored at
+    // D-LK6-11 — still fails loud).
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
-    auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"elf-lazy-gate","kind":"elf"},
+      "entryPoint": "",
+      "elf": {
+        "class":"elf64","data":"lsb","machine":62,"type":"exec",
+        "pageAlign":4096,
+        "interpreter":"/lib64/ld-linux-x86-64.so.2",
+        "bindNow": false
+      },
+      "sections":[
+        {"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400},
+        {"kind":"symtab","name":".symtab","type":2,"flags":0,"addrAlign":8,"entrySize":24,"virtualAddress":0},
+        {"kind":"strtab","name":".strtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0},
+        {"kind":"shstrtab","name":".shstrtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0}
+      ],
+      "relocations":[
+        {"name":"R_X86_64_PC32","kind":1,"nativeId":2},
+        {"name":"R_X86_64_64","kind":2,"nativeId":1},
+        {"name":"R_X86_64_32","kind":3,"nativeId":10}
+      ]
+    })");
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -1183,8 +1205,7 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     fn.bytes  = {0xC3};
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(
-        ExternImport{SymbolId{99}, "_printf",
-                     "/usr/lib/libSystem.B.dylib"});
+        ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
     LinkedImage img = link(mod, **target, **fmt, rep);
     EXPECT_TRUE(img.bytes.empty());

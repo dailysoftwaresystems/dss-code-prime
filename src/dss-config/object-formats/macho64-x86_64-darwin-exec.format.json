@@ -26,7 +26,9 @@
     "dylinkerPath": "/usr/lib/dyld",
     "loadDylibs": [
       "/usr/lib/libSystem.B.dylib"
-    ]
+    ],
+    "$bindNowComment": "Eager binding — the v1 stance per plan 14 §5 risk row, parallel to ELF cycle 2b.2's DF_1_NOW choice. Emits LC_DYLD_INFO_ONLY with the immediate bind_off opcode stream resolved at load via the linker; lazy_bind_off stays zero. Lazy upgrade (lazy_bind opcode stream resolved on first call via dyld_stub_binder) anchored at D-LK6-13; until then, the walker fails loud on bindNow=false.",
+    "bindNow": true
   },
 
   "sections": [

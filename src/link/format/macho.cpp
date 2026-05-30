@@ -97,6 +97,57 @@ void padTo(std::vector<std::uint8_t>& out, std::uint64_t alignment) {
     while (out.size() % alignment != 0) out.push_back(0);
 }
 
+// LC_* command constants (<mach-o/loader.h>) shared between the
+// static (encodeExec) and dynamic (encodeExecDynamic) arms.
+constexpr std::uint32_t LC_LOAD_DYLINKER  = 0x0E;
+constexpr std::uint32_t LC_MAIN           = 0x80000028u;  // |= LC_REQ_DYLD
+constexpr std::uint32_t LC_LOAD_DYLIB     = 0x0C;
+constexpr std::uint32_t LC_DYLD_INFO_ONLY = 0x80000022u;  // |= LC_REQ_DYLD
+constexpr std::uint32_t LC_DYSYMTAB       = 0x0B;
+constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
+
+// section_64.flags (S_*) — <mach-o/loader.h>
+constexpr std::uint32_t S_NON_LAZY_SYMBOL_POINTERS = 0x6;
+constexpr std::uint32_t S_SYMBOL_STUBS             = 0x8;
+constexpr std::uint32_t S_ATTR_SOME_INSTRUCTIONS   = 0x00000400u;
+constexpr std::uint32_t S_ATTR_PURE_INSTRUCTIONS   = 0x80000000u;
+
+// dyld bind opcodes (<mach-o/loader.h>) — consumed by the dynamic
+// arm's bind-stream emitter.
+constexpr std::uint8_t BIND_OPCODE_DONE                           = 0x00;
+constexpr std::uint8_t BIND_OPCODE_SET_DYLIB_ORDINAL_IMM          = 0x10;
+constexpr std::uint8_t BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB         = 0x20;
+constexpr std::uint8_t BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM  = 0x40;
+constexpr std::uint8_t BIND_OPCODE_SET_TYPE_IMM                   = 0x50;
+constexpr std::uint8_t BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB    = 0x70;
+constexpr std::uint8_t BIND_OPCODE_DO_BIND                        = 0x90;
+constexpr std::uint8_t BIND_TYPE_POINTER                          = 1;
+
+constexpr std::size_t kDyldInfoCommandSize = 48;
+constexpr std::size_t kDysymtabCommandSize = 80;
+constexpr std::size_t kStubSize            = 6;  // FF 25 disp32
+constexpr std::size_t kGotSlotSize         = 8;
+
+// LC byte-size of a path-bearing load command: fixed header + path
+// bytes (NUL-terminated) + pad to kLoadCmdAlign. Used by
+// LC_LOAD_DYLINKER (fixedSize=12) and LC_LOAD_DYLIB (fixedSize=24).
+[[nodiscard]] inline std::size_t
+commandSizeWithPath(std::size_t fixedSize, std::string const& path) {
+    std::size_t const raw = fixedSize + path.size() + 1;
+    return (raw + kLoadCmdAlign - 1) & ~(kLoadCmdAlign - 1);
+}
+
+// ULEB128 encoder (used by the bind-opcode stream emitter).
+inline void
+appendULEB128(std::vector<std::uint8_t>& out, std::uint64_t v) {
+    do {
+        std::uint8_t byte = static_cast<std::uint8_t>(v & 0x7F);
+        v >>= 7;
+        if (v != 0) byte |= 0x80u;
+        out.push_back(byte);
+    } while (v != 0);
+}
+
 } // namespace
 
 namespace {
@@ -106,6 +157,12 @@ encodeExec(AssembledModule const&    module,
            ObjectFormatSchema const& fmt,
            ObjectFormatSectionInfo const& secText,
            DiagnosticReporter&       reporter);
+[[nodiscard]] std::vector<std::uint8_t>
+encodeExecDynamic(AssembledModule const&    module,
+                  TargetSchema const&       targetSchema,
+                  ObjectFormatSchema const& fmt,
+                  ObjectFormatSectionInfo const& secText,
+                  DiagnosticReporter&       reporter);
 } // namespace
 
 std::vector<std::uint8_t>
@@ -123,18 +180,6 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
-    // Mach-O LC_DYLD_INFO chained-fixups / bind opcodes for FFI
-    // resolution anchored at plan 14 §3.1 D-LK6-5 (LK6 cycle 2c).
-    // A module with non-empty externImports fails loud here.
-    if (!module.externImports.empty()) {
-        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-             "macho::encode: extern imports present (" +
-             std::to_string(module.externImports.size()) +
-             " entries) but Mach-O chained-fixups / LC_DYLD_INFO "
-             "emission is not yet implemented. Anchored at plan 14 "
-             "§3.1 D-LK6-5 (LK6 cycle 2c).");
-        return {};
-    }
 
     // Mach-O requires `__text`; symtab/strtab live inside LC_SYMTAB,
     // not as separate section headers.
@@ -144,8 +189,26 @@ encode(AssembledModule const&    module,
 
     // Dispatch between MH_OBJECT (cycle 1) and MH_EXECUTE (cycle 2)
     // based on the schema's declared filetype. validate() rejects
-    // any value outside {1, 2} so this switch is exhaustive.
+    // any value outside {1, 2} so this switch is exhaustive. The
+    // MH_EXECUTE arm further splits into the static path (no
+    // externs; LK3 cycle 2) and the dynamic path (externs present;
+    // LK6 cycle 2c).
     if (fmt.macho().filetype == MachOObjectType::Execute) {
+        if (!module.externImports.empty()) {
+            if (!fmt.machoImage().bindNow) {
+                emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                     "macho::encode: schema requests lazy binding "
+                     "('image.bindNow' = false) but Mach-O lazy "
+                     "binding (LC_DYLD_INFO_ONLY.lazy_bind_off "
+                     "opcode stream + dyld_stub_binder) has not "
+                     "yet landed. Anchored at plan 14 §3.1 D-LK6-13. "
+                     "Set 'image.bindNow' = true (the v1 stance — "
+                     "immediate bind_off opcode stream) to proceed.");
+                return {};
+            }
+            return encodeExecDynamic(module, targetSchema, fmt,
+                                     *secText, reporter);
+        }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
     }
     (void)targetSchema;  // MH_OBJECT path does not apply relocations;
@@ -468,17 +531,10 @@ encode(AssembledModule const&    module,
 
 namespace {
 
-// LC_* command constants (<mach-o/loader.h>)
-constexpr std::uint32_t LC_LOAD_DYLINKER = 0x0E;
-constexpr std::uint32_t LC_MAIN          = 0x80000028u;  // |= LC_REQ_DYLD
-constexpr std::uint32_t LC_LOAD_DYLIB    = 0x0C;
-constexpr std::uint64_t kLoadCmdAlign    = 8;            // load commands
-                                                          // pad to 8 bytes
-
-// Pad load-command bytes to 8-byte boundary (LC alignment).
-void padLoadCmd(std::vector<std::uint8_t>& out) {
-    while (out.size() % kLoadCmdAlign != 0) out.push_back(0);
-}
+// LC_* command constants + commandSizeWithPath() hoisted to the
+// file-level anonymous namespace at the top of this file (shared
+// with encodeExecDynamic; code-simplifier REQUIRED fold, LK6
+// cycle 2c review).
 
 [[nodiscard]] std::vector<std::uint8_t>
 encodeExec(AssembledModule const&    module,
@@ -543,8 +599,10 @@ encodeExec(AssembledModule const&    module,
         }
     }
     // Build absolute symbol-VA map: function VA = section_64.addr
-    // + offsetInText. Mach-O cycle 2a has no extern imports
-    // (anchored D-LK6-5).
+    // + offsetInText. This static path runs only when
+    // externImports.empty() (the dispatch above routes extern-
+    // bearing modules to encodeExecDynamic — D-LK6-5 closed at
+    // LK6 cycle 2c).
     std::uint64_t const sectionVa = secText.virtualAddress;
     std::unordered_map<SymbolId, std::uint64_t> symbolVa;
     symbolVa.reserve(module.functions.size());
@@ -564,11 +622,6 @@ encodeExec(AssembledModule const&    module,
     // [u32 name_offset = 0x0C or 0x18][path bytes NUL-terminated]
     // [pad to 8]`. dyld reads cmdsize, finds the path at cmd+12 /
     // cmd+24, and resolves it.
-    auto commandSizeWithPath = [](std::size_t fixedSize,
-                                   std::string const& path) {
-        std::size_t const raw = fixedSize + path.size() + 1;
-        return (raw + kLoadCmdAlign - 1) & ~(kLoadCmdAlign - 1);
-    };
     std::size_t const dylinkerCmdSize =
         commandSizeWithPath(12, im.dylinkerPath);
     std::size_t totalDylibCmdSize = 0;
@@ -592,7 +645,8 @@ encodeExec(AssembledModule const&    module,
         + kLcMainSize + totalDylibCmdSize + kSymtabCommandSize;
 
     // ── (f) Build nlist_64 + string table — defined symbols only.
-    //       Extern dyld symbols arrive at LK6 cycle 2 (D-LK6-2).
+    //       (Extern dyld symbols flow through the encodeExecDynamic
+    //       arm with N_UNDF|N_EXT entries; LK6 cycle 2c closed.)
     StringTable strtab;
     std::vector<std::uint8_t> nlistBytes;
     for (auto const& fn : module.functions) {
@@ -795,6 +849,749 @@ encodeExec(AssembledModule const&    module,
 
     // symbol table + string table
     bytes.insert(bytes.end(), nlistBytes.begin(), nlistBytes.end());
+    auto strtabBytes = std::move(strtab).release();
+    bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
+
+    return bytes;
+}
+
+} // namespace
+
+// ── Mach-O MH_EXECUTE dynamic-linker writer — plan 14 LK6 cycle 2c ──
+//
+// Closes plan 14 §3.1 D-LK6-5 (x86_64 macOS arm). Emits a loadable
+// dynamic MH_EXECUTE that PT-LOAD's into dyld + binds extern imports
+// eagerly at startup via the immediate `LC_DYLD_INFO_ONLY.bind_off`
+// opcode stream (parallel to ELF cycle 2b.2's `DF_1_NOW` + GLOB_DAT
+// stance — `lazy_bind_off` stays zero). ARM64-darwin chained-fixups
+// path anchored at D-LK6-14 (separate cycle — requires its own JSON
+// + LC_DYLD_CHAINED_FIXUPS structure walker).
+//
+// Layout:
+//   [mach_header_64]                                                  (32)
+//   [LC_SEGMENT_64 __PAGEZERO]                                        (72)
+//   [LC_SEGMENT_64 __TEXT + section_64{__text, __stubs}]              (72 + 80*2)
+//   [LC_SEGMENT_64 __DATA_CONST + section_64{__got}]                  (72 + 80)
+//   [LC_SEGMENT_64 __LINKEDIT]                                        (72)
+//   [LC_DYLD_INFO_ONLY]                                               (48)
+//   [LC_LOAD_DYLINKER]                                                (~24)
+//   [LC_MAIN]                                                         (24)
+//   [LC_LOAD_DYLIB[N]]                                                (~32 each)
+//   [LC_SYMTAB]                                                       (24)
+//   [LC_DYSYMTAB]                                                     (80)
+//   [pad to page]
+//   [__text bytes (intra-mod relocs applied; extern rel32 → __stubs)]
+//   [__stubs bytes (6 B each: FF 25 disp32 → __got slot)]
+//   [pad to 8]
+//   [__got slots (8 B each, init 0; dyld fills at load via bind opcodes)]
+//   [pad to page]
+//   [__LINKEDIT: bind opcode stream]
+//   [bind opcode stream → indirect symtab pad]
+//   [indirect symtab (u32 per stub + per __got slot)]
+//   [nlist_64[]   — defined externs first, undefined externs after]
+//   [string table — NUL-seeded]
+//
+// `applyExecRelocations` (shared kernel) consumes `symbolVa` =
+// { intra-module function SymbolIds → text VA } ∪
+// { extern SymbolIds → __stubs slot VA } so the kernel's `S - P - 4`
+// formula patches in-text rel32 to the stub. The stub then jumps
+// through __got, which dyld fills at load.
+
+namespace {
+
+// LC_DYLD_INFO_ONLY / LC_DYSYMTAB / S_* / BIND_OPCODE_* /
+// kStubSize / kGotSlotSize / appendULEB128 are file-level
+// constants/helpers at the top of this file (shared with
+// encodeExec; code-simplifier REQUIRED fold, LK6 cycle 2c review).
+
+[[nodiscard]] std::vector<std::uint8_t>
+encodeExecDynamic(AssembledModule const&    module,
+                  TargetSchema const&       targetSchema,
+                  ObjectFormatSchema const& fmt,
+                  ObjectFormatSectionInfo const& secText,
+                  DiagnosticReporter&       reporter) {
+    auto const& id = fmt.macho();
+    auto const& im = fmt.machoImage();
+
+    // ── (a) Preconditions ────────────────────────────────────────
+    //
+    // Walker contract guards (parallel to ELF cycle 2b.2). The
+    // outer `encode()` already gated on externImports.empty() ==
+    // false + filetype == Execute + bindNow == true. Defense-in-
+    // depth + load-bearing inputs not enforced upstream.
+    if (module.externImports.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "macho::encodeExecDynamic: called with zero "
+             "externImports — dynamic-image emission requires at "
+             "least one extern; static images route through "
+             "encodeExec.");
+        return {};
+    }
+    if (module.functions.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "macho::encodeExecDynamic: zero functions — MH_EXECUTE "
+             "needs at least one entry function.");
+        return {};
+    }
+    constexpr std::uint64_t kPageSize = 0x1000;
+    std::uint64_t const sectionVa = secText.virtualAddress;
+    if (sectionVa < im.pageZeroSize) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: section VA 0x{:x} "
+                         "is below __TEXT vmaddr 0x{:x} "
+                         "(pageZeroSize) — __TEXT would overlap "
+                         "__PAGEZERO; loader rejects.",
+                         sectionVa, im.pageZeroSize));
+        return {};
+    }
+    if (sectionVa < kPageSize) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: section VA 0x{:x} "
+                         "is below kPageSize 0x{:x} — __stubs/__got "
+                         "layout requires room above sectionVa within "
+                         "the same page.", sectionVa, kPageSize));
+        return {};
+    }
+    // Mmap-congruence guard: __TEXT.fileoff = 0 by convention, so
+    // __TEXT.vmaddr (= pageZeroSize) and sectionVa - pageZeroSize
+    // must both be page-aligned for the kernel to accept the
+    // load. validate() enforces pageZeroSize-power-of-two, but the
+    // sectionVa offset within __TEXT could still be off if an
+    // unusual JSON sets virtualAddress to a non-page-aligned value.
+    // Surface here rather than silently emit a corrupt segment.
+    // (silent-failure-hunter MEDIUM, code-reviewer I1 fold)
+    if ((sectionVa - im.pageZeroSize) % kPageSize != 0) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: section VA 0x{:x} "
+                         "is not page-aligned relative to "
+                         "pageZeroSize 0x{:x} (delta {} bytes "
+                         "violates kernel mmap congruence "
+                         "vmaddr % page == fileoff % page).",
+                         sectionVa, im.pageZeroSize,
+                         (sectionVa - im.pageZeroSize) % kPageSize));
+        return {};
+    }
+    // Format-side fmt.relocationByKind pre-flight.
+    for (auto const& fn : module.functions) {
+        for (auto const& rel : fn.relocations) {
+            if (fmt.relocationByKind(rel.kind) == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("macho::encodeExecDynamic: kind {} not "
+                                 "declared by object format '{}' — "
+                                 "substrate-invariant violation.",
+                                 rel.kind.v, fmt.name()));
+                return {};
+            }
+        }
+    }
+
+    std::size_t const numExterns = module.externImports.size();
+
+    // ── (b) Group externs by library (preserve declaration order)
+    std::vector<std::string> libraryOrder;
+    std::unordered_map<std::string, std::uint32_t> libOrdinal;
+    for (auto const& ext : module.externImports) {
+        if (libOrdinal.emplace(ext.libraryPath,
+                static_cast<std::uint32_t>(libraryOrder.size())).second) {
+            libraryOrder.push_back(ext.libraryPath);
+        }
+    }
+    std::size_t const numLibs = libraryOrder.size();
+    if (numLibs == 0) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "macho::encodeExecDynamic: " +
+             std::to_string(numExterns) +
+             " extern(s) declared but every `libraryPath` is empty "
+             "— zero LC_LOAD_DYLIB entries would ship; dyld cannot "
+             "resolve undefined symbols without a library.");
+        return {};
+    }
+    // Mach-O dylib ordinals are 1-based (0 is reserved for
+    // BIND_SPECIAL_DYLIB_SELF). The bind opcode uses the immediate
+    // form (BIND_OPCODE_SET_DYLIB_ORDINAL_IMM) only for ordinals
+    // in 1..15 (4-bit immediate). Beyond that, the opcode falls
+    // back to the ULEB form (SET_DYLIB_ORDINAL_ULEB). Use the IMM
+    // form when possible — same byte cost (1B opcode + 1B ULEB =
+    // 2B for IMM-able ordinals; 1B opcode + 1B opcode = 2B for the
+    // ULEB form), but IMM is the conventional shape Apple's ld64
+    // emits and dyld's hot path optimizes for.
+
+    // ── (c) Build .text body + per-function start map ────────────
+    std::vector<std::uint8_t> textBody;
+    std::vector<std::uint64_t> funcTextStart;
+    funcTextStart.reserve(module.functions.size());
+    for (auto const& fn : module.functions) {
+        funcTextStart.push_back(textBody.size());
+        textBody.insert(textBody.end(), fn.bytes.begin(), fn.bytes.end());
+    }
+    if (textBody.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "macho::encodeExecDynamic: every AssembledFunction "
+             "contributed zero bytes — `__text` is empty.");
+        return {};
+    }
+
+    // ── (d) Resolve entry function index from schema.entryPoint
+    std::size_t entryFnIdx = 0;
+    if (auto const ep = fmt.entryPoint(); !ep.empty()) {
+        bool found = false;
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            std::string const cand =
+                "_sym_" + std::to_string(module.functions[i].symbol.v);
+            if (cand == ep) { entryFnIdx = i; found = true; break; }
+        }
+        if (!found) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"macho::encodeExecDynamic: entryPoint '"}
+                     + std::string{ep}
+                     + "' not found among module function symbols.");
+            return {};
+        }
+    }
+
+    // ── (e) Symbol-VA map: intra-fn VAs + extern __stubs slot VAs.
+    //       __stubs lives right after __text within __TEXT.
+    std::uint64_t const stubsVa = sectionVa + textBody.size();
+    std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+    symbolVa.reserve(module.functions.size() + numExterns);
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        if (!symbolVa.emplace(module.functions[i].symbol,
+                              sectionVa + funcTextStart[i]).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 "macho::encodeExecDynamic: duplicate function "
+                 "symbol #" +
+                 std::to_string(module.functions[i].symbol.v) +
+                 " — caller must give each function a unique "
+                 "SymbolId.");
+            return {};
+        }
+    }
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        std::uint64_t const stubVa =
+            stubsVa + static_cast<std::uint64_t>(i) * kStubSize;
+        if (!symbolVa.emplace(module.externImports[i].symbol,
+                              stubVa).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 "macho::encodeExecDynamic: extern SymbolId #" +
+                 std::to_string(module.externImports[i].symbol.v) +
+                 " collides with another symbol — caller must give "
+                 "each extern a unique SymbolId distinct from "
+                 "function ids.");
+            return {};
+        }
+    }
+
+    // ── (f) Apply intra-module relocations in-place ─────────────
+    if (!link::format::applyExecRelocations(
+            textBody, module, funcTextStart, symbolVa,
+            targetSchema, sectionVa, "macho::encodeExecDynamic",
+            reporter)) {
+        return {};
+    }
+
+    // ── (g) Build __stubs body: N × `FF 25 disp32` (PC-rel jump
+    //       through __got slot N).
+    //       __got lives in __DATA_CONST at a separate VA computed
+    //       once we know the section layout below.
+    //       Stub at offset i resolves to: jmp *(rip + (gotVa[i] -
+    //       (stubVa_i + 6))). The +6 is the rip value after the
+    //       `FF 25 disp32` instruction (its own length).
+
+    // ── (h) Build LC_LOAD_DYLINKER + LC_LOAD_DYLIB sizes ────────
+    std::size_t const dylinkerCmdSize =
+        commandSizeWithPath(12, im.dylinkerPath);
+    std::size_t totalDylibCmdSize = 0;
+    for (auto const& d : im.loadDylibs) {
+        totalDylibCmdSize += commandSizeWithPath(24, d.path);
+    }
+    // Linker validates non-empty loadDylibs upstream; defense-in-
+    // depth makes sure every library referenced by an externImport
+    // is in loadDylibs. dyld rejects bind opcodes referring to
+    // ordinals not present in LC_LOAD_DYLIB[].
+    std::unordered_set<std::string> declaredLibs;
+    declaredLibs.reserve(im.loadDylibs.size());
+    for (auto const& d : im.loadDylibs) declaredLibs.insert(d.path);
+    for (auto const& lib : libraryOrder) {
+        if (!declaredLibs.contains(lib)) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"macho::encodeExecDynamic: extern "
+                             "imports reference library '"} + lib +
+                 "' but it is not declared in image.loadDylibs — "
+                 "dyld rejects bind opcodes referring to undeclared "
+                 "dylib ordinals.");
+            return {};
+        }
+    }
+    // Stable map: library → dylib ordinal (1-based per dyld).
+    auto dylibOrdinal = [&](std::string const& path)
+                          -> std::uint32_t {
+        for (std::size_t i = 0; i < im.loadDylibs.size(); ++i) {
+            if (im.loadDylibs[i].path == path) {
+                return static_cast<std::uint32_t>(i + 1);
+            }
+        }
+        return 0;  // unreachable — declaredLibs check above
+    };
+
+    // ── (i) Build the bind opcode stream ─────────────────────────
+    //
+    // For each extern, emit:
+    //   SET_DYLIB_ORDINAL_(IMM|ULEB)  <ord>
+    //   SET_SYMBOL_TRAILING_FLAGS_IMM 0 + symbol name + NUL
+    //   SET_TYPE_IMM BIND_TYPE_POINTER         (once is enough but
+    //                                            re-emit per extern
+    //                                            for clarity)
+    //   SET_SEGMENT_AND_OFFSET_ULEB  <__DATA_CONST seg idx> <offset>
+    //   DO_BIND
+    // Then BIND_OPCODE_DONE.
+    //
+    // Segment index is 0-based in BIND_OPCODE_SET_SEGMENT_AND_
+    // OFFSET_ULEB's 4-bit immediate. Segments are numbered in the
+    // order they appear via LC_SEGMENT_64: __PAGEZERO=0, __TEXT=1,
+    // __DATA_CONST=2, __LINKEDIT=3 (this walker's emission order).
+    // If the emission order ever changes, this constant must too.
+    // (code-reviewer I2 fold — comment said "1-based" then
+    // enumerated 0-based, contradicting itself.)
+    constexpr std::uint8_t kSegIdxDataConst = 2;
+    std::vector<std::uint8_t> bindStream;
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        auto const& ext = module.externImports[i];
+        std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
+        if (ord <= 0x0F) {
+            bindStream.push_back(static_cast<std::uint8_t>(
+                BIND_OPCODE_SET_DYLIB_ORDINAL_IMM |
+                static_cast<std::uint8_t>(ord & 0x0F)));
+        } else {
+            bindStream.push_back(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
+            appendULEB128(bindStream, ord);
+        }
+        bindStream.push_back(static_cast<std::uint8_t>(
+            BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0));
+        // Mach-O bind symbols are conventionally prefixed with `_`
+        // for C ABI compatibility. The walker emits the
+        // `mangledName` verbatim — the caller (linker / assembler)
+        // is responsible for adding the underscore in mangledName
+        // if the symbol's source language uses C-style mangling.
+        for (char c : ext.mangledName)
+            bindStream.push_back(static_cast<std::uint8_t>(c));
+        bindStream.push_back(0);  // NUL terminator
+        bindStream.push_back(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+        bindStream.push_back(
+            BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | kSegIdxDataConst);
+        appendULEB128(bindStream,
+            static_cast<std::uint64_t>(i) * kGotSlotSize);
+        bindStream.push_back(BIND_OPCODE_DO_BIND);
+    }
+    bindStream.push_back(BIND_OPCODE_DONE);
+    // dyld parses the bind stream byte-by-byte; pad to 8 for
+    // load-command alignment downstream.
+    while (bindStream.size() % kLoadCmdAlign != 0)
+        bindStream.push_back(0);
+
+    // ── (j) Indirect symbols table: one u32 per stub slot + one
+    //       u32 per __got slot. Each entry is the index into
+    //       nlist_64 of the matching undefined extern. nlist_64
+    //       ordering: defined externs first (functions),
+    //       undefined externs next — so undef indices are
+    //       [numDefs .. numDefs + numExterns).
+    std::uint32_t const numDefs =
+        static_cast<std::uint32_t>(module.functions.size());
+    std::vector<std::uint32_t> indirectSyms;
+    indirectSyms.reserve(numExterns * 2);
+    for (std::size_t i = 0; i < numExterns; ++i)
+        indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
+    for (std::size_t i = 0; i < numExterns; ++i)
+        indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
+
+    // ── (k) Build nlist_64 + string table: defined externs first,
+    //       undefined externs next.
+    StringTable strtab;
+    std::vector<std::uint8_t> nlistBytes;
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        auto const& fn = module.functions[i];
+        std::string const symName =
+            "_sym_" + std::to_string(fn.symbol.v);
+        std::uint32_t const nameOff = strtab.add(symName);
+        appendU32LE(nlistBytes, nameOff);
+        appendU8(nlistBytes,
+                 static_cast<std::uint8_t>(N_SECT | N_EXT));
+        appendU8(nlistBytes, /*n_sect=*/1);
+        appendU16LE(nlistBytes, /*n_desc=*/0);
+        appendU64LE(nlistBytes, sectionVa + funcTextStart[i]);
+    }
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        auto const& ext = module.externImports[i];
+        std::uint32_t const nameOff = strtab.add(ext.mangledName);
+        std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
+        appendU32LE(nlistBytes, nameOff);
+        appendU8(nlistBytes,
+                 static_cast<std::uint8_t>(N_UNDF | N_EXT));
+        appendU8(nlistBytes, /*n_sect=*/0);  // undefined
+        // n_desc bits 8..15 = LIBRARY_ORDINAL (1-based dylib idx).
+        appendU16LE(nlistBytes,
+                    static_cast<std::uint16_t>(ord << 8));
+        appendU64LE(nlistBytes, 0);  // n_value = 0 for undefined
+    }
+    std::uint32_t const numberOfSymbols =
+        numDefs + static_cast<std::uint32_t>(numExterns);
+
+    // ── (l) Layout: compute file offsets for everything ─────────
+    //
+    // Layout order:
+    //   header + load commands + pad → __text → __stubs → __got
+    //   (__got page-aligned, in __DATA_CONST) → pad → __LINKEDIT
+    //   (bind opcodes → indirect symtab → nlist → strtab)
+
+    constexpr std::size_t kSegCmdPageZeroSize = kSegmentCommand64Size;
+    constexpr std::size_t kSegCmdTextSize =
+        kSegmentCommand64Size + kSection64Size * 2;  // __text + __stubs
+    constexpr std::size_t kSegCmdDataConstSize =
+        kSegmentCommand64Size + kSection64Size;      // __got
+    constexpr std::size_t kSegCmdLinkeditSize = kSegmentCommand64Size;
+    constexpr std::size_t kLcMainSize         = 24;
+
+    // ncmds = 4 segments + LC_DYLD_INFO_ONLY + LC_LOAD_DYLINKER
+    //       + LC_MAIN + N × LC_LOAD_DYLIB + LC_SYMTAB + LC_DYSYMTAB.
+    std::uint32_t const ncmds = static_cast<std::uint32_t>(
+        4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u + 1u);
+    std::size_t const sizeofcmds =
+        kSegCmdPageZeroSize + kSegCmdTextSize + kSegCmdDataConstSize +
+        kSegCmdLinkeditSize + kDyldInfoCommandSize + dylinkerCmdSize +
+        kLcMainSize + totalDylibCmdSize + kSymtabCommandSize +
+        kDysymtabCommandSize;
+    std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
+
+    std::uint64_t const textFileOff =
+        (headerAndCmds + kPageSize - 1) & ~(kPageSize - 1);
+    std::uint64_t const textFileSize = textBody.size();
+    std::uint64_t const stubsFileOff = textFileOff + textFileSize;
+    std::uint64_t const stubsFileSize =
+        static_cast<std::uint64_t>(numExterns) * kStubSize;
+
+    // __got lives in __DATA_CONST — separate segment, separate page.
+    // dyld maps each segment independently. Place __got's file
+    // offset on a page boundary above stubs (and above the
+    // header/cmds region in VA via __DATA_CONST.vmaddr).
+    std::uint64_t const gotFileOff =
+        (stubsFileOff + stubsFileSize + kPageSize - 1) & ~(kPageSize - 1);
+    std::uint64_t const gotFileSize =
+        static_cast<std::uint64_t>(numExterns) * kGotSlotSize;
+    // gotVa derives from the file-offset delta because __TEXT.fileoff
+    // = 0 by Apple convention — file offsets map directly to VAs
+    // relative to textSegVmaddr. The formula collapses to
+    // `textSegVmaddr + textSecOffsetInSeg + (gotFileOff - textFileOff)`
+    // when written out fully; here we use the equivalent
+    // `sectionVa + (gotFileOff - textFileOff)` since sectionVa
+    // already encodes the segment + section offset sum. If plan 16
+    // (codesign) ever prepends a signing superblob and forces
+    // __TEXT.fileoff != 0, this formula must be rewritten in the
+    // segment-anchored form (code-architect MEDIUM, LK6 cycle 2c).
+    std::uint64_t const gotVa =
+        sectionVa + (gotFileOff - textFileOff);
+
+    // Now patch __stubs disp32: jmp [rip + (gotVa[i] - stubVa_i+6)].
+    std::vector<std::uint8_t> stubsBody;
+    stubsBody.reserve(stubsFileSize);
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        std::uint64_t const stubVa = stubsVa +
+            static_cast<std::uint64_t>(i) * kStubSize;
+        std::uint64_t const gotSlotVa = gotVa +
+            static_cast<std::uint64_t>(i) * kGotSlotSize;
+        // disp32 = gotSlotVa - (stubVa + 6) (signed, fits in i32).
+        std::int64_t const disp =
+            static_cast<std::int64_t>(gotSlotVa) -
+            static_cast<std::int64_t>(stubVa + kStubSize);
+        if (disp < std::numeric_limits<std::int32_t>::min()
+         || disp > std::numeric_limits<std::int32_t>::max()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encodeExecDynamic: __stubs "
+                             "disp32 overflow (0x{:x}) for extern "
+                             "#{}; image too large for 32-bit "
+                             "PC-relative __got reference.",
+                             static_cast<std::uint64_t>(disp), i));
+            return {};
+        }
+        stubsBody.push_back(0xFF);
+        stubsBody.push_back(0x25);
+        std::uint32_t const d32 =
+            static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
+        stubsBody.push_back(static_cast<std::uint8_t>(d32 & 0xFF));
+        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 8) & 0xFF));
+        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 16) & 0xFF));
+        stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 24) & 0xFF));
+    }
+
+    // __got body: numExterns × 8 zero bytes (dyld fills at load).
+    std::vector<std::uint8_t> gotBody(gotFileSize, 0u);
+
+    // __LINKEDIT contents.
+    std::uint64_t const linkeditFileOff =
+        (gotFileOff + gotFileSize + kPageSize - 1) & ~(kPageSize - 1);
+    std::uint64_t const bindOff = linkeditFileOff;
+    std::uint64_t const bindSize = bindStream.size();
+    std::uint64_t const indirectSymtabOff = bindOff + bindSize;
+    std::uint64_t const indirectSymtabSize =
+        static_cast<std::uint64_t>(indirectSyms.size()) * 4u;
+    std::uint64_t const symtabOff = indirectSymtabOff + indirectSymtabSize;
+    std::uint64_t const symtabSize =
+        static_cast<std::uint64_t>(numberOfSymbols) * kNlist64Size;
+    std::uint64_t const strtabOff = symtabOff + symtabSize;
+    std::uint64_t const strtabSize = strtab.size();
+    std::uint64_t const linkeditFileSize =
+        (strtabOff + strtabSize) - linkeditFileOff;
+
+    // Segment VAs:
+    std::uint64_t const textSegVmaddr = im.pageZeroSize;
+    std::uint64_t const textSecOffsetInSeg = sectionVa - textSegVmaddr;
+    std::uint64_t const textSegVmsize =
+        ((stubsFileOff + stubsFileSize) - textFileOff +
+         textSecOffsetInSeg + kPageSize - 1) & ~(kPageSize - 1);
+    // __TEXT.fileoff = 0 by Apple convention (the mach header sits
+    // inside __TEXT). The segment therefore spans [0, stubsEnd) in
+    // the file — its filesize must equal stubsEnd, NOT
+    // (stubsEnd - textFileOff) which would truncate the mmap before
+    // reaching .text (code-reviewer C1 fold, dyld correctness).
+    std::uint64_t const textSegFileSize = stubsFileOff + stubsFileSize;
+
+    std::uint64_t const dataConstSegVmaddr = gotVa;
+    std::uint64_t const dataConstSegVmsize =
+        (gotFileSize + kPageSize - 1) & ~(kPageSize - 1);
+    std::uint64_t const dataConstSegFileSize = gotFileSize;
+
+    std::uint64_t const linkeditSegVmaddr =
+        dataConstSegVmaddr + dataConstSegVmsize;
+    std::uint64_t const linkeditSegVmsize =
+        (linkeditFileSize + kPageSize - 1) & ~(kPageSize - 1);
+
+    // Indirect-symtab reserved1 indices: __stubs uses [0..numExterns),
+    // __got uses [numExterns..2*numExterns).
+    constexpr std::uint32_t kStubsReserved1 = 0;
+    std::uint32_t const kGotReserved1 =
+        static_cast<std::uint32_t>(numExterns);
+
+    // ── (m) Emit bytes ───────────────────────────────────────────
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(strtabOff + strtabSize);
+
+    // mach_header_64
+    appendU32LE(bytes, MH_MAGIC_64);
+    appendU32LE(bytes, id.cputype);
+    appendU32LE(bytes, id.cpusubtype);
+    appendU32LE(bytes, static_cast<std::uint32_t>(id.filetype));
+    appendU32LE(bytes, ncmds);
+    appendU32LE(bytes, static_cast<std::uint32_t>(sizeofcmds));
+    appendU32LE(bytes, id.flags);
+    appendU32LE(bytes, 0);
+
+    // LC_SEGMENT_64 __PAGEZERO
+    appendU32LE(bytes, LC_SEGMENT_64);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdPageZeroSize));
+    appendName16(bytes, "__PAGEZERO");
+    appendU64LE(bytes, 0);
+    appendU64LE(bytes, im.pageZeroSize);
+    appendU64LE(bytes, 0);
+    appendU64LE(bytes, 0);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+
+    // LC_SEGMENT_64 __TEXT (2 sections: __text + __stubs)
+    constexpr std::int32_t kVmProtRx = 5;
+    appendU32LE(bytes, LC_SEGMENT_64);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdTextSize));
+    appendName16(bytes, "__TEXT");
+    appendU64LE(bytes, textSegVmaddr);
+    appendU64LE(bytes, textSegVmsize);
+    appendU64LE(bytes, 0);
+    appendU64LE(bytes, textSegFileSize);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
+    appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
+    appendU32LE(bytes, 2);
+    appendU32LE(bytes, 0);
+
+    // section_64 __text
+    appendName16(bytes, secText.name);
+    appendName16(bytes, secText.segment);
+    appendU64LE(bytes, sectionVa);
+    appendU64LE(bytes, textFileSize);
+    appendU32LE(bytes, static_cast<std::uint32_t>(textFileOff));
+    appendU32LE(bytes, static_cast<std::uint32_t>(secText.addrAlign));
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, secText.type);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+
+    // section_64 __stubs
+    appendName16(bytes, "__stubs");
+    appendName16(bytes, "__TEXT");
+    appendU64LE(bytes, stubsVa);
+    appendU64LE(bytes, stubsFileSize);
+    appendU32LE(bytes, static_cast<std::uint32_t>(stubsFileOff));
+    appendU32LE(bytes, /*addrAlign=*/1);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes,
+                S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS |
+                    S_ATTR_SOME_INSTRUCTIONS);
+    appendU32LE(bytes, kStubsReserved1);    // index of first indirect sym
+    appendU32LE(bytes, static_cast<std::uint32_t>(kStubSize));  // stub size
+    appendU32LE(bytes, 0);
+
+    // LC_SEGMENT_64 __DATA_CONST (1 section: __got)
+    constexpr std::int32_t kVmProtRw = 3;
+    appendU32LE(bytes, LC_SEGMENT_64);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdDataConstSize));
+    appendName16(bytes, "__DATA_CONST");
+    appendU64LE(bytes, dataConstSegVmaddr);
+    appendU64LE(bytes, dataConstSegVmsize);
+    appendU64LE(bytes, gotFileOff);
+    appendU64LE(bytes, dataConstSegFileSize);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
+    appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
+    appendU32LE(bytes, 1);
+    appendU32LE(bytes, 0);
+
+    // section_64 __got
+    appendName16(bytes, "__got");
+    appendName16(bytes, "__DATA_CONST");
+    appendU64LE(bytes, gotVa);
+    appendU64LE(bytes, gotFileSize);
+    appendU32LE(bytes, static_cast<std::uint32_t>(gotFileOff));
+    appendU32LE(bytes, /*addrAlign=*/3);   // log2(8) = 3
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, S_NON_LAZY_SYMBOL_POINTERS);
+    appendU32LE(bytes, kGotReserved1);    // index of first indirect sym
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+
+    // LC_SEGMENT_64 __LINKEDIT (no sections)
+    appendU32LE(bytes, LC_SEGMENT_64);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdLinkeditSize));
+    appendName16(bytes, "__LINKEDIT");
+    appendU64LE(bytes, linkeditSegVmaddr);
+    appendU64LE(bytes, linkeditSegVmsize);
+    appendU64LE(bytes, linkeditFileOff);
+    appendU64LE(bytes, linkeditFileSize);
+    appendU32LE(bytes, /*maxprot=*/1);  // R
+    appendU32LE(bytes, /*initprot=*/1);
+    appendU32LE(bytes, 0);
+    appendU32LE(bytes, 0);
+
+    // LC_DYLD_INFO_ONLY
+    appendU32LE(bytes, LC_DYLD_INFO_ONLY);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kDyldInfoCommandSize));
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // rebase_off/size
+    appendU32LE(bytes, static_cast<std::uint32_t>(bindOff));
+    appendU32LE(bytes, static_cast<std::uint32_t>(bindSize));
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // weak_bind
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // lazy_bind (eager — 0)
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // export
+
+    // LC_LOAD_DYLINKER
+    {
+        std::size_t const cmdStart = bytes.size();
+        appendU32LE(bytes, LC_LOAD_DYLINKER);
+        appendU32LE(bytes, static_cast<std::uint32_t>(dylinkerCmdSize));
+        appendU32LE(bytes, 12);
+        for (char c : im.dylinkerPath)
+            appendU8(bytes, static_cast<std::uint8_t>(c));
+        appendU8(bytes, 0);
+        while (bytes.size() - cmdStart < dylinkerCmdSize) appendU8(bytes, 0);
+    }
+
+    // LC_MAIN
+    appendU32LE(bytes, LC_MAIN);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kLcMainSize));
+    appendU64LE(bytes, textFileOff + funcTextStart[entryFnIdx]);
+    appendU64LE(bytes, 0);
+
+    // LC_LOAD_DYLIB[]
+    for (auto const& d : im.loadDylibs) {
+        std::size_t const cmdStart = bytes.size();
+        std::size_t const cmdSize = commandSizeWithPath(24, d.path);
+        appendU32LE(bytes, LC_LOAD_DYLIB);
+        appendU32LE(bytes, static_cast<std::uint32_t>(cmdSize));
+        appendU32LE(bytes, 24);
+        appendU32LE(bytes, 0);
+        appendU32LE(bytes, 0);
+        appendU32LE(bytes, 0);
+        for (char c : d.path)
+            appendU8(bytes, static_cast<std::uint8_t>(c));
+        appendU8(bytes, 0);
+        while (bytes.size() - cmdStart < cmdSize) appendU8(bytes, 0);
+    }
+
+    // LC_SYMTAB
+    appendU32LE(bytes, LC_SYMTAB);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kSymtabCommandSize));
+    appendU32LE(bytes, static_cast<std::uint32_t>(symtabOff));
+    appendU32LE(bytes, numberOfSymbols);
+    appendU32LE(bytes, static_cast<std::uint32_t>(strtabOff));
+    appendU32LE(bytes, static_cast<std::uint32_t>(strtabSize));
+
+    // LC_DYSYMTAB
+    appendU32LE(bytes, LC_DYSYMTAB);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
+    appendU32LE(bytes, 0);                    // ilocalsym
+    appendU32LE(bytes, 0);                    // nlocalsym
+    appendU32LE(bytes, 0);                    // iextdefsym
+    appendU32LE(bytes, numDefs);              // nextdefsym
+    appendU32LE(bytes, numDefs);              // iundefsym
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(numExterns));  // nundefsym
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // toc
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // modtab
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrefsym
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(indirectSymtabOff));
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(indirectSyms.size()));
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrel
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // locrel
+
+    // Sanity: emitted exactly sizeofcmds bytes.
+    if (bytes.size() != kMachHeader64Size + sizeofcmds) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::string{"macho::encodeExecDynamic: emitted "}
+                 + std::to_string(bytes.size() - kMachHeader64Size)
+                 + " bytes of load commands but sizeofcmds="
+                 + std::to_string(sizeofcmds)
+                 + " — substrate invariant violation.");
+        return {};
+    }
+
+    // Pad to textFileOff
+    while (bytes.size() < textFileOff) bytes.push_back(0);
+
+    // __text body (with applied relocations)
+    bytes.insert(bytes.end(), textBody.begin(), textBody.end());
+
+    // __stubs body
+    bytes.insert(bytes.end(), stubsBody.begin(), stubsBody.end());
+
+    // Pad to gotFileOff (separate page from __TEXT)
+    while (bytes.size() < gotFileOff) bytes.push_back(0);
+
+    // __got body (zeroes — dyld fills at load via bind opcodes)
+    bytes.insert(bytes.end(), gotBody.begin(), gotBody.end());
+
+    // Pad to linkeditFileOff
+    while (bytes.size() < linkeditFileOff) bytes.push_back(0);
+
+    // __LINKEDIT: bind stream
+    bytes.insert(bytes.end(), bindStream.begin(), bindStream.end());
+
+    // Indirect-symtab
+    for (auto const idx : indirectSyms) appendU32LE(bytes, idx);
+
+    // nlist_64[]
+    bytes.insert(bytes.end(), nlistBytes.begin(), nlistBytes.end());
+
+    // string table
     auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
 
