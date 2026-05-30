@@ -189,11 +189,17 @@ symbolVisibilityFromName(std::string_view s) noexcept {
 // output bytes.
 //
 // `nativeId` is the FORMAT-SPECIFIC numeric tag the format engine
-// writes into its relocation record:
-//   * ELF: `r_info` low 32 bits, e.g. R_X86_64_PC32 = 2.
-//   * PE:  Type field, e.g. IMAGE_REL_AMD64_REL32 = 4.
-//   * Mach-O: `r_type` 4-bit nibble in `r_info`, e.g.
-//     X86_64_RELOC_BRANCH = 2.
+// writes into its relocation record. Each format interprets the
+// field differently:
+//   * ELF: `r_info` low 32 bits = `r_type`, e.g. R_X86_64_PC32 = 2.
+//   * PE:  IMAGE_RELOCATION.Type field, e.g. IMAGE_REL_AMD64_REL32
+//     = 4.
+//   * Mach-O: STATIC PORTION of `relocation_info.r_info` packed
+//     as `(r_type<<28) | (r_length<<25) | (r_pcrel<<24)`. The
+//     walker ORs in r_extern (bit 27) + r_symbolnum (bits 0..23)
+//     at emit time. Mach-O `validate()` rejects nativeId values
+//     that pre-set those walker-owned bits (silent-corruption
+//     guard).
 //   * WASM: u32 LEB128 reloc type (fits u32 unchanged).
 //   * SPIR-V: no traditional relocation table (decoration-based);
 //     the field is unused on SPIR-V format schemas.
@@ -221,22 +227,30 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
 // `kind` unique cross-row; the format-specific numeric fields are
 // stored verbatim and interpreted by the format walker.
 //
-// **`name` is a single-level identifier** — ELF uses one (`.text`)
-// and PE uses one (`.text` / `.rdata`). Mach-O uses a two-level
-// `(segment, section)` tuple (`__TEXT,__text`). When LK3 lands the
-// Mach-O walker, this struct gains a parallel `segment` field —
-// anchored as plan 14 §3.1 **D-LK3-1**. Until then `name` carries
-// the section-only identifier and the segment relationship lives
-// implicit in the format walker.
+// **Two-level section naming**: `name` is the section-only id
+// (`.text` for ELF/PE, `__text` for Mach-O); `segment` is the
+// segment name for formats that use a two-level `(segment,
+// section)` tuple. Mach-O sections live inside segments (e.g.
+// `__TEXT,__text` = section `__text` in segment `__TEXT`); ELF
+// and PE leave `segment` empty. This split was anchored as plan
+// 14 §3.1 **D-LK3-1** during LK1; closed by LK3.
 struct DSS_EXPORT ObjectFormatSectionInfo {
     SectionKind   kind{};            // universal kind enum
-    std::string   name;              // e.g. ".text" / ".rela.text"
-                                     // (D-LK3-1: gains `segment` at LK3)
+    std::string   name;              // section name
+                                     //   ELF/PE: ".text" / ".rdata"
+                                     //   Mach-O: "__text" / "__data"
+    std::string   segment;           // segment name for two-level
+                                     // formats (Mach-O: "__TEXT");
+                                     // empty for ELF/PE
     std::uint32_t type = 0;          // ELF sh_type / PE Characteristics
-    std::uint64_t flags = 0;         // ELF sh_flags / PE flags
-                                     // / Mach-O S_ATTR_* (LK3)
-    std::uint64_t addrAlign = 0;     // sh_addralign or format equivalent
-    std::uint64_t entrySize = 0;     // sh_entsize (0 for variable-size)
+                                     // / Mach-O section_64.flags
+    std::uint64_t flags = 0;         // ELF sh_flags / unused on PE
+                                     // (validate-rejected) and Mach-O
+    std::uint64_t addrAlign = 0;     // ELF sh_addralign / Mach-O
+                                     // section_64.align (log2 form);
+                                     // unused on PE (validate-rejected)
+    std::uint64_t entrySize = 0;     // ELF sh_entsize / unused on
+                                     // PE + Mach-O
 };
 
 // ── ELF-specific identity block (loaded only when kind == Elf) ──
@@ -273,6 +287,26 @@ struct DSS_EXPORT PeIdentity {
                                         // 0 for relocatable .obj
 };
 
+// ── Mach-O-specific identity block (loaded only when kind==MachO) ──
+//
+// Mirrors the load-bearing fields of `mach_header_64` (Apple OS X
+// ABI Mach-O File Format Reference). `magic` is fixed at MH_MAGIC_64
+// (0xFEEDFACF) and not exposed on the schema — the substrate writes
+// it unconditionally for the 64-bit walker. `reserved` is zero by
+// definition.
+struct DSS_EXPORT MachOIdentity {
+    std::uint32_t cputype = 0;       // CPU_TYPE_X86_64=0x01000007
+                                     // / CPU_TYPE_ARM64=0x0100000C
+    std::uint32_t cpusubtype = 0;    // CPU_SUBTYPE_X86_64_ALL=3
+                                     // / CPU_SUBTYPE_ARM64_ALL=0
+    std::uint32_t filetype = 0;      // MH_OBJECT=1 / MH_EXECUTE=2
+                                     // / MH_DYLIB=6. Substrate ships
+                                     // MH_OBJECT only this cycle.
+    std::uint32_t flags = 0;         // MH_SUBSECTIONS_VIA_SYMBOLS=0x2000
+                                     // etc. Optional; 0 is legal for
+                                     // a minimal .o.
+};
+
 namespace detail {
 
 struct DSS_EXPORT ObjectFormatData {
@@ -298,8 +332,9 @@ struct DSS_EXPORT ObjectFormatData {
     // `kind` matches; otherwise zero-defaulted. The walker reads
     // its arm from JSON; validate() enforces the per-kind
     // populated-ness rule.
-    ElfIdentity elf{};
-    PeIdentity  pe{};
+    ElfIdentity   elf{};
+    PeIdentity    pe{};
+    MachOIdentity macho{};
 
     // Cross-field invariants:
     //   * relocations: kind != 0, kind unique cross-row, name unique
@@ -370,8 +405,9 @@ public:
     // Per-format identity accessors — each is populated only when
     // `kind()` matches that arm. Walker reads the relevant block
     // when it runs.
-    [[nodiscard]] ElfIdentity const& elf() const noexcept { return d_.elf; }
-    [[nodiscard]] PeIdentity  const& pe()  const noexcept { return d_.pe; }
+    [[nodiscard]] ElfIdentity   const& elf()   const noexcept { return d_.elf; }
+    [[nodiscard]] PeIdentity    const& pe()    const noexcept { return d_.pe; }
+    [[nodiscard]] MachOIdentity const& macho() const noexcept { return d_.macho; }
 
     // ── Loaders ───────────────────────────────────────────────
     static LoadResult<std::shared_ptr<ObjectFormatSchema>>

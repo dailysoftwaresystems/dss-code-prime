@@ -171,6 +171,90 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // Mach-O identity: cputype/cpusubtype/filetype must be declared.
+    // Mach-O is also the only format whose section rows REQUIRE a
+    // non-empty `segment` (two-level naming) — ELF/PE leave it
+    // empty. Section + segment names also must fit in 16 chars
+    // (Mach-O has no long-name escape; the walker writes a fixed
+    // 16-byte field).
+    if (kind == ObjectFormatKind::MachO) {
+        if (macho.cputype == 0) {
+            fail("/macho/cputype",
+                 "Mach-O format requires 'macho.cputype' (CPU_TYPE_* "
+                 "value, e.g. 0x01000007 for x86_64, 0x0100000C for "
+                 "arm64)");
+        }
+        if (macho.filetype == 0) {
+            fail("/macho/filetype",
+                 "Mach-O format requires 'macho.filetype' (MH_OBJECT=1 "
+                 "for relocatable .o; cycle 1 ships MH_OBJECT only)");
+        }
+        for (std::size_t i = 0; i < sections.size(); ++i) {
+            auto const& s = sections[i];
+            if (s.segment.empty()) {
+                fail(std::format("/sections/{}/segment", i),
+                     std::format("section '{}': Mach-O requires a "
+                                 "non-empty 'segment' name (e.g. "
+                                 "'__TEXT' for the section '__text'); "
+                                 "the single-string substrate field is "
+                                 "for ELF/PE only",
+                                 s.name));
+            }
+            if (s.name.size() > 16) {
+                fail(std::format("/sections/{}/name", i),
+                     std::format("section '{}' length {} exceeds the "
+                                 "16-char Mach-O section_64.sectname "
+                                 "field (no long-name escape exists)",
+                                 s.name, s.name.size()));
+            }
+            if (s.segment.size() > 16) {
+                fail(std::format("/sections/{}/segment", i),
+                     std::format("segment '{}' length {} exceeds the "
+                                 "16-char Mach-O section_64.segname "
+                                 "field",
+                                 s.segment, s.segment.size()));
+            }
+        }
+        // Mach-O nativeId packing reserves bit 27 (r_extern) and
+        // bits 0..23 (r_symbolnum) for walker-filled fields. JSON
+        // values setting those bits silently corrupt the
+        // relocation_info word at emit time (silent-failure C1 +
+        // type-design Q4 convergence). Validate the packing mask
+        // here so JSON typos fail loud at load time.
+        constexpr std::uint32_t kMachOReservedBits =
+            (1u << 27) | 0x00FFFFFFu;
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            auto const& r = relocations[i];
+            if ((r.nativeId & kMachOReservedBits) != 0) {
+                fail(std::format("/relocations/{}/nativeId", i),
+                     std::format("relocation '{}': 'nativeId' "
+                                 "0x{:08X} sets reserved bits "
+                                 "(bit 27 = r_extern is walker-filled; "
+                                 "bits 0..23 = r_symbolnum are filled "
+                                 "per-reloc with the symtab index). "
+                                 "Mach-O packing must only set bits "
+                                 "28..31 (r_type), 25..26 (r_length), "
+                                 "and 24 (r_pcrel)",
+                                 r.name, r.nativeId));
+            }
+        }
+    }
+
+    // ELF + PE sections must NOT carry a segment name (the field is
+    // Mach-O-specific). Reject explicitly so a JSON edit can't
+    // silently no-op.
+    if (kind == ObjectFormatKind::Elf || kind == ObjectFormatKind::Pe) {
+        for (std::size_t i = 0; i < sections.size(); ++i) {
+            if (!sections[i].segment.empty()) {
+                fail(std::format("/sections/{}/segment", i),
+                     std::format("section '{}': 'segment' must be empty "
+                                 "for ELF/PE rows (only Mach-O uses the "
+                                 "two-level (segment, section) naming)",
+                                 sections[i].name));
+            }
+        }
+    }
+
     return problems;
 }
 

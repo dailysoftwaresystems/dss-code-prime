@@ -4,6 +4,7 @@ add_library(link OBJECT
     object_format_schema_json.cpp
     format/elf.cpp
     format/pe.cpp
+    format/macho.cpp
 )
 
 target_include_directories(link PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

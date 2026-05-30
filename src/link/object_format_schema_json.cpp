@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -161,6 +162,17 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     continue;
                 }
                 info.name = s.at("name").get<std::string>();
+                // `segment` is optional for ELF/PE (empty default);
+                // Mach-O validate() rejects empty here.
+                if (s.contains("segment")) {
+                    if (!s.at("segment").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/sections/{}/segment", i),
+                                  "'segment' must be a string");
+                    } else {
+                        info.segment = s.at("segment").get<std::string>();
+                    }
+                }
                 auto readU64 = [&](char const* field, std::uint64_t& out) {
                     if (!s.contains(field)) return;
                     if (!s.at(field).is_number_integer()) {
@@ -292,6 +304,34 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             };
             readU16("machine", data.pe.machine, 0xFFFF);
             readU16("characteristics", data.pe.characteristics, 0xFFFF);
+        }
+    }
+
+    // Mach-O identity block — read only when format kind is MachO.
+    if (data.kind == ObjectFormatKind::MachO && doc.contains("macho")) {
+        auto const& m = doc.at("macho");
+        if (!m.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/macho",
+                      "'macho' must be an object when format.kind == 'macho'");
+        } else {
+            auto readU32 = [&](char const* field, std::uint32_t& out) {
+                if (!m.contains(field) || !m.at(field).is_number_integer())
+                    return;
+                std::int64_t const v = m.at(field).get<std::int64_t>();
+                if (v < 0
+                 || v > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/macho/{}", field),
+                              std::format("'{}' ({}) out of range [0, 2^32)",
+                                          field, v));
+                    return;
+                }
+                out = static_cast<std::uint32_t>(v);
+            };
+            readU32("cputype",    data.macho.cputype);
+            readU32("cpusubtype", data.macho.cpusubtype);
+            readU32("filetype",   data.macho.filetype);
+            readU32("flags",      data.macho.flags);
         }
     }
 

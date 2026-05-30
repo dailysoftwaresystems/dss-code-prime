@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -77,37 +78,10 @@ void padTo(std::vector<std::uint8_t>& out, std::uint64_t alignment) {
     while (out.size() % alignment != 0) out.push_back(0);
 }
 
-// ── String-table builder ────────────────────────────────────────
-
-// ELF string tables start with an empty string (NUL byte) so that
-// st_name = 0 == "no name". Returns the offset of the appended
-// name; same-name dedup is intentional (multiple symbols may share
-// a section name like "" but symbol names should be unique anyway).
-class StringTable {
-public:
-    StringTable() : bytes_{0} {}  // initial NUL
-
-    [[nodiscard]] std::uint32_t add(std::string_view name) {
-        if (name.empty()) return 0;
-        auto it = offsets_.find(std::string{name});
-        if (it != offsets_.end()) return it->second;
-        std::uint32_t const offset = static_cast<std::uint32_t>(bytes_.size());
-        bytes_.insert(bytes_.end(), name.begin(), name.end());
-        bytes_.push_back(0);
-        offsets_.emplace(std::string{name}, offset);
-        return offset;
-    }
-
-    [[nodiscard]] std::span<std::uint8_t const> view() const noexcept {
-        return bytes_;
-    }
-
-    [[nodiscard]] std::size_t size() const noexcept { return bytes_.size(); }
-
-private:
-    std::vector<std::uint8_t>                  bytes_;
-    std::unordered_map<std::string, std::uint32_t> offsets_;
-};
+// String-table builder hoisted to `src/link/format/string_table.hpp`
+// (D-LK4-9 closure, 3rd-consumer trigger from Mach-O). ELF uses
+// the NulByte init: byte 0 is the empty-name sentinel.
+using link::format::detail::StringTable;
 
 // ── Section header record (in-memory before serialization) ──────
 

@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -110,51 +111,11 @@ struct NameField {
     return out;
 }
 
-// ── String table builder ────────────────────────────────────────
-//
-// PE/COFF string tables start with a 4-byte LE u32 size INCLUDING
-// the size field itself (minimum value 4 = empty table). Strings
-// are NUL-terminated. Symbol names > 8 chars are appended here
-// and the symbol's Name field carries `[0][offset]`.
-
-class StringTable {
-public:
-    StringTable() {
-        // Reserve 4 bytes for the size prefix (filled at finalize).
-        bytes_.resize(4, 0);
-    }
-
-    // Append `name` and return its offset within the table.
-    // Offset is RELATIVE to the start of the string table (the
-    // 4-byte size prefix counts), so the smallest legal offset is
-    // 4 (just past the size).
-    [[nodiscard]] std::uint32_t add(std::string_view name) {
-        auto it = offsets_.find(std::string{name});
-        if (it != offsets_.end()) return it->second;
-        std::uint32_t const offset = static_cast<std::uint32_t>(bytes_.size());
-        bytes_.insert(bytes_.end(), name.begin(), name.end());
-        bytes_.push_back(0);
-        offsets_.emplace(std::string{name}, offset);
-        return offset;
-    }
-
-    // Write the size prefix and return the byte buffer for emission.
-    [[nodiscard]] std::vector<std::uint8_t> finish() && {
-        std::uint32_t const total = static_cast<std::uint32_t>(bytes_.size());
-        for (int i = 0; i < 4; ++i) {
-            bytes_[i] = static_cast<std::uint8_t>(total >> (i * 8));
-        }
-        return std::move(bytes_);
-    }
-
-    [[nodiscard]] std::size_t pendingSize() const noexcept {
-        return bytes_.size();
-    }
-
-private:
-    std::vector<std::uint8_t>                       bytes_;
-    std::unordered_map<std::string, std::uint32_t>  offsets_;
-};
+// String-table builder hoisted to `src/link/format/string_table.hpp`
+// (D-LK4-9 closure). PE uses the U32SizePrefix init: bytes 0..3 hold
+// an inclusive u32 size prefix stamped at release() time. Smallest
+// legal offset returned by `add()` is 4 (just past the size).
+using link::format::detail::StringTable;
 
 // ── Section header record (in-memory) ───────────────────────────
 
@@ -363,7 +324,7 @@ encode(AssembledModule const&    module,
     // symbol name ≤ 8 chars we inline; longer names get appended
     // to the string table.
 
-    StringTable strtab;
+    StringTable strtab{StringTable::Init::U32SizePrefix};
     std::vector<std::uint8_t> symtab;
 
     auto appendSym = [&](NameField const& nameField, std::uint32_t value,
@@ -456,7 +417,7 @@ encode(AssembledModule const&    module,
 
     // ── Emit ──
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(symtabPointer + symtabSizeBytes + strtab.pendingSize());
+    bytes.reserve(symtabPointer + symtabSizeBytes + strtab.size());
 
     // Build the section header for .text (the only emitted section
     // this cycle); push onto the vector so NumberOfSections derives
@@ -501,7 +462,7 @@ encode(AssembledModule const&    module,
     bytes.insert(bytes.end(), symtab.begin(), symtab.end());
 
     // String table (with size prefix)
-    auto strtabBytes = std::move(strtab).finish();
+    auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
 
     return bytes;

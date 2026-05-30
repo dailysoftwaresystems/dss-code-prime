@@ -1,0 +1,53 @@
+{
+  "$comment": "Mach-O relocatable object (.o, MH_OBJECT) for x86_64 macOS / Darwin. Third shipped object-format JSON (plan 14 LK3, 2026-05-30). Consumed by `src/link/format/macho.cpp` via the format-blind linker engine. mach_header_64 + section_64 + nlist_64 + relocation_info field values follow Apple's OS X ABI Mach-O File Format Reference + `<mach-o/loader.h>` / `<mach-o/nlist.h>` / `<mach-o/x86_64/reloc.h>`.",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "macho64-x86_64-darwin",
+    "version": "1.0",
+    "kind": "macho"
+  },
+
+  "macho": {
+    "$comment": "mach_header_64 identity. cputype = CPU_TYPE_X86_64 (0x01000007 — CPU_ARCH_ABI64 bit OR'd with x86 ABI type 7). cpusubtype = CPU_SUBTYPE_X86_64_ALL (3). filetype = MH_OBJECT (1). flags = 0 — MH_SUBSECTIONS_VIA_SYMBOLS (0x2000) is intentionally NOT set: the cycle-1 walker emits one flat `__text` blob with no N_ALT_ENTRY subsection markers, so advertising the flag would lie to ld64 about function-granular dead-strip safety (silent-failure-hunter HIGH-1 convergence). The flag will return when the substrate emits per-function subsections — anchored at plan 14 §3.1 D-LK3-2.",
+    "cputype": 16777223,
+    "cpusubtype": 3,
+    "filetype": 1,
+    "flags": 0
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign in log2 form: 4 = 16 bytes. PE's substrate `type` field repurposed for Mach-O section_64.flags.",
+      "kind": "text",
+      "name": "__text",
+      "segment": "__TEXT",
+      "type": 2147484672,
+      "flags": 0,
+      "addrAlign": 4,
+      "entrySize": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "32-bit PC-relative call/jmp. r_type = X86_64_RELOC_BRANCH (2), r_pcrel = 1, r_length = 2 (4 bytes). Mach-O `relocation_info.r_info` packs bits 28..31=r_type, 27=r_extern, 25..26=r_length, 24=r_pcrel, 0..23=r_symbolnum. The walker emits the static portion of r_info from this nativeId (type+length+pcrel = 0x25000000) and ORs in r_extern + r_symbolnum at emit time. `kind` = 1 matches x86_64.target.json's `rel32`. Mach-O has no Rela addend column — addends live in the patch bytes (the assembler writes 0; the linker computes target_va - (rip_after) - 0 since BRANCH is rip-relative).",
+      "name": "X86_64_RELOC_BRANCH",
+      "kind": 1,
+      "nativeId": 620756992
+    },
+    {
+      "$comment": "Absolute 64-bit. r_type = X86_64_RELOC_UNSIGNED (0), r_pcrel = 0, r_length = 3 (8 bytes). nativeId = (0<<28)|(3<<25)|(0<<24) = 0x06000000. `kind` = 2 matches x86_64.target.json's `abs64`.",
+      "name": "X86_64_RELOC_UNSIGNED_8",
+      "kind": 2,
+      "nativeId": 100663296
+    },
+    {
+      "$comment": "Absolute 32-bit. r_type = X86_64_RELOC_UNSIGNED (0), r_pcrel = 0, r_length = 2 (4 bytes). nativeId = (0<<28)|(2<<25)|(0<<24) = 0x04000000. `kind` = 3 matches x86_64.target.json's `abs32`.",
+      "name": "X86_64_RELOC_UNSIGNED_4",
+      "kind": 3,
+      "nativeId": 67108864
+    }
+  ]
+}

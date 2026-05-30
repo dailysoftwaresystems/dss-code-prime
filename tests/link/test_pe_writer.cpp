@@ -335,6 +335,23 @@ TEST(PeWriter, NonPeFormatKindEmitsK_NoMatchingObjectFormat) {
     EXPECT_TRUE(sawCode);
 }
 
+// ── PE section with `segment` field rejected (cross-format check) ──
+
+TEST(PeFormatJson, SegmentFieldRejectedOnPeSection) {
+    // Mach-O is the only format that uses the two-level (segment,
+    // section) naming. validate() rejects non-empty `segment` on
+    // ELF and PE rows symmetrically — pin the PE half so a future
+    // split of the rule (e.g. under D-LK2-1 image-side work) can't
+    // silently drop the PE arm (test-analyzer convergence).
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bad-pe-seg","kind":"pe"},
+      "pe": { "machine": 34404 },
+      "sections":[{"kind":"text","name":".text","segment":"__TEXT","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
 // ── pe.machine = 0 validate rejection ──────────────────────────
 
 TEST(PeFormatJson, ZeroMachineRejectedByValidate) {

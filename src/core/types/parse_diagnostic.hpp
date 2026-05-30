@@ -454,9 +454,9 @@ enum class DiagnosticCode : std::uint16_t {
     //      `ObjectFormatKind::Unknown` (the invalid sentinel was
     //      not initialized by the format schema's loader path).
     //   2. The switch reaches a format whose walker is not yet
-    //      registered (MachO / Wasm / Spirv until LK3 / plan 18 /
-    //      plan 17 plug them in). ELF + PE walkers landed at LK1
-    //      and LK2 respectively.
+    //      registered (Wasm / Spirv until plan 18 / plan 17 plug
+    //      them in). ELF / PE / Mach-O walkers landed at LK1 /
+    //      LK2 / LK3 respectively.
     //   3. A format walker was invoked for a schema whose `kind()`
     //      does not match the walker (e.g. `elf::encode` called
     //      with a PE-tagged schema, or `pe::encode` called with an
@@ -464,9 +464,9 @@ enum class DiagnosticCode : std::uint16_t {
     //   4. The format schema declares the right `kind()` but omits
     //      a `sections[]` row the walker requires (e.g. ELF writer
     //      requires SectionKind::Text/RelocTable/Symtab/Strtab/
-    //      ShStrtab — any missing row fires this code; PE writer
-    //      only requires SectionKind::Text since PE has no separate
-    //      section headers for symbol/string tables).
+    //      ShStrtab — any missing row fires this code; PE and
+    //      Mach-O writers only require SectionKind::Text since
+    //      their symbol/string tables don't carry section headers).
     K_SymbolUndefined              = 0x8001,
     K_RelocationKindMismatch       = 0x8002,
     K_NoMatchingObjectFormat       = 0x8003,

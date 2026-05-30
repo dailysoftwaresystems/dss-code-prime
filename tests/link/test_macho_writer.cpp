@@ -1,0 +1,412 @@
+// Mach-O 64-bit .o writer tests — plan 14 LK3 cycle 1.
+//
+// Pins golden byte-level invariants of the emitted MH_OBJECT:
+//   * mach_header_64 magic = 0xFEEDFACF (MH_MAGIC_64).
+//   * cputype = 0x01000007 (CPU_TYPE_X86_64); filetype = MH_OBJECT (1).
+//   * ncmds = 2 (LC_SEGMENT_64 + LC_SYMTAB).
+//   * LC_SEGMENT_64 at byte 32; section_64 for `__text` immediately
+//     follows the segment command.
+//   * section_64.sectname = "__text"; segname = "__TEXT" (two-level
+//     naming — D-LK3-1 closure).
+//   * section_64.flags = 0x80000400 (S_REGULAR | S_ATTR_PURE_INSTRUCTIONS
+//     | S_ATTR_SOME_INSTRUCTIONS).
+//   * nlist_64 records are 16 bytes packed.
+//   * relocation_info records are 8 bytes packed; r_info high 4 bits =
+//     r_type (BRANCH=2 for rel32 → call sym).
+//   * String table NUL-seeded (n_strx=0 means "no name") — same shape
+//     as ELF (D-LK4-9 substrate consumer).
+//
+// Also pins that the shipped `macho64-x86_64-darwin.format.json`
+// loads cleanly via `loadShipped`.
+
+#include "asm/asm.hpp"
+#include "core/types/diagnostic_reporter.hpp"
+#include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"
+#include "link/format/macho.hpp"
+#include "link/linker.hpp"
+#include "link/object_format_schema.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace dss;
+
+namespace {
+
+[[nodiscard]] std::uint16_t readU16LE(std::span<std::uint8_t const> b,
+                                       std::size_t off) {
+    return static_cast<std::uint16_t>(b[off])
+         | (static_cast<std::uint16_t>(b[off + 1]) << 8);
+}
+[[nodiscard]] std::uint32_t readU32LE(std::span<std::uint8_t const> b,
+                                       std::size_t off) {
+    std::uint32_t v = 0;
+    for (int i = 0; i < 4; ++i)
+        v |= static_cast<std::uint32_t>(b[off + i]) << (i * 8);
+    return v;
+}
+[[nodiscard]] std::uint64_t readU64LE(std::span<std::uint8_t const> b,
+                                       std::size_t off) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+        v |= static_cast<std::uint64_t>(b[off + i]) << (i * 8);
+    return v;
+}
+
+struct Loaded {
+    std::shared_ptr<TargetSchema>       target;
+    std::shared_ptr<ObjectFormatSchema> format;
+};
+
+[[nodiscard]] Loaded loadShipped() {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("x86_64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(x86_64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.target = std::move(t).value();
+    }
+    auto f = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin");
+    if (!f.has_value()) {
+        ADD_FAILURE() << "loadShipped(macho64-x86_64-darwin) failed";
+        for (auto const& d : f.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.format = std::move(f).value();
+    }
+    return out;
+}
+
+[[nodiscard]] AssembledModule makeTrivialModule(std::vector<std::uint8_t> bytes,
+                                                  std::uint32_t symId) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{symId};
+    fn.bytes = std::move(bytes);
+    mod.functions.push_back(std::move(fn));
+    return mod;
+}
+
+} // namespace
+
+// ── Shipped JSON loads ───────────────────────────────────────────
+
+TEST(MachOFormatJson, ShippedFileLoadsCleanly) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.format);
+    EXPECT_EQ(loaded.format->kind(), ObjectFormatKind::MachO);
+    EXPECT_EQ(loaded.format->name(), "macho64-x86_64-darwin");
+    EXPECT_EQ(loaded.format->macho().cputype, 0x01000007u);
+    EXPECT_EQ(loaded.format->macho().cpusubtype, 3u);
+    EXPECT_EQ(loaded.format->macho().filetype, 1u);
+    auto const* textRow = loaded.format->sectionByKind(SectionKind::Text);
+    ASSERT_NE(textRow, nullptr);
+    EXPECT_EQ(textRow->name, "__text");
+    EXPECT_EQ(textRow->segment, "__TEXT");
+    EXPECT_EQ(textRow->addrAlign, 4u);   // log2(16)
+    EXPECT_EQ(textRow->type, 0x80000400u);
+    // Mach-O has NO section headers for symtab/strtab.
+    EXPECT_EQ(loaded.format->sectionByKind(SectionKind::Symtab), nullptr);
+    EXPECT_EQ(loaded.format->sectionByKind(SectionKind::Strtab), nullptr);
+}
+
+// ── mach_header_64 golden bytes ─────────────────────────────────
+
+TEST(MachOWriter, MachHeader64IdentityBytesMatchAppleAbi) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 42);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_GE(bytes.size(), 32u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // magic = MH_MAGIC_64 = 0xFEEDFACF
+    EXPECT_EQ(readU32LE(bytes, 0), 0xFEEDFACFu);
+    // cputype = CPU_TYPE_X86_64 = 0x01000007
+    EXPECT_EQ(readU32LE(bytes, 4), 0x01000007u);
+    // cpusubtype = CPU_SUBTYPE_X86_64_ALL = 3
+    EXPECT_EQ(readU32LE(bytes, 8), 3u);
+    // filetype = MH_OBJECT = 1
+    EXPECT_EQ(readU32LE(bytes, 12), 1u);
+    // ncmds = 2 (LC_SEGMENT_64 + LC_SYMTAB)
+    EXPECT_EQ(readU32LE(bytes, 16), 2u);
+    // sizeofcmds = 72 + 80*1 (segment+section) + 24 (symtab) = 176
+    EXPECT_EQ(readU32LE(bytes, 20), 176u);
+    // flags = 0 (MH_SUBSECTIONS_VIA_SYMBOLS deliberately NOT set
+    // because cycle 1 emits a flat __text without subsection markers;
+    // anchored as D-LK3-2 for the future subsection-emit cycle)
+    EXPECT_EQ(readU32LE(bytes, 24), 0u);
+    // reserved = 0
+    EXPECT_EQ(readU32LE(bytes, 28), 0u);
+}
+
+// ── LC_SEGMENT_64 + section_64 two-level naming ─────────────────
+
+TEST(MachOWriter, LcSegment64ContainsOneSectionWithTwoLevelNaming) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 42);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 32u + 72u + 80u);
+
+    // LC_SEGMENT_64 at byte 32
+    EXPECT_EQ(readU32LE(bytes, 32), 0x19u);  // LC_SEGMENT_64
+    EXPECT_EQ(readU32LE(bytes, 36), 72u + 80u);  // cmdsize
+    // segname (16 bytes) starts at 40 — empty for MH_OBJECT
+    for (std::size_t i = 0; i < 16; ++i) {
+        EXPECT_EQ(bytes[40 + i], 0u) << "LC_SEGMENT_64 segname must be empty";
+    }
+    // nsects @ +72+64 = +136 (segment_command_64 fields:
+    // cmd(4)+cmdsize(4)+segname(16)+vmaddr(8)+vmsize(8)+fileoff(8)+
+    // filesize(8)+maxprot(4)+initprot(4)+nsects(4)+flags(4)).
+    EXPECT_EQ(readU32LE(bytes, 32 + 64), 1u);  // nsects = 1
+
+    // section_64 starts at byte 32 + 72 = 104
+    // sectname[16] = "__text\0\0\0\0\0\0\0\0\0\0"
+    EXPECT_EQ(bytes[104 + 0], '_');
+    EXPECT_EQ(bytes[104 + 1], '_');
+    EXPECT_EQ(bytes[104 + 2], 't');
+    EXPECT_EQ(bytes[104 + 3], 'e');
+    EXPECT_EQ(bytes[104 + 4], 'x');
+    EXPECT_EQ(bytes[104 + 5], 't');
+    EXPECT_EQ(bytes[104 + 6], 0u);
+    // segname[16] = "__TEXT\0\0\0\0\0\0\0\0\0\0" at offset 104+16=120
+    EXPECT_EQ(bytes[120 + 0], '_');
+    EXPECT_EQ(bytes[120 + 1], '_');
+    EXPECT_EQ(bytes[120 + 2], 'T');
+    EXPECT_EQ(bytes[120 + 3], 'E');
+    EXPECT_EQ(bytes[120 + 4], 'X');
+    EXPECT_EQ(bytes[120 + 5], 'T');
+    EXPECT_EQ(bytes[120 + 6], 0u);
+    // section_64.flags @ offset 104 + 16 + 16 + 8 + 8 + 4 + 4 + 4 + 4 = 168
+    // (sectname[16] + segname[16] + addr(8) + size(8) + offset(4) +
+    //  align(4) + reloff(4) + nreloc(4) → flags)
+    EXPECT_EQ(readU32LE(bytes, 168), 0x80000400u);
+}
+
+// ── LC_SYMTAB locates symbol + string tables ───────────────────
+
+TEST(MachOWriter, LcSymtabReferencesNlist64AndStringTable) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 7);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // LC_SYMTAB starts at byte 32 + 72 + 80 = 184
+    EXPECT_EQ(readU32LE(bytes, 184), 0x02u);  // LC_SYMTAB
+    EXPECT_EQ(readU32LE(bytes, 188), 24u);    // cmdsize
+    std::uint32_t const symoff = readU32LE(bytes, 192);
+    std::uint32_t const nsyms = readU32LE(bytes, 196);
+    std::uint32_t const stroff = readU32LE(bytes, 200);
+    std::uint32_t const strsize = readU32LE(bytes, 204);
+    EXPECT_EQ(nsyms, 1u);
+    EXPECT_GT(symoff, 0u);
+    EXPECT_LE(symoff + 16u, bytes.size());
+
+    // nlist_64 record: n_strx(u32) + n_type(u8) + n_sect(u8) +
+    // n_desc(u16) + n_value(u64). Total 16 bytes.
+    EXPECT_EQ(readU32LE(bytes, symoff + 0), 1u)
+        << "n_strx points 1 byte past the leading NUL "
+           "('_sym_7' lives at offset 1 in the strtab)";
+    // n_type = N_SECT | N_EXT = 0x0F
+    EXPECT_EQ(bytes[symoff + 4], 0x0Fu);
+    // n_sect = 1 (1-based)
+    EXPECT_EQ(bytes[symoff + 5], 1u);
+    // n_value = 0 (function offset 0 in .text)
+    EXPECT_EQ(readU64LE(bytes, symoff + 8), 0u);
+
+    // String table starts with NUL (n_strx=0 = "no name")
+    EXPECT_EQ(bytes[stroff], 0u);
+    // Then "_sym_7\0" at offset 1
+    EXPECT_EQ(bytes[stroff + 1], '_');
+    EXPECT_EQ(bytes[stroff + 2], 's');
+    EXPECT_EQ(bytes[stroff + 3], 'y');
+    EXPECT_EQ(bytes[stroff + 4], 'm');
+    EXPECT_EQ(bytes[stroff + 5], '_');
+    EXPECT_EQ(bytes[stroff + 6], '7');
+    EXPECT_EQ(bytes[stroff + 7], 0u);
+    EXPECT_GE(strsize, 8u);
+}
+
+// ── relocation_info r_info packing ─────────────────────────────
+
+TEST(MachOWriter, RelocationInfoPacksTypeLengthPcrelExternSymbolnum) {
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{1};
+    caller.bytes = {0xE8, 0x00, 0x00, 0x00, 0x00};  // call rel32
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{2};        // extern
+    rel.kind   = RelocationKind{1};  // → BRANCH
+    rel.addend = 0;                  // Mach-O convention
+    caller.relocations.push_back(rel);
+    mod.functions.push_back(std::move(caller));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // section_64.reloff @ offset 104 + 16 + 16 + 8 + 8 + 4 + 4 = 160
+    std::uint32_t const relocOff = readU32LE(bytes, 160);
+    std::uint32_t const relocCount = readU32LE(bytes, 164);
+    ASSERT_EQ(relocCount, 1u);
+    ASSERT_GT(relocOff, 0u);
+    ASSERT_LE(relocOff + 8u, bytes.size());
+
+    // r_address = 1 (patch site within .text)
+    EXPECT_EQ(readU32LE(bytes, relocOff + 0), 1u);
+    // r_info bits: type(28..31)=2(BRANCH); extern(27)=1; length(25..26)=2;
+    // pcrel(24)=1; symbolnum(0..23) = symtab index of target.
+    std::uint32_t const rInfo = readU32LE(bytes, relocOff + 4);
+    EXPECT_EQ((rInfo >> 28) & 0xFu, 2u);          // r_type = BRANCH
+    EXPECT_EQ((rInfo >> 27) & 0x1u, 1u);          // r_extern = 1
+    EXPECT_EQ((rInfo >> 25) & 0x3u, 2u);          // r_length = 2 (4 bytes)
+    EXPECT_EQ((rInfo >> 24) & 0x1u, 1u);          // r_pcrel = 1
+    // symtab index: 0 = caller (defined), 1 = extern target.
+    EXPECT_EQ(rInfo & 0x00FFFFFFu, 1u);
+}
+
+// ── Wrong-format kind rejection ────────────────────────────────
+
+TEST(MachOWriter, NonMachOFormatKindEmitsK_NoMatchingObjectFormat) {
+    auto loaded = loadShipped();
+    auto elf = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(elf.has_value());
+
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, **elf, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode);
+}
+
+// ── macho.cputype = 0 validate rejection ───────────────────────
+
+TEST(MachOFormatJson, ZeroCputypeRejectedByValidate) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bad-macho","kind":"macho"},
+      "macho": { "cputype": 0, "filetype": 1 }
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── Mach-O section row missing `segment` rejected ──────────────
+
+TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bad-macho-seg","kind":"macho"},
+      "macho": { "cputype": 16777223, "filetype": 1 },
+      "sections":[{"kind":"text","name":"__text","type":0,"flags":0,"addrAlign":4,"entrySize":0}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── ELF/PE section row with `segment` set rejected ─────────────
+
+TEST(ElfFormatJson, SegmentFieldRejectedOnElfSection) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"bad-elf","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62 },
+      "sections":[{"kind":"text","name":".text","segment":"__TEXT","type":1,"flags":6,"addrAlign":16,"entrySize":0}]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── Non-zero addend fails loud (Mach-O has no Rela addend) ─────
+
+TEST(MachOWriter, NonZeroAddendFailsLoud) {
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{1};
+    caller.bytes = {0xE8, 0x00, 0x00, 0x00, 0x00};
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{2};
+    rel.kind   = RelocationKind{1};
+    rel.addend = -4;
+    caller.relocations.push_back(rel);
+    mod.functions.push_back(std::move(caller));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+// ── Multi-function module exercises running-offset arithmetic ──
+
+TEST(MachOWriter, MultiFunctionModuleEmitsSequentialTextBytesAndIndices) {
+    // Two functions back-to-back; the second's symbol must have
+    // n_value = len(first.bytes). Pins the running-offset
+    // accumulator across functions (test-analyzer convergence —
+    // single-function tests cannot exercise the multi-function
+    // index/offset arithmetic).
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction a;
+    a.symbol = SymbolId{1};
+    a.bytes = {0x90, 0x90, 0xC3};   // nop nop ret = 3 bytes
+    mod.functions.push_back(std::move(a));
+    AssembledFunction b;
+    b.symbol = SymbolId{2};
+    b.bytes = {0xC3};
+    mod.functions.push_back(std::move(b));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // symoff via LC_SYMTAB at byte 184; symoff field at +8 = 192.
+    std::uint32_t const symoff = readU32LE(bytes, 184 + 8);
+    std::uint32_t const nsyms  = readU32LE(bytes, 184 + 12);
+    ASSERT_EQ(nsyms, 2u);
+
+    // Sym[0] = function `a`: n_value = 0.
+    EXPECT_EQ(readU64LE(bytes, symoff + 0 * 16 + 8), 0u);
+    // Sym[1] = function `b`: n_value = 3 (right after `a`'s bytes).
+    EXPECT_EQ(readU64LE(bytes, symoff + 1 * 16 + 8), 3u);
+    // Both symbols are N_SECT | N_EXT = 0x0F.
+    EXPECT_EQ(bytes[symoff + 0 * 16 + 4], 0x0Fu);
+    EXPECT_EQ(bytes[symoff + 1 * 16 + 4], 0x0Fu);
+}
+
+// ── End-to-end via the format-blind link() dispatch ────────────
+
+TEST(LinkerEndToEnd, MachODispatchProducesNonEmptyBytes) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 99);
+    DiagnosticReporter rep;
+    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(image.ok());
+    EXPECT_EQ(image.format, ObjectFormatKind::MachO);
+    EXPECT_FALSE(image.bytes.empty());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // Magic bytes 0xFEEDFACF (little-endian)
+    ASSERT_GE(image.bytes.size(), 4u);
+    EXPECT_EQ(image.bytes[0], 0xCFu);
+    EXPECT_EQ(image.bytes[1], 0xFAu);
+    EXPECT_EQ(image.bytes[2], 0xEDu);
+    EXPECT_EQ(image.bytes[3], 0xFEu);
+}

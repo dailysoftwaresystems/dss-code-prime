@@ -4,3 +4,4 @@ dss_add_test(NAME link/test_object_format_schema SOURCES test_object_format_sche
 dss_add_test(NAME link/test_linker               SOURCES test_linker.cpp)
 dss_add_test(NAME link/test_elf_writer           SOURCES test_elf_writer.cpp)
 dss_add_test(NAME link/test_pe_writer            SOURCES test_pe_writer.cpp)
+dss_add_test(NAME link/test_macho_writer         SOURCES test_macho_writer.cpp)
