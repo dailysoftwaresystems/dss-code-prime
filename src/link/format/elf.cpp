@@ -146,32 +146,31 @@ encode(AssembledModule const&    module,
     // fails loud here until that closes — silently producing an
     // ELF missing its dynamic-linker contract would crash at exec.
     if (!module.externImports.empty()) {
-        // Two distinct fail-loud arms — the substrate-missing vs
-        // substrate-ready distinction tells a 2b.2 implementer
-        // whether to fix the schema or land walker emission. The
-        // populated path is included in the ready arm so it's
-        // searchable (and behaviorally distinguishable from the
-        // empty arm); the bare D-LK6-4 anchor stays in plan 14
-        // §3.1 rather than crowding the diagnostic with section-
-        // name minutiae (silent-failure MEDIUM #1 fold).
+        // Two distinct fail-loud arms — substrate-missing vs
+        // substrate-ready distinguishability lets a 2b.2 implementer
+        // (and a schema author) see which remediation applies. The
+        // populated path is embedded in the ready arm so tests pin
+        // by path-presence asymmetry, not by anchor-code substring
+        // (test-analyzer Gap 3 fold).
+        std::string const prefix =
+            "elf::encode: extern imports present ("
+            + std::to_string(module.externImports.size())
+            + " entries) ";
+        std::string tail;
         if (fmt.elf().interpreter.empty()) {
-            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 "elf::encode: extern imports present (" +
-                 std::to_string(module.externImports.size()) +
-                 " entries) but `elf.interpreter` is empty — declare "
-                 "a PT_INTERP path on the schema (e.g. "
-                 "'/lib64/ld-linux-x86-64.so.2') before the walker "
-                 "can emit a loadable dynamic image.");
+            tail = "but `elf.interpreter` is empty — declare a "
+                   "PT_INTERP path on the schema (e.g. "
+                   "'/lib64/ld-linux-x86-64.so.2') before the walker "
+                   "can emit a loadable dynamic image.";
         } else {
-            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 "elf::encode: extern imports present (" +
-                 std::to_string(module.externImports.size()) +
-                 " entries); PT_INTERP substrate is ready ('"
+            tail = "and PT_INTERP substrate is ready ('"
                  + fmt.elf().interpreter
-                 + "') but ELF dynamic-linker section emission has "
+                 + "'), but ELF dynamic-linker section emission has "
                    "not yet landed. Anchored at plan 14 §3.1 "
-                   "D-LK6-4.");
+                   "D-LK6-4.";
         }
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             prefix + tail);
         return {};
     }
 
