@@ -36,7 +36,10 @@ using namespace dss;
 namespace {
 
 // Wrapper so vector arguments implicitly convert to span at call
-// sites (LK9 post-fold — uses shared `dss::link::test::readU32LE`).
+// sites (LK9 post-fold — uses shared
+// `dss::link_format::test::readU32LE`; the `link_format`
+// namespace avoids collision with the `dss::link()` function in
+// `linker.hpp`, deferred to D-LK9-2).
 [[nodiscard]] std::uint32_t readU32LE(std::vector<std::uint8_t> const& bytes,
                                        std::size_t off) {
     return dss::link_format::test::readU32LE(

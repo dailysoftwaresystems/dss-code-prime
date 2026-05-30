@@ -116,18 +116,13 @@ findSection(std::span<std::uint8_t const> bytes,
     return std::nullopt;
 }
 
-// readU32LE / readU64LE re-exported from the shared
-// `link_test_support.hpp` substrate (LK9 post-fold review — 3rd-
-// consumer threshold reached via spirv test). Keeping the old
-// `dss::macho::test::readU32LE` symbol alive avoids breaking
-// existing Mach-O test files.
-inline std::uint32_t readU32LE(std::span<std::uint8_t const> bytes,
-                                std::size_t off) {
-    return dss::link_format::test::readU32LE(bytes, off);
-}
-inline std::uint64_t readU64LE(std::span<std::uint8_t const> bytes,
-                                std::size_t off) {
-    return dss::link_format::test::readU64LE(bytes, off);
-}
+// readU32LE / readU64LE re-exported from the shared substrate
+// (`link_test_support.hpp`). Keeping the `dss::macho::test::*`
+// symbol names alive via `using` declarations avoids touching the
+// existing Mach-O test call sites — one-line aliases rather than
+// 4-line delegating wrappers (simplifier post-fold review: the
+// wrappers were over-engineered DRY violations).
+using ::dss::link_format::test::readU32LE;
+using ::dss::link_format::test::readU64LE;
 
 }  // namespace dss::macho::test
