@@ -59,6 +59,46 @@ constexpr std::uint8_t STT_FUNC   = 2;
 constexpr std::uint8_t STT_SECTION = 3;
 constexpr std::uint16_t SHN_UNDEF = 0;
 
+// Elf64 sh_type / sh_flags (gABI 4.7-4.8) — used by the dynamic
+// walker (cycle 2b.2). Named to match `<elf.h>`; type-design #2
+// convergence (LK6 cycle 2b.2 review).
+constexpr std::uint32_t SHT_PROGBITS = 1;
+constexpr std::uint32_t SHT_SYMTAB   = 2;
+constexpr std::uint32_t SHT_STRTAB   = 3;
+constexpr std::uint32_t SHT_RELA     = 4;
+constexpr std::uint32_t SHT_HASH     = 5;
+constexpr std::uint32_t SHT_DYNAMIC  = 6;
+constexpr std::uint32_t SHT_DYNSYM   = 11;
+constexpr std::uint64_t SHF_WRITE     = 1;
+constexpr std::uint64_t SHF_ALLOC     = 2;
+constexpr std::uint64_t SHF_EXECINSTR = 4;
+
+// Elf64 p_type / p_flags (gABI Fig. 5-2).
+constexpr std::uint32_t PT_LOAD    = 1;
+constexpr std::uint32_t PT_DYNAMIC = 2;
+constexpr std::uint32_t PT_INTERP  = 3;
+constexpr std::uint32_t PT_PHDR    = 6;
+constexpr std::uint32_t PF_X = 1;
+constexpr std::uint32_t PF_W = 2;
+constexpr std::uint32_t PF_R = 4;
+
+// Elf64 d_tag (gABI 5.10).
+constexpr std::uint64_t DT_NULL    = 0;
+constexpr std::uint64_t DT_NEEDED  = 1;
+constexpr std::uint64_t DT_HASH    = 4;
+constexpr std::uint64_t DT_STRTAB  = 5;
+constexpr std::uint64_t DT_SYMTAB  = 6;
+constexpr std::uint64_t DT_RELA    = 7;
+constexpr std::uint64_t DT_RELASZ  = 8;
+constexpr std::uint64_t DT_RELAENT = 9;
+constexpr std::uint64_t DT_STRSZ   = 10;
+constexpr std::uint64_t DT_SYMENT  = 11;
+constexpr std::uint64_t DT_FLAGS_1 = 0x6ffffffb;
+constexpr std::uint64_t DF_1_NOW   = 1;
+
+// x86_64 psABI reloc type.
+constexpr std::uint32_t R_X86_64_GLOB_DAT = 6;
+
 constexpr std::uint8_t makeStInfo(std::uint8_t bind, std::uint8_t type) {
     return static_cast<std::uint8_t>((bind << 4) | (type & 0xF));
 }
@@ -99,6 +139,19 @@ struct SectionHeader {
     std::uint64_t entry_size = 0;    // sh_entsize
 };
 
+// File-local helpers used by the dynamic walker (simplifier #1+#4
+// convergence). `padToOffset` extends `bytes` to an absolute file
+// position with zero-fill (NOT an alignment round-up — that's the
+// existing `padTo(out, alignment)`). `appendBytes` collapses the
+// `insert(end, X.begin(), X.end())` boilerplate to a named call.
+inline void padToOffset(std::vector<std::uint8_t>& out, std::uint64_t offset) {
+    if (out.size() < offset) out.resize(offset, 0);
+}
+inline void appendBytes(std::vector<std::uint8_t>& out,
+                         std::span<std::uint8_t const> body) {
+    out.insert(out.end(), body.begin(), body.end());
+}
+
 void writeSectionHeader(std::vector<std::uint8_t>& out, SectionHeader const& h) {
     appendU32LE(out, h.name_offset);
     appendU32LE(out, h.type);
@@ -110,6 +163,593 @@ void writeSectionHeader(std::vector<std::uint8_t>& out, SectionHeader const& h) 
     appendU32LE(out, h.info);
     appendU64LE(out, h.addr_align);
     appendU64LE(out, h.entry_size);
+}
+
+// ── LK6 cycle 2b.2: ELF dynamic-linker image emission ───────────
+//
+// Closes the walker half of plan 14 §3.1 D-LK6-4. Emits an ET_EXEC
+// with PT_INTERP + PT_DYNAMIC + writable PT_LOAD #2 covering
+// `.got` + `.dynamic`. Uses **eager binding** (DT_FLAGS_1 =
+// DF_1_NOW + R_X86_64_GLOB_DAT in `.rela.dyn`) — simpler than
+// lazy binding with PLT0 + R_X86_64_JUMP_SLOT, produces a binary
+// dyld resolves before transferring control. PLT stubs are 6-byte
+// `FF 25 disp32` (jmp [rip+disp32]) bridging direct `call rel32`
+// → indirect dispatch via GOT.
+//
+// Section layout (and on-disk order):
+//   PT_LOAD #1 (R+X, page-aligned VA + file offset):
+//     [0]               Ehdr                              (64 B)
+//     [64]              Program Header Table  (PT_PHDR + PT_INTERP
+//                                              + PT_LOAD#1 + PT_LOAD#2
+//                                              + PT_DYNAMIC = 5×56=280)
+//     [phtEnd]          .interp     (NUL-terminated path)
+//     [pad to pageAlign]
+//     [pageAlign]       .text       (sh_addr = secText.virtualAddress)
+//     [16-aligned]      .plt        (6 B per extern)
+//     [8-aligned]       .dynsym     (24 B per entry — STN_UNDEF + N)
+//     [1-aligned]       .dynstr     (NUL + extern names + lib paths)
+//     [8-aligned]       .hash       (16 + 4*(N+1) bytes)
+//     [8-aligned]       .rela.dyn   (24 B per extern — GLOB_DAT)
+//   PT_LOAD #2 (R+W, next pageAlign-aligned VA + file offset):
+//     [pageAligned]     .got        (8 B per extern, zero-init —
+//                                    dyld writes resolved fn ptrs)
+//     [8-aligned]       .dynamic    (16 B per DT_* entry)
+//   Non-loaded (after PT_LOAD #2):
+//     [8-aligned]       .symtab     (intra-module function symbols)
+//     [...]             .strtab
+//     [...]             .shstrtab
+//     [8-aligned]       Section Header Table (13 entries × 64 B)
+//
+// PLT-stub-internal `jmp [rip+disp32]` is computed inline (not
+// pushed through `applyExecRelocations`) — the kernel sig reshape
+// for multi-patch-section is anchored at D-LK6-7 and not needed
+// for cycle 2b.2.
+[[nodiscard]] std::vector<std::uint8_t>
+encodeElfExecDynamic(
+    AssembledModule const&         module,
+    TargetSchema const&            targetSchema,
+    ObjectFormatSchema const&      fmt,
+    ObjectFormatSectionInfo const& secText,
+    DiagnosticReporter&            reporter) {
+    auto const& elfId = fmt.elf();
+    std::uint64_t const pageAlign = elfId.pageAlign;
+
+    // Pre-conditions (caller dispatches on these; re-checked here so
+    // the helper is callable from future entry paths too —
+    // silent-failure H2 + C1 convergence).
+    if (module.externImports.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "elf::encodeElfExecDynamic: called with zero "
+             "externImports — dynamic-image emission requires at "
+             "least one extern; static images route through the "
+             "non-dynamic ET_EXEC arm.");
+        return {};
+    }
+    if (module.functions.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "elf::encodeElfExecDynamic: zero functions — ET_EXEC "
+             "needs at least one entry function.");
+        return {};
+    }
+    if (secText.virtualAddress < pageAlign) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::string{"elf::encodeElfExecDynamic: .text "
+                         "virtualAddress (0x"} +
+             std::to_string(secText.virtualAddress) +
+             ") is below pageAlign (0x" +
+             std::to_string(pageAlign) +
+             ") — baseImageVa would underflow. ET_EXEC needs "
+             "headers + PHT + .interp to fit in one page below "
+             ".text.");
+        return {};
+    }
+    // baseImageVa is one page below .text (so Ehdr + PHT + .interp
+    // fit in the first page of PT_LOAD #1, .text starts at
+    // secText.virtualAddress = baseImageVa + pageAlign).
+    std::uint64_t const baseImageVa = secText.virtualAddress - pageAlign;
+    auto const roundUp = [](std::uint64_t v, std::uint64_t a) {
+        return (v + a - 1) & ~(a - 1);
+    };
+
+    // ── (a) Build .text + per-function offset table ────────────
+    std::vector<std::uint8_t> text;
+    std::vector<std::uint64_t> funcTextStart;
+    funcTextStart.reserve(module.functions.size());
+    for (auto const& fn : module.functions) {
+        funcTextStart.push_back(text.size());
+        text.insert(text.end(), fn.bytes.begin(), fn.bytes.end());
+    }
+    if (text.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "elf::encodeElfExecDynamic: every AssembledFunction "
+             "contributed zero bytes — `.text` is empty; ET_EXEC "
+             "requires at least one entry instruction.");
+        return {};
+    }
+
+    // ── (b) Group externs by library (preserve declaration order)
+    std::vector<std::string> libraryOrder;
+    std::unordered_map<std::string, std::vector<std::size_t>>
+        externsByLib;
+    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
+        auto const& ext = module.externImports[i];
+        auto const it = externsByLib.find(ext.libraryPath);
+        if (it == externsByLib.end()) {
+            libraryOrder.push_back(ext.libraryPath);
+            externsByLib.emplace(ext.libraryPath,
+                                 std::vector<std::size_t>{i});
+        } else {
+            it->second.push_back(i);
+        }
+    }
+    std::size_t const numExterns = module.externImports.size();
+    std::size_t const numLibs = libraryOrder.size();
+
+    // ── (c) .interp body (NUL-terminated dynamic-linker path)
+    std::vector<std::uint8_t> interp;
+    for (char c : elfId.interpreter)
+        interp.push_back(static_cast<std::uint8_t>(c));
+    interp.push_back(0);
+
+    // ── (d) .dynstr body (NUL + extern names + library paths)
+    std::vector<std::uint8_t> dynstr;
+    dynstr.push_back(0);
+    std::vector<std::uint32_t> externNameOff(numExterns);
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        externNameOff[i] = static_cast<std::uint32_t>(dynstr.size());
+        for (char c : module.externImports[i].mangledName)
+            dynstr.push_back(static_cast<std::uint8_t>(c));
+        dynstr.push_back(0);
+    }
+    std::vector<std::uint32_t> libNameOff(numLibs);
+    for (std::size_t i = 0; i < numLibs; ++i) {
+        libNameOff[i] = static_cast<std::uint32_t>(dynstr.size());
+        for (char c : libraryOrder[i])
+            dynstr.push_back(static_cast<std::uint8_t>(c));
+        dynstr.push_back(0);
+    }
+
+    // ── (e) .dynsym body (STN_UNDEF + N extern symbols)
+    std::vector<std::uint8_t> dynsym;
+    auto appendDynsymEntry = [&](std::uint32_t nameOff,
+                                  std::uint8_t info,
+                                  std::uint16_t shndx,
+                                  std::uint64_t value,
+                                  std::uint64_t size) {
+        appendU32LE(dynsym, nameOff);
+        appendU8(dynsym, info);
+        appendU8(dynsym, 0);
+        appendU16LE(dynsym, shndx);
+        appendU64LE(dynsym, value);
+        appendU64LE(dynsym, size);
+    };
+    appendDynsymEntry(0, 0, 0, 0, 0);  // STN_UNDEF
+    std::vector<std::uint32_t> dynsymIdx(numExterns);
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        dynsymIdx[i] =
+            static_cast<std::uint32_t>(dynsym.size() / 24);
+        appendDynsymEntry(externNameOff[i],
+                          makeStInfo(STB_GLOBAL, STT_NOTYPE),
+                          SHN_UNDEF, 0, 0);
+    }
+
+    // ── (f) .hash body (DT_HASH single-bucket)
+    std::vector<std::uint8_t> hashSec;
+    appendU32LE(hashSec, 1);  // nbucket
+    appendU32LE(hashSec, static_cast<std::uint32_t>(numExterns + 1));  // nchain
+    appendU32LE(hashSec,
+        numExterns > 0 ? 1u : 0u);                     // bucket[0]
+    appendU32LE(hashSec, 0);                            // chain[0]=STN_UNDEF
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        std::uint32_t const next =
+            (i + 1 < numExterns) ? static_cast<std::uint32_t>(i + 2) : 0u;
+        appendU32LE(hashSec, next);
+    }
+
+    // ── (g) .plt body (placeholder; filled after layout)
+    std::vector<std::uint8_t> plt(numExterns * 6, 0);
+
+    // ── (h) .got body (zero-init; dyld writes resolved fn ptrs)
+    std::vector<std::uint8_t> got(numExterns * 8, 0);
+
+    // ── (i) Layout: compute file offsets + VAs ─────────────────
+    constexpr std::uint64_t kEhdrSize = 64;
+    constexpr std::uint64_t kPhdrSize = 56;
+    constexpr std::uint32_t kNumPhdrs = 5;  // PHDR + INTERP + LOAD×2 + DYNAMIC
+    std::uint64_t const phtOff = kEhdrSize;
+    std::uint64_t const phtSize = kNumPhdrs * kPhdrSize;
+    std::uint64_t const interpOff = phtOff + phtSize;
+    std::uint64_t const interpVa  = baseImageVa + interpOff;
+
+    std::uint64_t const textOff = pageAlign;   // .text at page boundary
+    std::uint64_t const textVa  = secText.virtualAddress;
+
+    // Subsequent sections in PT_LOAD #1; VA = baseImageVa + fileOff
+    // (PT_LOAD with fileoff=0 and vaddr=baseImageVa maps verbatim).
+    std::uint64_t const pltOff = roundUp(textOff + text.size(), 16);
+    std::uint64_t const pltVa  = baseImageVa + pltOff;
+    std::uint64_t const pltSize = plt.size();
+
+    std::uint64_t const dynsymOff = roundUp(pltOff + pltSize, 8);
+    std::uint64_t const dynsymVa  = baseImageVa + dynsymOff;
+    std::uint64_t const dynsymSz  = dynsym.size();
+
+    std::uint64_t const dynstrOff = dynsymOff + dynsymSz;
+    std::uint64_t const dynstrVa  = baseImageVa + dynstrOff;
+    std::uint64_t const dynstrSz  = dynstr.size();
+
+    std::uint64_t const hashOff = roundUp(dynstrOff + dynstrSz, 8);
+    std::uint64_t const hashVa  = baseImageVa + hashOff;
+    std::uint64_t const hashSz  = hashSec.size();
+
+    std::uint64_t const relaDynOff = roundUp(hashOff + hashSz, 8);
+    std::uint64_t const relaDynVa  = baseImageVa + relaDynOff;
+    std::uint64_t const relaDynSz  = numExterns * 24;
+
+    std::uint64_t const ptLoad1End = relaDynOff + relaDynSz;
+
+    // PT_LOAD #2 (R+W) — page-aligned in both file + VA.
+    std::uint64_t const ptLoad2Start = roundUp(ptLoad1End, pageAlign);
+    std::uint64_t const ptLoad2VaStart = baseImageVa + ptLoad2Start;
+    std::uint64_t const gotOff = ptLoad2Start;
+    std::uint64_t const gotVa  = ptLoad2VaStart;
+    std::uint64_t const gotSz  = got.size();
+
+    std::uint64_t const dynamicOff = roundUp(gotOff + gotSz, 8);
+    std::uint64_t const dynamicVa  = baseImageVa + dynamicOff;
+
+    // ── (j) Build .plt bytes (now we have VAs)
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        std::uint64_t const stubVa = pltVa + i * 6;
+        std::uint64_t const stubEndVa = stubVa + 6;
+        std::uint64_t const slotVa = gotVa + i * 8;
+        std::int64_t const disp =
+            static_cast<std::int64_t>(slotVa)
+            - static_cast<std::int64_t>(stubEndVa);
+        if (disp < std::numeric_limits<std::int32_t>::min()
+         || disp > std::numeric_limits<std::int32_t>::max()) {
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 "elf::encodeElfExecDynamic: PLT→GOT displacement "
+                 "(" + std::to_string(disp) +
+                 ") does not fit in 32 bits — module too large.");
+            return {};
+        }
+        plt[i*6 + 0] = 0xFFu;
+        plt[i*6 + 1] = 0x25u;
+        auto const u = static_cast<std::uint32_t>(disp);
+        plt[i*6 + 2] = static_cast<std::uint8_t>(u & 0xFF);
+        plt[i*6 + 3] = static_cast<std::uint8_t>((u >> 8)  & 0xFF);
+        plt[i*6 + 4] = static_cast<std::uint8_t>((u >> 16) & 0xFF);
+        plt[i*6 + 5] = static_cast<std::uint8_t>((u >> 24) & 0xFF);
+    }
+
+    // ── (k) Build .rela.dyn (R_X86_64_GLOB_DAT for each GOT slot)
+    constexpr std::uint32_t R_X86_64_GLOB_DAT = 6;
+    std::vector<std::uint8_t> relaDyn;
+    relaDyn.reserve(relaDynSz);
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        std::uint64_t const slotVa = gotVa + i * 8;
+        std::uint64_t const rInfo =
+            (static_cast<std::uint64_t>(dynsymIdx[i]) << 32)
+            | static_cast<std::uint64_t>(R_X86_64_GLOB_DAT);
+        appendU64LE(relaDyn, slotVa);
+        appendU64LE(relaDyn, rInfo);
+        appendI64LE(relaDyn, 0);
+    }
+
+    // ── (l) Build .dynamic
+    std::vector<std::uint8_t> dynamicSec;
+    auto appendDyn = [&](std::uint64_t tag, std::uint64_t val) {
+        appendU64LE(dynamicSec, tag);
+        appendU64LE(dynamicSec, val);
+    };
+    // DT_NEEDED per library, then the resolution-side metadata,
+    // then DF_1_NOW for eager binding, then DT_NULL terminator.
+    for (std::size_t i = 0; i < numLibs; ++i) {
+        appendDyn(DT_NEEDED, libNameOff[i]);
+    }
+    appendDyn(DT_STRTAB,  dynstrVa);
+    appendDyn(DT_STRSZ,   dynstrSz);
+    appendDyn(DT_SYMTAB,  dynsymVa);
+    appendDyn(DT_SYMENT,  24);
+    appendDyn(DT_HASH,    hashVa);
+    appendDyn(DT_RELA,    relaDynVa);
+    appendDyn(DT_RELASZ,  relaDynSz);
+    appendDyn(DT_RELAENT, 24);
+    appendDyn(DT_FLAGS_1, DF_1_NOW);
+    appendDyn(DT_NULL,    0);
+    std::uint64_t const dynamicSz = dynamicSec.size();
+
+    std::uint64_t const ptLoad2End = dynamicOff + dynamicSz;
+    std::uint64_t const ptLoad2Size = ptLoad2End - ptLoad2Start;
+
+    // Non-loaded .symtab / .strtab / .shstrtab + SHT.
+    std::vector<std::uint8_t> symtab;
+    StringTable strtab;
+    auto appendSymtabEntry = [&](std::uint32_t nameOff,
+                                  std::uint8_t info,
+                                  std::uint16_t shndx,
+                                  std::uint64_t value,
+                                  std::uint64_t size) {
+        appendU32LE(symtab, nameOff);
+        appendU8(symtab, info);
+        appendU8(symtab, 0);
+        appendU16LE(symtab, shndx);
+        appendU64LE(symtab, value);
+        appendU64LE(symtab, size);
+    };
+    appendSymtabEntry(0, 0, 0, 0, 0);                  // STN_UNDEF
+    appendSymtabEntry(0, makeStInfo(STB_LOCAL, STT_SECTION),
+                      2 /*shndx=.text*/, 0, 0);
+    std::uint32_t const firstNonLocal = 2;
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        auto const& fn = module.functions[i];
+        std::string const name =
+            std::string{"sym_"} + std::to_string(fn.symbol.v);
+        std::uint32_t const nameOff = strtab.add(name);
+        appendSymtabEntry(nameOff,
+                          makeStInfo(STB_GLOBAL, STT_FUNC),
+                          2 /*shndx=.text*/,
+                          textVa + funcTextStart[i],
+                          fn.bytes.size());
+    }
+
+    StringTable shstrtab;
+    auto const shsInterp   = shstrtab.add(".interp");
+    auto const shsText     = shstrtab.add(".text");
+    auto const shsPlt      = shstrtab.add(".plt");
+    auto const shsDynsym   = shstrtab.add(".dynsym");
+    auto const shsDynstr   = shstrtab.add(".dynstr");
+    auto const shsHash     = shstrtab.add(".hash");
+    auto const shsRelaDyn  = shstrtab.add(".rela.dyn");
+    auto const shsGot      = shstrtab.add(".got");
+    auto const shsDynamic  = shstrtab.add(".dynamic");
+    auto const shsSymtab   = shstrtab.add(".symtab");
+    auto const shsStrtab   = shstrtab.add(".strtab");
+    auto const shsShStrtab = shstrtab.add(".shstrtab");
+
+    std::uint64_t const symtabOff = roundUp(ptLoad2End, 8);
+    std::uint64_t const symtabSz  = symtab.size();
+    std::uint64_t const strtabOff = symtabOff + symtabSz;
+    std::uint64_t const strtabSz  = strtab.size();
+    std::uint64_t const shstrtabOff = strtabOff + strtabSz;
+    std::uint64_t const shstrtabSz  = shstrtab.size();
+    std::uint64_t const shtOff = roundUp(shstrtabOff + shstrtabSz, 8);
+
+    // ── (m) Apply intra-module + extern relocations.
+    //
+    // Pre-flight: every reloc kind must be declared on the format
+    // schema (symmetric with ET_REL + PE — silent-failure C3
+    // convergence: kernel only checks target-schema row).
+    for (auto const& fn : module.functions) {
+        for (auto const& rel : fn.relocations) {
+            if (fmt.relocationByKind(rel.kind) == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::string{"elf::encodeElfExecDynamic: kind "} +
+                     std::to_string(rel.kind.v) +
+                     " not declared by ELF format '" +
+                     std::string{fmt.name()} +
+                     "' — substrate-invariant violation.");
+                return {};
+            }
+        }
+    }
+    // symbolVa[intra] = textVa + funcOffset; symbolVa[extern] =
+    // PLT stub VA. The shared kernel patches REL32 calls
+    // (call rel32) → PLT stub for externs, → other function for
+    // intra-module. PLT stub then jumps through GOT to resolved fn.
+    // emplace().second checked so an extern SymbolId that collides
+    // with an intra-module function symbol fails loud (silent-
+    // failure C2 convergence — same defect exists in PE walker
+    // and is anchored for parallel fold).
+    std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+    symbolVa.reserve(module.functions.size() + numExterns);
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        symbolVa.emplace(module.functions[i].symbol,
+                         textVa + funcTextStart[i]);
+    }
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        auto const [it, inserted] = symbolVa.emplace(
+            module.externImports[i].symbol, pltVa + i * 6);
+        if (!inserted) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"elf::encodeElfExecDynamic: extern "
+                             "symbol #"} +
+                 std::to_string(module.externImports[i].symbol.v) +
+                 " ('" + module.externImports[i].mangledName +
+                 "') collides with an intra-module function symbol "
+                 "— an extern declared as a local definition would "
+                 "silently bypass dyld resolution.");
+            return {};
+        }
+    }
+    if (!link::format::applyExecRelocations(
+            text, module, funcTextStart, symbolVa,
+            targetSchema, textVa,
+            "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
+
+    // ── (n) Emit bytes ────────────────────────────────────────
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(shtOff + 13 * 64);
+
+    // Ehdr at [0..64] — fill at end (need shtOff first); start with 64 zero bytes.
+    bytes.resize(kEhdrSize, 0);
+
+    // Program Header Table at [64..64+phtSize].
+    auto appendPhdrEntry = [&](std::uint32_t pType,
+                                std::uint32_t pFlags,
+                                std::uint64_t pOffset,
+                                std::uint64_t pVaddr,
+                                std::uint64_t pFilesz,
+                                std::uint64_t pMemsz,
+                                std::uint64_t pAlign) {
+        appendU32LE(bytes, pType);
+        appendU32LE(bytes, pFlags);
+        appendU64LE(bytes, pOffset);
+        appendU64LE(bytes, pVaddr);
+        appendU64LE(bytes, pVaddr);   // p_paddr
+        appendU64LE(bytes, pFilesz);
+        appendU64LE(bytes, pMemsz);
+        appendU64LE(bytes, pAlign);
+    };
+    appendPhdrEntry(PT_PHDR,    PF_R,        phtOff,       baseImageVa + phtOff,
+                    phtSize,        phtSize,        8);
+    appendPhdrEntry(PT_INTERP,  PF_R,        interpOff,    interpVa,
+                    interp.size(), interp.size(), 1);
+    // PT_LOAD #1 R+X — Ehdr + PHT + .interp + .text + .plt + .dynsym
+    //                  + .dynstr + .hash + .rela.dyn
+    appendPhdrEntry(PT_LOAD,    PF_X | PF_R, 0,            baseImageVa,
+                    ptLoad1End,    ptLoad1End,    pageAlign);
+    // PT_LOAD #2 R+W — .got + .dynamic
+    appendPhdrEntry(PT_LOAD,    PF_W | PF_R, ptLoad2Start, ptLoad2VaStart,
+                    ptLoad2Size,   ptLoad2Size,   pageAlign);
+    appendPhdrEntry(PT_DYNAMIC, PF_W | PF_R, dynamicOff,   dynamicVa,
+                    dynamicSz,     dynamicSz,     8);
+
+    // Section bodies: pad-to-offset + append per section (simplifier
+    // #1 + #4 fold using local padToOffset / appendBytes helpers).
+    padToOffset(bytes, interpOff);    appendBytes(bytes, interp);
+    padToOffset(bytes, textOff);      appendBytes(bytes, text);
+    padToOffset(bytes, pltOff);       appendBytes(bytes, plt);
+    padToOffset(bytes, dynsymOff);    appendBytes(bytes, dynsym);
+                                       appendBytes(bytes, dynstr);  // align 1
+    padToOffset(bytes, hashOff);      appendBytes(bytes, hashSec);
+    padToOffset(bytes, relaDynOff);   appendBytes(bytes, relaDyn);
+    padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
+                                       appendBytes(bytes, got);
+    padToOffset(bytes, dynamicOff);   appendBytes(bytes, dynamicSec);
+    padToOffset(bytes, symtabOff);    appendBytes(bytes, symtab);
+                                       appendBytes(bytes, strtab.view());
+                                       appendBytes(bytes, shstrtab.view());
+    padToOffset(bytes, shtOff);
+
+    // ── (o) Section Header Table — 13 entries ─────────────────
+    //   0: SHT_NULL, 1: .interp, 2: .text, 3: .plt,
+    //   4: .dynsym, 5: .dynstr, 6: .hash, 7: .rela.dyn,
+    //   8: .got, 9: .dynamic, 10: .symtab, 11: .strtab, 12: .shstrtab
+    constexpr std::uint16_t IDX_INTERP   = 1;
+    constexpr std::uint16_t IDX_TEXT     = 2;
+    constexpr std::uint16_t IDX_DYNSYM   = 4;
+    constexpr std::uint16_t IDX_DYNSTR   = 5;
+    constexpr std::uint16_t IDX_STRTAB   = 11;
+    constexpr std::uint16_t IDX_SHSTRTAB = 12;
+    constexpr std::uint16_t kNumSections = 13;
+    (void)IDX_INTERP; (void)IDX_TEXT;
+
+    // Designated initializers per `SectionHeader` field — type-design
+    // #1 + simplifier #3 fold: 10-arg positional pushShdr lambda
+    // dropped (silent u32/u64 swap-bug surface) in favor of named
+    // fields at every call site.
+    writeSectionHeader(bytes, SectionHeader{});  // SHT_NULL (slot 0)
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsInterp, .type = SHT_PROGBITS, .flags = SHF_ALLOC,
+        .addr = interpVa, .offset = interpOff, .size = interp.size(),
+        .addr_align = 1});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsText, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR,
+        .addr = textVa, .offset = textOff, .size = text.size(),
+        .addr_align = 16});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsPlt, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR,
+        .addr = pltVa, .offset = pltOff, .size = pltSize,
+        .addr_align = 16});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsDynsym, .type = SHT_DYNSYM, .flags = SHF_ALLOC,
+        .addr = dynsymVa, .offset = dynsymOff, .size = dynsymSz,
+        .link = IDX_DYNSTR, .info = 1 /*first non-local symtab idx*/,
+        .addr_align = 8, .entry_size = 24});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsDynstr, .type = SHT_STRTAB, .flags = SHF_ALLOC,
+        .addr = dynstrVa, .offset = dynstrOff, .size = dynstrSz,
+        .addr_align = 1});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsHash, .type = SHT_HASH, .flags = SHF_ALLOC,
+        .addr = hashVa, .offset = hashOff, .size = hashSz,
+        .link = IDX_DYNSYM, .addr_align = 8, .entry_size = 4});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsRelaDyn, .type = SHT_RELA, .flags = SHF_ALLOC,
+        .addr = relaDynVa, .offset = relaDynOff, .size = relaDynSz,
+        .link = IDX_DYNSYM, .addr_align = 8, .entry_size = 24});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsGot, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_WRITE,
+        .addr = gotVa, .offset = gotOff, .size = gotSz,
+        .addr_align = 8, .entry_size = 8});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsDynamic, .type = SHT_DYNAMIC, .flags = SHF_ALLOC | SHF_WRITE,
+        .addr = dynamicVa, .offset = dynamicOff, .size = dynamicSz,
+        .link = IDX_DYNSTR, .addr_align = 8, .entry_size = 16});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsSymtab, .type = SHT_SYMTAB,
+        .offset = symtabOff, .size = symtabSz,
+        .link = IDX_STRTAB, .info = firstNonLocal,
+        .addr_align = 8, .entry_size = 24});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsStrtab, .type = SHT_STRTAB,
+        .offset = strtabOff, .size = strtabSz, .addr_align = 1});
+    writeSectionHeader(bytes, SectionHeader{
+        .name_offset = shsShStrtab, .type = SHT_STRTAB,
+        .offset = shstrtabOff, .size = shstrtabSz, .addr_align = 1});
+
+    // ── (p) Fill in Elf64_Ehdr ─────────────────────────────────
+    //
+    // Resolve entry function index from fmt.entryPoint() —
+    // symmetric with the existing ET_EXEC arm (silent-failure
+    // HIGH-1 fold from LK1 cycle 2; code-reviewer #1 regression
+    // catch on LK6 cycle 2b.2 review). Empty entryPoint defaults
+    // to functions[0]; non-empty resolves by synthesized
+    // `sym_<id>` name today (real-name resolution closes with
+    // D-LK1-1 / LK7).
+    std::size_t entryFnIdx = 0;
+    if (auto const ep = fmt.entryPoint(); !ep.empty()) {
+        bool found = false;
+        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+            std::string const synthesized =
+                "sym_" + std::to_string(module.functions[fi].symbol.v);
+            if (synthesized == ep) {
+                entryFnIdx = fi;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"elf::encodeElfExecDynamic: entryPoint '"}
+                     + std::string{ep}
+                     + "' does not match any function in the module. "
+                       "Leave entryPoint empty to default to the "
+                       "first function (D-LK1-1 carries real names).");
+            return {};
+        }
+    }
+    std::uint64_t const entryVa = textVa + funcTextStart[entryFnIdx];
+    std::vector<std::uint8_t> ehdr;
+    ehdr.reserve(kEhdrSize);
+    ehdr.push_back(0x7F); ehdr.push_back('E');
+    ehdr.push_back('L');  ehdr.push_back('F');
+    ehdr.push_back(elfId.fileClass);
+    ehdr.push_back(elfId.dataEncoding);
+    ehdr.push_back(static_cast<std::uint8_t>(EV_CURRENT));
+    ehdr.push_back(elfId.osabi);
+    ehdr.push_back(elfId.abiVersion);
+    for (int i = 0; i < 7; ++i) ehdr.push_back(0);
+    appendU16LE(ehdr, 2);  // ET_EXEC
+    appendU16LE(ehdr, elfId.machine);
+    appendU32LE(ehdr, EV_CURRENT);
+    appendU64LE(ehdr, entryVa);
+    appendU64LE(ehdr, phtOff);
+    appendU64LE(ehdr, shtOff);
+    appendU32LE(ehdr, 0);  // e_flags
+    appendU16LE(ehdr, static_cast<std::uint16_t>(kEhdrSize));
+    appendU16LE(ehdr, static_cast<std::uint16_t>(kPhdrSize));
+    appendU16LE(ehdr, static_cast<std::uint16_t>(kNumPhdrs));
+    appendU16LE(ehdr, 64);  // sizeof(Elf64_Shdr)
+    appendU16LE(ehdr, kNumSections);
+    appendU16LE(ehdr, IDX_SHSTRTAB);
+    std::memcpy(bytes.data(), ehdr.data(), kEhdrSize);
+
+    return bytes;
 }
 
 } // namespace
@@ -135,43 +775,45 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
-    // ELF GOT/PLT import-table emission — substrate landed at LK6
-    // cycle 2b.1 (`ElfIdentity.interpreter` PT_INTERP path field +
-    // JSON loader + shipped exec JSON declares
-    // "/lib64/ld-linux-x86-64.so.2"). Walker emission of
-    // `.interp` / `.dynstr` / `.dynsym` / `.hash` / `.got.plt` /
-    // `.plt` / `.dynamic` / `.rela.plt` + PT_INTERP / PT_DYNAMIC
-    // program headers remains anchored at D-LK6-4 (LK6 cycle 2b.2,
-    // walker emission). A module with non-empty externImports
-    // fails loud here until that closes — silently producing an
-    // ELF missing its dynamic-linker contract would crash at exec.
+    // ELF dynamic-linker import-table emission — substrate landed
+    // at LK6 cycle 2b.1 (PT_INTERP path field); walker emission
+    // closed at LK6 cycle 2b.2 (this dispatch — D-LK6-4 closed).
+    // When the module carries externImports, route to
+    // `encodeElfExecDynamic` for the full image with .interp +
+    // .dynsym + .dynstr + .hash + .rela.dyn + .plt + .got +
+    // .dynamic + PT_INTERP + PT_DYNAMIC + writable PT_LOAD #2.
+    // Eager binding (DF_1_NOW + R_X86_64_GLOB_DAT) — lazy binding
+    // is anchored separately (architect Obs 2 future cycle).
     if (!module.externImports.empty()) {
-        // Two distinct fail-loud arms — substrate-missing vs
-        // substrate-ready distinguishability lets a 2b.2 implementer
-        // (and a schema author) see which remediation applies. The
-        // populated path is embedded in the ready arm so tests pin
-        // by path-presence asymmetry, not by anchor-code substring
-        // (test-analyzer Gap 3 fold).
-        std::string const prefix =
-            "elf::encode: extern imports present ("
-            + std::to_string(module.externImports.size())
-            + " entries) ";
-        std::string tail;
-        if (fmt.elf().interpreter.empty()) {
-            tail = "but `elf.interpreter` is empty — declare a "
-                   "PT_INTERP path on the schema (e.g. "
-                   "'/lib64/ld-linux-x86-64.so.2') before the walker "
-                   "can emit a loadable dynamic image.";
-        } else {
-            tail = "and PT_INTERP substrate is ready ('"
-                 + fmt.elf().interpreter
-                 + "'), but ELF dynamic-linker section emission has "
-                   "not yet landed. Anchored at plan 14 §3.1 "
-                   "D-LK6-4.";
+        bool const isExecEarly =
+            (fmt.elf().objectType == ElfObjectType::Exec);
+        if (!isExecEarly) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 std::string{"elf::encode: extern imports present ("}
+                     + std::to_string(module.externImports.size())
+                     + " entries) but format is ET_REL. Externs flow "
+                       "to the linker only via ET_EXEC / ET_DYN.");
+            return {};
         }
-        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-             prefix + tail);
-        return {};
+        if (fmt.elf().interpreter.empty()) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 std::string{"elf::encode: extern imports present ("}
+                     + std::to_string(module.externImports.size())
+                     + " entries) but `elf.interpreter` is empty — "
+                       "declare a PT_INTERP path on the schema (e.g. "
+                       "'/lib64/ld-linux-x86-64.so.2') for a loadable "
+                       "dynamic image.");
+            return {};
+        }
+        // Section schema lookup mirrors the existing path so the
+        // dynamic helper inherits the same K_NoMatchingObjectFormat
+        // guard.
+        auto const* secTextDyn =
+            requireSection(fmt, SectionKind::Text, "ELF dynamic writer",
+                           reporter);
+        if (!secTextDyn) return {};
+        return encodeElfExecDynamic(module, targetSchema, fmt,
+                                     *secTextDyn, reporter);
     }
 
     // Route between ET_REL and ET_EXEC based on the schema's

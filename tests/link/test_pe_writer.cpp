@@ -1168,10 +1168,13 @@ TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected)
 TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     // architect O1: post-walker errorCount gate resets
     // resolvedFuncCount so LinkedImage.ok() doesn't return true
-    // with empty bytes when the walker fail-loud'd.
+    // with empty bytes when the walker fail-loud'd. Uses Mach-O
+    // (D-LK6-5 anchored — externs still fail loud until cycle 2c
+    // lands). ELF lost this capability when cycle 2b.2 landed
+    // the GOT/PLT walker (now produces valid bytes for externs).
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
-    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
     ASSERT_TRUE(fmt.has_value());
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -1180,7 +1183,8 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     fn.bytes  = {0xC3};
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(
-        ExternImport{SymbolId{99}, "printf", "libc.so.6"});
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
     LinkedImage img = link(mod, **target, **fmt, rep);
     EXPECT_TRUE(img.bytes.empty());
