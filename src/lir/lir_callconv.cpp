@@ -198,7 +198,101 @@ struct OpcodeHandles {
     std::uint16_t store;
     std::uint16_t frameLoad;
     std::uint16_t frameStore;
+    // ML7 cycle 2: virtual-op handles materialized by the callconv pass.
+    std::uint16_t arg;
+    std::uint16_t call;
 };
+
+// Resolve a cc register-name reference to a typed `LirReg`. Returns
+// nullopt + a loud diagnostic if the name doesn't exist in the
+// schema's `registers[]` (would be a schema misconfiguration that
+// `TargetSchemaData::validate` should normally catch — defensive
+// here so a loader-bypass path doesn't silently produce a junk reg).
+[[nodiscard]] std::optional<LirReg>
+resolveCcReg(TargetSchema const& schema,
+             std::string_view    name,
+             LirRegClass         cls,
+             std::string_view    contextLabel,
+             DiagnosticReporter& reporter) {
+    auto const ord = schema.registerByName(name);
+    if (!ord.has_value()) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+               DiagnosticSeverity::Error,
+               std::format("{}: calling convention declares register '{}' "
+                           "but the target schema's registers[] does not "
+                           "declare it — schema misconfiguration",
+                           contextLabel, name));
+        return std::nullopt;
+    }
+    return makePhysicalReg(*ord, cls);
+}
+
+// Emit a single-source `mov dest, src`. The mov instruction shape
+// in the substrate is `mov dest, src_reg` — operand layout
+// [src_reg], result = dest. Schema-uniform across SysV/MS-x64/AAPCS64
+// because the cc-blind `mov` opcode operates on regs, not the cc.
+void emitMov(LirBuilder& b, std::uint16_t movOp, LirReg dest, LirReg src) {
+    std::array<LirOperand, 1> ops{LirOperand::makeReg(src)};
+    b.addInst(movOp, dest, ops);
+}
+
+// Emit `mov dest, src` only when `dest.id != src.id` — the regalloc-
+// already-picked-this-reg no-op skip used by every ML7 cycle 2
+// materialization site (arg copy, call arg-passing, call return).
+// Trivial inline at 3 sites; the named helper makes the intent
+// ("skip mov when same reg") immediately readable.
+void maybeMov(LirBuilder& b, std::uint16_t movOp, LirReg dest, LirReg src) {
+    if (dest.id != src.id) emitMov(b, movOp, dest, src);
+}
+
+// Lookup the i-th arg-passing source register for the given class.
+// GPR class uses `cc.argGprs`; FPR uses `cc.argFprs`. Returns nullopt
+// when `index >= pool.size()` (stack-passed; D-ML7-2.2).
+[[nodiscard]] std::optional<LirReg>
+argPassingReg(TargetSchema const&            schema,
+              TargetCallingConvention const& cc,
+              std::uint32_t                  index,
+              LirRegClass                    cls,
+              std::string_view               contextLabel,
+              DiagnosticReporter&            reporter) {
+    auto const& pool = (cls == LirRegClass::FPR) ? cc.argFprs : cc.argGprs;
+    if (index >= pool.size()) {
+        report(reporter, DiagnosticCode::L_StackPassedArgUnsupported,
+               DiagnosticSeverity::Error,
+               std::format("{}: arg index {} requires stack passing "
+                           "(cc '{}' has only {} {} arg-passing registers); "
+                           "stack-passed args are anchored at D-ML7-2.2",
+                           contextLabel,
+                           index, cc.name, pool.size(),
+                           (cls == LirRegClass::FPR) ? "FPR" : "GPR"));
+        return std::nullopt;
+    }
+    return resolveCcReg(schema, pool[index], cls, contextLabel, reporter);
+}
+
+// Lookup the primary return register (slot 0) for the given class.
+// Multi-register returns (SysV's rax+rdx for >64-bit aggregates) are
+// not yet exercised — anchored as a future cycle when the first
+// >64-bit aggregate return surfaces.
+[[nodiscard]] std::optional<LirReg>
+returnReg(TargetSchema const&            schema,
+          TargetCallingConvention const& cc,
+          LirRegClass                    cls,
+          std::string_view               contextLabel,
+          DiagnosticReporter&            reporter) {
+    auto const& pool = (cls == LirRegClass::FPR) ? cc.returnFprs : cc.returnGprs;
+    if (pool.empty()) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+               DiagnosticSeverity::Error,
+               std::format("{}: calling convention '{}' declares no {} "
+                           "return registers but the call has a {} result",
+                           contextLabel, cc.name,
+                           (cls == LirRegClass::FPR) ? "FPR" : "GPR",
+                           (cls == LirRegClass::FPR) ? "float" : "integer"));
+        return std::nullopt;
+    }
+    return resolveCcReg(schema, pool[0], cls, contextLabel, reporter);
+}
 
 [[nodiscard]] std::optional<OpcodeHandles>
 resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
@@ -212,7 +306,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::uint16_t OpcodeHandles::* field;
         std::string_view mnem;
     };
-    std::array<Entry, 7> const table{{
+    std::array<Entry, 9> const table{{
         {&OpcodeHandles::mov,        "mov"},
         {&OpcodeHandles::add,        "add"},
         {&OpcodeHandles::sub,        "sub"},
@@ -220,6 +314,9 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         {&OpcodeHandles::store,      "store"},
         {&OpcodeHandles::frameLoad,  schema.frameLoadMnemonic()},
         {&OpcodeHandles::frameStore, schema.frameStoreMnemonic()},
+        // ML7 cycle 2: arg + call materialized inside this pass.
+        {&OpcodeHandles::arg,        "arg"},
+        {&OpcodeHandles::call,       "call"},
     }};
     for (auto const& [field, mnem] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -293,6 +390,183 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
             auto const* info = schema.opcodeInfo(op);
             bool const isTerm = (info != nullptr && info->isTerminator());
+
+            // ML7 cycle 2: materialize virtual `arg` op.
+            //
+            // After regalloc, `result` is a physical register (whatever
+            // the allocator picked for the parameter's vreg). The cc
+            // declares which physical register the caller placed the
+            // k-th param in (`cc.argGprs[k]` for GPR, `cc.argFprs[k]`
+            // for FPR). Emit a `mov result, sourceArgReg` to copy the
+            // param into the regalloc-chosen home — or skip when
+            // regalloc happened to pick the source reg itself (no-op).
+            //
+            // Out-of-range arg indices fall into D-ML7-2.2 (stack-
+            // passed). A future regalloc pre-coloring hint
+            // (D-ML7-2.5) would eliminate most of these movs by
+            // pre-pinning the param vreg to its cc arg reg; for v1
+            // correctness, the unconditional mov is the right shape.
+            if (op == h.arg) {
+                if (!result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_VirtualRegInPostRegalloc,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: arg inst {} has no "
+                                       "physical-reg result after regalloc",
+                                       inst.v));
+                    return false;
+                }
+                auto const argSrc =
+                    argPassingReg(schema, cc, payload, result.regClass(),
+                                  "materializeOneFunc: arg", reporter);
+                if (!argSrc.has_value()) return false;
+                maybeMov(b, h.mov, result, *argSrc);
+                continue;
+            }
+
+            // ML7 cycle 2: materialize virtual `call` op into the
+            // explicit ABI sequence.
+            //
+            // Input shape (post-regalloc): `result?, call callee, arg0,
+            // arg1, ...` — operands are [callee, arg0..argN-1] where
+            // callee is a SymbolRef (direct call) and each arg is a
+            // physical register holding the value at the call site.
+            //
+            // Output shape:
+            //   mov destArgReg_0, arg0   (per cc.argGprs/argFprs by class)
+            //   mov destArgReg_1, arg1
+            //   ...
+            //   call <callee_symbol>     (only the symbol operand —
+            //                             matches the existing
+            //                             x86-variable encoding variant
+            //                             guard `["symbol"]`)
+            //   mov result, returnReg    (only if result is non-void;
+            //                             returnReg picked from
+            //                             cc.returnGprs[0] / returnFprs[0]
+            //                             by result class)
+            //
+            // Indirect calls (`call <reg>`) are anchored at D-ML7-2.4.
+            // Move-graph cycles (when regalloc pins src args to dest
+            // arg-passing regs in a way that produces a cycle —
+            // e.g. arg0 in argGprs[1], arg1 in argGprs[0] would need
+            // `mov rdi, rsi; mov rsi, rdi`, where the second read sees
+            // the clobbered rdi) trip `L_MoveCycleUnsupported` loud.
+            // Proper parallel-copy resolution is anchored at D-ML7-2.3.
+            if (op == h.call) {
+                if (ops.empty()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: call inst {} has no "
+                                       "operands (expected [callee, args...])",
+                                       inst.v));
+                    return false;
+                }
+                LirOperand const calleeOp = ops[0];
+                if (calleeOp.kind != LirOperandKind::SymbolRef) {
+                    report(reporter,
+                           DiagnosticCode::L_IndirectCallUnsupported,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: call inst {}'s callee "
+                                       "operand is not a SymbolRef — indirect "
+                                       "calls are anchored at D-ML7-2.4",
+                                       inst.v));
+                    return false;
+                }
+                // Plan the move-to-arg-register sequence up front so a
+                // move-cycle check can run BEFORE any mov is emitted.
+                // Each entry is (destination arg-passing physreg,
+                // source physreg holding the value).
+                struct ArgMove {
+                    LirReg dest;
+                    LirReg src;
+                };
+                std::vector<ArgMove> argMoves;
+                argMoves.reserve(ops.size());
+                std::uint32_t gprIdx = 0;
+                std::uint32_t fprIdx = 0;
+                for (std::size_t i = 1; i < ops.size(); ++i) {
+                    LirOperand const& argOp = ops[i];
+                    if (argOp.kind != LirOperandKind::Reg
+                        || argOp.reg.isPhysical == 0) {
+                        report(reporter,
+                               DiagnosticCode::L_VirtualRegInPostRegalloc,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: call inst {} arg {} "
+                                           "is not a physical-reg operand "
+                                           "after regalloc", inst.v, i - 1));
+                        return false;
+                    }
+                    LirReg const srcReg = argOp.reg;
+                    LirRegClass const cls = srcReg.regClass();
+                    std::uint32_t const argIndex =
+                        (cls == LirRegClass::FPR) ? fprIdx++ : gprIdx++;
+                    auto const destReg =
+                        argPassingReg(schema, cc, argIndex, cls,
+                                      "materializeOneFunc: call", reporter);
+                    if (!destReg.has_value()) return false;
+                    argMoves.push_back({*destReg, srcReg});
+                }
+                // Move-cycle detection (silent-failure-hunter CRITICAL
+                // F1 fold). The naive emit-in-order shape is correct
+                // ONLY when no destination of a NOT-yet-emitted mov is
+                // also a source of an ALREADY-emitted mov — otherwise
+                // the second mov reads a clobbered register. A trivial
+                // O(N^2) scan suffices for the v1 N<=6 (SysV) /
+                // N<=4 (MS-x64) GPR-arg shape.
+                //
+                // Detection: for each move i, check whether its source
+                // is the destination of any subsequent move j>i AND
+                // dest_j != src_j (i.e. j is a real mov, not a no-op).
+                // If yes, the in-order emission would clobber src_i
+                // before move i runs — fail loud anchored to D-ML7-2.3.
+                for (std::size_t i = 0; i < argMoves.size(); ++i) {
+                    if (argMoves[i].dest.id == argMoves[i].src.id) continue;
+                    for (std::size_t j = i + 1; j < argMoves.size(); ++j) {
+                        if (argMoves[j].dest.id == argMoves[j].src.id) continue;
+                        if (argMoves[j].dest.id == argMoves[i].src.id) {
+                            report(reporter,
+                                   DiagnosticCode::L_MoveCycleUnsupported,
+                                   DiagnosticSeverity::Error,
+                                   std::format("callconv: call inst {} arg-"
+                                               "passing moves form a cycle "
+                                               "(move {} src reg #{} is the "
+                                               "destination of later move {}); "
+                                               "parallel-copy resolution is "
+                                               "anchored at D-ML7-2.3",
+                                               inst.v, i,
+                                               static_cast<unsigned>(argMoves[i].src.id),
+                                               j));
+                            return false;
+                        }
+                    }
+                }
+                // Cycle-free — emit in order.
+                for (auto const& m : argMoves) {
+                    maybeMov(b, h.mov, m.dest, m.src);
+                }
+                // Emit `call <callee_symbol>` — single-symbol operand
+                // form (matches the schema's variant guard).
+                std::array<LirOperand, 1> callOps{calleeOp};
+                b.addInst(h.call, InvalidLirReg, callOps,
+                          payload, src.instFlags(inst));
+                // Move return register into result (only if non-void).
+                if (result.valid()) {
+                    if (result.isPhysical == 0) {
+                        report(reporter,
+                               DiagnosticCode::L_VirtualRegInPostRegalloc,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: call inst {} result "
+                                           "is not a physical reg after regalloc",
+                                           inst.v));
+                        return false;
+                    }
+                    auto const retReg =
+                        returnReg(schema, cc, result.regClass(),
+                                  "materializeOneFunc: call", reporter);
+                    if (!retReg.has_value()) return false;
+                    maybeMov(b, h.mov, result, *retReg);
+                }
+                continue;
+            }
 
             // Materialize frame_load / frame_store.
             if (op == h.frameLoad) {

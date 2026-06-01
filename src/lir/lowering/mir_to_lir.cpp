@@ -656,8 +656,25 @@ struct Lowerer {
     // is materialized as the function/global's address. Cycle 3e uses
     // the existing `mov` opcode + the `LirOperandKind::SymbolRef`
     // operand kind (already present in the LirOperand POD since cycle
-    // 1) — no new opcode needed. AS1 emits x86_64 `lea result, [rip +
-    // symbol]` for the actual encoding.
+    // 1) — no new opcode needed.
+    //
+    // ML7 cycle 2 peephole impact: when this GlobalAddr's result is
+    // consumed ONLY by a direct `Call`, the Call lowerer folds the
+    // SymbolId straight into the LIR call's SymbolRef operand and
+    // never reads this GlobalAddr's emitted vreg. The Mov is emitted
+    // anyway (every MIR inst lowers in order) and remains in the
+    // stream as a dead def — regalloc handles dead vregs cleanly
+    // (single-instruction live range) but the assembler still emits
+    // bytes for it. Dead-Mov elimination for direct-call-only
+    // GlobalAddrs is anchored at D-ML7-2.9.
+    //
+    // Assembler-side: the `mov` opcode's current encoding variants
+    // are `["reg"]` and `["imm32"]` — neither accepts SymbolRef.
+    // A symbol-bearing `mov` requires a new variant (AS2/AS3 owns
+    // the rip-relative-lea synthesis); today a non-peepholed
+    // GlobalAddr-Mov would trip `A_NoMatchingEncodingVariant`. The
+    // direct-call peephole in `lowerCall` is what keeps c-subset
+    // running until that variant lands.
     void lowerGlobalAddr(MirInstId id) {
         if (!opcode(MnemonicSlot::Mov).has_value()) {
             reportMissingOpcode(MnemonicSlot::Mov, "MIR GlobalAddr");
@@ -671,14 +688,18 @@ struct Lowerer {
     }
 
     // MIR Call → LIR `call callee, args...`. Convention:
-    //   operand[0] = callee value (typically a GlobalAddr-produced
-    //                vreg or an indirect call target)
+    //   operand[0] = callee value (typically a GlobalAddr — direct
+    //                call — peepholed into a SymbolRef LIR operand;
+    //                anything else routes through the indirect-call
+    //                path which is anchored at D-ML7-2.4)
     //   operand[1..N] = argument values
-    // ML7 callconv lowering will rewrite this to the explicit
+    // ML7 cycle 2 (landed) rewrites this to the explicit
     // mov-to-arg-register + call + mov-from-return-register sequence
-    // using the cycle-2b TargetCallingConvention sections (argGprs/
-    // argFprs/returnGprs/returnFprs). Cycle 3e keeps the LIR at the
-    // abstract "call(callee, args...)" form — target-blind.
+    // using the ML5 cycle-2b `TargetCallingConvention` sections
+    // (argGprs/argFprs/returnGprs/returnFprs). The LIR shape coming
+    // OUT of isel is the abstract `call(callee, args...)` form —
+    // target-blind — and the callconv pass rewrites it to the
+    // schema-encodable single-SymbolRef form.
     void lowerCall(MirInstId id) {
         // Cycle 3e fix-up: opcode resolution now goes through the
         // MnemonicCache (was ad-hoc `target.opcodeByMnemonic("call")`
@@ -700,17 +721,42 @@ struct Lowerer {
         // `defineValue`, producing cascading "used before definition"
         // diagnostics that drown the root cause. Same discipline as
         // `lowerStore`/`lowerInsertValue`.
+
+        // ML7 cycle 2 peephole: if the callee operand is a `GlobalAddr`
+        // MIR instruction, fold its SymbolId directly into the LIR
+        // call's `SymbolRef` operand (the direct-call form). This
+        // matches the target schema's `call` encoding variant guard
+        // `["symbol"]` AND lets ML7 cycle 2's callconv materialization
+        // pass leave the callee operand intact while just rewriting
+        // the args. Indirect-call form (callee is any other MIR
+        // instruction — IntToPtr from a function pointer load, etc.)
+        // is anchored at D-ML7-2-3 (an indirect-call schema variant
+        // + the assembler-side encoder for `call <reg>` must land
+        // together; today the assembler trips on it loud).
+        MirInstId const calleeMir = operands[0];
+        bool const calleeIsGlobalAddr =
+            mir.instOpcode(calleeMir) == MirOpcode::GlobalAddr;
+
         std::vector<LirReg> argRegs;
         argRegs.reserve(operands.size());
-        for (auto const opnd : operands) {
-            std::optional<LirReg> const r = regForValue(opnd);
+        // Skip operand[0] (callee) when we fold it; otherwise include it.
+        std::size_t const firstArgIdx = calleeIsGlobalAddr ? 1u : 0u;
+        for (std::size_t i = firstArgIdx; i < operands.size(); ++i) {
+            std::optional<LirReg> const r = regForValue(operands[i]);
             if (!r.has_value()) return;
             argRegs.push_back(*r);
         }
 
-        // Build the LIR operand list: [callee_reg, arg0, arg1, ...].
+        // Build the LIR operand list.
+        // Direct: [SymbolRef(sym), arg0, arg1, ...]
+        // Indirect: [callee_reg, arg0, arg1, ...] (legacy shape; ML7
+        //           cycle 2 surfaces this loud at materialization time)
         std::vector<LirOperand> ops;
-        ops.reserve(argRegs.size());
+        ops.reserve(argRegs.size() + 1);
+        if (calleeIsGlobalAddr) {
+            SymbolId const sym = mir.globalAddrSymbol(calleeMir);
+            ops.push_back(LirOperand::makeSymbolRef(sym.v));
+        }
         for (auto const r : argRegs) ops.push_back(LirOperand::makeReg(r));
 
         // Result class follows MIR's result type. Void-returning calls

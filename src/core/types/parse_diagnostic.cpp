@@ -125,6 +125,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_InvalidSpillSlotSentinel:     return "L_InvalidSpillSlotSentinel";
         case DiagnosticCode::L_PhysRegOrdinalOutOfRange:     return "L_PhysRegOrdinalOutOfRange";
         case DiagnosticCode::L_MemOperandMalformed:          return "L_MemOperandMalformed";
+        case DiagnosticCode::L_StackPassedArgUnsupported:    return "L_StackPassedArgUnsupported";
+        case DiagnosticCode::L_CcRegLookupFailed:            return "L_CcRegLookupFailed";
+        case DiagnosticCode::L_MoveCycleUnsupported:         return "L_MoveCycleUnsupported";
+        case DiagnosticCode::L_IndirectCallUnsupported:      return "L_IndirectCallUnsupported";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

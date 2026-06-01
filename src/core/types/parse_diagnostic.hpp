@@ -398,6 +398,38 @@ enum class DiagnosticCode : std::uint16_t {
     // L_UnsupportedLoweringForOpcode (which is about opcode-lowering
     // coverage gaps): this code names the malformed substrate shape.
     L_MemOperandMalformed          = 0xB006,
+    // ML7 cycle 2 (plan 12): calling-convention materialization codes.
+    //
+    // L_StackPassedArgUnsupported: an `arg k` or `call` site requires
+    //   passing an argument on the stack because `k >= cc.argGprs.size()`
+    //   (or `argFprs.size()` for an FPR-class arg). Stack-passed args
+    //   need both a callee-side load from `[SP + caller-arg-offset]`
+    //   and a caller-side store/push BEFORE the call. v1 register-only.
+    //   Anchor: D-ML7-2.2.
+    // L_CcRegLookupFailed: the cc declares a register name in
+    //   `argGprs`/`argFprs`/`returnGprs`/`returnFprs` that does not
+    //   resolve via `schema.registerByName(...)` — schema misconfiguration
+    //   (e.g. a typo in the JSON between the `registers[]` and the cc's
+    //   reg list). `TargetSchemaData::validate` is meant to be the first
+    //   line of defense, but defense-in-depth at materialization time
+    //   catches a future schema-loader bug that bypasses validate.
+    //   Renamed from `L_ArgRegLookupFailed` at the post-fold review
+    //   (silent-failure F7: the name said "arg" but the code is also
+    //   used for the return-register lookup path).
+    // L_MoveCycleUnsupported: call-site arg-passing produces a move
+    //   cycle (e.g. swap two args between argGprs[0] and argGprs[1]).
+    //   The v1 emit-in-order materialization would silently miscompile
+    //   such a cycle — second mov reads a clobbered source. v1 detects
+    //   loud; D-ML7-2.3 anchors the proper parallel-copy resolution.
+    // L_IndirectCallUnsupported: the LIR `call` instruction's callee
+    //   operand is not a `SymbolRef`. v1 only encodes direct calls
+    //   (the schema's encoding variant guard is `["symbol"]`); indirect
+    //   calls need a new schema variant + the materializer must emit
+    //   `call <reg>` instead of `call <sym>`. Anchor: D-ML7-2.4.
+    L_StackPassedArgUnsupported    = 0xB007,
+    L_CcRegLookupFailed            = 0xB008,
+    L_MoveCycleUnsupported         = 0xB009,
+    L_IndirectCallUnsupported      = 0xB00A,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //
