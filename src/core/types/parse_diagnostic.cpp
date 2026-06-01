@@ -155,6 +155,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_TargetFormatMismatch:         return "D_TargetFormatMismatch";
         case DiagnosticCode::D_TargetMachineCodeMismatch:    return "D_TargetMachineCodeMismatch";
         case DiagnosticCode::D_TargetAbiModelMismatch:       return "D_TargetAbiModelMismatch";
+        case DiagnosticCode::D_TargetAbiModelUnsupportedByDriver: return "D_TargetAbiModelUnsupportedByDriver";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";
@@ -177,6 +178,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_AbiCcRegistersInconsistent:   return "F_AbiCcRegistersInconsistent";
         case DiagnosticCode::F_MangleMissingExpectedPrefix:  return "F_MangleMissingExpectedPrefix";
         case DiagnosticCode::F_FfiIngestDuplicateSymbol:     return "F_FfiIngestDuplicateSymbol";
+        case DiagnosticCode::F_FfiIngestAbiModelUnsupported: return "F_FfiIngestAbiModelUnsupported";
+        case DiagnosticCode::F_FfiIngestEmptyCanonical:      return "F_FfiIngestEmptyCanonical";
     }
     return "Unknown";
 }

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -84,18 +85,57 @@ struct DSS_EXPORT ExternDeclRef {
 
 // ── HirIngestResult ─────────────────────────────────────────────
 
-struct DSS_EXPORT HirIngestResult {
+// Result struct. `ok()` returns true iff the reporter held zero
+// errors at the moment `ingest()` returned. The reporter is the
+// single source of truth — `ok()` is a snapshot taken at return so
+// later reporter activity (by other code on the same reporter)
+// can't mutate it retroactively. Default-constructed value has
+// `ok() == false` (errorCountAtReturn = nullopt) — that's the
+// safe sentinel: any caller that obtains a HirIngestResult through
+// a path bypassing `ingest()` correctly sees ok=false rather than
+// inheriting an accidental ok=true from the default. (post-fold #6
+// type-design Q1 fold: private snapshot + factory-only set; the
+// `ingest()` friend is the only path that can populate it.)
+//
+// IMPORTANT: `ok() == false` does NOT imply `ffiMap` is unmodified.
+// Partial annotations are possible alongside !ok() (e.g., a
+// duplicate-symbol Warning promoted to Error by `--warnings-as-errors`
+// after some externs were already annotated). Callers deciding
+// downstream behavior MUST inspect `externsAnnotated` alongside
+// `ok()`, never `ok()` alone.
+class DSS_EXPORT HirIngestResult {
+public:
     std::size_t externsAnnotated = 0;  // # of (node, FfiMetadata) entries written to ffiMap
     std::size_t sourcesProcessed = 0;  // # of IngestionSource entries successfully read
     std::size_t rowsAggregated   = 0;  // # of ImportSurface rows in the union surface
-    // `ok` is derived state — the snapshot of `reporter.errorCount()`
-    // as of `ingest()` return. The reporter remains the single source
-    // of truth for diagnostic state (matches `LirAllocation::ok()`
-    // precedent at lir_regalloc.hpp). Setting `errorCountAtReturn`
-    // explicitly (rather than caching a bool) keeps the derivation
-    // honest if a caller emits errors AFTER ingest returns.
-    std::size_t errorCountAtReturn = 0;
-    [[nodiscard]] bool ok() const noexcept { return errorCountAtReturn == 0u; }
+
+    [[nodiscard]] bool ok() const noexcept {
+        return errorCountAtReturn_.has_value()
+            && *errorCountAtReturn_ == 0u;
+    }
+    [[nodiscard]] std::size_t errorCount() const noexcept {
+        return errorCountAtReturn_.value_or(0u);
+    }
+
+    // Snapshot-once setter — only `ingest()`'s internal
+    // `returnWithSnapshot` lambda should call this. The "once"
+    // semantic is enforced (a second call is a no-op): the trap
+    // we're closing is "default-construct → ok() == true" by
+    // accident; we don't need to forbid double-write.
+    void snapshotErrorCountOnce(std::size_t n) noexcept {
+        if (!errorCountAtReturn_.has_value()) {
+            errorCountAtReturn_ = n;
+        }
+    }
+
+private:
+    // nullopt sentinel = "never snapshotted by ingest()". A
+    // default-constructed HirIngestResult has `ok() == false` —
+    // any caller obtaining a result through a path that bypasses
+    // `ingest()`'s returnWithSnapshot lambda correctly sees
+    // not-ok, NOT an accidental ok=true from the previous bool
+    // default.
+    std::optional<std::size_t> errorCountAtReturn_;
 };
 
 // ── Public entry point ─────────────────────────────────────────
@@ -118,7 +158,13 @@ struct DSS_EXPORT HirIngestResult {
 //     occurrence; subsequent duplicates skipped with a Warning-level
 //     diagnostic (`F_FfiIngestDuplicateSymbol`) so the audit log
 //     captures the shadowing. Downstream linkers reject true
-//     link-time collisions independently.
+//     link-time collisions independently. NOTE: under
+//     `--warnings-as-errors`, the duplicate warning is PROMOTED to
+//     Error → `result.ok() == false` even though the FFI design
+//     treats first-source-wins as non-fatal. The `ffiMap` is still
+//     partially populated with the first-source bindings. Callers
+//     must inspect `externsAnnotated` rather than branching solely
+//     on `ok()` to decide whether to consume ffiMap.
 //   * Extern in `externs` with no match in aggregated surface:
 //     skipped without error — the user's source declares the
 //     extern but no library/header provides it; the linker will
@@ -144,9 +190,12 @@ ingest(std::span<IngestionSource const> sources,
 // Alphabetical-order is deterministic — round-trips with the
 // shipped `src/dss-config/ffi-headers/<lib>/*.h` layout.
 //
-// Failure modes: any per-file failure halts the directory read
-// and propagates the underlying HeaderReadError (operator gets the
-// first failure's prose, not a summary across multiple files).
+// Failure modes (post-fold #5 H1): per-file failures are collected.
+// The directory read returns a partial surface with rows from every
+// file that DID parse, and only returns std::unexpected when EVERY
+// file failed. Per-file failure diagnostics already reach the
+// reporter via `readCHeader`; the propagated HeaderReadError carries
+// the FIRST failure's detail for triage convenience.
 [[nodiscard]] DSS_EXPORT
 std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeaderDirectory(std::filesystem::path const& headerDir,

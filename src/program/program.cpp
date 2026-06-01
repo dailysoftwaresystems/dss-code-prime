@@ -199,7 +199,16 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // dispatching a register-machine pipeline against a non-
     // register-machine target.
     if (abi->cc == nullptr) {
-        emitDriver(reporter, DiagnosticCode::D_PlanNotLanded,
+        // post-fold #6 silent-failure C2 fix: dedicated code
+        // (D_TargetAbiModelUnsupportedByDriver) replaces the
+        // previous D_PlanNotLanded reuse. This pairing is a
+        // permanent architectural exclusion (plans 17/18 own their
+        // own lowering tiers), NOT a pending-arrival surface;
+        // grouping with D_PlanNotLanded would conflate the two
+        // remediation classes + let `--suppress=D_PlanNotLanded`
+        // (legitimate for compileProject stubs) silently mask
+        // this architectural reject.
+        emitDriver(reporter, DiagnosticCode::D_TargetAbiModelUnsupportedByDriver,
                    std::string{"target '"} + parsed->targetName
                        + "' has abiModel='"
                        + std::string{targetAbiModelName(

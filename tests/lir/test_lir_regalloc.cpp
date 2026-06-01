@@ -68,7 +68,7 @@ TEST(LirRegAlloc, EmptyModuleProducesNoResults) {
     EXPECT_EQ(out.perFunc.size(), 0u);
 }
 
-// ── Post-fold #5 silent-failure HIGH-2: pin ccIndex flow ─────
+// ── Post-fold #5 code-reviewer-#82 pin: ccIndex flow ─────────
 TEST(LirRegAlloc, CcIndex1RecordsThroughToFuncAllocation) {
     // Pin the D-FF3-3 wiring: passing ccIndex=1 must be recorded
     // on every LirFuncAllocation. Without this pin a regression

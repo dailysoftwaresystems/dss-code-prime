@@ -304,7 +304,10 @@ TEST(FfiIngest, DuplicateSymbolEmitsDedicatedWarningCode) {
 
 // ── Post-fold #5 silent-failure C2: WASM short-circuit ─────────
 
-TEST(FfiIngest, OperandStackTargetShortCircuitsWithPlanNotLanded) {
+TEST(FfiIngest, OperandStackTargetShortCircuitsWithDedicatedCode) {
+    // Post-fold #6: dedicated F_FfiIngestAbiModelUnsupported code
+    // replaces the previous D_PlanNotLanded reuse. The pairing is a
+    // permanent architectural exclusion, NOT pending-arrival.
     TypeInterner ti = makeInterner();
     auto built = buildModuleWithExtern(ti);
     HirFfiMap ffi{built.hir};
@@ -315,6 +318,7 @@ TEST(FfiIngest, OperandStackTargetShortCircuitsWithPlanNotLanded) {
       "opcodes": [ {"mnemonic":"invalid","result":"none"} ]
     })");
     ASSERT_TRUE(target.has_value());
+    EXPECT_EQ((*target)->abiModel(), TargetAbiModel::OperandStack);
     auto format = ObjectFormatSchema::loadShipped("wasm32-v1");
     ASSERT_TRUE(format.has_value());
 
@@ -326,14 +330,124 @@ TEST(FfiIngest, OperandStackTargetShortCircuitsWithPlanNotLanded) {
     EXPECT_FALSE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 0u);
     EXPECT_EQ(ffi.tryGet(built.externNode), nullptr);
-    bool sawPlanNotLanded = false;
+    bool sawAbiUnsupported = false, sawPlanNotLanded = false;
     for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_FfiIngestAbiModelUnsupported) {
+            sawAbiUnsupported = true;
+        }
         if (d.code == DiagnosticCode::D_PlanNotLanded) sawPlanNotLanded = true;
     }
-    EXPECT_TRUE(sawPlanNotLanded);
+    EXPECT_TRUE(sawAbiUnsupported);
+    EXPECT_FALSE(sawPlanNotLanded)
+        << "must NOT use D_PlanNotLanded — that's pending-arrival surface";
 }
 
-// ── Post-fold #5 P6 multiple-extern match ─────────────────────
+// ── Post-fold #6 silent-failure C1: empty canonical reject ────
+
+TEST(FfiIngest, EmptyExternDeclRefCanonicalNameRejectedLoud) {
+    // Caller-side empty canonicalName must NOT silently bind to an
+    // empty-string row in bySymbol.
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(format.has_value());
+
+    DiagnosticReporter rep;
+    std::array<IngestionSource, 0> sources{};
+    std::array externs{ExternDeclRef{built.externNode, ""}};
+    auto result = ingest(sources, externs, **target, **format, ffi, rep);
+
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(result.externsAnnotated, 0u);
+    EXPECT_EQ(ffi.tryGet(built.externNode), nullptr);
+    bool sawEmpty = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_FfiIngestEmptyCanonical) sawEmpty = true;
+    }
+    EXPECT_TRUE(sawEmpty);
+}
+
+// ── Post-fold #6 H2 + Gap 2: partial-failure surface ──────────
+
+TEST(FfiIngest, ReadCHeaderDirectoryPartialFailureReturnsSurface) {
+    // Pin H1: one bad header in a directory must NOT amputate the
+    // good headers' symbols from the aggregated surface.
+    ScratchDir scratch{Location::Temp, "ff5-partial"};
+    auto const tmpDir = scratch.path();
+    {
+        std::ofstream{tmpDir / "good.h"}
+            << "extern int puts(const char* s);\n";
+        std::ofstream{tmpDir / "bad.h"}
+            << "this is not valid C at all @@@\n";
+    }
+    DiagnosticReporter rep;
+    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", rep);
+    // Partial success: good.h's row reaches the surface; bad.h's
+    // failure is in the reporter; readCHeaderDirectory returns
+    // expected (not unexpected) because at least one file parsed.
+    ASSERT_TRUE(rows.has_value())
+        << "partial-success contract: at least one file parsed";
+    bool sawPuts = false;
+    for (auto const& r : *rows) {
+        if (r.mangledName == "puts") sawPuts = true;
+    }
+    EXPECT_TRUE(sawPuts);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "bad.h's parse failure is recorded in the reporter";
+}
+
+TEST(FfiIngest, ReadCHeaderDirectoryAllFailuresPropagatesError) {
+    // Pin the other branch: when EVERY file fails, return unexpected
+    // with the first failure's HeaderReadError detail.
+    ScratchDir scratch{Location::Temp, "ff5-allfail"};
+    auto const tmpDir = scratch.path();
+    {
+        std::ofstream{tmpDir / "bad1.h"} << "garbage 1 @@@\n";
+        std::ofstream{tmpDir / "bad2.h"} << "garbage 2 @@@\n";
+    }
+    DiagnosticReporter rep;
+    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", rep);
+    ASSERT_FALSE(rows.has_value());
+    EXPECT_EQ(rows.error().kind, HeaderReadErrorKind::HeaderParseFailed);
+}
+
+// ── Post-fold #6 H7: ok() snapshot semantics pin ──────────────
+
+TEST(FfiIngest, OkSnapshotImmuneToPostReturnReporterErrors) {
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+
+    ScratchDir scratch{Location::Temp, "ff5-snapshot"};
+    auto const tmpDir = scratch.path();
+    {
+        std::ofstream{tmpDir / "h.h"} << "extern int puts(const char* s);\n";
+    }
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(format.has_value());
+
+    DiagnosticReporter rep;
+    std::array sources{
+        IngestionSource{CHeaderSource{tmpDir / "h.h", "libc.so.6"}}};
+    std::array externs{ExternDeclRef{built.externNode, "puts"}};
+    auto result = ingest(sources, externs, **target, **format, ffi, rep);
+    ASSERT_TRUE(result.ok());
+
+    // Emit an error AFTER ingest returns — ok() must NOT flip.
+    dss::report(rep, DiagnosticCode::F_AbiUnknownTuple,
+                DiagnosticSeverity::Error, "post-ingest error");
+    EXPECT_TRUE(result.ok())
+        << "ok() reflects snapshot at return, not live reporter state";
+    EXPECT_EQ(rep.errorCount(), 1u);
+}
+
+// ── Post-fold #5 P6 multiple-extern match + #6 H6 cross-bind ─
 
 TEST(FfiIngest, MultipleExternsAllMatchedGetAnnotated) {
     TypeInterner ti = makeInterner();
@@ -369,15 +483,35 @@ TEST(FfiIngest, MultipleExternsAllMatchedGetAnnotated) {
 
     ASSERT_TRUE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 2u);
-    EXPECT_NE(ffi.tryGet(ef1), nullptr);
-    EXPECT_NE(ffi.tryGet(ef2), nullptr);
+    // post-fold #6 H6: pin per-extern decoration so a refactor that
+    // matches by FnSig (instead of canonical name) or that binds the
+    // SAME row to both externs trips the test.
+    auto const* metaEf1 = ffi.tryGet(ef1);
+    auto const* metaEf2 = ffi.tryGet(ef2);
+    ASSERT_NE(metaEf1, nullptr);
+    ASSERT_NE(metaEf2, nullptr);
+    EXPECT_EQ(metaEf1->mangledName, "puts");
+    EXPECT_EQ(metaEf2->mangledName, "exit");
+    EXPECT_NE(metaEf1->mangledName, metaEf2->mangledName);
 }
 
-// ── Diagnostic code name round-trip ─────────────────────────────
+// ── Diagnostic code name round-trips ───────────────────────────
 
 TEST(FfiIngest, DiagnosticCodeNameRoundTripFFfiIngestDuplicateSymbol) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_FfiIngestDuplicateSymbol),
               "F_FfiIngestDuplicateSymbol");
+}
+TEST(FfiIngest, DiagnosticCodeNameRoundTripFFfiIngestAbiModelUnsupported) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_FfiIngestAbiModelUnsupported),
+              "F_FfiIngestAbiModelUnsupported");
+}
+TEST(FfiIngest, DiagnosticCodeNameRoundTripFFfiIngestEmptyCanonical) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_FfiIngestEmptyCanonical),
+              "F_FfiIngestEmptyCanonical");
+}
+TEST(FfiIngest, DiagnosticCodeNameRoundTripDTargetAbiModelUnsupportedByDriver) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_TargetAbiModelUnsupportedByDriver),
+              "D_TargetAbiModelUnsupportedByDriver");
 }
 
 // ── FF3 (resolveAbi) gate: bad (target, format) pair fails ingest ─

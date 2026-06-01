@@ -297,6 +297,13 @@ enum class DiagnosticCode : std::uint16_t {
     // target OR format entirely.
     D_TargetMachineCodeMismatch   = 0xD00D,
     D_TargetAbiModelMismatch      = 0xD00E,
+    // D_TargetAbiModelUnsupportedByDriver: compileOneTarget reached an
+    //   abiModel (operand-stack / result-id) that the register-machine
+    //   LIR pipeline does not lower. Permanent architectural exclusion
+    //   — plans 17 (SPIR-V) and 18 (WASM) own their own lowering tiers.
+    //   Distinct from `D_PlanNotLanded` (pending-arrival surface).
+    //   (post-fold #6 silent-failure C2 fix.)
+    D_TargetAbiModelUnsupportedByDriver = 0xD00F,
 
     // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
@@ -767,6 +774,24 @@ enum class DiagnosticCode : std::uint16_t {
     //   duplicate-shadow is a CROSS-source concern. (post-fold #5
     //   silent-failure C3 / code-reviewer #88 fold.)
     F_FfiIngestDuplicateSymbol     = 0x5015,
+    // F_FfiIngestAbiModelUnsupported: FF5 ingest() saw a (target, format)
+    //   abiModel pair (operand-stack / result-id) that FF4 C-mangling
+    //   does not cover. Permanent architectural exclusion — plan 17
+    //   (SPIR-V) and plan 18 (WASM) own their own ingest surfaces.
+    //   Distinct from `D_PlanNotLanded` which means "this entry point
+    //   is pending plan landing" — this code means "this entry point
+    //   will NEVER apply to this abiModel". (post-fold #6 silent-
+    //   failure C2 fix.)
+    F_FfiIngestAbiModelUnsupported = 0x5016,
+    // F_FfiIngestEmptyCanonical: FF5 ingest() saw an empty canonical
+    //   name — either a binary-reader / header-parser bug emitted a
+    //   zero-length mangledName, OR a caller passed an
+    //   `ExternDeclRef{node, ""}` value. Both are structural
+    //   anomalies — proceeding with an empty key would silently
+    //   shadow legitimately-distinct symbols in the by-name lookup.
+    //   (post-fold #6 silent-failure C1 fix / D-FF5-EXTERNDECLREF-VALIDATE
+    //   promoted from anchor to close-now.)
+    F_FfiIngestEmptyCanonical      = 0x5017,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

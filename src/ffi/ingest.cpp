@@ -88,14 +88,18 @@ readSource(IngestionSource const& src, DiagnosticReporter& reporter,
 // unapply rejects a Mach-O input lacking the expected `_` prefix
 // loud — that's a structural anomaly worth surfacing.
 //
-// Returns the canonical name on success, empty string on failure
-// (caller skips the row with a logged underlying diagnostic).
-// post-fold #5 silent-failure H3: return optional<string> so the
-// caller can distinguish "decoration removed → empty canonical name"
-// (legitimate, kept) from "unapply failure" (skip the row). An
-// empty string from the strict unapply is genuinely unusable, but
-// not vs. the failure mode — return nullopt on failure for an
-// unambiguous sentinel.
+// Returns optional<string> to disambiguate three cases:
+//   * has_value() + non-empty       → use this canonical name
+//   * has_value() + empty           → caller MUST treat as a
+//                                     structural anomaly (caller-
+//                                     side reject — post-fold #6
+//                                     C1 fix; empty-key emplace
+//                                     would silently shadow other
+//                                     symbols)
+//   * !has_value()                  → strict-unapply rejected the
+//                                     binary input; underlying
+//                                     F_MangleMissingExpectedPrefix
+//                                     already in the reporter
 [[nodiscard]] std::optional<std::string>
 toCanonicalName(ImportSurface const& row, ObjectFormatKind format,
                 bool fromBinary, DiagnosticReporter& reporter) {
@@ -180,12 +184,16 @@ ingest(std::span<IngestionSource const> sources,
        DiagnosticReporter&              reporter) {
     HirIngestResult result{};
 
-    // Helper: every early return must snapshot the reporter so
-    // `result.ok()` reflects the diagnostic state at exit. Avoids
-    // the "early-return drops errorCountAtReturn=0 default → ok()
-    // returns true despite the reporter holding errors" bug.
+    // Every return path — early or normal — funnels through this
+    // helper so HirIngestResult's `errorCountAtReturn_` snapshot
+    // semantics are uniform. Default-constructed `result` has
+    // `errorCountAtReturn_ == nullopt` → `ok() == false`; only the
+    // returnWithSnapshot path engages the optional. Together with
+    // the friend-declaration on `ingest`, the population path is
+    // structurally pinned: no other caller can construct an
+    // ok()==true result.
     auto returnWithSnapshot = [&]() -> HirIngestResult {
-        result.errorCountAtReturn = reporter.errorCount();
+        result.snapshotErrorCountOnce(reporter.errorCount());
         return result;
     };
 
@@ -202,7 +210,13 @@ ingest(std::span<IngestionSource const> sources,
         auto abi = resolveAbi(target, format, reporter);
         if (!abi) return returnWithSnapshot();
         if (abi->cc == nullptr) {
-            dss::report(reporter, DiagnosticCode::D_PlanNotLanded,
+            // post-fold #6 silent-failure C2: dedicated code (not
+            // `D_PlanNotLanded` reuse). The (operand-stack /
+            // result-id) → no-FF4-C-mangling pairing is a
+            // permanent architectural exclusion, NOT a pending-
+            // arrival surface. plan 17 (SPIR-V) + plan 18 (WASM)
+            // own their own ingest surfaces; FF5 will never apply.
+            dss::report(reporter, DiagnosticCode::F_FfiIngestAbiModelUnsupported,
                         DiagnosticSeverity::Error,
                         std::format("FF5 ingest: target '{}' abiModel '{}' "
                                     "is not supported by the FF4 C-mangling "
@@ -249,6 +263,20 @@ ingest(std::span<IngestionSource const> sources,
         auto canonical = toCanonicalName(
             tagged.row, format.kind(), tagged.fromBinary, reporter);
         if (!canonical) continue;  // strict-unapply already reported
+        // post-fold #6 silent-failure C1: empty canonical name would
+        // emplace `bySymbol[""]` and silently shadow every subsequent
+        // empty-named row + silently match a `ExternDeclRef{node, ""}`
+        // caller-side bug. Reject loud.
+        if (canonical->empty()) {
+            dss::report(reporter, DiagnosticCode::F_FfiIngestEmptyCanonical,
+                        DiagnosticSeverity::Error,
+                        std::format("FF5 ingest: source '{}' produced an "
+                                    "empty canonical name from mangledName "
+                                    "'{}' — structural anomaly, skipping row.",
+                                    tagged.row.libraryPath,
+                                    tagged.row.mangledName));
+            continue;
+        }
         auto [it, inserted] = bySymbol.emplace(std::move(*canonical), &tagged);
         if (!inserted) {
             // First-source-wins is the local design choice (an
@@ -277,6 +305,19 @@ ingest(std::span<IngestionSource const> sources,
     // would be a false-positive (the user might have a different
     // ingestion source planned for a later cycle).
     for (auto const& ext : externs) {
+        // post-fold #6 silent-failure C1: caller-side empty
+        // canonicalName would match the empty-string key (if any
+        // somehow slipped past the producer-side guard above) and
+        // silently bind whatever the first empty-named row was.
+        // Reject loud.
+        if (ext.canonicalName.empty()) {
+            dss::report(reporter, DiagnosticCode::F_FfiIngestEmptyCanonical,
+                        DiagnosticSeverity::Error,
+                        "FF5 ingest: caller-supplied ExternDeclRef has "
+                        "empty canonicalName — structural anomaly, "
+                        "skipping match.");
+            continue;
+        }
         auto it = bySymbol.find(std::string{ext.canonicalName});
         if (it == bySymbol.end()) continue;
         TaggedRow const& matched = *it->second;
