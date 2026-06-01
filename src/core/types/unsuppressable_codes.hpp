@@ -20,13 +20,16 @@ namespace dss {
 // would see green — the silent-drop the H_ExternHasInitializer fold was
 // meant to permanently close would be re-opened with one CLI flag.
 //
-// Post-fold: `applyPolicy` consults `isUnsuppressable(d.code)` BEFORE
-// the suppress check; unsuppressable codes pass through unchanged
-// (also bypass `overrides` severity-demotion + `warningsAsErrors`, both
-// of which would defeat the gate in different ways). Post-fold #11
-// silent-failure F1: `report()` itself ALSO bypasses cap / dedup /
-// maxPerCode / maxDiagnostics for unsuppressable codes — the four
-// silent-drop gates around applyPolicy would otherwise re-open the
+// Post-fold (eb2c6c7 refinement): `applyPolicy` consults
+// `isUnsuppressable(d.code)` BEFORE the suppress check; unsuppressable
+// codes bypass SILENCING mutations (`--suppress` drops + `overrides`
+// demotion) but NOT severity ELEVATION (`--warnings-as-errors`) —
+// elevation strengthens the signal rather than defeating the gate, so
+// strict-mode operators get fail-loud exit codes on Warning-severity
+// unsuppressable codes like F_BinaryReaderPartialCorruption.
+// Post-fold #11 silent-failure F1: `report()` itself ALSO bypasses cap /
+// dedup / maxPerCode / maxDiagnostics for unsuppressable codes — the
+// four silent-drop gates around applyPolicy would otherwise re-open the
 // surface even when policy correctly let the code through.
 //
 // Membership tiers (informational — the closed-table at the .cpp is
@@ -69,6 +72,19 @@ namespace dss {
 // Adding a code here is a commitment: this code's emission MUST be visible
 // to the build pipeline regardless of any --suppress policy. New entries
 // land paired with the fold that introduces the underlying invariant.
+//
+// Anchored sub-row D-FF2-UNSUPP-INFO-WAE-ASYMMETRY: the silencing-vs-
+// elevation refinement gates Warning→Error via warningsAsErrors but
+// the elevation arm does NOT promote Info → Warning/Error. If a future
+// Info-severity unsuppressable producer lands, --warnings-as-errors
+// strict mode would NOT fail-loud on its emission (Info diagnostics
+// don't bump errorCount, and the elevation gate keys on severity ==
+// Warning). Trigger: first Info-severity entry added to the closed-
+// table. Resolution at that point: either extend the elevation gate
+// to also promote Info, or harden `unsuppressable_codes.cpp` with a
+// consteval check forbidding Info-severity members (would need a
+// parallel severity table to introspect). Today (2026-06-01) no Info-
+// severity unsuppressable producer exists; the asymmetry is dormant.
 [[nodiscard]] DSS_EXPORT bool
 isUnsuppressable(DiagnosticCode code) noexcept;
 

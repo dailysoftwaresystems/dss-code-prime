@@ -542,6 +542,25 @@ TEST(BinaryReaderReporter,
               1u)
         << "the silent-skip on a non-zero st_name with empty resolved "
            "name must fire F_BinaryReaderPartialCorruption Warning";
+    // eb2c6c7 audit fold (test-analyzer Finding D): tighten the
+    // negative WAE branch. Default config has `warningsAsErrors=false`
+    // — the diagnostic MUST land at severity Warning and MUST NOT
+    // increment errorCount(). A regression that unconditionally
+    // elevates Warning→Error in `applyPolicy` would pass the
+    // count-based check above but fail these two pins.
+    bool sawPartialCorruption = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_BinaryReaderPartialCorruption) {
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "partial-corruption MUST remain Warning under default "
+                   "config (warningsAsErrors=false)";
+            sawPartialCorruption = true;
+        }
+    }
+    EXPECT_TRUE(sawPartialCorruption);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "partial-corruption Warning MUST NOT bump errorCount() under "
+           "default config";
 }
 
 TEST(BinaryReaderReporter,

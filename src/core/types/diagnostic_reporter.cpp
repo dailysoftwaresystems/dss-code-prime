@@ -92,27 +92,28 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
-    // D-FF2-UNSUPP: severity-gating codes bypass SILENCING mutations
-    // (`--suppress` drops + `overrides` demotion) so they always reach
-    // `all_`. They do NOT bypass `--warnings-as-errors` — that is
-    // ELEVATION, not silencing, and strict-mode operators legitimately
+    // D-FF2-UNSUPP refined contract (post-fold #N audit on eb2c6c7):
+    // unsuppressable codes bypass SILENCING (`--suppress` drops +
+    // `overrides` demotion) so they always reach `all_`. Elevation
+    // (`--warnings-as-errors`) applies UNIFORMLY — it strengthens the
+    // signal, never silences it. Strict-mode operators legitimately
     // want Warning-severity unsuppressable codes (like
     // F_BinaryReaderPartialCorruption) promoted to Error so they
-    // increment errorCount. The unsuppressable gate's contract is
-    // "must reach all_", not "must preserve producer severity".
-    // Post-fold 2nd-order audit on b3db24c: refined to allow elevation
-    // (the original "skip all mutation" was over-broad).
-    if (isUnsuppressable(d.code)) {
-        if (cfg_.policy.warningsAsErrors && d.severity == DiagnosticSeverity::Warning) {
-            d.severity = DiagnosticSeverity::Error;
+    // increment errorCount.
+    //
+    // Post-fold-eb2c6c7 type-design Q3 + code-review F3: collapsed
+    // the previously-duplicated warningsAsErrors flip into a single
+    // end-of-function block. Two literal copies were drift-prone
+    // (one in the unsuppressable arm, one after silencing); the
+    // single-flip shape makes "elevation is universal; only silencing
+    // is gated by unsuppressable" the literal control flow.
+    if (!isUnsuppressable(d.code)) {
+        if (cfg_.policy.suppress.contains(d.code)) {
+            return std::nullopt;
         }
-        return d;
-    }
-    if (cfg_.policy.suppress.contains(d.code)) {
-        return std::nullopt;
-    }
-    if (auto it = cfg_.policy.overrides.find(d.code); it != cfg_.policy.overrides.end()) {
-        d.severity = it->second;
+        if (auto it = cfg_.policy.overrides.find(d.code); it != cfg_.policy.overrides.end()) {
+            d.severity = it->second;
+        }
     }
     if (cfg_.policy.warningsAsErrors && d.severity == DiagnosticSeverity::Warning) {
         d.severity = DiagnosticSeverity::Error;
@@ -162,6 +163,12 @@ std::uint64_t hashKey(ParseDiagnostic const& d) noexcept {
     // findings collide on the key — the deficiency UnitBuilder's driver reporter
     // sidesteps by disabling dedup wholesale.)
     h = fnv1a64Bytes(h, d.actual);
+    // d.contextPrefix is INTENTIONALLY excluded — see ParseDiagnostic
+    // field comment + D-MERGE-DEDUP-PREFIX-COLLISION fold. Multi-
+    // target merge stamps a per-target prefix at the merge point; two
+    // targets emitting the structurally-identical diagnostic must
+    // collapse at the destination rather than leak through as
+    // duplicates-with-different-prefix.
     return h;
 }
 } // namespace
@@ -174,11 +181,14 @@ bool DiagnosticReporter::isRecentDuplicate(ParseDiagnostic const& d) const noexc
 
 void DiagnosticReporter::report(ParseDiagnostic d) {
     // Policy first so the unsuppressable check below sees the post-
-    // policy code. applyPolicy short-circuits for unsuppressable codes
-    // (returning the diagnostic unmutated), so reordering vs. the
-    // pre-fold hitCap_-first check is invariant for those codes — and
-    // policy work is a few hash lookups, negligible vs. the surrounding
-    // pushes.
+    // policy code. applyPolicy skips SILENCING mutations (suppress
+    // drops + overrides demotion) for unsuppressable codes but still
+    // applies warningsAsErrors elevation — see the
+    // silencing-vs-elevation prose in `unsuppressable_codes.hpp`.
+    // Reordering vs. the pre-fold hitCap_-first check is still
+    // invariant for unsuppressable codes (they bypass cap below
+    // regardless), and policy work is a few hash lookups, negligible
+    // vs. the surrounding pushes.
     auto filtered = applyPolicy(std::move(d));
     if (!filtered) return;
 
@@ -362,7 +372,11 @@ std::string DiagnosticReporter::format(ParseDiagnostic const& d,
                                        BufferRegistry const& bufs) const {
     std::string out;
 
-    // Header line: severity[prefix]: [contextPrefix]expected/actual prose
+    // Header line: <severityName>[<codePrefix>]: <contextPrefix><expected/actual prose>
+    // The two bracket-rendered fields are distinct concepts: <codePrefix>
+    // is the single-letter band (`P`/`D`/`H`/...) from `diagnosticCodePrefix`,
+    // while <contextPrefix> is the per-target `[target=...]` stamp set by
+    // `program::mergeWithTargetContext`.
     // D-MERGE-DEDUP-PREFIX-COLLISION: contextPrefix is rendered here
     // (not stored in `actual`) so the dedup hash key — which includes
     // `actual` — sees the un-prefixed diagnostic.

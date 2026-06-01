@@ -69,10 +69,19 @@ namespace {
 // LSP mode owns its own emit path (LSP $/diagnostic), so this stderr
 // flush is the CLI/embed path only. (silent-failure-hunter F3 fold:
 // `severityName` prefix lets `grep error` filter correctly.)
+//
+// eb2c6c7 audit-fold (2026-06-01): `d.contextPrefix` is rendered
+// between the code-band and `d.actual` so multi-target runs route
+// per-target context to the operator's terminal. Pre-fold the prefix
+// was baked into `actual` so this print site saw it for free; post-
+// fold the prefix lives in its own field (excluded from dedup hash)
+// and every render path must spell out the inclusion. LSP
+// `composeMessage` performs the symmetric prepend.
 void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
     for (auto const& d : rep.all()) {
         std::cerr << severityName(d.severity)
                   << "[" << diagnosticCodeName(d.code) << "] "
+                  << d.contextPrefix
                   << d.actual << '\n';
     }
 }
@@ -468,11 +477,14 @@ int Program::compileFiles(
         //
         // Related concerns anchored separately:
         // D-MERGE-POLICY-IDEMPOTENCY (overrides absolute-set
-        // semantic), D-MERGE-DEDUP-PREFIX-COLLISION ([target=]
-        // prefix mutates dedup key + window-eviction across
-        // targets), D-MERGE-SCRATCH-FRESH (tripwire if scratch
+        // semantic), D-MERGE-SCRATCH-FRESH (tripwire if scratch
         // becomes reused), D-COMPILE-ONE-TARGET-NO-LEAK (contract
         // pin: compileOneTarget never writes to `rep` directly).
+        // D-MERGE-DEDUP-PREFIX-COLLISION was CLOSED at eb2c6c7:
+        // `mergeWithTargetContext` now stamps the per-target prefix
+        // into `contextPrefix` (excluded from hashKey) rather than
+        // mutating `actual`, so cross-target legitimate duplicates
+        // collapse at the merge destination.
         auto scratchCfg = reporterConfig;
         scratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
         scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();

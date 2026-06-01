@@ -11,11 +11,13 @@
 //
 // PINS the contract that severity-gating codes (architectural exclusions,
 // pending-plan announcements, lowering / verifier / linker invariants)
-// pass through DiagnosticReporter::applyPolicy unchanged regardless of
-// --suppress / overrides / warningsAsErrors. Without these pins, a
-// regression that drops the `isUnsuppressable` gate would silently
-// re-open the silent-drop surface every such code was introduced to
-// close — exactly the bug class D-FF2-UNSUPP closes.
+// bypass SILENCING mutations (--suppress drops + overrides demotion)
+// through DiagnosticReporter::applyPolicy. Elevation
+// (--warnings-as-errors) is INTENTIONALLY allowed — it strengthens the
+// signal rather than defeating the gate (eb2c6c7 refinement). Without
+// these pins, a regression that drops the `isUnsuppressable` gate
+// would silently re-open the silent-drop surface every such code was
+// introduced to close — exactly the bug class D-FF2-UNSUPP closes.
 
 using namespace dss;
 
@@ -217,6 +219,67 @@ TEST(Reporter, WarningsAsErrorsElevatesUnsuppressableWarning) {
         << "warningsAsErrors MUST promote unsuppressable Warning "
            "to Error so strict-mode operators get fail-loud exit "
            "code on partial-corruption signals";
+}
+
+TEST(Reporter, SuppressIsIgnoredForUnsuppressableWarning) {
+    // eb2c6c7 audit fold (test-analyzer Finding E): the pre-existing
+    // SuppressIsIgnoredForUnsuppressableCode pin uses an Error-severity
+    // member (H_ExternHasInitializer). Pin the same silencing-bypass
+    // contract for a Warning-severity unsuppressable member
+    // (F_BinaryReaderPartialCorruption) so a future regression that
+    // splits the gate by severity ("warnings can be suppressed because
+    // they're advisory") is caught.
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::F_BinaryReaderPartialCorruption);
+    DiagnosticReporter r{cfg};
+    r.report(makeDiag(DiagnosticCode::F_BinaryReaderPartialCorruption,
+                      DiagnosticSeverity::Warning));
+    EXPECT_EQ(r.all().size(), 1u)
+        << "Warning-severity unsuppressable code must reach `all_` "
+           "despite --suppress; silencing bypass applies regardless of "
+           "producer severity";
+}
+
+TEST(Reporter, OverrideCannotDemoteUnsuppressableWarning) {
+    // eb2c6c7 audit fold (test-analyzer Finding E): symmetric pin for
+    // the overrides arm of the silencing-bypass contract. Demoting a
+    // Warning-severity unsuppressable code to Info would silently
+    // ablate exit-code semantics under --warnings-as-errors (Info
+    // diagnostics don't trip the WAE elevation gate). The bypass MUST
+    // hold regardless of producer severity.
+    DiagnosticReporter::Config cfg;
+    cfg.policy.overrides[DiagnosticCode::F_BinaryReaderPartialCorruption]
+        = DiagnosticSeverity::Info;
+    DiagnosticReporter r{cfg};
+    r.report(makeDiag(DiagnosticCode::F_BinaryReaderPartialCorruption,
+                      DiagnosticSeverity::Warning));
+    ASSERT_EQ(r.all().size(), 1u);
+    EXPECT_EQ(r.all()[0].severity, DiagnosticSeverity::Warning)
+        << "overrides demotion (Warning→Info) must be blocked on "
+           "unsuppressable codes; severity must remain at producer level";
+}
+
+TEST(Reporter, UnsuppressableHonorsWarningsAsErrorsEvenWhenSuppressed) {
+    // eb2c6c7 audit fold (test-analyzer Finding F MEDIUM, folded
+    // because cheap): pin BOTH halves of the silencing-vs-elevation
+    // refinement in one fixture. A combined policy of (a) suppress on
+    // the code AND (b) warningsAsErrors must produce a single Error-
+    // severity diagnostic in `all_`. A regression that re-applies
+    // silencing under WAE would collapse all_ to size 0; a regression
+    // that drops WAE elevation under suppress would leave severity at
+    // Warning. Both half-failures are caught here.
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::F_BinaryReaderPartialCorruption);
+    cfg.policy.warningsAsErrors = true;
+    DiagnosticReporter r{cfg};
+    r.report(makeDiag(DiagnosticCode::F_BinaryReaderPartialCorruption,
+                      DiagnosticSeverity::Warning));
+    ASSERT_EQ(r.all().size(), 1u)
+        << "silencing-bypass: --suppress must not drop the diagnostic";
+    EXPECT_EQ(r.all()[0].severity, DiagnosticSeverity::Error)
+        << "elevation-honored: --warnings-as-errors must promote the "
+           "Warning to Error even when suppress is also set";
+    EXPECT_EQ(r.errorCount(), 1u);
 }
 
 TEST(Reporter, ForceReportRoutesUnsuppressableThroughApplyPolicyBypass) {

@@ -258,6 +258,40 @@ TEST(ReporterFormat, IncludesPrefixSeverityAndCaret) {
     EXPECT_NE(out.find("hint:  insert ';' before this token"), std::string::npos);
 }
 
+// eb2c6c7 audit fold (test-analyzer Finding C): pin that `format()`
+// actually renders `d.contextPrefix` between the code-band and the
+// expected/actual prose. The pre-existing `ContextPrefixDoesNotPollute
+// DedupKey` test pins HASH-key exclusion only — a regression that
+// dropped the `out += d.contextPrefix;` line in `format()` would
+// still pass that test (dedup still collapses) and every existing
+// format test (which leave `contextPrefix` empty). This is the
+// dedicated rendering pin.
+TEST(ReporterFormat, ContextPrefixAppearsBeforeExpectedActual) {
+    DiagnosticReporter r;
+    BufferRegistry bufs;
+    auto buf = SourceBuffer::fromString("var x = 1 + 2 }\n", "<inline>");
+    bufs.add(buf);
+
+    auto d = makeDiag(DiagnosticCode::P_UnexpectedToken,
+                      DiagnosticSeverity::Error,
+                      buf->id(),
+                      14, 15, "'}'");
+    d.contextPrefix = "[target=x86_64:elf64-x86_64-linux] ";
+    r.report(d);
+
+    auto const out = r.format(r.all()[0], bufs);
+    auto const prefixPos = out.find("[target=x86_64:elf64-x86_64-linux]");
+    auto const gotPos    = out.find("got '}'");
+    ASSERT_NE(prefixPos, std::string::npos)
+        << "contextPrefix must appear in the rendered header line; a "
+           "regression that drops `out += d.contextPrefix;` from "
+           "format() must not silently pass";
+    ASSERT_NE(gotPos, std::string::npos);
+    EXPECT_LT(prefixPos, gotPos)
+        << "contextPrefix must render BEFORE the expected/actual prose "
+           "(headline shape: severity[code]: <prefix><prose>)";
+}
+
 // Multi-byte span underlines with `^^^…` matching the span length, so
 // a regression that drops the loop and prints a single `^` would not
 // silently pass.

@@ -900,13 +900,24 @@ struct DSS_EXPORT ParseDiagnostic {
     // Optional human-friendly hint ("did you forget a semicolon?").
     std::string suggestion;
 
-    // Optional rendering-only prefix prepended to `actual` at format
-    // time (e.g. `[target=x86_64:elf64-x86_64-linux] ` stamped by
-    // `DiagnosticReporter::mergeFrom` so multi-target runs route
+    // Optional rendering-only prefix prepended to the expected/actual
+    // prose at `DiagnosticReporter::format()` time (e.g.
+    // `[target=x86_64:elf64-x86_64-linux] ` stamped by
+    // `program::mergeWithTargetContext` so multi-target runs route
     // per-target context to tooling without polluting the dedup hash).
-    // Excluded from `hashKey` so cross-source legitimate duplicates
-    // (same diagnostic from different targets) collapse correctly at
-    // the merge destination. D-MERGE-DEDUP-PREFIX-COLLISION fold.
+    // The CLI `drainDiagnosticsToStderr` and LSP `composeMessage`
+    // render paths perform the symmetric prepend. Excluded from
+    // `hashKey` so cross-source legitimate duplicates (same diagnostic
+    // from different targets) collapse correctly at the merge
+    // destination. D-MERGE-DEDUP-PREFIX-COLLISION fold.
+    //
+    // Anchored D-MERGE-CONTEXT-PREFIX-SIDE-TABLE: the empty-string
+    // overhead (~24 bytes SSO buffer) lands on every ParseDiagnostic,
+    // even single-target runs that never set the field. Negligible
+    // today; trigger to migrate to a side-table on the reporter (or a
+    // `std::unique_ptr<std::string>` 8-byte slot) is "perf hot path
+    // identifies diagnostic alloc as a bottleneck" OR
+    // "ParseDiagnostic exceeds 200 bytes".
     std::string contextPrefix;
 };
 

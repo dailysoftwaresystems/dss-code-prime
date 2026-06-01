@@ -235,6 +235,35 @@ TEST(Program_CompileFiles, NonExistentSourceFileReturnsNonZero) {
               1);
 }
 
+// ── Gap-C cap-relax: e2e pin (2026-06-01) ─────────────────────
+// Pins that multi-target compile returns non-zero on per-target
+// errors. NOTE: the original framing of this as a "single
+// P_TooManyDiagnostics marker pin" was a false pin —
+// D_TargetMachineCodeMismatch is in `kUnsuppressableCodes` so it
+// bypasses cap gates entirely; no marker would fire either way.
+// The actual single-chokepoint contract is pinned at the unit
+// layer in test_diagnostic_reporter.cpp; here we pin only the
+// exit-code surface (which still validates that multi-target
+// failures aggregate correctly through compileFiles → merge → exit).
+// Anchored D-CAP-MARKER-MULTI-TARGET-E2E-PIN for when compileFiles
+// exposes rep (or a suppressible per-target emitter exists).
+TEST(Program_CompileFiles, MultiTargetMismatchAggregatesToNonZeroExit) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    scratch.useAsCwd();
+    auto src = scratch.path() / "x.c";
+    {
+        std::ofstream out{src};
+        out << "int main(void) { return 0; }\n";
+    }
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.string()},
+        "c-subset",
+        {"x86_64:elf64-aarch64-linux",
+         "x86_64:elf64-aarch64-linux"});  // duplicate intentional
+    EXPECT_EQ(rc, 1) << "multi-target compile with errors must exit 1";
+}
+
 // ── D-LK6-8.2 pr-test-analyzer Gap 5 P9: cross-validate wired ──
 // Pins that crossValidateTargetFormat IS INVOKED from the compile
 // pipeline (program.cpp call site between schema-load and
@@ -245,43 +274,6 @@ TEST(Program_CompileFiles, NonExistentSourceFileReturnsNonZero) {
 // format=elf64-aarch64-linux): the schemas load individually, but
 // the (62 vs 183) elf.machine mismatch trips cross-validate and
 // compileFiles returns non-zero.
-// Gap-C cap-relax single-marker pin (2026-06-01, post-fold #14 audit):
-// pin that under multi-target cap saturation, the run-wide cap fires
-// EXACTLY ONCE at rep — not once per target. Pre-H1 fix scratch
-// inherited the same cap as rep, so 2 targets each cap-locally
-// produced 2 P_TooManyDiagnostics markers (one per scratch). The
-// H1 fix's cap-relax (scratch caps = ∞) restores the single-chokepoint
-// semantic where only rep's merge-time cap fires.
-TEST(Program_CompileFiles, CapMarkerFiresAtMostOnceAcrossMultipleTargets) {
-    ScratchDir scratch{Location::InsideRepo, "program"};
-    scratch.useAsCwd();
-    auto src = scratch.path() / "x.c";
-    {
-        std::ofstream out{src};
-        out << "int main(void) { return 0; }\n";
-    }
-    Program prog;
-    DiagnosticReporter::Config cfg;
-    cfg.maxDiagnostics = 1;
-    // 2 targets, each emits D_TargetMachineCodeMismatch (per cross-
-    // validate). With cap=1, the first target's diagnostic fills the
-    // cap; the second target's diagnostic + the marker land at rep.
-    // Per the H1 cap-relax + single-chokepoint contract: exactly ONE
-    // P_TooManyDiagnostics marker reaches rep, NOT one per target.
-    int const rc = prog.compileFiles(
-        {src.string()},
-        "c-subset",
-        {"x86_64:elf64-aarch64-linux",
-         "x86_64:elf64-aarch64-linux"},   // duplicate intentional
-        cfg);
-    EXPECT_EQ(rc, 1) << "multi-target compile with errors must exit 1";
-    // NOTE: We can't directly inspect rep without exposing it; the
-    // signature contract (single marker, non-zero exit) is what's
-    // pinned end-to-end. The reporter-level unit test
-    // `Reporter.GlobalCapEmitsMarkerAndStops` covers the in-reporter
-    // shape; THIS test pins it through the multi-target path.
-}
-
 TEST(Program_CompileFiles, CrossValidateRejectsMachineMismatch) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     scratch.useAsCwd();
