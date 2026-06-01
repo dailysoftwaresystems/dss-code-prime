@@ -188,3 +188,56 @@ TEST(ObjectFormatSchemaLoader, RelocationsNotArrayRejected) {
     })");
     ASSERT_FALSE(r.has_value());
 }
+
+// ── Shipped ARM64 ELF format.json files (D-LK6-1 sibling cycle) ──
+//
+// Pins that the shipped ARM64 ELF JSONs load cleanly AND their
+// relocation `name` cross-reference keys round-trip with the shipped
+// `arm64.target.json` (which the format.json's nativeId mapping
+// resolves against). Without these tests, a typo in either file
+// (e.g. "R_AARCH64_CALL26" vs "call26" key collision) would only
+// surface at link-time on the first ARM64 image build.
+
+TEST(ShippedArm64ElfReloc, ObjectVariantLoadsAndRoundTripsReloKinds) {
+    auto r = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(r.has_value());
+    auto const& fmt = **r;
+    EXPECT_EQ(fmt.name(), "elf64-aarch64-linux");
+
+    // Every reloc kind declared in arm64.target.json must have a
+    // matching format-side row (linker engine resolves by `kind`
+    // tag — the cross-reference IS the kind value).
+    auto tgtR = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(tgtR.has_value());
+    auto const& tgt = **tgtR;
+    for (auto const* name : {"call26", "adr_prel_pg_hi21",
+                              "add_abs_lo12_nc", "abs64"}) {
+        auto const* tri = tgt.relocationByName(name);
+        ASSERT_NE(tri, nullptr) << name << " missing from arm64.target.json";
+        auto const* fri = fmt.relocationByKind(tri->kind);
+        ASSERT_NE(fri, nullptr)
+            << "format-side has no row for kind=" << tri->kind.v
+            << " (target name=" << name << ")";
+    }
+}
+
+TEST(ShippedArm64ElfReloc, ExecVariantLoadsAndCarriesExecFields) {
+    auto r = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(r.has_value());
+    auto const& fmt = **r;
+    EXPECT_EQ(fmt.name(), "elf64-aarch64-linux-exec");
+    // exec variant carries entryPoint + interpreter + bindNow.
+    EXPECT_FALSE(fmt.elf().interpreter.empty());
+    EXPECT_TRUE(fmt.elf().bindNow);
+    // .text section has virtualAddress populated (sh_addr).
+    auto const* text = fmt.sectionByKind(SectionKind::Text);
+    ASSERT_NE(text, nullptr);
+    EXPECT_GT(text->virtualAddress, 0u);
+}
+
+TEST(ShippedArm64ElfReloc, MachineCodeIsEmAarch64) {
+    auto r = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(r.has_value());
+    // EM_AARCH64 = 183 per AArch64 ELF psABI.
+    EXPECT_EQ((*r)->elf().machine, 183);
+}
