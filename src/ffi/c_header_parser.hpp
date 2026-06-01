@@ -47,10 +47,12 @@ enum class HeaderReadErrorKind : std::uint8_t {
 // when a downstream lowering emitted a span-bearing diagnostic. Entry-point
 // errors that have no node-level locus (FileOpenFailed / EmptyImportLibrary /
 // GrammarLoadFailed / InvalidShippedPath) leave this default-constructed —
-// `at.buffer.valid() == false`, the canonical "no source location" value
-// per `hir/attributes/source_span.hpp:31-39`. No `std::optional` wrapper —
+// `at.isAbsent() == true`, the canonical "no source location" value per
+// `hir/attributes/source_span.hpp:30-60`. No `std::optional` wrapper —
 // `HirSourceLoc{}` is already the documented absent sentinel (post-fold #7
-// type-design T1 fold: one absence representation, not two).
+// type-design T1 fold: one absence representation, not two; post-fold #9
+// type-design Q1 anchor: `HirSourceLoc::absent()` is the canonical spelling
+// at producer sites).
 // Programmatic consumers (LSP, test pins, future introspection) read the
 // location directly from the struct rather than re-parsing reporter prose.
 struct DSS_EXPORT HeaderReadError {

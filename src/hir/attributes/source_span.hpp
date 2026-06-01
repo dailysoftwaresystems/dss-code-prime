@@ -42,13 +42,18 @@ struct HirSourceLoc {
     // non-empty span paired with InvalidBuffer is still semantically absent
     // (the span couldn't index into any registered buffer); a zero-length
     // span paired with a valid buffer is still present (caret-pointer at a
-    // token boundary). Consumers should prefer `is_present()` over
+    // token boundary). Consumers should prefer `isPresent()` over
     // `buffer.valid()` at call sites where the question is "do I have a
-    // locus?" — the predicate names the question correctly.
-    [[nodiscard]] constexpr bool is_present() const noexcept {
+    // locus?" — the predicate names the question correctly + decouples
+    // consumers from the BufferId implementation choice.
+    //
+    // Naming note: camelCase per codebase predicate convention (see
+    // `valid()`, `hasErrors()`, `empty()`). Earlier post-fold #8 shipped
+    // snake_case forms; post-fold #9 code-review fold harmonized.
+    [[nodiscard]] constexpr bool isPresent() const noexcept {
         return buffer.valid();
     }
-    [[nodiscard]] constexpr bool is_absent() const noexcept {
+    [[nodiscard]] constexpr bool isAbsent() const noexcept {
         return !buffer.valid();
     }
     [[nodiscard]] static constexpr HirSourceLoc absent() noexcept {

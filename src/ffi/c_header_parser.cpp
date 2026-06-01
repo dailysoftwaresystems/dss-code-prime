@@ -103,7 +103,7 @@ emitAndReturn(HeaderReadErrorKind kind, std::string detail,
         p.span   = loc->span;
     }
     reporter.report(std::move(p));
-    HeaderReadError err{kind, std::move(detail), HirSourceLoc{}};
+    HeaderReadError err{kind, std::move(detail), HirSourceLoc::absent()};
     if (loc != nullptr) err.at = *loc;
     return err;
 }
@@ -142,17 +142,59 @@ firstReportedErrorSpan(std::span<ParseDiagnostic const> diags) noexcept {
     return HirSourceLoc::absent();
 }
 
-// Post-fold #8 simplifier R4: collapses the two reporter-scan-with-
-// cause sites in `readCHeaderFromText` (semantic-fail wrap +
-// lowering-fail wrap). Mirrors the existing `firstConfigCauseInline`
-// pattern (named helper paired with `emitAndReturn`).
+// Post-fold #9 silent-failure H1: first underlying Error's `actual`
+// string for self-sufficient wrap messages. Mirror of
+// `firstConfigCauseInline` for the ParseDiagnostic band — used when
+// `--suppress=H_*` drops the underlying diagnostic so the FF2 wrap
+// would otherwise point at non-existent "preceding diagnostics".
+// Inlining the cause keeps the verdict self-sufficient under any
+// suppress policy.
+[[nodiscard]] std::string
+firstReportedErrorCauseInline(std::span<ParseDiagnostic const> diags) {
+    for (auto const& d : diags) {
+        if (d.severity != DiagnosticSeverity::Error) continue;
+        if (!d.actual.empty()) return d.actual;
+    }
+    return {};
+}
+
+// Post-fold #9 simplifier + M1 clamp: bound the reporter scan to
+// diagnostics emitted DURING this call. `std::min` clamp defends
+// against a future refactor that calls `truncateTo` (rollback) on
+// the reporter mid-call, which would otherwise make
+// `subspan(errStart)` UB when errStart > reporter.all().size().
+// Today the path is append-only — clamp is defense-in-depth.
+[[nodiscard]] std::span<ParseDiagnostic const>
+diagsSince(DiagnosticReporter const& reporter,
+           std::size_t               errStart) noexcept {
+    auto all = reporter.all();
+    return all.subspan(std::min(errStart, all.size()));
+}
+
+// Post-fold #8 simplifier (was "R4"; harmonized post-fold #9): the
+// two reporter-scan-with-cause sites in `readCHeaderFromText`
+// (semantic-fail wrap + lowering-fail wrap) share this shape.
+// Mirrors the existing `firstConfigCauseInline` pattern. Post-fold
+// #9 H1: when the span scan finds no locus (every underlying error
+// was suppressed by policy), inline the first Error's `actual`
+// string into the detail so the wrap stays self-sufficient under
+// `--suppress=H_*` (silent-failure HIGH fold).
 [[nodiscard]] HeaderReadError
 emitWithFirstReportedCause(HeaderReadErrorKind              kind,
                            std::string                      detail,
                            std::span<ParseDiagnostic const> diagsThisCall,
                            DiagnosticReporter&              reporter) {
     HirSourceLoc const cause = firstReportedErrorSpan(diagsThisCall);
-    HirSourceLoc const* causePtr = cause.is_present() ? &cause : nullptr;
+    HirSourceLoc const* causePtr = cause.isPresent() ? &cause : nullptr;
+    if (causePtr == nullptr) {
+        std::string const inlined =
+            firstReportedErrorCauseInline(diagsThisCall);
+        if (!inlined.empty()) {
+            detail += " (underlying cause: ";
+            detail += inlined;
+            detail += ")";
+        }
+    }
     return emitAndReturn(kind, std::move(detail), reporter, causePtr);
 }
 
@@ -242,7 +284,7 @@ readCHeaderFromText(std::string_view    text,
             HeaderReadErrorKind::HeaderParseFailed,
             std::string{"c-subset frontend rejected header '"}
                 + std::string{headerPathLabel} + "' — see preceding diagnostics.",
-            std::span<ParseDiagnostic const>{reporter.all()}.subspan(errStart),
+            diagsSince(reporter, errStart),
             reporter));
     }
 
@@ -263,7 +305,7 @@ readCHeaderFromText(std::string_view    text,
             HeaderReadErrorKind::HeaderParseFailed,
             std::string{"CST→HIR lowering rejected header '"}
                 + std::string{headerPathLabel} + "' — see preceding diagnostics.",
-            std::span<ParseDiagnostic const>{reporter.all()}.subspan(errStart),
+            diagsSince(reporter, errStart),
             reporter));
     }
 
@@ -272,7 +314,7 @@ readCHeaderFromText(std::string_view    text,
 
     auto locFor = [&sourceMap](HirNodeId n) -> HirSourceLoc {
         if (auto const* loc = sourceMap.tryGet(n)) return *loc;
-        return HirSourceLoc{};
+        return HirSourceLoc::absent();
     };
 
     std::vector<ImportSurface> rows;

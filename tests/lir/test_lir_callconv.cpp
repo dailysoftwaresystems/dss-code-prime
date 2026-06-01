@@ -69,12 +69,14 @@ lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0) {
     return out;
 }
 
-// Post-fold #7 simplifier R3: hoisted mov-walking helper, was inlined
-// in CalleeArgReceivesFromArgGprAcrossSysVAndMsX64 + the new
-// CcIndex1DrivesDifferentArgGprThanCc0. Returns true iff any `mov`
-// inst in `lir` touches `physOrd` as either result or a Reg-operand
-// source — used by tests that pin "this physical reg surfaces in the
-// post-callconv arg-loading sequence."
+// Mov-walking helper hoisted post-fold #7 (declared) and adopted
+// post-fold #8 R3 (both call sites). Used by
+// CcIndex1DrivesDifferentArgGprThanCc0 (post-fold #7 — positive +
+// negative pins) and CalleeArgReceivesFromArgGprAcrossSysVAndMsX64
+// (post-fold #8 R3 collapse of the 20-line inline walk). Returns true
+// iff any `mov` inst in `lir` touches `physOrd` as either result or a
+// Reg-operand source — used by tests that pin "this physical reg
+// surfaces in the post-callconv arg-loading sequence."
 [[nodiscard]] bool
 anyMovTouchesPhysReg(Lir const& lir, std::uint16_t physOrd,
                      std::uint16_t movOp) {
