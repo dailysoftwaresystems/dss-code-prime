@@ -577,14 +577,64 @@ TEST(LirCallconvAbi, CallSiteMaterializesArgIntoArgGprAndResultFromReturnGpr) {
         << " after the call (return-value mov)";
 }
 
-// (the prior VoidReturnCallEmitsNoPostCallReturnMov test was dropped:
-// the c-subset corpus available today produces only value-returning
-// calls, so the test was duplicating CallOpsCarryOnlySymbolRefAfterMaterialization
-// while pretending to cover the void-return branch. The structural
-// "no post-call mov when result is invalid" branch is folded into
-// the synthetic-MIR test below — IndirectCallRejectedLoud — which
-// constructs a precise LIR module and exercises the call-materialization
-// surface directly.)
+// VoidReturnCallExercisesNoPostCallReturnMov — synthesizes a LIR
+// call with a SymbolRef callee + zero args + InvalidLirReg result,
+// directly exercising the `if (result.valid())` false branch in
+// the call materializer (the dropped value-returning corpus test
+// was dishonest — it only exercised the true branch).
+TEST(LirCallconvAbi, VoidReturnCallExercisesNoPostCallReturnMov) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{55});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    // call <sym>, no args — result is implicitly invalid via
+    // InvalidLirReg passed below.
+    std::array<LirOperand, 1> callOps{LirOperand::makeSymbolRef(13)};
+    b.addInst(*callOp, InvalidLirReg, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{55};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    // The materialized output should have exactly one call inst (with
+    // single SymbolRef operand) and NO post-call return-value mov.
+    auto const movOp = sch.opcodeByMnemonic("mov");
+    ASSERT_TRUE(movOp.has_value());
+    std::uint32_t callCount = 0;
+    std::uint32_t movCount  = 0;
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b2 = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < result.lir.blockInstCount(b2); ++i) {
+                std::uint16_t const op =
+                    result.lir.instOpcode(result.lir.blockInstAt(b2, i));
+                if (op == *callOp) ++callCount;
+                if (op == *movOp)  ++movCount;
+            }
+        }
+    }
+    EXPECT_EQ(callCount, 1u);
+    EXPECT_EQ(movCount, 0u)
+        << "void-return call must NOT emit any post-call return-value mov "
+           "(`if (result.valid())` false branch in materializer)";
+}
 
 TEST(LirCallconvAbi, MultiArgFunctionMaterializesEveryArgGpr) {
     // A 3-arg function must materialize 3 arg movs (or omit those
@@ -747,6 +797,71 @@ TEST(LirCallconvAbi, RejectsIndirectCallLoud) {
         << "the reg-callee call must surface L_IndirectCallUnsupported";
     EXPECT_TRUE(sawAnchor)
         << "the diagnostic must cite the D-ML7-2.4 anchor for triage";
+}
+
+TEST(LirCallconvAbi, OrderableChainArgPassingSucceeds) {
+    // Regression for the post-fold predicate-inversion bug. Before
+    // the inversion fix, this sequence would have spuriously fired
+    // L_MoveCycleUnsupported:
+    //   arg 0 src=rsi (destined for argGprs[0]=rdi)
+    //   arg 1 src=rcx (destined for argGprs[1]=rsi)
+    // The valid in-order emission is `mov rdi, rsi; mov rsi, rcx` —
+    // rsi is read by the first mov BEFORE the second mov clobbers
+    // it. No cycle, no hazard. The detector must NOT fire here.
+    //
+    // The previous (inverted) predicate fired because
+    // `argMoves[1].dest = rsi == argMoves[0].src = rsi`. The
+    // corrected predicate (`argMoves[i].dest == argMoves[j].src`)
+    // checks for the true hazard direction and accepts this case.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+
+    auto const rcxOrd = sch.registerByName("rcx");
+    auto const rsiOrd = sch.registerByName("rsi");
+    ASSERT_TRUE(rcxOrd.has_value());
+    ASSERT_TRUE(rsiOrd.has_value());
+    LirReg const rcx = makePhysicalReg(*rcxOrd, LirRegClass::GPR);
+    LirReg const rsi = makePhysicalReg(*rsiOrd, LirRegClass::GPR);
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{11});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    // call <sym=g>, rsi, rcx
+    //   arg 0 src = rsi  -> dest = argGprs[0] = rdi  (rsi consumed)
+    //   arg 1 src = rcx  -> dest = argGprs[1] = rsi  (orderable: rdi
+    //                                                  not in any src)
+    std::array<LirOperand, 3> callOps{
+        LirOperand::makeSymbolRef(5),
+        LirOperand::makeReg(rsi),
+        LirOperand::makeReg(rcx),
+    };
+    b.addInst(*callOp, InvalidLirReg, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{11};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    EXPECT_TRUE(result.ok())
+        << "orderable arg-passing chain must NOT trip the cycle "
+           "detector (predicate-inversion regression check)";
+    for (auto const& d : ccRep.all()) {
+        EXPECT_NE(d.code, DiagnosticCode::L_MoveCycleUnsupported)
+            << "no L_MoveCycleUnsupported expected on orderable chain";
+    }
 }
 
 TEST(LirCallconvAbi, MoveCycleInArgPassingFailsLoud) {

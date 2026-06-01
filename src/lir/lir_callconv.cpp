@@ -505,35 +505,56 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     if (!destReg.has_value()) return false;
                     argMoves.push_back({*destReg, srcReg});
                 }
-                // Move-cycle detection (silent-failure-hunter CRITICAL
-                // F1 fold). The naive emit-in-order shape is correct
-                // ONLY when no destination of a NOT-yet-emitted mov is
-                // also a source of an ALREADY-emitted mov — otherwise
-                // the second mov reads a clobbered register. A trivial
-                // O(N^2) scan suffices for the v1 N<=6 (SysV) /
-                // N<=4 (MS-x64) GPR-arg shape.
+                // Move-ordering hazard detection (silent-failure-hunter
+                // CRITICAL F1 fold + post-fold inversion fix). The
+                // naive emit-in-order shape is correct ONLY when, for
+                // every pair (i, j) with i < j, emitting move i does
+                // not clobber a register that move j still needs to
+                // read. The hazard predicate is:
                 //
-                // Detection: for each move i, check whether its source
-                // is the destination of any subsequent move j>i AND
-                // dest_j != src_j (i.e. j is a real mov, not a no-op).
-                // If yes, the in-order emission would clobber src_i
-                // before move i runs — fail loud anchored to D-ML7-2.3.
+                //     dest_i == src_j   for some j > i
+                //
+                // (Move i WRITES dest_i. Move j READS src_j. If
+                // dest_i == src_j and i runs first, the value move j
+                // needed is gone.)
+                //
+                // The previous version of this loop used the inverted
+                // predicate `dest_j == src_i` which is SAFE in in-order
+                // emission (move i reads src_i before move j writes
+                // dest_j) — that loop accidentally still caught true
+                // 2-cycle swaps because swaps satisfy BOTH predicates
+                // symmetrically, but it false-rejected valid orderable
+                // sequences like (arg0: rdi←rsi, arg1: rsi←rcx). The
+                // current predicate fires on the true hazard only.
+                //
+                // The detector is conservative: it rejects any
+                // orderable chain where a true cycle is structurally
+                // possible (e.g. (a←b, b←a) — a real swap) AND
+                // multi-step shapes that the in-order emission cannot
+                // handle without re-ordering. Proper parallel-copy
+                // resolution (topo-sort + scratch-reg cycle breaking)
+                // is anchored at D-ML7-2.3 and would accept all
+                // orderable shapes by re-sorting moves before emit.
                 for (std::size_t i = 0; i < argMoves.size(); ++i) {
                     if (argMoves[i].dest.id == argMoves[i].src.id) continue;
                     for (std::size_t j = i + 1; j < argMoves.size(); ++j) {
                         if (argMoves[j].dest.id == argMoves[j].src.id) continue;
-                        if (argMoves[j].dest.id == argMoves[i].src.id) {
+                        // Hazard: move i writes dest_i which move j
+                        // still needs to read as src_j.
+                        if (argMoves[i].dest.id == argMoves[j].src.id) {
                             report(reporter,
                                    DiagnosticCode::L_MoveCycleUnsupported,
                                    DiagnosticSeverity::Error,
                                    std::format("callconv: call inst {} arg-"
-                                               "passing moves form a cycle "
-                                               "(move {} src reg #{} is the "
-                                               "destination of later move {}); "
-                                               "parallel-copy resolution is "
-                                               "anchored at D-ML7-2.3",
+                                               "passing moves have an order "
+                                               "hazard (move {} dest reg #{} "
+                                               "is the source of later move "
+                                               "{} — emitting in order would "
+                                               "clobber it); parallel-copy "
+                                               "resolution is anchored at "
+                                               "D-ML7-2.3",
                                                inst.v, i,
-                                               static_cast<unsigned>(argMoves[i].src.id),
+                                               static_cast<unsigned>(argMoves[i].dest.id),
                                                j));
                             return false;
                         }

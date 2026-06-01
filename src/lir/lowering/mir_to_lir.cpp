@@ -730,7 +730,7 @@ struct Lowerer {
         // pass leave the callee operand intact while just rewriting
         // the args. Indirect-call form (callee is any other MIR
         // instruction — IntToPtr from a function pointer load, etc.)
-        // is anchored at D-ML7-2-3 (an indirect-call schema variant
+        // is anchored at D-ML7-2.4 (an indirect-call schema variant
         // + the assembler-side encoder for `call <reg>` must land
         // together; today the assembler trips on it loud).
         MirInstId const calleeMir = operands[0];
