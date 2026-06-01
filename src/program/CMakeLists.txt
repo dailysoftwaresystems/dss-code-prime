@@ -2,6 +2,8 @@ add_library(program OBJECT
     program.cpp
     target_spec.cpp
     compile_pipeline.cpp
+    cli_args.cpp
+    input_resolver.cpp
 )
 
 target_include_directories(program PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

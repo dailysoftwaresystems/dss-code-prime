@@ -41,13 +41,16 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // review #1 (silent-failure-hunter F9 — eliminates the inline drain
 // duplicate that risked future divergence).
 //
-// **Latent hazard** (anchored D-LK10-7 — not load-bearing today):
+// **Policy-aware semantics (D-LK10-7 closed at LK10 cycle 3):**
 // `dst.report(d)` re-traverses `dst`'s `DiagnosticPolicy` (suppress
-// / overrides / warningsAsErrors), dedup window, per-code cap, and
-// hard cap. With the driver's default-constructed reporter (no
-// policy) the behavior is faithful. Once `Program` gains a policy
-// knob, callers must decide whether to drain through-policy (current
-// behavior) or by-passing it (a future `copyDiagnosticsRaw` variant).
+// / overrides / warningsAsErrors). With the CLI now wiring
+// `--warnings-as-errors` and `--suppress=<code>` through a
+// `DiagnosticReporter::Config` to `compileFiles`/`compileDirectory`,
+// the policy ALSO applies to per-tier drains coming through
+// `copyDiagnostics`. That's the intended shape — the user's
+// `--suppress` applies uniformly across the front-half and back-half
+// of the pipeline. (D-LK10-7's `copyDiagnosticsRaw` alternative
+// becomes unnecessary; this routing IS the design.)
 DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
                                  DiagnosticReporter&       dst);
 

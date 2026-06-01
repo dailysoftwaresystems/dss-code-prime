@@ -100,8 +100,12 @@ int main(int argc, char* argv[]) {
         std::ifstream f((outputBase / "unknown_flag.txt").string());
         std::string body((std::istreambuf_iterator<char>(f)),
                           std::istreambuf_iterator<char>());
-        check("Mentions unrecognized flag",
-              body.find("unrecognized flag") != std::string::npos,
+        // LK10 cycle 3 (2026-06-01) replaced the LSP-only argv parser
+        // with the rich CLI dispatcher. The unknown-flag message
+        // changed from "unrecognized flag:" to "error: unknown flag
+        // '<flag>'" — match the new wording.
+        check("Mentions unknown flag",
+              body.find("unknown flag") != std::string::npos,
               "stderr: " + body);
     }
     std::cout << std::endl;

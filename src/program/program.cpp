@@ -11,7 +11,9 @@
 #include "lsp/schema_cache.hpp"
 #include "lsp/thread_pool.hpp"
 #include "lsp/transport.hpp"
+#include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
+#include "program/input_resolver.hpp"
 #include "program/target_spec.hpp"
 
 #include <algorithm>
@@ -31,34 +33,8 @@ namespace dss {
 
 namespace {
 
-// LSP mode is invoked by `dss-code-prime --lsp [--schema-dir=PATH]`.
-// Order-independent.
-struct LspFlags {
-    bool                                 lspMode = false;
-    std::optional<std::filesystem::path> schemaDir;
-    std::vector<std::string>             unknown;
-};
-
-[[nodiscard]] LspFlags parseLspFlags(int argc, char* argv[]) {
-    LspFlags out;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view a{argv[i]};
-        if (a == "--lsp") {
-            out.lspMode = true;
-        } else if (a.starts_with("--schema-dir=")) {
-            out.schemaDir = std::filesystem::path{
-                std::string{a.substr(std::string_view{"--schema-dir="}.size())}};
-        } else if (a.starts_with("--")) {
-            // Track unknown long-flags so a typo (`--Lsp`) doesn't
-            // silently fall through into a different code path.
-            out.unknown.emplace_back(a);
-        }
-    }
-    return out;
-}
-
-[[nodiscard]] int runLspMode(LspFlags const& flags) {
-    lsp::SchemaCache cache{flags.schemaDir};
+[[nodiscard]] int runLspMode(CliArgs const& args) {
+    lsp::SchemaCache cache{args.lspSchemaDir};
     auto transport = std::make_unique<lsp::StdioTransport>();
     // Use hardware concurrency, clamped to [1, 8]. The clamp avoids
     // spawning 64-thread pools on big servers — the parser is CPU-
@@ -68,6 +44,22 @@ struct LspFlags {
     auto executor = std::make_unique<lsp::ThreadPool>(workers);
     lsp::LspServer server{std::move(transport), std::move(executor), cache};
     return server.run();
+}
+
+// Build a `DiagnosticReporter::Config` from the CLI's policy flags
+// (`--warnings-as-errors`, `--suppress=<code>`). The Config is
+// constructed at Program::run and passed into the policy-aware
+// compile* overloads — that lets the CLI policy apply uniformly to
+// the per-tier diagnostics drained into the run-wide reporter.
+// (D-LK10-7 closure: the policy knob arriving at Program::compileFiles
+// is the trigger that closes the D-LK10-7 anchor.)
+[[nodiscard]] DiagnosticReporter::Config buildReporterConfig(CliArgs const& args) {
+    DiagnosticReporter::Config cfg;
+    cfg.policy.warningsAsErrors = args.warningsAsErrors;
+    for (auto const code : args.suppress) {
+        cfg.policy.suppress.insert(code);
+    }
+    return cfg;
 }
 
 // Drain reporter diagnostics to stderr. The driver is the boundary
@@ -238,28 +230,46 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 } // namespace
 
 int Program::run(int argc, char* argv[]) {
-    const auto flags = parseLspFlags(argc, argv);
-    if (flags.lspMode) {
-        return runLspMode(flags);
-    }
-    // Reject unknown long-flags loudly so a typo (`--Lsp`) doesn't
-    // silently fall through into the placeholder path below.
-    if (!flags.unknown.empty()) {
-        for (auto const& u : flags.unknown) {
-            std::cerr << "unrecognized flag: " << u << std::endl;
-        }
-        std::cerr << "usage: dss-code-prime [--lsp [--schema-dir=PATH]]"
-                  << std::endl;
+    // LK10 cycle 3: rich CLI argument dispatch.
+    auto parsed = parseCliArgs(argc, argv);
+    if (!parsed) {
+        std::cerr << "error: " << parsed.error().detail << "\n\n"
+                  << cliHelpText();
         return 2;
     }
+    CliArgs const& args = *parsed;
 
-    // LK10 cycle 3 will wire CLI compile flags (e.g. `--compile
-    // FILES... --target T:F --output PATH`) into compileFiles /
-    // compileDirectory here. Until then the no-arg invocation
-    // remains a no-op identity check; the programmatic API
-    // (compileFiles / compileDirectory / compileProject) is the
-    // load-bearing entry surface for library + FFI consumers.
-    std::cout << "DSS Code Prime compiler ready." << std::endl;
+    if (args.helpMode) {
+        std::cout << cliHelpText();
+        return 0;
+    }
+    if (args.lspMode) {
+        return runLspMode(args);
+    }
+    if (args.projectPath.has_value()) {
+        return compileProject(*args.projectPath);
+    }
+    if (!args.transpileFiles.empty()) {
+        return transpile(args.transpileFiles, args.languageName,
+                         args.targets);
+    }
+    auto const cfg = buildReporterConfig(args);
+    if (args.directoryPath.has_value()) {
+        return compileDirectory(*args.directoryPath, args.languageName,
+                                args.targets, args.directoryMode, cfg);
+    }
+    if (!args.sourceFiles.empty()) {
+        return compileFiles(args.sourceFiles, args.languageName,
+                            args.targets, cfg);
+    }
+
+    // No mode flags set — print the ready message + usage hint. The
+    // back-compat path for `dss-code-prime` with zero arguments. The
+    // parseCliArgs `NoModeSelected` guard already rejects the case
+    // where the user supplied options without a mode flag, so we
+    // know all CliArgs are at their defaults here.
+    std::cout << "DSS Code Prime compiler ready.\n"
+              << "Run `dss-code-prime --help` for usage.\n";
     return 0;
 }
 
@@ -277,12 +287,54 @@ int Program::compileProject(const std::string& projectFilePath) {
     return 1;
 }
 
+int Program::transpile(
+    const std::vector<std::string>& sourceFiles,
+    const std::string& languageName,
+    const std::vector<std::string>& targets
+) {
+    // Plan 10 (source-translation, ST1..ST6) owns the actual
+    // transpile engine: `*.map.json` rule files + HIR→HIR walker +
+    // target-language CST builder + pretty-printer. v1: fails loud
+    // with `D_PlanNotLanded` citing plan 10. The CLI dispatcher
+    // routes `--transpile <files>` here so the surface is parsable
+    // and stable across plan 10's arrival.
+    DiagnosticReporter rep;
+    std::string detail =
+        "transpile: source-to-source translation is not yet "
+        "implemented — plan 10 (`*.map.json` + HIR pivot + target "
+        "CST builder, ST1..ST6) owns the engine. ";
+    detail += "Inputs: " + std::to_string(sourceFiles.size())
+            + " source file(s)";
+    if (!languageName.empty()) {
+        detail += ", source language '" + languageName + "'";
+    }
+    if (!targets.empty()) {
+        detail += ", " + std::to_string(targets.size())
+                + " target(s) (first: '" + targets.front() + "')";
+    }
+    detail += ".";
+    emitDriver(rep, DiagnosticCode::D_PlanNotLanded, std::move(detail));
+    drainDiagnosticsToStderr(rep);
+    return 1;
+}
+
 int Program::compileFiles(
     const std::vector<std::string>& sourceFiles,
     const std::string& languageName,
     const std::vector<std::string>& targets
 ) {
-    DiagnosticReporter rep;
+    // Default-policy delegate (back-compat for the C-ABI surface).
+    return compileFiles(sourceFiles, languageName, targets,
+                        DiagnosticReporter::Config{});
+}
+
+int Program::compileFiles(
+    const std::vector<std::string>& sourceFiles,
+    const std::string& languageName,
+    const std::vector<std::string>& targets,
+    DiagnosticReporter::Config const& reporterConfig
+) {
+    DiagnosticReporter rep{reporterConfig};
 
     if (sourceFiles.empty()) {
         emitDriver(rep, DiagnosticCode::D_EmptyInput,
@@ -370,17 +422,20 @@ int Program::compileDirectory(
     const std::string& languageName,
     const std::vector<std::string>& targets
 ) {
-    DiagnosticReporter rep;
+    // Default-policy + default-recursive delegate (back-compat).
+    return compileDirectory(directoryPath, languageName, targets,
+                            InputResolver::Mode::Recursive,
+                            DiagnosticReporter::Config{});
+}
 
-    fs::path const root{directoryPath};
-    std::error_code ec;
-    if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
-        emitDriver(rep, DiagnosticCode::D_FileNotFound,
-                   "compileDirectory: '" + directoryPath
-                   + "' does not exist or is not a directory.");
-        drainDiagnosticsToStderr(rep);
-        return 1;
-    }
+int Program::compileDirectory(
+    const std::string& directoryPath,
+    const std::string& languageName,
+    const std::vector<std::string>& targets,
+    InputResolver::Mode mode,
+    DiagnosticReporter::Config const& reporterConfig
+) {
+    DiagnosticReporter rep{reporterConfig};
 
     auto grammarR = GrammarSchema::loadShipped(languageName);
     if (!grammarR.has_value()) {
@@ -393,62 +448,25 @@ int Program::compileDirectory(
     }
     auto grammar = *grammarR;
 
-    // Resolve files: recurse `directoryPath`, keep regular files
-    // whose extension matches the schema's declared
-    // `fileExtensions`. Plan 00 §4.1.3 specifies an `InputResolver`
-    // utility for this; LK10 cycle 3 will hoist it once CLI flags
-    // (--recursive / --extension) give it a second policy axis.
-    // Anchor: D-LK10-1.
+    // Resolve files via the hoisted `InputResolver` (D-LK10-1
+    // closure — landed at LK10 cycle 3). The recursive vs flat
+    // policy axis is now an explicit caller parameter, mirroring
+    // plan 00 §4.1.3's spec. `fileExtensions()` returns a
+    // `std::span<std::string const>` directly compatible with the
+    // resolver's signature — no intermediate copy needed.
     std::vector<std::string> sourceFiles;
-    auto const exts = grammar->fileExtensions();
-    fs::recursive_directory_iterator it(root, ec);
-    if (ec) {
-        // Construction-time failure: the root iterator couldn't open
-        // even the first entry (permission on `root`, race delete).
-        // Post-fold review #1 split from `D_FileNotFound` (which now
-        // means "input path missing") to `D_DirectoryScanFailed`
-        // (this site + the mid-scan failure below).
-        emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
-                   "compileDirectory: failed to open directory '"
-                   + directoryPath + "': " + ec.message());
-        drainDiagnosticsToStderr(rep);
-        return 1;
-    }
-    fs::recursive_directory_iterator const end{};
-    for (; it != end; it.increment(ec)) {
-        if (ec) {
-            // Mid-scan failure (permission denied on a subdir, race
-            // delete, ...) — surface loudly. Without this the scan
-            // silently truncates and operator sees a partial build
-            // with zero error indication. (silent-failure-hunter F6
-            // fold + post-fold review #1 code split.)
-            emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
-                       "compileDirectory: directory-scan interrupted "
-                       "after partial enumeration of '" + directoryPath
-                       + "': " + ec.message());
-            drainDiagnosticsToStderr(rep);
-            return 1;
-        }
-        if (!it->is_regular_file()) continue;
-        auto const ext = it->path().extension().string();
-        auto const match = std::any_of(exts.begin(), exts.end(),
-            [&](auto const& e) { return e == ext; });
-        if (match) sourceFiles.push_back(it->path().generic_string());
-    }
-    // Deterministic order for reproducible builds.
-    std::sort(sourceFiles.begin(), sourceFiles.end());
-
-    if (sourceFiles.empty()) {
-        emitDriver(rep, DiagnosticCode::D_EmptyInput,
-                   "compileDirectory: no files in '" + directoryPath
-                   + "' match the '" + languageName
-                   + "' language's fileExtensions.");
+    if (!InputResolver::resolveDirectory(
+            fs::path{directoryPath}, grammar->fileExtensions(),
+            mode, sourceFiles, rep)) {
         drainDiagnosticsToStderr(rep);
         return 1;
     }
 
     // Delegate to compileFiles — same CU + per-target loop shape.
-    return compileFiles(sourceFiles, languageName, targets);
+    // Pass the reporter config through so `--warnings-as-errors`
+    // + `--suppress=<code>` apply uniformly across the directory
+    // scan AND the per-tier IR drains.
+    return compileFiles(sourceFiles, languageName, targets, reporterConfig);
 }
 
 } // namespace dss
