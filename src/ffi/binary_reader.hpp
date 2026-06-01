@@ -21,11 +21,11 @@
 // = add a magic check + a per-format `readImports*` implementation
 // in `ffi/<format>_binary_reader.{hpp,cpp}` + a dispatch arm.
 //
-// **Closure scope of this anchor (FF1, 2026-06-01 Track B)**: ELF
-// reader landing. PE + Mach-O readers anchored separately (FF1-PE,
-// FF1-MachO) — same dispatch shape, different binary-parser body.
-// The detection arm for non-ELF formats fails loud with
-// `F_UnknownFormat` until those land.
+// **Closure scope**: ELF + PE readers landed (FF1-ELF 2026-06-01,
+// FF1-PE post-fold #14). Mach-O reader still anchored separately
+// (FF1-MachO) — same dispatch shape, different binary-parser body.
+// The detection arm for Mach-O fails loud with
+// `F_UnsupportedBinaryFormat` until that lands.
 
 namespace dss::ffi {
 

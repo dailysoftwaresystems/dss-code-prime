@@ -250,13 +250,19 @@ TEST(BinaryReader, UnknownMagicFailsLoud) {
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnknownFormat);
 }
 
-TEST(BinaryReader, PeMagicEmitsUnsupportedFormatCitingFutureAnchor) {
-    std::vector<std::uint8_t> pe = {'M', 'Z', 0x00, 0x00, 0x00};
+TEST(BinaryReader, PeMagicTooShortToBeValidIsCorrupted) {
+    // FF1-PE landed post-fold #14. PE magic ('MZ') now dispatches to
+    // readPe(); a too-short PE buffer (no PE-signature header) fails
+    // loud as CorruptedBinary (not UnsupportedFormat as before).
+    std::vector<std::uint8_t> pe(64, 0);
+    pe[0] = 'M'; pe[1] = 'Z';
+    // DOS[0x3C] = 0 — PE signature would be at offset 0 which has 'MZ' not 'PE\0\0'.
     DiagnosticReporter rep;
     auto r = readImportsFromBytes(pe, "fake.dll", rep);
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnsupportedFormat);
-    EXPECT_NE(r.error().detail.find("FF1-PE"), std::string::npos);
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("PE signature missing"),
+              std::string::npos);
 }
 
 TEST(BinaryReader, MachoMagicEmitsUnsupportedFormatCitingFutureAnchor) {
@@ -494,11 +500,14 @@ TEST(BinaryReaderReporter, UnknownMagicAlsoEmitsFCodeThroughReporter) {
 }
 
 TEST(BinaryReaderReporter, PeMagicAlsoEmitsFCodeThroughReporter) {
+    // FF1-PE landed post-fold #14. A 4-byte PE-magic buffer dispatches
+    // to readPe() which fails loud at the "file shorter than DOS
+    // header" guard → emits F_CorruptedBinary, not F_UnsupportedBinaryFormat.
     DiagnosticReporter rep;
     std::vector<std::uint8_t> pe = {'M', 'Z', 0x00, 0x00};
     auto r = readImportsFromBytes(pe, "fake.dll", rep);
     ASSERT_FALSE(r.has_value());
-    EXPECT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_CorruptedBinary), 1u);
 }
 
 TEST(BinaryReaderReporter, Elf32AlsoEmitsFCodeThroughReporter) {

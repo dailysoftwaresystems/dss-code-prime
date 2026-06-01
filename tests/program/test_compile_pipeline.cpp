@@ -297,6 +297,30 @@ TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
         1);
 }
 
+// Post-fold #14 test-analyzer Gap 3: end-to-end driver pin that
+// `--suppress=H_ExternHasInitializer` does NOT silence the build
+// failure. Without the D-FF2-UNSUPP gate, the reporter would drop
+// the H_* diagnostic on the floor, `errorCount()` would return 0,
+// and `compileFiles` would silently exit 0 despite the broken input
+// — exactly the silent-drop surface the unsuppressable-codes table
+// closes. Reporter-level tests pin the gate at the policy layer;
+// THIS test pins it through the full pipeline (CLI policy →
+// DiagnosticReporter::Config → analyze → lowerToHir → exit code).
+TEST(Program_CompileFiles, SuppressedHExternHasInitializerStillReturnsNonZero) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "ext_init.c", "extern int x = 5;\n");
+    scratch.useAsCwd();
+    Program prog;
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::H_ExternHasInitializer);
+    EXPECT_EQ(prog.compileFiles({src.generic_string()},
+                                "c-subset",
+                                {"x86_64:elf64-x86_64-linux"},
+                                cfg),
+              1);
+}
+
 // ── compileDirectory ──────────────────────────────────────────
 
 TEST(Program_CompileDirectory, WiresThroughForMatchingFiles) {

@@ -323,6 +323,59 @@ TEST(MirLoweringExtern, MultipleExternsAcrossTwoLibrariesPropagateInOrder) {
               "/usr/lib/libobjc.A.dylib");
 }
 
+TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
+    // Post-fold #14 D-FF2-5 audit pin: `extern int x;` (and the
+    // array form `extern int x[10];` post-fold #11) lowers to a
+    // HIR `ExternGlobal` node correctly — but the MIR builder at
+    // `src/mir/lowering/hir_to_mir.cpp:1933-1937` currently rejects
+    // the kind with `unsupported()` because the FFI side of
+    // ExternGlobal (data-symbol ingestion + linker symbol-table
+    // emission) is not yet implemented end-to-end.
+    //
+    // PRE-FOLD #11: `extern int x[10];` silently lost its array
+    // type (externDecl had no arraySuffix configured); lowered as
+    // `int`. Post-fold #11 the array type survives semantic
+    // analysis but the MIR builder still rejects ExternGlobal
+    // wholesale.
+    //
+    // This test pins the CURRENT loud-rejection behavior. A future
+    // fold landing real ExternGlobal MIR support (extending
+    // `collectExterns` + `ExternImport` with TypeId, etc. — see
+    // anchor D-FF2-5-FEATURE) will replace this test with the
+    // positive pin. Until then, a regression that silently accepted
+    // ExternGlobal without lowering would slip past the audit; this
+    // test catches that exact silent-accept surface.
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c-subset"};
+    constexpr std::uint32_t kExternGlobalSymV = 31;
+    HirNodeId const eg =
+        b.makeExternGlobal(i32, /*symbol=*/kExternGlobalSymV);
+    HirNodeId const root = b.makeModule(std::array{eg});
+    Hir hir = std::move(b).finish(root);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr,
+                             MirLoweringConfig{},
+                             /*ffiMap=*/nullptr);
+    EXPECT_FALSE(result.ok)
+        << "ExternGlobal currently fails loud at MIR lowering — "
+           "silent-accept would slip a feature gap past the audit";
+    EXPECT_TRUE(result.externImports.empty());
+    bool sawUnsupported = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::H_UnsupportedLoweringForKind) {
+            sawUnsupported = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawUnsupported)
+        << "MIR builder must emit H_UnsupportedLoweringForKind for "
+           "ExternGlobal until full lowering support lands";
+}
+
 TEST(MirLoweringExtern, LowerToLirPropagatesExternsToMirToLirResult) {
     // pr-test-analyzer Gap 2 fold: a non-empty externs vector
     // passed to `lowerToLir` propagates verbatim into
