@@ -915,9 +915,21 @@ struct DSS_EXPORT ParseDiagnostic {
     // overhead (~24 bytes SSO buffer) lands on every ParseDiagnostic,
     // even single-target runs that never set the field. Negligible
     // today; trigger to migrate to a side-table on the reporter (or a
-    // `std::unique_ptr<std::string>` 8-byte slot) is "perf hot path
-    // identifies diagnostic alloc as a bottleneck" OR
-    // "ParseDiagnostic exceeds 200 bytes".
+    // `std::unique_ptr<std::string>` 8-byte slot) is "ParseDiagnostic
+    // exceeds 200 bytes" (sizeof check) OR "Tracy/perf-record on a
+    // diagnostic-heavy compile attributes >5% of compile time to
+    // ParseDiagnostic alloc/copy".
+    //
+    // Anchored D-MERGE-CONTEXT-PREFIX-CLOBBER: `mergeWithTargetContext`
+    // uses `copy.contextPrefix = prefix;` (assignment, not append).
+    // Today this is invariant because `mergeWithTargetContext` is the
+    // ONLY producer; a future second producer (e.g. per-file `[file=]`
+    // stamping under a multi-source merge wrapping a multi-target
+    // merge) would have its prefix silently clobbered. Trigger: first
+    // additional contextPrefix writer outside mergeWithTargetContext.
+    // Resolution: switch the merge to append (`copy.contextPrefix +=
+    // prefix`) OR move contextPrefix to a stack (vector<string>) so
+    // nested merges preserve outer context.
     std::string contextPrefix;
 };
 

@@ -107,3 +107,55 @@ TEST(DiagnosticTranslator, SerializePublishDiagnosticsIncludesUriVersionAndArray
     EXPECT_NE(wire.find(R"("source":"dss-code-prime")"), std::string::npos);
     EXPECT_NE(wire.find(R"("message":"hello")"), std::string::npos);
 }
+
+// 0f7d714 audit-fold (2026-06-01): pin that LSP composeMessage actually
+// prepends `d.contextPrefix`. The mirror of
+// ContextPrefixAppearsBeforeExpectedActual in test_diagnostic_reporter.cpp
+// — without this pin, a regression dropping the `d.contextPrefix +`
+// prefix on the composeMessage return would silently re-open the
+// multi-target LSP wire skew the eb2c6c7 audit-fold closed.
+TEST(DiagnosticTranslator, ContextPrefixIsPrependedToMessage) {
+    auto buf = SourceBuffer::fromString("let x = 1;", "t");
+    auto d = basicDiag(ByteOffset{4}, ByteOffset{5});
+    d.contextPrefix = "[target=x86_64:elf64-x86_64-linux] ";
+    auto out = dss::lsp::translateDiagnostic(d, *buf);
+    EXPECT_EQ(out.message,
+              "[target=x86_64:elf64-x86_64-linux] "
+              "expected ';' \xE2\x80\x94 got '}'");
+}
+
+// 0f7d714 audit-fold (2026-06-01): pin the empty-prose code-name
+// fallback. composeMessage restructured to build prose first then
+// prepend prefix at end specifically so this fallback survives
+// non-empty contextPrefix. A regression that gates the fallback on
+// `(prose+prefix).empty()` would emit a useless prefix-only
+// message; this test fails that case loudly.
+TEST(DiagnosticTranslator, EmptyProseFallsBackToCodeName) {
+    auto buf = SourceBuffer::fromString("x", "t");
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::P_UnexpectedToken;
+    d.severity = DiagnosticSeverity::Error;
+    d.span     = SourceSpan::of(ByteOffset{0}, ByteOffset{1});
+    // expected/actual/suggestion all default-empty.
+    auto out = dss::lsp::translateDiagnostic(d, *buf);
+    EXPECT_EQ(out.message, "P_UnexpectedToken")
+        << "all-empty prose must fall back to the bare code name; "
+           "without the fallback the LSP message field would be \"\"";
+}
+
+// 0f7d714 audit-fold: combined edge case — non-empty contextPrefix
+// + all-empty prose. The fallback assigns `prose = codeName(d.code)`
+// BEFORE the prefix is prepended, so the final message must contain
+// both. A regression that gates the fallback on the prefixed string
+// being empty would silently produce a prefix-only message.
+TEST(DiagnosticTranslator, ContextPrefixPlusEmptyProseEmitsPrefixAndCodeName) {
+    auto buf = SourceBuffer::fromString("x", "t");
+    ParseDiagnostic d;
+    d.code          = DiagnosticCode::P_UnexpectedToken;
+    d.severity      = DiagnosticSeverity::Error;
+    d.span          = SourceSpan::of(ByteOffset{0}, ByteOffset{1});
+    d.contextPrefix = "[target=arm64:elf64-aarch64-linux] ";
+    auto out = dss::lsp::translateDiagnostic(d, *buf);
+    EXPECT_EQ(out.message,
+              "[target=arm64:elf64-aarch64-linux] P_UnexpectedToken");
+}

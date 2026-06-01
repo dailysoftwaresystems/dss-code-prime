@@ -92,7 +92,7 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
-    // D-FF2-UNSUPP refined contract (post-fold #N audit on eb2c6c7):
+    // D-FF2-UNSUPP refined contract (eb2c6c7 audit-fold 2026-06-01):
     // unsuppressable codes bypass SILENCING (`--suppress` drops +
     // `overrides` demotion) so they always reach `all_`. Elevation
     // (`--warnings-as-errors`) applies UNIFORMLY — it strengthens the
@@ -101,12 +101,12 @@ std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d
     // F_BinaryReaderPartialCorruption) promoted to Error so they
     // increment errorCount.
     //
-    // Post-fold-eb2c6c7 type-design Q3 + code-review F3: collapsed
-    // the previously-duplicated warningsAsErrors flip into a single
-    // end-of-function block. Two literal copies were drift-prone
-    // (one in the unsuppressable arm, one after silencing); the
-    // single-flip shape makes "elevation is universal; only silencing
-    // is gated by unsuppressable" the literal control flow.
+    // Shape note (eb2c6c7 audit-fold): the previously-duplicated
+    // warningsAsErrors flip was collapsed into a single end-of-
+    // function block. Two literal copies were drift-prone (one in
+    // the unsuppressable arm, one after silencing); the single-flip
+    // shape makes "elevation is universal; only silencing is gated
+    // by unsuppressable" the literal control flow.
     if (!isUnsuppressable(d.code)) {
         if (cfg_.policy.suppress.contains(d.code)) {
             return std::nullopt;
@@ -181,14 +181,8 @@ bool DiagnosticReporter::isRecentDuplicate(ParseDiagnostic const& d) const noexc
 
 void DiagnosticReporter::report(ParseDiagnostic d) {
     // Policy first so the unsuppressable check below sees the post-
-    // policy code. applyPolicy skips SILENCING mutations (suppress
-    // drops + overrides demotion) for unsuppressable codes but still
-    // applies warningsAsErrors elevation — see the
-    // silencing-vs-elevation prose in `unsuppressable_codes.hpp`.
-    // Reordering vs. the pre-fold hitCap_-first check is still
-    // invariant for unsuppressable codes (they bypass cap below
-    // regardless), and policy work is a few hash lookups, negligible
-    // vs. the surrounding pushes.
+    // policy code. See `applyPolicy` above for the canonical
+    // silencing-vs-elevation contract.
     auto filtered = applyPolicy(std::move(d));
     if (!filtered) return;
 

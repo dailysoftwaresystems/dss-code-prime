@@ -82,8 +82,9 @@ namespace dss {
 // Warning). Trigger: first Info-severity entry added to the closed-
 // table. Resolution at that point: either extend the elevation gate
 // to also promote Info, or harden `unsuppressable_codes.cpp` with a
-// consteval check forbidding Info-severity members (would need a
-// parallel severity table to introspect). Today (2026-06-01) no Info-
+// consteval check forbidding Info-severity members (requires
+// augmenting `kUnsuppressableCodes` into a `{code, severity}` table
+// so introspection is compile-time). Today (2026-06-01) no Info-
 // severity unsuppressable producer exists; the asymmetry is dormant.
 [[nodiscard]] DSS_EXPORT bool
 isUnsuppressable(DiagnosticCode code) noexcept;

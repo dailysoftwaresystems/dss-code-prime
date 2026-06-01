@@ -19,6 +19,16 @@
 // once the count of structurally-identical duplicates crossed the
 // hoist threshold). Pure read over the reporter's span — no state,
 // no per-consumer variance.
+//
+// Anchored D-TEST-DIAG-SEVERITY-EXACT-PIN (0f7d714 audit-fold
+// 2026-06-01): the `sawX bool + EXPECT_EQ severity + EXPECT_EQ
+// errorCount` pattern at
+// tests/ffi/test_binary_reader.cpp::Elf64PartialCorruptionFires...
+// is a singleton today; a second test combining the same trio
+// triggers hoisting an `expectExactlyOneDiagWith(rep, code, severity,
+// expectedErrorCount)` helper here. The 97 `bool sawX = false`
+// occurrences across the codebase use disjoint assertion combinations
+// (payload fields / spans / multi-code) and do NOT match this trio.
 
 namespace dss::test_support {
 

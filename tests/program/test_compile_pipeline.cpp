@@ -289,6 +289,38 @@ TEST(Program_CompileFiles, CrossValidateRejectsMachineMismatch) {
               1);
 }
 
+// 0f7d714 audit-fold (2026-06-01): pin that the CLI stderr drain
+// actually renders `d.contextPrefix` for per-target diagnostics.
+// The `eb2c6c7` Track 1 split moved the `[target=...]` stamp from
+// d.actual into d.contextPrefix; the 0f7d714 audit-fold added the
+// prepend at drainDiagnosticsToStderr; this test pins the e2e CLI
+// behavior. Without this pin a regression dropping `<< d.contextPrefix`
+// from drainDiagnosticsToStderr would silently re-open the multi-
+// target stderr skew (operators could no longer tell which target
+// produced each line). Uses `extern int x = 5;` because it parses
+// cleanly (parse errors come from a CU-level shared reporter that
+// is NOT routed through mergeWithTargetContext); the H_Extern* error
+// fires in the per-target loop and IS prefixed.
+TEST(Program_CompileFiles, StderrIncludesTargetContextPrefixOnPerTargetError) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "ext_init.c", "extern int x = 5;\n");
+    scratch.useAsCwd();
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:elf64-x86_64-linux"});
+    auto const stderrOut = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(rc, 1);
+    EXPECT_NE(stderrOut.find("[target=x86_64:elf64-x86_64-linux]"),
+              std::string::npos)
+        << "drainDiagnosticsToStderr MUST render contextPrefix so "
+           "multi-target operators can route per-target diagnostics; "
+           "got stderr:\n" << stderrOut;
+}
+
 // ── compileProject: plan 06 fail-loud stub ────────────────────
 
 TEST(Program_CompileProject, FailsLoudPlanNotLanded) {
