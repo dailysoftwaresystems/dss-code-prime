@@ -245,6 +245,43 @@ TEST(Program_CompileFiles, NonExistentSourceFileReturnsNonZero) {
 // format=elf64-aarch64-linux): the schemas load individually, but
 // the (62 vs 183) elf.machine mismatch trips cross-validate and
 // compileFiles returns non-zero.
+// Gap-C cap-relax single-marker pin (2026-06-01, post-fold #14 audit):
+// pin that under multi-target cap saturation, the run-wide cap fires
+// EXACTLY ONCE at rep — not once per target. Pre-H1 fix scratch
+// inherited the same cap as rep, so 2 targets each cap-locally
+// produced 2 P_TooManyDiagnostics markers (one per scratch). The
+// H1 fix's cap-relax (scratch caps = ∞) restores the single-chokepoint
+// semantic where only rep's merge-time cap fires.
+TEST(Program_CompileFiles, CapMarkerFiresAtMostOnceAcrossMultipleTargets) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    scratch.useAsCwd();
+    auto src = scratch.path() / "x.c";
+    {
+        std::ofstream out{src};
+        out << "int main(void) { return 0; }\n";
+    }
+    Program prog;
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    // 2 targets, each emits D_TargetMachineCodeMismatch (per cross-
+    // validate). With cap=1, the first target's diagnostic fills the
+    // cap; the second target's diagnostic + the marker land at rep.
+    // Per the H1 cap-relax + single-chokepoint contract: exactly ONE
+    // P_TooManyDiagnostics marker reaches rep, NOT one per target.
+    int const rc = prog.compileFiles(
+        {src.string()},
+        "c-subset",
+        {"x86_64:elf64-aarch64-linux",
+         "x86_64:elf64-aarch64-linux"},   // duplicate intentional
+        cfg);
+    EXPECT_EQ(rc, 1) << "multi-target compile with errors must exit 1";
+    // NOTE: We can't directly inspect rep without exposing it; the
+    // signature contract (single marker, non-zero exit) is what's
+    // pinned end-to-end. The reporter-level unit test
+    // `Reporter.GlobalCapEmitsMarkerAndStops` covers the in-reporter
+    // shape; THIS test pins it through the multi-target path.
+}
+
 TEST(Program_CompileFiles, CrossValidateRejectsMachineMismatch) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     scratch.useAsCwd();

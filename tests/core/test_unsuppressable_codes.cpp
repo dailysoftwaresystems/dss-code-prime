@@ -195,25 +195,28 @@ TEST(Reporter, UnsuppressableBypassesDedupWindow) {
            "the second image-write failure carries distinct signal";
 }
 
-TEST(Reporter, WarningsAsErrorsDoesNotMutateUnsuppressableCode) {
-    // Post-fold #12 test-analyzer Gap 5: warningsAsErrors completes
-    // the policy-trifecta. Today no unsuppressable code is emitted
-    // at Warning severity (the closed-table is all Error producers),
-    // but a future regression could (e.g. demote H_TypeUnresolved to
-    // Warning at producer). applyPolicy must preserve the producer
-    // severity end-to-end — the unsuppressable short-circuit fires
-    // BEFORE the warningsAsErrors flip.
+TEST(Reporter, WarningsAsErrorsElevatesUnsuppressableWarning) {
+    // 2nd-order audit refinement on commit 0bd2f41 (2026-06-01):
+    // F_BinaryReaderPartialCorruption is a Warning-severity
+    // unsuppressable code. The original "skip all policy mutation"
+    // semantic was too broad — strict-mode operators legitimately
+    // want Warning-severity unsuppressable codes promoted to Error
+    // so they increment errorCount. Refined: the unsuppressable gate
+    // bypasses SILENCING (suppress + overrides demotion) but NOT
+    // elevation (warningsAsErrors). Closes the conflict between
+    // post-fold #14's "warningsAsErrors elevates" intent and
+    // commit 0bd2f41's addition to kUnsuppressableCodes.
     DiagnosticReporter::Config cfg;
     cfg.policy.warningsAsErrors = true;
     DiagnosticReporter r{cfg};
-    // Synthesize a Warning-severity unsuppressable diagnostic.
-    auto d = makeDiag(DiagnosticCode::H_TypeUnresolved,
+    auto d = makeDiag(DiagnosticCode::F_BinaryReaderPartialCorruption,
                       DiagnosticSeverity::Warning);
     r.report(std::move(d));
     ASSERT_EQ(r.all().size(), 1u);
-    EXPECT_EQ(r.all()[0].severity, DiagnosticSeverity::Warning)
-        << "warningsAsErrors must not promote an unsuppressable code "
-           "— producer severity is preserved end-to-end";
+    EXPECT_EQ(r.all()[0].severity, DiagnosticSeverity::Error)
+        << "warningsAsErrors MUST promote unsuppressable Warning "
+           "to Error so strict-mode operators get fail-loud exit "
+           "code on partial-corruption signals";
 }
 
 TEST(Reporter, ForceReportRoutesUnsuppressableThroughApplyPolicyBypass) {

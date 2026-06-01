@@ -899,6 +899,15 @@ struct DSS_EXPORT ParseDiagnostic {
 
     // Optional human-friendly hint ("did you forget a semicolon?").
     std::string suggestion;
+
+    // Optional rendering-only prefix prepended to `actual` at format
+    // time (e.g. `[target=x86_64:elf64-x86_64-linux] ` stamped by
+    // `DiagnosticReporter::mergeFrom` so multi-target runs route
+    // per-target context to tooling without polluting the dedup hash).
+    // Excluded from `hashKey` so cross-source legitimate duplicates
+    // (same diagnostic from different targets) collapse correctly at
+    // the merge destination. D-MERGE-DEDUP-PREFIX-COLLISION fold.
+    std::string contextPrefix;
 };
 
 } // namespace dss

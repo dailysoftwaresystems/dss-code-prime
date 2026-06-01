@@ -131,6 +131,43 @@ TEST(Reporter, PerCodeCapCoalescesSilently) {
     EXPECT_EQ(r.errorCount(), 3u);
 }
 
+TEST(Reporter, ContextPrefixDoesNotPolluteDedupKey) {
+    // D-MERGE-DEDUP-PREFIX-COLLISION fold (2026-06-01): the
+    // `contextPrefix` field on ParseDiagnostic is rendering-only and
+    // MUST NOT enter the dedup hash. Two diagnostics with identical
+    // (code, buffer, span, ruleContext, actual) but DIFFERENT
+    // contextPrefix values must collapse via dedup.
+    //
+    // Pre-fix `mergeWithTargetContext` mutated `actual` directly, so
+    // multi-target runs leaked structurally-identical duplicates
+    // through to the merged reporter (different prefix → different
+    // hash → no dedup). The contextPrefix field moves the rendering
+    // string out of the hash input.
+    DiagnosticReporter::Config cfg;
+    cfg.dedupWindow = 4;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+
+    ParseDiagnostic d1;
+    d1.code     = DiagnosticCode::P_UnexpectedToken;
+    d1.severity = DiagnosticSeverity::Error;
+    d1.buffer   = b;
+    d1.span     = SourceSpan::of(0, 5);
+    d1.actual   = "same";
+    d1.contextPrefix = "[target=spec-A] ";
+
+    ParseDiagnostic d2 = d1;
+    d2.contextPrefix = "[target=spec-B] ";  // different prefix only
+
+    r.report(std::move(d1));
+    r.report(std::move(d2));
+
+    EXPECT_EQ(r.all().size(), 1u)
+        << "structurally-identical diagnostics with different "
+           "contextPrefix must collapse via dedup; pre-fix this leaked "
+           "to size==2 because the prefix was in `actual`";
+}
+
 TEST(Reporter, GlobalCapEmitsMarkerAndStops) {
     DiagnosticReporter::Config cfg;
     cfg.maxDiagnostics = 5;

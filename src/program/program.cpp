@@ -91,13 +91,20 @@ void emitDriver(DiagnosticReporter& rep,
 // `compileOneTarget`; this helper consolidates that scratch
 // reporter into the run-wide reporter with the target prefix added.
 // (silent-failure-hunter F9 fold, LK10 cycle 2 post-audit review.)
+//
+// D-MERGE-DEDUP-PREFIX-COLLISION fold (2026-06-01): prefix lands in
+// the dedicated `contextPrefix` field on ParseDiagnostic — NOT in
+// `actual` — so the dedup hash at the destination computes on the
+// un-prefixed key. Two targets emitting the structurally-identical
+// diagnostic now collapse at rep, instead of leaking through
+// duplicate-with-different-prefix.
 void mergeWithTargetContext(DiagnosticReporter const& src,
                             std::string const&        targetSpec,
                             DiagnosticReporter&       dst) {
     auto const prefix = "[target=" + targetSpec + "] ";
     for (auto const& d : src.all()) {
         ParseDiagnostic copy = d;
-        copy.actual = prefix + copy.actual;
+        copy.contextPrefix = prefix;
         dst.report(std::move(copy));
     }
 }

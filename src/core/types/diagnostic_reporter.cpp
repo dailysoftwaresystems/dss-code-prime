@@ -92,15 +92,20 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
-    // D-FF2-UNSUPP: severity-gating codes bypass ALL policy mutation. Their
-    // emission is structural — suppressing OR demoting via overrides
-    // OR letting warningsAsErrors flip them would each defeat the gate
-    // in a different way. The codes in `kUnsuppressableCodes` are all
-    // emitted at Error severity by their producers; we preserve that
-    // severity end-to-end. Closes the silent-drop surface where
-    // `--suppress=H_ExternHasInitializer` (etc.) re-opened the failure
-    // mode the underlying fold was meant to permanently close.
+    // D-FF2-UNSUPP: severity-gating codes bypass SILENCING mutations
+    // (`--suppress` drops + `overrides` demotion) so they always reach
+    // `all_`. They do NOT bypass `--warnings-as-errors` — that is
+    // ELEVATION, not silencing, and strict-mode operators legitimately
+    // want Warning-severity unsuppressable codes (like
+    // F_BinaryReaderPartialCorruption) promoted to Error so they
+    // increment errorCount. The unsuppressable gate's contract is
+    // "must reach all_", not "must preserve producer severity".
+    // Post-fold 2nd-order audit on b3db24c: refined to allow elevation
+    // (the original "skip all mutation" was over-broad).
     if (isUnsuppressable(d.code)) {
+        if (cfg_.policy.warningsAsErrors && d.severity == DiagnosticSeverity::Warning) {
+            d.severity = DiagnosticSeverity::Error;
+        }
         return d;
     }
     if (cfg_.policy.suppress.contains(d.code)) {
@@ -357,11 +362,15 @@ std::string DiagnosticReporter::format(ParseDiagnostic const& d,
                                        BufferRegistry const& bufs) const {
     std::string out;
 
-    // Header line: severity[prefix]: expected/actual prose
+    // Header line: severity[prefix]: [contextPrefix]expected/actual prose
+    // D-MERGE-DEDUP-PREFIX-COLLISION: contextPrefix is rendered here
+    // (not stored in `actual`) so the dedup hash key — which includes
+    // `actual` — sees the un-prefixed diagnostic.
     std::format_to(std::back_inserter(out),
                    "{}[{}]: ",
                    severityName(d.severity),
                    diagnosticCodePrefix(d.code));
+    out += d.contextPrefix;
     appendExpectedActual(out, d);
     out += '\n';
 

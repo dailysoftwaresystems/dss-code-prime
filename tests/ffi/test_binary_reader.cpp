@@ -545,6 +545,41 @@ TEST(BinaryReaderReporter,
 }
 
 TEST(BinaryReaderReporter,
+     Elf64PartialCorruptionElevatesToErrorUnderWarningsAsErrors) {
+    // D-FF1-PARTIAL-CORRUPTION-WAE-PIN (2026-06-01): pin that
+    // --warnings-as-errors elevates F_BinaryReaderPartialCorruption
+    // from Warning to Error end-to-end. The unsuppressable gate
+    // bypasses --suppress + overrides (silencing) but NOT
+    // warningsAsErrors (elevation), so strict-mode operators get
+    // fail-loud exit code on partial-corruption signals.
+    std::vector<Sym> syms;
+    syms.push_back(Sym{0, info(1, 2), 0, 1, 0x1000, 0});
+    syms.push_back(Sym{0xFFFFFFFFu, info(1, 2), 0, 1, 0x2000, 0});
+    auto const bytes = buildMinimalElf64(syms, {"good"});
+
+    DiagnosticReporter::Config cfg;
+    cfg.policy.warningsAsErrors = true;
+    DiagnosticReporter rep{cfg};
+    auto r = readImportsFromBytes(bytes, "libtest.so", rep);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 1u);
+    bool sawElevated = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_BinaryReaderPartialCorruption) {
+            sawElevated = true;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Error)
+                << "warningsAsErrors must elevate F_BinaryReader"
+                   "PartialCorruption to Error";
+            break;
+        }
+    }
+    EXPECT_TRUE(sawElevated);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "elevated diagnostic must increment errorCount so the "
+           "driver's exit-code gate fires under strict mode";
+}
+
+TEST(BinaryReaderReporter,
      Elf64NoPartialCorruptionWarningForByDesignSkips) {
     // Negative pin: by-design unnamed entries (st_name=0) + local-bind
     // entries (STB_LOCAL=0) must NOT count as partial corruption.
