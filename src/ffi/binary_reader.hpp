@@ -90,9 +90,12 @@ rangeExceedsBuffer(std::uint64_t off, std::uint64_t size,
 // (an empty `.dynsym` `.so` is a corrupted library — flagged as
 // `CorruptedBinary` rather than returned as an empty list).
 //
-// `reporter` is used for per-row diagnostics during parsing (e.g.
-// individual symbols with corrupted name offsets emit a warning but
-// don't abort the parse).
+// `reporter` is used for per-row diagnostics during parsing —
+// individual symbols with corrupted name offsets emit
+// `F_BinaryReaderPartialCorruption` at Warning severity (counter-
+// aggregated; one Warning per parse summarizing N skips) and DO
+// NOT abort. `--warnings-as-errors` elevates to fail-loud.
+// D-FF1-PARTIAL-CORRUPTION-LOUD (2026-06-01).
 [[nodiscard]] DSS_EXPORT
 std::expected<std::vector<ImportSurface>, BinaryReadError>
 readImports(std::filesystem::path const& libraryPath,

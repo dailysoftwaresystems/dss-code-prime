@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <cstring>
 #include <vector>
 
 // D-FF1-TEST-BYTE-EMIT: little-endian byte-emit helpers used by
@@ -13,11 +12,12 @@
 // `diagnostic_count.hpp` + `scratch_dir.hpp` hoist precedent — pull
 // the helper once 3 structurally-identical consumers exist.
 //
-// Distinct from `src/linker/byte_emit.hpp` (production helpers that
-// write into pre-sized buffers via `readU32LEAt`/`writeU32LEAt`).
-// The test-side helpers append onto growing `std::vector<u8>` for
-// the build-then-read pattern; signatures don't compose with the
-// production helpers and the use-case is purely fixture construction.
+// Distinct from `src/link/format/byte_emit.hpp` + `src/asm/format/byte_emit.hpp`
+// (production helpers that write into pre-sized buffers via
+// `readU32LEAt`/`writeU32LEAt`). The test-side helpers append onto
+// growing `std::vector<u8>` for the build-then-read pattern; signatures
+// don't compose with the production helpers and the use-case is purely
+// fixture construction.
 
 namespace dss::test_support {
 

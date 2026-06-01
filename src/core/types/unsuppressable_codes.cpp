@@ -9,7 +9,7 @@ namespace {
 
 // D-FF2-UNSUPP closed-table. Sorted by phase letter (D / F / H / I / K
 // / L / R / A) + numeric value within each phase for at-a-glance
-// audit. The linear scan via `std::ranges::find` is O(N) on N=52
+// audit. The linear scan via `std::ranges::find` is O(N) on N=53
 // members — still faster than hash lookup at this size + needs no
 // static-init dance.
 //
@@ -21,7 +21,7 @@ namespace {
 // D-LK6-8.2 SIGILL surface (D_TargetMachineCodeMismatch /
 // D_TargetAbiModelMismatch) and the LK10 image-write contract
 // (K_ImageWrite* + K_ImageEmpty).
-constexpr std::array<DiagnosticCode, 52> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 53> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -38,6 +38,16 @@ constexpr std::array<DiagnosticCode, 52> kUnsuppressableCodes{{
     // names would silently shadow `bySymbol[""]` rows).
     DiagnosticCode::F_FfiIngestAbiModelUnsupported,
     DiagnosticCode::F_FfiIngestEmptyCanonical,
+    // F_BinaryReaderPartialCorruption (silent-failure-hunter
+    // 2nd-order audit on 9dbdc8e): the Warning's stated intent is
+    // "operators must see this signal". Without unsuppressable
+    // membership, the four cap/dedup gates at report() could
+    // silently drop it under multi-target cap saturation —
+    // re-opening the very silent-skip surface the commit closed.
+    // The closed-table's invariant is "must reach `all_` regardless
+    // of policy", which is independent of severity; Warning members
+    // are admissible when their visibility is load-bearing.
+    DiagnosticCode::F_BinaryReaderPartialCorruption,
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-

@@ -271,6 +271,52 @@ TEST(BinaryReaderPe, ExportRvaOutsideAnySectionRejected) {
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::SectionNotFound);
 }
 
+// D-FF1-PARTIAL-CORRUPTION-LOUD PE pin (2026-06-01): build a PE with
+// one valid export + 2 entries whose name pointers are deliberately
+// poisoned past EOF. The PE reader skips the corrupted entries +
+// emits F_BinaryReaderPartialCorruption Warning summarizing the loss.
+// Regression-blocker for the silent-skip surface this commit closes.
+TEST(BinaryReaderPe, PartialCorruptionWarningFiresOnPoisonedNameRvas) {
+    // Build with 3 names but corrupt 2 of the 3 name-RVAs to point
+    // past EOF (which fails rvaToFileOff → ++corruptedNameSkips).
+    auto bytes = buildMinimalPe32Plus({"good", "bad1", "bad2"});
+
+    // Locate the names table RVA in the export directory (offset +32
+    // inside the export-directory header, which lives at the start
+    // of the .edata section's raw data at file offset
+    // kSectionRawDataOff = 432).
+    constexpr std::uint32_t kSectionRawDataOff = 128 + 4 + 20 + 240 + 40;
+    constexpr std::uint32_t kExportDirHeaderSize = 40;
+    std::uint32_t const namesTableRva =
+        kSectionRawDataOff + kExportDirHeaderSize;
+    // Names table: 3 × u32 RVAs. Poison entries [1] and [2] to point
+    // past EOF (RVA 0xFFFFFFF0 — way past any section).
+    std::size_t const namesTableFileOff = namesTableRva;
+    putU32(bytes, namesTableFileOff + 1 * 4, 0xFFFFFFF0u);
+    putU32(bytes, namesTableFileOff + 2 * 4, 0xFFFFFFF1u);
+
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "partial.dll", rep);
+    ASSERT_TRUE(r.has_value())
+        << "partial corruption must NOT abort — valid exports still surface";
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].mangledName, "good");
+    bool sawPartial = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_BinaryReaderPartialCorruption) {
+            sawPartial = true;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+            EXPECT_NE(d.actual.find("skipped 2"), std::string::npos)
+                << "counter must reflect 2 skips; actual: " << d.actual;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawPartial)
+        << "F_BinaryReaderPartialCorruption Warning must fire when "
+           "name-RVAs resolve OOB — closes the silent-skip surface "
+           "D-FF1-PARTIAL-CORRUPTION-LOUD pins";
+}
+
 TEST(BinaryReaderPe, ZeroExportTableRvaReturnsEmptySurface) {
     auto bytes = buildMinimalPe32Plus({"x"});
     // DataDirectories[0] RVA = 0 + size = 0 → no exports.

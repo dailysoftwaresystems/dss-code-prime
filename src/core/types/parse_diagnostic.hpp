@@ -847,7 +847,12 @@ enum class DiagnosticCode : std::uint16_t {
     //   for linking, but the operator should verify the library was
     //   built correctly. Emitted at Warning severity — under
     //   `--warnings-as-errors` this elevates to fail-loud, which is
-    //   the correct strict-mode behavior. Anchor: D-FF1-PARTIAL-CORRUPTION-LOUD.
+    //   the correct strict-mode behavior. Member of `kUnsuppressableCodes`
+    //   per the silent-failure-hunter 2nd-order audit: cap saturation
+    //   would otherwise silently drop the very signal this code was
+    //   introduced to surface. Open anchor:
+    //   D-FF1-PARTIAL-CORRUPTION-MACHO (apply same counter+emit
+    //   pattern to Mach-O reader when FF1-MachO lands).
     F_BinaryReaderPartialCorruption = 0x5018,
 };
 

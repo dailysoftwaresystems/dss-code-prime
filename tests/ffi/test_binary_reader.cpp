@@ -512,6 +512,59 @@ TEST(BinaryReaderReporter, Elf32AlsoEmitsFCodeThroughReporter) {
     EXPECT_GE(countCode(rep, DiagnosticCode::F_UnsupportedElfClass), 1u);
 }
 
+// D-FF1-PARTIAL-CORRUPTION-LOUD pins (2026-06-01):
+// pin that F_BinaryReaderPartialCorruption fires when a reader silently
+// skips structurally-corrupt entries — the Warning is the only signal the
+// operator gets about partial-loss surfaces. A regression that dropped
+// the counter or short-circuited the emission would now fail loud.
+
+TEST(BinaryReaderReporter,
+     Elf64PartialCorruptionFiresWhenStNameIndexIsOutOfRange) {
+    // Build an ELF with one valid symbol "good" + one symbol claiming
+    // st_name = a huge index into .dynstr. readNulTerminated returns
+    // empty for the out-of-range index → corruptedNameSkips=1 →
+    // F_BinaryReaderPartialCorruption Warning fires; the valid symbol
+    // is still surfaced.
+    std::vector<Sym> syms;
+    syms.push_back(Sym{0, info(1, 2), 0, 1, 0x1000, 0});  // valid, name = nameOffsets[0]
+    syms.push_back(Sym{0xFFFFFFFFu, info(1, 2), 0, 1, 0x2000, 0});
+        // st_name overridden by buildMinimalElf64 only for the FIRST N
+        // syms (`if (i < nameOffsets.size())`). With names={"good"} the
+        // second sym's st_name=0xFFFFFFFF survives — points past .dynstr.
+    auto const bytes = buildMinimalElf64(syms, {"good"});
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "libtest.so", rep);
+    ASSERT_TRUE(r.has_value())
+        << "partial corruption must NOT abort — valid rows still surface";
+    EXPECT_EQ(r->size(), 1u) << "only 'good' should be surfaced";
+    EXPECT_EQ((*r)[0].mangledName, "good");
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption),
+              1u)
+        << "the silent-skip on a non-zero st_name with empty resolved "
+           "name must fire F_BinaryReaderPartialCorruption Warning";
+}
+
+TEST(BinaryReaderReporter,
+     Elf64NoPartialCorruptionWarningForByDesignSkips) {
+    // Negative pin: by-design unnamed entries (st_name=0) + local-bind
+    // entries (STB_LOCAL=0) must NOT count as partial corruption.
+    std::vector<Sym> syms;
+    // Local-bind: STB_LOCAL=0, STT_FUNC=2 → info = 0|2 = 2
+    syms.push_back(Sym{0, info(0, 2), 0, 1, 0x1000, 0});
+    // Section-symbol-style unnamed: st_name=0, STB_GLOBAL=1, STT_NOTYPE=0
+    syms.push_back(Sym{0, info(1, 0), 0, 1, 0x2000, 0});
+    auto const bytes = buildMinimalElf64(syms, {});
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "libtest.so", rep);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption),
+              0u)
+        << "by-design unnamed + local-bind skips must NOT trigger the "
+           "partial-corruption Warning — those are structural filters, "
+           "not corruption";
+}
+
 TEST(BinaryReaderReporter, CorruptedBinaryAlsoEmitsFCodeThroughReporter) {
     std::vector<std::uint8_t> bytes(32, 0);
     bytes[0] = 0x7F; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';

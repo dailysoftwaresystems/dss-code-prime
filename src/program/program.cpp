@@ -458,6 +458,14 @@ int Program::compileFiles(
         // cap would fire long before the user's intended run-wide
         // cap. The merge architecture predates the H1 fix; the relax
         // restores its single-chokepoint cap semantic.
+        //
+        // Related concerns anchored separately:
+        // D-MERGE-POLICY-IDEMPOTENCY (overrides absolute-set
+        // semantic), D-MERGE-DEDUP-PREFIX-COLLISION ([target=]
+        // prefix mutates dedup key + window-eviction across
+        // targets), D-MERGE-SCRATCH-FRESH (tripwire if scratch
+        // becomes reused), D-COMPILE-ONE-TARGET-NO-LEAK (contract
+        // pin: compileOneTarget never writes to `rep` directly).
         auto scratchCfg = reporterConfig;
         scratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
         scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
