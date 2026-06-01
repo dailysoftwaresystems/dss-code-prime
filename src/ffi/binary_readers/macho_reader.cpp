@@ -127,16 +127,8 @@ readMacho(std::span<std::uint8_t const> bytes,
     }
     std::uint32_t const magic = readU32(bytes, 0);
     if (magic != kMachOMagic64) {
-        // Dispatch contract: guessFormat MATCHED kMachOMagic64
-        // before routing to this reader; FAT (0xCAFEBABE) and 32-bit
-        // (0xFEEDFACE) take their own FormatGuess arms upstream and
-        // never reach here. Big-endian Mach-O variants (0xCFFAEDFE,
-        // 0xCEFAEDFE) are intentionally NOT in FormatGuess —
-        // guessFormat reports them as Unknown rather than as a
-        // recognized-but-unsupported variant. This arm thus catches
-        // only a concurrent buffer mutation between guessFormat and
-        // this read (paranoia guard against a TOCTOU on the same
-        // bytes).
+        // guessFormat routes only 0xFEEDFACF here; this arm guards a
+        // TOCTOU between guess and read on the same byte buffer.
         return std::unexpected(emitAndReturn(
             BinaryReadErrorKind::CorruptedBinary,
             "Mach-O reader: header magic is not 0xFEEDFACF "
@@ -287,25 +279,23 @@ readMacho(std::span<std::uint8_t const> bytes,
         std::uint32_t const n_strx = readU32(bytes, symOff + 0);
         NType const nt{bytes[symOff + 4]};
 
+        // Cheapest gate first: unnamed entries (by-design, not corruption).
+        if (n_strx == 0u) continue;
         // Stab debug entries — never exports. Applied to BOTH paths
         // (defense-in-depth: a malformed LC_DYSYMTAB could include
         // stab entries inside its extdef slice).
         if (nt.isStab()) continue;
-        // Defense-in-depth N_TYPE filter: even when LC_DYSYMTAB is
-        // present (dysymtabFilter mode), still require the row to
-        // be section-defined. A malformed/corrupted DYSYMTAB whose
+        // Defense-in-depth N_TYPE filter: even on the dysymtabFilter
+        // path, require N_SECT. A malformed/corrupted DYSYMTAB whose
         // slice contains N_UNDF/N_ABS/N_INDR entries would otherwise
-        // silently surface them as Function/Default exports with
-        // garbage `n_value`. Real linkers also pre-filter the slice,
-        // but trust-but-verify is cheap. (code-reviewer H1 +
-        // silent-failure A3 fold, 7-agent audit on 4ca5bff.)
+        // surface them as Function/Default exports with garbage
+        // `n_value`. Real linkers pre-filter the slice; trust-but-
+        // verify is cheap.
         if (!nt.isSectionDefined()) continue;
-        // Fallback walk only: also require the N_EXT bit (LC_DYSYMTAB
-        // present means the linker already declared the slice
-        // externally-defined — the bit may or may not be set on every
-        // row but the slice membership is the authoritative signal).
+        // Fallback walk only: also require the N_EXT bit. LC_DYSYMTAB
+        // membership is the authoritative external-visibility signal
+        // when present; the bit on individual rows can be inconsistent.
         if (!dysymtabFilter && !nt.isExternal()) continue;
-        if (n_strx == 0u) continue;  // unnamed — by design (not corruption)
 
         ImportSurface row;
         row.mangledName = readNulTerminated(bytes,

@@ -529,8 +529,18 @@ TEST(BinaryReaderMacho, LcBodyRunsPastSizeofcmdsRegionFailsLoud) {
 // binary may declare LC_DYSYMTAB with all-zero counts; v1 surfaces
 // whatever N_EXT entries are still in LC_SYMTAB.
 TEST(BinaryReaderMacho, DysymtabWithZeroNextdefsymFallsThroughToNExtWalk) {
-    std::vector<Nlist> syms{sect(1), sect(1)};
-    std::vector<std::string> names{"a", "b"};
+    // 2060dc8 audit fold (silent-failure M1): mix one external +
+    // one INTERNAL row so the test can discriminate a true N_EXT
+    // fallthrough from a regression that flips to "full-scan slice
+    // (dysymtabFilter=true, walkStart=0, walkEnd=nsyms)" — in the
+    // regression case the internal row would surface, but the
+    // !dysymtabFilter && !isExternal check in fallthrough mode
+    // correctly filters it.
+    std::vector<Nlist> syms{
+        sect(1),                                                   // [0] external
+        Nlist{0, kNTypeSect, 1, 0, 0x2000},                       // [1] internal (no N_EXT)
+    };
+    std::vector<std::string> names{"public_a", "internal_b"};
     auto const bytes = buildMinimalMacho64(syms, names,
                                             /*includeDysymtab=*/true,
                                             /*iextdefsym=*/0u,
@@ -539,13 +549,12 @@ TEST(BinaryReaderMacho, DysymtabWithZeroNextdefsymFallsThroughToNExtWalk) {
     auto r = readImportsFromBytes(bytes, "zero_nextdef.dylib", rep);
     ASSERT_TRUE(r.has_value())
         << "kind=" << binaryReadErrorKindName(r.error().kind);
-    // Fallthrough → N_EXT walk → both rows surface (sect() has N_EXT set).
-    ASSERT_EQ(r->size(), 2u)
-        << "nextdefsym==0 MUST fall through to N_EXT walk, not "
-           "return empty silently — see macho_reader.cpp comment "
-           "block at the LC_DYSYMTAB filter branch";
-    EXPECT_EQ((*r)[0].mangledName, "a");
-    EXPECT_EQ((*r)[1].mangledName, "b");
+    ASSERT_EQ(r->size(), 1u)
+        << "nextdefsym==0 MUST fall through to N_EXT walk (not "
+           "treat as full-scan slice) — only the external row should "
+           "surface; a regression that flips to full-scan-slice would "
+           "surface BOTH rows and fail size==1";
+    EXPECT_EQ((*r)[0].mangledName, "public_a");
 }
 
 // 4ca5bff audit fold (code-reviewer H1 + silent-failure A3
@@ -573,5 +582,78 @@ TEST(BinaryReaderMacho, DysymtabSliceWithUndefinedEntryIsFiltered) {
         << "defense-in-depth: even with DYSYMTAB declaring 2 extdefs, "
            "the N_UNDF row must be filtered out (a regression that "
            "trusts the slice absolutely would surface garbage)";
+    EXPECT_EQ((*r)[0].mangledName, "real_export");
+    // 2060dc8 audit fold (test-analyzer #2): the filtered N_UNDF row
+    // has n_strx=0 (unnamed), so it's filtered BEFORE the readNul
+    // step that bumps the corruption counter. Pin that the counter
+    // stays at 0 — a regression that reordered the filters to put
+    // n_strx==0 last AND removed isSectionDefined() would surface
+    // a phantom F_BinaryReaderPartialCorruption Warning.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption),
+              0u)
+        << "filtered N_UNDF row must not contribute to the "
+           "partial-corruption counter";
+}
+
+// 2060dc8 audit fold (silent-failure M2 / test-analyzer #1): pin
+// N_ABS and N_INDR slice entries are also filtered by the defense-
+// in-depth N_TYPE check. The 4ca5bff fold pinned only N_UNDF; the
+// commit-message rationale cited N_UNDF/N_ABS/N_INDR as all
+// admissible-but-malformed slice contents. A regression that
+// special-cased the filter to `isUndefined()` instead of
+// `!isSectionDefined()` would silently surface N_ABS / N_INDR as
+// Function/Default exports. NType::isUndefined() predicate is also
+// covered transitively here (the loop hits it via typeBits() ==
+// kNTypeUndf on the N_UNDF row in the prior test; this test
+// exercises the other two NType arms).
+TEST(BinaryReaderMacho, DysymtabSliceFiltersNAbsAndNIndrEntries) {
+    constexpr std::uint8_t kNTypeAbs  = 0x02u;
+    constexpr std::uint8_t kNTypeIndr = 0x0Au;
+    std::vector<Nlist> syms{
+        Nlist{0, static_cast<std::uint8_t>(kNTypeAbs  | kNExtBit), 0, 0, 0},   // [0] N_ABS  — filter
+        Nlist{0, static_cast<std::uint8_t>(kNTypeIndr | kNExtBit), 0, 0, 0},   // [1] N_INDR — filter
+        sect(1),                                                                // [2] N_SECT — keep
+    };
+    std::vector<std::string> names{"_abs", "_indr", "real_export"};
+    auto const bytes = buildMinimalMacho64(syms, names,
+                                            /*includeDysymtab=*/true,
+                                            /*iextdefsym=*/0u,
+                                            /*nextdefsym=*/3u);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "abs_indr_slice.dylib", rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u)
+        << "defense-in-depth: a regression that filtered only N_UNDF "
+           "(via isUndefined()) instead of !isSectionDefined() would "
+           "surface N_ABS + N_INDR as Function/Default exports — "
+           "exactly the silent-failure surface the audit closed";
+    EXPECT_EQ((*r)[0].mangledName, "real_export");
+}
+
+// 2060dc8 audit fold (test-analyzer #3): the 4ca5bff fold moved
+// the isStab() skip to apply on BOTH paths (defense-in-depth). The
+// dysymtab-slice arm of that defense was previously only
+// transitively covered via the fallback `SkipsStabEntries` test;
+// this pin exercises the slice path directly. A regression that
+// re-localized stab-skip to fallback-only would silently regress
+// here.
+TEST(BinaryReaderMacho, DysymtabSliceFiltersStabEntries) {
+    std::vector<Nlist> syms{
+        Nlist{0, kNStabFun, 1, 0, 0x1000},                                     // [0] stab — filter
+        sect(1),                                                                // [1] N_SECT — keep
+    };
+    std::vector<std::string> names{"stab_in_slice", "real_export"};
+    auto const bytes = buildMinimalMacho64(syms, names,
+                                            /*includeDysymtab=*/true,
+                                            /*iextdefsym=*/0u,
+                                            /*nextdefsym=*/2u);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "stab_slice.dylib", rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u)
+        << "stab filter must apply on the dysymtab-slice path too "
+           "(the 4ca5bff defense-in-depth fold) — a regression that "
+           "scoped isStab() to the fallback only would surface the "
+           "stab row as a Function/Default export";
     EXPECT_EQ((*r)[0].mangledName, "real_export");
 }

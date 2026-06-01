@@ -16,11 +16,15 @@
 //
 // Format-blind dispatch: the entry point `readImports(path, reporter)`
 // detects the format from the file's first bytes (ELF magic
-// `\x7FELF`, PE `MZ`...`PE\0\0`, Mach-O `0xFEEDFACF` / `0xCAFEBABE`
-// / `0xFEEDFACE`) and routes to the per-format implementation.
-// Adding a new format = add a magic check in `guessFormat` + a
-// per-format reader implementation in
-// `ffi/binary_readers/<format>_reader.{hpp,cpp}` + a dispatch arm
+// `\x7FELF`, PE `MZ`...`PE\0\0`, Mach-O `0xFEEDFACF` /
+// `0xCAFEBABE` / `0xFEEDFACE`) and routes to the per-format
+// implementation. ELF / PE / Mach-O 64-bit dispatch into their
+// respective readers; Mach-O FAT (`0xCAFEBABE`) and Mach-O 32-bit
+// (`0xFEEDFACE`) are recognised at dispatch but reject loud as
+// `UnsupportedFormat` with remediation-specific detail (anchors
+// D-FF1-MACHO-FAT and D-FF1-MACHO-32). Adding a new format = add a
+// magic check in `guessFormat` + a per-format reader implementation
+// in `ffi/binary_readers/<format>_reader.{hpp,cpp}` + a dispatch arm
 // in `readImportsFromBytes`.
 //
 // **Closure scope (FF1)**: ELF + PE + Mach-O readers shipped
@@ -95,9 +99,10 @@ rangeExceedsBuffer(std::uint64_t off, std::uint64_t size,
 //     empty surface (rare; structurally valid).
 //   * PE: ordinal-only exports (`NumberOfNamePointers == 0`) return
 //     an empty surface (no remediation — v1 only walks named exports).
-//   * Mach-O: a binary with `LC_SYMTAB` present but no externally-
-//     defined symbols (e.g. LC_DYSYMTAB.nextdefsym == 0) returns an
-//     empty surface.
+//   * Mach-O: returns an empty surface when no row passes the
+//     symbol-walk filters. LC_DYSYMTAB with `nextdefsym == 0`
+//     falls through to the N_EXT walk over the full LC_SYMTAB;
+//     only if that walk surfaces no rows is the result empty.
 //
 // `reporter` is used for per-row diagnostics during parsing —
 // individual symbols with corrupted name offsets emit

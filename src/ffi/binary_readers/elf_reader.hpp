@@ -14,10 +14,9 @@
 namespace dss::ffi {
 
 // Read `.dynsym` + `.dynstr` from an ELF64 LE binary; emit one
-// `ImportSurface` row per non-empty-name dynamic symbol.
-//
-// D-FF1-NEST split (FF1-MachO cycle): hoisted out of binary_reader.cpp
-// at the 3rd-reader landing — see binary_readers/reader_common.hpp.
+// `ImportSurface` row per non-empty-name dynamic symbol. Shares
+// byte-decode primitives + reporter wiring with the sibling readers
+// via `binary_readers/reader_common.hpp`.
 [[nodiscard]] DSS_EXPORT
 std::expected<std::vector<ImportSurface>, BinaryReadError>
 readElf64(std::span<std::uint8_t const> bytes,

@@ -45,6 +45,15 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
             reporter));
     }
     auto const guess = guessFormat(bytes);
+    // D-FF1-DISPATCH-TABLE anchor: today the switch holds 3 reader
+    // calls + 3 unsupported-format arms each with anchor-tagged
+    // remediation prose. Promoting to a `FormatGuess`-indexed
+    // function-pointer table would distribute the per-arm prose
+    // across stub functions. Trigger to fold: 4th reader of
+    // identical signature lands AND ≥1 unsupported arm folds into
+    // a shared "unsupported variant with detail" shape (likely WASM
+    // or COFF object — distinct from Mach-O variants which retain
+    // bespoke remediation messages).
     switch (guess) {
         case FormatGuess::Elf:
             return readElf64(bytes, libraryPathLabel, reporter);
