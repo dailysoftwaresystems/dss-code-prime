@@ -688,9 +688,9 @@ enum class DiagnosticCode : std::uint16_t {
     //   "unknown" means we can't even guess; "unsupported" means we
     //   recognised the format but the reader for it isn't shipped.
     // F_UnsupportedBinaryFormat: format recognised but binary-reader
-    //   not yet shipped (e.g. PE during FF1-ELF-only cycle). Cites
-    //   the per-format anchor (FF1-PE / FF1-MachO) so the user knows
-    //   what's pending.
+    //   not yet shipped (Mach-O after FF1-ELF + FF1-PE landed). Cites
+    //   the per-format anchor (FF1-MachO) so the user knows what's
+    //   pending.
     // F_CorruptedBinary: file structurally invalid — section offset
     //   past EOF, string-table index out of range, etc.
     // F_UnsupportedElfClass: ELF32 / non-LE / ELFv0 — v1 supports

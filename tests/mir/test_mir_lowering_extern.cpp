@@ -324,13 +324,13 @@ TEST(MirLoweringExtern, MultipleExternsAcrossTwoLibrariesPropagateInOrder) {
 }
 
 TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
-    // Post-fold #14 D-FF2-5 audit pin: `extern int x;` (and the
+    // D-FF2-5 audit pin (2026-06-01): `extern int x;` (and the
     // array form `extern int x[10];` post-fold #11) lowers to a
     // HIR `ExternGlobal` node correctly — but the MIR builder at
-    // `src/mir/lowering/hir_to_mir.cpp:1933-1937` currently rejects
-    // the kind with `unsupported()` because the FFI side of
-    // ExternGlobal (data-symbol ingestion + linker symbol-table
-    // emission) is not yet implemented end-to-end.
+    // src/mir/lowering/hir_to_mir.cpp (HirKind::ExternGlobal arm of
+    // the decl switch) currently rejects the kind with `unsupported()`
+    // because the FFI side of ExternGlobal (data-symbol ingestion +
+    // linker symbol-table emission) is not yet implemented end-to-end.
     //
     // PRE-FOLD #11: `extern int x[10];` silently lost its array
     // type (externDecl had no arraySuffix configured); lowered as
@@ -343,8 +343,9 @@ TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
     // `collectExterns` + `ExternImport` with TypeId, etc. — see
     // anchor D-FF2-5-FEATURE) will replace this test with the
     // positive pin. Until then, a regression that silently accepted
-    // ExternGlobal without lowering would slip past the audit; this
-    // test catches that exact silent-accept surface.
+    // ExternGlobal at the MIR-builder layer (distinct from D-FF2-3's
+    // parser-level extern-with-init surface) would slip past the
+    // audit; this test catches that exact silent-accept surface.
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirBuilder b{"c-subset"};

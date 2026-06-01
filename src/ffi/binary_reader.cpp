@@ -4,6 +4,7 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -398,18 +399,17 @@ readElf64(std::span<std::uint8_t const> bytes,
 //   → Optional header (96 / 240 bytes for PE32 / PE32+)
 //   → Section table (N × 40 bytes)
 //   → DataDirectories[0] = (RVA, size) of .edata export directory
-// Inside .edata:
-//   [0..3]   ExportFlags        (skipped)
-//   [4..7]   TimeDateStamp      (skipped)
-//   [8..11]  MajorVersion       (skipped)
-//   [12..15] MinorVersion       (skipped)
-//   [16..19] NameRva            (DLL name; skipped — we use libraryPathLabel)
-//   [20..23] OrdinalBase        (skipped — v1 doesn't read ordinals)
-//   [24..27] AddressTableEntries (count of function RVAs; skipped)
-//   [28..31] NumberOfNamePointers
-//   [32..35] AddressOfFunctions  (RVA — skipped, v1 only reads names)
-//   [36..39] AddressOfNames      (RVA → array of u32 RVAs to NUL-strings)
-//   [40..43] AddressOfNameOrdinals (RVA → array of u16; skipped)
+// Inside .edata (Microsoft PE/COFF spec rev 8.3, "Export Directory Table"):
+//   [ 0.. 3] ExportFlags        (skipped)
+//   [ 4.. 7] TimeDateStamp      (skipped)
+//   [ 8..11] MajorVersion + MinorVersion (skipped)
+//   [12..15] NameRva            (DLL name; skipped — we use libraryPathLabel)
+//   [16..19] OrdinalBase        (skipped — v1 doesn't read ordinals)
+//   [20..23] AddressTableEntries (count of function RVAs)
+//   [24..27] NumberOfNamePointers
+//   [28..31] AddressOfFunctions   (RVA — skipped, v1 only reads names)
+//   [32..35] AddressOfNames       (RVA → array of u32 RVAs to NUL-strings)
+//   [36..39] AddressOfNameOrdinals (RVA → array of u16; skipped)
 //
 // All exported NAMES become Function/Default/External rows. PE has no
 // type info equivalent to ELF's STT_OBJECT vs STT_FUNC + no visibility
@@ -486,10 +486,16 @@ readPe(std::span<std::uint8_t const> bytes,
     if      (optMagic == kPeMagicPe32Plus) isPe32Plus = true;
     else if (optMagic == kPeMagicPe32)     isPe32Plus = false;
     else {
+        // Format as hex matching the literal in the message; pre-fix
+        // `"0x" + std::to_string(u16)` rendered the value as decimal
+        // (e.g. 0xABCD → "0x43981") which was actively misleading.
+        char hex[8];
+        std::snprintf(hex, sizeof(hex), "0x%04X",
+                      static_cast<unsigned>(optMagic));
         return std::unexpected(emitAndReturn(
             BinaryReadErrorKind::CorruptedBinary,
-            "PE reader: optional header magic 0x"
-            + std::to_string(optMagic)
+            std::string{"PE reader: optional header magic "}
+            + hex
             + " is neither PE32 (0x010B) nor PE32+ (0x020B)", reporter));
     }
 

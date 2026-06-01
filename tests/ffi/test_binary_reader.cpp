@@ -251,7 +251,7 @@ TEST(BinaryReader, UnknownMagicFailsLoud) {
 }
 
 TEST(BinaryReader, PeMagicTooShortToBeValidIsCorrupted) {
-    // FF1-PE landed post-fold #14. PE magic ('MZ') now dispatches to
+    // FF1-PE landed 2026-06-01. PE magic ('MZ') now dispatches to
     // readPe(); a too-short PE buffer (no PE-signature header) fails
     // loud as CorruptedBinary (not UnsupportedFormat as before).
     std::vector<std::uint8_t> pe(64, 0);
@@ -500,7 +500,7 @@ TEST(BinaryReaderReporter, UnknownMagicAlsoEmitsFCodeThroughReporter) {
 }
 
 TEST(BinaryReaderReporter, PeMagicAlsoEmitsFCodeThroughReporter) {
-    // FF1-PE landed post-fold #14. A 4-byte PE-magic buffer dispatches
+    // FF1-PE landed 2026-06-01. A 4-byte PE-magic buffer dispatches
     // to readPe() which fails loud at the "file shorter than DOS
     // header" guard → emits F_CorruptedBinary, not F_UnsupportedBinaryFormat.
     DiagnosticReporter rep;
