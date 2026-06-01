@@ -4,8 +4,8 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <array>
-#include <cstdio>
 #include <cstring>
+#include <format>
 #include <fstream>
 #include <optional>
 #include <string_view>
@@ -486,17 +486,12 @@ readPe(std::span<std::uint8_t const> bytes,
     if      (optMagic == kPeMagicPe32Plus) isPe32Plus = true;
     else if (optMagic == kPeMagicPe32)     isPe32Plus = false;
     else {
-        // Format as hex matching the literal in the message; pre-fix
-        // `"0x" + std::to_string(u16)` rendered the value as decimal
-        // (e.g. 0xABCD → "0x43981") which was actively misleading.
-        char hex[8];
-        std::snprintf(hex, sizeof(hex), "0x%04X",
-                      static_cast<unsigned>(optMagic));
         return std::unexpected(emitAndReturn(
             BinaryReadErrorKind::CorruptedBinary,
-            std::string{"PE reader: optional header magic "}
-            + hex
-            + " is neither PE32 (0x010B) nor PE32+ (0x020B)", reporter));
+            std::format("PE reader: optional header magic 0x{:04X} "
+                        "is neither PE32 (0x010B) nor PE32+ (0x020B)",
+                        optMagic),
+            reporter));
     }
 
     // DataDirectories[0] = Export Table. Per PE/COFF spec:

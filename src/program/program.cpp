@@ -444,15 +444,15 @@ int Program::compileFiles(
         // so interleaved diagnostics from multi-target runs can be
         // routed by tooling. (silent-failure-hunter F9 fold.)
         //
-        // Post-fold #15 silent-failure H1 CRITICAL: scratch reporter
-        // MUST inherit `reporterConfig` so per-target diagnostics
-        // honor the same --suppress / --warnings-as-errors / unsuppressable
+        // H1 silent-failure fix 2026-06-01: scratch reporter MUST
+        // inherit `reporterConfig` so per-target diagnostics honor
+        // the same --suppress / --warnings-as-errors / unsuppressable
         // policy as the run-wide `rep`. Pre-fix the scratch was
         // default-constructed — `--suppress=H_ExternHasInitializer`
         // applied at the run level was silently ignored per-target,
         // making the Gap 3 e2e contract test pass for the wrong
-        // reason. (After this fix, the unsuppressable gate is the
-        // load-bearing path that keeps the H_* error visible.)
+        // reason. After this fix, the unsuppressable gate is the
+        // load-bearing path that keeps the H_* error visible.
         DiagnosticReporter scratch{reporterConfig};
         bool const ok = compileOneTarget(cu, *grammar, sourceStem,
                                           spec, scratch);
