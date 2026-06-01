@@ -85,19 +85,37 @@ struct EncodingState {
     // silently emitting a zero offset.
     std::optional<std::int32_t> disp32Mem;
     // SIB.index slot (D-AS4-5). Set when a `SibIndex` wire fires;
-    // optional makes the no-index vs with-index distinction explicit
-    // (no-index → SIB byte emits index=4 marker; with-index → SIB
-    // byte emits this register's low 3 bits + scale from MemBase).
+    // `optional` is the written-bit — same pattern as `disp32Mem`
+    // (code-simplifier REQUIRED post-fold #1: dropped the redundant
+    // `wroteSibIndex` flag).
     std::optional<std::uint8_t> sibIndex3;
-    bool                  wroteSibIndex = false;
     // SIB.scale — 2-bit exponent (0=*1, 1=*2, 2=*4, 3=*8) derived
-    // from the MemBase operand's `scale` field. Defaults to 0; when
-    // a `SibIndex` is wired, the walker reads MemBase's scale via
-    // the MemBaseScale wire and stores the exponent here.
-    std::uint8_t          sibScaleExp = 0;
+    // from the MemBase operand's `scale` field. `optional` makes the
+    // "MemBaseScale wired alone without SibIndex" silent-drop case
+    // detectable (post-fold #1 tighten — was a raw uint8_t defaulting
+    // to 0, silently coupling to wroteSibIndex).
+    std::optional<std::uint8_t> sibScaleExp;
     std::vector<std::int32_t>     imm32s;        // immediate values to append (LE 4B each)
     std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
 };
+
+// Reject a duplicate write to the same slot. Returns true if the
+// slot was already written (caller should fail loud + return false);
+// false means safe to proceed. Centralises the 3 ModR/M-family
+// double-write checks (code-simplifier REQUIRED post-fold #1 —
+// canonical phrasing for all three slots).
+[[nodiscard]] bool
+rejectDoubleWrite(bool alreadyWritten, std::string_view mnemonic,
+                  std::string_view slotName,
+                  DiagnosticReporter& reporter) {
+    if (!alreadyWritten) return false;
+    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+           DiagnosticSeverity::Error,
+           std::format("opcode '{}': second writer to {} slot "
+                       "(validate() should have rejected the schema)",
+                       mnemonic, slotName));
+    return true;
+}
 
 // Wire a value (register hwEncoding OR immediate) into the named
 // slot. Returns false on inconsistency (e.g. two operands trying to
@@ -108,34 +126,16 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
          DiagnosticReporter& reporter) {
     switch (slot) {
         case EncodingSlotKind::ModRmReg:
-            if (st.wroteModRmReg) {
-                // validate() should have rejected this schema, but if
-                // a future synthetic-Lir path reaches the encoder, the
-                // assertion fails loud rather than silently overwriting
-                // the already-written register bits.
-                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-                       DiagnosticSeverity::Error,
-                       std::format("opcode '{}': second writer to "
-                                   "ModR/M.reg slot (validate() should "
-                                   "have rejected the schema)",
-                                   mnemonic));
-                return false;
-            }
+            if (rejectDoubleWrite(st.wroteModRmReg, mnemonic,
+                                  "ModR/M.reg", reporter)) return false;
             st.hasModRm       = true;
             st.modRmReg3      = static_cast<std::uint8_t>(hwEnc & 0x7u);
             st.rexR           = (hwEnc & 0x8u) != 0u;
             st.wroteModRmReg  = true;
             return true;
         case EncodingSlotKind::ModRmRm:
-            if (st.wroteModRmRm) {
-                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-                       DiagnosticSeverity::Error,
-                       std::format("opcode '{}': second writer to "
-                                   "ModR/M.rm slot (validate() should "
-                                   "have rejected the schema)",
-                                   mnemonic));
-                return false;
-            }
+            if (rejectDoubleWrite(st.wroteModRmRm, mnemonic,
+                                  "ModR/M.rm", reporter)) return false;
             st.hasModRm      = true;
             st.modRmRm3      = static_cast<std::uint8_t>(hwEnc & 0x7u);
             st.rexB          = (hwEnc & 0x8u) != 0u;
@@ -143,19 +143,11 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             return true;
         case EncodingSlotKind::ModRmRmMem:
             // D-AS4-1 memory-addressing: like ModRmRm but flips the
-            // mod field to MemDisp32. The base register's low 3 bits
-            // fill ModR/M.rm; the high bit drives REX.B. The SIB
-            // forced-presence rule (when rm.lo3 == 4) fires at
-            // emit time, not here.
-            if (st.wroteModRmRm) {
-                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-                       DiagnosticSeverity::Error,
-                       std::format("opcode '{}': second writer to "
-                                   "ModR/M.rm slot (ModRmRmMem after a "
-                                   "prior ModRmRm/ModRmRmMem wire)",
-                                   mnemonic));
-                return false;
-            }
+            // mod field to MemDisp32. Shares the ModR/M.rm slot with
+            // ModRmRm (only one can write per instruction).
+            if (rejectDoubleWrite(st.wroteModRmRm, mnemonic,
+                                  "ModR/M.rm (ModRmRmMem)",
+                                  reporter)) return false;
             st.hasModRm      = true;
             st.modRmRm3      = static_cast<std::uint8_t>(hwEnc & 0x7u);
             st.rexB          = (hwEnc & 0x8u) != 0u;
@@ -167,7 +159,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             // bits fill SIB.index; the high bit drives REX.X. With-
             // index forces a SIB byte unconditionally (independent of
             // the rsp/r12 force-presence rule for no-index).
-            if (st.wroteSibIndex) {
+            if (st.sibIndex3.has_value()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': second writer to "
@@ -194,9 +186,8 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
                                    mnemonic));
                 return false;
             }
-            st.sibIndex3      = static_cast<std::uint8_t>(hwEnc & 0x7u);
-            st.rexX           = (hwEnc & 0x8u) != 0u;
-            st.wroteSibIndex  = true;
+            st.sibIndex3 = static_cast<std::uint8_t>(hwEnc & 0x7u);
+            st.rexX      = (hwEnc & 0x8u) != 0u;
             return true;
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Disp32Mem:
@@ -300,6 +291,15 @@ wireMemBaseScale(EncodingState& st, EncodingSlotKind slot,
                                "1, 2, 4, 8)",
                                mnemonic, scale));
             return false;
+    }
+    if (st.sibScaleExp.has_value()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': second writer to MemBaseScale "
+                           "slot — only one base scale per addressing "
+                           "form",
+                           mnemonic));
+        return false;
     }
     st.sibScaleExp = scaleExp;
     return true;
@@ -534,7 +534,7 @@ bool encode(Lir const&                  lir,
     bool const memModeNeedsSibForce =
         (st.modMode != EncodingState::ModMode::RegDirect)
         && (st.modRmRm3 == 0b100u);
-    bool const hasIndex = st.wroteSibIndex;
+    bool const hasIndex = st.sibIndex3.has_value();
     bool const sibFollows = memModeNeedsSibForce || hasIndex;
     if (st.hasModRm || selected->tmpl.modrmRegExt.has_value()) {
         std::uint8_t const modField =
@@ -556,7 +556,7 @@ bool encode(Lir const&                  lir,
     //      mode; register-direct mode has no SIB). Fail loud if a
     //      schema declared SibIndex without ModRmRmMem — silent
     //      "SIB emitted with mod=11" would produce a wrong instruction.
-    if (st.wroteSibIndex
+    if (st.sibIndex3.has_value()
         && st.modMode != EncodingState::ModMode::MemDisp32) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
@@ -589,7 +589,9 @@ bool encode(Lir const&                  lir,
         std::uint8_t const sibIndex = hasIndex
             ? *st.sibIndex3
             : static_cast<std::uint8_t>(0b100u);  // no-index marker
-        std::uint8_t const sibScale = hasIndex ? st.sibScaleExp : 0u;
+        std::uint8_t const sibScale = hasIndex
+            ? st.sibScaleExp.value_or(0u)
+            : static_cast<std::uint8_t>(0u);
         std::uint8_t const sib = static_cast<std::uint8_t>(
             (sibScale << 6) | (sibIndex << 3) | st.modRmRm3);
         out.push_back(sib);

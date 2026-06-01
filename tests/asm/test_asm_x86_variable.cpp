@@ -1335,6 +1335,110 @@ TEST(X86VariableEncoder, LeaWithIndexRejectsIllegalScale) {
     EXPECT_GT(rep.errorCount(), 0u);
 }
 
+TEST(X86VariableEncoder, LoadIndexedRcxRsiScale4) {
+    // `mov rcx, [rsi + rdx*4 + 0]` — 4-op indexed load with non-rsp,
+    // non-r12 base and index. mod=10 reg=rcx(1) rm=4(SIB) SIB(scale=2 index=rdx(2) base=rsi(6))
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rcx = physGprByName(**schema, "rcx");
+    LirReg const rsi = physGprByName(**schema, "rsi");
+    LirReg const rdx = physGprByName(**schema, "rdx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),
+            LirOperand::makeReg(rdx),
+            LirOperand::makeMemBase(4),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*loadOp, rcx, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8B);  // load opcode
+    EXPECT_EQ(bytes[2], 0x8C);  // mod=10 reg=rcx(1) rm=4(SIB)
+    EXPECT_EQ(bytes[3], 0x96);  // SIB: scale=10b index=rdx(2) base=rsi(6) = 0x80|0x10|0x06
+    EXPECT_EQ(bytes[4], 0x00);
+}
+
+TEST(X86VariableEncoder, StoreIndexedRdxRbxR12Scale8) {
+    // `mov [rbx + r12*8 + 0x20], rdx` — 5-op indexed store with REX.W
+    // and REX.X (from r12 index). reg=rdx(2), rm=4(SIB), SIB:
+    // scale=11b index=r12.lo3(4) base=rbx(3); REX = 4A (W+X).
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const storeOp = (*schema)->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOp.has_value());
+    LirReg const rdx = physGprByName(**schema, "rdx");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const r12 = physGprByName(**schema, "r12");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rdx),
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(r12),
+            LirOperand::makeMemBase(8),
+            LirOperand::makeMemOffset(0x20),
+        };
+        (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x4A);  // REX.W | REX.X
+    EXPECT_EQ(bytes[1], 0x89);  // store opcode
+    EXPECT_EQ(bytes[2], 0x94);  // mod=10 reg=rdx(2) rm=4(SIB) = 0x80|0x10|0x04
+    EXPECT_EQ(bytes[3], 0xE3);  // SIB: scale=11b index=r12.lo3(4) base=rbx(3) = 0xC0|0x20|0x03
+    EXPECT_EQ(bytes[4], 0x20);  // disp32 LE
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LeaWithIndexAndNonZeroDisp32) {
+    // `lea rax, [rbx + rcx*4 + 0x12345678]` — pin disp32 emission
+    // after SIB byte.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const rcx = physGprByName(**schema, "rcx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(rcx),
+            LirOperand::makeMemBase(4),
+            LirOperand::makeMemOffset(0x12345678),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8D);
+    EXPECT_EQ(bytes[2], 0x84);
+    EXPECT_EQ(bytes[3], 0x8B);  // SIB: scale=2(*4) index=rcx(1) base=rbx(3)
+    EXPECT_EQ(bytes[4], 0x78);  // disp32 LE byte 0
+    EXPECT_EQ(bytes[5], 0x56);
+    EXPECT_EQ(bytes[6], 0x34);
+    EXPECT_EQ(bytes[7], 0x12);
+}
+
 TEST(X86VariableEncoder, LeaNoIndexThreeOperandFormStillWorks) {
     auto schema = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(schema.has_value());

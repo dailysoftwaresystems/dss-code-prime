@@ -831,6 +831,26 @@ encode(AssembledModule const&    module,
                        "dynamic image.");
             return {};
         }
+        // CRITICAL machine-dispatch guard (silent-failure audit post-fold
+        // #1, 2026-06-01): `encodeElfExecDynamic` hardcodes the x86_64
+        // 6-byte `FF 25 disp32` PLT stub. Reaching this path with a
+        // non-x86_64 machine code (ARM64 / RISC-V / etc.) would silently
+        // emit x86_64 jump bytes as an "ARM64 PLT stub", producing SIGILL
+        // at the first extern call. ARM64 PLT stub encoding is anchored
+        // at plan 14 §3.1 D-LK6-8 (ADRP+LDR+BR 16-byte sequence).
+        constexpr std::uint16_t kEmX86_64 = 62u;
+        if (fmt.elf().machine != kEmX86_64) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 std::string{"elf::encode: extern imports present but "}
+                     + "ELF e_machine=" + std::to_string(fmt.elf().machine)
+                     + " is not x86_64 (EM_X86_64=62). PLT stub encoding "
+                       "is currently x86_64-only (6-byte `FF 25 disp32`); "
+                       "per-machine dispatch (ARM64 16-byte ADRP+LDR+BR "
+                       "etc.) is anchored at plan 14 §3.1 D-LK6-8. "
+                       "Self-contained intra-module ARM64 images work via "
+                       "the static ET_EXEC path (no externImports).");
+            return {};
+        }
         // Section schema lookup mirrors the existing path so the
         // dynamic helper inherits the same K_NoMatchingObjectFormat
         // guard.

@@ -20,7 +20,7 @@
 
   "sections": [
     {
-      "$comment": "Executable code. sh_type = SHT_PROGBITS (1); sh_flags = SHF_ALLOC | SHF_EXECINSTR (0x6); addralign = 4 (ARM64 instructions are 32-bit fixed-width; sections traditionally align to 16 or higher for cache, but the minimum is 4).",
+      "$comment": "Executable code. sh_type = SHT_PROGBITS (1); sh_flags = SHF_ALLOC | SHF_EXECINSTR (0x6); addralign = 16 (cache-friendly; ARM64 instructions are 4-byte but section alignment is conventionally larger).",
       "kind": "text",
       "name": ".text",
       "type": 1,

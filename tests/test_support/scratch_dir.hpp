@@ -49,7 +49,16 @@ public:
     // `group` becomes a subdir under the base — e.g. "link-writer",
     // "program", "asm". Lets parallel test binaries share the base
     // without colliding on the unique path slot.
-    explicit ScratchDir(Location loc, std::string_view group) {
+    //
+    // Throws `std::runtime_error` on ANY filesystem error (parent
+    // permission denied, disk full, antivirus lock). Silent swallow
+    // would leave `path_` set to a path that doesn't exist on disk;
+    // tests writing into it produce confusing ENOENT downstream
+    // rather than a clear "scratch dir setup failed" signal. (silent-
+    // failure audit post-fold #1 — same anti-pattern that F17 closed
+    // for `useAsCwd`; ctor was missed in the original hoist.)
+    explicit ScratchDir(Location loc, std::string_view group)
+        : loc_(loc) {
         static std::atomic<std::uint64_t> counter{0};
 #ifdef _WIN32
         auto const pid = static_cast<std::uint64_t>(_getpid());
@@ -58,6 +67,10 @@ public:
 #endif
         std::error_code ec;
         originalCwd_ = std::filesystem::current_path(ec);
+        if (ec) {
+            throw std::runtime_error(
+                "ScratchDir ctor: current_path() failed: " + ec.message());
+        }
 
         std::filesystem::path base;
         switch (loc) {
@@ -72,9 +85,19 @@ public:
                 break;
         }
         std::filesystem::create_directories(base, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "ScratchDir ctor: create_directories('"
+                + base.generic_string() + "') failed: " + ec.message());
+        }
         path_ = base / (std::to_string(pid) + "-"
                         + std::to_string(counter.fetch_add(1)));
         std::filesystem::create_directories(path_, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "ScratchDir ctor: create_directories('"
+                + path_.generic_string() + "') failed: " + ec.message());
+        }
     }
 
     ~ScratchDir() {
@@ -107,6 +130,21 @@ public:
     // failure F17 fold, LK10 cycle 2 — preserved here.) gtest converts
     // the uncaught throw into a test failure with the message intact.
     void useAsCwd() {
+        // `Location::Temp` puts the scratch dir outside the repo tree;
+        // calling `useAsCwd` would silently misroute schema-loader
+        // walks (`findShippedConfig` walks UP from cwd looking for
+        // `src/dss-config/`). Reject loudly rather than produce a
+        // confusing "shipped config not found" downstream.
+        // (architect audit Q6 post-fold #1 — was a precondition the
+        // type didn't enforce.)
+        if (loc_ == Location::Temp) {
+            throw std::runtime_error(
+                "ScratchDir::useAsCwd: Location::Temp is outside the "
+                "repo tree; schema-loader cwd-walk would fail to find "
+                "src/dss-config/. Construct with Location::InsideRepo "
+                "for tests that drive `compileFiles` or anything else "
+                "that loads shipped configs.");
+        }
         std::error_code ec;
         std::filesystem::current_path(path_, ec);
         if (ec) {
@@ -117,6 +155,7 @@ public:
     }
 
 private:
+    Location              loc_;
     std::filesystem::path path_;
     std::filesystem::path originalCwd_;
 };
