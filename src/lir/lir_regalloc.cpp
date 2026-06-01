@@ -30,14 +30,9 @@ namespace {
     std::abort();
 }
 
-void report(DiagnosticReporter& reporter, DiagnosticCode code,
-            DiagnosticSeverity severity, std::string actual) {
-    ParseDiagnostic d;
-    d.code     = code;
-    d.severity = severity;
-    d.actual   = std::move(actual);
-    reporter.report(std::move(d));
-}
+// `report()` shim hoisted to `core/types/diagnostic_reporter.hpp` as
+// `dss::report` at LK10 cycle 3 post-fold #2 (D-LK10-8). Call sites
+// below resolve to the canonical free function via ADL.
 
 // Per-class register lists. The naming is conservative: `calleeSaved`
 // here means "treated as call-safe for allocation" — populated with

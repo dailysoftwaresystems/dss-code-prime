@@ -12,7 +12,7 @@ namespace dss {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 
 } // namespace
 

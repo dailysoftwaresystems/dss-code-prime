@@ -84,8 +84,8 @@ struct DSS_EXPORT CliArgs {
 // CLI driver can dispatch a remediation-distinct diagnostic per
 // kind, not a generic "bad CLI args" message.
 enum class CliArgsError : std::uint8_t {
-    UnknownFlag         = 1,
-    MissingFlagValue    = 2,
+    UnknownFlag         = 1,    // `-<x>` or `--<x>` that isn't recognized
+    MissingFlagValue    = 2,    // --target ""  /  --target  (no next arg)
     DuplicateModeFlag   = 3,    // both --compile AND --directory etc.
     NoModeSelected      = 4,    // mode flags absent but mode-options set
     EmptyFileList       = 5,    // --compile / --transpile with no files
@@ -94,6 +94,7 @@ enum class CliArgsError : std::uint8_t {
     InvalidSuppressCode = 8,    // --suppress=<bad-code>
     InvalidConfig       = 9,    // --config=<not-debug-not-release>
     EmptyFilename       = 10,   // --compile "" or bare `-` as positional
+    UnexpectedPositional = 11,  // bare positional outside --compile/--transpile
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view

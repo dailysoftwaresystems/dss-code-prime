@@ -17,7 +17,7 @@ namespace {
 void emit(DiagnosticReporter& reporter,
           DiagnosticCode code,
           std::string msg) {
-    lir_pass_util::report(reporter, code,
+    dss::report(reporter, code,
                           DiagnosticSeverity::Error,
                           std::move(msg));
 }

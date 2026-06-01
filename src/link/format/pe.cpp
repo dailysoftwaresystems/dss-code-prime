@@ -48,7 +48,7 @@ namespace dss::pe {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 using link::format::detail::appendU8;
 using link::format::detail::appendU16LE;
 using link::format::detail::appendU32LE;

@@ -302,6 +302,36 @@ TEST(Program_CompileProject, FailsLoudPlanNotLanded) {
     EXPECT_EQ(prog.compileProject("any.dsp"), 1);
 }
 
+// H2 behavioral pin (silent-failure audit post-fold #2): even with
+// --suppress=D_PlanNotLanded, compileProject + transpile must return
+// non-zero. The suppress hides the stderr message but MUST NOT
+// absorb the "the operation didn't happen" signal into a silent
+// success exit. Without this, build systems downstream of
+// dss-code-prime treat exit 0 as "transpile happened" and consume
+// nonexistent outputs.
+TEST(Program_CompileProject, SuppressedPlanNotLandedStillReturnsNonZero) {
+    Program prog;
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::D_PlanNotLanded);
+    EXPECT_EQ(prog.compileProject("any.dsp", cfg), 1);
+}
+
+TEST(Program_Transpile, FailsLoudPlanNotLanded) {
+    Program prog;
+    EXPECT_EQ(
+        prog.transpile({"in.c"}, "c-subset", {"x86_64-v1-link-elf"}),
+        1);
+}
+
+TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
+    Program prog;
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::D_PlanNotLanded);
+    EXPECT_EQ(
+        prog.transpile({"in.c"}, "c-subset", {"x86_64-v1-link-elf"}, cfg),
+        1);
+}
+
 // ── compileDirectory ──────────────────────────────────────────
 
 TEST(Program_CompileDirectory, WiresThroughForMatchingFiles) {

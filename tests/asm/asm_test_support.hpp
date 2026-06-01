@@ -59,7 +59,7 @@ roundTripVerify(TargetSchema const&            schema,
                 LirInstId                      inst,
                 std::span<std::uint8_t const>  encodedBytes,
                 DiagnosticReporter&            reporter) {
-    using dss::lir_pass_util::report;
+    using dss::report;
 
     auto const opcode = lir.instOpcode(inst);
     auto const result = disassembleInst(schema, opcode, encodedBytes, reporter);

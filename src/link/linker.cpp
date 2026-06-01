@@ -16,7 +16,7 @@ namespace dss::linker {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 
 } // namespace
 

@@ -133,4 +133,22 @@ private:
     bool                                    hitCap_ = false;
 };
 
+// Ergonomic free function for the common "construct a ParseDiagnostic
+// with code/severity/actual + dispatch through the reporter" shape.
+// Hoisted out of `lir/lir_pass_util.{hpp,cpp}` at LK10 cycle 3 post-fold
+// #2 (D-LK10-8 closure): the shim is intrinsically tier-agnostic (it
+// walks no LIR types) and was forcing driver-tier consumers like
+// `program/input_resolver.cpp` to #include LIR headers for a one-line
+// helper. Now lives at the canonical home so every tier — LIR, AS,
+// link, driver — imports from the same place. Inline-defined so no
+// new translation unit is required.
+inline void report(DiagnosticReporter& reporter, DiagnosticCode code,
+                   DiagnosticSeverity severity, std::string actual) {
+    ParseDiagnostic d;
+    d.code     = code;
+    d.severity = severity;
+    d.actual   = std::move(actual);
+    reporter.report(std::move(d));
+}
+
 } // namespace dss

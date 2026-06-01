@@ -13,7 +13,7 @@ namespace dss {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 
 // Per-pass shared cache for "the mov opcode in this schema". Looked
 // up once; reused for every implicit move emitted.

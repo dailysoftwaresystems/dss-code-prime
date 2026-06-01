@@ -518,3 +518,93 @@ TEST(CliArgs, SchemaDirInLspModeAccepted) {
     EXPECT_TRUE(r->lspMode);
     ASSERT_TRUE(r->lspSchemaDir.has_value());
 }
+
+// ── Post-fold #2: 7-agent audit folds ────────────────────────
+
+// C2 symmetry (pr-test-analyzer Rating 9): every value-bearing flag
+// must reject empty RHS. Cover the 5 untested call sites.
+TEST(CliArgs, DirectoryEqualsEmptyRhsRejects) {
+    Argv a{"dss-code-prime", "--directory=", "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+TEST(CliArgs, ProjectEqualsEmptyRhsRejects) {
+    Argv a{"dss-code-prime", "--project="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+TEST(CliArgs, LanguageEqualsEmptyRhsRejects) {
+    Argv a{"dss-code-prime", "--compile", "a.c", "--language=",
+           "--target", "x86_64-v1-link-elf"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+TEST(CliArgs, LangAliasEqualsEmptyRhsRejects) {
+    Argv a{"dss-code-prime", "--compile", "a.c", "--lang=",
+           "--target", "x86_64-v1-link-elf"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+TEST(CliArgs, SuppressEqualsEmptyRhsRejects) {
+    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf", "--suppress="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+// post-fold #2: takeFlagValue tighten — space form with empty next
+// arg must also reject (was silently accepted as ""). Comment-analyzer
+// caught the asymmetry between equalsValue and takeFlagValue.
+TEST(CliArgs, TargetSpaceFormEmptyNextArgRejects) {
+    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+           "--target", ""};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+// C1 boundary (pr-test-analyzer Rating 8): 0x0000 must reject because
+// no enumerated code at value 0.
+TEST(CliArgs, SuppressRejectsHexZero) {
+    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf", "--suppress=0x0000"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidSuppressCode);
+}
+
+// silent-failure post-fold #2: --config case-insensitive.
+TEST(CliArgs, ConfigAcceptsAllCapsRelease) {
+    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf", "--config=RELEASE"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_EQ(r->config, CompileConfig::Release);
+}
+
+TEST(CliArgs, ConfigAcceptsAllCapsDebug) {
+    Argv a{"dss-code-prime", "--compile", "a.c", "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf", "--config=DEBUG"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_EQ(r->config, CompileConfig::Debug);
+}
+
+// type-design post-fold #2: UnknownFlag (bad spelling) vs
+// UnexpectedPositional (file outside --compile) split.
+TEST(CliArgs, BarePositionalEmitsUnexpectedPositional) {
+    Argv a{"dss-code-prime", "stray.c"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::UnexpectedPositional);
+}

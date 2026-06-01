@@ -65,7 +65,7 @@ alignUp(std::uint64_t v, std::uint64_t a) noexcept {
 // every walker speaks the same K_* dialect.
 inline void emit(DiagnosticReporter& reporter, DiagnosticCode code,
                  std::string msg) {
-    lir_pass_util::report(reporter, code, DiagnosticSeverity::Error,
+    dss::report(reporter, code, DiagnosticSeverity::Error,
                           std::move(msg));
 }
 

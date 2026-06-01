@@ -6,7 +6,6 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
-#include "lir/lir_pass_util.hpp"
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/thread_pool.hpp"
@@ -75,15 +74,13 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
     }
 }
 
-// Emit a driver-tier D_* diagnostic. Wraps `lir_pass_util::report`
-// so all driver-side fail-loud sites take the same shape (Error
-// severity, ferried through the same reporter the kernel uses).
+// Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
+// driver-side fail-loud sites take the same shape (Error severity,
+// ferried through the same reporter the kernel uses).
 void emitDriver(DiagnosticReporter& rep,
                 DiagnosticCode code,
                 std::string msg) {
-    lir_pass_util::report(rep, code,
-                          DiagnosticSeverity::Error,
-                          std::move(msg));
+    dss::report(rep, code, DiagnosticSeverity::Error, std::move(msg));
 }
 
 // `copyDiagnostics` is declared in `compile_pipeline.hpp` (hoisted at
@@ -280,11 +277,6 @@ int Program::run(int argc, char* argv[]) {
     return 0;
 }
 
-int Program::compileProject(const std::string& projectFilePath) {
-    // Back-compat 1-arg overload (C-ABI). Default-constructed policy.
-    return compileProject(projectFilePath, DiagnosticReporter::Config{});
-}
-
 int Program::compileProject(
     const std::string& projectFilePath,
     DiagnosticReporter::Config const& reporterConfig
@@ -302,17 +294,16 @@ int Program::compileProject(
                "yet implemented — plan 06 (artifact profile) owns "
                "the .dsp schema. Path: '" + projectFilePath + "'.");
     drainDiagnosticsToStderr(rep);
-    return rep.errorCount() == 0 ? 0 : 1;
-}
-
-int Program::transpile(
-    const std::vector<std::string>& sourceFiles,
-    const std::string& languageName,
-    const std::vector<std::string>& targets
-) {
-    // Back-compat 3-arg overload. Default policy.
-    return transpile(sourceFiles, languageName, targets,
-                     DiagnosticReporter::Config{});
+    // Unconditional non-zero exit — `D_PlanNotLanded` signals "the
+    // requested operation cannot be performed by this build", a hard
+    // capability gap that `--suppress` MUST NOT absorb into a silent
+    // success exit. (silent-failure audit post-fold #2: H2's
+    // `errorCount() == 0 ? 0 : 1` allowed `--suppress=D_PlanNotLanded`
+    // to exit 0 with zero-byte output, exactly the silent-failure
+    // class the fold was meant to close.) The user's `--suppress`
+    // still hides the message via the policy applied at emit time;
+    // it just no longer hides the exit code.
+    return 1;
 }
 
 int Program::transpile(
@@ -345,17 +336,8 @@ int Program::transpile(
     detail += ".";
     emitDriver(rep, DiagnosticCode::D_PlanNotLanded, std::move(detail));
     drainDiagnosticsToStderr(rep);
-    return rep.errorCount() == 0 ? 0 : 1;
-}
-
-int Program::compileFiles(
-    const std::vector<std::string>& sourceFiles,
-    const std::string& languageName,
-    const std::vector<std::string>& targets
-) {
-    // Default-policy delegate (back-compat for the C-ABI surface).
-    return compileFiles(sourceFiles, languageName, targets,
-                        DiagnosticReporter::Config{});
+    // Unconditional non-zero — see compileProject for rationale.
+    return 1;
 }
 
 int Program::compileFiles(
@@ -445,17 +427,6 @@ int Program::compileFiles(
 
     drainDiagnosticsToStderr(rep);
     return exitCode;
-}
-
-int Program::compileDirectory(
-    const std::string& directoryPath,
-    const std::string& languageName,
-    const std::vector<std::string>& targets
-) {
-    // Default-policy + default-recursive delegate (back-compat).
-    return compileDirectory(directoryPath, languageName, targets,
-                            InputResolver::Mode::Recursive,
-                            DiagnosticReporter::Config{});
 }
 
 int Program::compileDirectory(

@@ -17,55 +17,32 @@ public:
     /// Entry point for the CLI. Parses arguments and dispatches compilation.
     int run(int argc, char* argv[]);
 
-    /// Programmatic entry point for embedding (DLL consumers).
-    /// Compile a project file (.dsp).
-    int compileProject(const std::string& projectFilePath);
-
-    /// Policy-aware overload (LK10 cycle 3 post-fold #1 — silent-failure
-    /// audit H2): threads `--warnings-as-errors` + `--suppress=<code>`
-    /// through the local reporter so the user's policy applies even
-    /// on fail-loud-pending-plan-06 paths.
+    /// Compile a project file (.dsp). `reporterConfig` threads
+    /// `--warnings-as-errors` + `--suppress=<code>` through every tier.
+    /// (LK10 cycle 3 post-fold #2: overload pair collapsed to single
+    /// signature with default — code-simplifier REQUIRED.)
     int compileProject(
         const std::string& projectFilePath,
-        DiagnosticReporter::Config const& reporterConfig
+        DiagnosticReporter::Config const& reporterConfig = {}
     );
 
-    /// Programmatic entry point for embedding (DLL consumers).
-    /// Compile explicit source files for a language to one or more targets.
-    int compileFiles(
-        const std::vector<std::string>& sourceFiles,
-        const std::string& languageName,
-        const std::vector<std::string>& targets
-    );
-
-    /// Policy-aware overload (LK10 cycle 3 — D-LK10-7 closure). The
-    /// `reporterConfig` is applied to the run-wide DiagnosticReporter,
-    /// so `--warnings-as-errors` + `--suppress=<code>` propagate through
-    /// every tier's drain.
+    /// Compile explicit source files for a language to one or more
+    /// targets. `reporterConfig` is applied run-wide.
     int compileFiles(
         const std::vector<std::string>& sourceFiles,
         const std::string& languageName,
         const std::vector<std::string>& targets,
-        DiagnosticReporter::Config const& reporterConfig
+        DiagnosticReporter::Config const& reporterConfig = {}
     );
 
-    /// Programmatic entry point for embedding (DLL consumers).
-    /// Compile all matching source files in a directory (recursive scan).
-    int compileDirectory(
-        const std::string& directoryPath,
-        const std::string& languageName,
-        const std::vector<std::string>& targets
-    );
-
-    /// Policy-aware overload with explicit recursion policy (LK10
-    /// cycle 3 — D-LK10-1 closure: --recursive / --no-recursive is
-    /// the second policy axis that triggered the InputResolver hoist).
+    /// Compile every matching source file in a directory.
+    /// `mode` selects recursive vs flat scan (D-LK10-1 closure axis).
     int compileDirectory(
         const std::string& directoryPath,
         const std::string& languageName,
         const std::vector<std::string>& targets,
-        InputResolver::Mode mode,
-        DiagnosticReporter::Config const& reporterConfig
+        InputResolver::Mode mode = InputResolver::Mode::Recursive,
+        DiagnosticReporter::Config const& reporterConfig = {}
     );
 
     /// Source-to-source transpilation entry point — plan 10 owns
@@ -76,16 +53,8 @@ public:
     int transpile(
         const std::vector<std::string>& sourceFiles,
         const std::string& languageName,
-        const std::vector<std::string>& targets
-    );
-
-    /// Policy-aware transpile overload (H2 fold) — see compileProject
-    /// above for rationale.
-    int transpile(
-        const std::vector<std::string>& sourceFiles,
-        const std::string& languageName,
         const std::vector<std::string>& targets,
-        DiagnosticReporter::Config const& reporterConfig
+        DiagnosticReporter::Config const& reporterConfig = {}
     );
 };
 

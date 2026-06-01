@@ -1,7 +1,6 @@
 #include "program/input_resolver.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
-#include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
 #include <system_error>
@@ -12,10 +11,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-using lir_pass_util::report;
-
 void emit(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
-    report(rep, code, DiagnosticSeverity::Error, std::move(msg));
+    dss::report(rep, code, DiagnosticSeverity::Error, std::move(msg));
 }
 
 // Common extension match for both recursive + flat scans. Returns

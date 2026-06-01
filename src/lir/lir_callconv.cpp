@@ -20,7 +20,7 @@ namespace dss {
 namespace {
 
 // Shorthand: shared diagnostic helper from lir_pass_util.
-using lir_pass_util::report;
+using dss::report;
 
 // Per-class width in bytes. The cc's saved-reg and spill-slot areas
 // use the widest declared width per class as a uniform slot size —

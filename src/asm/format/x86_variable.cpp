@@ -16,7 +16,7 @@ namespace dss::x86_variable {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 
 // Map an `OperandKindFilter` to the `LirOperandKind` the substrate
 // actually carries on each LIR operand pool slot. Returns nullopt if

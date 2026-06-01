@@ -12,7 +12,7 @@ namespace dss {
 namespace {
 
 // Diagnostic-emit shorthand, same convention as ML6/ML7.
-using lir_pass_util::report;
+using dss::report;
 
 // Dispatch shell for a single LIR instruction's byte encoding. Cycle 1
 // substrate has no format walkers registered yet — every shape returns

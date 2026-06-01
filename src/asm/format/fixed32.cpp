@@ -16,7 +16,7 @@ namespace dss::fixed32 {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 
 // (`filterToLirKind`, `operandsMatchGuard`, and `hwEncodingOf`
 // hoisted to `asm/format/walker_util.hpp` per D-AS3-2 closure.)
