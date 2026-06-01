@@ -263,6 +263,7 @@
         "format": "x86-variable",
         "variants": [
           {
+            "$comment": "3-op no-index form: `mov reg, [base + disp32]`.",
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [139] },
@@ -271,28 +272,15 @@
               { "index": 1, "slotKind": "membase.scale" },
               { "index": 2, "slotKind": "disp32.mem"    }
             ]
-          }
-        ]
-      }
-    },
-    {
-      "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)]. No result. Emits `mov [base + disp], reg`: REX.W 0x89 /r ModR/M(mod=10, reg=value, rm=base) [SIB 0x24 when base.lo3==4] disp32. Plan 13 §3.1 D-AS4-1.",
-      "mnemonic":      "store",
-      "result":        "none",
-      "hasSideEffects": true,
-      "minOperands":   4,
-      "maxOperands":   4,
-      "minSuccessors": 0,
-      "maxSuccessors": 0,
-      "encoding": {
-        "format": "x86-variable",
-        "variants": [
+          },
           {
-            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
-            "template": { "rexW": true, "opcode": [137] },
-            "wires":    [
-              { "index": 0, "slotKind": "modrm.reg"     },
-              { "index": 1, "slotKind": "modrm.rm.mem"  },
+            "$comment": "4-op indexed form (D-AS4-5): `mov reg, [base + index*scale + disp32]`. The walker emits SIB unconditionally when SibIndex wires.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
               { "index": 2, "slotKind": "membase.scale" },
               { "index": 3, "slotKind": "disp32.mem"    }
             ]
@@ -301,14 +289,80 @@
       }
     },
     {
-      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)]. AS1 emits x86_64 `lea reg, [base + index*scale + disp]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm in cycle 3d.",
+      "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale), MemOffset(disp)] OR [value_reg, base_reg, index_reg, MemBase(scale), MemOffset(disp)]. No result. Emits `mov [base (+ index*scale) + disp32], reg`: REX.W 0x89 /r ModR/M(mod=10, reg=value, rm=base) [SIB] disp32. Plan 13 §3.1 D-AS4-1 + D-AS4-5.",
+      "mnemonic":      "store",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   5,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "4-op no-index form (D-AS4-1).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "5-op indexed form (D-AS4-5).",
+            "guard":    { "operandKinds": ["reg", "reg", "reg", "membase", "memoffset"] },
+            "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "sib.index"     },
+              { "index": 3, "slotKind": "membase.scale" },
+              { "index": 4, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)]. AS1 emits x86_64 `lea reg, [base + index*scale + disp]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm via 4-operand form. Encoding (D-AS4-5 close 2026-06-01): REX.W 0x8D /r ModR/M(mod=10, reg=result, rm=base) [SIB] disp32. Opcode 0x8D is the `lea` mnemonic; the rest matches the `load`/`store` shape since lea reads memory operands but writes only the EA (no memory access).",
       "mnemonic":      "lea",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   3,
       "maxOperands":   4,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "3-op no-index form: `lea reg, [base + disp32]`.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op indexed form: `lea reg, [base + index*scale + disp32]`.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). Operands: [src_reg]. Width comes from the result reg's class + the source reg's width-of-record. AS1 emits movsx.",

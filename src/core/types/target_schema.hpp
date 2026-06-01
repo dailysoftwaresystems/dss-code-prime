@@ -438,12 +438,27 @@ enum class EncodingSlotKind : std::uint8_t {
     ModRmRmMem    = 8,
     MemBaseScale  = 9,
     Disp32Mem     = 10,
+    // D-AS4-5 closure (2026-06-01): SIB.index field (bits 3..5 of
+    // the SIB byte). Wires an index register's hwEncoding low 3
+    // bits into SIB.index and the high bit into REX.X (the AS2
+    // pre-declared `rexX` field is finally consumed here). Paired
+    // with `MemBaseScale` (which now also supplies the 2-bit scale
+    // exponent for SIB.scale bits 6..7).
+    //
+    // Schema variant guard adds `Reg` between the base `Reg` and
+    // `MemBase` for the with-index shape:
+    //   3-op no-index: [base, MemBase(scale=1), MemOffset(disp)]
+    //   4-op indexed:  [base, index, MemBase(scale∈{1,2,4,8}), MemOffset(disp)]
+    // The walker dispatches on the presence of `SibIndex` wiring to
+    // emit the SIB byte unconditionally (separate from the rsp/r12
+    // force-presence rule that fires today on no-index addressing).
+    SibIndex      = 11,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
     //   ImmShift / Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 11> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 12> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -455,6 +470,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 11> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmRmMem,   "modrm.rm.mem"  },
     { EncodingSlotKind::MemBaseScale, "membase.scale" },
     { EncodingSlotKind::Disp32Mem,    "disp32.mem"    },
+    { EncodingSlotKind::SibIndex,     "sib.index"     },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -473,7 +489,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 11,
+static_assert(kEncodingSlotKindCount == 12,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -495,6 +511,7 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
+        case EncodingSlotKind::SibIndex:
             return TargetEncodingShape::X86Variable;
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
@@ -583,8 +600,9 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
-            // D-AS4-1 memory-addressing slots write immediate
-            // displacements (not symbol-relative). Symbol-bearing
+        case EncodingSlotKind::SibIndex:
+            // D-AS4-1 / D-AS4-5 memory-addressing slots write immediate
+            // displacements / register encodings (not symbol-relative). Symbol-bearing
             // memory addressing (RIP-relative `mov reg, [sym]` /
             // ARM64 ADRP+ADD pair) is anchored at D-AS4-1 as a
             // separate symbol-bearing variant when that consumer

@@ -59,11 +59,10 @@ struct EncodingState {
     std::uint8_t          modRmRm3   = 0;       // low 3 bits → ModR/M.rm
     bool                  rexR       = false;   // high bit of ModRmReg slot's hwEncoding
     bool                  rexB       = false;   // high bit of ModRmRm slot's hwEncoding
-    // `rexX` is reserved for SIB.index high bit. v1 memory addressing
-    // (D-AS4-1 cycle 2) uses no index reg — SIB-when-present encodes
-    // `[base + 0*idx + disp]`, with index field forced to 4 (no-index
-    // marker). When `index*scale` lands as a future cycle, that wire
-    // will set rexX from the index's hwEncoding bit 3.
+    // `rexX` carries the SIB.index high bit. Set by the `SibIndex`
+    // slot's wiring (D-AS4-5 closure 2026-06-01) from the index reg
+    // hwEncoding bit 3. Stays false on no-index forms (the SIB byte
+    // emits index=4 = no-index marker).
     bool                  rexX       = false;
     // Defense-in-depth: track which ModR/M sub-slots have been written.
     // `validate()` already rejects schemas that would double-write
@@ -85,6 +84,17 @@ struct EncodingState {
     // ModR/M-mem + missing-Disp32Mem pairing fail loud rather than
     // silently emitting a zero offset.
     std::optional<std::int32_t> disp32Mem;
+    // SIB.index slot (D-AS4-5). Set when a `SibIndex` wire fires;
+    // optional makes the no-index vs with-index distinction explicit
+    // (no-index → SIB byte emits index=4 marker; with-index → SIB
+    // byte emits this register's low 3 bits + scale from MemBase).
+    std::optional<std::uint8_t> sibIndex3;
+    bool                  wroteSibIndex = false;
+    // SIB.scale — 2-bit exponent (0=*1, 1=*2, 2=*4, 3=*8) derived
+    // from the MemBase operand's `scale` field. Defaults to 0; when
+    // a `SibIndex` is wired, the walker reads MemBase's scale via
+    // the MemBaseScale wire and stores the exponent here.
+    std::uint8_t          sibScaleExp = 0;
     std::vector<std::int32_t>     imm32s;        // immediate values to append (LE 4B each)
     std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
 };
@@ -151,6 +161,42 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             st.rexB          = (hwEnc & 0x8u) != 0u;
             st.wroteModRmRm  = true;
             st.modMode       = EncodingState::ModMode::MemDisp32;
+            return true;
+        case EncodingSlotKind::SibIndex:
+            // D-AS4-5 indexed addressing: the index register's low 3
+            // bits fill SIB.index; the high bit drives REX.X. With-
+            // index forces a SIB byte unconditionally (independent of
+            // the rsp/r12 force-presence rule for no-index).
+            if (st.wroteSibIndex) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': second writer to "
+                                   "SIB.index slot — only one index "
+                                   "register per addressing form",
+                                   mnemonic));
+                return false;
+            }
+            // x86-64 ABI rule: SIB.index = 4 is the no-index marker;
+            // it cannot encode a real rsp index (rsp = lo3 4). Reject
+            // an rsp index loudly rather than silently producing a no-
+            // index form. (silent-failure defense — without this, an
+            // assembler bug that picked rsp as an index would emit a
+            // valid-looking but wrong instruction.)
+            if ((hwEnc & 0x7u) == 0b100u && (hwEnc & 0x8u) == 0u) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': rsp (lo3=4, hi=0) "
+                                   "cannot be used as a SIB index — "
+                                   "the x86-64 SIB encoding reserves "
+                                   "index=4 as the no-index marker. "
+                                   "Re-allocate the index to a non-rsp "
+                                   "register.",
+                                   mnemonic));
+                return false;
+            }
+            st.sibIndex3      = static_cast<std::uint8_t>(hwEnc & 0x7u);
+            st.rexX           = (hwEnc & 0x8u) != 0u;
+            st.wroteSibIndex  = true;
             return true;
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Disp32Mem:
@@ -219,12 +265,15 @@ wireImm32(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
     return true;
 }
 
-// D-AS4-1 memory-addressing: validate a MemBase operand's scale
-// against the v1 cycle scope (scale == 1 — base+disp form). Future
-// `[base + index*scale]` cycles will accept scale ∈ {1,2,4,8}.
-// The slot writes no bytes.
+// D-AS4-1 + D-AS4-5 memory-addressing: validate a MemBase operand's
+// scale and store the SIB.scale exponent for emission. Scale ∈
+// {1,2,4,8} (D-AS4-5 generalisation from cycle-1's scale==1-only).
+// The slot writes no bytes directly; the exponent feeds the SIB
+// byte when a `SibIndex` is also wired (or the existing rsp/r12
+// force-presence rule fires on no-index).
 [[nodiscard]] bool
-wireMemBaseScale(EncodingSlotKind slot, std::uint32_t scale,
+wireMemBaseScale(EncodingState& st, EncodingSlotKind slot,
+                 std::uint32_t scale,
                  std::string_view mnemonic,
                  DiagnosticReporter& reporter) {
     if (slot != EncodingSlotKind::MemBaseScale) {
@@ -235,16 +284,24 @@ wireMemBaseScale(EncodingSlotKind slot, std::uint32_t scale,
                            mnemonic, encodingSlotKindName(slot)));
         return false;
     }
-    if (scale != 1u) {
-        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': MemBase scale {} not supported "
-                           "(v1 cycle scope: scale == 1 only — "
-                           "[base + index*scale] addressing is anchored "
-                           "as a follow-up to D-AS4-1)",
-                           mnemonic, scale));
-        return false;
+    // x86-64 SIB.scale field is a 2-bit exponent; legal scales are
+    // {1, 2, 4, 8}. Reject anything else loudly.
+    std::uint8_t scaleExp = 0;
+    switch (scale) {
+        case 1u: scaleExp = 0; break;
+        case 2u: scaleExp = 1; break;
+        case 4u: scaleExp = 2; break;
+        case 8u: scaleExp = 3; break;
+        default:
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': MemBase scale {} is not "
+                               "a legal x86-64 SIB scale (accepted: "
+                               "1, 2, 4, 8)",
+                               mnemonic, scale));
+            return false;
     }
+    st.sibScaleExp = scaleExp;
     return true;
 }
 
@@ -365,10 +422,11 @@ bool encode(Lir const&                  lir,
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::MemBase) {
-            // D-AS4-1 memory-addressing: MemBase carries the scale
-            // for `[base + index*scale + disp]` addressing. v1 cycle
-            // scope only handles scale == 1 (no indexed addressing).
-            if (!wireMemBaseScale(wire.slotKind, srcOp.scale,
+            // D-AS4-1 + D-AS4-5 memory-addressing: MemBase carries the
+            // scale for `[base + index*scale + disp]` addressing.
+            // Cycle-1 (closed at LK10 cycle 2) handled scale==1 only;
+            // D-AS4-5 generalises to scale ∈ {1,2,4,8}.
+            if (!wireMemBaseScale(st, wire.slotKind, srcOp.scale,
                                    info->mnemonic, reporter)) {
                 return false;
             }
@@ -464,6 +522,20 @@ bool encode(Lir const&                  lir,
     //    mod=10 (memory + disp32). The walker accumulates modMode
     //    via the slot-wiring loop (ModRmRm → RegDirect, ModRmRmMem →
     //    MemDisp32).
+    // Decide whether a SIB byte follows. Two triggers:
+    //   (a) D-AS4-1 force-presence: memory mode + rm.lo3 == 4.
+    //   (b) D-AS4-5 indexed addressing: a SibIndex wire fired.
+    // When SIB follows, ModR/M.rm MUST be 4 (the "SIB follows"
+    // marker); the actual base register's lo3 goes into SIB.base.
+    // The pre-existing no-index force-presence path "worked by
+    // accident" because rsp/r12 (lo3=4) doubled as both the marker
+    // and the base — for non-{rsp,r12} indexed forms, that
+    // coincidence doesn't hold and we MUST emit 4 explicitly.
+    bool const memModeNeedsSibForce =
+        (st.modMode != EncodingState::ModMode::RegDirect)
+        && (st.modRmRm3 == 0b100u);
+    bool const hasIndex = st.wroteSibIndex;
+    bool const sibFollows = memModeNeedsSibForce || hasIndex;
     if (st.hasModRm || selected->tmpl.modrmRegExt.has_value()) {
         std::uint8_t const modField =
             static_cast<std::uint8_t>(st.modMode);
@@ -471,29 +543,55 @@ bool encode(Lir const&                  lir,
             selected->tmpl.modrmRegExt.has_value()
                 ? static_cast<std::uint8_t>(*selected->tmpl.modrmRegExt & 0x7u)
                 : st.modRmReg3;
-        std::uint8_t const rmField  = st.modRmRm3;
+        std::uint8_t const rmField  = sibFollows
+            ? static_cast<std::uint8_t>(0b100u)   // SIB-follows marker
+            : st.modRmRm3;
         std::uint8_t const modrm    = static_cast<std::uint8_t>(
             (modField << 6) | (regField << 3) | rmField);
         out.push_back(modrm);
     }
 
-    // 5) SIB byte. The x86-64 ABI requires a SIB byte when ModR/M.mod
-    //    is not 11 AND ModR/M.rm.lo3 == 4 (the rsp/r12 family — bit
-    //    pattern that would otherwise mean "SIB follows"). v1 cycle
-    //    scope uses no index register; SIB encodes `[base + 0 + disp]`
-    //    with index=4 (no-index marker) and scale=0.
+    // 4.5) D-AS4-5 coherence: a SibIndex wire is only meaningful with
+    //      a ModRmRmMem base (the indexed form is a memory-addressing
+    //      mode; register-direct mode has no SIB). Fail loud if a
+    //      schema declared SibIndex without ModRmRmMem — silent
+    //      "SIB emitted with mod=11" would produce a wrong instruction.
+    if (st.wroteSibIndex
+        && st.modMode != EncodingState::ModMode::MemDisp32) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': variant wires SibIndex but "
+                           "no ModRmRmMem (register-direct ModR/M mode) "
+                           "— indexed addressing requires a memory base. "
+                           "Schema is malformed.",
+                           info->mnemonic));
+        return false;
+    }
+
+    // 5) SIB byte. Emitted in TWO cases:
+    //    (a) D-AS4-1 force-presence rule: ModR/M.mod != 11 AND
+    //        ModR/M.rm.lo3 == 4 (rsp/r12 family — the rm encoding
+    //        that otherwise means "SIB follows"). No index register;
+    //        SIB encodes `[base + 0 + disp]` with index=4 (no-index
+    //        marker) and scale=0.
+    //    (b) D-AS4-5 indexed addressing: a `SibIndex` wire fired
+    //        (st.wroteSibIndex). SIB encodes `[base + index*scale + disp]`
+    //        with index = st.sibIndex3 (from the SibIndex wire's
+    //        register operand), scale exponent = st.sibScaleExp
+    //        (from MemBaseScale's scale field), base = st.modRmRm3.
     //
     //    SIB byte layout: scale<<6 | index<<3 | base
-    //    For our use: scale=0, index=4, base=st.modRmRm3 → 0x24 when
-    //    the base is rsp (rm.lo3=4 + REX.B=0). When base is r12
-    //    (rm.lo3=4 + REX.B=1) the high bit lives in REX.B and the
-    //    SIB byte stays 0x24 too.
-    bool const memModeNeedsSib =
-        (st.modMode != EncodingState::ModMode::RegDirect)
-        && (st.modRmRm3 == 0b100u);  // rsp/r12 family
-    if (memModeNeedsSib) {
+    //    Indexed form's REX.X drives the index high bit (already set
+    //    in st.rexX by the SibIndex wire above; emitted in the REX
+    //    prefix step earlier).
+    // (Re-use `sibFollows` computed above for the ModR/M.rm encoding.)
+    if (sibFollows) {
+        std::uint8_t const sibIndex = hasIndex
+            ? *st.sibIndex3
+            : static_cast<std::uint8_t>(0b100u);  // no-index marker
+        std::uint8_t const sibScale = hasIndex ? st.sibScaleExp : 0u;
         std::uint8_t const sib = static_cast<std::uint8_t>(
-            (0u << 6) | (0b100u << 3) | st.modRmRm3);
+            (sibScale << 6) | (sibIndex << 3) | st.modRmRm3);
         out.push_back(sib);
     }
 
