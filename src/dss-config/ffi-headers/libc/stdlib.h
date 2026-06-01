@@ -1,10 +1,6 @@
-// Pre-reduced libc <stdlib.h> for FFI ingestion (plan 11 FF2).
-//
-// Same curation rules as stdio.h — only declarations the c-subset
-// grammar accepts. malloc/free use `void*` and an `int` size for v1
-// (a future grammar extension introducing `size_t` will widen this
-// to the ABI-correct unsigned long; the FF6 smoke test pins the v1
-// shape).
+// Pre-reduced libc <stdlib.h> for FFI ingestion (plan 11 FF2 §4 Q1).
+// `int` size is a v1 approximation pending the c-subset grammar's
+// unsigned-integer / size_t extension; `void*` works as-is.
 
 extern void* malloc(int size);
 extern void  free(void* p);

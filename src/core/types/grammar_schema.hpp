@@ -7,6 +7,7 @@
 #include "core/types/type_lattice/core_type.hpp"  // TypeExtensionDescriptor
 #include "core/types/number_style.hpp"
 #include "core/types/operator_table.hpp"
+#include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/semantic_config.hpp"
@@ -585,5 +586,31 @@ public:
 private:
     detail::GrammarSchemaData d_;
 };
+
+// Forward every ConfigDiagnostic from a failed `loadShipped` /
+// `loadFromFile` / `loadFromText` into a DiagnosticReporter. Hoisted
+// here (post-FF2 audit silent-failure C1) from program.cpp's anon
+// namespace once a second consumer arrived (FF2 c_header_parser):
+// without this, FF1/FF2 wrappers only emit their tier's wrap code
+// (`F_HeaderGrammarLoadFailed` / `D_SchemaLoadFailed`) and the
+// underlying C_* config diagnostics are silently dropped. Inline
+// so no new TU is required.
+inline void forwardConfigDiagnostics(std::span<ConfigDiagnostic const> diags,
+                                      DiagnosticReporter& dst) {
+    for (auto const& cd : diags) {
+        ParseDiagnostic p;
+        p.code     = cd.code;
+        p.severity = cd.severity;
+        // Prefix `path` with `at ` so downstream tooling can
+        // distinguish a JSON pointer (`at /sections/0`) from a
+        // free-form loader message (`: missing required field`).
+        if (!cd.path.empty()) p.actual = "at " + cd.path;
+        if (!cd.message.empty()) {
+            if (!p.actual.empty()) p.actual += ": ";
+            p.actual += cd.message;
+        }
+        dst.report(std::move(p));
+    }
+}
 
 } // namespace dss

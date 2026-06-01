@@ -648,10 +648,18 @@ enum class DiagnosticCode : std::uint16_t {
     F_UnsupportedElfClass          = 0x5006,
     F_SectionNotFound              = 0x5007,
     // ── FF2 C header parser (plan 11 §2.3) ──
+    // Codes split per the type-design + silent-failure-hunter post-fold
+    // review of FF2 baseline: distinct user-actionable remediations →
+    // distinct codes (same discipline as the D_FileNotFound 3-way
+    // split + D_TargetFormatMismatch 2-way split + K_Image* 5-way
+    // split). A consumer routing on a single F_HeaderParseFailed
+    // could not triage "caller passed empty importLibrary" (caller
+    // API bug) from "shipped grammar broken" (build/install bug)
+    // from "header syntax error" (user source bug).
+    //
     // F_HeaderParseFailed: c-subset frontend rejected the header text
-    //   (tokenize / parse / semantic / lower-to-HIR diagnostics).
-    //   Remediation: fix the source header or extend the c-subset
-    //   grammar to cover the construct.
+    //   (tokenize / parse / semantic / lowering diagnostics).
+    //   Remediation: fix the source header.
     // F_HeaderHasFunctionBody: a non-extern function DEFINITION (with
     //   `{ ... }` body) appeared at top level. Headers in v1 are
     //   declaration-only — function bodies belong in `.c` translation
@@ -660,9 +668,36 @@ enum class DiagnosticCode : std::uint16_t {
     //   `extern` nor `typedef` (e.g. a bare `int x;` global). Header
     //   mode accepts only the declaration surface FFI ingestion
     //   consumes.
+    // F_HeaderEmptyImportLibrary: the caller passed an empty
+    //   `importLibrary` — silent-failure surface if accepted (every
+    //   row downstream would be unlinkable). Remediation: caller
+    //   supplies a non-empty library identity (`"libc.so.6"`,
+    //   `"msvcrt.dll"`, etc.).
+    // F_HeaderGrammarLoadFailed: the shipped c-subset grammar JSON
+    //   failed to load. Remediation: ship the grammar artifact /
+    //   investigate the underlying C_* diagnostics also reported.
+    // F_HeaderHasUnsupportedTopLevel: a top-level HIR kind reached the
+    //   header walker that is neither extern decl nor typedef and not
+    //   the function-body / non-extern-global case either (e.g. an
+    //   `ImportGroup` from `#include`, or a future HirKind addition).
+    //   Remediation: remove the construct from the curated header OR
+    //   extend FF2 to accept it.
+    // F_HeaderInternalInvariant: an internal-invariant violation
+    //   reached the header walker — a compiler bug, not a user-fixable
+    //   issue. Remediation: file a bug.
+    // F_HeaderHasExternInitializer: an `extern` declaration carries an
+    //   initializer (`extern int x = 5;`) — silently dropping the
+    //   initializer would be a definition-vs-declaration semantic
+    //   mismatch. Remediation: drop the `extern` (it's a definition)
+    //   or drop the initializer (it's a declaration).
     F_HeaderParseFailed            = 0x5008,
     F_HeaderHasFunctionBody        = 0x5009,
     F_HeaderHasNonExternDecl       = 0x500A,
+    F_HeaderEmptyImportLibrary     = 0x500B,
+    F_HeaderGrammarLoadFailed      = 0x500C,
+    F_HeaderHasUnsupportedTopLevel = 0x500D,
+    F_HeaderInternalInvariant      = 0x500E,
+    F_HeaderHasExternInitializer   = 0x500F,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

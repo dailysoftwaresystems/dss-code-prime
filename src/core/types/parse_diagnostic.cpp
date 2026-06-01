@@ -165,6 +165,11 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_HeaderParseFailed:            return "F_HeaderParseFailed";
         case DiagnosticCode::F_HeaderHasFunctionBody:        return "F_HeaderHasFunctionBody";
         case DiagnosticCode::F_HeaderHasNonExternDecl:       return "F_HeaderHasNonExternDecl";
+        case DiagnosticCode::F_HeaderEmptyImportLibrary:     return "F_HeaderEmptyImportLibrary";
+        case DiagnosticCode::F_HeaderGrammarLoadFailed:      return "F_HeaderGrammarLoadFailed";
+        case DiagnosticCode::F_HeaderHasUnsupportedTopLevel: return "F_HeaderHasUnsupportedTopLevel";
+        case DiagnosticCode::F_HeaderInternalInvariant:      return "F_HeaderInternalInvariant";
+        case DiagnosticCode::F_HeaderHasExternInitializer:   return "F_HeaderHasExternInitializer";
     }
     return "Unknown";
 }

@@ -1,23 +1,9 @@
-// Plan 11 FF2 (C header parser) tests — `dss::ffi::readCHeader[FromText]`.
+// Plan 11 FF2 (C header parser) tests — `dss::ffi::readCHeader[FromText,Shipped]`.
 //
-// Pins:
-//   * extern function declarations land as ImportSurface rows with
-//     SymbolKind::Function and the user-supplied importLibrary.
-//   * extern global declarations land as ImportSurface rows with
-//     SymbolKind::Object.
-//   * typedef declarations are accepted but produce no row.
-//   * NON-extern function definitions (function bodies) fail loud with
-//     F_HeaderHasFunctionBody — declarations-only mode.
-//   * NON-extern globals fail loud with F_HeaderHasNonExternDecl.
-//   * Empty importLibrary at the entry fails loud (would be silent-
-//     failure surface — caller forgot to specify the library and a
-//     downstream linker would either silently drop the row or fail
-//     with a less specific code).
-//   * Tokenize / parse / semantic errors propagate as
-//     F_HeaderParseFailed with the underlying P_*/S_* codes also
-//     reaching the reporter.
-//   * Diagnostic-code name round-trip for the 3 new F_* codes.
-//   * Shipped pre-reduced libc/stdio.h round-trips through the parser.
+// Each test pins a single contract; together they cover the closed
+// set of HeaderReadErrorKind variants plus the happy paths. The
+// shipped-header tests use `readCHeaderShipped` so the test no
+// longer duplicates the `findShippedConfig` walk-up.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -42,13 +28,13 @@ namespace {
 
 } // namespace
 
+// ── Happy-path row emission ───────────────────────────────────
+
 TEST(FfiCHeaderParser, ExternFunctionLandsAsImportSurfaceRow) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "extern int puts(const char* s);\n",
-        "<test>",
-        "libc.so.6",
-        rep);
+        "<test>", "libc.so.6", rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     auto const& rows = *rowsOrErr;
     ASSERT_EQ(rows.size(), 1u);
@@ -57,16 +43,14 @@ TEST(FfiCHeaderParser, ExternFunctionLandsAsImportSurfaceRow) {
     EXPECT_EQ(rows[0].kind, SymbolKind::Function);
     EXPECT_EQ(rows[0].visibility, SymbolVisibility::Default);
     EXPECT_EQ(rows[0].linkage, SymbolLinkage::External);
-    EXPECT_FALSE(rows[0].cSignature.has_value());  // FF3 owns signature shape
+    EXPECT_FALSE(rows[0].cSignature.has_value());
 }
 
 TEST(FfiCHeaderParser, ExternGlobalLandsAsImportSurfaceRow) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "extern int errno;\n",
-        "<test>",
-        "libc.so.6",
-        rep);
+        "<test>", "libc.so.6", rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     auto const& rows = *rowsOrErr;
     ASSERT_EQ(rows.size(), 1u);
@@ -81,9 +65,7 @@ TEST(FfiCHeaderParser, MixedExternsLandInDeclarationOrder) {
         "extern int puts(const char* s);\n"
         "extern int errno;\n"
         "extern int putchar(int c);\n",
-        "<test>",
-        "libc.so.6",
-        rep);
+        "<test>", "libc.so.6", rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     auto const& rows = *rowsOrErr;
     ASSERT_EQ(rows.size(), 3u);
@@ -93,15 +75,52 @@ TEST(FfiCHeaderParser, MixedExternsLandInDeclarationOrder) {
     EXPECT_EQ(rows[1].kind, SymbolKind::Object);
     EXPECT_EQ(rows[2].mangledName, "putchar");
     EXPECT_EQ(rows[2].kind, SymbolKind::Function);
+    // Per-row invariants tightening (pr-test-analyzer P6 fold):
+    // a refactor introducing per-row library inference must trip
+    // the test, not slip past on the size+name check alone.
+    for (auto const& row : rows) {
+        EXPECT_EQ(row.libraryPath, "libc.so.6");
+        EXPECT_FALSE(row.cSignature.has_value());
+        EXPECT_EQ(row.visibility, SymbolVisibility::Default);
+        EXPECT_EQ(row.linkage, SymbolLinkage::External);
+    }
 }
+
+TEST(FfiCHeaderParser, EmptyHeaderProducesEmptySurfaceAndNoDiagnostic) {
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "", "<test>", "libc.so.6", rep);
+    ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
+    EXPECT_EQ(rowsOrErr->size(), 0u);
+    // No-input must produce no diagnostic — pins the "informational
+    // chatter on empty input" silent-failure surface (pr-test-analyzer
+    // P5 fold).
+    EXPECT_EQ(rep.all().size(), 0u);
+}
+
+TEST(FfiCHeaderParser, TypedefAcceptedProducesNoRow) {
+    // pr-test-analyzer P8 fold: typedef is documented as "absorbed
+    // into the type system, no surface row". This pins that the
+    // TypeDecl arm of the kind switch produces 0 rows and 0
+    // diagnostics — a refactor accidentally rejecting typedefs
+    // would surface here.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "typedef int byte_t;\n"
+        "extern int puts(const char* s);\n",
+        "<test>", "libc.so.6", rep);
+    ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
+    ASSERT_EQ(rowsOrErr->size(), 1u);
+    EXPECT_EQ((*rowsOrErr)[0].mangledName, "puts");
+}
+
+// ── Each error kind has at least one test ─────────────────────
 
 TEST(FfiCHeaderParser, FunctionBodyRejectedLoud) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int f(int x) { return x; }\n",
-        "<test>",
-        "libc.so.6",
-        rep);
+        "<test>", "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderHasFunctionBody);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderHasFunctionBody), 1u);
@@ -111,80 +130,127 @@ TEST(FfiCHeaderParser, NonExternGlobalRejectedLoud) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int counter;\n",
-        "<test>",
-        "libc.so.6",
-        rep);
+        "<test>", "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderHasNonExternDecl);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderHasNonExternDecl), 1u);
 }
 
 TEST(FfiCHeaderParser, EmptyImportLibraryRejectedAtEntry) {
+    // Post-fold type-design split: this is the EmptyImportLibrary
+    // kind / F_HeaderEmptyImportLibrary code (caller-API misuse),
+    // distinct from F_HeaderParseFailed (header source error).
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "extern int puts(const char* s);\n",
-        "<test>",
-        "",  // empty — would be silent-failure surface downstream
-        rep);
+        "<test>", "", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
-    EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderParseFailed), 1u);
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::EmptyImportLibrary);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderEmptyImportLibrary), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_HeaderParseFailed), 0u);
 }
 
 TEST(FfiCHeaderParser, ParseFailurePropagatesUnderlyingDiagnostics) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "@@@ this is not c @@@\n",
-        "<test>",
-        "libc.so.6",
-        rep);
+        "<test>", "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderParseFailed), 1u);
-    // The c-subset frontend's underlying tokenize/parse/semantic
-    // diagnostics must reach the caller's reporter — FF2 wraps the
-    // verdict, doesn't swallow the cause. Pinned by: more than just
-    // the FF2-layer F_HeaderParseFailed reaches the reporter.
+    // Underlying frontend diagnostics MUST reach the caller's
+    // reporter — FF2 wraps the verdict, doesn't swallow the cause.
     EXPECT_GT(rep.all().size(), 1u)
         << "expected at least one underlying frontend diagnostic in "
            "reporter alongside the FF2-layer F_HeaderParseFailed";
 }
 
-TEST(FfiCHeaderParser, EmptyHeaderProducesEmptySurface) {
+TEST(FfiCHeaderParser, DuplicateExternRedeclarationRejectedByFrontend) {
+    // pr-test-analyzer P8 fold: same-symbol redeclaration must
+    // propagate the c-subset frontend's S_* / P_* code, not be
+    // silently merged. If the frontend ever relaxes redecl, the
+    // test trips and we re-decide FF2's stance.
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
-        "",
-        "<test>",
-        "libc.so.6",
-        rep);
-    ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
-    EXPECT_EQ(rowsOrErr->size(), 0u);
+        "extern int puts(const char* s);\n"
+        "extern int puts(const char* s);\n",
+        "<test>", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderParseFailed), 1u);
+    EXPECT_GT(rep.all().size(), 1u);  // underlying S_* / P_* reaches reporter
 }
 
 TEST(FfiCHeaderParser, FileNotFoundReportsFileOpenFailed) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeader(
         fs::path{"this/path/definitely/does/not/exist/nope.h"},
-        "libc.so.6",
-        rep);
+        "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::FileOpenFailed);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_FileOpenFailed), 1u);
 }
 
+// ── Source-span attribution on FF2-layer diagnostics ──────────
+
+TEST(FfiCHeaderParser, RejectDiagnosticCarriesSourceSpan) {
+    // Silent-failure HIGH-4 fold: header-mode rejection diagnostics
+    // (HeaderHasFunctionBody / HeaderHasNonExternDecl / etc.) carry
+    // a (buffer, span) tuple pointing at the offending top-level
+    // decl. Without this, LSP / editor integrations can't underline
+    // the source.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "int f(int x) { return x; }\n",
+        "<test>", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    bool foundWithSpan = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_HeaderHasFunctionBody) {
+            EXPECT_TRUE(d.buffer.valid())
+                << "F_HeaderHasFunctionBody must carry a BufferId";
+            EXPECT_GT(d.span.length(), 0u)
+                << "F_HeaderHasFunctionBody must carry a non-empty span";
+            foundWithSpan = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(foundWithSpan);
+}
+
+// ── Diagnostic code name round-trips ──────────────────────────
+
 TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderParseFailed) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderParseFailed),
               "F_HeaderParseFailed");
 }
-
 TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderHasFunctionBody) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderHasFunctionBody),
               "F_HeaderHasFunctionBody");
 }
-
 TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderHasNonExternDecl) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderHasNonExternDecl),
               "F_HeaderHasNonExternDecl");
+}
+TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderEmptyImportLibrary) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderEmptyImportLibrary),
+              "F_HeaderEmptyImportLibrary");
+}
+TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderGrammarLoadFailed) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderGrammarLoadFailed),
+              "F_HeaderGrammarLoadFailed");
+}
+TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderHasUnsupportedTopLevel) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderHasUnsupportedTopLevel),
+              "F_HeaderHasUnsupportedTopLevel");
+}
+TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderInternalInvariant) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderInternalInvariant),
+              "F_HeaderInternalInvariant");
+}
+TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderHasExternInitializer) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderHasExternInitializer),
+              "F_HeaderHasExternInitializer");
 }
 
 TEST(FfiCHeaderParser, HeaderReadErrorKindNameRoundTrip) {
@@ -196,33 +262,64 @@ TEST(FfiCHeaderParser, HeaderReadErrorKindNameRoundTrip) {
               "HeaderHasFunctionBody");
     EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::HeaderHasNonExternDecl),
               "HeaderHasNonExternDecl");
+    EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::EmptyImportLibrary),
+              "EmptyImportLibrary");
+    EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::GrammarLoadFailed),
+              "GrammarLoadFailed");
+    EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::HeaderHasUnsupportedTopLevel),
+              "HeaderHasUnsupportedTopLevel");
+    EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::InternalInvariant),
+              "InternalInvariant");
 }
 
-TEST(FfiCHeaderParser, ShippedLibcStdioParsesCleanly) {
+// ── Shipped headers via readCHeaderShipped ───────────────────
+
+TEST(FfiCHeaderParser, ShippedLibcStdioRoundTrips) {
     DiagnosticReporter rep;
-    // src/dss-config/ffi-headers/libc/stdio.h is the smallest shipped
-    // pre-reduced header (plan 11 §4 Q1). Pins that the shipped
-    // header round-trips through the FF2 dispatch — the per-row
-    // contents are pinned via the explicit-text tests above; this
-    // pins that the file-on-disk pathway also works.
-    fs::path here = fs::current_path();
-    fs::path candidate{};
-    for (fs::path p = here; !p.empty() && p != p.root_path(); p = p.parent_path()) {
-        fs::path try1 = p / "src" / "dss-config" / "ffi-headers" / "libc" / "stdio.h";
-        if (fs::exists(try1)) { candidate = try1; break; }
-    }
-    if (candidate.empty()) {
+    auto rowsOrErr = readCHeaderShipped("libc/stdio.h", "libc.so.6", rep);
+    if (!rowsOrErr.has_value()
+        && rowsOrErr.error().kind == HeaderReadErrorKind::FileOpenFailed) {
         GTEST_SKIP() << "shipped libc/stdio.h not located from cwd; "
-                     << "not a regression — only pinnable when run with "
-                     << "the repo root reachable upward from cwd.";
+                     << "build configs without an upward-reachable repo root "
+                     << "can't run this test (not a regression).";
     }
-    auto rowsOrErr = readCHeader(candidate, "libc.so.6", rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
-    EXPECT_EQ(rowsOrErr->size(), 2u);
+    ASSERT_EQ(rowsOrErr->size(), 2u);
     EXPECT_EQ((*rowsOrErr)[0].mangledName, "puts");
     EXPECT_EQ((*rowsOrErr)[1].mangledName, "putchar");
     for (auto const& row : *rowsOrErr) {
         EXPECT_EQ(row.libraryPath, "libc.so.6");
         EXPECT_EQ(row.kind, SymbolKind::Function);
     }
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(FfiCHeaderParser, ShippedLibcStdlibRoundTrips) {
+    // pr-test-analyzer P9 fold: stdlib.h exercises `void*` return,
+    // `void*` parameter, and `void` return — distinct shapes from
+    // stdio.h. A c-subset grammar regression dropping `void*` for
+    // return types would trip ONLY this test.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderShipped("libc/stdlib.h", "libc.so.6", rep);
+    if (!rowsOrErr.has_value()
+        && rowsOrErr.error().kind == HeaderReadErrorKind::FileOpenFailed) {
+        GTEST_SKIP() << "shipped libc/stdlib.h not located from cwd.";
+    }
+    ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
+    ASSERT_EQ(rowsOrErr->size(), 3u);
+    EXPECT_EQ((*rowsOrErr)[0].mangledName, "malloc");
+    EXPECT_EQ((*rowsOrErr)[1].mangledName, "free");
+    EXPECT_EQ((*rowsOrErr)[2].mangledName, "exit");
+    for (auto const& row : *rowsOrErr) {
+        EXPECT_EQ(row.libraryPath, "libc.so.6");
+        EXPECT_EQ(row.kind, SymbolKind::Function);
+    }
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(FfiCHeaderParser, ShippedHeaderPathTraversalRejected) {
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderShipped("../etc/passwd", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::FileOpenFailed);
 }

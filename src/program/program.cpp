@@ -88,32 +88,10 @@ void emitDriver(DiagnosticReporter& rep,
 // post-fold review #1 to dedupe with the semantic-tier drain).
 // program.cpp uses it for CU + per-Tree reporter drains.
 
-// Forward every ConfigDiagnostic from a failed `loadShipped` into
-// the driver reporter. Mirrors `copyDiagnostics` for the per-row
-// C_* / config-side detail the loader produced — without this, the
-// driver only emits the wrapping `D_SchemaLoadFailed` and the
-// actual config bug (bad JSON line, missing field, etc.) is silently
-// dropped. (code-reviewer F2 fold, LK10 cycle 2 post-audit review.)
-void forwardConfigDiagnostics(std::span<ConfigDiagnostic const> diags,
-                              DiagnosticReporter&               dst) {
-    for (auto const& cd : diags) {
-        ParseDiagnostic p;
-        p.code     = cd.code;
-        p.severity = cd.severity;
-        // Post-fold review #1 (silent-failure-hunter F3): prefix
-        // `path` with "at " so downstream tooling can distinguish
-        // "JSON pointer to a bad field" (`at /sections/0`) from
-        // "free-form loader message" (`: missing required field`).
-        // Without the marker, an operator grepping for a JSON
-        // pointer can't tell which half of `actual` carries it.
-        if (!cd.path.empty()) p.actual = "at " + cd.path;
-        if (!cd.message.empty()) {
-            if (!p.actual.empty()) p.actual += ": ";
-            p.actual += cd.message;
-        }
-        dst.report(std::move(p));
-    }
-}
+// `forwardConfigDiagnostics` was hoisted to `grammar_schema.hpp` at
+// the FF2 post-fold audit (silent-failure C1) once a second consumer
+// (ffi/c_header_parser.cpp) arrived. The inline body lives alongside
+// `ConfigDiagnostic` itself — its natural canonical home.
 
 // Stamp `[target=<spec>]` context into every error message emitted
 // inside the per-target loop. Caller passes a fresh reporter to

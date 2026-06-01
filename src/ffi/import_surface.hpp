@@ -29,9 +29,12 @@
 //   * Mach-O readers populate from `LC_SYMTAB` n_strx; libraryPath
 //     from `LC_LOAD_DYLIB` paths.
 //   * FF2 C header parser populates synthetically — mangledName from
-//     the C decl's identifier (with per-platform underscoring rules
-//     applied per FF4); libraryPath from the user-declared
-//     `#pragma comment(lib, ...)` or a project-config side table.
+//     the C decl's identifier verbatim (FF4 will apply per-platform
+//     underscoring rules downstream; FF2 leaves the name as-declared);
+//     libraryPath from the caller-supplied `importLibrary` argument
+//     (per plan 11 §2.3 — headers carry declarations, not library
+//     identity, so the caller passes the owning library at the
+//     `readCHeader(..., importLibrary, ...)` boundary).
 //
 // Closed-enum discriminators (visibility / kind / linkage) mirror
 // the codebase's pattern (RelocFormulaKind, ObjectFormatKind, etc.):
@@ -74,23 +77,19 @@ struct DSS_EXPORT ImportSurface {
     SymbolKind       kind       = SymbolKind::NoType;
     SymbolVisibility visibility = SymbolVisibility::Default;
     SymbolLinkage    linkage    = SymbolLinkage::External;
-    // Reserved for FF2 C-header consumption — FF2 (C header parser)
-    // populates this from `extern fn(...)` declarations parsed out
-    // of `*.h` files; FF1 binary readers leave it nullopt (binaries
-    // don't carry C signatures, only mangled names + symbol kinds).
-    // FF3 (ABI catalog) then CONSUMES the structured signature to
-    // compute calling-convention + layout for the import — FF3's
-    // role is signature APPLICATION, not signature PARSING; the
-    // parsing happens at FF2 via the c-subset frontend reuse.
+    // Reserved field — currently UNUSED by FF1/FF2 (both leave
+    // nullopt). FF2's c-subset reuse already produces a structured
+    // FnSig TypeId via the HIR side-table; the row carries that
+    // structured shape through the HIR, not a duplicate free-form
+    // string here. FF3 (ABI catalog) consumes the FnSig TypeId
+    // directly off the HIR — no string parsing layer.
     //
-    // Free-form opaque string (e.g. `"int(const char*)"`) at this
-    // level. `optional` makes "no signature attached" semantically
-    // distinct from "header declared with empty parens" (which is
-    // invalid C and should surface as a parse diagnostic).
-    // post-fold #1 type-design fix — was a free-form `std::string`
-    // with the "empty means absent" convention, an SoT smell that
-    // FF2 + FF3 would have inherited. (FF3 attribution corrected
-    // at post-fold #2: parsing is FF2, not FF3.)
+    // The field remains in the shape for forward compatibility:
+    // an FF3 cycle that needs to expose a textual signature in
+    // tooling output (e.g. a `--dump-imports` driver flag) can
+    // populate it then. Anchored as D-FF2-1 (deferred type
+    // reshape — possibly drop the field, or promote to
+    // `optional<FnSigTypeId>` at FF3 cycle close).
     std::optional<std::string> cSignature;
 };
 

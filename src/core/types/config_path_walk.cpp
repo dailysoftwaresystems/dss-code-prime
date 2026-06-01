@@ -50,4 +50,46 @@ findShippedConfig(ShippedConfigLocator const& loc) {
              + " config found in src/dss-config/" + std::string{loc.subdir} + "/"}});
 }
 
+LoadResult<std::filesystem::path>
+findShippedFfiHeader(std::string_view headerRelPath) {
+    // Reject empty + path-traversal. Forward-slash + dots are allowed
+    // here because callers pass `"libc/stdio.h"` etc.
+    if (headerRelPath.empty()
+        || headerRelPath.front() == '/'
+        || headerRelPath.front() == '\\'
+        || headerRelPath.front() == '.') {
+        return std::unexpected(std::vector<ConfigDiagnostic>{
+            {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
+             std::string{headerRelPath},
+             "invalid shipped-ffi-header relative path"}});
+    }
+    if (headerRelPath.find("..") != std::string_view::npos) {
+        return std::unexpected(std::vector<ConfigDiagnostic>{
+            {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
+             std::string{headerRelPath},
+             "shipped-ffi-header path must not contain '..'"}});
+    }
+
+    namespace fs = std::filesystem;
+    const std::string leaf{headerRelPath};
+
+    std::error_code ec;
+    fs::path here = fs::current_path(ec);
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        const fs::path candidate =
+            here / "src" / "dss-config" / "ffi-headers" / leaf;
+        if (fs::exists(candidate, ec)) {
+            return candidate;
+        }
+        const fs::path parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+
+    return std::unexpected(std::vector<ConfigDiagnostic>{
+        {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
+         std::string{headerRelPath},
+         "no shipped FFI header found in src/dss-config/ffi-headers/"}});
+}
+
 } // namespace dss
