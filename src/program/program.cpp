@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -444,16 +445,24 @@ int Program::compileFiles(
         // so interleaved diagnostics from multi-target runs can be
         // routed by tooling. (silent-failure-hunter F9 fold.)
         //
-        // H1 silent-failure fix 2026-06-01: scratch reporter MUST
-        // inherit `reporterConfig` so per-target diagnostics honor
-        // the same --suppress / --warnings-as-errors / unsuppressable
-        // policy as the run-wide `rep`. Pre-fix the scratch was
-        // default-constructed — `--suppress=H_ExternHasInitializer`
-        // applied at the run level was silently ignored per-target,
-        // making the Gap 3 e2e contract test pass for the wrong
-        // reason. After this fix, the unsuppressable gate is the
-        // load-bearing path that keeps the H_* error visible.
-        DiagnosticReporter scratch{reporterConfig};
+        // H1 silent-failure fix 2026-06-01 + F1b/F1c double-policy fix:
+        // scratch inherits `reporterConfig`'s POLICY axes (suppress /
+        // overrides / warningsAsErrors / unsuppressable gate) so
+        // per-target diagnostics honor the same user policy as run-
+        // wide `rep`. But the CAP / DEDUP axes (maxDiagnostics /
+        // maxPerCode / dedupWindow) are intentionally RELAXED on
+        // scratch — those are run-wide limits enforced once at `rep`
+        // during merge. Without the relax, both scratch AND rep would
+        // apply caps, silently dropping diagnostics + emitting two
+        // P_TooManyDiagnostics markers per run, AND the per-target
+        // cap would fire long before the user's intended run-wide
+        // cap. The merge architecture predates the H1 fix; the relax
+        // restores its single-chokepoint cap semantic.
+        auto scratchCfg = reporterConfig;
+        scratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+        scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+        scratchCfg.dedupWindow    = 0;
+        DiagnosticReporter scratch{scratchCfg};
         bool const ok = compileOneTarget(cu, *grammar, sourceStem,
                                           spec, scratch);
         mergeWithTargetContext(scratch, spec, rep);

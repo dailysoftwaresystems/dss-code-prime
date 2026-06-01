@@ -18,6 +18,7 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "ffi/binary_reader.hpp"
+#include "byte_emit.hpp"
 #include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
@@ -30,22 +31,11 @@
 using namespace dss;
 using namespace dss::ffi;
 using dss::test_support::countCode;
+using dss::test_support::appU16;
+using dss::test_support::appU32;
+using dss::test_support::appU64;
 
 namespace {
-
-// Append a u16/u32/u64 little-endian to a byte vector.
-inline void appU16(std::vector<std::uint8_t>& b, std::uint16_t v) {
-    b.push_back(static_cast<std::uint8_t>(v & 0xFF));
-    b.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFF));
-}
-inline void appU32(std::vector<std::uint8_t>& b, std::uint32_t v) {
-    for (int i = 0; i < 4; ++i)
-        b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF));
-}
-inline void appU64(std::vector<std::uint8_t>& b, std::uint64_t v) {
-    for (int i = 0; i < 8; ++i)
-        b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF));
-}
 
 // One Elf64_Sym entry as packed bytes (24 bytes).
 struct Sym {

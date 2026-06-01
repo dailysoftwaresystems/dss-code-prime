@@ -356,6 +356,13 @@ readElf64(std::span<std::uint8_t const> bytes,
     // Iterate dynsym entries. Slot 0 is STN_UNDEF — skip.
     std::vector<ImportSurface> out;
     std::size_t const numSyms = static_cast<std::size_t>(dynsymSize / kElf64SymSz);
+    // D-FF1-PARTIAL-CORRUPTION-LOUD: count entries that fail the
+    // empty-name post-read check (the only PARTIAL-corruption arm
+    // — the unnamed/local skips are structural filters by design,
+    // not corruption). Counter is emitted as a Warning at end-of-
+    // parse so operators can investigate library integrity without
+    // aborting the parse (the surviving rows are still useful).
+    std::uint32_t corruptedNameSkips = 0;
     for (std::size_t i = 1; i < numSyms; ++i) {
         std::size_t const symOff = static_cast<std::size_t>(dynsymOff)
                                   + i * kElf64SymSz;
@@ -367,20 +374,38 @@ readElf64(std::span<std::uint8_t const> bytes,
         // LINKAGE for the FF1 surface; the symbol's runtime VA is
         // dyld's concern, not ours).
 
-        if (st_name == 0u) continue;  // unnamed entries (section syms, etc.)
-        if (stBind(st_info) == kStbLocal) continue;  // locals don't export
+        if (st_name == 0u) continue;  // unnamed entries (section syms, etc.) — by-design
+        if (stBind(st_info) == kStbLocal) continue;  // locals don't export — by-design
 
         ImportSurface row;
         row.mangledName = readNulTerminated(bytes,
                                              static_cast<std::size_t>(dynstrOff),
                                              static_cast<std::size_t>(dynstrOff + dynstrSize),
                                              st_name);
-        if (row.mangledName.empty()) continue;  // corrupted name index
+        if (row.mangledName.empty()) {
+            // st_name was non-zero, so the entry CLAIMS to be named,
+            // but the string-table read returned empty — corruption.
+            ++corruptedNameSkips;
+            continue;
+        }
         row.libraryPath = std::string{libraryPathLabel};
         row.kind        = elfSttToKind(stType(st_info));
         row.visibility  = elfStvToVisibility(stVisibility(st_other));
         row.linkage     = elfStbToLinkage(stBind(st_info));
         out.push_back(std::move(row));
+    }
+
+    if (corruptedNameSkips > 0) {
+        dss::report(reporter,
+            DiagnosticCode::F_BinaryReaderPartialCorruption,
+            DiagnosticSeverity::Warning,
+            "ELF64 reader: '" + std::string{libraryPathLabel}
+            + "': skipped " + std::to_string(corruptedNameSkips)
+            + " .dynsym entries with corrupted name indices (non-zero "
+              "st_name resolved to empty string — possibly truncated "
+              ".dynstr or out-of-bounds name offset). Surfaced "
+            + std::to_string(out.size())
+            + " valid symbols.");
     }
 
     return out;
@@ -605,23 +630,44 @@ readPe(std::span<std::uint8_t const> bytes,
     // ── Walk names ──
     std::vector<ImportSurface> out;
     out.reserve(numberOfNamePointers);
+    // D-FF1-PARTIAL-CORRUPTION-LOUD: count silent-skip cases so the
+    // parse can emit a Warning summarizing how many entries were
+    // dropped. Three skip reasons all indicate corruption (RVA
+    // doesn't resolve, file offset OOB, NUL-string read empty);
+    // collapsing them into one counter keeps the diagnostic compact
+    // while still surfacing the partial-loss signal.
+    std::uint32_t corruptedNameSkips = 0;
     for (std::uint32_t i = 0; i < numberOfNamePointers; ++i) {
         std::uint32_t const nameRva = readU32(bytes,
             *namesTableFileOff + static_cast<std::uint64_t>(i) * 4u);
         auto const nameFileOff = rvaToFileOff(nameRva);
-        if (!nameFileOff) continue;  // corrupted entry — skip, don't abort
-        if (*nameFileOff >= bytes.size()) continue;
+        if (!nameFileOff) { ++corruptedNameSkips; continue; }
+        if (*nameFileOff >= bytes.size()) { ++corruptedNameSkips; continue; }
         ImportSurface row;
         row.mangledName = readNulTerminated(
             bytes, /*tableStart=*/static_cast<std::size_t>(*nameFileOff),
             /*tableEnd=*/bytes.size(), /*index=*/0);
-        if (row.mangledName.empty()) continue;
+        if (row.mangledName.empty()) { ++corruptedNameSkips; continue; }
         row.libraryPath = std::string{libraryPathLabel};
         row.kind        = SymbolKind::Function;       // v1: all PE exports are Function/Default
         row.visibility  = SymbolVisibility::Default;
         row.linkage     = SymbolLinkage::External;
         out.push_back(std::move(row));
     }
+
+    if (corruptedNameSkips > 0) {
+        dss::report(reporter,
+            DiagnosticCode::F_BinaryReaderPartialCorruption,
+            DiagnosticSeverity::Warning,
+            "PE reader: '" + std::string{libraryPathLabel}
+            + "': skipped " + std::to_string(corruptedNameSkips)
+            + " export-name entries with corrupted RVA / OOB file "
+              "offset / empty-string reads (truncated .edata or "
+              "out-of-section name pointers). Surfaced "
+            + std::to_string(out.size())
+            + " valid exports.");
+    }
+
     return out;
 }
 

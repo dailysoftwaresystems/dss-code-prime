@@ -182,6 +182,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_FfiIngestDuplicateSymbol:     return "F_FfiIngestDuplicateSymbol";
         case DiagnosticCode::F_FfiIngestAbiModelUnsupported: return "F_FfiIngestAbiModelUnsupported";
         case DiagnosticCode::F_FfiIngestEmptyCanonical:      return "F_FfiIngestEmptyCanonical";
+        case DiagnosticCode::F_BinaryReaderPartialCorruption: return "F_BinaryReaderPartialCorruption";
     }
     return "Unknown";
 }

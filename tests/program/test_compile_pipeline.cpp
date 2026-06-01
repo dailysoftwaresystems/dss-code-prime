@@ -297,17 +297,23 @@ TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
         1);
 }
 
-// Test-analyzer Gap 3 (2026-06-01): driver pin that
-// `--suppress=H_ExternHasInitializer` does NOT silence the build
-// failure. Without the D-FF2-UNSUPP gate, the reporter would drop
-// the H_* diagnostic on the floor, `errorCount()` would return 0,
-// and `compileFiles` would silently exit 0 despite the broken input
-// — exactly the silent-drop surface the unsuppressable-codes table
-// closes. Reporter-level tests pin the gate at the policy layer;
-// THIS test pins it through the post-CLI pipeline (policy config →
-// compileFiles → per-target scratch reporter inherits config →
-// analyze → lowerToHir → errorCount → exit code). The CLI→Config
-// plumbing is covered by the `cli_args` tests.
+// D-FF2-UNSUPP gate pin 2026-06-01: pins that the unsuppressable
+// gate keeps `H_ExternHasInitializer` visible through the full
+// post-CLI pipeline even when `--suppress=H_ExternHasInitializer`
+// is set. Reporter-level unit tests cover the gate at the policy
+// layer; THIS test pins it through compileFiles → per-target
+// scratch → analyze → lowerToHir → errorCount → exit code.
+//
+// NOTE: this test does NOT pin the H1 fix (program.cpp scratch
+// inheriting reporterConfig). H_ExternHasInitializer is in
+// `kUnsuppressableCodes`, so `applyPolicy` short-circuits the
+// suppress check regardless of which reporter receives the
+// diagnostic. Reverting the H1 fix would NOT cause this test to
+// fail. The H1 fix's load-bearing path is suppressible per-target
+// diagnostics; pinning it requires a suppressible per-target
+// emitter, which doesn't exist in the c-subset path today.
+// Anchored as D-H1-SUPPRESSIBLE-PER-TARGET-PIN (trigger: first
+// suppressible code that fires reliably on the per-target path).
 TEST(Program_CompileFiles, SuppressedHExternHasInitializerStillReturnsNonZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSubsetSource(

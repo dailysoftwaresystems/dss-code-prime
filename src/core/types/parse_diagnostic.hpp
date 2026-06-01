@@ -833,6 +833,22 @@ enum class DiagnosticCode : std::uint16_t {
     //   (post-fold #6 silent-failure C1 fix / D-FF5-EXTERNDECLREF-VALIDATE
     //   promoted from anchor to close-now.)
     F_FfiIngestEmptyCanonical      = 0x5017,
+    // F_BinaryReaderPartialCorruption: an FF1 binary reader (ELF / PE /
+    //   Mach-O) skipped one or more symbol-table entries during parse
+    //   due to structural anomalies — out-of-bounds name indices,
+    //   RVAs that don't resolve to any section, NUL-byte indices into
+    //   the string table that wrap past EOF, etc. The reader continues
+    //   parsing other entries; the surviving rows ARE returned. This
+    //   Warning documents the partial loss so operators can investigate
+    //   the source binary's integrity (truncated download, mismatched
+    //   build artifact, ABI breakage at the library boundary).
+    //   Distinct from F_CorruptedBinary (aborts the parse): a
+    //   partially-corrupted .so / .dll / .dylib may still be usable
+    //   for linking, but the operator should verify the library was
+    //   built correctly. Emitted at Warning severity — under
+    //   `--warnings-as-errors` this elevates to fail-loud, which is
+    //   the correct strict-mode behavior. Anchor: D-FF1-PARTIAL-CORRUPTION-LOUD.
+    F_BinaryReaderPartialCorruption = 0x5018,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
