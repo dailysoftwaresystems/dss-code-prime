@@ -53,7 +53,8 @@ lowerThroughRewrite(std::string src) {
     if (!out.lowered.lir.ok) return out;
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
     out.alloc = allocateRegisters(out.lowered.lir.lir, *out.lowered.target,
-                                  out.liveness, out.regallocRep);
+                                  out.liveness, /*ccIndex=*/0,
+                                  out.regallocRep);
     if (!out.alloc.ok()) return out;
     out.rewritten = rewriteWithAllocation(out.lowered.lir.lir,
                                           *out.lowered.target, out.alloc,

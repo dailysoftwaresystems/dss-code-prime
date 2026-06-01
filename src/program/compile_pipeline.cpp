@@ -45,6 +45,7 @@ bool compileSingleUnit(CompilationUnit const&        cu,
                        GrammarSchema const&          grammar,
                        TargetSchema const&           target,
                        ObjectFormatSchema const&     format,
+                       std::uint16_t                 callingConventionIndex,
                        std::filesystem::path const&  outPath,
                        DiagnosticReporter&           reporter) {
     // Take a CU pointer matching `analyze()`'s shared_ptr signature.
@@ -106,7 +107,8 @@ bool compileSingleUnit(CompilationUnit const&        cu,
 
     // 6. Register allocation.
     auto const allocEntry = reporter.errorCount();
-    auto const alloc = allocateRegisters(lir.lir, target, liveness, reporter);
+    auto const alloc = allocateRegisters(lir.lir, target, liveness,
+                                          callingConventionIndex, reporter);
     if (!alloc.ok() || !tierClean(reporter, allocEntry)) {
         return false;
     }

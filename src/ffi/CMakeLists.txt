@@ -4,6 +4,7 @@ add_subdirectory(mangling)
 add_library(ffi OBJECT
     binary_reader.cpp
     c_header_parser.cpp
+    ingest.cpp
 )
 
 target_include_directories(ffi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -24,4 +25,7 @@ target_link_libraries(ffi PRIVATE
     analysis_semantic
     hir
     hir_lowering
+    ffi_abi
+    ffi_mangling
+    link
 )

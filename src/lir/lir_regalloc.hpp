@@ -157,10 +157,20 @@ struct DSS_EXPORT LirAllocation {
 // in the reporter stream (which has a per-code cap).
 //
 // The LIR module is NOT mutated.
+// `callingConventionIndex` is the ordinal into
+// `schema.callingConventions()` that the per-target ABI resolver
+// (FF3 `resolveAbi`) picked for the (target, format) pair driving
+// this compile. The allocator records it on every produced
+// `LirFuncAllocation`; `materializeCallingConvention` reads it back
+// to look up the structured cc and emit the right prologue/epilogue.
+// Pre-D-FF3-3 every function was hardcoded to index 0 — silent
+// miscompile on non-default-cc targets (e.g. PE64 + x86_64 silently
+// dispatched to sysv_amd64 instead of ms_x64).
 [[nodiscard]] DSS_EXPORT LirAllocation
 allocateRegisters(Lir const&          lir,
                   TargetSchema const& schema,
                   LirLiveness const&  liveness,
+                  std::uint16_t       callingConventionIndex,
                   DiagnosticReporter& reporter);
 
 // Allocate for a single function. The caller must supply the matching

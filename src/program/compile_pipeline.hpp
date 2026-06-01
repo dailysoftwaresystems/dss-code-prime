@@ -71,11 +71,19 @@ DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
 //   * Creating any required parent directories before calling — the
 //     kernel does NOT `create_directories` (mirrors the writer
 //     substrate's contract; auto-mkdir would mask config bugs).
+// `callingConventionIndex` is the per-(target, format) cc ordinal
+// resolved by `dss::ffi::resolveAbi` in the driver before reaching
+// this kernel. Threaded through to the LIR allocator so prologue/
+// epilogue emission picks the correct cc table row. Pre-D-FF3-3
+// every compile silently used index 0 — a real miscompile on
+// non-default-cc targets (PE64 + x86_64 silently emitted SysV
+// register assignments instead of MS_x64).
 [[nodiscard]] DSS_EXPORT bool
 compileSingleUnit(CompilationUnit const&         cu,
                   GrammarSchema const&           grammar,
                   TargetSchema const&            target,
                   ObjectFormatSchema const&      format,
+                  std::uint16_t                  callingConventionIndex,
                   std::filesystem::path const&   outPath,
                   DiagnosticReporter&            reporter);
 

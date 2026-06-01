@@ -5,6 +5,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "ffi/abi/abi_catalog.hpp"
 #include "link/object_format_schema.hpp"
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
@@ -176,6 +177,27 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         return false;
     }
 
+    // D-FF3-3: resolve the (target, format) calling-convention BEFORE
+    // dispatching to compileSingleUnit. Replaces the pre-D-FF3-3
+    // silent dispatch to `callingConventions[0]` for every compile
+    // — that hardcode produced SysV register assignments on PE+x86_64
+    // targets when MS_x64 was required, etc. The resolved cc index
+    // threads through compileSingleUnit → allocateRegisters →
+    // materializeCallingConvention.
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, reporter);
+    if (!abi) return false;
+    std::uint16_t ccIndex = 0;
+    if (abi->cc != nullptr) {
+        auto const span = (*targetR)->callingConventions();
+        ccIndex = static_cast<std::uint16_t>(
+            std::distance(span.data(), abi->cc));
+    }
+    // For operand-stack (WASM) / result-id (SPIR-V) abi-models the
+    // resolver returns cc=nullptr; the LIR allocator's
+    // R_NoCallingConventions arm + the cc-count check in
+    // allocateOneFunc handle that path. ccIndex stays 0; for those
+    // abi-models the value is unused.
+
     // Output path convention (cycle 2 v1; plan 6 owns the
     // authoritative artifact-profile-driven scheme):
     //   <cwd>/target/<formatName>/<sourceStem><ext>
@@ -200,7 +222,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
 
     return compileSingleUnit(cu, grammar, **targetR, **formatR,
-                             outPath, reporter);
+                             ccIndex, outPath, reporter);
 }
 
 } // namespace

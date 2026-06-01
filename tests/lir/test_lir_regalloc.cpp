@@ -63,7 +63,7 @@ TEST(LirRegAlloc, EmptyModuleProducesNoResults) {
     Lir empty = std::move(b).finish();
     LirLiveness const lv = analyzeLiveness(empty);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(empty, **target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(empty, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     EXPECT_EQ(out.perFunc.size(), 0u);
 }
@@ -74,7 +74,7 @@ TEST(LirRegAlloc, StraightLineFunctionAssignsAllPhys) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -119,7 +119,7 @@ TEST(LirRegAlloc, ForVRegFindsAssignment) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -143,7 +143,7 @@ TEST(LirRegAlloc, ForFuncResolvesByFuncId) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 2u);
     Lir const& lir = lowered.lir.lir;
@@ -168,7 +168,7 @@ TEST(LirRegAlloc, AllPhysicalAssignmentsAreDistinctAtAnyPoint) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -226,7 +226,7 @@ TEST(LirRegAlloc, HighPressureFunctionSpillsSome) {
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -246,7 +246,7 @@ TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 2u);
 
@@ -367,7 +367,7 @@ TEST(LirRegAlloc, ReservedStackPointerNeverAllocated) {
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -402,7 +402,7 @@ TEST(LirRegAlloc, FprClassRangesGetFprRegisters) {
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -429,7 +429,7 @@ TEST(LirRegAlloc, LoopFunctionAllocatesWithoutCrash) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     expectAllocationInvariants(out.perFunc[0]);
@@ -447,7 +447,7 @@ TEST(LirRegAlloc, SwitchFunctionAllocatesWithoutCrash) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     expectAllocationInvariants(out.perFunc[0]);
@@ -485,7 +485,7 @@ TEST(LirRegAlloc, HighPressureFunctionEmitsSpillSummary) {
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
     LirAllocation const out =
-        allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+        allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());  // info-severity spill summary doesn't fail
     EXPECT_GT(out.perFunc[0].numSpillSlots, 0u);
     // Exactly ONE summary diagnostic per function with non-zero spills.
@@ -550,7 +550,7 @@ TEST(LirRegAlloc, OkPropagationOnCleanRun) {
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
     LirAllocation const out =
-        allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+        allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     EXPECT_EQ(out.perFunc.size(), 1u);
     EXPECT_TRUE(out.perFunc[0].ok);
@@ -565,7 +565,7 @@ TEST(LirRegAlloc, AssignmentVRegMatchesIndexId) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];

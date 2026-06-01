@@ -19,4 +19,4 @@ target_compile_definitions(program PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # only needs include-paths exposed — the .o files get linked into
 # dss-code-prime-lib by the top-level lib target, which already aggregates
 # every backend.
-target_link_libraries(program PUBLIC core lsp)
+target_link_libraries(program PUBLIC core lsp ffi_abi)

@@ -300,6 +300,7 @@ namespace {
 LirFuncAllocation allocateOneFunc(Lir const& lir,
                                   TargetSchema const& schema,
                                   LirFuncLiveness const& flow,
+                                  std::uint16_t callingConventionIndex,
                                   DiagnosticReporter& reporter,
                                   bool schemaOk) {
     LirFuncAllocation out;
@@ -314,13 +315,22 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         return out;
     }
 
-    out.callingConventionIndex = 0;
-    auto const* cc = schema.callingConvention(0);
+    // D-FF3-3 post-fold #5: callingConventionIndex now comes from
+    // `resolveAbi(target, format)` resolution at compileOneTarget,
+    // threaded through compileSingleUnit. The previous hardcoded
+    // `0` silently dispatched non-ELF targets (e.g. PE64+x86_64)
+    // to the first cc (sysv_amd64) instead of the correct cc
+    // (ms_x64) — a real miscompile surface, not a substrate
+    // placeholder.
+    out.callingConventionIndex = callingConventionIndex;
+    auto const* cc = schema.callingConvention(callingConventionIndex);
     if (cc == nullptr) {
-        // Should be unreachable given schemaOk; defensive only.
         report(reporter, DiagnosticCode::R_CallingConventionLookupFailed,
                DiagnosticSeverity::Error,
-               "calling convention index 0 lookup returned nullptr");
+               std::format("calling convention index {} lookup returned "
+                           "nullptr (target schema declares {} cc rows)",
+                           static_cast<unsigned>(callingConventionIndex),
+                           schema.callingConventionCount()));
         out.ok = false;
         return out;
     }
@@ -428,13 +438,16 @@ allocateFuncRegisters(Lir const&             lir,
                DiagnosticSeverity::Error,
                "target schema declares no calling conventions");
     }
-    return allocateOneFunc(lir, schema, flow, reporter, schemaOk);
+    return allocateOneFunc(lir, schema, flow,
+                           /*callingConventionIndex=*/0,
+                           reporter, schemaOk);
 }
 
 LirAllocation
 allocateRegisters(Lir const&          lir,
                   TargetSchema const& schema,
                   LirLiveness const&  liveness,
+                  std::uint16_t       callingConventionIndex,
                   DiagnosticReporter& reporter) {
     LirAllocation out;
     bool const schemaOk = (schema.callingConventionCount() > 0);
@@ -449,7 +462,8 @@ allocateRegisters(Lir const&          lir,
     out.perFunc.reserve(liveness.perFunc.size());
     for (auto const& flow : liveness.perFunc) {
         out.perFunc.push_back(
-            allocateOneFunc(lir, schema, flow, reporter, schemaOk));
+            allocateOneFunc(lir, schema, flow,
+                            callingConventionIndex, reporter, schemaOk));
     }
     return out;
 }
