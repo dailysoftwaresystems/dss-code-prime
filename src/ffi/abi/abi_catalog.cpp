@@ -110,9 +110,10 @@ struct AbiResolveErrorRow {
 constexpr std::array<AbiResolveErrorRow,
                      static_cast<std::size_t>(AbiResolveErrorKind::Count_)>
     kAbiResolveErrorTable{{
-    { AbiResolveErrorKind::UnknownTuple,           "UnknownTuple",           DiagnosticCode::F_AbiUnknownTuple           },
-    { AbiResolveErrorKind::NoMatchingCcInTarget,   "NoMatchingCcInTarget",   DiagnosticCode::F_AbiNoMatchingCcInTarget   },
-    { AbiResolveErrorKind::FormatAbiModelMismatch, "FormatAbiModelMismatch", DiagnosticCode::F_AbiFormatAbiModelMismatch },
+    { AbiResolveErrorKind::UnknownTuple,            "UnknownTuple",            DiagnosticCode::F_AbiUnknownTuple            },
+    { AbiResolveErrorKind::NoMatchingCcInTarget,    "NoMatchingCcInTarget",    DiagnosticCode::F_AbiNoMatchingCcInTarget    },
+    { AbiResolveErrorKind::FormatAbiModelMismatch,  "FormatAbiModelMismatch",  DiagnosticCode::F_AbiFormatAbiModelMismatch  },
+    { AbiResolveErrorKind::CcRegistersInconsistent, "CcRegistersInconsistent", DiagnosticCode::F_AbiCcRegistersInconsistent },
 }};
 
 consteval bool kAbiResolveErrorTableRowsAligned() {
@@ -219,9 +220,53 @@ resolveAbi(TargetSchema const&       target,
             reporter));
     }
 
-    // (D-FF3-Coherence redundant — schema loader's `validate()`
-    // already rejects cc rows with unresolvable register names
-    // at JSON-load time. See abi_catalog.hpp comment block.)
+    // D-FF3-Coherence (un-retired post-fold #4): defense-in-depth
+    // structural validation of the resolved cc. Catches the
+    // paste-error class (e.g. `ms_arm64` cc declared with
+    // `rcx,rdx,r8,r9` from `ms_x64`) when the schema reaches FF3
+    // through a path that bypasses `TargetSchemaData::validate()`
+    // — `TargetSchema`'s ctor is public + skips validate, so test
+    // fixtures, future `.dsslir` round-trip loaders, fuzz
+    // harnesses, etc. can construct a schema directly. Without
+    // this pass FF3 would return a `cc *` into structurally-wrong
+    // data and ML7 regalloc would emit wrong-arch register names.
+    auto firstUnresolved = [&target](
+            std::span<std::string const> names) -> std::string_view {
+        for (auto const& n : names) {
+            if (!target.registerByName(n).has_value()) return n;
+        }
+        return {};
+    };
+    struct CcRoleSpan {
+        std::string_view              roleName;
+        std::span<std::string const>  names;
+    };
+    std::array<CcRoleSpan, 6> const roles{{
+        { "argGprs",     cc->argGprs     },
+        { "argFprs",     cc->argFprs     },
+        { "returnGprs",  cc->returnGprs  },
+        { "returnFprs",  cc->returnFprs  },
+        { "callerSaved", cc->callerSaved },
+        { "calleeSaved", cc->calleeSaved },
+    }};
+    for (auto const& role : roles) {
+        std::string_view const bad = firstUnresolved(role.names);
+        if (!bad.empty()) {
+            return std::unexpected(emitAndReturn(
+                AbiResolveErrorKind::CcRegistersInconsistent,
+                std::format("target '{}' callingConvention '{}': "
+                            "{}[] contains register name '{}' that "
+                            "is not declared in target.registers[]. "
+                            "Most likely a paste-error from an "
+                            "unrelated arch — every cc register name "
+                            "must resolve in the target's own "
+                            "register file.",
+                            target.name(), cc->name,
+                            role.roleName, bad),
+                reporter));
+        }
+    }
+
     return AbiTuple{row->callingConvention, cc};
 }
 

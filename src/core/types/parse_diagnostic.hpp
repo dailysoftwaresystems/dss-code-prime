@@ -735,12 +735,20 @@ enum class DiagnosticCode : std::uint16_t {
     F_AbiUnknownTuple              = 0x5010,
     F_AbiNoMatchingCcInTarget      = 0x5011,
     F_AbiFormatAbiModelMismatch    = 0x5012,
-    // (0x5013 was reserved for F_AbiCcRegistersInconsistent
-    // pending D-FF3-Coherence; trigger EVALUATED 2026-06-01 and
-    // the surface was found to be already closed by
-    // `TargetSchemaData::validate()`'s cc-register cross-check at
-    // JSON load. Code stays reserved for ABI stability — adding a
-    // new F_* code in this band requires using 0x5014 or higher.)
+    // F_AbiCcRegistersInconsistent: a target.json's
+    //   `callingConventions[i]` row carries one or more register
+    //   names (`argGprs`/`argFprs`/`returnGprs`/`returnFprs`/
+    //   `callerSaved`/`calleeSaved`) that do not resolve in
+    //   `target.registers[]`. Most common cause: paste-error from
+    //   an unrelated arch (e.g. `ms_arm64` cc declared with
+    //   `rcx,rdx,r8,r9` copied from `ms_x64`). Closes the
+    //   silent-failure surface where FF3 would return a `cc *`
+    //   into structurally-wrong data when a caller bypasses the
+    //   JSON loader (TargetSchema ctor is public + skips
+    //   validate()). (D-FF3-Coherence un-retired 2026-06-01 at
+    //   post-fold #4 once the schema-loader-singleton premise
+    //   was disproved.)
+    F_AbiCcRegistersInconsistent   = 0x5013,
     // F_MangleMissingExpectedPrefix: `unapplyCManglingStrict` was
     //   called on a decorated input that lacks the per-format
     //   prefix the rule expects (e.g. a Mach-O symbol passed in as

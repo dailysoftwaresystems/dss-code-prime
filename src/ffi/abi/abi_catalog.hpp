@@ -66,28 +66,19 @@ enum class AbiResolveErrorKind : std::uint8_t {
     UnknownTuple              = 0,  // (target.name, format.kind) not in catalog
     NoMatchingCcInTarget      = 1,  // target.json lacks the cc the catalog says it needs
     FormatAbiModelMismatch    = 2,  // defensive — abiModel/format-kind disagreement
+    CcRegistersInconsistent   = 3,  // cc row carries register names absent from target.registers[]
     Count_                          // table-size sentinel — keep LAST (codebase convention)
 };
 
-// (D-FF3-Coherence — REDUNDANT WITH SCHEMA LOADER, anchor RETIRED.
-// The silent-failure surface flagged by audit "cc with wrong-arch
-// register names slips past FF3" does NOT exist in practice:
-// `TargetSchemaData::validate()` already rejects any cc whose
-// `argGprs`/`argFprs`/`returnGprs`/`returnFprs`/`callerSaved`/
-// `calleeSaved` references don't resolve in `registerIndex` —
-// see `src/core/types/target_schema.cpp::validate()` lines 901-908,
-// and the loader at `target_schema_json.cpp:903-908` forwards
-// validate() errors as ConfigDiagnostics that cause loadFromText
-// to return `std::unexpected`. A target.json with a paste-error
-// cc cannot load at all; FF3 never sees it.
-//   The only way to bypass this gate is to construct a
-// `TargetSchemaData` programmatically (not via JSON) — but the
-// type lattice + cycle-2b discipline forbids that path. FF3 can
-// rely on the schema loader as a single source of truth for cc
-// structural validity.
-// Verdict: D-FF3-Coherence trigger formally EVALUATED 2026-06-01
-// against existing schema-loader behavior; surface does NOT
-// exist; anchor retired.)
+// (D-FF3-Coherence: previously retired 2026-06-01 on the premise
+// that `TargetSchemaData::validate()` already closes this surface
+// at JSON load. That premise was FALSE: `TargetSchema`'s ctor is
+// public (target_schema.hpp:1042) and performs zero validation —
+// any caller bypassing the JSON loader (test fixture, .dsslir
+// preamble round-trip, fuzz harness, future binary-cache reload)
+// can construct a schema carrying a paste-error cc that FF3 must
+// defensively reject. The defensive pass below restores the
+// closure. UN-RETIRED 2026-06-01 (post-fold #4 silent-failure C1).)
 
 struct DSS_EXPORT AbiResolveError {
     AbiResolveErrorKind kind = AbiResolveErrorKind::UnknownTuple;

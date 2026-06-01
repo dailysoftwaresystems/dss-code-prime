@@ -129,15 +129,13 @@ TEST(FfiCMangle, ApplyUnapplyRoundTripPreservesCanonicalForm) {
 }
 
 // ── D-FF4-3: strict unapply mode ──────────────────────────────
-
-TEST(FfiCMangleStrict, ElfPassesThroughCleanly) {
-    // No-decoration formats: strict mode is a no-op success path.
-    DiagnosticReporter rep;
-    auto r = unapplyCManglingStrict("printf", ObjectFormatKind::Elf, rep);
-    ASSERT_TRUE(r.has_value()) << mangleErrorKindName(r.error().kind);
-    EXPECT_EQ(*r, "printf");
-    EXPECT_EQ(rep.errorCount(), 0u);
-}
+//
+// No-decoration formats (Elf/Pe/Wasm/Spirv/Unknown) get
+// strict-mode no-op coverage via `ApplyThenStrictUnapplyRoundTrip`
+// below, which iterates every ObjectFormatKind variant. The
+// MachO-decorated happy path is also covered by that loop but
+// is pinned explicitly below for readability (the value
+// `"_printf"` is spelled out, vs. table iteration).
 
 TEST(FfiCMangleStrict, MachOStripsLeadingUnderscoreCleanly) {
     DiagnosticReporter rep;

@@ -142,19 +142,17 @@ unapplyCManglingStrict(std::string_view    decoratedName,
                        DiagnosticReporter& reporter) {
     if (decoratedName.empty()) return std::string{};
     if (cFormatAddsLeadingUnderscore(format)) {
-        if (decoratedName.empty() || decoratedName.front() != '_') {
-            MangleError err{
-                MangleErrorKind::MissingExpectedPrefix,
-                std::string{"format expects leading '_' decoration but "
-                            "input '"} + std::string{decoratedName}
-                    + "' does not carry it"
-            };
-            ParseDiagnostic p;
-            p.code     = DiagnosticCode::F_MangleMissingExpectedPrefix;
-            p.severity = DiagnosticSeverity::Error;
-            p.actual   = err.detail;
-            reporter.report(std::move(p));
-            return std::unexpected(std::move(err));
+        // Guarded by the empty-input early-return above; decoratedName.front() is safe.
+        if (decoratedName.front() != '_') {
+            std::string detail = std::string{"format expects leading '_' "
+                                             "decoration but input '"}
+                                 + std::string{decoratedName}
+                                 + "' does not carry it";
+            dss::report(reporter,
+                        DiagnosticCode::F_MangleMissingExpectedPrefix,
+                        DiagnosticSeverity::Error, detail);
+            return std::unexpected(MangleError{
+                MangleErrorKind::MissingExpectedPrefix, std::move(detail)});
         }
         return std::string{decoratedName.substr(1)};
     }

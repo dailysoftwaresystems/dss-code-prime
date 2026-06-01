@@ -174,6 +174,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_AbiUnknownTuple:              return "F_AbiUnknownTuple";
         case DiagnosticCode::F_AbiNoMatchingCcInTarget:      return "F_AbiNoMatchingCcInTarget";
         case DiagnosticCode::F_AbiFormatAbiModelMismatch:    return "F_AbiFormatAbiModelMismatch";
+        case DiagnosticCode::F_AbiCcRegistersInconsistent:   return "F_AbiCcRegistersInconsistent";
         case DiagnosticCode::F_MangleMissingExpectedPrefix:  return "F_MangleMissingExpectedPrefix";
     }
     return "Unknown";

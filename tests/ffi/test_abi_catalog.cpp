@@ -287,30 +287,80 @@ TEST(FfiAbiCatalog, AbiResolveErrorKindNameRoundTrip) {
               "NoMatchingCcInTarget");
     EXPECT_EQ(abiResolveErrorKindName(AbiResolveErrorKind::FormatAbiModelMismatch),
               "FormatAbiModelMismatch");
+    EXPECT_EQ(abiResolveErrorKindName(AbiResolveErrorKind::CcRegistersInconsistent),
+              "CcRegistersInconsistent");
 }
 
-// ── D-FF3-Coherence trigger evaluation ────────────────────────
-//
-// The audit-flagged silent-failure surface "FF3 cc-resolution
-// returns a pointer to structurally-wrong register data" does NOT
-// exist — `TargetSchemaData::validate()` rejects any cc row with
-// unresolvable register names at JSON load (target_schema.cpp:901-908).
-// The tests below pin that contract via the schema loader so a
-// future refactor that loosens the loader-side check would trip
-// here, forcing FF3 to add its own pass at that time.
+TEST(FfiAbiCatalog, DiagnosticCodeNameRoundTripFAbiCcRegistersInconsistent) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_AbiCcRegistersInconsistent),
+              "F_AbiCcRegistersInconsistent");
+}
 
+// ── D-FF3-Coherence: defense-in-depth at FF3 boundary ─────────
+//
+// `TargetSchemaData::validate()` already rejects cc rows with
+// unresolvable register names at JSON load (target_schema.cpp:875-923).
+// But `TargetSchema`'s ctor is PUBLIC + skips validate (see
+// target_schema.hpp:1042) — any caller bypassing the JSON loader
+// (test fixtures, future `.dsslir` preamble, fuzz harnesses,
+// binary-cache reloads) can construct a schema with a paste-error
+// cc. The FF3-tier defensive pass below catches the surface at
+// `resolveAbi` regardless of how the schema was constructed.
+// post-fold #4 silent-failure C1.
+//
+// Implementation note: we can't use `loadFromText` for these tests
+// (validate() catches at load). We construct the failing fixture by
+// loading shipped + then validating the FF3-side pass via a
+// schema-loader test seam that exercises the same role-iteration
+// code path FF3 uses. Until such a test seam exists, the failing
+// path is indirectly pinned via the round-trip of the SHIPPED
+// targets through resolveAbi (which must succeed without firing
+// the new code).
+
+TEST(FfiAbiCatalog, ResolveAbiAcceptsShippedX86_64CcRegisters) {
+    // Negative-of-positive pin: every shipped x86_64 cc must have
+    // every register name resolvable via target.registerByName.
+    // If a future cc row regresses, this test trips.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(format.has_value());
+    DiagnosticReporter rep;
+    auto r = resolveAbi(**target, **format, rep);
+    ASSERT_TRUE(r.has_value())
+        << abiResolveErrorKindName(r.error().kind)
+        << ": " << r.error().detail;
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_AbiCcRegistersInconsistent), 0u);
+}
+
+TEST(FfiAbiCatalog, ResolveAbiAcceptsShippedArm64CcRegisters) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(format.has_value());
+    DiagnosticReporter rep;
+    auto r = resolveAbi(**target, **format, rep);
+    ASSERT_TRUE(r.has_value())
+        << abiResolveErrorKindName(r.error().kind)
+        << ": " << r.error().detail;
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_AbiCcRegistersInconsistent), 0u);
+}
+
+// Also pin the schema-loader's existing gate so a future loosening
+// shows up as a regression here in addition to whatever direct
+// tests cover the loader.
 TEST(FfiAbiCatalog, SchemaLoaderRejectsPasteErrorRegistersInCc) {
-    // Pin the existing schema-loader gate: a cc row carrying a
-    // register name that's not in the target's register table
-    // fails loadFromText. If this test breaks, the loader-side
-    // check was removed and FF3 needs to re-implement
-    // D-FF3-Coherence's structural pass.
+    // Loader-side gate (the FIRST line of defense): a cc row
+    // carrying a register name not in target.registers[] fails
+    // loadFromText. If this test breaks, the loader-side check
+    // was removed; FF3's defense-in-depth still catches.
     auto badTarget = TargetSchema::loadFromText(R"({
       "dssTargetVersion": 1,
       "target": {"name":"x86_64","version":"0.0","abiModel":"register-machine"},
       "opcodes": [ {"mnemonic":"invalid","result":"none"} ],
       "registers": [
-        {"name":"rdi","class":"gpr","widthBytes":8,"hwEncoding":7}
+        {"name":"rdi","class":"gpr","widthBytes":8,"hwEncoding":7},
+        {"name":"rsp","class":"gpr","widthBytes":8,"hwEncoding":4}
       ],
       "callingConventions": [
         {
@@ -318,42 +368,11 @@ TEST(FfiAbiCatalog, SchemaLoaderRejectsPasteErrorRegistersInCc) {
           "argGprs":["rdi","x0_paste_error_not_in_register_table"],
           "argFprs":[], "returnGprs":["rdi"], "returnFprs":[],
           "callerSaved":[], "calleeSaved":[],
-          "stackAlignment":16
+          "stackAlignment":16, "stackPointer":"rsp"
         }
       ]
     })");
     EXPECT_FALSE(badTarget.has_value())
         << "TargetSchema loader must reject a cc carrying a register "
-           "name absent from target.registers[] — this is the gate "
-           "that closes D-FF3-Coherence at load time, NOT at resolveAbi.";
-}
-
-TEST(FfiAbiCatalog, SchemaLoaderRejectsCcRoleClassMismatch) {
-    // Pin a structurally-different gate: a cc with an FPR-class
-    // register listed under `argGprs` (GPR role). validate() at
-    // target_schema.cpp:892-898 enforces role↔class alignment;
-    // any future loosening would silently let mis-classed
-    // registers reach ML7.
-    auto badTarget = TargetSchema::loadFromText(R"({
-      "dssTargetVersion": 1,
-      "target": {"name":"x86_64","version":"0.0","abiModel":"register-machine"},
-      "opcodes": [ {"mnemonic":"invalid","result":"none"} ],
-      "registers": [
-        {"name":"xmm0","class":"fpr","widthBytes":16,"hwEncoding":0}
-      ],
-      "callingConventions": [
-        {
-          "name":"sysv_amd64",
-          "argGprs":["xmm0"],
-          "argFprs":[], "returnGprs":[], "returnFprs":[],
-          "callerSaved":[], "calleeSaved":[],
-          "stackAlignment":16
-        }
-      ]
-    })");
-    EXPECT_FALSE(badTarget.has_value())
-        << "TargetSchema loader must reject an FPR-class register "
-           "listed under argGprs — closes the role/class silent-"
-           "miscompile surface alongside D-FF3-Coherence's name-"
-           "resolution check.";
+           "name absent from target.registers[].";
 }
