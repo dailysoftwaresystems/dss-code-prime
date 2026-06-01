@@ -758,6 +758,15 @@ enum class DiagnosticCode : std::uint16_t {
     //   is authoritative and a missing prefix is a structural
     //   anomaly. (D-FF4-3 post-fold-#3.)
     F_MangleMissingExpectedPrefix  = 0x5014,
+    // F_FfiIngestDuplicateSymbol: FF5 ingest() saw the same canonical
+    //   symbol exposed by more than one IngestionSource. First-source-
+    //   wins per FFI design; this Warning records the shadowed
+    //   definition so an operator can re-order sources or remove the
+    //   redundant declaration. Distinct from F_HeaderParseFailed
+    //   (which means "a single header failed to parse") — the
+    //   duplicate-shadow is a CROSS-source concern. (post-fold #5
+    //   silent-failure C3 / code-reviewer #88 fold.)
+    F_FfiIngestDuplicateSymbol     = 0x5015,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

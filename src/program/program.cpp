@@ -177,26 +177,41 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         return false;
     }
 
-    // D-FF3-3: resolve the (target, format) calling-convention BEFORE
-    // dispatching to compileSingleUnit. Replaces the pre-D-FF3-3
-    // silent dispatch to `callingConventions[0]` for every compile
-    // — that hardcode produced SysV register assignments on PE+x86_64
+    // D-FF3-3 (commit 9440143): resolve the (target, format) calling
+    // convention BEFORE dispatching to compileSingleUnit. Replaces
+    // the previous silent dispatch to `callingConventions[0]` —
+    // that hardcode produced SysV register assignments on PE+x86_64
     // targets when MS_x64 was required, etc. The resolved cc index
-    // threads through compileSingleUnit → allocateRegisters →
-    // materializeCallingConvention.
+    // threads through compileSingleUnit → allocateRegisters → the
+    // LirFuncAllocation::callingConventionIndex field that
+    // materializeCallingConvention reads downstream.
     auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, reporter);
     if (!abi) return false;
-    std::uint16_t ccIndex = 0;
-    if (abi->cc != nullptr) {
-        auto const span = (*targetR)->callingConventions();
-        ccIndex = static_cast<std::uint16_t>(
-            std::distance(span.data(), abi->cc));
+
+    // Post-fold-#5 silent-failure CRITICAL-1: operand-stack (WASM)
+    // and result-id (SPIR-V) abi-models return cc=nullptr from
+    // resolveAbi. The register-machine LIR pipeline downstream
+    // would silently use cc index 0 of whatever the target schema
+    // ships (or emit `R_NoCallingConventions` if none), producing
+    // x86/ARM-shaped binaries for a WASM/SPIR-V target. Both
+    // formats need their own MIR→IR lowering tier (plan 17 for
+    // SPIR-V, plan 18 for WASM). Fail loud here rather than
+    // dispatching a register-machine pipeline against a non-
+    // register-machine target.
+    if (abi->cc == nullptr) {
+        emitDriver(reporter, DiagnosticCode::D_PlanNotLanded,
+                   std::string{"target '"} + parsed->targetName
+                       + "' has abiModel='"
+                       + std::string{targetAbiModelName(
+                             (*targetR)->abiModel())}
+                       + "' — register-machine LIR pipeline does not "
+                         "lower it. Plan 17 (SPIR-V) / plan 18 (WASM) "
+                         "own this lowering.");
+        return false;
     }
-    // For operand-stack (WASM) / result-id (SPIR-V) abi-models the
-    // resolver returns cc=nullptr; the LIR allocator's
-    // R_NoCallingConventions arm + the cc-count check in
-    // allocateOneFunc handle that path. ccIndex stays 0; for those
-    // abi-models the value is unused.
+    auto const span = (*targetR)->callingConventions();
+    std::uint16_t const ccIndex = static_cast<std::uint16_t>(
+        std::distance(span.data(), abi->cc));
 
     // Output path convention (cycle 2 v1; plan 6 owns the
     // authoritative artifact-profile-driven scheme):

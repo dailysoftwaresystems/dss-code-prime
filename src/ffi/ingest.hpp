@@ -23,9 +23,13 @@
 // single pipeline that populates `HirFfiMap` from real library
 // surfaces.
 //
-// Source-language agnostic: takes a HIR module (built from any
-// source language) + a list of (HirNodeId, canonicalName) extern
-// declarations the caller pre-resolved from the SemanticModel.
+// Source-language agnostic: takes a caller-resolved list of
+// (HirNodeId, canonicalName) extern declarations — never inspects
+// the HIR tree, never reads SemanticModel. Caller pre-resolves
+// names from whatever source language produced the externs.
+// Header-source ingest is c-subset-only today (FF2's grammar);
+// binary-source ingest is format-blind (FF1 dispatches on magic
+// bytes).
 // Target-blind: takes a TargetSchema + ObjectFormatSchema; uses FF3
 // + FF4 closed-table dispatch on (target.name, format.kind) and
 // `ObjectFormatKind` respectively.
@@ -84,7 +88,14 @@ struct DSS_EXPORT HirIngestResult {
     std::size_t externsAnnotated = 0;  // # of (node, FfiMetadata) entries written to ffiMap
     std::size_t sourcesProcessed = 0;  // # of IngestionSource entries successfully read
     std::size_t rowsAggregated   = 0;  // # of ImportSurface rows in the union surface
-    bool        ok               = false;
+    // `ok` is derived state — the snapshot of `reporter.errorCount()`
+    // as of `ingest()` return. The reporter remains the single source
+    // of truth for diagnostic state (matches `LirAllocation::ok()`
+    // precedent at lir_regalloc.hpp). Setting `errorCountAtReturn`
+    // explicitly (rather than caching a bool) keeps the derivation
+    // honest if a caller emits errors AFTER ingest returns.
+    std::size_t errorCountAtReturn = 0;
+    [[nodiscard]] bool ok() const noexcept { return errorCountAtReturn == 0u; }
 };
 
 // ── Public entry point ─────────────────────────────────────────
@@ -104,9 +115,10 @@ struct DSS_EXPORT HirIngestResult {
 //   * Missing source: caller-API-level — fails loud via reporter
 //     on the FIRST source that fails to read.
 //   * Duplicate mangledName across sources: silent for the first
-//     occurrence; subsequent duplicates skipped with an info
-//     diagnostic (the FFI spec treats first-source-wins as
-//     deterministic; downstream linkers do the same).
+//     occurrence; subsequent duplicates skipped with a Warning-level
+//     diagnostic (`F_FfiIngestDuplicateSymbol`) so the audit log
+//     captures the shadowing. Downstream linkers reject true
+//     link-time collisions independently.
 //   * Extern in `externs` with no match in aggregated surface:
 //     skipped without error — the user's source declares the
 //     extern but no library/header provides it; the linker will

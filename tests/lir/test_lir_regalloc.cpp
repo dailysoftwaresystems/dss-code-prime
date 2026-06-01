@@ -68,6 +68,47 @@ TEST(LirRegAlloc, EmptyModuleProducesNoResults) {
     EXPECT_EQ(out.perFunc.size(), 0u);
 }
 
+// ── Post-fold #5 silent-failure HIGH-2: pin ccIndex flow ─────
+TEST(LirRegAlloc, CcIndex1RecordsThroughToFuncAllocation) {
+    // Pin the D-FF3-3 wiring: passing ccIndex=1 must be recorded
+    // on every LirFuncAllocation. Without this pin a regression
+    // that drops the threaded index back to 0 would silently
+    // re-emit SysV register assignments on PE+x86_64 targets.
+    auto lowered = lowerCSubsetToLir(
+        "int f(int x) { return x + x; }");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/1, regallocRep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_GE(out.perFunc.size(), 1u);
+    for (auto const& fa : out.perFunc) {
+        EXPECT_EQ(fa.callingConventionIndex, 1u);
+    }
+}
+
+TEST(LirRegAlloc, CcIndexOutOfRangeFailsLoud) {
+    // x86_64 ships 2 cc rows; ccIndex=99 must trip
+    // R_CallingConventionLookupFailed per allocateOneFunc's
+    // defensive arm.
+    auto lowered = lowerCSubsetToLir(
+        "int f(int x) { return x + x; }");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/99, regallocRep);
+    EXPECT_FALSE(out.ok());
+    bool sawCcLookupFail = false;
+    for (auto const& d : regallocRep.all()) {
+        if (d.code == DiagnosticCode::R_CallingConventionLookupFailed) {
+            sawCcLookupFail = true;
+        }
+    }
+    EXPECT_TRUE(sawCcLookupFail);
+}
+
 TEST(LirRegAlloc, StraightLineFunctionAssignsAllPhys) {
     auto lowered = lowerCSubsetToLir(
         "int f(int x) { return x + x; }");

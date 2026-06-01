@@ -90,7 +90,13 @@ readSource(IngestionSource const& src, DiagnosticReporter& reporter,
 //
 // Returns the canonical name on success, empty string on failure
 // (caller skips the row with a logged underlying diagnostic).
-[[nodiscard]] std::string
+// post-fold #5 silent-failure H3: return optional<string> so the
+// caller can distinguish "decoration removed → empty canonical name"
+// (legitimate, kept) from "unapply failure" (skip the row). An
+// empty string from the strict unapply is genuinely unusable, but
+// not vs. the failure mode — return nullopt on failure for an
+// unambiguous sentinel.
+[[nodiscard]] std::optional<std::string>
 toCanonicalName(ImportSurface const& row, ObjectFormatKind format,
                 bool fromBinary, DiagnosticReporter& reporter) {
     if (!fromBinary) {
@@ -100,7 +106,7 @@ toCanonicalName(ImportSurface const& row, ObjectFormatKind format,
     auto canonical = unapplyCManglingStrict(row.mangledName, format, reporter);
     if (!canonical) {
         // Underlying diagnostic already emitted by strict unapply.
-        return {};
+        return std::nullopt;
     }
     return std::move(*canonical);
 }
@@ -140,12 +146,27 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
     std::sort(headers.begin(), headers.end());
 
     std::vector<ImportSurface> aggregated;
+    std::size_t failedFiles = 0;
+    // post-fold #5 silent-failure H1: collect per-file failures
+    // instead of halting on the first. A typo in `stdlib.h` should
+    // NOT silently amputate `stdio.h`, `string.h`, etc. — the
+    // operator needs to see every parse failure AND get the
+    // partial surface for the files that did parse. Only fail
+    // the whole directory read if EVERY file failed.
+    std::optional<HeaderReadError> firstError;
     for (auto const& path : headers) {
         auto r = readCHeader(path, importLibrary, reporter);
-        if (!r) return std::unexpected(std::move(r.error()));
+        if (!r) {
+            ++failedFiles;
+            if (!firstError) firstError = std::move(r.error());
+            continue;
+        }
         aggregated.insert(aggregated.end(),
                           std::make_move_iterator(r->begin()),
                           std::make_move_iterator(r->end()));
+    }
+    if (!headers.empty() && failedFiles == headers.size()) {
+        return std::unexpected(std::move(*firstError));
     }
     return aggregated;
 }
@@ -159,14 +180,38 @@ ingest(std::span<IngestionSource const> sources,
        DiagnosticReporter&              reporter) {
     HirIngestResult result{};
 
+    // Helper: every early return must snapshot the reporter so
+    // `result.ok()` reflects the diagnostic state at exit. Avoids
+    // the "early-return drops errorCountAtReturn=0 default → ok()
+    // returns true despite the reporter holding errors" bug.
+    auto returnWithSnapshot = [&]() -> HirIngestResult {
+        result.errorCountAtReturn = reporter.errorCount();
+        return result;
+    };
+
     // (1) FF3 cross-validation — fail loud if the (target, format)
-    // tuple isn't representable by the catalog. The resolved cc
-    // is not stored in FfiMetadata (CallConv lives on the FnSig
-    // TypeId per post-FF3 design); this call is a structural
-    // gate, not a data producer.
+    // tuple isn't representable by the catalog. Post-fold-#5
+    // silent-failure CRITICAL-2: also short-circuit on
+    // operand-stack / result-id abi-models (cc=nullptr) — FF4's
+    // C-mangling rules don't apply to WASM's import-namespace
+    // dispatch or SPIR-V's resultId surface. Producing
+    // FfiMetadata via FF4 for those targets would silently emit
+    // wrong-shape metadata once plan 17/18 grows real ingestion
+    // paths.
     {
         auto abi = resolveAbi(target, format, reporter);
-        if (!abi) return result;
+        if (!abi) return returnWithSnapshot();
+        if (abi->cc == nullptr) {
+            dss::report(reporter, DiagnosticCode::D_PlanNotLanded,
+                        DiagnosticSeverity::Error,
+                        std::format("FF5 ingest: target '{}' abiModel '{}' "
+                                    "is not supported by the FF4 C-mangling "
+                                    "path; SPIR-V (plan 17) and WASM "
+                                    "(plan 18) own their own ingest surfaces.",
+                                    target.name(),
+                                    targetAbiModelName(target.abiModel())));
+            return returnWithSnapshot();
+        }
     }
 
     // (2) Aggregate ImportSurface rows from every source, tagged
@@ -181,7 +226,7 @@ ingest(std::span<IngestionSource const> sources,
     for (auto const& src : sources) {
         bool failed = false;
         auto rows = readSource(src, reporter, failed);
-        if (failed) return result;
+        if (failed) return returnWithSnapshot();
         bool const fromBinary =
             std::holds_alternative<BinaryLibrarySource>(src);
         aggregated.reserve(aggregated.size() + rows.size());
@@ -193,24 +238,33 @@ ingest(std::span<IngestionSource const> sources,
     result.rowsAggregated = aggregated.size();
 
     // (3) Build a canonical-name → TaggedRow index for O(1) match.
-    // First-source-wins on duplicates — emits an info-level
+    // First-source-wins on duplicates — emits a Warning-level
     // diagnostic for each shadowed row so audit logs capture the
-    // shadowing, but doesn't fail (the FFI design treats
-    // first-wins as deterministic per plan §4.2).
+    // shadowing, but doesn't fail (this is a local FF5 design
+    // choice; downstream linkers reject true link-time symbol
+    // collisions independently).
     std::unordered_map<std::string, TaggedRow const*> bySymbol;
     bySymbol.reserve(aggregated.size());
     for (auto const& tagged : aggregated) {
-        std::string canonical = toCanonicalName(
+        auto canonical = toCanonicalName(
             tagged.row, format.kind(), tagged.fromBinary, reporter);
-        if (canonical.empty()) continue;  // strict-unapply already reported
-        auto [it, inserted] = bySymbol.emplace(std::move(canonical), &tagged);
+        if (!canonical) continue;  // strict-unapply already reported
+        auto [it, inserted] = bySymbol.emplace(std::move(*canonical), &tagged);
         if (!inserted) {
-            dss::report(reporter, DiagnosticCode::F_HeaderParseFailed,
+            // First-source-wins is the local design choice (an
+            // operator who exposes the same symbol from two
+            // libraries gets the first one); the linker would
+            // reject a true link-time collision separately. Use
+            // the dedicated F_FfiIngestDuplicateSymbol code (NOT
+            // F_HeaderParseFailed — that's the per-file parse-
+            // failure code; the cross-source duplicate is a
+            // different remediation surface).
+            dss::report(reporter, DiagnosticCode::F_FfiIngestDuplicateSymbol,
                         DiagnosticSeverity::Warning,
                         std::format("FFI ingest: duplicate symbol '{}' "
                                     "from source '{}' shadowed by earlier "
                                     "definition from '{}' (first-source-"
-                                    "wins per FFI spec).",
+                                    "wins).",
                                     it->first, tagged.row.libraryPath,
                                     it->second->row.libraryPath));
         }
@@ -244,8 +298,7 @@ ingest(std::span<IngestionSource const> sources,
         ++result.externsAnnotated;
     }
 
-    result.ok = (reporter.errorCount() == 0u);
-    return result;
+    return returnWithSnapshot();
 }
 
 } // namespace dss::ffi

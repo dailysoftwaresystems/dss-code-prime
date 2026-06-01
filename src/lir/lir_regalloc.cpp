@@ -431,6 +431,7 @@ LirFuncAllocation
 allocateFuncRegisters(Lir const&             lir,
                       TargetSchema const&    schema,
                       LirFuncLiveness const& flow,
+                      std::uint16_t          callingConventionIndex,
                       DiagnosticReporter&    reporter) {
     bool const schemaOk = (schema.callingConventionCount() > 0);
     if (!schemaOk) {
@@ -439,7 +440,7 @@ allocateFuncRegisters(Lir const&             lir,
                "target schema declares no calling conventions");
     }
     return allocateOneFunc(lir, schema, flow,
-                           /*callingConventionIndex=*/0,
+                           callingConventionIndex,
                            reporter, schemaOk);
 }
 

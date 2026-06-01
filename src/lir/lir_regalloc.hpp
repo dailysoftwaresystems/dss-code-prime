@@ -174,13 +174,22 @@ allocateRegisters(Lir const&          lir,
                   DiagnosticReporter& reporter);
 
 // Allocate for a single function. The caller must supply the matching
-// `LirFuncLiveness` produced over the same `lir`. The schema-wide
-// validity check (≥1 calling convention) is repeated here for callers
-// that bypass `allocateRegisters`.
+// `LirFuncLiveness` produced over the same `lir` AND the per-(target,
+// format) calling-convention ordinal it would normally receive from
+// `dss::ffi::resolveAbi(...)`. The schema-wide validity check
+// (≥1 calling convention) is repeated here for callers that bypass
+// `allocateRegisters`.
+//
+// Post-fold-#5 code-reviewer-#82 fold: the parameter is REQUIRED (no
+// default) so a future caller cannot accidentally inherit the
+// pre-D-FF3-3 `0` hardcode silently. Test callers pass `0` explicitly
+// when the test fixture's target ships a single cc (cc[0] is then
+// the only valid choice).
 [[nodiscard]] DSS_EXPORT LirFuncAllocation
 allocateFuncRegisters(Lir const&             lir,
                       TargetSchema const&    schema,
                       LirFuncLiveness const& flow,
+                      std::uint16_t          callingConventionIndex,
                       DiagnosticReporter&    reporter);
 
 } // namespace dss
