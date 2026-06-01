@@ -2,6 +2,8 @@
 
 #include "core/export.hpp"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -73,15 +75,19 @@ struct DSS_EXPORT ImportSurface {
     SymbolVisibility visibility = SymbolVisibility::Default;
     SymbolLinkage    linkage    = SymbolLinkage::External;
     // Reserved for FF2 C-header consumption — populated when an
-    // `extern` decl carries a function signature. Empty for FF1
-    // binary readers (binaries don't carry C signatures, only
-    // mangled names + symbol kinds).
+    // `extern` decl carries a function signature. `std::nullopt`
+    // for FF1 binary readers (binaries don't carry C signatures,
+    // only mangled names + symbol kinds).
     //
-    // The shape is a free-form opaque string (e.g. `"int(const char*)"`)
-    // — parsed structurally by plan 11's ABI catalog (FF3) when the
-    // user's source declaration is validated against this surface.
-    // FF1 binary readers leave it empty.
-    std::string      cSignature;
+    // Free-form opaque string (e.g. `"int(const char*)"`) — parsed
+    // structurally by plan 11's ABI catalog (FF3) when the user's
+    // source declaration is validated against this surface. `optional`
+    // makes "no signature attached" semantically distinct from "header
+    // declared with empty parens" (which is invalid C and should
+    // surface as a parse diagnostic). post-fold #1 type-design fix —
+    // was a free-form `std::string` with the "empty means absent"
+    // convention, an SoT smell that FF2 + FF3 would have inherited.
+    std::optional<std::string> cSignature;
 };
 
 } // namespace dss::ffi

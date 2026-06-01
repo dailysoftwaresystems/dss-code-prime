@@ -196,6 +196,14 @@ inline void appendBytes(std::vector<std::uint8_t>& out,
 //   NOP
 // All 4 are 4-byte instructions; total 16 bytes per stub.
 //
+// PCS contract (AArch64 Procedure Call Standard §5.1.2): x16 (IP0)
+// and x17 (IP1) are designated INTRA-PROCEDURE-CALL SCRATCH
+// registers — call-clobbered, sole-legal-scratch for the PLT
+// dispatch between the caller's `BL` and the resolved function's
+// entry. Any other GPR used here would corrupt the caller's saved
+// state. Using x16+x17 is what makes this 4-instruction sequence
+// callee-state-preserving by construction.
+//
 // Range check: ADRP carries a 21-bit signed page-relative immediate
 // (±4 GiB reachable). The LDR's imm12 is 12-bit unsigned scaled by 8
 // (0..32760 byte offset within page, 8-byte aligned). The GOT slot

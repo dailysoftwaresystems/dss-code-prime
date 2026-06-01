@@ -279,12 +279,14 @@ TEST(ElfExecWriter, ExternImportsOnArm64MachineSucceedsAfterDLK68Close) {
 
 // D-LK6-8 byte-pin: ARM64 16-byte PLT stub layout.
 // First stub at pltVa, GOT slot at gotVa. The 4 instructions are:
-//   [0..3]   ADRP x16, page-of(slotVa)     opcode 0x9? at byte 3
-//   [4..7]   LDR  x17, [x16, lo12(slotVa)] opcode 0xF9 at byte 7
+//   [0..3]   ADRP x16, page-of(slotVa)     high byte 3 in {0x90..0x9F}
+//   [4..7]   LDR  x17, [x16, lo12(slotVa)] high byte 7 == 0xF9
 //   [8..11]  BR   x17                       fixed 0xD61F0220
 //   [12..15] NOP                            fixed 0xD503201F
-// Test pins the FIXED-byte regions (BR + NOP) which don't depend on
-// VA layout, plus the ADRP/LDR opcode marker bytes.
+// Test scans for the unique fixed-byte BR+NOP marker pair, then
+// validates the ADRP/LDR opcode marker bytes at offsets -8/-4 from
+// the BR. post-fold #1 — was previously docstring-claimed but not
+// actually verified (pr-test-analyzer caught the gap).
 TEST(ElfExecWriter, Arm64PltStubLayoutPinsAdrpLdrBrNop) {
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
@@ -316,20 +318,49 @@ TEST(ElfExecWriter, Arm64PltStubLayoutPinsAdrpLdrBrNop) {
     // walker, so scan for the BR x17 (D6 1F 02 20 in BE; in LE that's
     // 0x20 0x02 0x1F 0xD6) — unique enough as a marker. Confirm the
     // NOP (1F 20 03 D5 LE) immediately follows.
-    bool sawBrThenNop = false;
+    std::size_t brIdx = bytes.size();
     for (std::size_t i = 0; i + 8 <= bytes.size(); ++i) {
         if (bytes[i+0] == 0x20 && bytes[i+1] == 0x02
          && bytes[i+2] == 0x1F && bytes[i+3] == 0xD6
          && bytes[i+4] == 0x1F && bytes[i+5] == 0x20
          && bytes[i+6] == 0x03 && bytes[i+7] == 0xD5) {
-            sawBrThenNop = true;
+            brIdx = i;
             break;
         }
     }
-    EXPECT_TRUE(sawBrThenNop)
+    ASSERT_LT(brIdx, bytes.size())
         << "ARM64 PLT stub must contain BR x17 (0xD61F0220) followed "
            "by NOP (0xD503201F) — the fixed back half of every stub.";
+    // ADRP opcode pin: instruction at brIdx-8, byte 3 = 0x90 ORed
+    // with the immhi top bits. The opcode marker (bits 28+31:25 of
+    // the ADRP encoding) lands at byte 3 with mask 0x9F; the page-
+    // pair immhi bits at byte 3 mask 0x60 (bits 22:21 of the inst).
+    // For the test layout, immhi top bits are zero (small page-pair
+    // values), so byte 3 should be exactly 0x90.
+    ASSERT_GE(brIdx, 8u);
+    EXPECT_EQ(bytes[brIdx - 8 + 3] & 0x9Fu, 0x90u)
+        << "ADRP opcode marker missing at PLT stub byte 3";
+    // LDR opcode pin: instruction at brIdx-4, byte 3 = 0xF9 fixed
+    // for LDR (immediate, unsigned offset, 64-bit).
+    EXPECT_EQ(bytes[brIdx - 4 + 3], 0xF9u)
+        << "LDR opcode marker missing at PLT stub byte 7";
 }
+
+// D-LK6-8 defense-in-depth: out-of-range ADRP page-pair must be
+// rejected loudly. Constructed by pinning the GOT slot far enough
+// from the PLT stub to overflow the signed-21-bit page-pair budget.
+// (Direct testing of the helper would require exposing it; instead
+// we drive the full walker with a small text + many externs to push
+// the GOT slot past the ±4 GiB threshold. Out of test scope; the
+// happy-path indirectly exercises the range-check path's
+// instructions.) Anchored as D-LK6-8.range-test for when a synthetic
+// VA-shaping fixture lands.
+
+// D-LK6-8: a corrupted-config slotVa with low12 not multiple of 8
+// would trigger the LDR misalignment reject. The current `.got`
+// layout is page-aligned + 8-byte slots, so this can't be reached
+// from valid AssembledModule inputs — anchored as a defense-in-depth
+// test for if synthetic-Lir fixtures introduce GOT mislayouts.
 
 // Universality pin (D-LK6-8 post-close): the guard is now
 // `machine != x86_64 && machine != ARM64`. RISC-V / MIPS / PPC64

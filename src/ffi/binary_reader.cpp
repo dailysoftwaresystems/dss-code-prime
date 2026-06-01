@@ -11,6 +11,53 @@ namespace dss::ffi {
 
 namespace {
 
+// Map an `BinaryReadErrorKind` to the structured `DiagnosticCode::F_*`
+// value (plan 11 §2.6). The kind enum is the function-return shape
+// (compact, semantic); the F_* code is the in-reporter shape that
+// downstream diagnostic policy (`--suppress`, `--warnings-as-errors`)
+// consumes. Wired at post-fold #1 — was previously a SoT gap
+// (code-reviewer + type-design 2-agent convergence: F_* codes
+// declared in the header but never reached the reporter).
+[[nodiscard]] constexpr DiagnosticCode
+toDiagnosticCode(BinaryReadErrorKind k) noexcept {
+    switch (k) {
+        case BinaryReadErrorKind::FileOpenFailed:      return DiagnosticCode::F_FileOpenFailed;
+        case BinaryReadErrorKind::FileEmpty:           return DiagnosticCode::F_FileEmpty;
+        case BinaryReadErrorKind::UnknownFormat:       return DiagnosticCode::F_UnknownBinaryFormat;
+        case BinaryReadErrorKind::UnsupportedFormat:   return DiagnosticCode::F_UnsupportedBinaryFormat;
+        case BinaryReadErrorKind::CorruptedBinary:     return DiagnosticCode::F_CorruptedBinary;
+        case BinaryReadErrorKind::UnsupportedElfClass: return DiagnosticCode::F_UnsupportedElfClass;
+        case BinaryReadErrorKind::SectionNotFound:     return DiagnosticCode::F_SectionNotFound;
+    }
+    return DiagnosticCode::None;  // unreachable per the closed enum
+}
+
+// Overflow-safe bounds check: does `[off, off+size)` lie inside
+// `[0, totalSize)`? The naive `off + size > totalSize` wraps when
+// `off + size` overflows u64 (a corrupted/hostile binary can declare
+// `sh_offset = UINT64_MAX - 4` + `sh_size = 8` to bypass the check).
+// (silent-failure audit post-fold #1 CRITICAL.)
+[[nodiscard]] constexpr bool
+rangeExceedsBuffer(std::uint64_t off, std::uint64_t size,
+                   std::uint64_t totalSize) noexcept {
+    // off > totalSize handles `off` itself beyond EOF;
+    // size > totalSize - off handles the rest WITHOUT addition.
+    return off > totalSize || size > totalSize - off;
+}
+
+// C++20+ mandates arithmetic right shift on signed integers
+// ([expr.shift]/3). The ARM64 page-pair formula (`pageDiff >> 12`
+// in `src/link/format/elf.cpp::emitArm64PltStub`) and the page-pair
+// reloc kernel (`Aarch64AdrPrelPgHi21` in
+// `src/link/format/exec_reloc_apply.hpp`) BOTH rely on this. Without
+// arithmetic shift the negative-page-pair branch silently produces
+// wrong ADRP immediates. Pin the compile-time invariant here so a
+// pre-C++20 build is a HARD FAIL, not a silent miscompile.
+static_assert((std::int64_t{-1} >> 1) == std::int64_t{-1},
+              "ffi binary reader assumes arithmetic right shift on "
+              "signed integers (C++20+ guarantee). Compile with "
+              "-std=c++20 or newer.");
+
 // ── ELF64 layout constants (gABI 4.10) ──────────────────────────
 // Identical layout to what `src/link/format/elf.cpp` already emits.
 // We re-declare the constants here rather than #include-pull from
@@ -185,12 +232,19 @@ readElf64(std::span<std::uint8_t const> bytes,
             BinaryReadErrorKind::CorruptedBinary,
             "ELF64 reader: no section header table (stripped binary?)"});
     }
-    std::uint64_t const shtEnd = e_shoff
-        + static_cast<std::uint64_t>(e_shnum) * e_shentsize;
-    if (shtEnd > bytes.size()) {
+    // Multiplication overflow guard. `e_shnum` is u16 (≤65535) and
+    // `e_shentsize` is u16 (always 64 here); their product fits u32
+    // comfortably (max 4.2 MB). Promote both to u64 explicitly so
+    // the multiplication itself doesn't overflow on any platform.
+    std::uint64_t const shtBytes =
+        static_cast<std::uint64_t>(e_shnum) * static_cast<std::uint64_t>(e_shentsize);
+    if (rangeExceedsBuffer(e_shoff, shtBytes, bytes.size())) {
         return std::unexpected(BinaryReadError{
             BinaryReadErrorKind::CorruptedBinary,
-            "ELF64 reader: section header table runs past EOF"});
+            "ELF64 reader: section header table runs past EOF "
+            "(e_shoff=" + std::to_string(e_shoff)
+            + " + " + std::to_string(shtBytes) + " bytes > file "
+            + std::to_string(bytes.size()) + ")"});
     }
 
     // Locate the shstrtab (section-name string table) so we can find
@@ -212,7 +266,7 @@ readElf64(std::span<std::uint8_t const> bytes,
 
     std::uint64_t const shstrtabOff  = shtOffset(e_shstrndx);
     std::uint64_t const shstrtabSize = shtSize(e_shstrndx);
-    if (shstrtabOff + shstrtabSize > bytes.size()) {
+    if (rangeExceedsBuffer(shstrtabOff, shstrtabSize, bytes.size())) {
         return std::unexpected(BinaryReadError{
             BinaryReadErrorKind::CorruptedBinary,
             "ELF64 reader: shstrtab runs past EOF"});
@@ -261,15 +315,24 @@ readElf64(std::span<std::uint8_t const> bytes,
             "ELF64 reader: .dynsym sh_entsize=" + std::to_string(dynsymEnt)
             + " (expected 24)"});
     }
-    if (dynsymOff + dynsymSize > bytes.size()) {
+    if (rangeExceedsBuffer(dynsymOff, dynsymSize, bytes.size())) {
         return std::unexpected(BinaryReadError{
             BinaryReadErrorKind::CorruptedBinary,
             "ELF64 reader: .dynsym runs past EOF"});
     }
+    // Section size must be a multiple of the entry size — a partial
+    // tail entry would be silently truncated by `numSyms = size / 24`.
+    if ((dynsymSize % kElf64SymSz) != 0u) {
+        return std::unexpected(BinaryReadError{
+            BinaryReadErrorKind::CorruptedBinary,
+            "ELF64 reader: .dynsym size=" + std::to_string(dynsymSize)
+            + " is not a multiple of sh_entsize=" + std::to_string(kElf64SymSz)
+            + " — corrupted (truncated final entry)"});
+    }
 
     std::uint64_t const dynstrOff  = shtOffset(static_cast<std::uint16_t>(dynstrIdx));
     std::uint64_t const dynstrSize = shtSize(static_cast<std::uint16_t>(dynstrIdx));
-    if (dynstrOff + dynstrSize > bytes.size()) {
+    if (rangeExceedsBuffer(dynstrOff, dynstrSize, bytes.size())) {
         return std::unexpected(BinaryReadError{
             BinaryReadErrorKind::CorruptedBinary,
             "ELF64 reader: .dynstr runs past EOF"});
@@ -323,40 +386,65 @@ std::string_view binaryReadErrorKindName(BinaryReadErrorKind k) noexcept {
     return "Unknown";
 }
 
+// Emit a binary-reader failure through the run-wide DiagnosticReporter
+// AND return the structured BinaryReadError. Centralises the kind →
+// F_* code mapping so every failure path produces a remediation-
+// distinct diagnostic that downstream policy (`--suppress` /
+// `--warnings-as-errors`) consumes. post-fold #1 fix — the F_* codes
+// declared in parse_diagnostic.hpp were dead before this wiring.
+[[nodiscard]] BinaryReadError
+emitAndReturn(BinaryReadErrorKind kind, std::string detail,
+              DiagnosticReporter& reporter) {
+    dss::report(reporter, toDiagnosticCode(kind),
+                DiagnosticSeverity::Error, detail);
+    return BinaryReadError{kind, std::move(detail)};
+}
+
 std::expected<std::vector<ImportSurface>, BinaryReadError>
-readImportsFromBytes(std::span<std::uint8_t const> bytes,
-                     std::string_view              libraryPathLabel,
-                     DiagnosticReporter&           reporter) {
+readImportsFromBytesImpl(std::span<std::uint8_t const> bytes,
+                          std::string_view              libraryPathLabel,
+                          DiagnosticReporter&           reporter) {
     if (bytes.empty()) {
-        return std::unexpected(BinaryReadError{
+        return std::unexpected(emitAndReturn(
             BinaryReadErrorKind::FileEmpty,
             std::string{"readImports: '"} + std::string{libraryPathLabel}
-            + "' is zero bytes (truncated download / build artifact?)"});
+            + "' is zero bytes (truncated download / build artifact?)",
+            reporter));
     }
     auto const guess = guessFormat(bytes);
     switch (guess) {
         case FormatGuess::Elf:
             return readElf64(bytes, libraryPathLabel, reporter);
         case FormatGuess::Pe:
-            return std::unexpected(BinaryReadError{
+            return std::unexpected(emitAndReturn(
                 BinaryReadErrorKind::UnsupportedFormat,
                 std::string{"readImports: '"} + std::string{libraryPathLabel}
                 + "' is a PE binary (MZ magic). PE export-table reader "
-                  "is anchored at plan 11 §3 FF1-PE (not yet shipped)."});
+                  "is anchored at plan 11 §3 FF1-PE (not yet shipped).",
+                reporter));
         case FormatGuess::MachO:
-            return std::unexpected(BinaryReadError{
+            return std::unexpected(emitAndReturn(
                 BinaryReadErrorKind::UnsupportedFormat,
                 std::string{"readImports: '"} + std::string{libraryPathLabel}
                 + "' is a Mach-O binary. Mach-O LC_SYMTAB reader is "
-                  "anchored at plan 11 §3 FF1-MachO (not yet shipped)."});
+                  "anchored at plan 11 §3 FF1-MachO (not yet shipped).",
+                reporter));
         case FormatGuess::Unknown:
             break;
     }
-    return std::unexpected(BinaryReadError{
+    return std::unexpected(emitAndReturn(
         BinaryReadErrorKind::UnknownFormat,
         std::string{"readImports: '"} + std::string{libraryPathLabel}
         + "' has no recognised magic (expected ELF '\\x7FELF', PE 'MZ', "
-          "or Mach-O 0xFEEDFACF/0xCAFEBABE)."});
+          "or Mach-O 0xFEEDFACF/0xCAFEBABE).",
+        reporter));
+}
+
+std::expected<std::vector<ImportSurface>, BinaryReadError>
+readImportsFromBytes(std::span<std::uint8_t const> bytes,
+                     std::string_view              libraryPathLabel,
+                     DiagnosticReporter&           reporter) {
+    return readImportsFromBytesImpl(bytes, libraryPathLabel, reporter);
 }
 
 std::expected<std::vector<ImportSurface>, BinaryReadError>
@@ -364,10 +452,16 @@ readImports(std::filesystem::path const& libraryPath,
             DiagnosticReporter&          reporter) {
     std::ifstream in(libraryPath, std::ios::binary);
     if (!in) {
-        return std::unexpected(BinaryReadError{
-            BinaryReadErrorKind::FileOpenFailed,
+        // emitAndReturn lives in the anonymous namespace; replicate
+        // its body here (one site, no enclosing namespace block).
+        std::string detail =
             "readImports: failed to open '"
-            + libraryPath.generic_string() + "' for reading"});
+            + libraryPath.generic_string() + "' for reading";
+        dss::report(reporter,
+                    DiagnosticCode::F_FileOpenFailed,
+                    DiagnosticSeverity::Error, detail);
+        return std::unexpected(BinaryReadError{
+            BinaryReadErrorKind::FileOpenFailed, std::move(detail)});
     }
     std::vector<std::uint8_t> bytes{
         std::istreambuf_iterator<char>(in),

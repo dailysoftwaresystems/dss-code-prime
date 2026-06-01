@@ -299,6 +299,25 @@ TEST(BinaryReaderElf, ShorterThanEhdrFailsLoud) {
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
 }
 
+TEST(BinaryReaderElf, DynsymSizeNotMultipleOfEntsizeFailsLoud) {
+    // Post-fold #1 silent-failure fix: dynsymSize / 24 silently floored
+    // before. Now rejects with CorruptedBinary if size % 24 != 0.
+    // Build a normal ELF then poke the dynsym sh_size to 25.
+    std::vector<Sym> syms{ {0, info(1, 2), 0, 1, 0x1000, 16} };
+    auto bytes = buildMinimalElf64(syms, {"f"});
+    // Locate shdr 2 (.dynsym) and corrupt its sh_size field.
+    std::uint64_t shtOff = 0;
+    std::memcpy(&shtOff, &bytes[40], 8);
+    // sh_size is at offset 32 of each shdr; shdr 2 starts at shtOff + 2*64.
+    bytes[shtOff + 2 * 64 + 32 + 0] = 25;
+    bytes[shtOff + 2 * 64 + 32 + 1] = 0;  // size now declared 25, not multiple of 24
+
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "corrupt.so", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+}
+
 TEST(BinaryReaderElf, NoDynsymSectionFailsLoud) {
     // Build an ELF with NO .dynsym (only NULL + .shstrtab).
     std::vector<std::uint8_t> bytes;
@@ -336,6 +355,43 @@ TEST(BinaryReaderElf, NoDynsymSectionFailsLoud) {
     auto r = readImportsFromBytes(bytes, "stripped.so", rep);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::SectionNotFound);
+}
+
+// ── readImports(path) — file-based entry point ───────────────────
+
+// Post-fold #1: pin the file-based entry's ENOENT path.
+// `readImports(path)` opens an ifstream; a nonexistent path produces
+// `FileOpenFailed`. Without this test, a regression that drops the
+// `if (!in)` guard would silently fall through to FileEmpty.
+TEST(BinaryReaderFile, NonExistentPathReturnsFileOpenFailed) {
+    DiagnosticReporter rep;
+    auto r = readImports(
+        std::filesystem::path{"/this/path/does/not/exist/libnope.so"},
+        rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::FileOpenFailed);
+    // Verify it ALSO emitted F_FileOpenFailed through the reporter
+    // (post-fold #1 wired the kind→F_* mapping).
+    bool sawF = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_FileOpenFailed) sawF = true;
+    }
+    EXPECT_TRUE(sawF);
+}
+
+// Post-fold #1: pin that every failure path emits through the
+// reporter (not just returns the BinaryReadError). The CLI's
+// --suppress=<code> policy needs the diagnostic to actually reach
+// the reporter to fire.
+TEST(BinaryReaderFile, EmptyBytesEmitsFFileEmptyThroughReporter) {
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes({}, "empty.so", rep);
+    ASSERT_FALSE(r.has_value());
+    bool sawF = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_FileEmpty) sawF = true;
+    }
+    EXPECT_TRUE(sawF);
 }
 
 // ── Diagnostic-name round-trip ───────────────────────────────────
