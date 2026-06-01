@@ -10,6 +10,7 @@
 #include "hir/hir_attrs.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 
+#include <array>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -17,49 +18,68 @@
 
 namespace dss::ffi {
 
-std::string_view
-headerReadErrorKindName(HeaderReadErrorKind k) noexcept {
-    switch (k) {
-        case HeaderReadErrorKind::FileOpenFailed:               return "FileOpenFailed";
-        case HeaderReadErrorKind::HeaderParseFailed:            return "HeaderParseFailed";
-        case HeaderReadErrorKind::HeaderHasFunctionBody:        return "HeaderHasFunctionBody";
-        case HeaderReadErrorKind::HeaderHasNonExternDecl:       return "HeaderHasNonExternDecl";
-        case HeaderReadErrorKind::EmptyImportLibrary:           return "EmptyImportLibrary";
-        case HeaderReadErrorKind::GrammarLoadFailed:            return "GrammarLoadFailed";
-        case HeaderReadErrorKind::HeaderHasUnsupportedTopLevel: return "HeaderHasUnsupportedTopLevel";
-        case HeaderReadErrorKind::InternalInvariant:            return "InternalInvariant";
-    }
-    return "Unknown";
-}
-
 namespace {
+
+// Closed-table mapping `HeaderReadErrorKind` → name + F_* code,
+// mirroring `kTargetArchMachineCodes` / `kRelocFormulaTable` from
+// elsewhere in the codebase (post-FF2-#2 simplifier #2 fold).
+// Replaces two parallel exhaustive switches over the same enum —
+// add a new row and both `headerReadErrorKindName` +
+// `toDiagnosticCode` pick it up; the static_assert below pins
+// length so a forgotten row is a compile error.
+struct HeaderReadErrorRow {
+    HeaderReadErrorKind kind;
+    std::string_view    name;
+    DiagnosticCode      code;
+};
+
+constexpr std::array<HeaderReadErrorRow, 9> kHeaderReadErrorTable{{
+    { HeaderReadErrorKind::FileOpenFailed,               "FileOpenFailed",               DiagnosticCode::F_FileOpenFailed               },
+    { HeaderReadErrorKind::HeaderParseFailed,            "HeaderParseFailed",            DiagnosticCode::F_HeaderParseFailed            },
+    { HeaderReadErrorKind::HeaderHasFunctionBody,        "HeaderHasFunctionBody",        DiagnosticCode::F_HeaderHasFunctionBody        },
+    { HeaderReadErrorKind::HeaderHasNonExternDecl,       "HeaderHasNonExternDecl",       DiagnosticCode::F_HeaderHasNonExternDecl       },
+    { HeaderReadErrorKind::EmptyImportLibrary,           "EmptyImportLibrary",           DiagnosticCode::F_HeaderEmptyImportLibrary     },
+    { HeaderReadErrorKind::GrammarLoadFailed,            "GrammarLoadFailed",            DiagnosticCode::F_HeaderGrammarLoadFailed      },
+    { HeaderReadErrorKind::HeaderHasUnsupportedTopLevel, "HeaderHasUnsupportedTopLevel", DiagnosticCode::F_HeaderHasUnsupportedTopLevel },
+    { HeaderReadErrorKind::InternalInvariant,            "InternalInvariant",            DiagnosticCode::F_HeaderInternalInvariant      },
+    { HeaderReadErrorKind::InvalidShippedPath,           "InvalidShippedPath",           DiagnosticCode::F_HeaderInvalidShippedPath     },
+}};
+
+static_assert(static_cast<std::uint8_t>(HeaderReadErrorKind::InvalidShippedPath) + 1u
+                  == kHeaderReadErrorTable.size(),
+              "kHeaderReadErrorTable must hold one row per HeaderReadErrorKind "
+              "variant — add a row when adding a variant.");
+
+consteval bool kHeaderReadErrorTableRowsAlignWithKind() {
+    for (std::size_t i = 0; i < kHeaderReadErrorTable.size(); ++i) {
+        if (static_cast<std::size_t>(kHeaderReadErrorTable[i].kind) != i) return false;
+    }
+    return true;
+}
+static_assert(kHeaderReadErrorTableRowsAlignWithKind(),
+              "kHeaderReadErrorTable row order must match the "
+              "HeaderReadErrorKind underlying values — a paste-error "
+              "row in the wrong slot would otherwise silently map "
+              "the wrong code to the wrong kind.");
 
 [[nodiscard]] constexpr DiagnosticCode
 toDiagnosticCode(HeaderReadErrorKind k) noexcept {
-    switch (k) {
-        case HeaderReadErrorKind::FileOpenFailed:
-            return DiagnosticCode::F_FileOpenFailed;
-        case HeaderReadErrorKind::HeaderParseFailed:
-            return DiagnosticCode::F_HeaderParseFailed;
-        case HeaderReadErrorKind::HeaderHasFunctionBody:
-            return DiagnosticCode::F_HeaderHasFunctionBody;
-        case HeaderReadErrorKind::HeaderHasNonExternDecl:
-            return DiagnosticCode::F_HeaderHasNonExternDecl;
-        case HeaderReadErrorKind::EmptyImportLibrary:
-            return DiagnosticCode::F_HeaderEmptyImportLibrary;
-        case HeaderReadErrorKind::GrammarLoadFailed:
-            return DiagnosticCode::F_HeaderGrammarLoadFailed;
-        case HeaderReadErrorKind::HeaderHasUnsupportedTopLevel:
-            return DiagnosticCode::F_HeaderHasUnsupportedTopLevel;
-        case HeaderReadErrorKind::InternalInvariant:
-            return DiagnosticCode::F_HeaderInternalInvariant;
-    }
-    return DiagnosticCode::F_HeaderInternalInvariant;
+    return kHeaderReadErrorTable[static_cast<std::size_t>(k)].code;
 }
 
-static_assert(static_cast<std::uint8_t>(HeaderReadErrorKind::InternalInvariant) == 7u,
-              "HeaderReadErrorKind grew without updating "
-              "toDiagnosticCode — add a switch arm for the new variant.");
+// Compose a self-sufficient FF2 wrap message that includes the
+// first underlying ConfigDiagnostic's prose. Without this, an
+// operator with `--suppress=C_*` set sees only the FF2 wrap with
+// the trailing "see preceding C_* diagnostics" pointer to nothing
+// (silent-failure C2 post-FF2-#2 fold).
+[[nodiscard]] std::string
+firstConfigCauseInline(std::span<ConfigDiagnostic const> diags) {
+    for (auto const& cd : diags) {
+        if (!cd.message.empty()) return cd.message;
+        if (!cd.path.empty())    return std::string{"at "} + cd.path;
+    }
+    return {};
+}
 
 // Emit + return helper, optionally stamping a source location.
 [[nodiscard]] HeaderReadError
@@ -89,15 +109,19 @@ slurpFile(std::filesystem::path const& path, DiagnosticReporter& reporter) {
     }
     std::ostringstream ss;
     ss << in.rdbuf();
-    // post-FF2 silent-failure C2 fix: mid-read I/O failure after a
-    // successful open leaves the partial prefix in `ss` and looks
-    // like a successful (but truncated) read. The c-subset parser
-    // would then either silently accept the prefix or emit a
-    // misleading parse error. Surface as FileOpenFailed loud.
-    if (in.bad()) {
+    // Silent-failure C2 (mid-read I/O truncation) + C3 (output-side
+    // OOM): a successful `is_open()` followed by `rdbuf` drain that
+    // hits either an input badbit (disk/network I/O error) OR an
+    // output badbit (allocation failure mid-stream) leaves a partial
+    // prefix in `ss`. Without checking BOTH, the parser would either
+    // silently accept truncated input or emit a misleading parse
+    // error. (post-FF2-#2 silent-failure CRITICAL fold.)
+    if (in.bad() || ss.bad()) {
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::FileOpenFailed,
-            "FFI header file read I/O error after open: " + path.generic_string(),
+            std::string{"FFI header file I/O error after open: "}
+                + path.generic_string()
+                + (ss.bad() ? " (output buffer allocation failure)" : ""),
             reporter));
     }
     return ss.str();
@@ -105,16 +129,18 @@ slurpFile(std::filesystem::path const& path, DiagnosticReporter& reporter) {
 
 } // namespace
 
+std::string_view
+headerReadErrorKindName(HeaderReadErrorKind k) noexcept {
+    auto const idx = static_cast<std::size_t>(k);
+    if (idx >= kHeaderReadErrorTable.size()) return "Unknown";
+    return kHeaderReadErrorTable[idx].name;
+}
+
 std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeaderFromText(std::string_view    text,
                     std::string_view    headerPathLabel,
                     std::string_view    importLibrary,
                     DiagnosticReporter& reporter) {
-    // Caller-API gate: empty importLibrary would produce unlinkable
-    // rows downstream — silent-failure surface unless rejected here.
-    // Distinct kind + code (EmptyImportLibrary / F_HeaderEmptyImportLibrary)
-    // from parse failures so `--suppress` on parse-noise doesn't
-    // also hide caller-API misuse.
     if (importLibrary.empty()) {
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::EmptyImportLibrary,
@@ -126,14 +152,17 @@ readCHeaderFromText(std::string_view    text,
 
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) {
-        // Forward the underlying C_* diagnostics so an operator sees
-        // the actual config bug (bad JSON, missing field, etc.) not
-        // only the FF2 wrap (silent-failure-hunter C1 fold).
+        // Forward C_* diagnostics so they reach the reporter (subject
+        // to user `--suppress` policy). Inline the first cause into
+        // the FF2 wrap so the verdict is self-sufficient even when
+        // C_* codes are suppressed (silent-failure C2 fold).
+        std::string const cause = firstConfigCauseInline(loaded.error());
         forwardConfigDiagnostics(loaded.error(), reporter);
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::GrammarLoadFailed,
-            "FFI header reader could not load shipped c-subset grammar "
-            "(see preceding C_* diagnostics).",
+            std::string{"FFI header reader could not load shipped c-subset "
+                        "grammar"} + (cause.empty() ? "" : ": " + cause)
+                + ".",
             reporter));
     }
 
@@ -142,10 +171,6 @@ readCHeaderFromText(std::string_view    text,
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     SemanticModel model = analyze(cu);
 
-    // Drain the accumulated CU diagnostics (tokenize → parse →
-    // semantic) into the caller's reporter so original P_*/L_*/S_*
-    // codes surface — the FF2-layer F_* wraps the verdict, not the
-    // underlying cause.
     for (auto const& d : model.diagnostics().all()) {
         reporter.report(d);
     }
@@ -158,6 +183,17 @@ readCHeaderFromText(std::string_view    text,
     }
 
     auto loweringResult = lowerToHir(model, reporter);
+    if (loweringResult == nullptr) {
+        // Defense-in-depth: `lowerToHir` is documented to return a
+        // non-null unique_ptr today, but a future contract change to
+        // signal catastrophic failure via nullptr would UB through
+        // the `->ok` deref below. (silent-failure H1 fold.)
+        return std::unexpected(emitAndReturn(
+            HeaderReadErrorKind::InternalInvariant,
+            std::string{"internal: lowerToHir returned nullptr for header '"}
+                + std::string{headerPathLabel} + "' — file a bug report.",
+            reporter));
+    }
     if (!loweringResult->ok) {
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::HeaderParseFailed,
@@ -204,8 +240,6 @@ readCHeaderFromText(std::string_view    text,
                                     : SymbolKind::Object;
                 row.visibility  = SymbolVisibility::Default;
                 row.linkage     = SymbolLinkage::External;
-                // cSignature left nullopt — FF3 (ABI catalog) attaches
-                // the resolved FnSig via the HIR side-table.
                 rows.push_back(std::move(row));
                 break;
             }
@@ -239,10 +273,6 @@ readCHeaderFromText(std::string_view    text,
                           "follow-up to extend the c-subset import resolver.",
                     reporter, &loc));
             case HirKind::Error:
-                // Lowering's recovery sentinel. ok=true guard above
-                // means the lowering didn't increment errorCount, but
-                // a stray Error node here is still an invariant
-                // violation worth surfacing distinctly.
                 return std::unexpected(emitAndReturn(
                     HeaderReadErrorKind::InternalInvariant,
                     std::string{"internal: lowering produced an Error "
@@ -251,16 +281,19 @@ readCHeaderFromText(std::string_view    text,
                         + "' despite ok=true — file a bug report.",
                     reporter, &loc));
             default:
-                // Any other HirKind at module scope (`Module`,
-                // statements, expressions, `Unreachable`, `Extension`,
-                // future kinds) is structurally unexpected. Fail loud
-                // with the distinct unsupported-top-level code so
-                // future grammar evolution can't silently slip past.
+                // Future HirKinds + any module-scope shape FF2 doesn't
+                // expect (Module, Block, statements, expressions,
+                // Unreachable, Extension). The numeric kind value is
+                // surfaced so a future regression report names exactly
+                // what landed (silent-failure H5 post-FF2-#2 fold).
                 return std::unexpected(emitAndReturn(
                     HeaderReadErrorKind::HeaderHasUnsupportedTopLevel,
                     std::string{"header '"} + std::string{headerPathLabel}
                         + "' contains an unsupported top-level "
-                          "declaration shape.",
+                          "declaration shape (HirKind="
+                        + std::to_string(static_cast<unsigned>(kind))
+                        + ") — extend FF2's kind-switch or remove the "
+                          "construct from the curated header.",
                     reporter, &loc));
         }
     }
@@ -283,11 +316,27 @@ readCHeaderShipped(std::string_view    headerRelPath,
                    DiagnosticReporter& reporter) {
     auto located = findShippedFfiHeader(headerRelPath);
     if (!located) {
+        // Split outcomes: invalid relative path (caller-API bug) vs.
+        // valid path but no file found (deploy/install bug). Inspect
+        // the first ConfigDiagnostic's code to route. Inline the
+        // cause text so the wrap is self-sufficient under
+        // `--suppress=C_*` (silent-failure C2 + H2 folds).
+        bool const isPathInvalid =
+            !located.error().empty()
+            && located.error().front().code
+                   == DiagnosticCode::C_InvalidShippedFfiHeaderPath;
+        std::string const cause = firstConfigCauseInline(located.error());
         forwardConfigDiagnostics(located.error(), reporter);
+        HeaderReadErrorKind const kind = isPathInvalid
+            ? HeaderReadErrorKind::InvalidShippedPath
+            : HeaderReadErrorKind::FileOpenFailed;
         return std::unexpected(emitAndReturn(
-            HeaderReadErrorKind::FileOpenFailed,
-            std::string{"shipped FFI header not found: "}
-                + std::string{headerRelPath},
+            kind,
+            (isPathInvalid
+                ? std::string{"invalid shipped FFI header path '"}
+                : std::string{"shipped FFI header not found: '"})
+                + std::string{headerRelPath} + "'"
+                + (cause.empty() ? "" : " (" + cause + ")"),
             reporter));
     }
     return readCHeader(*located, importLibrary, reporter);

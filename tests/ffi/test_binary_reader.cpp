@@ -543,20 +543,8 @@ TEST(BinaryReaderReporter, CorruptedBinaryAlsoEmitsFCodeThroughReporter) {
     EXPECT_TRUE(sawF);
 }
 
-// pr-test-analyzer Gap 3 (priority 8): cSignature optional contract.
-// FF1 ELF readers must produce nullopt — distinct from "empty parens"
-// (invalid C). A regression that sets `cSignature = std::string{}`
-// would silently flip the FF1 vs FF2 semantic.
-TEST(BinaryReaderElf, Ff1ProducedRowsHaveNoCSignature) {
-    std::vector<std::string> names = {"printf"};
-    std::vector<Sym> syms;
-    syms.push_back({0, info(1, 2), 0, 1, 0x1000, 16});
-    auto const bytes = buildMinimalElf64(syms, names);
-    DiagnosticReporter rep;
-    auto const r = readImportsFromBytes(bytes, "lib.so", rep);
-    ASSERT_TRUE(r.has_value());
-    ASSERT_EQ(r->size(), 1u);
-    EXPECT_FALSE((*r)[0].cSignature.has_value())
-        << "FF1 binary readers must leave cSignature nullopt; "
-           "FF2 (C header parser) is the populator.";
-}
+// (Former `Ff1ProducedRowsHaveNoCSignature` test removed at FF2
+// post-#2 type-design fold: `cSignature` field dropped from
+// `ImportSurface` since no producer or consumer needed it.
+// Anchored D-FF2-1: re-add `optional<FnSigTypeId>` only if FF3 needs
+// to attach the resolved sig to the row instead of the HIR node.)

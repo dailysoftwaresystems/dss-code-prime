@@ -3,7 +3,6 @@
 #include "core/export.hpp"
 
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -70,27 +69,18 @@ enum class SymbolLinkage : std::uint8_t {
 };
 
 // One row in the import surface — describes a single symbol the
-// dynamic library exports.
+// dynamic library exports. FF3 (ABI catalog) will resolve typed
+// signatures off the HIR side-table — not via a field on this row —
+// so no `cSignature` slot lives here (D-FF2-1: dropped post-FF2-#2
+// type-design fold; re-add as `optional<FnSigTypeId>` ONLY if FF3
+// surfaces a concrete need to attach the resolved sig to the row
+// itself instead of the HIR node).
 struct DSS_EXPORT ImportSurface {
     std::string      mangledName;   // on-binary symbol name (verbatim)
     std::string      libraryPath;   // owning binary's path/soname
     SymbolKind       kind       = SymbolKind::NoType;
     SymbolVisibility visibility = SymbolVisibility::Default;
     SymbolLinkage    linkage    = SymbolLinkage::External;
-    // Reserved field — currently UNUSED by FF1/FF2 (both leave
-    // nullopt). FF2's c-subset reuse already produces a structured
-    // FnSig TypeId via the HIR side-table; the row carries that
-    // structured shape through the HIR, not a duplicate free-form
-    // string here. FF3 (ABI catalog) consumes the FnSig TypeId
-    // directly off the HIR — no string parsing layer.
-    //
-    // The field remains in the shape for forward compatibility:
-    // an FF3 cycle that needs to expose a textual signature in
-    // tooling output (e.g. a `--dump-imports` driver flag) can
-    // populate it then. Anchored as D-FF2-1 (deferred type
-    // reshape — possibly drop the field, or promote to
-    // `optional<FnSigTypeId>` at FF3 cycle close).
-    std::optional<std::string> cSignature;
 };
 
 } // namespace dss::ffi

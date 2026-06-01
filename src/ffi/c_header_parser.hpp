@@ -23,17 +23,21 @@
 namespace dss::ffi {
 
 // Closed-set FF2 failure modes — distinct remediations → distinct
-// kinds (post-FF2 type-design + silent-failure-hunter audit split).
-// 1:1 with `F_Header*` diagnostic codes via `toDiagnosticCode`.
+// kinds. 1:1 with `F_Header*` diagnostic codes via the
+// `kHeaderReadErrorTable` (c_header_parser.cpp). Variants are
+// EXPLICITLY numbered so a maintainer cannot accidentally insert a
+// new variant in the middle without renumbering — keeps the table
+// row-aligned.
 enum class HeaderReadErrorKind : std::uint8_t {
-    FileOpenFailed              = 0,  // path doesn't exist / permission / I/O
-    HeaderParseFailed           = 1,  // c-subset frontend (tokenize/parse/semantic/lower) errors
-    HeaderHasFunctionBody       = 2,  // a non-extern function DEFINITION at top level
-    HeaderHasNonExternDecl      = 3,  // a non-extern non-typedef global definition
-    EmptyImportLibrary          = 4,  // caller passed empty importLibrary — caller-API bug
-    GrammarLoadFailed           = 5,  // shipped c-subset grammar JSON could not load
-    HeaderHasUnsupportedTopLevel = 6, // ImportGroup (#include), future HirKind, etc.
-    InternalInvariant           = 7,  // compiler-bug surface — file a bug
+    FileOpenFailed               = 0,  // path doesn't exist / permission / I/O
+    HeaderParseFailed            = 1,  // c-subset frontend (tokenize/parse/semantic/lower) errors
+    HeaderHasFunctionBody        = 2,  // a non-extern function DEFINITION at top level
+    HeaderHasNonExternDecl       = 3,  // a non-extern non-typedef global definition
+    EmptyImportLibrary           = 4,  // caller passed empty importLibrary — caller-API bug
+    GrammarLoadFailed            = 5,  // shipped c-subset grammar JSON could not load
+    HeaderHasUnsupportedTopLevel = 6,  // ImportGroup (#include), future HirKind, etc.
+    InternalInvariant            = 7,  // compiler-bug surface — file a bug
+    InvalidShippedPath           = 8,  // readCHeaderShipped relative-path validation reject
 };
 
 struct DSS_EXPORT HeaderReadError {
@@ -44,8 +48,8 @@ struct DSS_EXPORT HeaderReadError {
 [[nodiscard]] DSS_EXPORT std::string_view
     headerReadErrorKindName(HeaderReadErrorKind k) noexcept;
 
-// Read a pre-reduced C header from disk and return its import surface.
-// `importLibrary` names the owning library (`"libc.so.6"`,
+// Read a pre-reduced C header from disk and return its import
+// surface. `importLibrary` names the owning library (`"libc.so.6"`,
 // `"msvcrt.dll"`, `"libSystem.B.dylib"`) — headers carry declarations
 // but not the runtime library identity, so the caller must supply it
 // (matches plan 11 §2.3). Empty `importLibrary` is rejected at the
@@ -54,7 +58,9 @@ struct DSS_EXPORT HeaderReadError {
 //
 // Diagnostics from the c-subset frontend pipe through `reporter`
 // (P_*/L_*/S_*/H_*) AND the FF2-layer F_* verdict; `--suppress` /
-// `--warnings-as-errors` apply.
+// `--warnings-as-errors` apply. Underlying causes that were
+// suppressed by user policy are inlined into the wrap message so
+// the FF2 verdict stays self-sufficient.
 //
 // Lifetime: `importLibrary` / `text` / `headerPathLabel` are not
 // retained past return — the function copies what it needs into
@@ -76,9 +82,13 @@ readCHeaderFromText(std::string_view    text,
 
 // Convenience: resolve `headerRelPath` (e.g. `"libc/stdio.h"`) under
 // the shipped `src/dss-config/ffi-headers/` tree via the standard
-// `findShippedConfig` cwd-walk-up, then dispatch to `readCHeader`.
-// Returns a `FileOpenFailed` error if the shipped header can't be
-// located. The walk-up is bounded; details in `config_path_walk.hpp`.
+// `findShippedFfiHeader` cwd-walk-up, then dispatch to `readCHeader`.
+//
+// Returns `InvalidShippedPath` if `headerRelPath` is empty, absolute
+// (leading `/`/`\`, drive letter), starts with `.`, or contains a
+// `..` path component (rejected per-component, not via substring
+// match). Returns `FileOpenFailed` if the path validates but no
+// shipped file matches in the cwd ancestry.
 [[nodiscard]] DSS_EXPORT
 std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeaderShipped(std::string_view    headerRelPath,

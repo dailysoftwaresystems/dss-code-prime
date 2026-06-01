@@ -84,15 +84,6 @@ void emitDriver(DiagnosticReporter& rep,
     dss::report(rep, code, DiagnosticSeverity::Error, std::move(msg));
 }
 
-// `copyDiagnostics` is declared in `compile_pipeline.hpp` (hoisted at
-// post-fold review #1 to dedupe with the semantic-tier drain).
-// program.cpp uses it for CU + per-Tree reporter drains.
-
-// `forwardConfigDiagnostics` was hoisted to `grammar_schema.hpp` at
-// the FF2 post-fold audit (silent-failure C1) once a second consumer
-// (ffi/c_header_parser.cpp) arrived. The inline body lives alongside
-// `ConfigDiagnostic` itself — its natural canonical home.
-
 // Stamp `[target=<spec>]` context into every error message emitted
 // inside the per-target loop. Caller passes a fresh reporter to
 // `compileOneTarget`; this helper consolidates that scratch

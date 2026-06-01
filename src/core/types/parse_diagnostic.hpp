@@ -151,6 +151,14 @@ enum class DiagnosticCode : std::uint16_t {
     // construction — the schema loader in `core` cannot see the `hir`-layer
     // enums — and reported as H_UnsupportedLoweringForKind.)
     C_InvalidHirLowering          = 0xC033,
+    // C_InvalidShippedFfiHeaderPath: `findShippedFfiHeader` was called
+    // with a relative path that is empty / absolute / starts with `.`
+    // / contains a `..` component. Distinct from C_InvalidLanguageName
+    // because the remediation prose is path-shaped, not name-shaped:
+    // the caller passes something like `"libc/stdio.h"`, NOT a logical
+    // language identifier. Post-FF2-#2 fold (silent-failure HIGH-2 +
+    // code-reviewer HIGH).
+    C_InvalidShippedFfiHeaderPath = 0xC034,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
@@ -618,7 +626,7 @@ enum class DiagnosticCode : std::uint16_t {
     K_ImageWriteCloseFailed        = 0x800A,
     K_ImageEmpty                   = 0x800B,
 
-    // ── F_* — FFI binary-reader / C-header-parser (plan 11 §2.6) ──
+    // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
     //   denied / I/O error during initial open. Distinct from
     //   D_FileNotFound (CLI input file) because the remediation is
@@ -678,18 +686,27 @@ enum class DiagnosticCode : std::uint16_t {
     //   investigate the underlying C_* diagnostics also reported.
     // F_HeaderHasUnsupportedTopLevel: a top-level HIR kind reached the
     //   header walker that is neither extern decl nor typedef and not
-    //   the function-body / non-extern-global case either (e.g. an
-    //   `ImportGroup` from `#include`, or a future HirKind addition).
-    //   Remediation: remove the construct from the curated header OR
-    //   extend FF2 to accept it.
+    //   the function-body / non-extern-global case either. Fires from
+    //   TWO arms: explicit `HirKind::ImportGroup` (#include) AND the
+    //   residual default arm covering Module / statements / expressions
+    //   / Unreachable / Extension / future HirKinds (with the
+    //   numeric kind embedded in the diagnostic detail). Remediation:
+    //   remove the construct from the curated header OR extend FF2 to
+    //   accept it.
+    // F_HeaderInvalidShippedPath: `readCHeaderShipped` was called with
+    //   a relative path that is empty / absolute / contains a `..`
+    //   component / starts with `.` — caller-API bug separate from
+    //   genuine "file not found in any ancestor dir" (F_FileOpenFailed).
+    //   Remediation: caller passes a valid relative path like
+    //   `"libc/stdio.h"`.
     // F_HeaderInternalInvariant: an internal-invariant violation
     //   reached the header walker — a compiler bug, not a user-fixable
     //   issue. Remediation: file a bug.
-    // F_HeaderHasExternInitializer: an `extern` declaration carries an
-    //   initializer (`extern int x = 5;`) — silently dropping the
-    //   initializer would be a definition-vs-declaration semantic
-    //   mismatch. Remediation: drop the `extern` (it's a definition)
-    //   or drop the initializer (it's a declaration).
+    // (Note: D-FF2-3 anchors a future `F_HeaderHasExternInitializer`
+    // code for `extern int x = 5;` rejection. Code is NOT pre-reserved
+    // — it lands paired with the matching HeaderReadErrorKind variant
+    // when D-FF2-3 closes, per the codebase rule "don't pre-build
+    // unused slots". Post-FF2-#2 type-design fold.)
     F_HeaderParseFailed            = 0x5008,
     F_HeaderHasFunctionBody        = 0x5009,
     F_HeaderHasNonExternDecl       = 0x500A,
@@ -697,7 +714,7 @@ enum class DiagnosticCode : std::uint16_t {
     F_HeaderGrammarLoadFailed      = 0x500C,
     F_HeaderHasUnsupportedTopLevel = 0x500D,
     F_HeaderInternalInvariant      = 0x500E,
-    F_HeaderHasExternInitializer   = 0x500F,
+    F_HeaderInvalidShippedPath     = 0x500F,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

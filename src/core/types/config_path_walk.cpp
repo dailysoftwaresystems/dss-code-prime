@@ -52,32 +52,53 @@ findShippedConfig(ShippedConfigLocator const& loc) {
 
 LoadResult<std::filesystem::path>
 findShippedFfiHeader(std::string_view headerRelPath) {
-    // Reject empty + path-traversal. Forward-slash + dots are allowed
-    // here because callers pass `"libc/stdio.h"` etc.
-    if (headerRelPath.empty()
-        || headerRelPath.front() == '/'
-        || headerRelPath.front() == '\\'
-        || headerRelPath.front() == '.') {
+    namespace fs = std::filesystem;
+
+    // Reject empty + leading-`.` (would hide a `.config` file) first.
+    if (headerRelPath.empty() || headerRelPath.front() == '.') {
         return std::unexpected(std::vector<ConfigDiagnostic>{
-            {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
+            {DiagnosticCode::C_InvalidShippedFfiHeaderPath,
+             DiagnosticSeverity::Error,
              std::string{headerRelPath},
-             "invalid shipped-ffi-header relative path"}});
-    }
-    if (headerRelPath.find("..") != std::string_view::npos) {
-        return std::unexpected(std::vector<ConfigDiagnostic>{
-            {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
-             std::string{headerRelPath},
-             "shipped-ffi-header path must not contain '..'"}});
+             "shipped-ffi-header path must be non-empty and not start with '.'"}});
     }
 
-    namespace fs = std::filesystem;
-    const std::string leaf{headerRelPath};
+    // Use the platform-correct filesystem check rather than a leading-
+    // char check. Catches POSIX `/etc/passwd`, Windows `C:\...` (drive
+    // letter), `\\server\share` (UNC), forward-slash variants on
+    // Windows. The pre-fold check missed Windows absolute paths
+    // (silent-failure CRITICAL-1 post-FF2-#2 fold).
+    fs::path const relPath{headerRelPath};
+    if (relPath.is_absolute() || relPath.has_root_name()
+        || relPath.has_root_directory()) {
+        return std::unexpected(std::vector<ConfigDiagnostic>{
+            {DiagnosticCode::C_InvalidShippedFfiHeaderPath,
+             DiagnosticSeverity::Error,
+             std::string{headerRelPath},
+             "shipped-ffi-header path must be relative (no drive letter, "
+             "no leading '/' or '\\')"}});
+    }
+
+    // Per-component `..` traversal check. The previous `find("..")`
+    // substring search false-rejected names like `foo..bar` (no
+    // traversal intent) while also matching the real cases. Iterate
+    // components — each `..` is a parent-dir reference regardless of
+    // whether it appears as `../foo` or `foo/../bar`.
+    for (auto const& comp : relPath) {
+        if (comp == "..") {
+            return std::unexpected(std::vector<ConfigDiagnostic>{
+                {DiagnosticCode::C_InvalidShippedFfiHeaderPath,
+                 DiagnosticSeverity::Error,
+                 std::string{headerRelPath},
+                 "shipped-ffi-header path must not contain a '..' component"}});
+        }
+    }
 
     std::error_code ec;
     fs::path here = fs::current_path(ec);
     for (int i = 0; i < 8 && !here.empty(); ++i) {
         const fs::path candidate =
-            here / "src" / "dss-config" / "ffi-headers" / leaf;
+            here / "src" / "dss-config" / "ffi-headers" / relPath;
         if (fs::exists(candidate, ec)) {
             return candidate;
         }
@@ -86,8 +107,13 @@ findShippedFfiHeader(std::string_view headerRelPath) {
         here = parent;
     }
 
+    // Genuinely-not-found is a deploy/install bug, not a caller-API
+    // bug. Use a DIFFERENT C_* code so consumers can route
+    // `--suppress` independently. (Reuses C_MissingField which is
+    // the existing "config not where it should be" code; specific
+    // not-found code can split later if needed.)
     return std::unexpected(std::vector<ConfigDiagnostic>{
-        {DiagnosticCode::C_InvalidLanguageName, DiagnosticSeverity::Error,
+        {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
          std::string{headerRelPath},
          "no shipped FFI header found in src/dss-config/ffi-headers/"}});
 }

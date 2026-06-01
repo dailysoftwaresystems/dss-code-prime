@@ -43,7 +43,6 @@ TEST(FfiCHeaderParser, ExternFunctionLandsAsImportSurfaceRow) {
     EXPECT_EQ(rows[0].kind, SymbolKind::Function);
     EXPECT_EQ(rows[0].visibility, SymbolVisibility::Default);
     EXPECT_EQ(rows[0].linkage, SymbolLinkage::External);
-    EXPECT_FALSE(rows[0].cSignature.has_value());
 }
 
 TEST(FfiCHeaderParser, ExternGlobalLandsAsImportSurfaceRow) {
@@ -80,7 +79,6 @@ TEST(FfiCHeaderParser, MixedExternsLandInDeclarationOrder) {
     // the test, not slip past on the size+name check alone.
     for (auto const& row : rows) {
         EXPECT_EQ(row.libraryPath, "libc.so.6");
-        EXPECT_FALSE(row.cSignature.has_value());
         EXPECT_EQ(row.visibility, SymbolVisibility::Default);
         EXPECT_EQ(row.linkage, SymbolLinkage::External);
     }
@@ -248,9 +246,9 @@ TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderInternalInvariant) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderInternalInvariant),
               "F_HeaderInternalInvariant");
 }
-TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderHasExternInitializer) {
-    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderHasExternInitializer),
-              "F_HeaderHasExternInitializer");
+TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderInvalidShippedPath) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_HeaderInvalidShippedPath),
+              "F_HeaderInvalidShippedPath");
 }
 
 TEST(FfiCHeaderParser, HeaderReadErrorKindNameRoundTrip) {
@@ -270,6 +268,8 @@ TEST(FfiCHeaderParser, HeaderReadErrorKindNameRoundTrip) {
               "HeaderHasUnsupportedTopLevel");
     EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::InternalInvariant),
               "InternalInvariant");
+    EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::InvalidShippedPath),
+              "InvalidShippedPath");
 }
 
 // ── Shipped headers via readCHeaderShipped ───────────────────
@@ -318,8 +318,92 @@ TEST(FfiCHeaderParser, ShippedLibcStdlibRoundTrips) {
 }
 
 TEST(FfiCHeaderParser, ShippedHeaderPathTraversalRejected) {
+    // Post-FF2-#2 H2 fold: path-traversal is now a distinct kind
+    // (InvalidShippedPath) + code (F_HeaderInvalidShippedPath),
+    // separating caller-API bugs from file-not-found.
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderShipped("../etc/passwd", "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::FileOpenFailed);
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderInvalidShippedPath), 1u);
+}
+
+TEST(FfiCHeaderParser, ShippedHeaderEmptyPathRejected) {
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderShipped("", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
+}
+
+TEST(FfiCHeaderParser, ShippedHeaderLeadingSlashRejected) {
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderShipped("/etc/passwd", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
+}
+
+#if defined(_WIN32)
+TEST(FfiCHeaderParser, ShippedHeaderWindowsAbsoluteRejected) {
+    // CRITICAL-1 fold: Windows absolute paths (drive letter) must
+    // be rejected — the pre-fold leading-char check would have
+    // accepted `C:\Windows\...` and composed it as an absolute
+    // path via `fs::path::operator/`.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderShipped("C:/Windows/System32/drivers/etc/hosts",
+                                        "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
+}
+#endif
+
+TEST(FfiCHeaderParser, ShippedHeaderLeadingDotRejected) {
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderShipped(".config/secrets", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
+}
+
+TEST(FfiCHeaderParser, ShippedHeaderEmbeddedTraversalRejectedByComponent) {
+    // Per-component check: a `..` in the middle of the path is also
+    // rejected (the pre-fold substring check matched but so did
+    // `foo..bar`; this test pins the cleaner component check).
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderShipped("libc/../etc/passwd", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
+}
+
+TEST(FfiCHeaderParser, NonExternGlobalRejectionCarriesSourceSpan) {
+    // Post-FF2-#2 test-analyzer fold: every FF2-layer rejection
+    // carries a span — pin the Global arm explicitly, since the
+    // Function arm pin alone would miss a regression that drops
+    // the &loc pass-through on the Global arm specifically.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "int counter;\n",
+        "<test>", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    bool foundWithSpan = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_HeaderHasNonExternDecl) {
+            EXPECT_TRUE(d.buffer.valid());
+            EXPECT_GT(d.span.length(), 0u);
+            foundWithSpan = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(foundWithSpan);
+}
+
+TEST(FfiCHeaderParser, ShippedPathRejectionInlinesCauseInWrapMessage) {
+    // Post-FF2-#2 silent-failure C2 fold: the wrap diagnostic must
+    // include the underlying cause text so that even with
+    // `--suppress=C_*` the operator sees what went wrong.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderShipped("libc/../etc/passwd", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    // Cause was "shipped-ffi-header path must not contain a '..' component".
+    EXPECT_NE(rowsOrErr.error().detail.find("'..'"), std::string::npos)
+        << "wrap must inline the underlying ConfigDiagnostic cause; got: "
+        << rowsOrErr.error().detail;
 }

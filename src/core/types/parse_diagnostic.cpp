@@ -71,6 +71,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_InvalidSemantics:         return "C_InvalidSemantics";
         case DiagnosticCode::C_UnknownArtifactProfile:   return "C_UnknownArtifactProfile";
         case DiagnosticCode::C_InvalidHirLowering:       return "C_InvalidHirLowering";
+        case DiagnosticCode::C_InvalidShippedFfiHeaderPath: return "C_InvalidShippedFfiHeaderPath";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";
@@ -169,7 +170,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_HeaderGrammarLoadFailed:      return "F_HeaderGrammarLoadFailed";
         case DiagnosticCode::F_HeaderHasUnsupportedTopLevel: return "F_HeaderHasUnsupportedTopLevel";
         case DiagnosticCode::F_HeaderInternalInvariant:      return "F_HeaderInternalInvariant";
-        case DiagnosticCode::F_HeaderHasExternInitializer:   return "F_HeaderHasExternInitializer";
+        case DiagnosticCode::F_HeaderInvalidShippedPath:     return "F_HeaderInvalidShippedPath";
     }
     return "Unknown";
 }
