@@ -25,17 +25,12 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "program/program.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <cstdint>
 #include <filesystem>
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
 #include <fstream>
 #include <string>
 #include <vector>
@@ -44,68 +39,13 @@ namespace fs = std::filesystem;
 using namespace dss;
 
 namespace {
-
-// Per-test scratch directory.
-//
-// CRITICAL: the scratch dir must live INSIDE the repo tree (under
-// `<originalCwd>/test-scratch/...`), NOT under `temp_directory_path()`.
-// Schema loaders use `findShippedConfig` which walks UP from cwd
-// looking for `src/dss-config/<...>`. ctest invokes the binary from
-// the build directory (which is inside the repo tree), so walking
-// up from `<build>/test-scratch/...` finds `<repo>/src/dss-config`.
-// A scratch dir under `%TEMP%` would break that walk entirely.
-//
-// PID-seed remains so parallel `ctest -j` runs in different process
-// instances don't share scratch paths.
-class ScratchDir {
-public:
-    ScratchDir() {
-        static std::atomic<std::uint64_t> counter{0};
-#ifdef _WIN32
-        auto const pid = static_cast<std::uint64_t>(_getpid());
-#else
-        auto const pid = static_cast<std::uint64_t>(getpid());
-#endif
-        std::error_code ec;
-        originalCwd_ = fs::current_path(ec);
-        auto const base = originalCwd_ / "test-scratch" / "program";
-        fs::create_directories(base, ec);
-        path_ = base / (std::to_string(pid) + "-"
-                        + std::to_string(counter.fetch_add(1)));
-        fs::create_directories(path_, ec);
-    }
-    ~ScratchDir() {
-        std::error_code ec;
-        // Restore cwd before removing the scratch dir; some
-        // platforms refuse to remove a dir that's the current
-        // process cwd.
-        fs::current_path(originalCwd_, ec);
-        fs::remove_all(path_, ec);
-    }
-    [[nodiscard]] fs::path const& path() const noexcept { return path_; }
-
-    // Pin cwd to this scratch dir for the test body. Output paths
-    // computed by `compileFiles` (cwd-rooted) land under here.
-    // Safe because the scratch dir lives inside the repo tree —
-    // the schema-loader cwd-walk still reaches the repo root.
-    //
-    // Post-fold review #1 (silent-failure-hunter F17): ASSERT on
-    // ec rather than swallow. A failed cwd-change would silently
-    // misroute artifacts to `<originalCwd>/target/...` (i.e. the
-    // build directory), then the test's "output dir exists" check
-    // would fail with a confusing diagnostic instead of naming the
-    // actual root cause.
-    void useAsCwd() {
-        std::error_code ec;
-        fs::current_path(path_, ec);
-        ASSERT_FALSE(ec) << "useAsCwd: cwd change to '"
-                         << path_.generic_string()
-                         << "' failed: " << ec.message();
-    }
-private:
-    fs::path path_;
-    fs::path originalCwd_;
-};
+// ScratchDir hoisted to `tests/test_support/scratch_dir.hpp` at
+// D-LK10-6 closure (2026-06-01). Use `Location::InsideRepo` here
+// because compile_pipeline tests drive `compileFiles`, whose
+// schema loader walks UP from cwd to find `src/dss-config/`; a
+// temp-rooted scratch would break the walk.
+using dss::test_support::Location;
+using dss::test_support::ScratchDir;
 
 // Not nodiscard — some call sites only care about the side effect.
 fs::path writeCSubsetSource(fs::path const& dir,
@@ -145,7 +85,7 @@ fs::path writeCSubsetSource(fs::path const& dir,
 // pin (anchored D-LK10-2).
 
 TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSubsetSource(
         scratch.path(), "forty_two.c",
         "int forty_two() { return 42; }\n");
@@ -189,7 +129,7 @@ TEST(Program_CompileFiles, MultiTargetWiresDistinctArtifactDirs) {
     // distinct output directories. Independently of byte
     // production, the driver's per-target loop must create one
     // output dir per target.
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSubsetSource(
         scratch.path(), "small.c",
         "int small() { return 7; }\n");
@@ -216,7 +156,7 @@ TEST(Program_CompileFiles, EmptySourceListReturnsNonZero) {
 }
 
 TEST(Program_CompileFiles, EmptyTargetListReturnsNonZero) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSubsetSource(
         scratch.path(), "f.c", "int f() { return 0; }\n");
     Program prog;
@@ -226,7 +166,7 @@ TEST(Program_CompileFiles, EmptyTargetListReturnsNonZero) {
 }
 
 TEST(Program_CompileFiles, MalformedTargetSpecReturnsNonZero) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSubsetSource(
         scratch.path(), "f.c", "int f() { return 0; }\n");
     scratch.useAsCwd();
@@ -245,7 +185,7 @@ TEST(Program_CompileFiles, MalformedTargetSpecReturnsNonZero) {
 }
 
 TEST(Program_CompileFiles, UnknownLanguageReturnsNonZero) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSubsetSource(
         scratch.path(), "f.txt", "ignored\n");
     Program prog;
@@ -256,7 +196,7 @@ TEST(Program_CompileFiles, UnknownLanguageReturnsNonZero) {
 }
 
 TEST(Program_CompileFiles, UnknownTargetNameReturnsNonZero) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSubsetSource(
         scratch.path(), "f.c", "int f() { return 0; }\n");
     scratch.useAsCwd();
@@ -268,7 +208,7 @@ TEST(Program_CompileFiles, UnknownTargetNameReturnsNonZero) {
 }
 
 TEST(Program_CompileFiles, UnknownFormatNameReturnsNonZero) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSubsetSource(
         scratch.path(), "f.c", "int f() { return 0; }\n");
     scratch.useAsCwd();
@@ -286,7 +226,7 @@ TEST(Program_CompileFiles, NonExistentSourceFileReturnsNonZero) {
     // `D_FileNotFound` into the CU's driver-level reporter; that
     // diagnostic MUST reach the operator via the run-wide reporter
     // (code-reviewer F1 fold).
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     scratch.useAsCwd();
     Program prog;
     EXPECT_EQ(prog.compileFiles({"/no/such/ghost-source-file.c"},
@@ -340,7 +280,7 @@ TEST(Program_CompileDirectory, WiresThroughForMatchingFiles) {
     // pipeline. Same upstream gap as the zero-arg single-file
     // test — byte assertion is gated on plan 12 ML7 cycle 2 +
     // plan 13 AS cycle gaps (anchored D-LK10-2).
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     writeCSubsetSource(scratch.path(), "a.c",
                         "int aaa() { return 1; }\n");
     writeCSubsetSource(scratch.path(), "b.c",
@@ -366,7 +306,7 @@ TEST(Program_CompileDirectory, WiresThroughForMatchingFiles) {
 }
 
 TEST(Program_CompileDirectory, RejectsMissingDirectory) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     auto const ghost = scratch.path() / "does-not-exist";
     Program prog;
     EXPECT_EQ(prog.compileDirectory(ghost.generic_string(),
@@ -376,7 +316,7 @@ TEST(Program_CompileDirectory, RejectsMissingDirectory) {
 }
 
 TEST(Program_CompileDirectory, RejectsNoMatchingFiles) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::InsideRepo, "program"};
     // Directory exists but contains nothing matching c-subset.
     writeCSubsetSource(scratch.path(), "only.txt", "nothing\n");
     Program prog;

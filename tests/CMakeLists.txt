@@ -12,7 +12,11 @@ function(dss_add_test)
     string(REPLACE "/" "_" target "dss_${DSS_NAME}")
     add_executable(${target} ${DSS_SOURCES})
     target_link_libraries(${target} PRIVATE dss-code-prime-lib GTest::gtest GTest::gtest_main)
-    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(${target}
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/tests/test_support
+    )
 
     add_test(NAME ${DSS_NAME} COMMAND ${target})
 endfunction()

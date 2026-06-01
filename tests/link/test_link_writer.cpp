@@ -23,17 +23,12 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link/writer.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <cstdint>
 #include <filesystem>
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -41,44 +36,10 @@
 
 namespace fs = std::filesystem;
 using namespace dss;
+using dss::test_support::Location;
+using dss::test_support::ScratchDir;
 
 namespace {
-
-// Per-test scratch directory, removed on destruction. Atomic
-// monotonic counter ensures unique paths even when stack
-// addresses collide across sequential test runs (code-reviewer
-// post-fold concern: `reinterpret_cast<uintptr_t>(this)` reuses
-// reclaimed addresses).
-class ScratchDir {
-public:
-    ScratchDir() {
-        static std::atomic<std::uint64_t> counter{0};
-        // PID-seed the path so parallel `ctest -j` runs (which
-        // execute test binaries in separate processes against the
-        // same `temp_directory_path()`) don't share scratch paths
-        // and race on `remove_all` in dtors. (silent-failure LOW
-        // fold, LK10 cycle 1 post-fold #2 review.)
-#ifdef _WIN32
-        auto const pid = static_cast<std::uint64_t>(_getpid());
-#else
-        auto const pid = static_cast<std::uint64_t>(getpid());
-#endif
-        auto const base = fs::temp_directory_path()
-                          / "dss-link-writer-test";
-        std::error_code ec;
-        fs::create_directories(base, ec);
-        path_ = base / (std::to_string(pid) + "-"
-                        + std::to_string(counter.fetch_add(1)));
-        fs::create_directories(path_, ec);
-    }
-    ~ScratchDir() {
-        std::error_code ec;
-        fs::remove_all(path_, ec);
-    }
-    [[nodiscard]] fs::path const& path() const noexcept { return path_; }
-private:
-    fs::path path_;
-};
 
 // Hand-rolled LinkedImage that bypasses the full pipeline — used
 // to pin writeImage's preconditions and round-trip behavior
@@ -98,7 +59,7 @@ private:
 // ── Round-trip: bytes on disk == bytes in image ─────────────────────
 
 TEST(LinkWriter, WritesBytesVerbatim) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     auto const out = scratch.path() / "round-trip.bin";
 
     auto const image = makeImage({0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE});
@@ -118,7 +79,7 @@ TEST(LinkWriter, WritesAnyFormatBytesVerbatim) {
     // by construction (just dumps `image.bytes`). Pin this with
     // a PE-tagged LinkedImage to forestall any future drift that
     // sneaks a per-format branch into writer.cpp.
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     auto const out = scratch.path() / "pe.bin";
     LinkedImage image;
     image.format = ObjectFormatKind::Pe;
@@ -142,7 +103,7 @@ TEST(LinkWriter, OverwritesExistingFile) {
     // truncate mode contract: writeImage replaces the file's
     // bytes, never appends. Prior content of arbitrary length
     // must not bleed into the new write.
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     auto const out = scratch.path() / "overwritten.bin";
     {
         std::ofstream stale(out, std::ios::binary);
@@ -159,7 +120,7 @@ TEST(LinkWriter, OverwritesExistingFile) {
 // ── Precondition guards (fail-loud K_ImageNotOk) ─────────────
 
 TEST(LinkWriter, RejectsImageWithOkFalse) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     LinkedImage image;
     image.format = ObjectFormatKind::Elf;
     image.bytes  = {0x7F, 'E', 'L', 'F'};  // valid bytes...
@@ -182,7 +143,7 @@ TEST(LinkWriter, RejectsEmptyBytes) {
     // to K_ImageEmpty (0x800B) — type-design post-fold #2 split
     // from K_ImageNotOk to give walker-bug-vs-caller-bug
     // remediations distinct dispatchable codes.
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     LinkedImage image;
     image.format = ObjectFormatKind::Elf;
     image.expectedFuncCount = 1;
@@ -211,7 +172,7 @@ TEST(LinkWriter, RejectsParentComponentIsAFile) {
     // platform-specific; on Windows certain reserved names in
     // the parent trigger it. This test pins the K_* code dispatch
     // for the typical "parent is a file" case.
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     auto const fileAsParent = scratch.path() / "regular.txt";
     {
         std::ofstream f(fileAsParent);
@@ -236,7 +197,7 @@ TEST(LinkWriter, RejectsParentComponentIsAFile) {
 }
 
 TEST(LinkWriter, RejectsMissingParentDirectory) {
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     auto const nonexistent =
         scratch.path() / "does-not-exist" / "ghost.bin";
     auto const image = makeImage({0x42});
@@ -272,7 +233,7 @@ TEST(LinkWriter, RejectsPathIsADirectory) {
     // file inside it) is the most-common positive case for the
     // post-open failbit branch. Without this, the open() failure
     // arm has no real coverage.
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     auto const image = makeImage({0x01});
     DiagnosticReporter rep;
     EXPECT_FALSE(linker::writeImage(image, scratch.path(), rep));
@@ -318,7 +279,7 @@ TEST(LinkWriter, EndToEndAssembleLinkWriteToDisk) {
     ASSERT_TRUE(image.ok());
     ASSERT_FALSE(image.bytes.empty());
 
-    ScratchDir scratch;
+    ScratchDir scratch{Location::Temp, "link-writer"};
     auto const elfPath = scratch.path() / "f.o";
     ASSERT_TRUE(linker::writeImage(image, elfPath, rep));
     EXPECT_EQ(rep.errorCount(), 0u);
