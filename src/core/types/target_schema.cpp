@@ -26,11 +26,43 @@ std::string_view relocFormulaName(RelocFormulaKind k) noexcept {
 }
 
 std::optional<RelocFormulaKind> parseRelocFormulaKind(std::string_view s) noexcept {
-    if (s == "linear")                   return RelocFormulaKind::Linear;
-    if (s == "aarch64_call26")           return RelocFormulaKind::Aarch64Call26;
-    if (s == "aarch64_adr_prel_pg_hi21") return RelocFormulaKind::Aarch64AdrPrelPgHi21;
-    if (s == "aarch64_add_abs_lo12")     return RelocFormulaKind::Aarch64AddAbsLo12;
+    // ASCII-lowercase the input once so 'LINEAR'/'Linear'/'linear'
+    // all accept uniformly. CLI flags / config field strings are
+    // operator-typed; case-asymmetric accept is operator-hostile and
+    // silently rejects perfectly reasonable inputs. Mirrors the LK10
+    // cycle 3 post-fold #2 precedent for `--config=debug|release`.
+    // (silent-failure audit H1 post-fold #1.)
+    std::string lowered;
+    lowered.reserve(s.size());
+    for (char c : s) {
+        lowered.push_back(static_cast<char>(
+            (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c));
+    }
+    if (lowered == "linear")                   return RelocFormulaKind::Linear;
+    if (lowered == "aarch64_call26")           return RelocFormulaKind::Aarch64Call26;
+    if (lowered == "aarch64_adr_prel_pg_hi21") return RelocFormulaKind::Aarch64AdrPrelPgHi21;
+    if (lowered == "aarch64_add_abs_lo12")     return RelocFormulaKind::Aarch64AddAbsLo12;
     return std::nullopt;
+}
+
+// Comma-separated list of accepted `formula` discriminator strings —
+// generated from the enum table so adding a new variant doesn't
+// require editing error-message text in the JSON loader. (architect
+// Q2 post-fold #1 — was a hardcoded literal that silently lagged the
+// enum.)
+std::string acceptedRelocFormulaList() {
+    std::string out;
+    auto const append = [&](RelocFormulaKind k) {
+        if (!out.empty()) out += ", ";
+        out += "'";
+        out += relocFormulaName(k);
+        out += "'";
+    };
+    append(RelocFormulaKind::Linear);
+    append(RelocFormulaKind::Aarch64Call26);
+    append(RelocFormulaKind::Aarch64AdrPrelPgHi21);
+    append(RelocFormulaKind::Aarch64AddAbsLo12);
+    return out;
 }
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(

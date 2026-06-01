@@ -49,6 +49,27 @@ inline void appendI64LE(std::vector<std::uint8_t>& out, std::int64_t v) {
     appendU64LE(out, static_cast<std::uint64_t>(v));
 }
 
+// Positional (read/write-at-offset) helpers — patch sites need
+// in-place mutation, not append. Hoisted from `exec_reloc_apply.hpp`
+// at D-LK6-1 post-fold #1 (3-consumer trip: 3 ARM64 formula arms read
+// + OR + write the 32-bit instruction word, vs Linear's append-style
+// overwrite — but Linear can use these too when widthBytes==4).
+inline std::uint32_t
+readU32LEAt(std::vector<std::uint8_t> const& buf, std::size_t off) noexcept {
+    return  static_cast<std::uint32_t>(buf[off + 0])
+         | (static_cast<std::uint32_t>(buf[off + 1]) <<  8)
+         | (static_cast<std::uint32_t>(buf[off + 2]) << 16)
+         | (static_cast<std::uint32_t>(buf[off + 3]) << 24);
+}
+
+inline void
+writeU32LEAt(std::vector<std::uint8_t>& buf, std::size_t off, std::uint32_t v) noexcept {
+    buf[off + 0] = static_cast<std::uint8_t>(v        & 0xFFu);
+    buf[off + 1] = static_cast<std::uint8_t>((v >>  8) & 0xFFu);
+    buf[off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);
+    buf[off + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
+}
+
 // Round `v` up to the nearest multiple of `a` (a must be > 0; not
 // required to be a power of two — handled with the modulo-cycle
 // form to keep the contract simple). Hoisted from per-walker

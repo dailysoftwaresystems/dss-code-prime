@@ -312,19 +312,168 @@ TEST(Aarch64AddAbsLo12, EncodesImm12AtBits21To10) {
     EXPECT_EQ(readInst(p.text, 0), 0x91000000u | (0x678u << 10));
 }
 
-TEST(Aarch64AddAbsLo12, IgnoresHighBits) {
+TEST(Aarch64AddAbsLo12, IgnoresHighBitsOfPositiveSplusA) {
     auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
     ASSERT_NE(tgt, nullptr);
 
-    // Large symbol VA — only low 12 bits matter (the formula masks
-    // unsigned by construction; no range check).
+    // Large POSITIVE symbol VA — only low 12 bits matter (the formula
+    // masks unsigned by construction; no range check on positive
+    // inputs). post-fold #1: SA<0 now rejects (separate test), so
+    // this test pins the "ignore high bits, mask low 12" contract for
+    // valid positive inputs.
     auto p = applyOneReloc(tgt, 0x91000000u,
-                            /*symbolVa*/ 0xFFFFFFFF12345ABC,
+                            /*symbolVa*/ 0x7FFFFFFF12345ABC,
                             /*addend*/   0,
                             /*patchSectionVa*/ 0,
                             /*funcOffset*/ 0);
     ASSERT_TRUE(p.ok);
     EXPECT_EQ(readInst(p.text, 0), 0x91000000u | (0xABCu << 10));
+}
+
+// ── Post-fold #1: additional coverage ────────────────────────
+
+// pr-test-analyzer Rating 8: Call26 boundary tests
+TEST(Aarch64Call26, PatchesMaxPositiveInRange) {
+    auto tgt = loadOneRelocTarget("aarch64_call26");
+    ASSERT_NE(tgt, nullptr);
+    // signed-26-bit max = 0x01FFFFFF → delta = 0x01FFFFFF << 2 = 0x07FFFFFC.
+    auto p = applyOneReloc(tgt, 0x94000000u,
+                            /*symbolVa*/ 0x07FFFFFC,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0x94000000u | 0x01FFFFFFu);
+}
+
+TEST(Aarch64Call26, PatchesMinNegativeInRange) {
+    auto tgt = loadOneRelocTarget("aarch64_call26");
+    ASSERT_NE(tgt, nullptr);
+    // signed-26-bit min = -0x02000000 → delta = -0x02000000 << 2 = -0x08000000.
+    // patchSectionVa=0x10000000, funcOffset=0, target=0x08000000 →
+    // delta = -0x08000000 → shifted = -0x02000000 → encoded as 0x02000000 in 26-bit.
+    auto p = applyOneReloc(tgt, 0x94000000u,
+                            /*symbolVa*/ 0x08000000,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0x10000000,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0x94000000u | 0x02000000u);
+}
+
+// pr-test-analyzer Rating 8: AdrPrelPgHi21 boundary tests
+TEST(Aarch64AdrPrelPgHi21, MaxPositiveInRange) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_prel_pg_hi21");
+    ASSERT_NE(tgt, nullptr);
+    // signed-21-bit max = 0xFFFFF; symbolVa = 0xFFFFF << 12 + 0 (low) = 0xFFFFF000.
+    auto p = applyOneReloc(tgt, 0x90000000u,
+                            /*symbolVa*/ 0xFFFFF000u,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    std::uint32_t const v = 0xFFFFFu;
+    std::uint32_t const immlo = (v & 0x3u) << 29;
+    std::uint32_t const immhi = ((v >> 2) & 0x7FFFFu) << 5;
+    EXPECT_EQ(readInst(p.text, 0), 0x90000000u | immlo | immhi);
+}
+
+TEST(Aarch64AdrPrelPgHi21, MinNegativeInRange) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_prel_pg_hi21");
+    ASSERT_NE(tgt, nullptr);
+    // signed-21-bit min = -0x100000; patchSectionVa = 0x100000 << 12,
+    // symbolVa = 0 → (0>>12) - (0x100000000>>12) = 0 - 0x100000 = -0x100000.
+    auto p = applyOneReloc(tgt, 0x90000000u,
+                            /*symbolVa*/ 0,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ static_cast<std::uint64_t>(0x100000) << 12,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    // -0x100000 in 21-bit two's-complement = 0x100000 (bit 20 set, rest 0).
+    std::uint32_t const v = 0x100000u;
+    std::uint32_t const immlo = (v & 0x3u) << 29;
+    std::uint32_t const immhi = ((v >> 2) & 0x7FFFFu) << 5;
+    EXPECT_EQ(readInst(p.text, 0), 0x90000000u | immlo | immhi);
+}
+
+// pr-test-analyzer Rating 9: dirty-base reject for AdrPrelPgHi21 + AddAbsLo12
+TEST(Aarch64AdrPrelPgHi21, RejectsBaseInstWithDirtyImmlo) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_prel_pg_hi21");
+    ASSERT_NE(tgt, nullptr);
+    // ADRP opcode + bit set in immlo[30:29].
+    auto p = applyOneReloc(tgt, 0x90000000u | (1u << 29),
+                            /*symbolVa*/ 0x5000,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    EXPECT_FALSE(p.ok);
+}
+
+TEST(Aarch64AdrPrelPgHi21, RejectsBaseInstWithDirtyImmhi) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_prel_pg_hi21");
+    ASSERT_NE(tgt, nullptr);
+    // ADRP opcode + bit set in immhi[23:5].
+    auto p = applyOneReloc(tgt, 0x90000000u | (1u << 10),
+                            /*symbolVa*/ 0x5000,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    EXPECT_FALSE(p.ok);
+}
+
+TEST(Aarch64AddAbsLo12, RejectsBaseInstWithDirtyImm12) {
+    auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
+    ASSERT_NE(tgt, nullptr);
+    // ADD opcode + bit set in imm12[21:10].
+    auto p = applyOneReloc(tgt, 0x91000000u | (1u << 10),
+                            /*symbolVa*/ 0x678,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    EXPECT_FALSE(p.ok);
+}
+
+// architect Q6 post-fold #1: AddAbsLo12 with negative S+A rejects.
+TEST(Aarch64AddAbsLo12, RejectsNegativeSplusA) {
+    auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
+    ASSERT_NE(tgt, nullptr);
+    // symbolVa = 0, addend = -1 → SA = -1 → reject (would silently
+    // truncate to 0xFFF garbage).
+    auto p = applyOneReloc(tgt, 0x91000000u,
+                            /*symbolVa*/ 0,
+                            /*addend*/   -1,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    EXPECT_FALSE(p.ok);
+}
+
+// silent-failure H1 post-fold #1: parseRelocFormulaKind case-insensitive.
+TEST(RelocFormulaKind, ParseAcceptsAllCapsAndMixedCase) {
+    EXPECT_EQ(parseRelocFormulaKind("LINEAR"),                   RelocFormulaKind::Linear);
+    EXPECT_EQ(parseRelocFormulaKind("Linear"),                   RelocFormulaKind::Linear);
+    EXPECT_EQ(parseRelocFormulaKind("AARCH64_CALL26"),           RelocFormulaKind::Aarch64Call26);
+    EXPECT_EQ(parseRelocFormulaKind("Aarch64_Adr_Prel_Pg_Hi21"), RelocFormulaKind::Aarch64AdrPrelPgHi21);
+}
+
+// pr-test-analyzer Rating 7: shipped x86_64 Linear round-trip
+TEST(ShippedX86_64Target, LinearRoundTripsAllRows) {
+    auto r = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(r.has_value());
+    auto const& tgt = **r;
+    for (auto const& name : {"rel32", "abs64", "abs32"}) {
+        auto const* tri = tgt.relocationByName(name);
+        ASSERT_NE(tri, nullptr) << name;
+        EXPECT_EQ(tri->formulaKind, RelocFormulaKind::Linear) << name;
+    }
+}
+
+// architect Q2 post-fold #1: acceptedRelocFormulaList contains every variant.
+TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
+    auto const list = acceptedRelocFormulaList();
+    EXPECT_NE(list.find("'linear'"),                   std::string::npos);
+    EXPECT_NE(list.find("'aarch64_call26'"),           std::string::npos);
+    EXPECT_NE(list.find("'aarch64_adr_prel_pg_hi21'"), std::string::npos);
+    EXPECT_NE(list.find("'aarch64_add_abs_lo12'"),     std::string::npos);
 }
 
 // ── Shipped arm64.target.json loads cleanly ──────────────────

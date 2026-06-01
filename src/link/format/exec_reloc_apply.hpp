@@ -177,21 +177,11 @@ namespace dss::link::format {
                 std::int64_t const sMin = -sMax - 1;
                 return v >= sMin && v <= sMax;
             };
-            // Read the 32-bit instruction word at patchOff (used by
-            // non-Linear formulas that OR a bitfield into an existing
-            // instruction emitted by the assembler).
-            auto const readInst32 = [&]() -> std::uint32_t {
-                return  static_cast<std::uint32_t>(text[patchOff + 0])
-                     | (static_cast<std::uint32_t>(text[patchOff + 1]) <<  8)
-                     | (static_cast<std::uint32_t>(text[patchOff + 2]) << 16)
-                     | (static_cast<std::uint32_t>(text[patchOff + 3]) << 24);
-            };
-            auto const writeInst32 = [&](std::uint32_t inst) {
-                text[patchOff + 0] = static_cast<std::uint8_t>(inst        & 0xFF);
-                text[patchOff + 1] = static_cast<std::uint8_t>((inst >>  8) & 0xFF);
-                text[patchOff + 2] = static_cast<std::uint8_t>((inst >> 16) & 0xFF);
-                text[patchOff + 3] = static_cast<std::uint8_t>((inst >> 24) & 0xFF);
-            };
+            // Read / write the 32-bit instruction word at patchOff
+            // via `byte_emit.hpp` (post-fold #1 — hoisted to share
+            // with future positional patchers).
+            auto const readInst32  = [&] { return detail::readU32LEAt(text, patchOff); };
+            auto const writeInst32 = [&](std::uint32_t inst) { detail::writeU32LEAt(text, patchOff, inst); };
             // Reject non-Linear pre-OR contamination (the bitfield to
             // be written must be zero in the assembler-emitted base
             // instruction). Without this, an assembler that mistakenly
@@ -290,7 +280,24 @@ namespace dss::link::format {
                 }
                 case RelocFormulaKind::Aarch64AddAbsLo12: {
                     // value = (S+A) & 0xFFF; ADD imm12 at bits[21:10].
+                    // Reject negative `S+A`: ADD_ABS_LO12_NC is defined
+                    // only for non-negative absolute addresses (paired
+                    // with an ADRP that computes the page base). A
+                    // negative `S+A` would silently truncate via
+                    // unsigned cast and produce a garbage low-12.
+                    // (architect Q6 post-fold #1.)
                     std::int64_t const SA = static_cast<std::int64_t>(S) + A;
+                    if (SA < 0) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' got S+A=" + std::to_string(SA)
+                                 + " — ADD_ABS_LO12_NC requires a "
+                                   "non-negative absolute address (the "
+                                   "ADRP companion encodes the high bits; "
+                                   "a negative S+A would silently truncate "
+                                   "to garbage low-12).");
+                        return false;
+                    }
                     auto const v = static_cast<std::uint32_t>(SA) & 0xFFFu;
                     std::uint32_t const bits = v << 10;
                     std::uint32_t const mask = 0xFFFu << 10;

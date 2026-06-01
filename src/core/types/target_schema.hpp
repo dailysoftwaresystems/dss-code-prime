@@ -666,38 +666,38 @@ struct DSS_EXPORT TargetEncodingInfo {
 // row MUST carry a `kind != 0` (loader-enforced). Two rows with the
 // same `kind` are also rejected.
 //
-// The linker (LK6 cycle 1) computes the patch value as:
-//   value = S + A + (pcRelative ? -P : 0) + addendBias
-// and writes `widthBytes` of it (little-endian, two's complement)
-// into the section's bytes at `Relocation::offset`. S is the
-// resolved symbol's runtime VA; A is `Relocation::addend`; P is the
-// patch site's runtime VA (section.virtualAddress + Relocation::offset).
+// **Formula dispatch (D-LK6-1 closure — LK10 cycle 3 post-fold #2
+// sibling cycle, 2026-06-01):** every relocation row carries a
+// `formulaKind: RelocFormulaKind` closed-enum discriminator. The
+// linker (`applyExecRelocations` in `link/format/exec_reloc_apply.hpp`)
+// dispatches ONCE on this enum to compute the patch and write it. The
+// JSON-side `formula` key is **load-bearing** — it accepts exactly the
+// string set declared by `parseRelocFormulaKind`.
 //
-// This linear shape covers the v1 x86_64 relocations (rel32 / abs64
-// / abs32). Formulas that need a non-linear transform — ARM64
-// `call26` ((S+A-P) >> 2), `adr_prel_pg_hi21` (page-pair shift),
-// R_X86_64_TLS*, R_X86_64_GOTPCREL — leave the structured fields at
-// their `widthBytes=0` default; the walker fails loud
-// `K_RelocationKindMismatch` rather than silently mis-applying.
-// Closure of that gap is plan 14 §3.1 D-LK6-1 (closed-enum reshape
-// into `RelocFormulaLinear` / `RelocFormulaShifted` /
-// `RelocFormulaUnapplied`).
+//   * `Linear` covers x86_64 rel32 / abs32 / abs64 + ARM64 abs64:
+//       value = S + A + (pcRel ? -P : 0) + addendBias
+//       written `widthBytes` LE at the patch site. The structured
+//       triple (`pcRelative`, `addendBias`, `widthBytes`) parameterises
+//       the formula.
+//   * `Aarch64Call26` / `Aarch64AdrPrelPgHi21` / `Aarch64AddAbsLo12`
+//       encode bit-shift / bitfield-insert ARM64 formulas — see the
+//       per-variant comments on `RelocFormulaKind` below.
 //
-// JSON loader still ACCEPTS a `formula` text key (for human
-// documentation), but the value is discarded — the structured fields
-// below are the sole load-bearing input. Keeping `formula` as a C++
-// field invited desync between the human prose and the structured
-// triple (a typo in either side silently mis-applied at link time);
-// dropping it eliminates the desync vector entirely (type-design
-// O2.b + comment-analyzer #3 convergence, LK6 cycle 1 review).
-//
-// Coherence rules (enforced in `validate()`):
-//   (a) `widthBytes != 0` ⇒ `widthBytes ∈ {4, 8}` (JSON loader).
-//   (b) `pcRelative || addendBias != 0` ⇒ `widthBytes != 0`.
-//   (c) `addendBias != 0` ⇒ `pcRelative` (no absolute-with-bias).
-//   (d) `widthBytes != 0` ⇒ `|addendBias|` fits signed in widthBytes.
-//   (e) `formulaKind != Linear` ⇒ `widthBytes == 4`, `pcRelative == false`,
-//       `addendBias == 0` (the variant fully encodes the formula).
+// Coherence rules (enforced at JSON load + `validate()`):
+//   (a) `widthBytes != 0` ⇒ `widthBytes ∈ {4, 8}`.
+//   (b) Linear, `pcRelative || addendBias != 0` ⇒ `widthBytes != 0`.
+//   (c) Linear, `addendBias != 0` ⇒ `pcRelative` (no absolute-with-bias).
+//   (d) Linear, `widthBytes != 0` ⇒ `|addendBias|` fits signed in widthBytes.
+//   (e) `formulaKind != Linear` ⇒ `widthBytes == 4` (auto-defaulted by
+//       the JSON loader), `pcRelative == false`, `addendBias == 0`
+//       (the variant fully encodes the formula).
+// Rule (e) is what makes the wide-product struct safe: every non-Linear
+// row leaves the Linear sub-triple at default; the kernel ignores them.
+// A `std::variant<LinearReloc, Aarch64Call26, ...>` would make this
+// type-encoded but the three ARM64 variants are stateless tag types
+// (the bit layout lives in code, not on the row), so the variant
+// reshape gives little. Anchored D-LK6-17 — fold when RISC-V's first
+// reloc kind lands (next ISA likely to add a 5th formula class).
 
 // Closed-enum tagged variant — D-LK6-1 closure (plan 14 §3.1, 2026-06-01).
 // Each variant names a concrete relocation-formula class with a fixed
@@ -740,6 +740,11 @@ enum class RelocFormulaKind : std::uint8_t {
 [[nodiscard]] DSS_EXPORT std::optional<RelocFormulaKind>
     parseRelocFormulaKind(std::string_view s) noexcept;
 
+// Comma-separated quoted list of accepted formula-discriminator
+// strings — used by the JSON loader's error messages so the accepted
+// set never lags the enum.
+[[nodiscard]] DSS_EXPORT std::string acceptedRelocFormulaList();
+
 struct DSS_EXPORT TargetRelocationInfo {
     std::string      name;            // canonical text key (e.g. "rel32", "abs64")
     RelocationKind   kind{};          // opaque tag — written into Relocation::kind;
@@ -752,13 +757,14 @@ struct DSS_EXPORT TargetRelocationInfo {
                                        // (e.g. -4 for x86 rel32 to
                                        // skip past the 4-byte
                                        // displacement field)
-    std::uint8_t widthBytes  = 0;      // Linear: 4 / 8 — bytes to write at
-                                       // the patch site. 0 means "linker
-                                       // rejects this kind" (only valid
-                                       // pre-D-LK6-1 closure; today every
-                                       // shipped kind has a formulaKind +
-                                       // widthBytes). Non-Linear: must be
-                                       // 4 (ARM64 instruction word width).
+    std::uint8_t widthBytes  = 0;      // Linear: 4 / 8 — bytes to write
+                                       // at the patch site. 0 reaches
+                                       // only via legacy / malformed
+                                       // JSON (kernel rejects with
+                                       // K_RelocationKindMismatch).
+                                       // Non-Linear: always 4 (ARM64
+                                       // instruction word; auto-defaulted
+                                       // by the JSON loader if absent).
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode

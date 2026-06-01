@@ -421,10 +421,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 if (!r.at("formula").is_string()) {
                     c.emit(DiagnosticCode::C_MalformedJson,
                            std::format("/relocations/{}/formula", i),
-                           "'formula' must be a string discriminator "
-                           "(accepted: 'linear', 'aarch64_call26', "
-                           "'aarch64_adr_prel_pg_hi21', "
-                           "'aarch64_add_abs_lo12')");
+                           std::format("'formula' must be a string "
+                                       "discriminator (accepted: {})",
+                                       acceptedRelocFormulaList()));
                     return false;
                 }
                 auto const formulaStr = r.at("formula").get<std::string>();
@@ -434,11 +433,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                            std::format("/relocations/{}/formula", i),
                            std::format("'{}' is not a recognized "
                                        "relocation-formula discriminator "
-                                       "(accepted: 'linear', "
-                                       "'aarch64_call26', "
-                                       "'aarch64_adr_prel_pg_hi21', "
-                                       "'aarch64_add_abs_lo12') — see "
-                                       "plan 14 §3.1 D-LK6-1", formulaStr));
+                                       "(accepted: {}) — see plan 14 "
+                                       "§3.1 D-LK6-1",
+                                       formulaStr,
+                                       acceptedRelocFormulaList()));
                     return false;
                 }
                 info.formulaKind = *parsed;
