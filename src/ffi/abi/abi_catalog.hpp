@@ -57,11 +57,16 @@ struct DSS_EXPORT AbiTuple {
 };
 
 // Closed-set FF3 failure modes. 1:1 with `F_Abi*` codes via the
-// `kAbiResolveErrorTable` (abi_catalog.cpp).
+// `kAbiResolveErrorTable` (abi_catalog.cpp). `_Count` is a sentinel
+// pinning the table-size invariant (silent-failure H3 post-fold #3:
+// `LastVariant + 1u` would silently accept a new variant appended
+// without a row; `Count_` increments alongside any addition. Matches
+// `HirOpKind::Count_` codebase precedent).
 enum class AbiResolveErrorKind : std::uint8_t {
     UnknownTuple              = 0,  // (target.name, format.kind) not in catalog
     NoMatchingCcInTarget      = 1,  // target.json lacks the cc the catalog says it needs
     FormatAbiModelMismatch    = 2,  // defensive — abiModel/format-kind disagreement
+    Count_                          // table-size sentinel — keep LAST (codebase convention)
 };
 
 struct DSS_EXPORT AbiResolveError {

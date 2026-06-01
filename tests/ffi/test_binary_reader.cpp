@@ -16,6 +16,7 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "ffi/binary_reader.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -26,6 +27,7 @@
 
 using namespace dss;
 using namespace dss::ffi;
+using dss::test_support::countCode;
 
 namespace {
 
@@ -372,11 +374,7 @@ TEST(BinaryReaderFile, NonExistentPathReturnsFileOpenFailed) {
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::FileOpenFailed);
     // Verify it ALSO emitted F_FileOpenFailed through the reporter
     // (post-fold #1 wired the kind→F_* mapping).
-    bool sawF = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::F_FileOpenFailed) sawF = true;
-    }
-    EXPECT_TRUE(sawF);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_FileOpenFailed), 1u);
 }
 
 // Post-fold #1: pin that every failure path emits through the
@@ -387,11 +385,7 @@ TEST(BinaryReaderFile, EmptyBytesEmitsFFileEmptyThroughReporter) {
     DiagnosticReporter rep;
     auto r = readImportsFromBytes({}, "empty.so", rep);
     ASSERT_FALSE(r.has_value());
-    bool sawF = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::F_FileEmpty) sawF = true;
-    }
-    EXPECT_TRUE(sawF);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_FileEmpty), 1u);
 }
 
 // ── Diagnostic-name round-trip ───────────────────────────────────
@@ -496,11 +490,7 @@ TEST(BinaryReaderReporter, UnknownMagicAlsoEmitsFCodeThroughReporter) {
         std::vector<std::uint8_t>{0xAA, 0xBB, 0xCC, 0xDD, 0xEE},
         "garbage.bin", rep);
     ASSERT_FALSE(r.has_value());
-    bool sawF = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::F_UnknownBinaryFormat) sawF = true;
-    }
-    EXPECT_TRUE(sawF);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_UnknownBinaryFormat), 1u);
 }
 
 TEST(BinaryReaderReporter, PeMagicAlsoEmitsFCodeThroughReporter) {
@@ -508,11 +498,7 @@ TEST(BinaryReaderReporter, PeMagicAlsoEmitsFCodeThroughReporter) {
     std::vector<std::uint8_t> pe = {'M', 'Z', 0x00, 0x00};
     auto r = readImportsFromBytes(pe, "fake.dll", rep);
     ASSERT_FALSE(r.has_value());
-    bool sawF = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::F_UnsupportedBinaryFormat) sawF = true;
-    }
-    EXPECT_TRUE(sawF);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
 }
 
 TEST(BinaryReaderReporter, Elf32AlsoEmitsFCodeThroughReporter) {
@@ -522,11 +508,7 @@ TEST(BinaryReaderReporter, Elf32AlsoEmitsFCodeThroughReporter) {
     DiagnosticReporter rep;
     auto r = readImportsFromBytes(bytes, "32bit.so", rep);
     ASSERT_FALSE(r.has_value());
-    bool sawF = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::F_UnsupportedElfClass) sawF = true;
-    }
-    EXPECT_TRUE(sawF);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_UnsupportedElfClass), 1u);
 }
 
 TEST(BinaryReaderReporter, CorruptedBinaryAlsoEmitsFCodeThroughReporter) {
@@ -536,11 +518,7 @@ TEST(BinaryReaderReporter, CorruptedBinaryAlsoEmitsFCodeThroughReporter) {
     DiagnosticReporter rep;
     auto r = readImportsFromBytes(bytes, "tiny.so", rep);
     ASSERT_FALSE(r.has_value());
-    bool sawF = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::F_CorruptedBinary) sawF = true;
-    }
-    EXPECT_TRUE(sawF);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_CorruptedBinary), 1u);
 }
 
 // (Former `Ff1ProducedRowsHaveNoCSignature` test removed at FF2

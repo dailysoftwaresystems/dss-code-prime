@@ -10,6 +10,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_verifier.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -17,6 +18,7 @@
 #include <array>
 
 using namespace dss;
+using dss::test_support::countCode;
 
 namespace {
 
@@ -33,13 +35,8 @@ MirLiteralValue intLit(std::int64_t v) {
     return lit;
 }
 
-std::size_t countCode(DiagnosticReporter const& r, DiagnosticCode c) {
-    std::size_t n = 0;
-    for (auto const& d : r.all()) {
-        if (d.code == c) ++n;
-    }
-    return n;
-}
+// (former local `countCode` folded to `dss::test_support::countCode`
+// in `tests/test_support/diagnostic_count.hpp` at FF3+FF4 post-fold #3.)
 
 // Build a minimal well-formed module: one function with an EntryBlock
 // at slot 0 whose only instruction is `Return`.

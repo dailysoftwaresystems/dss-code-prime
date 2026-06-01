@@ -219,7 +219,12 @@ TEST(FfiAbiCatalog, CatalogCountIsExactly6PinsAllAnchoredRows) {
         if (r.targetName == "arm64" && r.formatKind == ObjectFormatKind::Elf
             && r.callingConvention == CallConv::CcAAPCS64
             && r.expectedCcName == "aapcs64") sawArmElfAAPCS = true;
+        // Pin the placeholder CallConv (CcMS64 per D-FF3-4 anchor)
+        // explicitly — when D-FF3-4 introduces CcMSARM64 and flips
+        // this row, the test trips, forcing either deletion of the
+        // anchor or update of this pin (test-analyzer P6 post-fold #3).
         if (r.targetName == "arm64" && r.formatKind == ObjectFormatKind::Pe
+            && r.callingConvention == CallConv::CcMS64
             && r.expectedCcName == "ms_arm64") sawArmPeMs = true;
         if (r.targetName == "arm64" && r.formatKind == ObjectFormatKind::MachO
             && r.callingConvention == CallConv::CcApple

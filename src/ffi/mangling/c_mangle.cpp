@@ -17,7 +17,7 @@ struct CManglingRule {
     bool             addLeadingUnderscore;
 };
 
-constexpr std::array<CManglingRule, 6> kCManglingRules{{
+constexpr std::array<CManglingRule, kObjectFormatKindTable.rows.size()> kCManglingRules{{
     { ObjectFormatKind::Unknown, false },  // defensive default
     { ObjectFormatKind::Elf,     false },  // System V / Linux convention
     { ObjectFormatKind::Pe,      false },  // PE64 cdecl (32-bit cdecl `_func` lands at D-FF4-1)

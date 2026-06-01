@@ -16,6 +16,7 @@
 #include "hir/hir_node.hpp"
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -45,6 +46,7 @@ using dss::ParseDiagnostic;
 using dss::TypeId;
 using dss::TypeInterner;
 using dss::TypeKind;
+using dss::test_support::countCode;
 
 // The verifier holds a reference into the module, so it must not bind to a
 // temporary `Hir` in EITHER arity — the HR5 source-map overload's defaulted
@@ -59,13 +61,8 @@ namespace {
 
 TypeInterner makeInterner() { return TypeInterner{CompilationUnitId{1}}; }
 
-std::size_t countCode(DiagnosticReporter const& r, DiagnosticCode c) {
-    std::size_t n = 0;
-    for (ParseDiagnostic const& d : r.all()) {
-        if (d.code == c) ++n;
-    }
-    return n;
-}
+// (former local `countCode` folded to `dss::test_support::countCode`
+// in `tests/test_support/diagnostic_count.hpp` at FF3+FF4 post-fold #3.)
 
 } // namespace
 

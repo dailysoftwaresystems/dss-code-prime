@@ -102,15 +102,18 @@ struct AbiResolveErrorRow {
     DiagnosticCode      code;
 };
 
-constexpr std::array<AbiResolveErrorRow, 3> kAbiResolveErrorTable{{
+// Closed-table — one row per AbiResolveErrorKind variant. The
+// array size is anchored on the enum's `_Count` sentinel — a
+// future variant appended (or mid-enum-inserted) bumps `Count_`
+// and forces a corresponding row addition, OR the build breaks.
+// (silent-failure H3 post-fold #3 fix.)
+constexpr std::array<AbiResolveErrorRow,
+                     static_cast<std::size_t>(AbiResolveErrorKind::Count_)>
+    kAbiResolveErrorTable{{
     { AbiResolveErrorKind::UnknownTuple,           "UnknownTuple",           DiagnosticCode::F_AbiUnknownTuple           },
     { AbiResolveErrorKind::NoMatchingCcInTarget,   "NoMatchingCcInTarget",   DiagnosticCode::F_AbiNoMatchingCcInTarget   },
     { AbiResolveErrorKind::FormatAbiModelMismatch, "FormatAbiModelMismatch", DiagnosticCode::F_AbiFormatAbiModelMismatch },
 }};
-
-static_assert(static_cast<std::uint8_t>(AbiResolveErrorKind::FormatAbiModelMismatch) + 1u
-                  == kAbiResolveErrorTable.size(),
-              "kAbiResolveErrorTable must hold one row per AbiResolveErrorKind.");
 
 consteval bool kAbiResolveErrorTableRowsAligned() {
     for (std::size_t i = 0; i < kAbiResolveErrorTable.size(); ++i) {
