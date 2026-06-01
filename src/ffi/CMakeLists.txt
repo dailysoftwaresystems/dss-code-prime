@@ -1,3 +1,6 @@
+add_subdirectory(abi)
+add_subdirectory(mangling)
+
 add_library(ffi OBJECT
     binary_reader.cpp
     c_header_parser.cpp

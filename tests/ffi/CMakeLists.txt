@@ -1,2 +1,4 @@
 dss_add_test(NAME ffi/test_binary_reader SOURCES test_binary_reader.cpp)
 dss_add_test(NAME ffi/test_c_header_parser SOURCES test_c_header_parser.cpp)
+dss_add_test(NAME ffi/test_abi_catalog SOURCES test_abi_catalog.cpp)
+dss_add_test(NAME ffi/test_c_mangle SOURCES test_c_mangle.cpp)

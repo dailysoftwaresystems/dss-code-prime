@@ -1,0 +1,93 @@
+#include "ffi/mangling/c_mangle.hpp"
+
+#include <array>
+#include <string>
+
+namespace dss::ffi {
+
+namespace {
+
+// Closed-table: per-ObjectFormatKind decoration rule for C names.
+// Each row maps a format kind to whether it prefixes C identifiers
+// with a leading underscore. The shape is one row per
+// `ObjectFormatKind` variant so the static_assert below catches a
+// new variant addition that forgot to declare its rule.
+struct CManglingRule {
+    ObjectFormatKind format;
+    bool             addLeadingUnderscore;
+};
+
+constexpr std::array<CManglingRule, 6> kCManglingRules{{
+    { ObjectFormatKind::Unknown, false },  // defensive default
+    { ObjectFormatKind::Elf,     false },  // System V / Linux convention
+    { ObjectFormatKind::Pe,      false },  // PE64 cdecl (32-bit cdecl `_func` lands at D-FF4-1)
+    { ObjectFormatKind::MachO,   true  },  // Apple convention: leading `_` on every C symbol
+    { ObjectFormatKind::Wasm,    false },  // uses import-namespace, no name mangling
+    { ObjectFormatKind::Spirv,   false },  // no C ABI surface
+}};
+
+// One row per format-kind variant: a future format added to
+// `ObjectFormatKind` without a matching rule here would silently
+// inherit the linear-scan default (false / no decoration), masking
+// the design decision. The static_assert + the
+// `kCManglingRulesAlignedWithEnum` consteval pin force a fold-now.
+static_assert(kCManglingRules.size()
+                  == static_cast<std::size_t>(ObjectFormatKind::Spirv) + 1u,
+              "kCManglingRules row count must equal the ObjectFormatKind "
+              "variant count — adding a kind requires adding a rule.");
+
+consteval bool kCManglingRulesAlignedWithEnum() {
+    for (std::size_t i = 0; i < kCManglingRules.size(); ++i) {
+        if (static_cast<std::size_t>(kCManglingRules[i].format) != i) return false;
+    }
+    return true;
+}
+static_assert(kCManglingRulesAlignedWithEnum(),
+              "kCManglingRules row order must match the ObjectFormatKind "
+              "underlying values — a paste-error row in the wrong slot "
+              "would silently apply the wrong rule to the wrong format.");
+
+[[nodiscard]] constexpr bool
+addsLeadingUnderscoreFor(ObjectFormatKind format) noexcept {
+    auto const idx = static_cast<std::size_t>(format);
+    if (idx >= kCManglingRules.size()) return false;
+    return kCManglingRules[idx].addLeadingUnderscore;
+}
+
+} // namespace
+
+bool cFormatAddsLeadingUnderscore(ObjectFormatKind format) noexcept {
+    return addsLeadingUnderscoreFor(format);
+}
+
+std::string
+applyCMangling(std::string_view canonicalName, ObjectFormatKind format) {
+    if (canonicalName.empty()) return {};
+    if (addsLeadingUnderscoreFor(format)) {
+        std::string out;
+        out.reserve(canonicalName.size() + 1u);
+        out.push_back('_');
+        out.append(canonicalName);
+        return out;
+    }
+    return std::string{canonicalName};
+}
+
+std::string
+unapplyCMangling(std::string_view decoratedName, ObjectFormatKind format) {
+    if (decoratedName.empty()) return {};
+    if (addsLeadingUnderscoreFor(format)
+        && !decoratedName.empty()
+        && decoratedName.front() == '_') {
+        return std::string{decoratedName.substr(1)};
+    }
+    // Conservative: missing-prefix is not synthesized into an
+    // error here — operators sometimes ship libraries with
+    // non-standard naming, and the linker resolves by exact
+    // symbol equality. FF1 binary readers feed
+    // already-as-on-disk strings; FF4's job is to compute the
+    // canonical form, not validate the producer.
+    return std::string{decoratedName};
+}
+
+} // namespace dss::ffi

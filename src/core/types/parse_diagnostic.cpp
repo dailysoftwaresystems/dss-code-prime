@@ -171,6 +171,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_HeaderHasUnsupportedTopLevel: return "F_HeaderHasUnsupportedTopLevel";
         case DiagnosticCode::F_HeaderInternalInvariant:      return "F_HeaderInternalInvariant";
         case DiagnosticCode::F_HeaderInvalidShippedPath:     return "F_HeaderInvalidShippedPath";
+        case DiagnosticCode::F_AbiUnknownTuple:              return "F_AbiUnknownTuple";
+        case DiagnosticCode::F_AbiNoMatchingCcInTarget:      return "F_AbiNoMatchingCcInTarget";
+        case DiagnosticCode::F_AbiFormatAbiModelMismatch:    return "F_AbiFormatAbiModelMismatch";
     }
     return "Unknown";
 }

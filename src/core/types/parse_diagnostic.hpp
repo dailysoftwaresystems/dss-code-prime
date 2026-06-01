@@ -715,6 +715,24 @@ enum class DiagnosticCode : std::uint16_t {
     F_HeaderHasUnsupportedTopLevel = 0x500D,
     F_HeaderInternalInvariant      = 0x500E,
     F_HeaderInvalidShippedPath     = 0x500F,
+    // ── FF3 ABI catalog (plan 11 §2.4) ──
+    // F_AbiUnknownTuple: the (target.name, format.kind) pair has no
+    //   row in FF3's catalog. Remediation: ship the format.json for
+    //   this combination, OR add the catalog row if the combination
+    //   is genuinely supported.
+    // F_AbiNoMatchingCcInTarget: FF3 catalog says (target, format)
+    //   needs a specific calling-convention name (e.g. "ms_x64"), but
+    //   the target.json does not ship a callingConventions row by
+    //   that name. Remediation: extend the target.json's
+    //   callingConventions array OR drop the (target, format) pair.
+    // F_AbiFormatAbiModelMismatch: defensive — (format.kind, target.abiModel)
+    //   pair reached FF3 in an unexpected state (e.g. WASM format
+    //   with register-machine target). crossValidateTargetFormat
+    //   should reject this upstream; FF3 emits the code if it slips
+    //   past as a defense-in-depth.
+    F_AbiUnknownTuple              = 0x5010,
+    F_AbiNoMatchingCcInTarget      = 0x5011,
+    F_AbiFormatAbiModelMismatch    = 0x5012,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
