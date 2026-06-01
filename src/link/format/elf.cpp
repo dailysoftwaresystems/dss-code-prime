@@ -96,8 +96,44 @@ constexpr std::uint64_t DT_SYMENT  = 11;
 constexpr std::uint64_t DT_FLAGS_1 = 0x6ffffffb;
 constexpr std::uint64_t DF_1_NOW   = 1;
 
-// x86_64 psABI reloc type.
-constexpr std::uint32_t R_X86_64_GLOB_DAT = 6;
+// Per-machine ELF reloc type for "write resolved symbol VA into GOT
+// slot at load time" (dyld semantics).
+// x86_64 psABI §4.4.1 — R_X86_64_GLOB_DAT = 6.
+// AArch64 ELF psABI §4.6.3 — R_AARCH64_GLOB_DAT = 1025 (0x401).
+constexpr std::uint32_t R_X86_64_GLOB_DAT   = 6;
+constexpr std::uint32_t R_AARCH64_GLOB_DAT  = 1025;
+
+// Closed-enum machine codes the dynamic walker dispatches on.
+// EM_X86_64 = 62 (gABI fig 4-2); EM_AARCH64 = 183 (AArch64 ELF psABI).
+// Adding a 3rd ISA (RISC-V = 243, PPC64 = 21, MIPS = 8) requires:
+//   * new `R_*_GLOB_DAT` constant
+//   * new arm in `pltStubSizeFor` / `globDatTypeFor` / `emitPltStub`
+//   * relaxed dispatch guard in `elf::encode`
+// All three are localized to this file today; the architect-anchored
+// TU split (D-LK6-8 §post-fold #1) becomes warranted when the 3rd
+// machine arrives.
+constexpr std::uint16_t kEmX86_64  = 62u;
+constexpr std::uint16_t kEmAArch64 = 183u;
+
+// Per-machine PLT stub size in bytes.
+[[nodiscard]] constexpr std::uint64_t
+pltStubSizeFor(std::uint16_t machine) noexcept {
+    switch (machine) {
+        case kEmX86_64:  return 6u;   // 6-byte `FF 25 disp32`
+        case kEmAArch64: return 16u;  // 4×4-byte ADRP+LDR+BR+NOP
+    }
+    return 0u;  // caller's machine-guard already rejected unknowns
+}
+
+// Per-machine GOT-slot relocation type.
+[[nodiscard]] constexpr std::uint32_t
+globDatTypeFor(std::uint16_t machine) noexcept {
+    switch (machine) {
+        case kEmX86_64:  return R_X86_64_GLOB_DAT;
+        case kEmAArch64: return R_AARCH64_GLOB_DAT;
+    }
+    return 0u;
+}
 
 constexpr std::uint8_t makeStInfo(std::uint8_t bind, std::uint8_t type) {
     return static_cast<std::uint8_t>((bind << 4) | (type & 0xF));
@@ -150,6 +186,144 @@ inline void padToOffset(std::vector<std::uint8_t>& out, std::uint64_t offset) {
 inline void appendBytes(std::vector<std::uint8_t>& out,
                          std::span<std::uint8_t const> body) {
     out.insert(out.end(), body.begin(), body.end());
+}
+
+// Emit one PLT stub for ARM64 (16 bytes: ADRP + LDR + BR + NOP) per
+// AArch64 ELF psABI §4.5 "PLT formats". The 4 instructions are:
+//   ADRP x16, page-of(GOT_slot)
+//   LDR  x17, [x16, lo12-of(GOT_slot)]
+//   BR   x17
+//   NOP
+// All 4 are 4-byte instructions; total 16 bytes per stub.
+//
+// Range check: ADRP carries a 21-bit signed page-relative immediate
+// (±4 GiB reachable). The LDR's imm12 is 12-bit unsigned scaled by 8
+// (0..32760 byte offset within page, 8-byte aligned). The GOT slot
+// VA's low-12 must therefore be 8-byte-aligned — a property the
+// caller guarantees by construction (GOT slots are 8 bytes each,
+// gotVa is page-aligned).
+[[nodiscard]] inline bool emitArm64PltStub(
+        std::vector<std::uint8_t>& plt,
+        std::size_t                stubOffset,
+        std::uint64_t              stubVa,
+        std::uint64_t              slotVa,
+        DiagnosticReporter&        reporter) {
+    // ADRP page-pair value: signed 21-bit, computed identically to
+    // the R_AARCH64_ADR_PREL_PG_HI21 reloc formula (D-LK6-1
+    // Aarch64AdrPrelPgHi21 — kept consistent intentionally so the
+    // ADRP encoding in the kernel and the ADRP in the PLT stub match).
+    auto const pageOf = [](std::uint64_t v) noexcept -> std::uint64_t {
+        return v & ~std::uint64_t{0xFFF};
+    };
+    std::int64_t const pageDiff =
+        static_cast<std::int64_t>(pageOf(slotVa))
+      - static_cast<std::int64_t>(pageOf(stubVa));
+    std::int64_t const adrpValue = pageDiff >> 12;
+    constexpr std::int64_t kAdrpMax =  (std::int64_t{1} << 20) - 1;
+    constexpr std::int64_t kAdrpMin = -(std::int64_t{1} << 20);
+    if (adrpValue < kAdrpMin || adrpValue > kAdrpMax) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             "elf::encodeElfExecDynamic (ARM64 PLT): ADRP page-pair "
+             "value " + std::to_string(adrpValue) +
+             " out of signed 21-bit range — PLT and GOT too far "
+             "apart (>±4 GiB).");
+        return false;
+    }
+
+    // LDR imm12: low 12 bits of slotVa, scaled by 8 for 64-bit access.
+    std::uint64_t const lo12 = slotVa & std::uint64_t{0xFFF};
+    if ((lo12 & 0x7u) != 0u) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             "elf::encodeElfExecDynamic (ARM64 PLT): GOT slot VA "
+             "is not 8-byte aligned (low12=0x" +
+             std::to_string(lo12) + "). The AArch64 64-bit LDR "
+             "encoding requires an 8-byte-aligned offset; the "
+             "linker's GOT layout is broken.");
+        return false;
+    }
+
+    // ADRP x16 encoding: base 0x90000010 (Rd=x16); immlo at bits[30:29],
+    // immhi at bits[23:5] holding 21-bit two's-complement page value.
+    std::uint32_t const adrpV = static_cast<std::uint32_t>(adrpValue) & 0x1FFFFFu;
+    std::uint32_t const immlo = (adrpV & 0x3u) << 29;
+    std::uint32_t const immhi = ((adrpV >> 2) & 0x7FFFFu) << 5;
+    std::uint32_t const adrp  = 0x90000010u | immlo | immhi;
+
+    // LDR (immediate, unsigned offset) 64-bit: base 0xF9400000;
+    // imm12 at bits[21:10] (scaled by 8), Rn=x16 at bits[9:5],
+    // Rt=x17 at bits[4:0]. Pre-shifted base 0xF9400211 carries
+    // Rn=16 + Rt=17 already.
+    std::uint32_t const imm12 = static_cast<std::uint32_t>(lo12 >> 3);
+    std::uint32_t const ldr   = 0xF9400211u | (imm12 << 10);
+
+    // BR x17 (unconditional indirect branch); NOP for stub padding
+    // so each PLT entry is 16 bytes (cache-line friendly).
+    constexpr std::uint32_t kBrX17 = 0xD61F0220u;
+    constexpr std::uint32_t kNop   = 0xD503201Fu;
+
+    auto const writeInst = [&](std::size_t off, std::uint32_t inst) {
+        plt[off + 0] = static_cast<std::uint8_t>(inst         & 0xFFu);
+        plt[off + 1] = static_cast<std::uint8_t>((inst >>  8) & 0xFFu);
+        plt[off + 2] = static_cast<std::uint8_t>((inst >> 16) & 0xFFu);
+        plt[off + 3] = static_cast<std::uint8_t>((inst >> 24) & 0xFFu);
+    };
+    writeInst(stubOffset + 0,  adrp);
+    writeInst(stubOffset + 4,  ldr);
+    writeInst(stubOffset + 8,  kBrX17);
+    writeInst(stubOffset + 12, kNop);
+    return true;
+}
+
+// Emit one PLT stub for x86_64 (6 bytes: `FF 25 disp32`) per
+// x86_64 psABI. `jmp [rip+disp32]` jumps indirectly through the GOT
+// slot at the PC-relative displacement.
+[[nodiscard]] inline bool emitX86_64PltStub(
+        std::vector<std::uint8_t>& plt,
+        std::size_t                stubOffset,
+        std::uint64_t              stubVa,
+        std::uint64_t              slotVa,
+        DiagnosticReporter&        reporter) {
+    std::uint64_t const stubEndVa = stubVa + 6;
+    std::int64_t const disp =
+        static_cast<std::int64_t>(slotVa)
+      - static_cast<std::int64_t>(stubEndVa);
+    if (disp < std::numeric_limits<std::int32_t>::min()
+     || disp > std::numeric_limits<std::int32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             "elf::encodeElfExecDynamic (x86_64 PLT): PLT→GOT "
+             "displacement (" + std::to_string(disp) +
+             ") does not fit signed 32-bit — module too large.");
+        return false;
+    }
+    plt[stubOffset + 0] = 0xFFu;
+    plt[stubOffset + 1] = 0x25u;
+    auto const u = static_cast<std::uint32_t>(disp);
+    plt[stubOffset + 2] = static_cast<std::uint8_t>(u & 0xFFu);
+    plt[stubOffset + 3] = static_cast<std::uint8_t>((u >>  8) & 0xFFu);
+    plt[stubOffset + 4] = static_cast<std::uint8_t>((u >> 16) & 0xFFu);
+    plt[stubOffset + 5] = static_cast<std::uint8_t>((u >> 24) & 0xFFu);
+    return true;
+}
+
+// Per-machine PLT stub dispatch. D-LK6-8 closure (2026-06-01).
+[[nodiscard]] inline bool emitPltStub(
+        std::uint16_t              machine,
+        std::vector<std::uint8_t>& plt,
+        std::size_t                stubOffset,
+        std::uint64_t              stubVa,
+        std::uint64_t              slotVa,
+        DiagnosticReporter&        reporter) {
+    switch (machine) {
+        case kEmX86_64:
+            return emitX86_64PltStub(plt, stubOffset, stubVa, slotVa, reporter);
+        case kEmAArch64:
+            return emitArm64PltStub(plt, stubOffset, stubVa, slotVa, reporter);
+    }
+    emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+         "elf::encodeElfExecDynamic: machine code " +
+         std::to_string(machine) + " has no PLT stub emitter — "
+         "caller's machine-guard should have rejected this.");
+    return false;
 }
 
 void writeSectionHeader(std::vector<std::uint8_t>& out, SectionHeader const& h) {
@@ -373,7 +547,11 @@ encodeElfExecDynamic(
     }
 
     // ── (g) .plt body (placeholder; filled after layout)
-    std::vector<std::uint8_t> plt(numExterns * 6, 0);
+    // D-LK6-8 closure: stub size is per-machine (x86_64 = 6,
+    // ARM64 = 16).
+    std::uint16_t const machine = fmt.elf().machine;
+    std::uint64_t const pltStubSize = pltStubSizeFor(machine);
+    std::vector<std::uint8_t> plt(numExterns * pltStubSize, 0);
 
     // ── (h) .got body (zero-init; dyld writes resolved fn ptrs)
     std::vector<std::uint8_t> got(numExterns * 8, 0);
@@ -425,39 +603,28 @@ encodeElfExecDynamic(
     std::uint64_t const dynamicVa  = baseImageVa + dynamicOff;
 
     // ── (j) Build .plt bytes (now we have VAs)
+    // D-LK6-8 closure: per-machine PLT stub emitter dispatches on
+    // `machine`. x86_64 emits 6-byte `FF 25 disp32`; ARM64 emits
+    // 16-byte ADRP+LDR+BR+NOP.
     for (std::size_t i = 0; i < numExterns; ++i) {
-        std::uint64_t const stubVa = pltVa + i * 6;
-        std::uint64_t const stubEndVa = stubVa + 6;
+        std::uint64_t const stubVa = pltVa + i * pltStubSize;
         std::uint64_t const slotVa = gotVa + i * 8;
-        std::int64_t const disp =
-            static_cast<std::int64_t>(slotVa)
-            - static_cast<std::int64_t>(stubEndVa);
-        if (disp < std::numeric_limits<std::int32_t>::min()
-         || disp > std::numeric_limits<std::int32_t>::max()) {
-            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                 "elf::encodeElfExecDynamic: PLT→GOT displacement "
-                 "(" + std::to_string(disp) +
-                 ") does not fit in 32 bits — module too large.");
+        std::size_t   const stubOffset = i * pltStubSize;
+        if (!emitPltStub(machine, plt, stubOffset, stubVa, slotVa, reporter)) {
             return {};
         }
-        plt[i*6 + 0] = 0xFFu;
-        plt[i*6 + 1] = 0x25u;
-        auto const u = static_cast<std::uint32_t>(disp);
-        plt[i*6 + 2] = static_cast<std::uint8_t>(u & 0xFF);
-        plt[i*6 + 3] = static_cast<std::uint8_t>((u >> 8)  & 0xFF);
-        plt[i*6 + 4] = static_cast<std::uint8_t>((u >> 16) & 0xFF);
-        plt[i*6 + 5] = static_cast<std::uint8_t>((u >> 24) & 0xFF);
     }
 
-    // ── (k) Build .rela.dyn (R_X86_64_GLOB_DAT for each GOT slot)
-    constexpr std::uint32_t R_X86_64_GLOB_DAT = 6;
+    // ── (k) Build .rela.dyn (per-machine GLOB_DAT for each GOT slot)
+    // D-LK6-8 closure: R_X86_64_GLOB_DAT = 6 vs R_AARCH64_GLOB_DAT = 1025.
+    std::uint32_t const globDatType = globDatTypeFor(machine);
     std::vector<std::uint8_t> relaDyn;
     relaDyn.reserve(relaDynSz);
     for (std::size_t i = 0; i < numExterns; ++i) {
         std::uint64_t const slotVa = gotVa + i * 8;
         std::uint64_t const rInfo =
             (static_cast<std::uint64_t>(dynsymIdx[i]) << 32)
-            | static_cast<std::uint64_t>(R_X86_64_GLOB_DAT);
+            | static_cast<std::uint64_t>(globDatType);
         appendU64LE(relaDyn, slotVa);
         appendU64LE(relaDyn, rInfo);
         appendI64LE(relaDyn, 0);
@@ -575,8 +742,10 @@ encodeElfExecDynamic(
                          textVa + funcTextStart[i]);
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
+        // D-LK6-8: extern symbol VA points at the PLT stub. Stub
+        // size is per-machine (6 bytes for x86_64; 16 bytes for ARM64).
         auto const [it, inserted] = symbolVa.emplace(
-            module.externImports[i].symbol, pltVa + i * 6);
+            module.externImports[i].symbol, pltVa + i * pltStubSize);
         if (!inserted) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
                  std::string{"elf::encodeElfExecDynamic: extern "
@@ -831,24 +1000,23 @@ encode(AssembledModule const&    module,
                        "dynamic image.");
             return {};
         }
-        // CRITICAL machine-dispatch guard (silent-failure audit post-fold
-        // #1, 2026-06-01): `encodeElfExecDynamic` hardcodes the x86_64
-        // 6-byte `FF 25 disp32` PLT stub. Reaching this path with a
-        // non-x86_64 machine code (ARM64 / RISC-V / etc.) would silently
-        // emit x86_64 jump bytes as an "ARM64 PLT stub", producing SIGILL
-        // at the first extern call. ARM64 PLT stub encoding is anchored
-        // at plan 14 §3.1 D-LK6-8 (ADRP+LDR+BR 16-byte sequence).
-        constexpr std::uint16_t kEmX86_64 = 62u;
-        if (fmt.elf().machine != kEmX86_64) {
+        // Machine-dispatch guard (D-LK6-8 closed 2026-06-01).
+        // `encodeElfExecDynamic` now dispatches per-machine to
+        // `emitPltStub` + `globDatTypeFor` + `pltStubSizeFor`.
+        // Supported: x86_64 (62), ARM64 (183). Other machines fail
+        // loud — adding RISC-V (243) / PPC64 (21) / MIPS (8) means
+        // adding the per-machine arms in this file (see top-level
+        // comment near `kEmX86_64` / `kEmAArch64`).
+        std::uint16_t const elfMachine = fmt.elf().machine;
+        if (elfMachine != kEmX86_64 && elfMachine != kEmAArch64) {
             emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
                  std::string{"elf::encode: extern imports present but "}
-                     + "ELF e_machine=" + std::to_string(fmt.elf().machine)
-                     + " is not x86_64 (EM_X86_64=62). PLT stub encoding "
-                       "is currently x86_64-only (6-byte `FF 25 disp32`); "
-                       "per-machine dispatch (ARM64 16-byte ADRP+LDR+BR "
-                       "etc.) is anchored at plan 14 §3.1 D-LK6-8. "
-                       "Self-contained intra-module ARM64 images work via "
-                       "the static ET_EXEC path (no externImports).");
+                     + "ELF e_machine=" + std::to_string(elfMachine)
+                     + " has no PLT stub emitter yet. Supported "
+                       "machines: x86_64 (62), ARM64 (183). Other "
+                       "ISAs (RISC-V 243, PPC64 21, MIPS 8) are "
+                       "anchored as future work — add a row to "
+                       "pltStubSizeFor / globDatTypeFor / emitPltStub.");
             return {};
         }
         // Section schema lookup mirrors the existing path so the

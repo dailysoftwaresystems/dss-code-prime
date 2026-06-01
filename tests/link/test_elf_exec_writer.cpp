@@ -236,42 +236,107 @@ AssembledModule makeModuleWithOneExtern() {
 }
 } // namespace
 
-// CRITICAL silent-failure audit post-fold #1 (D-LK6-8 machine-guard):
-// extern imports + non-x86_64 machine code MUST fail loud at the
-// walker. Without this guard, the walker would silently emit x86_64
-// 6-byte FF 25 disp32 PLT stubs into an ARM64 image → SIGILL at the
-// first extern call.
-//
-// Uses the shipped `elf64-aarch64-linux-exec.format.json` rather than
-// inlining a synthetic JSON — pins the guard against the real
-// production schema (code-simplifier audit post-fold #1).
-TEST(ElfExecWriter, ExternImportsOnArm64MachineFailsLoudCitingDLK68) {
-    auto target = TargetSchema::loadShipped("x86_64");
+// D-LK6-8 CLOSED 2026-06-01: ARM64 dynamic walker landed.
+// ExternImports on the shipped `elf64-aarch64-linux-exec.format.json`
+// + the shipped `arm64.target.json` now PRODUCE bytes (no longer
+// fail loud). The function body is ARM64-shape (BL + RET = 8 bytes;
+// BL at offset 0 is the call26 reloc patch site, naturally 4-byte
+// aligned per ARM64 instruction format).
+TEST(ElfExecWriter, ExternImportsOnArm64MachineSucceedsAfterDLK68Close) {
+    auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
     ASSERT_TRUE(fmt.has_value()) << [&]{
         std::string s; for (auto const& d : fmt.error()) s += d.message + "\n"; return s;
     }();
-    auto mod = makeModuleWithOneExtern();
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // BL #0 (0x94000000) + RET (0xD65F03C0). 8 bytes. BL at offset 0
+    // is the call26 patch site.
+    fn.bytes = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6};
+    Relocation rel;
+    rel.offset = 0;            // 4-byte aligned (BL is at start)
+    rel.target = SymbolId{99}; // extern
+    rel.kind   = RelocationKind{1};  // arm64.target.json: call26
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "printf";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
 
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty());
-    bool sawMachineMention = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_FormatLacksImportSupport
-         && d.actual.find("D-LK6-8") != std::string::npos) {
-            sawMachineMention = true;
-        }
-    }
-    EXPECT_TRUE(sawMachineMention);
+    std::string diags;
+    for (auto const& d : rep.all()) diags += d.actual + "\n";
+    EXPECT_EQ(rep.errorCount(), 0u) << diags;
+    EXPECT_FALSE(bytes.empty()) << diags;
 }
 
-// Universality pin: the guard is `!= 62` (not `== 183`). A regression
-// flipping the comparator to `== 183` would pass the ARM64 test but
-// silently emit x86_64 PLT stubs into RISC-V / MIPS / PPC64 images.
+// D-LK6-8 byte-pin: ARM64 16-byte PLT stub layout.
+// First stub at pltVa, GOT slot at gotVa. The 4 instructions are:
+//   [0..3]   ADRP x16, page-of(slotVa)     opcode 0x9? at byte 3
+//   [4..7]   LDR  x17, [x16, lo12(slotVa)] opcode 0xF9 at byte 7
+//   [8..11]  BR   x17                       fixed 0xD61F0220
+//   [12..15] NOP                            fixed 0xD503201F
+// Test pins the FIXED-byte regions (BR + NOP) which don't depend on
+// VA layout, plus the ADRP/LDR opcode marker bytes.
+TEST(ElfExecWriter, Arm64PltStubLayoutPinsAdrpLdrBrNop) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(fmt.has_value());
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6};
+    Relocation rel;
+    rel.offset = 0; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol = SymbolId{99};
+    imp.mangledName = "printf";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // The PLT layout offset isn't trivially derivable from outside the
+    // walker, so scan for the BR x17 (D6 1F 02 20 in BE; in LE that's
+    // 0x20 0x02 0x1F 0xD6) — unique enough as a marker. Confirm the
+    // NOP (1F 20 03 D5 LE) immediately follows.
+    bool sawBrThenNop = false;
+    for (std::size_t i = 0; i + 8 <= bytes.size(); ++i) {
+        if (bytes[i+0] == 0x20 && bytes[i+1] == 0x02
+         && bytes[i+2] == 0x1F && bytes[i+3] == 0xD6
+         && bytes[i+4] == 0x1F && bytes[i+5] == 0x20
+         && bytes[i+6] == 0x03 && bytes[i+7] == 0xD5) {
+            sawBrThenNop = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawBrThenNop)
+        << "ARM64 PLT stub must contain BR x17 (0xD61F0220) followed "
+           "by NOP (0xD503201F) — the fixed back half of every stub.";
+}
+
+// Universality pin (D-LK6-8 post-close): the guard is now
+// `machine != x86_64 && machine != ARM64`. RISC-V / MIPS / PPC64
+// still fail loud. A future regression dropping ARM64 from the
+// supported set would also fail the ARM64 happy-path test.
 // EM_RISCV = 243 per RISC-V ELF psABI.
-TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingDLK68) {
+TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
@@ -291,14 +356,14 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingDLK68) {
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, **target, **fmt, rep);
     EXPECT_TRUE(bytes.empty());
-    bool sawMachineMention = false;
+    bool sawFutureWorkMention = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::K_FormatLacksImportSupport
-         && d.actual.find("D-LK6-8") != std::string::npos) {
-            sawMachineMention = true;
+         && d.actual.find("future work") != std::string::npos) {
+            sawFutureWorkMention = true;
         }
     }
-    EXPECT_TRUE(sawMachineMention);
+    EXPECT_TRUE(sawFutureWorkMention);
 }
 
 TEST(ElfExecWriter, ExternImportsEmitFivePhdrsAndDynamicSegment) {
