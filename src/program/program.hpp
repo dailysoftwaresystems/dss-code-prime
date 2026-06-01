@@ -21,6 +21,15 @@ public:
     /// Compile a project file (.dsp).
     int compileProject(const std::string& projectFilePath);
 
+    /// Policy-aware overload (LK10 cycle 3 post-fold #1 — silent-failure
+    /// audit H2): threads `--warnings-as-errors` + `--suppress=<code>`
+    /// through the local reporter so the user's policy applies even
+    /// on fail-loud-pending-plan-06 paths.
+    int compileProject(
+        const std::string& projectFilePath,
+        DiagnosticReporter::Config const& reporterConfig
+    );
+
     /// Programmatic entry point for embedding (DLL consumers).
     /// Compile explicit source files for a language to one or more targets.
     int compileFiles(
@@ -68,6 +77,15 @@ public:
         const std::vector<std::string>& sourceFiles,
         const std::string& languageName,
         const std::vector<std::string>& targets
+    );
+
+    /// Policy-aware transpile overload (H2 fold) — see compileProject
+    /// above for rationale.
+    int transpile(
+        const std::vector<std::string>& sourceFiles,
+        const std::string& languageName,
+        const std::vector<std::string>& targets,
+        DiagnosticReporter::Config const& reporterConfig
     );
 };
 

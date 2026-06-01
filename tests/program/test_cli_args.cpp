@@ -436,3 +436,85 @@ TEST(CliArgs, NoModeWithLanguageOptionRejects) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
 }
+
+// ── Post-fold #1: silent-failure audit (C1/C2/H1/H2) ─────────
+
+// C1: `--suppress=0xFFFF` (hex form, unenumerated value) must reject —
+// symmetric with the F1 fold's `--suppress=Unknown` symbolic-name
+// reject. Otherwise the user inserts a useless entry into the suppress
+// set and thinks something is suppressed.
+TEST(CliArgs, SuppressRejectsUnenumeratedHexCode) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf",
+           "--suppress=0xFFFF"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidSuppressCode);
+}
+
+// C1: but a real hex-form code is accepted. Validates round-trip:
+// parse the hex form of `D_FileNotFound`'s value back to the symbol.
+TEST(CliArgs, SuppressAcceptsEnumeratedHexCode) {
+    auto const code = static_cast<std::uint16_t>(DiagnosticCode::D_FileNotFound);
+    char hexBuf[8];
+    std::snprintf(hexBuf, sizeof(hexBuf), "0x%04X", code);
+    std::string const flag = std::string{"--suppress="} + hexBuf;
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf",
+           flag};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_EQ(r->suppress.size(), 1u);
+    EXPECT_EQ(r->suppress[0], DiagnosticCode::D_FileNotFound);
+}
+
+// C2: empty RHS in --target= must reject as MissingFlagValue (was
+// silently accepted as "" target spec).
+TEST(CliArgs, TargetEqualsEmptyRhsRejects) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+// C2: same for --config= empty RHS.
+TEST(CliArgs, ConfigEqualsEmptyRhsRejects) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf",
+           "--config="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+// H1: --schema-dir=<path> outside --lsp mode is silently dropped today —
+// must reject so the user sees the directive isn't being honored.
+TEST(CliArgs, SchemaDirOutsideLspModeRejects) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64-v1-link-elf",
+           "--schema-dir=/tmp/schemas"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+    EXPECT_NE(r.error().detail.find("--schema-dir"), std::string::npos);
+}
+
+// H1: but with --lsp it's accepted.
+TEST(CliArgs, SchemaDirInLspModeAccepted) {
+    Argv a{"dss-code-prime", "--lsp", "--schema-dir=/tmp/schemas"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_TRUE(r->lspMode);
+    ASSERT_TRUE(r->lspSchemaDir.has_value());
+}

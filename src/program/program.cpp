@@ -246,14 +246,21 @@ int Program::run(int argc, char* argv[]) {
     if (args.lspMode) {
         return runLspMode(args);
     }
+    // Build the diagnostic policy config BEFORE the dispatch fork —
+    // every CLI-routed entry point (compileProject, transpile,
+    // compileFiles, compileDirectory) honors `--warnings-as-errors`
+    // and `--suppress=<code>`. Without this, the fail-loud paths
+    // (compileProject + transpile) would build local reporters with
+    // default config and silently ignore the user's policy. (silent-
+    // failure audit H2 post-fold #1.)
+    auto const cfg = buildReporterConfig(args);
     if (args.projectPath.has_value()) {
-        return compileProject(*args.projectPath);
+        return compileProject(*args.projectPath, cfg);
     }
     if (!args.transpileFiles.empty()) {
         return transpile(args.transpileFiles, args.languageName,
-                         args.targets);
+                         args.targets, cfg);
     }
-    auto const cfg = buildReporterConfig(args);
     if (args.directoryPath.has_value()) {
         return compileDirectory(*args.directoryPath, args.languageName,
                                 args.targets, args.directoryMode, cfg);
@@ -274,17 +281,28 @@ int Program::run(int argc, char* argv[]) {
 }
 
 int Program::compileProject(const std::string& projectFilePath) {
+    // Back-compat 1-arg overload (C-ABI). Default-constructed policy.
+    return compileProject(projectFilePath, DiagnosticReporter::Config{});
+}
+
+int Program::compileProject(
+    const std::string& projectFilePath,
+    DiagnosticReporter::Config const& reporterConfig
+) {
     // Plan 06 (.dsp parser + artifact profile) is unstarted; cycle 2
     // anchors the fail-loud surface so a caller passing a project
     // path gets a structural diagnostic rather than silent success
-    // and a zero-byte target dir.
-    DiagnosticReporter rep;
+    // and a zero-byte target dir. Policy-aware overload (H2 fold):
+    // `--warnings-as-errors` + `--suppress=<code>` apply here too —
+    // a user who explicitly suppresses `D_PlanNotLanded` gets the
+    // diagnostic dropped before stderr, not silently ignored.
+    DiagnosticReporter rep{reporterConfig};
     emitDriver(rep, DiagnosticCode::D_PlanNotLanded,
                "compileProject: .dsp project-file parsing is not "
                "yet implemented — plan 06 (artifact profile) owns "
                "the .dsp schema. Path: '" + projectFilePath + "'.");
     drainDiagnosticsToStderr(rep);
-    return 1;
+    return rep.errorCount() == 0 ? 0 : 1;
 }
 
 int Program::transpile(
@@ -292,13 +310,25 @@ int Program::transpile(
     const std::string& languageName,
     const std::vector<std::string>& targets
 ) {
+    // Back-compat 3-arg overload. Default policy.
+    return transpile(sourceFiles, languageName, targets,
+                     DiagnosticReporter::Config{});
+}
+
+int Program::transpile(
+    const std::vector<std::string>& sourceFiles,
+    const std::string& languageName,
+    const std::vector<std::string>& targets,
+    DiagnosticReporter::Config const& reporterConfig
+) {
     // Plan 10 (source-translation, ST1..ST6) owns the actual
     // transpile engine: `*.map.json` rule files + HIR→HIR walker +
     // target-language CST builder + pretty-printer. v1: fails loud
     // with `D_PlanNotLanded` citing plan 10. The CLI dispatcher
     // routes `--transpile <files>` here so the surface is parsable
-    // and stable across plan 10's arrival.
-    DiagnosticReporter rep;
+    // and stable across plan 10's arrival. Policy-aware overload
+    // (H2 fold): see compileProject for rationale.
+    DiagnosticReporter rep{reporterConfig};
     std::string detail =
         "transpile: source-to-source translation is not yet "
         "implemented — plan 10 (`*.map.json` + HIR pivot + target "
@@ -315,7 +345,7 @@ int Program::transpile(
     detail += ".";
     emitDriver(rep, DiagnosticCode::D_PlanNotLanded, std::move(detail));
     drainDiagnosticsToStderr(rep);
-    return 1;
+    return rep.errorCount() == 0 ? 0 : 1;
 }
 
 int Program::compileFiles(

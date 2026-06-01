@@ -48,10 +48,18 @@ parseSuppressCode(std::string_view spec) noexcept {
         std::uint16_t v = 0;
         auto const [p, ec] = std::from_chars(
             spec.data() + 2, spec.data() + spec.size(), v, 16);
-        if (ec == std::errc{} && p == spec.data() + spec.size()) {
-            return static_cast<DiagnosticCode>(v);
+        if (ec != std::errc{} || p != spec.data() + spec.size()) {
+            return std::nullopt;
         }
-        return std::nullopt;
+        // Validate that the parsed code is ACTUALLY enumerated.
+        // `static_cast<DiagnosticCode>(0xFFFF)` is a valid C++ value but
+        // names nothing the reporter could ever emit — accepting it
+        // would silently insert a useless entry into the suppress set.
+        // (silent-failure audit C1 post-fold #1: same class as F1's
+        // symbolic-name guard, applied symmetrically to the hex form.)
+        auto const code = static_cast<DiagnosticCode>(v);
+        if (diagnosticCodeName(code) == "Unknown") return std::nullopt;
+        return code;
     }
     // Symbolic name form: linear scan over the uint16 range. The
     // diagnostic-code enum is closed (~80 codes today). The scan
@@ -226,13 +234,31 @@ parseCliArgs(int argc, char* argv[]) {
     // The non-`=` form is handled by takeFlagValue() at each call
     // site. silent-failure F4 post-fold: every value-bearing flag
     // now accepts both `--flag <value>` AND `--flag=value` shapes.
+    // Returns:
+    //   * non-empty optional → matched the `prefix=<value>` form with
+    //     a non-empty value
+    //   * MissingFlagValue error → matched `prefix=` with an empty
+    //     RHS (`--target=`, `--config=`, etc.). Symmetric reject with
+    //     the non-`=` form, which `takeFlagValue` already rejects via
+    //     `MissingFlagValue` when no next arg exists. Without this
+    //     symmetry, `--target=` would silently stuff `""` into
+    //     `targets`, propagate, and fail late at the downstream
+    //     `TargetSpec::parse` site. (silent-failure audit C2 post-fold #1.)
+    //   * nullopt return → did NOT match the prefix-equals form
     auto const equalsValue = [](std::string_view a,
-                                 std::string_view prefix) -> std::optional<std::string_view> {
-        if (a.starts_with(prefix) && a.size() > prefix.size()
-            && a[prefix.size()] == '=') {
-            return a.substr(prefix.size() + 1);
+                                 std::string_view prefix)
+            -> std::expected<std::optional<std::string_view>, CliArgsErrorInfo> {
+        if (!a.starts_with(prefix) || a.size() <= prefix.size()
+            || a[prefix.size()] != '=') {
+            return std::optional<std::string_view>{std::nullopt};
         }
-        return std::nullopt;
+        auto const value = a.substr(prefix.size() + 1);
+        if (value.empty()) {
+            return std::unexpected(make_error(
+                CliArgsError::MissingFlagValue,
+                std::string{prefix} + "= requires a non-empty value"));
+        }
+        return std::optional<std::string_view>{value};
     };
 
     for (int i = 1; i < argc; ++i) {
@@ -250,10 +276,13 @@ parseCliArgs(int argc, char* argv[]) {
             out.lspMode = true;
             continue;
         }
-        if (a.starts_with("--schema-dir=")) {
-            out.lspSchemaDir = std::filesystem::path{
-                std::string{a.substr(std::string_view{"--schema-dir="}.size())}};
-            continue;
+        {
+            auto eqV = equalsValue(a, "--schema-dir");
+            if (!eqV) return std::unexpected(eqV.error());
+            if (eqV->has_value()) {
+                out.lspSchemaDir = std::filesystem::path{std::string{**eqV}};
+                continue;
+            }
         }
 
         // ── Compile mode ────────────────────────────────────────
@@ -278,10 +307,14 @@ parseCliArgs(int argc, char* argv[]) {
             out.directoryPath = std::move(*v);
             continue;
         }
-        if (auto eqV = equalsValue(a, "--directory"); eqV.has_value()) {
-            if (auto e = setMode(Mode::Directory, "--directory"); !e) return std::unexpected(e.error());
-            out.directoryPath = std::string{*eqV};
-            continue;
+        {
+            auto eqV = equalsValue(a, "--directory");
+            if (!eqV) return std::unexpected(eqV.error());
+            if (eqV->has_value()) {
+                if (auto e = setMode(Mode::Directory, "--directory"); !e) return std::unexpected(e.error());
+                out.directoryPath = std::string{**eqV};
+                continue;
+            }
         }
 
         // ── Project mode ────────────────────────────────────────
@@ -292,10 +325,14 @@ parseCliArgs(int argc, char* argv[]) {
             out.projectPath = std::move(*v);
             continue;
         }
-        if (auto eqV = equalsValue(a, "--project"); eqV.has_value()) {
-            if (auto e = setMode(Mode::Project, "--project"); !e) return std::unexpected(e.error());
-            out.projectPath = std::string{*eqV};
-            continue;
+        {
+            auto eqV = equalsValue(a, "--project");
+            if (!eqV) return std::unexpected(eqV.error());
+            if (eqV->has_value()) {
+                if (auto e = setMode(Mode::Project, "--project"); !e) return std::unexpected(e.error());
+                out.projectPath = std::string{**eqV};
+                continue;
+            }
         }
 
         // ── Compile-mode shared options ─────────────────────────
@@ -305,13 +342,21 @@ parseCliArgs(int argc, char* argv[]) {
             out.languageName = std::move(*v);
             continue;
         }
-        if (auto eqV = equalsValue(a, "--language"); eqV.has_value()) {
-            out.languageName = std::string{*eqV};
-            continue;
+        {
+            auto eqV = equalsValue(a, "--language");
+            if (!eqV) return std::unexpected(eqV.error());
+            if (eqV->has_value()) {
+                out.languageName = std::string{**eqV};
+                continue;
+            }
         }
-        if (auto eqV = equalsValue(a, "--lang"); eqV.has_value()) {
-            out.languageName = std::string{*eqV};
-            continue;
+        {
+            auto eqV = equalsValue(a, "--lang");
+            if (!eqV) return std::unexpected(eqV.error());
+            if (eqV->has_value()) {
+                out.languageName = std::string{**eqV};
+                continue;
+            }
         }
         if (a == "--target") {
             auto v = takeFlagValue(a, i, argc, argv);
@@ -319,9 +364,13 @@ parseCliArgs(int argc, char* argv[]) {
             out.targets.push_back(std::move(*v));
             continue;
         }
-        if (auto eqV = equalsValue(a, "--target"); eqV.has_value()) {
-            out.targets.emplace_back(*eqV);
-            continue;
+        {
+            auto eqV = equalsValue(a, "--target");
+            if (!eqV) return std::unexpected(eqV.error());
+            if (eqV->has_value()) {
+                out.targets.emplace_back(**eqV);
+                continue;
+            }
         }
         if (a == "--recursive") {
             out.directoryMode = InputResolver::Mode::Recursive;
@@ -333,17 +382,21 @@ parseCliArgs(int argc, char* argv[]) {
         }
 
         // ── --config=<debug|release> (plan 22 OPT* wiring) ──────
-        if (auto eqV = equalsValue(a, "--config"); eqV.has_value()) {
-            auto const cfg = parseCompileConfig(*eqV);
-            if (!cfg.has_value()) {
-                return std::unexpected(make_error(
-                    CliArgsError::InvalidConfig,
-                    std::string{"--config: '"} + std::string{*eqV}
-                    + "' is not a recognized configuration "
-                      "(accepted: debug, release)"));
+        {
+            auto eqV = equalsValue(a, "--config");
+            if (!eqV) return std::unexpected(eqV.error());
+            if (eqV->has_value()) {
+                auto const cfg = parseCompileConfig(**eqV);
+                if (!cfg.has_value()) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidConfig,
+                        std::string{"--config: '"} + std::string{**eqV}
+                        + "' is not a recognized configuration "
+                          "(accepted: debug, release)"));
+                }
+                out.config = *cfg;
+                continue;
             }
-            out.config = *cfg;
-            continue;
         }
         if (a == "--config") {
             auto v = takeFlagValue(a, i, argc, argv);
@@ -365,17 +418,21 @@ parseCliArgs(int argc, char* argv[]) {
             out.warningsAsErrors = true;
             continue;
         }
-        if (a.starts_with("--suppress=")) {
-            auto const codeStr = a.substr(std::string_view{"--suppress="}.size());
-            auto const code = parseSuppressCode(codeStr);
-            if (!code.has_value()) {
-                return std::unexpected(make_error(
-                    CliArgsError::InvalidSuppressCode,
-                    std::string{"--suppress: '"} + std::string{codeStr}
-                    + "' is not a recognized diagnostic-code name or hex value"));
+        {
+            auto eqV = equalsValue(a, "--suppress");
+            if (!eqV) return std::unexpected(eqV.error());
+            if (eqV->has_value()) {
+                auto const codeStr = **eqV;
+                auto const code = parseSuppressCode(codeStr);
+                if (!code.has_value()) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidSuppressCode,
+                        std::string{"--suppress: '"} + std::string{codeStr}
+                        + "' is not a recognized diagnostic-code name or hex value"));
+                }
+                out.suppress.push_back(*code);
+                continue;
             }
-            out.suppress.push_back(*code);
-            continue;
         }
 
         // ── Unknown flag (fail loud) ────────────────────────────
@@ -397,6 +454,20 @@ parseCliArgs(int argc, char* argv[]) {
     }
 
     // ── Post-parse validation ───────────────────────────────────
+    //
+    // `--schema-dir=<path>` is meaningful only in --lsp mode (the LSP
+    // server reads it to locate `*.grammar.json` / `*.target.json` /
+    // `*.format.json` at request-handling time). Outside --lsp the
+    // flag has nowhere to apply; accepting it would silently drop the
+    // user's directive (the LK10 cycle 3 dispatch only reads
+    // `lspSchemaDir` inside `runLspMode`). (silent-failure audit H1
+    // post-fold #1.)
+    if (out.lspSchemaDir.has_value() && !out.lspMode) {
+        return std::unexpected(make_error(
+            CliArgsError::NoModeSelected,
+            "--schema-dir=<path> is only meaningful with --lsp — "
+            "pass --lsp to enter LSP mode"));
+    }
     if (out.helpMode || out.lspMode) {
         // Help + LSP modes don't need compile options.
         return out;
