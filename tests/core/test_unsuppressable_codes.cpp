@@ -216,36 +216,27 @@ TEST(Reporter, WarningsAsErrorsDoesNotMutateUnsuppressableCode) {
            "— producer severity is preserved end-to-end";
 }
 
-TEST(Reporter, ForceReportRespectsUnsuppressableBypassNotJustCap) {
-    // Post-fold #12 test-analyzer Gap 1: forceReport bypasses the
-    // cap but goes through applyPolicy. With the F1 fold,
-    // unsuppressable codes ALSO bypass cap/dedup/maxPerCode/
-    // maxDiagnostics inside report() itself. forceReport's contract
-    // is "bypass cap"; combining with the unsuppressable bypass
-    // means both paths converge — unsuppressable codes always reach
-    // `all_` regardless of which entry point was used. Pin both.
+TEST(Reporter, ForceReportRoutesUnsuppressableThroughApplyPolicyBypass) {
+    // Post-fold #13 code-review fold: the prior test ("...BypassNotJustCap")
+    // was duplicative — `forceReport` bypasses cap unconditionally for
+    // EVERY code (any suppressable code would also have landed). The
+    // load-bearing convergence: when an unsuppressable code is ALSO in
+    // the user's --suppress set, `forceReport` MUST still land it via
+    // applyPolicy's unsuppressable short-circuit. Pre-fix any future
+    // "forceReport really forces everything past suppress" shortcut
+    // would still satisfy this test — the contract pinned is the
+    // unsuppressable predicate is consulted by BOTH entry points.
     DiagnosticReporter::Config cfg;
-    cfg.maxDiagnostics = 1;
+    cfg.policy.suppress.insert(DiagnosticCode::K_SymbolUndefined);
     DiagnosticReporter r{cfg};
-    // Fill the cap to set hitCap_.
-    r.report(makeDiag(DiagnosticCode::P_UnexpectedToken));
-    auto d2 = makeDiag(DiagnosticCode::P_UnknownToken);
-    d2.span = SourceSpan::of(5, 6);
-    r.report(std::move(d2));
-    ASSERT_TRUE(r.hitCap());
-    // forceReport an unsuppressable code — must land.
+    // forceReport an unsuppressable code that's ALSO suppressed —
+    // the unsuppressable gate (inside applyPolicy) wins.
     r.forceReport(makeDiag(DiagnosticCode::K_SymbolUndefined));
-    bool found = false;
-    for (auto const& d : r.all()) {
-        if (d.code == DiagnosticCode::K_SymbolUndefined) {
-            found = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(found)
-        << "forceReport of an unsuppressable code must land in `all_` "
-           "despite cap; both entry points converge through applyPolicy "
-           "which short-circuits for unsuppressable codes";
+    ASSERT_EQ(r.all().size(), 1u)
+        << "forceReport routed through applyPolicy must honor "
+           "the unsuppressable short-circuit even when the code "
+           "is in --suppress; without it the diagnostic would drop";
+    EXPECT_EQ(r.all()[0].code, DiagnosticCode::K_SymbolUndefined);
 }
 
 TEST(Reporter, ForceReportStillDropsRegularSuppressedCode) {

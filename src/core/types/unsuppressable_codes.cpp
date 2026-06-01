@@ -9,7 +9,7 @@ namespace {
 
 // D-FF2-UNSUPP closed-table. Sorted by phase letter (D / F / H / I / K
 // / L / R / A) + numeric value within each phase for at-a-glance
-// audit. The linear scan via `std::ranges::find` is O(N) on N=51
+// audit. The linear scan via `std::ranges::find` is O(N) on N=52
 // members — still faster than hash lookup at this size + needs no
 // static-init dance.
 //
@@ -21,7 +21,7 @@ namespace {
 // D-LK6-8.2 SIGILL surface (D_TargetMachineCodeMismatch /
 // D_TargetAbiModelMismatch) and the LK10 image-write contract
 // (K_ImageWrite* + K_ImageEmpty).
-constexpr std::array<DiagnosticCode, 51> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 52> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -99,9 +99,18 @@ constexpr std::array<DiagnosticCode, 51> kUnsuppressableCodes{{
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating
-    // downstream contracts). All 9 codes fire from arms that gate
+    // downstream contracts). All 10 codes fire from arms that gate
     // the producer's ok() / return value. Suppressing any → silent
     // miscompile through the LIR layer.
+    //
+    // Post-fold #13 silent-failure CRITICAL: L_UnsupportedLoweringForOpcode
+    // (0xB001) is the MIR→LIR analog of H_UnsupportedLoweringForKind —
+    // fires from 22+ sites across mir_to_lir.cpp / lir_callconv.cpp /
+    // lir_2addr_legalize.cpp / lir_pass_util.cpp / lir_verifier.cpp on
+    // every coverage-gap deferral. Was omitted in post-fold #12 →
+    // `--suppress=L_UnsupportedLoweringForOpcode` silently re-opened
+    // the MIR→LIR miscompile surface for unrecognized opcodes.
+    DiagnosticCode::L_UnsupportedLoweringForOpcode,
     DiagnosticCode::L_RequiredLirOpcodeMissing,
     DiagnosticCode::L_VirtualRegInPostRegalloc,
     DiagnosticCode::L_MemOperandMalformed,

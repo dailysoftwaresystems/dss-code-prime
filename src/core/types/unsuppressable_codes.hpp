@@ -50,7 +50,8 @@ namespace dss {
 //     K_NoMatchingObjectFormat, K_FormatLacksImportSupport,
 //     K_RelocationKindMismatch, K_WalkerInputContractViolation
 //     (format-walker dispatch / extern / reloc invariants).
-//   - LIR verifier / lowering structural invariants (9 L_* codes):
+//   - LIR verifier / lowering structural invariants (10 L_* codes):
+//     L_UnsupportedLoweringForOpcode (MIR→LIR coverage-gap fail-loud),
 //     L_RequiredLirOpcodeMissing, L_VirtualRegInPostRegalloc,
 //     L_MemOperandMalformed, L_PhysRegOrdinalOutOfRange,
 //     L_InvalidSpillSlotSentinel, L_MoveCycleUnsupported,
