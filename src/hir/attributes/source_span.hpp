@@ -59,6 +59,23 @@ struct HirSourceLoc {
     [[nodiscard]] static constexpr HirSourceLoc absent() noexcept {
         return {};
     }
+
+    // Stronger predicate: locus is present AND covers at least one byte
+    // of source text. Distinct semantic from `isPresent()`: a caret-
+    // pointer locus (valid buffer + zero-length span) IS present per
+    // the type's contract but does NOT span text. Producers that need
+    // a renderable underline (LSP squiggle, terminal caret-with-text)
+    // ask via `spansText()`; producers that need "is this locus
+    // bindable to a buffer" ask via `isPresent()`.
+    //
+    // D-FF2 type-design Q2 fold: the asymmetry was previously baked
+    // into `firstReportedErrorSpan`'s filter as an inline
+    // `span.length() == 0` check — the named predicate makes the
+    // two-axis distinction explicit so future consumers don't have to
+    // re-derive it.
+    [[nodiscard]] constexpr bool spansText() const noexcept {
+        return isPresent() && span.length() > 0;
+    }
 };
 
 } // namespace dss

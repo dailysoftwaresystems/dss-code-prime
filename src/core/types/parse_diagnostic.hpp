@@ -375,6 +375,21 @@ enum class DiagnosticCode : std::uint16_t {
     //   `H_UnsupportedLoweringForKind`: "remove the initializer", not
     //   "extend the engine".
     H_ExternHasInitializer        = 0xF00A,
+    // H_ExternDeclMalformed: the lowering's defensive arm reached an
+    //   `externDecl` whose CST cannot be navigated to the
+    //   varDeclTail-equivalent subtree — the language config IS
+    //   correct (kindByChild present), but `descend(childPath)`
+    //   returned invalid or a non-Internal node for this particular
+    //   instance. Today's c-subset short-circuits at semantic-error
+    //   time, so this arm is structurally unreachable through shipped
+    //   grammars — but a future grammar permitting recovery shapes
+    //   that reach lowering would trip it. Remediation: fix the input
+    //   (it's incomplete or malformed at this position).
+    //   Distinct from `H_UnsupportedLoweringForKind` (engine config
+    //   error — language hasn't configured kindByChild) and from
+    //   `H_ExternHasInitializer` (user-source init contradiction).
+    //   D-FF2-4 audit H2 fold.
+    H_ExternDeclMalformed         = 0xF00B,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

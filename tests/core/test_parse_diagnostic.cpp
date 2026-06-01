@@ -28,6 +28,7 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_InvalidBreak),        "H_InvalidBreak");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_VerifierFailure),     "H_VerifierFailure");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_ExternHasInitializer), "H_ExternHasInitializer");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_ExternDeclMalformed),  "H_ExternDeclMalformed");
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {

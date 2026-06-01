@@ -2443,26 +2443,38 @@ struct Lowerer {
         // contain no expression nodes. Pre-fix the check walked for
         // `isExprNode` descendants which missed empty-brace inits.
         //
-        // Post-fold #8 silent-failure H1: a source language whose
-        // `externDecl` declaration row has NO `kindByChild` set, OR
-        // whose configured `childPath` doesn't resolve to an Internal
-        // node, would silently bypass the init-check via the
-        // pre-fold-#8 `if (decl.kindByChild)` guard. Defensive fall-
-        // through: when the shape walk can't reach varDeclTail, emit
-        // H_UnsupportedLoweringForKind so a future grammar regression
-        // can't re-open the D-FF2-3 silent-drop. No shipped grammar
-        // trips this today (c-subset configures kindByChild).
-        NodeId const varDeclTail =
-            decl.kindByChild
-                ? descend(node, decl.kindByChild->childPath)
-                : NodeId{};
+        // Post-fold #8 silent-failure H1 + post-fold #9 H2 split:
+        // distinguish "engine-config error" (kindByChild absent → the
+        // language hasn't told the engine HOW to navigate the extern's
+        // tail) from "parse-recovery shape" (kindByChild IS configured
+        // but `descend` returned invalid/non-Internal for THIS
+        // particular CST). Different audiences, different remediations,
+        // different codes:
+        //   - H_UnsupportedLoweringForKind: grammar-author config bug
+        //   - H_ExternDeclMalformed: incomplete/malformed user source
+        // Pre-split both arms collapsed into UnsupportedLoweringForKind
+        // and blamed the grammar config for what could be a recovery
+        // shape. No shipped grammar trips either arm today (c-subset
+        // configures kindByChild + the `if (model.hasErrors()) return`
+        // short-circuit in FF2/lowering paths catches malformed
+        // input upstream), but defensive split prevents either future
+        // surface from re-opening the D-FF2-3 silent-drop.
+        if (!decl.kindByChild) {
+            emitH(DiagnosticCode::H_UnsupportedLoweringForKind, node,
+                  "externDecl rule has no kindByChild configuration — "
+                  "the engine cannot locate the varDeclTail-equivalent "
+                  "subtree to check for an initializer. Configure "
+                  "`kindByChild` in the language's semantics so this "
+                  "extern shape can be lowered safely");
+            return errorNode(node);
+        }
+        NodeId const varDeclTail = descend(node, decl.kindByChild->childPath);
         if (!varDeclTail.valid()
             || tree().kind(varDeclTail) != NodeKind::Internal) {
-            emitH(DiagnosticCode::H_UnsupportedLoweringForKind, node,
-                  "extern declaration's tail subtree cannot be resolved "
-                  "for init-check — the language's externDecl rule must "
-                  "configure `kindByChild` so the engine can locate the "
-                  "varDeclTail-equivalent subtree");
+            emitH(DiagnosticCode::H_ExternDeclMalformed, node,
+                  "extern declaration is incomplete or malformed at "
+                  "this position — the configured kindByChild->childPath "
+                  "could not resolve to an Internal node in this CST");
             return errorNode(node);
         }
         RuleId const skipRule = arraySuffixSkipRule(decl);

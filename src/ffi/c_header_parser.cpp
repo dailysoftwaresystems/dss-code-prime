@@ -135,9 +135,13 @@ emitAndReturn(HeaderReadErrorKind kind, std::string detail,
 firstReportedErrorSpan(std::span<ParseDiagnostic const> diags) noexcept {
     for (auto const& d : diags) {
         if (d.severity != DiagnosticSeverity::Error) continue;
-        if (!d.buffer.valid()) continue;
-        if (d.span.length() == 0) continue;
-        return HirSourceLoc{d.buffer, d.span};
+        HirSourceLoc const loc{d.buffer, d.span};
+        // Post-fold #10 type-design Q2 fold: `spansText()` encodes the
+        // "covering locus, not a caret pointer" requirement the
+        // previous inline `buffer.valid() + length() > 0` checks
+        // expressed implicitly.
+        if (!loc.spansText()) continue;
+        return loc;
     }
     return HirSourceLoc::absent();
 }

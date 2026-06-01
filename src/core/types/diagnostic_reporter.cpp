@@ -1,5 +1,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 
+#include "core/types/unsuppressable_codes.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <format>
@@ -90,6 +92,17 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
+    // D-FF2-4: severity-gating codes bypass ALL policy mutation. Their
+    // emission is structural — suppressing OR demoting via overrides
+    // OR letting warningsAsErrors flip them would each defeat the gate
+    // in a different way. The codes in `kUnsuppressableCodes` are all
+    // emitted at Error severity by their producers; we preserve that
+    // severity end-to-end. Closes the silent-drop surface where
+    // `--suppress=H_ExternHasInitializer` (etc.) re-opened the failure
+    // mode the underlying fold was meant to permanently close.
+    if (isUnsuppressable(d.code)) {
+        return d;
+    }
     if (cfg_.policy.suppress.contains(d.code)) {
         return std::nullopt;
     }

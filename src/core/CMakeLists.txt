@@ -8,6 +8,7 @@ add_library(core OBJECT
     types/scope_kind.cpp
     types/parse_diagnostic.cpp
     types/diagnostic_reporter.cpp
+    types/unsuppressable_codes.cpp
     types/config_path_walk.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
