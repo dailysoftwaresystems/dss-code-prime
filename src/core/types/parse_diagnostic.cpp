@@ -162,6 +162,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_CorruptedBinary:              return "F_CorruptedBinary";
         case DiagnosticCode::F_UnsupportedElfClass:          return "F_UnsupportedElfClass";
         case DiagnosticCode::F_SectionNotFound:              return "F_SectionNotFound";
+        case DiagnosticCode::F_HeaderParseFailed:            return "F_HeaderParseFailed";
+        case DiagnosticCode::F_HeaderHasFunctionBody:        return "F_HeaderHasFunctionBody";
+        case DiagnosticCode::F_HeaderHasNonExternDecl:       return "F_HeaderHasNonExternDecl";
     }
     return "Unknown";
 }

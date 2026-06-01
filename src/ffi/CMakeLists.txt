@@ -1,5 +1,6 @@
 add_library(ffi OBJECT
     binary_reader.cpp
+    c_header_parser.cpp
 )
 
 target_include_directories(ffi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

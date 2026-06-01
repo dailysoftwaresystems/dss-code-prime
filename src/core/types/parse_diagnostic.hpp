@@ -647,6 +647,22 @@ enum class DiagnosticCode : std::uint16_t {
     F_CorruptedBinary              = 0x5005,
     F_UnsupportedElfClass          = 0x5006,
     F_SectionNotFound              = 0x5007,
+    // ── FF2 C header parser (plan 11 §2.3) ──
+    // F_HeaderParseFailed: c-subset frontend rejected the header text
+    //   (tokenize / parse / semantic / lower-to-HIR diagnostics).
+    //   Remediation: fix the source header or extend the c-subset
+    //   grammar to cover the construct.
+    // F_HeaderHasFunctionBody: a non-extern function DEFINITION (with
+    //   `{ ... }` body) appeared at top level. Headers in v1 are
+    //   declaration-only — function bodies belong in `.c` translation
+    //   units, not headers.
+    // F_HeaderHasNonExternDecl: a top-level decl that is neither
+    //   `extern` nor `typedef` (e.g. a bare `int x;` global). Header
+    //   mode accepts only the declaration surface FFI ingestion
+    //   consumes.
+    F_HeaderParseFailed            = 0x5008,
+    F_HeaderHasFunctionBody        = 0x5009,
+    F_HeaderHasNonExternDecl       = 0x500A,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
