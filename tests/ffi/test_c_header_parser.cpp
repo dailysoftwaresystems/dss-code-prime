@@ -222,7 +222,7 @@ TEST(FfiCHeaderParser, ErrorStructCarriesLocationOnRejection) {
     ASSERT_FALSE(rowsOrErr.has_value());
     auto const& err = rowsOrErr.error();
     EXPECT_EQ(err.kind, HeaderReadErrorKind::HeaderHasFunctionBody);
-    EXPECT_TRUE(err.at.buffer.valid())
+    EXPECT_TRUE(err.at.is_present())
         << "HeaderReadError::at.buffer must be valid for per-decl "
            "rejections";
     EXPECT_GT(err.at.span.length(), 0u)
@@ -238,7 +238,7 @@ TEST(FfiCHeaderParser, ErrorStructAtSetForHeaderHasNonExternDecl) {
         "<test>", "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderHasNonExternDecl);
-    EXPECT_TRUE(rowsOrErr.error().at.buffer.valid());
+    EXPECT_TRUE(rowsOrErr.error().at.is_present());
     EXPECT_GT(rowsOrErr.error().at.span.length(), 0u);
 }
 
@@ -255,10 +255,77 @@ TEST(FfiCHeaderParser, ErrorStructAtSetOnLoweringFailure) {
         "<test>", "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
-    EXPECT_TRUE(rowsOrErr.error().at.buffer.valid())
+    EXPECT_TRUE(rowsOrErr.error().at.is_present())
         << "HeaderReadError::at must mirror the underlying lowering "
            "diagnostic's span — F2 fold contract";
     EXPECT_GT(rowsOrErr.error().at.span.length(), 0u);
+}
+
+TEST(FfiCHeaderParser, FirstReportedErrorSpanBoundedToCurrentCall) {
+    // Post-fold #8 self-audit CRITICAL (rewritten post-#8 audit):
+    // concrete consumer is `readCHeaderDirectory` (ingest.cpp loop)
+    // — it reuses ONE reporter across N header reads. Without the
+    // subspan(errStart) bound, file #2's HeaderReadError.at would
+    // inherit file #1's leftover span on the shared reporter.
+    //
+    // Both calls below take the SAME lowering-failure path
+    // (`extern int = ...;`) on the shared reporter; both calls'
+    // diagnostics have spans. Pre-fix, call 2's scan starting at
+    // index 0 would return call 1's H_ExternHasInitializer span
+    // (in <call1>'s buffer). With the subspan bound, call 2's
+    // `at` correctly points into <call2>'s buffer.
+    //
+    // The earlier post-#7 version of this test used EmptyImportLibrary
+    // for call 2, which short-circuits BEFORE the F2 scan — it pinned
+    // a contract that was already true pre-fix. The current shape
+    // genuinely regression-blocks the subspan(errStart) bound.
+    DiagnosticReporter rep;
+
+    auto first = readCHeaderFromText(
+        "extern int x = 5;\n",
+        "<call1>", "libc.so.6", rep);
+    ASSERT_FALSE(first.has_value());
+    ASSERT_TRUE(first.error().at.is_present())
+        << "test setup: call 1 must produce a span-bearing error";
+    auto const call1Buffer = first.error().at.buffer;
+
+    // Call 2 on the SAME reporter, also a lowering-fail with span,
+    // but in a DIFFERENT buffer.
+    auto second = readCHeaderFromText(
+        "extern int y = 7;\n",
+        "<call2>", "libc.so.6", rep);
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(second.error().kind, HeaderReadErrorKind::HeaderParseFailed);
+    ASSERT_TRUE(second.error().at.is_present())
+        << "test setup: call 2 must also produce a span-bearing error";
+    EXPECT_NE(second.error().at.buffer, call1Buffer)
+        << "Call 2's at.buffer must point into <call2>, not <call1>. "
+           "Pre-fix the unbounded scan returned call 1's earlier "
+           "span; this is the genuine regression-blocker for the "
+           "subspan(errStart) bound.";
+}
+
+TEST(FfiCHeaderParser, ErrorStructLocationAbsentEvenWithPriorCallError) {
+    // Companion to the cross-call test: when call 2 takes a path that
+    // legitimately has no decl locus (EmptyImportLibrary entry-point
+    // error), `at` must STILL stay default — call 1's leftover error
+    // on the shared reporter must not leak via any other path.
+    DiagnosticReporter rep;
+
+    auto first = readCHeaderFromText(
+        "extern int x = 5;\n",
+        "<call1>", "libc.so.6", rep);
+    ASSERT_FALSE(first.has_value());
+    ASSERT_TRUE(first.error().at.is_present());
+
+    auto second = readCHeaderFromText(
+        "extern int puts(const char* s);\n",
+        "<call2>", "", rep);
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(second.error().kind, HeaderReadErrorKind::EmptyImportLibrary);
+    EXPECT_FALSE(second.error().at.is_present())
+        << "EmptyImportLibrary is an entry-point error; `at` must "
+           "stay absent regardless of prior reporter contents";
 }
 
 TEST(FfiCHeaderParser, ErrorStructLocationAbsentForEntryPointFailures) {
@@ -273,7 +340,7 @@ TEST(FfiCHeaderParser, ErrorStructLocationAbsentForEntryPointFailures) {
         "<test>", "", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::EmptyImportLibrary);
-    EXPECT_FALSE(rowsOrErr.error().at.buffer.valid())
+    EXPECT_FALSE(rowsOrErr.error().at.is_present())
         << "EmptyImportLibrary is a caller-API entry-point error; "
            "no decl locus exists, so `at.buffer` must be invalid";
 }

@@ -491,43 +491,18 @@ TEST(LirCallconvAbi, CalleeArgReceivesFromArgGprAcrossSysVAndMsX64) {
     ASSERT_NE(cc, nullptr);
     ASSERT_FALSE(cc->argGprs.empty());
 
-    // The cc's argGprs[0] must resolve via schema.registerByName.
     auto const argGpr0Ord =
         bundle.lowered.target->registerByName(cc->argGprs[0]);
     ASSERT_TRUE(argGpr0Ord.has_value());
-
-    // Walk all movs in the post-callconv module and find at least one
-    // whose source is argGprs[0]. This is the arg-materialization mov
-    // (UNLESS regalloc happened to pick argGprs[0] as the home reg,
-    // in which case there's no mov — also a valid outcome).
     auto const movOp =
         bundle.lowered.target->opcodeByMnemonic("mov");
     ASSERT_TRUE(movOp.has_value());
-    bool sawArgGpr0Source = false;
-    bool sawArgGpr0Result = false;
-    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
-        LirFuncId const fn = result.lir.funcAt(fi);
-        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
-            LirBlockId const b = result.lir.funcBlockAt(fn, bi);
-            for (std::uint32_t i = 0; i < result.lir.blockInstCount(b); ++i) {
-                LirInstId const inst = result.lir.blockInstAt(b, i);
-                if (result.lir.instOpcode(inst) != *movOp) continue;
-                LirReg const r = result.lir.instResult(inst);
-                if (r.valid() && r.isPhysical != 0
-                    && r.id == *argGpr0Ord) {
-                    sawArgGpr0Result = true;
-                }
-                for (auto const& op : result.lir.instOperands(inst)) {
-                    if (op.kind == LirOperandKind::Reg
-                        && op.reg.isPhysical != 0
-                        && op.reg.id == *argGpr0Ord) {
-                        sawArgGpr0Source = true;
-                    }
-                }
-            }
-        }
-    }
-    EXPECT_TRUE(sawArgGpr0Source || sawArgGpr0Result)
+
+    // Post-fold #8 simplifier R3 fold: was a 22-line inline mov-walk;
+    // collapses to the shared `anyMovTouchesPhysReg` helper. Either
+    // a mov touches argGprs[0] (as src — the arg copy — or as dest
+    // — the regalloc-picked home).
+    EXPECT_TRUE(anyMovTouchesPhysReg(result.lir, *argGpr0Ord, *movOp))
         << "the arg materialization must touch argGprs[0] ("
         << cc->argGprs[0] << ") either as a mov source (arg copy) "
            "or as the regalloc-picked home reg (no-op skipped mov)";

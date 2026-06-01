@@ -37,6 +37,23 @@ struct HirSourceLoc {
     // Byte range within `buffer`. Defaults to empty; `SourceSpan` is factory-only
     // so there is no other zero-state to spell.
     SourceSpan span = SourceSpan::empty(0);
+
+    // Absence predicate. `buffer.valid()` is the single discriminator — a
+    // non-empty span paired with InvalidBuffer is still semantically absent
+    // (the span couldn't index into any registered buffer); a zero-length
+    // span paired with a valid buffer is still present (caret-pointer at a
+    // token boundary). Consumers should prefer `is_present()` over
+    // `buffer.valid()` at call sites where the question is "do I have a
+    // locus?" — the predicate names the question correctly.
+    [[nodiscard]] constexpr bool is_present() const noexcept {
+        return buffer.valid();
+    }
+    [[nodiscard]] constexpr bool is_absent() const noexcept {
+        return !buffer.valid();
+    }
+    [[nodiscard]] static constexpr HirSourceLoc absent() noexcept {
+        return {};
+    }
 };
 
 } // namespace dss

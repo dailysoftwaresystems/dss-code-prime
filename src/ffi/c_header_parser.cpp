@@ -12,6 +12,7 @@
 
 #include <array>
 #include <fstream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -117,15 +118,42 @@ emitAndReturn(HeaderReadErrorKind kind, std::string detail,
 // struct-side `at` is informative for the LSP / test path. First
 // span-bearing Error wins; later diagnostics are typically cascade
 // reports of the same construct.
+//
+// Post-fold #8 type-design Q4: signature takes `std::span` so the
+// caller bounds the scan to diagnostics emitted DURING this call via
+// `subspan(errStart)`. Pre-fix this was an `offset` parameter on a
+// reporter ref — the span signature is honest about what's scanned
+// AND makes cross-call contamination impossible by construction.
+// `readCHeaderDirectory` (ingest.cpp loop) is the concrete consumer
+// that drove the bound — without it, file #2's HeaderReadError.at
+// would inherit file #1's leftover span on the shared reporter.
+//
+// Zero-length span filter: spans with length==0 are caret-pointer
+// markers (no covered text); filtered as "no useful locus" today.
+// Revisit if a future lowering deliberately emits zero-width spans.
 [[nodiscard]] HirSourceLoc
-firstReportedErrorSpan(DiagnosticReporter const& reporter) noexcept {
-    for (auto const& d : reporter.all()) {
+firstReportedErrorSpan(std::span<ParseDiagnostic const> diags) noexcept {
+    for (auto const& d : diags) {
         if (d.severity != DiagnosticSeverity::Error) continue;
         if (!d.buffer.valid()) continue;
         if (d.span.length() == 0) continue;
         return HirSourceLoc{d.buffer, d.span};
     }
-    return HirSourceLoc{};
+    return HirSourceLoc::absent();
+}
+
+// Post-fold #8 simplifier R4: collapses the two reporter-scan-with-
+// cause sites in `readCHeaderFromText` (semantic-fail wrap +
+// lowering-fail wrap). Mirrors the existing `firstConfigCauseInline`
+// pattern (named helper paired with `emitAndReturn`).
+[[nodiscard]] HeaderReadError
+emitWithFirstReportedCause(HeaderReadErrorKind              kind,
+                           std::string                      detail,
+                           std::span<ParseDiagnostic const> diagsThisCall,
+                           DiagnosticReporter&              reporter) {
+    HirSourceLoc const cause = firstReportedErrorSpan(diagsThisCall);
+    HirSourceLoc const* causePtr = cause.is_present() ? &cause : nullptr;
+    return emitAndReturn(kind, std::move(detail), reporter, causePtr);
 }
 
 [[nodiscard]] std::expected<std::string, HeaderReadError>
@@ -171,6 +199,11 @@ readCHeaderFromText(std::string_view    text,
                     std::string_view    headerPathLabel,
                     std::string_view    importLibrary,
                     DiagnosticReporter& reporter) {
+    // Post-fold #8: snapshot reporter size at entry so the F2
+    // first-Error-span scan is bounded to diagnostics emitted by THIS
+    // call, not by prior callers' leftover diagnostics on the same
+    // shared reporter.
+    std::size_t const errStart = reporter.all().size();
     if (importLibrary.empty()) {
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::EmptyImportLibrary,
@@ -205,17 +238,12 @@ readCHeaderFromText(std::string_view    text,
         reporter.report(d);
     }
     if (model.hasErrors()) {
-        // Silent-failure F2 fold: pick up the first underlying
-        // Error's (buffer, span) so the struct-side `at` mirror is
-        // informative for LSP/test consumers.
-        HirSourceLoc const cause = firstReportedErrorSpan(reporter);
-        HirSourceLoc const* causePtr =
-            cause.buffer.valid() ? &cause : nullptr;
-        return std::unexpected(emitAndReturn(
+        return std::unexpected(emitWithFirstReportedCause(
             HeaderReadErrorKind::HeaderParseFailed,
             std::string{"c-subset frontend rejected header '"}
                 + std::string{headerPathLabel} + "' — see preceding diagnostics.",
-            reporter, causePtr));
+            std::span<ParseDiagnostic const>{reporter.all()}.subspan(errStart),
+            reporter));
     }
 
     auto loweringResult = lowerToHir(model, reporter);
@@ -231,17 +259,12 @@ readCHeaderFromText(std::string_view    text,
             reporter));
     }
     if (!loweringResult->ok) {
-        // Silent-failure F2 fold: thread the lowering diagnostic's
-        // span (e.g. H_ExternHasInitializer's pointer at the init
-        // expr) into the struct-side `at`.
-        HirSourceLoc const cause = firstReportedErrorSpan(reporter);
-        HirSourceLoc const* causePtr =
-            cause.buffer.valid() ? &cause : nullptr;
-        return std::unexpected(emitAndReturn(
+        return std::unexpected(emitWithFirstReportedCause(
             HeaderReadErrorKind::HeaderParseFailed,
             std::string{"CST→HIR lowering rejected header '"}
                 + std::string{headerPathLabel} + "' — see preceding diagnostics.",
-            reporter, causePtr));
+            std::span<ParseDiagnostic const>{reporter.all()}.subspan(errStart),
+            reporter));
     }
 
     Hir const& hir = loweringResult->hir;
