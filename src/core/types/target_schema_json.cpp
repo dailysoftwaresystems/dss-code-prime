@@ -364,6 +364,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll).release());
     }
     data.name = target.at("name").get<std::string>();
+    // Empty `name` would be silently accepted by the closed-enum
+    // cross-validation at the driver tier (lookupTargetArch returns
+    // nullptr → skip), reopening the SIGILL surface D-LK6-8.2 was
+    // anchored to close. Reject at load time. (silent-failure CRITICAL-2
+    // post-fold #1 — D-LK6-8.2 audit.)
+    if (data.name.empty()) {
+        coll.emit(DiagnosticCode::C_MissingField, "/target/name",
+                  "'name' must be a non-empty string — an empty target "
+                  "name would silently bypass the (target, format) "
+                  "machine cross-check (plan 14 §3.1 D-LK6-8.2).");
+        return std::unexpected(std::move(coll).release());
+    }
     if (target.contains("version") && target.at("version").is_string()) {
         data.version = target.at("version").get<std::string>();
     }

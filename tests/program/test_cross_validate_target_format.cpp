@@ -59,6 +59,42 @@ makeElfFormat(std::uint16_t machine) {
     return *r;
 }
 
+// Synthesize a PE ObjectFormatSchema with a given machine code.
+std::shared_ptr<ObjectFormatSchema const>
+makePeFormat(std::uint16_t machine) {
+    std::string const json = std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"synth-pe","kind":"pe"},
+      "pe": {"machine": )"} + std::to_string(machine) + R"(}
+    })";
+    auto r = ObjectFormatSchema::loadFromText(json);
+    if (!r.has_value()) {
+        std::string s;
+        for (auto const& d : r.error()) s += d.message + "\n";
+        ADD_FAILURE() << "format load failed: " << s;
+        return nullptr;
+    }
+    return *r;
+}
+
+// Synthesize a Mach-O ObjectFormatSchema with a given cputype.
+std::shared_ptr<ObjectFormatSchema const>
+makeMachOFormat(std::uint32_t cputype) {
+    std::string const json = std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"synth-macho","kind":"macho"},
+      "macho": {"cputype": )"} + std::to_string(cputype) + R"(}
+    })";
+    auto r = ObjectFormatSchema::loadFromText(json);
+    if (!r.has_value()) {
+        std::string s;
+        for (auto const& d : r.error()) s += d.message + "\n";
+        ADD_FAILURE() << "format load failed: " << s;
+        return nullptr;
+    }
+    return *r;
+}
+
 bool sawCode(DiagnosticReporter const& rep, DiagnosticCode code) {
     for (auto const& d : rep.all()) {
         if (d.code == code) return true;
@@ -177,4 +213,103 @@ TEST(CrossValidateTargetFormat, DTargetFormatMismatchNameRoundTrip) {
               "D_TargetFormatMismatch");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_TargetFormatMismatch),
               "D000C");
+}
+
+// ── Post-fold #1 (pr-test-analyzer P9): PE arm coverage ──────
+
+TEST(CrossValidateTargetFormat, X86_64PeMatches) {
+    auto target = makeTarget("x86_64");
+    auto format = makePeFormat(0x8664);
+    ASSERT_TRUE(target && format);
+    DiagnosticReporter rep;
+    EXPECT_TRUE(crossValidateTargetFormat(*target, *format, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(CrossValidateTargetFormat, Arm64TargetWithX86_64PeFailsLoud) {
+    auto target = makeTarget("arm64");
+    auto format = makePeFormat(0x8664);
+    ASSERT_TRUE(target && format);
+    DiagnosticReporter rep;
+    EXPECT_FALSE(crossValidateTargetFormat(*target, *format, rep));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+}
+
+// ── Post-fold #1 (pr-test-analyzer P9): Mach-O arm coverage ───
+
+TEST(CrossValidateTargetFormat, X86_64MachOMatches) {
+    auto target = makeTarget("x86_64");
+    auto format = makeMachOFormat(0x01000007);
+    ASSERT_TRUE(target && format);
+    DiagnosticReporter rep;
+    EXPECT_TRUE(crossValidateTargetFormat(*target, *format, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(CrossValidateTargetFormat, Arm64TargetWithX86_64MachOFailsLoud) {
+    auto target = makeTarget("arm64");
+    auto format = makeMachOFormat(0x01000007);
+    ASSERT_TRUE(target && format);
+    DiagnosticReporter rep;
+    EXPECT_FALSE(crossValidateTargetFormat(*target, *format, rep));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+}
+
+// ── Post-fold #1 (silent-failure CRITICAL-1): abiModel cross-check ──
+
+TEST(CrossValidateTargetFormat, RegisterMachineWithWasmFormatFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto wasm = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"synth-wasm","kind":"wasm"}
+    })");
+    ASSERT_TRUE(wasm.has_value());
+
+    DiagnosticReporter rep;
+    EXPECT_FALSE(crossValidateTargetFormat(**target, **wasm, rep));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+}
+
+TEST(CrossValidateTargetFormat, RegisterMachineWithSpirvFormatFailsLoud) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto spirv = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"synth-spirv","kind":"spirv"}
+    })");
+    ASSERT_TRUE(spirv.has_value());
+
+    DiagnosticReporter rep;
+    EXPECT_FALSE(crossValidateTargetFormat(**target, **spirv, rep));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+}
+
+// ── Post-fold #1 (CRITICAL-2): empty target name rejected at load ─
+
+TEST(TargetSchemaLoader, EmptyTargetNameRejected) {
+    auto r = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":""},
+      "opcodes": [ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── Post-fold #1: shipped PE / Mach-O cross-validate cleanly ──
+
+TEST(CrossValidateTargetFormat, ShippedX86_64PeMatches) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    auto format = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(target.has_value() && format.has_value());
+    DiagnosticReporter rep;
+    EXPECT_TRUE(crossValidateTargetFormat(**target, **format, rep));
+}
+
+TEST(CrossValidateTargetFormat, ShippedX86_64MachOMatches) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    auto format = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(target.has_value() && format.has_value());
+    DiagnosticReporter rep;
+    EXPECT_TRUE(crossValidateTargetFormat(**target, **format, rep));
 }

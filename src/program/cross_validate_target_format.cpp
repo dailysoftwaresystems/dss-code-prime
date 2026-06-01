@@ -25,6 +25,27 @@ constexpr std::array<TargetArchMachineCodes, 2> kTargetArchMachineCodes{{
     { "arm64",  183u, 0xAA64u, 0x0100000Cu },
 }};
 
+// Static uniqueness check: `lookupTargetArch` returns the FIRST
+// match by linear scan, so a duplicate `targetName` row (paste-error
+// from adding a 3rd arch) would silently be dead code while the
+// first row served as the sole authority. Catch the typo at compile
+// time. (silent-failure HIGH-1 post-fold #1.)
+consteval bool targetArchNamesAreUnique() {
+    for (std::size_t i = 0; i < kTargetArchMachineCodes.size(); ++i) {
+        for (std::size_t j = i + 1; j < kTargetArchMachineCodes.size(); ++j) {
+            if (kTargetArchMachineCodes[i].targetName
+                == kTargetArchMachineCodes[j].targetName) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+static_assert(targetArchNamesAreUnique(),
+              "kTargetArchMachineCodes contains duplicate targetName "
+              "rows. lookupTargetArch returns the FIRST match, so a "
+              "duplicate row is dead code that masks a paste-error.");
+
 [[nodiscard]] TargetArchMachineCodes const*
 lookupTargetArch(std::string_view targetName) noexcept {
     for (auto const& row : kTargetArchMachineCodes) {
@@ -62,9 +83,59 @@ targetArchMachineCodesTable() noexcept {
     return {kTargetArchMachineCodes.data(), kTargetArchMachineCodes.size()};
 }
 
+// ABI-model ↔ format-kind compatibility (silent-failure CRITICAL-1
+// post-fold #1). The previous version of this file claimed `abiModel()`
+// gated WASM/SPIR-V compatibility "upstream" but no consumer ever read
+// the field. Result: a `RegisterMachine` x86_64 target paired with a
+// WASM format silently passed through cross-validate, reached
+// `compileSingleUnit`, and the WASM walker had no awareness of the
+// register-machine LIR shape. The check below makes the claim real.
+//
+// Closed-enum dispatch on the target's abi-model:
+//   RegisterMachine → Elf / Pe / MachO are valid; Wasm / Spirv reject.
+//   OperandStack    → Wasm valid; everything else rejects.
+//   ResultId        → Spirv valid; everything else rejects.
+[[nodiscard]] bool
+abiModelMatchesFormatKind(TargetAbiModel abi, ObjectFormatKind kind) noexcept {
+    switch (abi) {
+        case TargetAbiModel::RegisterMachine:
+            return kind == ObjectFormatKind::Elf
+                || kind == ObjectFormatKind::Pe
+                || kind == ObjectFormatKind::MachO
+                || kind == ObjectFormatKind::Unknown;  // defer to linker
+        case TargetAbiModel::OperandStack:
+            return kind == ObjectFormatKind::Wasm
+                || kind == ObjectFormatKind::Unknown;
+        case TargetAbiModel::ResultId:
+            return kind == ObjectFormatKind::Spirv
+                || kind == ObjectFormatKind::Unknown;
+    }
+    return false;  // unreachable per closed enum
+}
+
 bool crossValidateTargetFormat(TargetSchema const&       target,
                                 ObjectFormatSchema const& format,
                                 DiagnosticReporter&       reporter) {
+    // ABI-model ↔ format-kind cross-check (CRITICAL-1 post-fold #1).
+    // Catches `RegisterMachine` target paired with Wasm/Spirv format
+    // AND `OperandStack`/`ResultId` target paired with native format.
+    // This MUST run before the per-arch machine-code check below —
+    // WASM/SPIR-V skip the machine check (no machine field), so a
+    // mismatched abi-model would slip past the table lookup silently.
+    if (!abiModelMatchesFormatKind(target.abiModel(), format.kind())) {
+        dss::report(reporter, DiagnosticCode::D_TargetFormatMismatch,
+                    DiagnosticSeverity::Error,
+                    std::format("target '{}' declares abiModel='{}' "
+                                "but the format schema has kind='{}'. "
+                                "Register-machine targets require ELF/PE/Mach-O; "
+                                "operand-stack requires WASM; result-id requires "
+                                "SPIR-V. Anchored: plan 14 §3.1 D-LK6-8.2.",
+                                target.name(),
+                                targetAbiModelName(target.abiModel()),
+                                objectFormatKindName(format.kind())));
+        return false;
+    }
+
     auto const* row = lookupTargetArch(target.name());
     if (row == nullptr) {
         // Target not in the cross-check table. Defer to format-side
