@@ -195,6 +195,75 @@ TEST(Reporter, UnsuppressableBypassesDedupWindow) {
            "the second image-write failure carries distinct signal";
 }
 
+TEST(Reporter, WarningsAsErrorsDoesNotMutateUnsuppressableCode) {
+    // Post-fold #12 test-analyzer Gap 5: warningsAsErrors completes
+    // the policy-trifecta. Today no unsuppressable code is emitted
+    // at Warning severity (the closed-table is all Error producers),
+    // but a future regression could (e.g. demote H_TypeUnresolved to
+    // Warning at producer). applyPolicy must preserve the producer
+    // severity end-to-end — the unsuppressable short-circuit fires
+    // BEFORE the warningsAsErrors flip.
+    DiagnosticReporter::Config cfg;
+    cfg.policy.warningsAsErrors = true;
+    DiagnosticReporter r{cfg};
+    // Synthesize a Warning-severity unsuppressable diagnostic.
+    auto d = makeDiag(DiagnosticCode::H_TypeUnresolved,
+                      DiagnosticSeverity::Warning);
+    r.report(std::move(d));
+    ASSERT_EQ(r.all().size(), 1u);
+    EXPECT_EQ(r.all()[0].severity, DiagnosticSeverity::Warning)
+        << "warningsAsErrors must not promote an unsuppressable code "
+           "— producer severity is preserved end-to-end";
+}
+
+TEST(Reporter, ForceReportRespectsUnsuppressableBypassNotJustCap) {
+    // Post-fold #12 test-analyzer Gap 1: forceReport bypasses the
+    // cap but goes through applyPolicy. With the F1 fold,
+    // unsuppressable codes ALSO bypass cap/dedup/maxPerCode/
+    // maxDiagnostics inside report() itself. forceReport's contract
+    // is "bypass cap"; combining with the unsuppressable bypass
+    // means both paths converge — unsuppressable codes always reach
+    // `all_` regardless of which entry point was used. Pin both.
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    DiagnosticReporter r{cfg};
+    // Fill the cap to set hitCap_.
+    r.report(makeDiag(DiagnosticCode::P_UnexpectedToken));
+    auto d2 = makeDiag(DiagnosticCode::P_UnknownToken);
+    d2.span = SourceSpan::of(5, 6);
+    r.report(std::move(d2));
+    ASSERT_TRUE(r.hitCap());
+    // forceReport an unsuppressable code — must land.
+    r.forceReport(makeDiag(DiagnosticCode::K_SymbolUndefined));
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "forceReport of an unsuppressable code must land in `all_` "
+           "despite cap; both entry points converge through applyPolicy "
+           "which short-circuits for unsuppressable codes";
+}
+
+TEST(Reporter, ForceReportStillDropsRegularSuppressedCode) {
+    // Companion to the above: forceReport bypasses CAPS but does
+    // still consult applyPolicy. A normal suppressable code that's
+    // in the suppress set must still be dropped under forceReport.
+    // Pre-fix any forceReport-shortcut around applyPolicy would
+    // silently emit suppressed codes — a regression class we pin.
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::P_DeprecatedSyntax);
+    DiagnosticReporter r{cfg};
+    r.forceReport(makeDiag(DiagnosticCode::P_DeprecatedSyntax,
+                           DiagnosticSeverity::Warning));
+    EXPECT_EQ(r.all().size(), 0u)
+        << "forceReport routes through applyPolicy; suppressed normal "
+           "codes still drop";
+}
+
 TEST(Reporter, NormalCodeSuppressedAlongsideUnsuppressableInSameReporter) {
     // Co-existence: suppressing a regular code on the same reporter must
     // still drop the regular code while leaving the unsuppressable one

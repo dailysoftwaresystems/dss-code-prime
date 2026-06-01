@@ -44,8 +44,26 @@ namespace dss {
 //     H_VerifierFailure, H_TypeUnresolved + ALL 12 I_* MIR-verifier
 //     codes (frozen-module structural / SSA / dominance invariants).
 //   - Linker fail-loud (image refused / undefined extern / image-
-//     write contract violation): K_SymbolUndefined, K_ImageNotOk,
-//     K_ImageEmpty + 4 K_ImageWrite* codes (LK10 contract).
+//     write contract violation / format-walker invariants):
+//     K_SymbolUndefined, K_ImageNotOk, K_ImageEmpty + 4
+//     K_ImageWrite* codes (LK10 contract), plus
+//     K_NoMatchingObjectFormat, K_FormatLacksImportSupport,
+//     K_RelocationKindMismatch, K_WalkerInputContractViolation
+//     (format-walker dispatch / extern / reloc invariants).
+//   - LIR verifier / lowering structural invariants (9 L_* codes):
+//     L_RequiredLirOpcodeMissing, L_VirtualRegInPostRegalloc,
+//     L_MemOperandMalformed, L_PhysRegOrdinalOutOfRange,
+//     L_InvalidSpillSlotSentinel, L_MoveCycleUnsupported,
+//     L_IndirectCallUnsupported, L_StackPassedArgUnsupported,
+//     L_CcRegLookupFailed.
+//   - Regalloc Error-severity invariants (3 R_* codes; Info-
+//     severity spillage codes intentionally OUT):
+//     R_NoCallingConventions, R_CallingConventionLookupFailed,
+//     R_VRegHasNoClass.
+//   - Assembler / encoding bytes-on-disk invariants (5 A_* codes):
+//     A_LirToMirSizeMismatch, A_NoMatchingEncodingVariant,
+//     A_RoundTripMismatch, A_NoEncodingDeclared,
+//     A_NoEncodingShapeWalker.
 //
 // Adding a code here is a commitment: this code's emission MUST be visible
 // to the build pipeline regardless of any --suppress policy. New entries

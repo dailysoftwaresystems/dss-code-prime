@@ -2471,10 +2471,18 @@ struct Lowerer {
         NodeId const varDeclTail = descend(node, decl.kindByChild->childPath);
         if (!varDeclTail.valid()
             || tree().kind(varDeclTail) != NodeKind::Internal) {
+            // Post-fold #12 D-FF2-MSG-JARGON: user-facing message
+            // names the user-source problem ("incomplete declaration")
+            // not the engine internals ("kindByChild->childPath",
+            // "Internal node", "CST"). The diagnostic infrastructure
+            // already carries the source span for the user to inspect.
             emitH(DiagnosticCode::H_ExternDeclMalformed, node,
                   "extern declaration is incomplete or malformed at "
-                  "this position — the configured kindByChild->childPath "
-                  "could not resolve to an Internal node in this CST");
+                  "this position — the declaration's body structure "
+                  "could not be located; check that the declaration "
+                  "is complete (e.g. `extern int x;` without an "
+                  "initializer, or `extern int f(int);` for a "
+                  "function declaration)");
             return errorNode(node);
         }
         RuleId const skipRule = arraySuffixSkipRule(decl);

@@ -188,7 +188,12 @@ emitWithFirstReportedCause(HeaderReadErrorKind              kind,
                            std::span<ParseDiagnostic const> diagsThisCall,
                            DiagnosticReporter&              reporter) {
     HirSourceLoc const cause = firstReportedErrorSpan(diagsThisCall);
-    HirSourceLoc const* causePtr = cause.isPresent() ? &cause : nullptr;
+    // Post-fold #12 F3: producer-consumer symmetry — firstReportedErrorSpan
+    // filters by `spansText()` (covering locus, not caret), so the consumer
+    // tests the same predicate. Pre-fix the consumer used `isPresent()`
+    // which would have accepted a caret-only locus if a future producer
+    // ever returned one — a defensive harmonization, not a current bug.
+    HirSourceLoc const* causePtr = cause.spansText() ? &cause : nullptr;
     if (causePtr == nullptr) {
         std::string const inlined =
             firstReportedErrorCauseInline(diagsThisCall);

@@ -308,9 +308,24 @@ enum class DiagnosticCode : std::uint16_t {
     // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
     // Emitted by the language-agnostic HIR verifier (`src/hir/hir_verifier`) and
-    // (later) the CST→HIR lowering. Reserved for verifier-/lowering-time
-    // failures only — config-load errors in a `hirLowering` block use the C_*
-    // band (plan §4 Q8). Append, never renumber.
+    // the CST→HIR lowering (`src/hir/lowering/cst_to_hir.cpp`). Reserved for
+    // failures DISCOVERED during the HIR verifier or lowering phases —
+    // regardless of root cause:
+    //   - engine config bugs (e.g. H_UnsupportedLoweringForKind: the
+    //     language's hirLowering config has no mapping for a CST rule;
+    //     H_ExternDeclMalformed: kindByChild's childPath cannot navigate
+    //     to the expected subtree);
+    //   - user-source contradictions discovered at lowering (e.g.
+    //     H_ExternHasInitializer: `extern int x = 5;` is a structural
+    //     contradiction the parser accepts but lowering rejects);
+    //   - verifier-time structural invariant breaches (e.g.
+    //     H_TypeUnresolved, H_VerifierFailure).
+    // Config-load errors in a `hirLowering` block (i.e. failures BEFORE any
+    // verifier/lowering runs) use the C_* band (plan §4 Q8). Append, never
+    // renumber.
+    // (Post-fold #12 D-FF2-CODE-BAND-SEMANTICS: header explicitly
+    // acknowledges the mixed-audience nature — engine bugs vs user-source
+    // bugs — so a future code lands without re-litigating band placement.)
     // H_TypeUnresolved: an expression / TypeRef / VarDecl node whose `typeId` is
     //   not valid() — i.e. lowering/semantic analysis failed to resolve its type.
     //   A node already flagged `HirFlags::HasError` is skipped (cascade
