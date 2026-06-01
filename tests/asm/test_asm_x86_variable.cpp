@@ -972,6 +972,9 @@ TEST(X86VariableEncoder, AddRspImm32EmitsExactEpilogueBytes) {
     EXPECT_EQ(bytes[1], 0x81);
     EXPECT_EQ(bytes[2], 0xC4);
     EXPECT_EQ(bytes[3], 0x20);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
 }
 
 TEST(X86VariableEncoder, LoadFromRspForcesSibByte) {
@@ -1032,6 +1035,9 @@ TEST(X86VariableEncoder, LoadFromRbpEmitsNoSibByte) {
     EXPECT_EQ(bytes[1], 0x8B);
     EXPECT_EQ(bytes[2], 0x8D);  // mod=10 reg=rcx(1) rm=rbp(5) — no SIB; 0x80|0x08|0x05
     EXPECT_EQ(bytes[3], 0x10);
+    EXPECT_EQ(bytes[4], 0x00);  // disp32 LE bytes 1-3 must all be 0
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
 }
 
 TEST(X86VariableEncoder, StoreToRspForcesSibByte) {
@@ -1062,6 +1068,9 @@ TEST(X86VariableEncoder, StoreToRspForcesSibByte) {
     EXPECT_EQ(bytes[2], 0x94);  // mod=10 reg=rdx(2) rm=rsp(4) → 0x80|0x10|0x04
     EXPECT_EQ(bytes[3], 0x24);
     EXPECT_EQ(bytes[4], 0x08);
+    EXPECT_EQ(bytes[5], 0x00);  // disp32 LE bytes 1-3 must all be 0
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
 }
 
 TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {
@@ -1093,6 +1102,44 @@ TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {
     EXPECT_EQ(bytes[2], 0x84);  // mod=10 reg=rax(0) rm=r12.lo3(4) → 0x80|0x00|0x04
     EXPECT_EQ(bytes[3], 0x24);
     EXPECT_EQ(bytes[4], 0x10);
+    EXPECT_EQ(bytes[5], 0x00);  // disp32 LE bytes 1-3 must all be 0
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LoadFromRbxEmitsNoSibByte) {
+    // Negative-test for non-rsp/r12-family base. `mov rax, [rbx+0x10]`
+    // → 48 8B 43 10 00 00 00 — rbx.lo3 = 3, NOT in {4} (rsp/r12 family),
+    // so NO SIB byte is forcibly emitted. Sister test to
+    // `LoadFromRbpEmitsNoSibByte` (rbp.lo3 = 5) — together they pin
+    // that the SIB-forced rule fires ONLY for lo3 == 4.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x10),
+        };
+        (void)b.addInst(*loadOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8B);
+    EXPECT_EQ(bytes[2], 0x83);  // mod=10 reg=rax(0) rm=rbx(3) → 0x80|0x00|0x03
+    EXPECT_EQ(bytes[3], 0x10);  // disp32 byte 0 — no SIB intervening
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
 }
 
 TEST(X86VariableEncoder, NegativeDispEmitsAsTwosComplement) {

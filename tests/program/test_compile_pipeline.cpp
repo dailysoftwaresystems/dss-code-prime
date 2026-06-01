@@ -157,14 +157,16 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
         "c-subset",
         {"x86_64:elf64-x86_64-linux"});
 
-    // D-LK10-2 closed at AS load/store + ret/add/sub-imm32 cycle
-    // (2026-06-01). The full driver pipeline now produces a real
-    // ELF .o file with `\x7fELF` magic for a zero-arg c-subset
-    // function. Plan 12 ML7 cycle 2 closed the IR-tier half
-    // (arg + call + ret virtual-op materialization); plan 13 AS
-    // cycle (D-AS4-1) closed the encoder half (load/store with
-    // [base+disp32] addressing + ret with optional-reg operand +
-    // add/sub reg+imm32 for prologue/epilogue SP adjustment).
+    // D-LK10-2 closed 2026-06-01 (commit `a22286f`). The full driver
+    // pipeline now produces a real ELF .o file with `\x7fELF` magic
+    // for a zero-arg c-subset function. Plan 12 ML7 cycle 2 closed
+    // the IR-tier half (arg + call + ret virtual-op materialization);
+    // plan 13 AS cycle (D-AS4-1 partial close — `[base+disp32]` form)
+    // closed the encoder half (load/store with `[base+disp32]`
+    // addressing + add/sub reg+imm32 for prologue/epilogue SP
+    // adjustment). The remaining D-AS4-1 sub-items (`lea` encoding,
+    // indexed/scaled addressing — D-AS4-5, Disp8 form) are unrelated
+    // to the c-subset zero-arg corpus and stay deferred.
     auto const outDir = scratch.path() / "target" / "elf64-x86_64-linux";
     ASSERT_TRUE(fs::is_directory(outDir));
     ASSERT_EQ(rc, 0)

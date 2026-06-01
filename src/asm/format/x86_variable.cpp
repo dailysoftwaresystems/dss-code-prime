@@ -75,6 +75,9 @@ struct EncodingState {
     // Addressing mode for the ModR/M.mod field. RegDirect (mod=11)
     // is the cycle-1 register-only shape; MemDisp32 (mod=10) emits
     // a 32-bit displacement and forces SIB when base.lo3 == 4.
+    // Values chosen so `static_cast<uint8_t>(modMode)` IS the ModR/M.mod
+    // field directly (no lookup table needed). RegDirect = 11b (mod=3);
+    // MemDisp32 = 10b (mod=2 + 32-bit displacement follows).
     enum class ModMode : std::uint8_t { RegDirect = 0b11, MemDisp32 = 0b10 };
     ModMode               modMode    = ModMode::RegDirect;
     // Memory-mode 32-bit displacement (from a Disp32Mem slot —
@@ -511,6 +514,22 @@ bool encode(Lir const&                  lir,
             return false;
         }
         asm_byte_emit::appendImm32LE(out, *st.disp32Mem);
+    } else if (st.disp32Mem.has_value()) {
+        // Symmetric guard (silent-failure-hunter F1 post-fold): a
+        // schema that wires `Disp32Mem` but uses `ModRmRm` (register-
+        // direct) instead of `ModRmRmMem` would silently stash the
+        // displacement in EncodingState and never emit it. The forward
+        // direction is caught above; this is the inverse. Fail loud
+        // rather than drop bytes silently — anchored as belt-and-
+        // suspenders against a future malformed schema variant.
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': variant wires Disp32Mem but "
+                           "uses register-direct ModR/M mode (no "
+                           "ModRmRmMem wire) — the displacement would "
+                           "be silently dropped; schema is malformed",
+                           info->mnemonic));
+        return false;
     }
 
     // 7) Immediates: append in slot-wiring order.

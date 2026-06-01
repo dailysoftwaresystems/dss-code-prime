@@ -377,22 +377,33 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // legalize-pass "operand 0 IS the destination" assumption
             // there would silently route the destination to a
             // non-destination position.
+            // Destination-bearing slot taxonomy:
+            //   * ModRmReg — x86 register-direct destination (mod=11
+            //     + reg field carries the dest's hwEncoding).
+            //   * ModRmRm — x86 register-direct destination via rm
+            //     field (the `requires2Address: true` 2-addr shape
+            //     where operand 0 IS the dest).
+            //   * ModRmRmMem — x86 memory destination (mod=10 + rm
+            //     field carries the base reg). The 2-addr shape's
+            //     arithmetic-to-memory form (e.g. a future `add
+            //     r/m64, imm32` with a memory dest) routes here.
+            //   * Rd — fixed32 destination.
+            //
+            // Disp32Mem and MemBaseScale are NEVER destinations:
+            // Disp32Mem carries the displacement VALUE (an immediate);
+            // MemBaseScale carries the shape (validates scale==1).
+            // Excluding them here is intentional.
+            //
+            // D-LK10-2 post-fold (silent-failure F-G1): omitting
+            // ModRmRmMem would cause future memory-destination 2-addr
+            // forms to silently fail rule-G validation with a
+            // misleading "destination would be silently dropped"
+            // message.
             auto const isDestSlot = [](EncodingSlotKind s) noexcept {
                 return s == EncodingSlotKind::ModRmReg
                     || s == EncodingSlotKind::ModRmRm
                     || s == EncodingSlotKind::ModRmRmMem
                     || s == EncodingSlotKind::Rd;
-                // ModRmRmMem IS a destination slot when an opcode
-                // is `requires2Address: true` AND its operand 0 is
-                // a memory destination (e.g. a future `add r/m64,
-                // imm32` arithmetic-to-memory form). Disp32Mem +
-                // MemBaseScale are NEVER destinations (the first
-                // carries the displacement value, the second
-                // carries the scale shape) — exclude them. (D-AS4-1
-                // post-fold: silent-failure F-G1 — without this
-                // addition, future memory-destination 2-addr forms
-                // silently fail rule-G validation with a misleading
-                // "destination would be silently dropped" message.)
             };
             bool const has2AddrDestWire = o.requires2Address
                 && std::any_of(v.wires.begin(), v.wires.end(),
