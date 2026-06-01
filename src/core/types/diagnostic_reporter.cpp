@@ -92,7 +92,7 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
-    // D-FF2-4: severity-gating codes bypass ALL policy mutation. Their
+    // D-FF2-UNSUPP: severity-gating codes bypass ALL policy mutation. Their
     // emission is structural — suppressing OR demoting via overrides
     // OR letting warningsAsErrors flip them would each defeat the gate
     // in a different way. The codes in `kUnsuppressableCodes` are all

@@ -7,7 +7,7 @@
 #include <string>
 #include <unordered_set>
 
-// D-FF2-4 closed-table pins.
+// D-FF2-UNSUPP closed-table pins.
 //
 // PINS the contract that severity-gating codes (architectural exclusions,
 // pending-plan announcements, lowering / verifier / linker invariants)
@@ -15,7 +15,7 @@
 // --suppress / overrides / warningsAsErrors. Without these pins, a
 // regression that drops the `isUnsuppressable` gate would silently
 // re-open the silent-drop surface every such code was introduced to
-// close — exactly the bug class D-FF2-4 closes.
+// close — exactly the bug class D-FF2-UNSUPP closes.
 
 using namespace dss;
 

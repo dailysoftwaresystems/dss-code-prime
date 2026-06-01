@@ -388,7 +388,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   Distinct from `H_UnsupportedLoweringForKind` (engine config
     //   error — language hasn't configured kindByChild) and from
     //   `H_ExternHasInitializer` (user-source init contradiction).
-    //   D-FF2-4 audit H2 fold.
+    //   D-FF2 H2 audit fold (post-fold #8/#9).
     H_ExternDeclMalformed         = 0xF00B,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
