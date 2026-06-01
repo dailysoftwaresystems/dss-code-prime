@@ -37,11 +37,28 @@
 // scope), and a `diagPrefix` that fronts every diagnostic with the
 // format's identity.
 //
-// Patch formula (uniform across all 3 formats):
-//   value = S + A + (pcRelative ? -P : 0) + addendBias
+// Patch formula dispatched on `TargetRelocationInfo::formulaKind`
+// (D-LK6-1 closure — 2026-06-01):
+//   * Linear:                value = S + A + (pcRelative ? -P : 0) + addendBias
+//                            written `widthBytes` LE into `text` at the patch site.
+//                            Covers x86_64 rel32 / abs32 / abs64 + ARM64 abs64.
+//   * Aarch64Call26:         value = (S + A - P) >> 2; signed 26-bit;
+//                            OR (value & 0x03FFFFFF) into the 32-bit
+//                            instruction word at `text[patchOff..+4]`.
+//   * Aarch64AdrPrelPgHi21:  value = ((S + A) >> 12) - (P >> 12);
+//                            signed 21-bit; ADRP-split bits[1:0]→immlo[30:29],
+//                            bits[20:2]→immhi[23:5].
+//   * Aarch64AddAbsLo12:     value = (S + A) & 0xFFF;
+//                            OR (value << 10) into ADD imm12 [21:10].
+//
 // where S = `symbolVa[target]`, A = `Relocation::addend`,
-// P = `patchSectionVa + funcStart + Relocation::offset`. The
-// `value` is written `widthBytes` LE into `text` at the patch site.
+// P = `patchSectionVa + funcStart + Relocation::offset`.
+//
+// The non-Linear variants READ the 32-bit instruction word from
+// `text` (the assembler emitted the opcode + zero immediate field),
+// OR the computed value into the appropriate bitfield, and write
+// the modified word back. This contrasts with Linear which simply
+// OVERWRITES `widthBytes` bytes.
 //
 // Fail-loud guards (each surfaces as a single diagnostic and
 // returns false):
@@ -118,16 +135,16 @@ namespace dss::link::format {
                              "target schema.");
                 return false;
             }
-            // (3) widthBytes != 0 (non-linear formulas — D-LK6-1)
+            // (3) widthBytes != 0 — every formula kind has a fixed
+            //     write width; widthBytes==0 means the JSON declared
+            //     no width (pre-D-LK6-1 placeholder) or the loader
+            //     misconfigured the row.
             if (tri->widthBytes == 0) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      prefixStr + ": relocation '" + tri->name
-                           + "' has no structured-formula widthBytes "
-                             "— the formula needs a non-linear "
-                             "transform (mask / shift / bit-field) "
-                             "the LK6 cycle 1 linear shape cannot "
-                             "express. Anchored: plan 14 §3.1 "
-                             "D-LK6-1.");
+                           + "' has widthBytes=0 — JSON loader must "
+                             "set 4 or 8 for Linear and 4 for non-"
+                             "Linear formula kinds.");
                 return false;
             }
             // (4) patch fits inside originating function's bytes
@@ -144,41 +161,144 @@ namespace dss::link::format {
                            + " — would overrun adjacent function.");
                 return false;
             }
-            // (5) compute value — S is absolute (caller pre-computed
-            //     the symbol VA, which may live in `.text` for
-            //     functions or `.idata` / GOT / __got for externs);
-            //     P is the patch site VA, always inside the
-            //     `patchSectionVa` section in cycle 2a scope.
+            // (5) compute & apply per formula kind. S is absolute
+            //     (caller pre-computed the symbol VA, which may live
+            //     in `.text` for functions or `.idata` / GOT / __got
+            //     for externs); P is the patch site VA, always inside
+            //     the `patchSectionVa` section in cycle 2a scope.
             std::uint64_t const patchOff = fnStart + rel.offset;
             std::uint64_t const S = tIt->second;
             std::int64_t  const A = rel.addend;
             std::uint64_t const P = patchSectionVa + patchOff;
-            std::int64_t  const value =
-                static_cast<std::int64_t>(S) + A
-                + (tri->pcRelative ? -static_cast<std::int64_t>(P) : 0)
-                + tri->addendBias;
-            // (6) range-check signed-fit in widthBytes
-            if (tri->widthBytes < 8) {
-                std::int64_t const sMax =
-                    (std::int64_t{1} << (8 * tri->widthBytes - 1)) - 1;
+
+            // Range-check helper for signed-N-bit fit.
+            auto const fitsSignedNBits = [&](std::int64_t v, int bits) -> bool {
+                std::int64_t const sMax = (std::int64_t{1} << (bits - 1)) - 1;
                 std::int64_t const sMin = -sMax - 1;
-                if (value < sMin || value > sMax) {
+                return v >= sMin && v <= sMax;
+            };
+            // Read the 32-bit instruction word at patchOff (used by
+            // non-Linear formulas that OR a bitfield into an existing
+            // instruction emitted by the assembler).
+            auto const readInst32 = [&]() -> std::uint32_t {
+                return  static_cast<std::uint32_t>(text[patchOff + 0])
+                     | (static_cast<std::uint32_t>(text[patchOff + 1]) <<  8)
+                     | (static_cast<std::uint32_t>(text[patchOff + 2]) << 16)
+                     | (static_cast<std::uint32_t>(text[patchOff + 3]) << 24);
+            };
+            auto const writeInst32 = [&](std::uint32_t inst) {
+                text[patchOff + 0] = static_cast<std::uint8_t>(inst        & 0xFF);
+                text[patchOff + 1] = static_cast<std::uint8_t>((inst >>  8) & 0xFF);
+                text[patchOff + 2] = static_cast<std::uint8_t>((inst >> 16) & 0xFF);
+                text[patchOff + 3] = static_cast<std::uint8_t>((inst >> 24) & 0xFF);
+            };
+            // Reject non-Linear pre-OR contamination (the bitfield to
+            // be written must be zero in the assembler-emitted base
+            // instruction). Without this, an assembler that mistakenly
+            // emitted a partial immediate would silently corrupt the
+            // patched instruction.
+            auto const rejectIfBitfieldDirty = [&](std::uint32_t inst,
+                                                    std::uint32_t mask) -> bool {
+                if ((inst & mask) != 0) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          prefixStr + ": relocation '" + tri->name
-                             + "' value " + std::to_string(value)
-                             + " does not fit signed in widthBytes="
-                             + std::to_string(static_cast<int>(tri->widthBytes))
-                             + " (range [" + std::to_string(sMin)
-                             + ", " + std::to_string(sMax) + "]) — "
-                               "would silently truncate.");
-                    return false;
+                            + "' base instruction at patch site has "
+                              "non-zero bits in the immediate field — "
+                              "assembler must emit the opcode with the "
+                              "immediate cleared (the linker OR's the "
+                              "computed value in).");
+                    return true;
                 }
-            }
-            // (7) write `widthBytes` LE
-            auto const uVal = static_cast<std::uint64_t>(value);
-            for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
-                text[patchOff + b] =
-                    static_cast<std::uint8_t>((uVal >> (8u * b)) & 0xFFu);
+                return false;
+            };
+
+            switch (tri->formulaKind) {
+                case RelocFormulaKind::Linear: {
+                    std::int64_t const value =
+                        static_cast<std::int64_t>(S) + A
+                        + (tri->pcRelative ? -static_cast<std::int64_t>(P) : 0)
+                        + tri->addendBias;
+                    if (tri->widthBytes < 8) {
+                        if (!fitsSignedNBits(value, 8 * tri->widthBytes)) {
+                            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                                 prefixStr + ": relocation '" + tri->name
+                                     + "' value " + std::to_string(value)
+                                     + " does not fit signed in widthBytes="
+                                     + std::to_string(static_cast<int>(tri->widthBytes))
+                                     + " — would silently truncate.");
+                            return false;
+                        }
+                    }
+                    auto const uVal = static_cast<std::uint64_t>(value);
+                    for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
+                        text[patchOff + b] =
+                            static_cast<std::uint8_t>((uVal >> (8u * b)) & 0xFFu);
+                    }
+                    break;
+                }
+                case RelocFormulaKind::Aarch64Call26: {
+                    // value = (S + A - P) >> 2; signed 26 bits.
+                    std::int64_t const delta =
+                        static_cast<std::int64_t>(S) + A
+                        - static_cast<std::int64_t>(P);
+                    if ((delta & 0x3) != 0) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' (S+A-P)=" + std::to_string(delta)
+                                 + " is not 4-byte aligned — ARM64 "
+                                   "branch target must be word-aligned.");
+                        return false;
+                    }
+                    std::int64_t const value = delta >> 2;
+                    if (!fitsSignedNBits(value, 26)) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' shifted value " + std::to_string(value)
+                                 + " does not fit signed 26-bit — "
+                                   "branch out of ±128 MiB range.");
+                        return false;
+                    }
+                    auto const inst = readInst32();
+                    if (rejectIfBitfieldDirty(inst, 0x03FFFFFFu)) return false;
+                    auto const bits = static_cast<std::uint32_t>(value) & 0x03FFFFFFu;
+                    writeInst32(inst | bits);
+                    break;
+                }
+                case RelocFormulaKind::Aarch64AdrPrelPgHi21: {
+                    // value = ((S+A) >> 12) - (P >> 12); signed 21 bits.
+                    std::int64_t const SA = static_cast<std::int64_t>(S) + A;
+                    std::int64_t const value =
+                        (SA >> 12) - (static_cast<std::int64_t>(P) >> 12);
+                    if (!fitsSignedNBits(value, 21)) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' page-pair value " + std::to_string(value)
+                                 + " does not fit signed 21-bit — "
+                                   "ADRP target out of ±4 GiB page range.");
+                        return false;
+                    }
+                    // ADRP encoding: immlo at bits [30:29] holds value[1:0];
+                    // immhi at bits [23:5] holds value[20:2].
+                    auto const v = static_cast<std::uint32_t>(value) & 0x1FFFFFu;
+                    std::uint32_t const immlo = (v & 0x3u) << 29;
+                    std::uint32_t const immhi = ((v >> 2) & 0x7FFFFu) << 5;
+                    std::uint32_t const mask  = (0x3u << 29) | (0x7FFFFu << 5);
+                    auto const inst = readInst32();
+                    if (rejectIfBitfieldDirty(inst, mask)) return false;
+                    writeInst32(inst | immlo | immhi);
+                    break;
+                }
+                case RelocFormulaKind::Aarch64AddAbsLo12: {
+                    // value = (S+A) & 0xFFF; ADD imm12 at bits[21:10].
+                    std::int64_t const SA = static_cast<std::int64_t>(S) + A;
+                    auto const v = static_cast<std::uint32_t>(SA) & 0xFFFu;
+                    std::uint32_t const bits = v << 10;
+                    std::uint32_t const mask = 0xFFFu << 10;
+                    auto const inst = readInst32();
+                    if (rejectIfBitfieldDirty(inst, mask)) return false;
+                    writeInst32(inst | bits);
+                    break;
+                }
             }
         }
     }

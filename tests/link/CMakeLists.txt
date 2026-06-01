@@ -8,6 +8,9 @@ dss_add_test(NAME link/test_macho_writer         SOURCES test_macho_writer.cpp)
 dss_add_test(NAME link/test_string_table         SOURCES test_string_table.cpp)
 dss_add_test(NAME link/test_elf_exec_writer      SOURCES test_elf_exec_writer.cpp)
 
+# D-LK6-1 closure — ARM64 bit-shift relocation-formula variants.
+dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_formulas.cpp)
+
 # Plan 14 LK7 — codesign-placeholder reservation tests.
 dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)
 

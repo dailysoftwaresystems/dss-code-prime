@@ -15,6 +15,24 @@
 
 namespace dss {
 
+std::string_view relocFormulaName(RelocFormulaKind k) noexcept {
+    switch (k) {
+        case RelocFormulaKind::Linear:               return "linear";
+        case RelocFormulaKind::Aarch64Call26:        return "aarch64_call26";
+        case RelocFormulaKind::Aarch64AdrPrelPgHi21: return "aarch64_adr_prel_pg_hi21";
+        case RelocFormulaKind::Aarch64AddAbsLo12:    return "aarch64_add_abs_lo12";
+    }
+    return "unknown";
+}
+
+std::optional<RelocFormulaKind> parseRelocFormulaKind(std::string_view s) noexcept {
+    if (s == "linear")                   return RelocFormulaKind::Linear;
+    if (s == "aarch64_call26")           return RelocFormulaKind::Aarch64Call26;
+    if (s == "aarch64_adr_prel_pg_hi21") return RelocFormulaKind::Aarch64AdrPrelPgHi21;
+    if (s == "aarch64_add_abs_lo12")     return RelocFormulaKind::Aarch64AddAbsLo12;
+    return std::nullopt;
+}
+
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
     std::filesystem::path const& path) {
     std::ifstream in(path, std::ios::binary);

@@ -1075,10 +1075,13 @@ TEST(ElfExecFormatJsonValidate, PcRelativeWithoutWidthBytesRejected) {
 }
 
 TEST(ElfExecWriter, NoStructuredFormulaWidthFailsLoud) {
-    // A relocation kind whose schema row has widthBytes == 0 (the
-    // formula doesn't fit the LK6 cycle-1 linear shape) fails loud.
-    // Synthesize such a kind via the JSON loader to keep the test
-    // target-blind (no dependence on a particular shipped schema).
+    // A relocation kind whose schema row uses formula='linear' but
+    // OMITS widthBytes (the LK6 cycle-1 placeholder shape) fails loud
+    // at apply time. D-LK6-1 closure: invalid formula strings are
+    // rejected at JSON-load (closed enum); widthBytes=0 with valid
+    // formula='linear' still reaches the walker and gets rejected
+    // there. Synthesize via the JSON loader to keep the test target-
+    // blind (no dependence on a particular shipped schema).
     auto fmtR = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
     ASSERT_TRUE(fmtR.has_value());
 
@@ -1086,7 +1089,7 @@ TEST(ElfExecWriter, NoStructuredFormulaWidthFailsLoud) {
       "dssTargetVersion": 1,
       "target": {"name":"noapply"},
       "relocations":[
-        { "name": "weird", "kind": 1, "formula": "complicated" }
+        { "name": "weird", "kind": 1, "formula": "linear" }
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })");

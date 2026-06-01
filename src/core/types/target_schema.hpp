@@ -696,22 +696,69 @@ struct DSS_EXPORT TargetEncodingInfo {
 //   (b) `pcRelative || addendBias != 0` ⇒ `widthBytes != 0`.
 //   (c) `addendBias != 0` ⇒ `pcRelative` (no absolute-with-bias).
 //   (d) `widthBytes != 0` ⇒ `|addendBias|` fits signed in widthBytes.
+//   (e) `formulaKind != Linear` ⇒ `widthBytes == 4`, `pcRelative == false`,
+//       `addendBias == 0` (the variant fully encodes the formula).
+
+// Closed-enum tagged variant — D-LK6-1 closure (plan 14 §3.1, 2026-06-01).
+// Each variant names a concrete relocation-formula class with a fixed
+// bit-layout + shift policy. The kernel dispatches once on this
+// discriminator in `applyExecRelocations` and applies the named formula.
+//
+// Adding a new target's reloc kind (RISC-V, MIPS, etc.) = add a new
+// variant + one switch arm in the kernel. JSON-side: declare the new
+// name string. NO target-name branching in the kernel — the formula
+// class is a property of the target's `*.target.json`, not the kernel.
+//
+// **Source / target / linker agnostic**: the discriminator is on
+// `TargetSchema`; ELF / PE / Mach-O walkers reuse the kernel verbatim.
+// HIR / MIR / LIR see opaque `Relocation::kind` values — they never
+// inspect `formulaKind`.
+enum class RelocFormulaKind : std::uint8_t {
+    // value = S + A + (pcRel ? -P : 0) + addendBias  — write widthBytes LE
+    // bytes. Covers x86_64 rel32 / abs32 / abs64 + ARM64 abs64.
+    Linear                = 0,
+    // ARM64 R_AARCH64_CALL26 / R_AARCH64_JUMP26:
+    //   value = (S + A - P) >> 2
+    //   range-check signed 26-bit; OR (value & 0x03FFFFFF) into the
+    //   ARM64 instruction word's bits[25:0] (BL / B target).
+    Aarch64Call26         = 1,
+    // ARM64 R_AARCH64_ADR_PREL_PG_HI21:
+    //   value = ((S + A) >> 12) - (P >> 12)
+    //   range-check signed 21-bit; ADRP-style split: bits[1:0] of value
+    //   → instruction immlo[30:29]; bits[20:2] → immhi[23:5].
+    Aarch64AdrPrelPgHi21  = 2,
+    // ARM64 R_AARCH64_ADD_ABS_LO12_NC (and LDST equivalents):
+    //   value = (S + A) & 0xFFF
+    //   no range check (12-bit unsigned-modular by construction);
+    //   OR (value << 10) into ADD imm12 [21:10].
+    Aarch64AddAbsLo12     = 3,
+};
+
+[[nodiscard]] DSS_EXPORT std::string_view
+    relocFormulaName(RelocFormulaKind k) noexcept;
+
+[[nodiscard]] DSS_EXPORT std::optional<RelocFormulaKind>
+    parseRelocFormulaKind(std::string_view s) noexcept;
+
 struct DSS_EXPORT TargetRelocationInfo {
-    std::string    name;            // canonical text key (e.g. "rel32", "abs64")
-    RelocationKind kind{};          // opaque tag — written into Relocation::kind;
-                                    // values flow ONLY from this field + the
-                                    // schema's `relocationInfo`/`relocationByName`
-                                    // accessors, never assembler-fabricated.
-    bool         pcRelative  = false;  // include `-P` (PC-relative)
-    std::int32_t addendBias  = 0;      // implicit constant bias
+    std::string      name;            // canonical text key (e.g. "rel32", "abs64")
+    RelocationKind   kind{};          // opaque tag — written into Relocation::kind;
+                                      // values flow ONLY from this field + the
+                                      // schema's `relocationInfo`/`relocationByName`
+                                      // accessors, never assembler-fabricated.
+    RelocFormulaKind formulaKind = RelocFormulaKind::Linear; // D-LK6-1 closure
+    bool         pcRelative  = false;  // Linear only: include `-P` (PC-relative)
+    std::int32_t addendBias  = 0;      // Linear only: implicit constant bias
                                        // (e.g. -4 for x86 rel32 to
                                        // skip past the 4-byte
                                        // displacement field)
-    std::uint8_t widthBytes  = 0;      // 4 / 8 — bytes to write at
-                                       // the patch site. 0 means
-                                       // "linker rejects this kind"
-                                       // (non-linear formulas — see
-                                       // D-LK6-1).
+    std::uint8_t widthBytes  = 0;      // Linear: 4 / 8 — bytes to write at
+                                       // the patch site. 0 means "linker
+                                       // rejects this kind" (only valid
+                                       // pre-D-LK6-1 closure; today every
+                                       // shipped kind has a formulaKind +
+                                       // widthBytes). Non-Linear: must be
+                                       // 4 (ARM64 instruction word width).
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode

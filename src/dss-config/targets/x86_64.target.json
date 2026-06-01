@@ -542,10 +542,10 @@
       "redZoneBytes":     0
     }
   ],
-  "$relocationsComment": "Relocation taxonomy (plan 13 AS4 + plan 14 LK6 cycle 1). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker reads via TargetSchema::relocationInfo(kind). `formula` is human-readable documentation; the linker actually computes patches from the STRUCTURED fields (pcRelative + addendBias + widthBytes): value = S + A + (pcRelative ? -P : 0) + addendBias; widthBytes bytes (LE) written at the patch site. Tag values are arbitrary per-target (only the names need to round-trip with format.json cross-reference).",
+  "$relocationsComment": "Relocation taxonomy (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker reads via TargetSchema::relocationInfo(kind). `formula` is a CLOSED-ENUM DISCRIMINATOR (load-bearing — see RelocFormulaKind in target_schema.hpp): 'linear' (S + A + (pcRel ? -P : 0) + addendBias; widthBytes LE), or one of the bit-shift variants ('aarch64_call26' / 'aarch64_adr_prel_pg_hi21' / 'aarch64_add_abs_lo12'). For 'linear', the structured fields (pcRelative + addendBias + widthBytes) parameterize the formula. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference.",
   "relocations": [
-    { "name": "rel32", "kind": 1, "formula": "S + A - P - 4", "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },
-    { "name": "abs64", "kind": 2, "formula": "S + A",         "pcRelative": false, "addendBias":  0, "widthBytes": 8 },
-    { "name": "abs32", "kind": 3, "formula": "S + A",         "pcRelative": false, "addendBias":  0, "widthBytes": 4 }
+    { "name": "rel32", "kind": 1, "formula": "linear", "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },
+    { "name": "abs64", "kind": 2, "formula": "linear", "pcRelative": false, "addendBias":  0, "widthBytes": 8 },
+    { "name": "abs32", "kind": 3, "formula": "linear", "pcRelative": false, "addendBias":  0, "widthBytes": 4 }
   ]
 }

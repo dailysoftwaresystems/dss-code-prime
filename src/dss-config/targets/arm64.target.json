@@ -291,10 +291,11 @@
       "redZoneBytes":     0
     }
   ],
-  "$relocationsComment": "AArch64 ELF relocation kinds (plan 13 AS4 — NOT AAPCS64; AAPCS64 is the calling convention above; these are R_AARCH64_* relocation entries that the linker emits into ELF object files). The linker (plan 14) decodes the formula via TargetSchema::relocationInfo(kind). Tag values are arbitrary per-target — only the NAME is the cross-reference key with the format-side `*.format.json`.",
+  "$relocationsComment": "AArch64 ELF relocation kinds (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). The 'formula' field is a closed-enum discriminator (RelocFormulaKind in target_schema.hpp): 'aarch64_call26' = (S+A-P)>>2, signed-26-bit, OR into BL/B inst[25:0]; 'aarch64_adr_prel_pg_hi21' = ((S+A)>>12)-(P>>12), signed-21-bit, ADRP-split into immlo[30:29]+immhi[23:5]; 'aarch64_add_abs_lo12' = (S+A)&0xFFF, ADD imm12[21:10]; 'linear' (used for abs64) writes 8 LE bytes. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference. Paired anchors: D-LK6-8 (ARM64 PLT stub bytes) + D-LK6-14 (Apple Silicon chained-fixups dispatch) remain open and are independent of the formula reshape.",
   "relocations": [
-    { "name": "call26",            "kind": 1, "formula": "(S + A - P) >> 2"           },
-    { "name": "adr_prel_pg_hi21",  "kind": 2, "formula": "((S + A) >> 12) - (P >> 12)" },
-    { "name": "abs64",             "kind": 3, "formula": "S + A"                       }
+    { "name": "call26",            "kind": 1, "formula": "aarch64_call26"          },
+    { "name": "adr_prel_pg_hi21",  "kind": 2, "formula": "aarch64_adr_prel_pg_hi21" },
+    { "name": "add_abs_lo12_nc",   "kind": 3, "formula": "aarch64_add_abs_lo12"     },
+    { "name": "abs64",             "kind": 4, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 8 }
   ]
 }
