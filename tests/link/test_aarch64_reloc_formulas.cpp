@@ -316,13 +316,12 @@ TEST(Aarch64AddAbsLo12, IgnoresHighBitsOfPositiveSplusA) {
     auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
     ASSERT_NE(tgt, nullptr);
 
-    // Large POSITIVE symbol VA — only low 12 bits matter (the formula
-    // masks unsigned by construction; no range check on positive
-    // inputs). post-fold #1: SA<0 now rejects (separate test), so
-    // this test pins the "ignore high bits, mask low 12" contract for
-    // valid positive inputs.
+    // Positive symbol VA within UINT32_MAX — only low 12 bits matter
+    // (high bits ignored via the `& 0xFFFu` mask). post-fold #2: SA
+    // > UINT32_MAX now rejects (silent-failure CRITICAL-1), so the
+    // ignore-high-bits contract is pinned within the valid range.
     auto p = applyOneReloc(tgt, 0x91000000u,
-                            /*symbolVa*/ 0x7FFFFFFF12345ABC,
+                            /*symbolVa*/ 0xDEAD0ABCu,
                             /*addend*/   0,
                             /*patchSectionVa*/ 0,
                             /*funcOffset*/ 0);
@@ -474,6 +473,127 @@ TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
     EXPECT_NE(list.find("'aarch64_call26'"),           std::string::npos);
     EXPECT_NE(list.find("'aarch64_adr_prel_pg_hi21'"), std::string::npos);
     EXPECT_NE(list.find("'aarch64_add_abs_lo12'"),     std::string::npos);
+}
+
+// ── Post-fold #2 (second 7-agent audit) ──────────────────────
+
+// pr-test-analyzer Rating 8: exact format pin for acceptedRelocFormulaList
+// (was loose `find()` — regression to space-separated or unquoted output
+// would pass silently).
+TEST(RelocFormulaKind, AcceptedListIsCommaSpaceQuotedExactly) {
+    EXPECT_EQ(acceptedRelocFormulaList(),
+              "'linear', 'aarch64_call26', "
+              "'aarch64_adr_prel_pg_hi21', 'aarch64_add_abs_lo12'");
+}
+
+// pr-test-analyzer Rating 7: whitespace tolerance pinned as reject
+// (parseRelocFormulaKind only ASCII-lowercases; doesn't trim).
+TEST(RelocFormulaKind, ParseRejectsTrailingWhitespace) {
+    EXPECT_EQ(parseRelocFormulaKind("linear "), std::nullopt);
+    EXPECT_EQ(parseRelocFormulaKind(" linear"), std::nullopt);
+}
+
+// silent-failure CRITICAL-1 post-fold #2: AddAbsLo12 rejects S+A above UINT32_MAX.
+TEST(Aarch64AddAbsLo12, RejectsSplusAAboveUint32Max) {
+    auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
+    ASSERT_NE(tgt, nullptr);
+
+    // symbolVa = 0x100000000 (= UINT32_MAX + 1) → reject.
+    auto p = applyOneReloc(tgt, 0x91000000u,
+                            /*symbolVa*/ 0x100000000ULL,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    EXPECT_FALSE(p.ok);
+}
+
+TEST(Aarch64AddAbsLo12, AcceptsSplusAAtUint32Max) {
+    auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
+    ASSERT_NE(tgt, nullptr);
+
+    // symbolVa = UINT32_MAX = 0xFFFFFFFF → low 12 = 0xFFF → patched.
+    auto p = applyOneReloc(tgt, 0x91000000u,
+                            /*symbolVa*/ 0xFFFFFFFFULL,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0x91000000u | (0xFFFu << 10));
+}
+
+// silent-failure CRITICAL-2 post-fold #2: validate() rule (e) enforced
+// even for programmatically-built rows (was JSON-loader-only).
+TEST(TargetSchemaValidate, RuleERejectsNonLinearWithPcRelative) {
+    // The JSON loader catches this too, but the rule (e) belongs
+    // ALSO in validate() for defense-in-depth (catches future
+    // variant-reshape constructors / fuzz harnesses / in-memory
+    // schemas that bypass the loader).
+    auto r = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"bad"},
+      "relocations":[
+        { "name": "x", "kind": 1, "formula": "aarch64_call26", "pcRelative": true }
+      ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(TargetSchemaValidate, RuleERejectsNonLinearWithAddendBias) {
+    auto r = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"bad"},
+      "relocations":[
+        { "name": "x", "kind": 1, "formula": "aarch64_call26", "addendBias": 4 }
+      ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// pr-test-analyzer Rating 7: AdrPrelPgHi21 negative-S+A pin
+// (well-defined: just a normal page-pair shift with arithmetic right shift).
+TEST(Aarch64AdrPrelPgHi21, AcceptsNegativeSplusAWhenInRange) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_prel_pg_hi21");
+    ASSERT_NE(tgt, nullptr);
+
+    // symbolVa = 0, addend = -0x1000 → SA = -0x1000 → (SA>>12)=-1.
+    // patchSectionVa = 0, funcOffset = 0 → (P>>12) = 0.
+    // value = -1 - 0 = -1 → fits signed 21-bit → 21-bit two's-complement = 0x1FFFFF.
+    auto p = applyOneReloc(tgt, 0x90000000u,
+                            /*symbolVa*/ 0,
+                            /*addend*/   -0x1000,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    std::uint32_t const v = 0x1FFFFFu;
+    std::uint32_t const immlo = (v & 0x3u) << 29;
+    std::uint32_t const immhi = ((v >> 2) & 0x7FFFFu) << 5;
+    EXPECT_EQ(readInst(p.text, 0), 0x90000000u | immlo | immhi);
+}
+
+// pr-test-analyzer Rating 6: direct unit tests for byte_emit positional helpers.
+TEST(ByteEmit, ReadU32LEAtRoundTrip) {
+    std::vector<std::uint8_t> buf(16, 0);
+    dss::link::format::detail::writeU32LEAt(buf, 4, 0xDEADBEEFu);
+    EXPECT_EQ(dss::link::format::detail::readU32LEAt(buf, 4), 0xDEADBEEFu);
+}
+
+TEST(ByteEmit, ReadU32LEAtAllZerosAllOnes) {
+    std::vector<std::uint8_t> buf(8, 0);
+    dss::link::format::detail::writeU32LEAt(buf, 0, 0x00000000u);
+    EXPECT_EQ(dss::link::format::detail::readU32LEAt(buf, 0), 0x00000000u);
+    dss::link::format::detail::writeU32LEAt(buf, 0, 0xFFFFFFFFu);
+    EXPECT_EQ(dss::link::format::detail::readU32LEAt(buf, 0), 0xFFFFFFFFu);
+}
+
+TEST(ByteEmit, WriteU32LEAtPlacesLittleEndianBytes) {
+    std::vector<std::uint8_t> buf(8, 0);
+    dss::link::format::detail::writeU32LEAt(buf, 2, 0x12345678u);
+    EXPECT_EQ(buf[2], 0x78);
+    EXPECT_EQ(buf[3], 0x56);
+    EXPECT_EQ(buf[4], 0x34);
+    EXPECT_EQ(buf[5], 0x12);
 }
 
 // ── Shipped arm64.target.json loads cleanly ──────────────────

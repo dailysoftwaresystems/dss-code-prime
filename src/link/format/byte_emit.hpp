@@ -5,6 +5,7 @@
 #include "lir/lir_pass_util.hpp"
 #include "link/object_format_schema.hpp"
 
+#include <cassert>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -54,8 +55,16 @@ inline void appendI64LE(std::vector<std::uint8_t>& out, std::int64_t v) {
 // at D-LK6-1 post-fold #1 (3-consumer trip: 3 ARM64 formula arms read
 // + OR + write the 32-bit instruction word, vs Linear's append-style
 // overwrite — but Linear can use these too when widthBytes==4).
+//
+// Bounds-check via `assert` — every caller pre-validates the offset
+// against the buffer's expected size (`applyExecRelocations` rules
+// 3 + 4), so the assertion is a defense-in-depth that catches caller
+// bugs (mis-populated `funcTextStart`, off-by-one in a future patcher)
+// while staying zero-cost in release. (silent-failure audit HIGH-2
+// post-fold #2.)
 inline std::uint32_t
 readU32LEAt(std::vector<std::uint8_t> const& buf, std::size_t off) noexcept {
+    assert(off + 4 <= buf.size() && "readU32LEAt: offset overruns buffer");
     return  static_cast<std::uint32_t>(buf[off + 0])
          | (static_cast<std::uint32_t>(buf[off + 1]) <<  8)
          | (static_cast<std::uint32_t>(buf[off + 2]) << 16)
@@ -64,6 +73,7 @@ readU32LEAt(std::vector<std::uint8_t> const& buf, std::size_t off) noexcept {
 
 inline void
 writeU32LEAt(std::vector<std::uint8_t>& buf, std::size_t off, std::uint32_t v) noexcept {
+    assert(off + 4 <= buf.size() && "writeU32LEAt: offset overruns buffer");
     buf[off + 0] = static_cast<std::uint8_t>(v        & 0xFFu);
     buf[off + 1] = static_cast<std::uint8_t>((v >>  8) & 0xFFu);
     buf[off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);

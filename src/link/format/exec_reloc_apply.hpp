@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -280,22 +281,27 @@ namespace dss::link::format {
                 }
                 case RelocFormulaKind::Aarch64AddAbsLo12: {
                     // value = (S+A) & 0xFFF; ADD imm12 at bits[21:10].
-                    // Reject negative `S+A`: ADD_ABS_LO12_NC is defined
-                    // only for non-negative absolute addresses (paired
-                    // with an ADRP that computes the page base). A
-                    // negative `S+A` would silently truncate via
-                    // unsigned cast and produce a garbage low-12.
-                    // (architect Q6 post-fold #1.)
+                    // Reject S+A outside [0, UINT32_MAX]: ADD_ABS_LO12_NC
+                    // requires a non-negative absolute address that fits
+                    // in 32 bits (the paired ADRP companion computes the
+                    // page base from the same 32-bit space). Negative
+                    // SA cast to uint32_t produces garbage low-12;
+                    // SA > UINT32_MAX silently truncates the high bits
+                    // with no ADRP-companion correspondence. (architect
+                    // Q6 post-fold #1 + silent-failure audit CRITICAL-1
+                    // post-fold #2.)
                     std::int64_t const SA = static_cast<std::int64_t>(S) + A;
-                    if (SA < 0) {
+                    if (SA < 0
+                     || SA > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
                         emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                              prefixStr + ": relocation '" + tri->name
                                  + "' got S+A=" + std::to_string(SA)
-                                 + " — ADD_ABS_LO12_NC requires a "
-                                   "non-negative absolute address (the "
-                                   "ADRP companion encodes the high bits; "
-                                   "a negative S+A would silently truncate "
-                                   "to garbage low-12).");
+                                 + " — ADD_ABS_LO12_NC requires "
+                                   "0 ≤ S+A ≤ UINT32_MAX (paired with an "
+                                   "ADRP that computes the page base from "
+                                   "the same 32-bit space; out-of-range "
+                                   "values would silently truncate to "
+                                   "garbage low-12).");
                         return false;
                     }
                     auto const v = static_cast<std::uint32_t>(SA) & 0xFFFu;

@@ -1,6 +1,7 @@
 #include "core/types/target_schema.hpp"
 
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/ascii_case.hpp"
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -15,53 +16,25 @@
 
 namespace dss {
 
+// All three helpers iterate `kRelocFormulaTable` — single source of
+// truth (post-fold #2 — was 3 independent hand-rolled enumerations).
+// Adding a new variant = one row in the table + one enum entry.
 std::string_view relocFormulaName(RelocFormulaKind k) noexcept {
-    switch (k) {
-        case RelocFormulaKind::Linear:               return "linear";
-        case RelocFormulaKind::Aarch64Call26:        return "aarch64_call26";
-        case RelocFormulaKind::Aarch64AdrPrelPgHi21: return "aarch64_adr_prel_pg_hi21";
-        case RelocFormulaKind::Aarch64AddAbsLo12:    return "aarch64_add_abs_lo12";
-    }
-    return "unknown";
+    return kRelocFormulaTable.name(k);
 }
 
 std::optional<RelocFormulaKind> parseRelocFormulaKind(std::string_view s) noexcept {
-    // ASCII-lowercase the input once so 'LINEAR'/'Linear'/'linear'
-    // all accept uniformly. CLI flags / config field strings are
-    // operator-typed; case-asymmetric accept is operator-hostile and
-    // silently rejects perfectly reasonable inputs. Mirrors the LK10
-    // cycle 3 post-fold #2 precedent for `--config=debug|release`.
-    // (silent-failure audit H1 post-fold #1.)
-    std::string lowered;
-    lowered.reserve(s.size());
-    for (char c : s) {
-        lowered.push_back(static_cast<char>(
-            (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c));
-    }
-    if (lowered == "linear")                   return RelocFormulaKind::Linear;
-    if (lowered == "aarch64_call26")           return RelocFormulaKind::Aarch64Call26;
-    if (lowered == "aarch64_adr_prel_pg_hi21") return RelocFormulaKind::Aarch64AdrPrelPgHi21;
-    if (lowered == "aarch64_add_abs_lo12")     return RelocFormulaKind::Aarch64AddAbsLo12;
-    return std::nullopt;
+    return kRelocFormulaTable.fromName(asciiToLower(s));
 }
 
-// Comma-separated list of accepted `formula` discriminator strings —
-// generated from the enum table so adding a new variant doesn't
-// require editing error-message text in the JSON loader. (architect
-// Q2 post-fold #1 — was a hardcoded literal that silently lagged the
-// enum.)
 std::string acceptedRelocFormulaList() {
     std::string out;
-    auto const append = [&](RelocFormulaKind k) {
+    for (auto const& row : kRelocFormulaTable.rows) {
         if (!out.empty()) out += ", ";
         out += "'";
-        out += relocFormulaName(k);
+        out += row.second;
         out += "'";
-    };
-    append(RelocFormulaKind::Linear);
-    append(RelocFormulaKind::Aarch64Call26);
-    append(RelocFormulaKind::Aarch64AdrPrelPgHi21);
-    append(RelocFormulaKind::Aarch64AddAbsLo12);
+    }
     return out;
 }
 
@@ -830,6 +803,46 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "patched site.",
                                  r.name, r.addendBias,
                                  r.widthBytes, sMin, sMax));
+            }
+        }
+        // Rule (e) — D-LK6-1 closure coherence: non-Linear formulas
+        // encode pcRelative + addendBias + widthBytes intrinsically.
+        // The JSON loader gates this at load time (and the shipped
+        // configs go through that gate), but a programmatically-
+        // constructed schema (test fixture, future variant reshape,
+        // fuzz harness) could bypass the loader and reach `validate()`
+        // with an incoherent row. The kernel would then silently
+        // misapply (e.g. `widthBytes=8` on a non-Linear arm patches
+        // 8 LE bytes into a 32-bit instruction word; `pcRelative=true`
+        // on Call26 double-subtracts P). Defense-in-depth here so
+        // every schema reaching the kernel has rule (e) enforced.
+        // (silent-failure audit CRITICAL-2 post-fold #2.)
+        if (r.formulaKind != RelocFormulaKind::Linear) {
+            if (r.widthBytes != 4) {
+                fail(std::format("/relocations/{}/widthBytes", i),
+                     std::format("relocation '{}': non-Linear formula "
+                                 "'{}' requires widthBytes=4 (ARM64 "
+                                 "instruction word); got {}.",
+                                 r.name,
+                                 relocFormulaName(r.formulaKind),
+                                 r.widthBytes));
+            }
+            if (r.pcRelative) {
+                fail(std::format("/relocations/{}/pcRelative", i),
+                     std::format("relocation '{}': non-Linear formula "
+                                 "'{}' encodes PC-relativity "
+                                 "intrinsically; 'pcRelative' must be "
+                                 "false.",
+                                 r.name,
+                                 relocFormulaName(r.formulaKind)));
+            }
+            if (r.addendBias != 0) {
+                fail(std::format("/relocations/{}/addendBias", i),
+                     std::format("relocation '{}': non-Linear formula "
+                                 "'{}' encodes any addend bias "
+                                 "intrinsically; 'addendBias' must be 0.",
+                                 r.name,
+                                 relocFormulaName(r.formulaKind)));
             }
         }
     }

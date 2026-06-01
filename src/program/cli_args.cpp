@@ -1,5 +1,6 @@
 #include "program/cli_args.hpp"
 
+#include "core/types/ascii_case.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
 #include <charconv>
@@ -96,16 +97,10 @@ parseSuppressCode(std::string_view spec) noexcept {
 // or `minsizerel` shapes when plan 22 OPT* lands more knobs.
 [[nodiscard]] std::optional<CompileConfig>
 parseCompileConfig(std::string_view spec) noexcept {
-    // ASCII-lowercase the input once so `Debug`/`DEBUG`/`debug` all
-    // accept uniformly. CLI flags are operator-typed; case-asymmetric
-    // accept is operator-hostile and silently rejects perfectly
-    // reasonable inputs. (silent-failure audit post-fold #2.)
-    std::string lowered;
-    lowered.reserve(spec.size());
-    for (char c : spec) {
-        lowered.push_back(static_cast<char>(
-            (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c));
-    }
+    // Case-insensitive accept via `asciiToLower` (hoisted to
+    // `core/types/ascii_case.hpp` at D-LK6-1 post-fold #2 — was
+    // a duplicated loop; second consumer is `parseRelocFormulaKind`).
+    auto const lowered = asciiToLower(spec);
     if (lowered == "debug")   return CompileConfig::Debug;
     if (lowered == "release") return CompileConfig::Release;
     return std::nullopt;

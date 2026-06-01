@@ -729,10 +729,25 @@ enum class RelocFormulaKind : std::uint8_t {
     Aarch64AdrPrelPgHi21  = 2,
     // ARM64 R_AARCH64_ADD_ABS_LO12_NC (and LDST equivalents):
     //   value = (S + A) & 0xFFF
-    //   no range check (12-bit unsigned-modular by construction);
-    //   OR (value << 10) into ADD imm12 [21:10].
+    //   range-check S+A ∈ [0, UINT32_MAX] (kernel rejects negative or
+    //   out-of-32-bit values — the paired ADRP companion can only
+    //   compute pages within the 32-bit space without an additional
+    //   high-bit reloc); OR (value << 10) into ADD imm12 [21:10].
     Aarch64AddAbsLo12     = 3,
 };
+
+// Single source of truth — `relocFormulaName` + `parseRelocFormulaKind`
+// + `acceptedRelocFormulaList` all iterate this table. Adding a new
+// variant = add a row here + add the enum entry. The `static_assert`
+// on size catches forgetting one half. (architect + type-design
+// 4-agent convergence at post-fold #2 — was previously 3 independent
+// hand-rolled enumerations, DRY hazard waiting for the 5th variant.)
+inline constexpr EnumNameTable<RelocFormulaKind, 4> kRelocFormulaTable{{{
+    { RelocFormulaKind::Linear,               "linear" },
+    { RelocFormulaKind::Aarch64Call26,        "aarch64_call26" },
+    { RelocFormulaKind::Aarch64AdrPrelPgHi21, "aarch64_adr_prel_pg_hi21" },
+    { RelocFormulaKind::Aarch64AddAbsLo12,    "aarch64_add_abs_lo12" },
+}}};
 
 [[nodiscard]] DSS_EXPORT std::string_view
     relocFormulaName(RelocFormulaKind k) noexcept;
@@ -741,8 +756,8 @@ enum class RelocFormulaKind : std::uint8_t {
     parseRelocFormulaKind(std::string_view s) noexcept;
 
 // Comma-separated quoted list of accepted formula-discriminator
-// strings — used by the JSON loader's error messages so the accepted
-// set never lags the enum.
+// strings — used by the JSON loader's error messages. Driven from
+// `kRelocFormulaTable` so the accepted set never lags the enum.
 [[nodiscard]] DSS_EXPORT std::string acceptedRelocFormulaList();
 
 struct DSS_EXPORT TargetRelocationInfo {
