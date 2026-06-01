@@ -3,8 +3,10 @@
 // Pins:
 //   * ELF magic + ELFCLASS64 + ELFDATA2LSB detection.
 //   * `.dynsym` + `.dynstr` round-trip from a synthesized ELF.
-//   * Format-blind dispatch: PE/Mach-O magics emit
-//     UnsupportedFormat citing the future FF1-PE/FF1-MachO anchors.
+//   * Format-blind dispatch: Mach-O magic emits UnsupportedFormat
+//     citing the future FF1-MachO anchor; PE magic now dispatches
+//     into the readPe path (see test_binary_reader_pe.cpp for the
+//     PE-specific surface).
 //   * Failure modes: empty file, unknown magic, ELFCLASS32 reject,
 //     truncated section table, missing .dynsym.
 //   * Symbol kind / visibility / linkage mapping from ELF

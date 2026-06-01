@@ -261,6 +261,16 @@ TEST(BinaryReaderPe, BadOptionalHeaderMagicRejected) {
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
     EXPECT_NE(r.error().detail.find("optional header magic"),
               std::string::npos);
+    // Hex format regression pin (post-fold #15): the message must
+    // render optMagic as 4-digit hex (`0xCDAB` for the
+    // little-endian-loaded value here), NOT decimal. The pre-fold
+    // bug used `"0x" + std::to_string(u16)` which produced
+    // `"0x52651"` for optMagic=0xCDAB — actively misleading.
+    EXPECT_NE(r.error().detail.find("0xCDAB"), std::string::npos)
+        << "optMagic must render as 4-digit hex; regression on the "
+           "snprintf/std::format hex fix";
+    EXPECT_EQ(r.error().detail.find("0x52651"), std::string::npos)
+        << "optMagic must NOT render as decimal (was the bug)";
 }
 
 TEST(BinaryReaderPe, ExportRvaOutsideAnySectionRejected) {
