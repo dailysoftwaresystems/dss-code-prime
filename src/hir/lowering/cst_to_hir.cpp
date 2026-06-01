@@ -260,14 +260,23 @@ struct Lowerer {
         return id;
     }
 
-    void unsupported(NodeId node, std::string detail) {
+    // Parameterized lowering-error emission. Post-fold #7 simplifier
+    // R1 + type-design T2: collapses the previous per-code helpers
+    // (`unsupported`, `externHasInitializer`) into a neutrally-named
+    // core so a third H_* code lands as one inline call site, not a
+    // third near-identical helper.
+    void emitH(DiagnosticCode code, NodeId node, std::string detail) {
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::H_UnsupportedLoweringForKind;
+        d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree().source().id();
         d.span     = node.valid() ? tree().span(node) : SourceSpan::empty(0);
         d.actual   = std::move(detail);
         reporter.report(std::move(d));
+    }
+    void unsupported(NodeId node, std::string detail) {
+        emitH(DiagnosticCode::H_UnsupportedLoweringForKind,
+              node, std::move(detail));
     }
     HirNodeId errorNode(NodeId cst, TypeId type = InvalidType) {
         return track(builder.addLeaf(HirKind::Error, type, 0, HirFlags::HasError), cst);
@@ -2336,7 +2345,7 @@ struct Lowerer {
             return reportedError(node, "array declarator is deferred to HR9 "
                                        "(the lattice has no Array type yet)");
         std::optional<HirNodeId> init;
-        RuleId const skip = decl.arraySuffix ? decl.arraySuffix->rule : RuleId{};
+        RuleId const skip = arraySuffixSkipRule(decl);
         for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) {
             // Coerce the initializer to the declared variable type — the same
             // discipline `lowerVarLike` applies for local VarDecls. Without
@@ -2408,6 +2417,39 @@ struct Lowerer {
                 return track(builder.makeExternFunction(type, sym.v, params), node);
             }
         }
+        // D-FF2-3: reject `extern int x = 5;` (and `= y`, `= {}`, etc.).
+        // An extern announces a symbol whose storage lives in another
+        // translation unit; an initializer would either redefine the
+        // symbol locally (contradicting `extern`) or be silently dropped
+        // at lowering.
+        //
+        // SHAPE-based detection (post-fold #7 silent-failure F4): the
+        // varDeclTail subtree's visible children are at most {
+        // arrayDeclSuffix, AssignOp + initValue, EndStatement }. Any
+        // internal child that isn't arrayDeclSuffix IS the initValue
+        // subtree — even when its contents are empty (`= {}`) or
+        // contain no expression nodes. Pre-fix the check walked for
+        // `isExprNode` descendants which missed empty-brace inits.
+        // Engine-side detection: any future source language whose
+        // extern grammar drops an initValue-like subtree trips the
+        // same arm.
+        if (decl.kindByChild) {
+            NodeId varDeclTail = descend(node, decl.kindByChild->childPath);
+            if (varDeclTail.valid()
+                && tree().kind(varDeclTail) == NodeKind::Internal) {
+                RuleId const skipRule = arraySuffixSkipRule(decl);
+                for (NodeId c : visible(varDeclTail)) {
+                    if (tree().kind(c) != NodeKind::Internal) continue;
+                    if (skipRule.valid()
+                        && tree().rule(c).v == skipRule.v) continue;
+                    emitH(DiagnosticCode::H_ExternHasInitializer, c,
+                          "extern declarations cannot carry an "
+                          "initializer — storage lives in another "
+                          "translation unit; remove the initializer");
+                    return errorNode(node);
+                }
+            }
+        }
         return track(builder.makeExternGlobal(type, sym.v), node);
     }
 
@@ -2447,6 +2489,15 @@ struct Lowerer {
                 for (NodeId g : visible(c)) stack.push_back(g);
         }
         return out;
+    }
+
+    // Post-fold #7 simplifier R2: the `decl.arraySuffix ?
+    // decl.arraySuffix->rule : RuleId{}` pattern appears at lowerTopLevel
+    // (the global-init walk) AND lowerExternDecl (the extern-init reject).
+    // Hoisted to document the "skip the [N] size-expr subtree" intent.
+    [[nodiscard]] static RuleId
+    arraySuffixSkipRule(DeclarationRule const& decl) noexcept {
+        return decl.arraySuffix ? decl.arraySuffix->rule : RuleId{};
     }
 
     [[nodiscard]] NodeId descend(NodeId start, std::vector<std::uint32_t> const& path) {

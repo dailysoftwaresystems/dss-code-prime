@@ -456,6 +456,78 @@ TEST(HirLoweringCSubset, ExternFunctionAndGlobal) {
     EXPECT_EQ(res->hir.kind(decls[2]), HirKind::Function);         // f
 }
 
+TEST(HirLoweringCSubset, ExternGlobalWithInitializerRejectedLoud) {
+    // D-FF2-3: `extern int x = 5;` is a contradiction — extern means
+    // "storage lives elsewhere"; an init would either redefine the
+    // symbol locally OR be silently dropped (the prior behavior).
+    // Reject loud with H_ExternHasInitializer (remediation-distinct
+    // from H_UnsupportedLoweringForKind: remove the init or drop
+    // the `extern` keyword — not "extend the engine").
+    SemanticModel model = analyzeCSubset("extern int x = 5;\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "test setup: the c-subset grammar accepts the form; the "
+           "rejection is at lowering, not at parse";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternHasInitializer), 1u);
+    // The pre-fix silent path landed an ExternGlobal at top level; the
+    // new path lands an Error sentinel so downstream tooling can't
+    // mistake it for a successful extern declaration.
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Error);
+}
+
+TEST(HirLoweringCSubset, ExternGlobalWithIdentifierInitializerRejectedLoud) {
+    // Post-fold #7 PT1a: pin identifier-init `extern int x = y;`
+    // (RHS is an operand-rule referencing a prior decl), not just
+    // literal-init. Shape-based F4 detector trips on any non-
+    // arrayDeclSuffix initValue subtree regardless of RHS shape.
+    SemanticModel model = analyzeCSubset(
+        "int y = 1;\n"
+        "extern int x = y;\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternHasInitializer), 1u);
+}
+
+TEST(HirLoweringCSubset, ExternGlobalWithEmptyBraceInitializerRejectedLoud) {
+    // Post-fold #7 silent-failure F4: pre-fold the init-walk searched
+    // for `isExprNode` descendants — `extern int x = {};` has NONE
+    // (empty braceInitList), so the silent-accept arm fired. The
+    // shape-based detector now keys on the initValue subtree's
+    // existence and rejects loud regardless of contents.
+    SemanticModel model = analyzeCSubset("extern int x = {};\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternHasInitializer), 1u);
+}
+
+TEST(HirLoweringCSubset, ExternGlobalWithArraySuffixNoInitStillAccepted) {
+    // D-FF2-3 negative: `extern int x[10];` carries an array-size
+    // expression (`10`) inside arrayDeclSuffix — that's NOT an init
+    // and must NOT trigger H_ExternHasInitializer. The shape-based
+    // detector skips the arrayDeclSuffix subtree exactly for this
+    // case. Post-fold #7 PT4: also pin that the resulting decl IS
+    // an ExternGlobal (not an Error sentinel) — a regression that
+    // false-positively rejected `extern int x[10];` would otherwise
+    // pass a `res->ok`-only check if no diagnostic landed.
+    SemanticModel model = analyzeCSubset("extern int x[10];\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternHasInitializer), 0u);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 1u);
+    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::ExternGlobal);
+}
+
 TEST(HirLoweringCSubset, GlobalVariable) {
     SemanticModel model = analyzeCSubset("int counter;\nint f() { return 0; }\n");
     ASSERT_FALSE(model.hasErrors());

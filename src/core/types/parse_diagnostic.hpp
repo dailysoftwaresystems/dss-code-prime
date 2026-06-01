@@ -356,11 +356,25 @@ enum class DiagnosticCode : std::uint16_t {
     // H_UnsupportedLoweringForKind: the CST→HIR lowering engine (plan 09 HR8)
     //   reached a CST rule/construct it cannot lower — either the language's
     //   `hirLowering` config has no mapping for it, the mapping names an
-    //   unknown HIR kind/op, or the construct is a known-deferred one (extern /
-    //   typedef-of-pointer / compound-assign / ++ / arrays / strings — owned by
-    //   a later plan). An `Error` HIR node is emitted as a recovery sentinel and
-    //   lowering continues (collect-all); never a silent skip or a miscompile.
+    //   unknown HIR kind/op, or the construct is a known-deferred one
+    //   (typedef-of-pointer / compound-assign / ++ / arrays / strings —
+    //   owned by a later plan; extern decls are fully lowered, and
+    //   `extern int x = 5;` rejects via `H_ExternHasInitializer`). An
+    //   `Error` HIR node is emitted as a recovery sentinel and lowering
+    //   continues (collect-all); never a silent skip or a miscompile.
     H_UnsupportedLoweringForKind  = 0xF009,
+    // H_ExternHasInitializer: an `extern` declaration carries an
+    //   initializer (e.g. `extern int x = 5;`, `extern int y = z;`,
+    //   `extern int a[2] = {0,1};`, even `extern int b = {};`). Extern
+    //   announces a symbol whose storage lives in another translation
+    //   unit — an initializer would either redefine the symbol locally
+    //   (contradicting `extern`) or be silently dropped at lowering
+    //   (D-FF2-3 fold replaces that drop). Detection is shape-based:
+    //   any non-arrayDeclSuffix internal child of `varDeclTail` IS the
+    //   init subtree. Distinct remediation from
+    //   `H_UnsupportedLoweringForKind`: "remove the initializer", not
+    //   "extend the engine".
+    H_ExternHasInitializer        = 0xF00A,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -709,11 +723,10 @@ enum class DiagnosticCode : std::uint16_t {
     // F_HeaderInternalInvariant: an internal-invariant violation
     //   reached the header walker — a compiler bug, not a user-fixable
     //   issue. Remediation: file a bug.
-    // (Note: D-FF2-3 anchors a future `F_HeaderHasExternInitializer`
-    // code for `extern int x = 5;` rejection. Code is NOT pre-reserved
-    // — it lands paired with the matching HeaderReadErrorKind variant
-    // when D-FF2-3 closes, per the codebase rule "don't pre-build
-    // unused slots". Post-FF2-#2 type-design fold.)
+    // (D-FF2-3 CLOSED 2026-06-01 via `H_ExternHasInitializer`
+    // (0xF00A) at the lowering tier — the FFI walker reuses the
+    // c-subset frontend, so the reject reaches it through the
+    // shared lowering pipeline; no separate F_* code needed.)
     F_HeaderParseFailed            = 0x5008,
     F_HeaderHasFunctionBody        = 0x5009,
     F_HeaderHasNonExternDecl       = 0x500A,

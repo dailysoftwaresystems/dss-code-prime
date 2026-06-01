@@ -81,7 +81,14 @@ firstConfigCauseInline(std::span<ConfigDiagnostic const> diags) {
     return {};
 }
 
-// Emit + return helper, optionally stamping a source location.
+// Emit + return helper, optionally stamping a source location. The
+// `loc` parameter (when set) is threaded into BOTH the emitted
+// `ParseDiagnostic` (for the reporter pipeline) AND the returned
+// `HeaderReadError::at` field (for programmatic consumers without
+// reporter access). D-FF2-2 fold: the struct-side mirror closes the
+// gap where LSP / test pins had to re-parse reporter prose to locate
+// the offending decl. `HirSourceLoc{}` is the documented absent
+// value (source_span.hpp:31-39) — no optional wrapper.
 [[nodiscard]] HeaderReadError
 emitAndReturn(HeaderReadErrorKind kind, std::string detail,
               DiagnosticReporter& reporter,
@@ -95,7 +102,30 @@ emitAndReturn(HeaderReadErrorKind kind, std::string detail,
         p.span   = loc->span;
     }
     reporter.report(std::move(p));
-    return HeaderReadError{kind, std::move(detail)};
+    HeaderReadError err{kind, std::move(detail), HirSourceLoc{}};
+    if (loc != nullptr) err.at = *loc;
+    return err;
+}
+
+// Post-fold #7 silent-failure F2: when the c-subset frontend (parse /
+// semantic / lowering) rejects, the underlying diagnostic carries a
+// (buffer, span) pointing at the offending construct — but the FF2
+// wrap kind (HeaderParseFailed) is the same across "no span possible"
+// (e.g. tokenizer EOF) and "span available downstream" (e.g.
+// H_ExternHasInitializer at lowering). Mirror the locus into the
+// returned struct when any reported Error carried one, so the
+// struct-side `at` is informative for the LSP / test path. First
+// span-bearing Error wins; later diagnostics are typically cascade
+// reports of the same construct.
+[[nodiscard]] HirSourceLoc
+firstReportedErrorSpan(DiagnosticReporter const& reporter) noexcept {
+    for (auto const& d : reporter.all()) {
+        if (d.severity != DiagnosticSeverity::Error) continue;
+        if (!d.buffer.valid()) continue;
+        if (d.span.length() == 0) continue;
+        return HirSourceLoc{d.buffer, d.span};
+    }
+    return HirSourceLoc{};
 }
 
 [[nodiscard]] std::expected<std::string, HeaderReadError>
@@ -175,11 +205,17 @@ readCHeaderFromText(std::string_view    text,
         reporter.report(d);
     }
     if (model.hasErrors()) {
+        // Silent-failure F2 fold: pick up the first underlying
+        // Error's (buffer, span) so the struct-side `at` mirror is
+        // informative for LSP/test consumers.
+        HirSourceLoc const cause = firstReportedErrorSpan(reporter);
+        HirSourceLoc const* causePtr =
+            cause.buffer.valid() ? &cause : nullptr;
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::HeaderParseFailed,
             std::string{"c-subset frontend rejected header '"}
                 + std::string{headerPathLabel} + "' — see preceding diagnostics.",
-            reporter));
+            reporter, causePtr));
     }
 
     auto loweringResult = lowerToHir(model, reporter);
@@ -195,11 +231,17 @@ readCHeaderFromText(std::string_view    text,
             reporter));
     }
     if (!loweringResult->ok) {
+        // Silent-failure F2 fold: thread the lowering diagnostic's
+        // span (e.g. H_ExternHasInitializer's pointer at the init
+        // expr) into the struct-side `at`.
+        HirSourceLoc const cause = firstReportedErrorSpan(reporter);
+        HirSourceLoc const* causePtr =
+            cause.buffer.valid() ? &cause : nullptr;
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::HeaderParseFailed,
             std::string{"CST→HIR lowering rejected header '"}
                 + std::string{headerPathLabel} + "' — see preceding diagnostics.",
-            reporter));
+            reporter, causePtr));
     }
 
     Hir const& hir = loweringResult->hir;

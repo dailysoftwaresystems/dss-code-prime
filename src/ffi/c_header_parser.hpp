@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "ffi/import_surface.hpp"
+#include "hir/attributes/source_span.hpp"  // HirSourceLoc
 
 #include <cstdint>
 #include <expected>
@@ -40,9 +41,22 @@ enum class HeaderReadErrorKind : std::uint8_t {
     InvalidShippedPath           = 8,  // readCHeaderShipped relative-path validation reject
 };
 
+// D-FF2-2: source location of the offending construct, set by per-decl
+// rejection sites (HeaderHasFunctionBody / HeaderHasNonExternDecl /
+// HeaderHasUnsupportedTopLevel / InternalInvariant) and by HeaderParseFailed
+// when a downstream lowering emitted a span-bearing diagnostic. Entry-point
+// errors that have no node-level locus (FileOpenFailed / EmptyImportLibrary /
+// GrammarLoadFailed / InvalidShippedPath) leave this default-constructed —
+// `at.buffer.valid() == false`, the canonical "no source location" value
+// per `hir/attributes/source_span.hpp:31-39`. No `std::optional` wrapper —
+// `HirSourceLoc{}` is already the documented absent sentinel (post-fold #7
+// type-design T1 fold: one absence representation, not two).
+// Programmatic consumers (LSP, test pins, future introspection) read the
+// location directly from the struct rather than re-parsing reporter prose.
 struct DSS_EXPORT HeaderReadError {
     HeaderReadErrorKind kind = HeaderReadErrorKind::HeaderParseFailed;
     std::string         detail;
+    HirSourceLoc        at{};
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view

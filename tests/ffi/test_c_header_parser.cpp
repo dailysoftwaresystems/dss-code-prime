@@ -207,6 +207,77 @@ TEST(FfiCHeaderParser, RejectDiagnosticCarriesSourceSpan) {
     EXPECT_TRUE(foundWithSpan);
 }
 
+TEST(FfiCHeaderParser, ErrorStructCarriesLocationOnRejection) {
+    // D-FF2-2: HeaderReadError::at carries (buffer, span) of the
+    // offending decl so programmatic consumers (LSP, test pins,
+    // future introspection) can locate the error without re-parsing
+    // reporter prose. Mirrors the (buffer, span) that emitAndReturn
+    // already threads into the emitted ParseDiagnostic. Post-fold #7
+    // T1: no optional<> wrapper — `HirSourceLoc{}` is the absent
+    // sentinel (buffer.valid() == false).
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "int f(int x) { return x; }\n",
+        "<test>", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    auto const& err = rowsOrErr.error();
+    EXPECT_EQ(err.kind, HeaderReadErrorKind::HeaderHasFunctionBody);
+    EXPECT_TRUE(err.at.buffer.valid())
+        << "HeaderReadError::at.buffer must be valid for per-decl "
+           "rejections";
+    EXPECT_GT(err.at.span.length(), 0u)
+        << "HeaderReadError::at.span must be non-empty";
+}
+
+TEST(FfiCHeaderParser, ErrorStructAtSetForHeaderHasNonExternDecl) {
+    // Post-fold #7 PT2a: every per-decl rejection site must populate
+    // `at`, not just HeaderHasFunctionBody. Pins the NonExternDecl arm.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "int counter;\n",
+        "<test>", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderHasNonExternDecl);
+    EXPECT_TRUE(rowsOrErr.error().at.buffer.valid());
+    EXPECT_GT(rowsOrErr.error().at.span.length(), 0u);
+}
+
+TEST(FfiCHeaderParser, ErrorStructAtSetOnLoweringFailure) {
+    // Post-fold #7 silent-failure F2: D-FF2-3's H_ExternHasInitializer
+    // is emitted by lowering, then wrapped as HeaderParseFailed at the
+    // FF2 boundary. Without the F2 fold, the wrap dropped the locus —
+    // the LSP consumer would see HeaderReadError::at absent despite a
+    // span-bearing diagnostic in the reporter. Pin that the wrap now
+    // forwards the first reported Error's span into the struct.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "extern int x = 5;\n",
+        "<test>", "libc.so.6", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
+    EXPECT_TRUE(rowsOrErr.error().at.buffer.valid())
+        << "HeaderReadError::at must mirror the underlying lowering "
+           "diagnostic's span — F2 fold contract";
+    EXPECT_GT(rowsOrErr.error().at.span.length(), 0u);
+}
+
+TEST(FfiCHeaderParser, ErrorStructLocationAbsentForEntryPointFailures) {
+    // D-FF2-2 negative: entry-point errors (EmptyImportLibrary /
+    // FileOpenFailed / GrammarLoadFailed / InvalidShippedPath) have
+    // no single decl locus — `at` stays default-constructed
+    // (buffer.valid() == false). Programmatic consumers must check
+    // before reading; this pins the contract.
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "extern int puts(const char* s);\n",
+        "<test>", "", rep);
+    ASSERT_FALSE(rowsOrErr.has_value());
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::EmptyImportLibrary);
+    EXPECT_FALSE(rowsOrErr.error().at.buffer.valid())
+        << "EmptyImportLibrary is a caller-API entry-point error; "
+           "no decl locus exists, so `at.buffer` must be invalid";
+}
+
 // ── Diagnostic code name round-trips ──────────────────────────
 
 TEST(FfiCHeaderParser, DiagnosticCodeNameRoundTripFHeaderParseFailed) {

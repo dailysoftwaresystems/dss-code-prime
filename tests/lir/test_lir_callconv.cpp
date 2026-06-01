@@ -47,19 +47,57 @@ struct RewrittenBundle {
     RewrittenBundle(test_support::LoweredLir l) : lowered(std::move(l)) {}
 };
 
+// `ccIndex` default `= 0` is a TEST-HARNESS convenience only — the
+// underlying `allocateRegisters` parameter is REQUIRED (no default)
+// per `src/lir/lir_regalloc.hpp:183-187`'s "no default" discipline,
+// which exists to prevent a future caller from inheriting the
+// pre-D-FF3-3 hardcode silently. Tests pinning ccIndex=1 behavior
+// must pass `1` explicitly; the default exists so the dozens of
+// pre-existing non-cc tests don't have to be rewritten.
 [[nodiscard]] RewrittenBundle
-lowerThroughRewrite(std::string src) {
+lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0) {
     RewrittenBundle out{lowerCSubsetToLir(std::move(src))};
     if (!out.lowered.lir.ok) return out;
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
     out.alloc = allocateRegisters(out.lowered.lir.lir, *out.lowered.target,
-                                  out.liveness, /*ccIndex=*/0,
+                                  out.liveness, ccIndex,
                                   out.regallocRep);
     if (!out.alloc.ok()) return out;
     out.rewritten = rewriteWithAllocation(out.lowered.lir.lir,
                                           *out.lowered.target, out.alloc,
                                           out.rewriteRep);
     return out;
+}
+
+// Post-fold #7 simplifier R3: hoisted mov-walking helper, was inlined
+// in CalleeArgReceivesFromArgGprAcrossSysVAndMsX64 + the new
+// CcIndex1DrivesDifferentArgGprThanCc0. Returns true iff any `mov`
+// inst in `lir` touches `physOrd` as either result or a Reg-operand
+// source — used by tests that pin "this physical reg surfaces in the
+// post-callconv arg-loading sequence."
+[[nodiscard]] bool
+anyMovTouchesPhysReg(Lir const& lir, std::uint16_t physOrd,
+                     std::uint16_t movOp) {
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i) {
+                LirInstId const inst = lir.blockInstAt(b, i);
+                if (lir.instOpcode(inst) != movOp) continue;
+                LirReg const r = lir.instResult(inst);
+                if (r.valid() && r.isPhysical != 0 && r.id == physOrd)
+                    return true;
+                for (auto const& op : lir.instOperands(inst)) {
+                    if (op.kind == LirOperandKind::Reg
+                        && op.reg.isPhysical != 0
+                        && op.reg.id == physOrd)
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -493,6 +531,76 @@ TEST(LirCallconvAbi, CalleeArgReceivesFromArgGprAcrossSysVAndMsX64) {
         << "the arg materialization must touch argGprs[0] ("
         << cc->argGprs[0] << ") either as a mov source (arg copy) "
            "or as the regalloc-picked home reg (no-op skipped mov)";
+}
+
+TEST(LirCallconvAbi, CcIndex1DrivesDifferentArgGprThanCc0) {
+    // PINS: D-FF3-3 behavioral arm — companion to
+    // `LirRegAlloc.CcIndex1RecordsThroughToFuncAllocation`
+    // (metadata pin, test_lir_regalloc.cpp) and
+    // `CalleeArgReceivesFromArgGprAcrossSysVAndMsX64` (ccIndex=0
+    // behavior). This pins that ccIndex=1 actually steers the emitted
+    // arg-loading mov to a DIFFERENT physical register than ccIndex=0
+    // does — i.e. the index isn't read into metadata and then ignored
+    // downstream. For x86_64: cc[0]=sysv_amd64 (arg0=rdi), cc[1]=ms_x64
+    // (arg0=rcx). Without this pin, a regression that reads
+    // `funcAlloc.callingConventionIndex` but then hardcodes cc[0] in
+    // the prologue emitter would silently emit SysV ABI on PE+x86_64
+    // targets — wrong-machine-code surface.
+    //
+    // Post-fold #7 silent-failure F3: assert `bundle.alloc.ok()`
+    // BEFORE `bundle.rewritten.ok` so an alloc failure (e.g. future
+    // schema regression on cc[1]) fails loud with the right cause
+    // instead of being masked by `LirRewriteResult{}` defaulting to
+    // ok=true. Post-fold #7 PT3: also assert cc[0].argGprs[0] does
+    // NOT surface — catches a regression that emits BOTH cc[0] and
+    // cc[1] arg movs (a `sawCc1Arg0`-only positive pin would pass).
+    auto bundle = lowerThroughRewrite("int f(int x) { return x; }",
+                                       /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.alloc.ok())
+        << "allocateRegisters(ccIndex=1) failed — likely a schema or "
+           "regalloc regression upstream of materialization; the "
+           "downstream rewritten.ok would default-true and mislead";
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+
+    auto const* cc0 = bundle.lowered.target->callingConvention(0);
+    auto const* cc1 = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc0, nullptr);
+    ASSERT_NE(cc1, nullptr);
+    ASSERT_FALSE(cc0->argGprs.empty());
+    ASSERT_FALSE(cc1->argGprs.empty());
+    // The behavioral pin only has teeth when cc[0].argGprs[0] !=
+    // cc[1].argGprs[0]. A future schema where they coincide makes
+    // the test vacuous — fail loud rather than silently pass.
+    ASSERT_NE(cc0->argGprs[0], cc1->argGprs[0])
+        << "Behavioral pin requires cc[0] and cc[1] argGprs[0] to "
+           "differ for the test to be meaningful; both name "
+        << cc0->argGprs[0];
+
+    auto const cc0Arg0Ord =
+        bundle.lowered.target->registerByName(cc0->argGprs[0]);
+    auto const cc1Arg0Ord =
+        bundle.lowered.target->registerByName(cc1->argGprs[0]);
+    ASSERT_TRUE(cc0Arg0Ord.has_value());
+    ASSERT_TRUE(cc1Arg0Ord.has_value());
+    auto const movOp = bundle.lowered.target->opcodeByMnemonic("mov");
+    ASSERT_TRUE(movOp.has_value());
+
+    EXPECT_TRUE(anyMovTouchesPhysReg(result.lir, *cc1Arg0Ord, *movOp))
+        << "ccIndex=1 arg materialization must touch " << cc1->argGprs[0]
+        << " (cc[1].argGprs[0]); a regression hardcoding cc[0] would "
+        << "surface " << cc0->argGprs[0] << " instead and silently "
+        << "emit SysV ABI for a Windows target";
+    EXPECT_FALSE(anyMovTouchesPhysReg(result.lir, *cc0Arg0Ord, *movOp))
+        << "ccIndex=1 must NOT use " << cc0->argGprs[0]
+        << " (cc[0].argGprs[0]); a regression that emits BOTH cc[0] "
+        << "and cc[1] arg movs would pass a positive-only pin but "
+        << "still ship wrong-ABI bytes";
 }
 
 TEST(LirCallconvAbi, CallSiteMaterializesArgIntoArgGprAndResultFromReturnGpr) {

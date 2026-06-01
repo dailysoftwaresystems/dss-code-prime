@@ -583,7 +583,8 @@
           "whenRule": "externFuncTail",
           "whenKind": "function",
           "paramsPath": [1]
-        } }
+        },
+        "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } }
     ],
     "references": [
       { "rule": "operand" },

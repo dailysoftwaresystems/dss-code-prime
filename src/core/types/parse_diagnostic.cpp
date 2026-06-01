@@ -105,6 +105,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_TextVersionMismatch:      return "H_TextVersionMismatch";
         case DiagnosticCode::H_TextUnknownName:          return "H_TextUnknownName";
         case DiagnosticCode::H_UnsupportedLoweringForKind: return "H_UnsupportedLoweringForKind";
+        case DiagnosticCode::H_ExternHasInitializer:     return "H_ExternHasInitializer";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
