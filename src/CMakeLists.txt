@@ -10,6 +10,7 @@ add_subdirectory(mir/lowering)
 add_subdirectory(lir)
 add_subdirectory(asm)
 add_subdirectory(link)
+add_subdirectory(ffi)
 add_subdirectory(lsp)
 add_subdirectory(program)
 
@@ -29,6 +30,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:lir_lowering>
     $<TARGET_OBJECTS:asm>
     $<TARGET_OBJECTS:link>
+    $<TARGET_OBJECTS:ffi>
     $<TARGET_OBJECTS:lsp>
     $<TARGET_OBJECTS:program>)
 target_include_directories(dss-code-prime-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

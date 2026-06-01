@@ -593,6 +593,36 @@ enum class DiagnosticCode : std::uint16_t {
     K_ImageWriteShort              = 0x8009,
     K_ImageWriteCloseFailed        = 0x800A,
     K_ImageEmpty                   = 0x800B,
+
+    // ── F_* — FFI binary-reader / C-header-parser (plan 11 §2.6) ──
+    // F_FileOpenFailed: shared-library path doesn't exist / permission
+    //   denied / I/O error during initial open. Distinct from
+    //   D_FileNotFound (CLI input file) because the remediation is
+    //   "check the project's importLibrary path or distro lib paths",
+    //   not "fix the user's --compile argument".
+    // F_FileEmpty: zero-byte file. Symptomatic of a broken build /
+    //   truncated download.
+    // F_UnknownBinaryFormat: no recognised magic bytes (not ELF, not
+    //   PE, not Mach-O). Distinct from `UnsupportedBinaryFormat` —
+    //   "unknown" means we can't even guess; "unsupported" means we
+    //   recognised the format but the reader for it isn't shipped.
+    // F_UnsupportedBinaryFormat: format recognised but binary-reader
+    //   not yet shipped (e.g. PE during FF1-ELF-only cycle). Cites
+    //   the per-format anchor (FF1-PE / FF1-MachO) so the user knows
+    //   what's pending.
+    // F_CorruptedBinary: file structurally invalid — section offset
+    //   past EOF, string-table index out of range, etc.
+    // F_UnsupportedElfClass: ELF32 / non-LE / ELFv0 — v1 supports
+    //   ELF64 little-endian (gABI mainstream).
+    // F_SectionNotFound: expected .dynsym / .dynstr / etc. missing
+    //   from the binary. A stripped library is the typical cause.
+    F_FileOpenFailed               = 0x5001,
+    F_FileEmpty                    = 0x5002,
+    F_UnknownBinaryFormat          = 0x5003,
+    F_UnsupportedBinaryFormat      = 0x5004,
+    F_CorruptedBinary              = 0x5005,
+    F_UnsupportedElfClass          = 0x5006,
+    F_SectionNotFound              = 0x5007,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

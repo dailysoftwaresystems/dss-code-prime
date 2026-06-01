@@ -150,6 +150,14 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_ImageWriteShort:              return "K_ImageWriteShort";
         case DiagnosticCode::K_ImageWriteCloseFailed:        return "K_ImageWriteCloseFailed";
         case DiagnosticCode::K_ImageEmpty:                   return "K_ImageEmpty";
+
+        case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
+        case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";
+        case DiagnosticCode::F_UnknownBinaryFormat:          return "F_UnknownBinaryFormat";
+        case DiagnosticCode::F_UnsupportedBinaryFormat:      return "F_UnsupportedBinaryFormat";
+        case DiagnosticCode::F_CorruptedBinary:              return "F_CorruptedBinary";
+        case DiagnosticCode::F_UnsupportedElfClass:          return "F_UnsupportedElfClass";
+        case DiagnosticCode::F_SectionNotFound:              return "F_SectionNotFound";
     }
     return "Unknown";
 }
@@ -165,6 +173,7 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0x5xxx → O0xxx     RESERVED — object format / linker (plan 14;
     //                       holding the slot so plan-14 doesn't accidentally
     //                       land on 0xCxxx (which is C_*) or 0xDxxx (D_*))
+    //   0x5xxx → F0xxx     (FFI binary-reader + C-header-parser; plan 11 §2.6 — allocated 2026-06-01)
     //   0x6xxx → W0xxx     RESERVED — WAT/WASM verifier (plan 18; allocated 2026-05-29)
     //   0x7xxx → V0xxx     RESERVED — SPIR-V verifier  (plan 17; allocated 2026-05-29)
     //   0x9xxx → P9xxx     (parse, internal-invariant range)
@@ -185,6 +194,8 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'A';
     } else if (nibble == 0x4000u) {
         letter = 'R';
+    } else if (nibble == 0x5000u) {
+        letter = 'F';
     } else if (nibble == 0x8000u) {
         letter = 'K';
     } else if (nibble == 0xA000u) {
@@ -204,6 +215,7 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     // marker (A/K/R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
     // P_BuilderInvariant prints as "P9000".
     const bool hasNibbleMarker = (nibble == 0x1000u || nibble == 0x4000u
+                                  || nibble == 0x5000u
                                   || nibble == 0x8000u
                                   || nibble == 0xA000u || nibble == 0xB000u
                                   || nibble == 0xC000u || nibble == 0xD000u
