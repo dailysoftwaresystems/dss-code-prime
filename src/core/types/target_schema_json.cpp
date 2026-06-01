@@ -364,16 +364,38 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll).release());
     }
     data.name = target.at("name").get<std::string>();
-    // Empty `name` would be silently accepted by the closed-enum
-    // cross-validation at the driver tier (lookupTargetArch returns
-    // nullptr → skip), reopening the SIGILL surface D-LK6-8.2 was
-    // anchored to close. Reject at load time. (silent-failure CRITICAL-2
-    // post-fold #1 — D-LK6-8.2 audit.)
-    if (data.name.empty()) {
+    // Empty OR whitespace-only `name` would be silently accepted by
+    // the closed-enum cross-validation at the driver tier
+    // (`lookupTargetArch` does exact comparison → no match → skip),
+    // reopening the SIGILL surface D-LK6-8.2 was anchored to close.
+    // Also reject leading/trailing whitespace ("  arm64 " ≠ "arm64").
+    // (silent-failure CRITICAL-2 + HIGH-1 post-fold — D-LK6-8.2 audit
+    // rounds 1 and 2 — empty was caught in round 1, whitespace in
+    // round 2.)
+    auto const isNonAsciiWhitespace = [](char c) noexcept {
+        // ASCII whitespace per POSIX [[:space:]]:
+        // space, tab, newline, CR, vertical tab, form feed.
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+            || c == '\v' || c == '\f';
+    };
+    auto const allWhitespace = [&](std::string_view s) noexcept {
+        for (char c : s) {
+            if (!isNonAsciiWhitespace(c)) return false;
+        }
+        return true;
+    };
+    auto const hasLeadingTrailingWS = [&](std::string_view s) noexcept {
+        return !s.empty()
+            && (isNonAsciiWhitespace(s.front())
+             || isNonAsciiWhitespace(s.back()));
+    };
+    if (data.name.empty() || allWhitespace(data.name)
+        || hasLeadingTrailingWS(data.name)) {
         coll.emit(DiagnosticCode::C_MissingField, "/target/name",
-                  "'name' must be a non-empty string — an empty target "
-                  "name would silently bypass the (target, format) "
-                  "machine cross-check (plan 14 §3.1 D-LK6-8.2).");
+                  "'name' must be a non-empty string with no leading "
+                  "or trailing whitespace — would silently bypass the "
+                  "(target, format) machine cross-check (plan 14 §3.1 "
+                  "D-LK6-8.2).");
         return std::unexpected(std::move(coll).release());
     }
     if (target.contains("version") && target.at("version").is_string()) {

@@ -235,6 +235,31 @@ TEST(Program_CompileFiles, NonExistentSourceFileReturnsNonZero) {
               1);
 }
 
+// ── D-LK6-8.2 pr-test-analyzer Gap 5 P9: cross-validate wired ──
+// Pins that crossValidateTargetFormat IS INVOKED from the compile
+// pipeline (program.cpp call site between schema-load and
+// compileSingleUnit). Without this, a refactor could quietly remove
+// the call and every cross-validation case would silently pass
+// through to compileSingleUnit — exactly the silent-failure surface
+// D-LK6-8.2 was anchored to close. Pair (target=x86_64,
+// format=elf64-aarch64-linux): the schemas load individually, but
+// the (62 vs 183) elf.machine mismatch trips cross-validate and
+// compileFiles returns non-zero.
+TEST(Program_CompileFiles, CrossValidateRejectsMachineMismatch) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    scratch.useAsCwd();
+    auto src = scratch.path() / "x.c";
+    {
+        std::ofstream out{src};
+        out << "int main(void) { return 0; }\n";
+    }
+    Program prog;
+    EXPECT_EQ(prog.compileFiles({src.string()},
+                                "c-subset",
+                                {"x86_64:elf64-aarch64-linux"}),
+              1);
+}
+
 // ── compileProject: plan 06 fail-loud stub ────────────────────
 
 TEST(Program_CompileProject, FailsLoudPlanNotLanded) {

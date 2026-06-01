@@ -60,7 +60,7 @@ void emitMismatch(DiagnosticReporter& reporter,
                   std::uint64_t expected,
                   std::uint64_t actual,
                   std::string_view fieldName) {
-    dss::report(reporter, DiagnosticCode::D_TargetFormatMismatch,
+    dss::report(reporter, DiagnosticCode::D_TargetMachineCodeMismatch,
                 DiagnosticSeverity::Error,
                 std::format("target '{}' expects {} {}=0x{:X} ({}), "
                             "but the format schema declares 0x{:X} ({}). "
@@ -123,7 +123,7 @@ bool crossValidateTargetFormat(TargetSchema const&       target,
     // WASM/SPIR-V skip the machine check (no machine field), so a
     // mismatched abi-model would slip past the table lookup silently.
     if (!abiModelMatchesFormatKind(target.abiModel(), format.kind())) {
-        dss::report(reporter, DiagnosticCode::D_TargetFormatMismatch,
+        dss::report(reporter, DiagnosticCode::D_TargetAbiModelMismatch,
                     DiagnosticSeverity::Error,
                     std::format("target '{}' declares abiModel='{}' "
                                 "but the format schema has kind='{}'. "

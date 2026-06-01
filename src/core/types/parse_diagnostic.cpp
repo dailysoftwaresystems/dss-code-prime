@@ -152,6 +152,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_ImageEmpty:                   return "K_ImageEmpty";
 
         case DiagnosticCode::D_TargetFormatMismatch:         return "D_TargetFormatMismatch";
+        case DiagnosticCode::D_TargetMachineCodeMismatch:    return "D_TargetMachineCodeMismatch";
+        case DiagnosticCode::D_TargetAbiModelMismatch:       return "D_TargetAbiModelMismatch";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";

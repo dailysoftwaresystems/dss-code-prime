@@ -73,6 +73,29 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         return std::unexpected(std::move(coll).release());
     }
     data.name = format.at("name").get<std::string>();
+    // Cross-tier symmetry with `target.name` (D-LK6-8.2 post-fold #2
+    // architect Q3): `format.name` is the label every walker
+    // diagnostic message uses. An empty or whitespace-only name
+    // would produce unintelligible diagnostics silently. The same
+    // non-empty-non-whitespace discipline applies on both sides.
+    auto const isAsciiSpace = [](char c) noexcept {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+            || c == '\v' || c == '\f';
+    };
+    bool const isBadName = [&]() noexcept {
+        if (data.name.empty()) return true;
+        if (isAsciiSpace(data.name.front())) return true;
+        if (isAsciiSpace(data.name.back()))  return true;
+        for (char c : data.name) if (!isAsciiSpace(c)) return false;
+        return true;  // all whitespace
+    }();
+    if (isBadName) {
+        coll.emit(DiagnosticCode::C_MissingField, "/format/name",
+                  "'name' must be a non-empty string with no leading "
+                  "or trailing whitespace — appears verbatim in every "
+                  "walker diagnostic.");
+        return std::unexpected(std::move(coll).release());
+    }
     if (format.contains("version") && format.at("version").is_string()) {
         data.version = format.at("version").get<std::string>();
     }

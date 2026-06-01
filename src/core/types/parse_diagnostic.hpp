@@ -265,16 +265,30 @@ enum class DiagnosticCode : std::uint16_t {
     // meaning (input dir / input file missing).
     D_OutputDirCreateFailed       = 0xD00A,
     D_DirectoryScanFailed         = 0xD00B,
-    // D_TargetFormatMismatch: D-LK6-8.2 closure — the (target, format)
-    // pair the user supplied via `--target=<target>:<format>` declares
-    // mismatched machine identity. Example: `arm64:elf64-x86_64-linux-exec`
-    // — the format JSON's `elf.machine=62` (EM_X86_64) doesn't match
-    // the target schema's "arm64" arch identity (expected
-    // `elf.machine=183`). Pre-fold this dispatched silently into the
-    // x86_64 PLT-stub emitter, producing SIGILL at runtime. Now fails
-    // loud at the driver tier before linking. (silent-failure-hunter
-    // CRITICAL post-fold #1 on commit 84c68bc; closed 2026-06-01.)
+    // D_TargetFormatMismatch (deprecated alias of
+    // D_TargetMachineCodeMismatch — kept for downstream
+    // tooling already filtering on this code; new emissions use the
+    // remediation-distinct codes below).
     D_TargetFormatMismatch        = 0xD00C,
+    // D_TargetMachineCodeMismatch: D-LK6-8.2 closure — the machine
+    // code declared on the FORMAT schema doesn't match the TARGET
+    // schema's expected machine code for that format kind. Example:
+    // `arm64:elf64-x86_64-linux-exec` declares `elf.machine=62`
+    // (EM_X86_64) but the "arm64" target expects `elf.machine=183`
+    // (EM_AARCH64). Pre-fold this dispatched silently into the wrong
+    // PLT-stub emitter → SIGILL.
+    // D_TargetAbiModelMismatch: D-LK6-8.2 post-fold #1 closure — the
+    // target's `abiModel` (register-machine / operand-stack /
+    // result-id) doesn't match the format's `kind` (Elf/Pe/MachO vs
+    // Wasm vs Spirv). Example: register-machine x86_64 target paired
+    // with a WASM format. Pre-fold this also silently passed because
+    // the cited `abiModel()` "upstream gate" was fictitious.
+    // The two codes are remediation-distinct: machine-code mismatch
+    // is fixed by changing one of the two schema files' machine
+    // values; abi-model mismatch is fixed by picking a different
+    // target OR format entirely.
+    D_TargetMachineCodeMismatch   = 0xD00D,
+    D_TargetAbiModelMismatch      = 0xD00E,
 
     // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

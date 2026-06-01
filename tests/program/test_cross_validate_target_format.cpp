@@ -137,7 +137,7 @@ TEST(CrossValidateTargetFormat, Arm64TargetWithX86_64FormatFailsLoud) {
     ASSERT_TRUE(target && format);
     DiagnosticReporter rep;
     EXPECT_FALSE(crossValidateTargetFormat(*target, *format, rep));
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetMachineCodeMismatch));
 }
 
 TEST(CrossValidateTargetFormat, X86_64TargetWithArm64FormatFailsLoud) {
@@ -146,7 +146,7 @@ TEST(CrossValidateTargetFormat, X86_64TargetWithArm64FormatFailsLoud) {
     ASSERT_TRUE(target && format);
     DiagnosticReporter rep;
     EXPECT_FALSE(crossValidateTargetFormat(*target, *format, rep));
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetMachineCodeMismatch));
 }
 
 // ── Unknown target name: skip the check ───────────────────────
@@ -232,7 +232,7 @@ TEST(CrossValidateTargetFormat, Arm64TargetWithX86_64PeFailsLoud) {
     ASSERT_TRUE(target && format);
     DiagnosticReporter rep;
     EXPECT_FALSE(crossValidateTargetFormat(*target, *format, rep));
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetMachineCodeMismatch));
 }
 
 // ── Post-fold #1 (pr-test-analyzer P9): Mach-O arm coverage ───
@@ -252,7 +252,7 @@ TEST(CrossValidateTargetFormat, Arm64TargetWithX86_64MachOFailsLoud) {
     ASSERT_TRUE(target && format);
     DiagnosticReporter rep;
     EXPECT_FALSE(crossValidateTargetFormat(*target, *format, rep));
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetMachineCodeMismatch));
 }
 
 // ── Post-fold #1 (silent-failure CRITICAL-1): abiModel cross-check ──
@@ -268,7 +268,7 @@ TEST(CrossValidateTargetFormat, RegisterMachineWithWasmFormatFailsLoud) {
 
     DiagnosticReporter rep;
     EXPECT_FALSE(crossValidateTargetFormat(**target, **wasm, rep));
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetAbiModelMismatch));
 }
 
 TEST(CrossValidateTargetFormat, RegisterMachineWithSpirvFormatFailsLoud) {
@@ -282,7 +282,71 @@ TEST(CrossValidateTargetFormat, RegisterMachineWithSpirvFormatFailsLoud) {
 
     DiagnosticReporter rep;
     EXPECT_FALSE(crossValidateTargetFormat(**target, **spirv, rep));
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetFormatMismatch));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::D_TargetAbiModelMismatch));
+}
+
+// ── Post-fold #2 (pr-test-analyzer Gap 1): Unknown-cell deferral ─
+// Note: `ObjectFormatKind::Unknown` is the default-sentinel and the
+// JSON loader rejects `"kind":"unknown"` at load time, so the
+// Unknown arms in `abiModelMatchesFormatKind` + the format-kind
+// switch are unreachable via valid user-loaded schemas. The arms
+// exist for defense-in-depth against a default-constructed
+// ObjectFormatData reaching the function (e.g. a future
+// programmatically-constructed schema). Not testable from a JSON
+// fixture today; anchored as defensive code.
+
+// ── Post-fold #2 (HIGH-1): whitespace target.name rejected at load ─
+
+TEST(TargetSchemaLoader, WhitespaceOnlyTargetNameRejected) {
+    auto r = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"   "},
+      "opcodes": [ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(TargetSchemaLoader, LeadingTrailingWhitespaceTargetNameRejected) {
+    auto r = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":" arm64 "},
+      "opcodes": [ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── Post-fold #2 (architect Q3): format.name cross-tier symmetry ─
+
+TEST(ObjectFormatSchemaLoader, EmptyFormatNameRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"","kind":"elf"}
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+TEST(ObjectFormatSchemaLoader, WhitespaceFormatNameRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":" elf64 ","kind":"elf"}
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── Post-fold #2 (HIGH-3): split-code round-trip ───────────────
+
+TEST(CrossValidateTargetFormat, DTargetMachineCodeMismatchNameRoundTrip) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_TargetMachineCodeMismatch),
+              "D_TargetMachineCodeMismatch");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_TargetMachineCodeMismatch),
+              "D000D");
+}
+
+TEST(CrossValidateTargetFormat, DTargetAbiModelMismatchNameRoundTrip) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_TargetAbiModelMismatch),
+              "D_TargetAbiModelMismatch");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_TargetAbiModelMismatch),
+              "D000E");
 }
 
 // ── Post-fold #1 (CRITICAL-2): empty target name rejected at load ─
