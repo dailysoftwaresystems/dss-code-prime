@@ -43,19 +43,27 @@ using walker_util::PendingRelocSlot;
 // REX.B, plus the immediate(s) and pending symbol-relative slot
 // that follow. The struct shape lets the slot wiring loop populate
 // fields independently of emission order — emission writes REX →
-// opcode → ModR/M → imm → disp32 at the end.
+// opcode → ModR/M → SIB → disp → imm → disp32 at the end.
+//
+// D-AS4-1 memory-addressing extension (cycle 2 of the load/store
+// encoder support): when a variant wires a base register into
+// `ModRmRmMem` (instead of the register-direct `ModRmRm`), the
+// walker flips `modMode` to MemDisp32. The ModR/M.mod field then
+// emits `10b` (32-bit displacement form) and — when the base's low
+// 3 bits equal 4 (rsp/r12 family) — a SIB byte forcibly follows
+// per the x86-64 ABI rule. The 4 displacement bytes come from a
+// paired `Disp32Mem` slot (sourced from a LIR `MemOffset` operand).
 struct EncodingState {
     bool                  hasModRm   = false;
     std::uint8_t          modRmReg3  = 0;       // low 3 bits → ModR/M.reg
     std::uint8_t          modRmRm3   = 0;       // low 3 bits → ModR/M.rm
     bool                  rexR       = false;   // high bit of ModRmReg slot's hwEncoding
     bool                  rexB       = false;   // high bit of ModRmRm slot's hwEncoding
-    // `rexX` is reserved for SIB.index high bit — declared now so the
-    // REX-byte assembly downstream is structurally complete; no cycle-2
-    // walker writes it (current scope: register-direct only, no SIB).
-    // SIB-bearing memory addressing modes will set this when they
-    // land (paired with the corresponding `EncodingSlotKind::SibIndex`
-    // entry that doesn't exist yet).
+    // `rexX` is reserved for SIB.index high bit. v1 memory addressing
+    // (D-AS4-1 cycle 2) uses no index reg — SIB-when-present encodes
+    // `[base + 0*idx + disp]`, with index field forced to 4 (no-index
+    // marker). When `index*scale` lands as a future cycle, that wire
+    // will set rexX from the index's hwEncoding bit 3.
     bool                  rexX       = false;
     // Defense-in-depth: track which ModR/M sub-slots have been written.
     // `validate()` already rejects schemas that would double-write
@@ -64,6 +72,16 @@ struct EncodingState {
     // catches it as a fail-loud rather than a silent overwrite.
     bool                  wroteModRmReg = false;
     bool                  wroteModRmRm  = false;
+    // Addressing mode for the ModR/M.mod field. RegDirect (mod=11)
+    // is the cycle-1 register-only shape; MemDisp32 (mod=10) emits
+    // a 32-bit displacement and forces SIB when base.lo3 == 4.
+    enum class ModMode : std::uint8_t { RegDirect = 0b11, MemDisp32 = 0b10 };
+    ModMode               modMode    = ModMode::RegDirect;
+    // Memory-mode 32-bit displacement (from a Disp32Mem slot —
+    // immediate value, NOT relocated). std::optional makes the
+    // ModR/M-mem + missing-Disp32Mem pairing fail loud rather than
+    // silently emitting a zero offset.
+    std::optional<std::int32_t> disp32Mem;
     std::vector<std::int32_t>     imm32s;        // immediate values to append (LE 4B each)
     std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
 };
@@ -110,16 +128,64 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             st.rexB          = (hwEnc & 0x8u) != 0u;
             st.wroteModRmRm  = true;
             return true;
+        case EncodingSlotKind::ModRmRmMem:
+            // D-AS4-1 memory-addressing: like ModRmRm but flips the
+            // mod field to MemDisp32. The base register's low 3 bits
+            // fill ModR/M.rm; the high bit drives REX.B. The SIB
+            // forced-presence rule (when rm.lo3 == 4) fires at
+            // emit time, not here.
+            if (st.wroteModRmRm) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': second writer to "
+                                   "ModR/M.rm slot (ModRmRmMem after a "
+                                   "prior ModRmRm/ModRmRmMem wire)",
+                                   mnemonic));
+                return false;
+            }
+            st.hasModRm      = true;
+            st.modRmRm3      = static_cast<std::uint8_t>(hwEnc & 0x7u);
+            st.rexB          = (hwEnc & 0x8u) != 0u;
+            st.wroteModRmRm  = true;
+            st.modMode       = EncodingState::ModMode::MemDisp32;
+            return true;
         case EncodingSlotKind::Imm32:
-            // Imm32 expects an immediate value, not a register hwEnc.
-            // Wired separately via `wireImm32`. Reaching here means
-            // the JSON wired a register into an Imm32 slot — fail
-            // loud rather than silently dropping the high bits.
+        case EncodingSlotKind::Disp32Mem:
+            // Imm32 / Disp32Mem expect an immediate-style value, not a
+            // register hwEnc. Wired separately via the operand-kind
+            // dispatch below. Reaching here means the JSON wired a
+            // register into a non-register slot — fail loud.
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': variant wires a register "
-                               "into an Imm32 slot",
+                               "into a non-register slot '{}'",
+                               mnemonic,
+                               encodingSlotKindName(slot)));
+            return false;
+        case EncodingSlotKind::MemBaseScale:
+            // MemBase carries a scale value, not a register. Fail loud.
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': variant wires a register "
+                               "into a MemBaseScale slot",
                                mnemonic));
+            return false;
+        case EncodingSlotKind::Disp32:
+        case EncodingSlotKind::Rd:
+        case EncodingSlotKind::Rn:
+        case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Imm26:
+            // Other shapes — not handled by the x86 walker (the
+            // schema's slotShapeFor + validate cross-check prevents
+            // reaching here under a clean schema). Defense-in-depth
+            // fail-loud.
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': slot '{}' belongs to a "
+                               "different encoding shape and is not "
+                               "handled by the x86 walker",
+                               mnemonic,
+                               encodingSlotKindName(slot)));
             return false;
     }
     // Enum-drift fallback. A new `EncodingSlotKind` value added without
@@ -147,6 +213,63 @@ wireImm32(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
         return false;
     }
     st.imm32s.push_back(v);
+    return true;
+}
+
+// D-AS4-1 memory-addressing: validate a MemBase operand's scale
+// against the v1 cycle scope (scale == 1 — base+disp form). Future
+// `[base + index*scale]` cycles will accept scale ∈ {1,2,4,8}.
+// The slot writes no bytes.
+[[nodiscard]] bool
+wireMemBaseScale(EncodingSlotKind slot, std::uint32_t scale,
+                 std::string_view mnemonic,
+                 DiagnosticReporter& reporter) {
+    if (slot != EncodingSlotKind::MemBaseScale) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': MemBase operand wired into "
+                           "a non-MemBaseScale slot '{}'",
+                           mnemonic, encodingSlotKindName(slot)));
+        return false;
+    }
+    if (scale != 1u) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': MemBase scale {} not supported "
+                           "(v1 cycle scope: scale == 1 only — "
+                           "[base + index*scale] addressing is anchored "
+                           "as a follow-up to D-AS4-1)",
+                           mnemonic, scale));
+        return false;
+    }
+    return true;
+}
+
+// D-AS4-1 memory-addressing: stash a MemOffset operand's signed
+// 32-bit displacement for emission after ModR/M (and SIB when
+// present). std::optional collision check makes a future
+// double-write (or a malformed schema) fail loud.
+[[nodiscard]] bool
+wireDisp32Mem(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
+              std::string_view mnemonic, DiagnosticReporter& reporter) {
+    if (slot != EncodingSlotKind::Disp32Mem) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': MemOffset operand wired into "
+                           "a non-Disp32Mem slot '{}'",
+                           mnemonic, encodingSlotKindName(slot)));
+        return false;
+    }
+    if (st.disp32Mem.has_value()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': second writer to Disp32Mem "
+                           "slot (only one memory displacement per "
+                           "instruction in cycle scope)",
+                           mnemonic));
+        return false;
+    }
+    st.disp32Mem = v;
     return true;
 }
 
@@ -238,6 +361,21 @@ bool encode(Lir const&                  lir,
                             info->mnemonic, reporter)) {
                 return false;
             }
+        } else if (srcOp.kind == LirOperandKind::MemBase) {
+            // D-AS4-1 memory-addressing: MemBase carries the scale
+            // for `[base + index*scale + disp]` addressing. v1 cycle
+            // scope only handles scale == 1 (no indexed addressing).
+            if (!wireMemBaseScale(wire.slotKind, srcOp.scale,
+                                   info->mnemonic, reporter)) {
+                return false;
+            }
+        } else if (srcOp.kind == LirOperandKind::MemOffset) {
+            // D-AS4-1 memory-addressing: MemOffset carries the signed
+            // 32-bit displacement for [base + disp32] addressing.
+            if (!wireDisp32Mem(st, wire.slotKind, srcOp.offset,
+                                info->mnemonic, reporter)) {
+                return false;
+            }
         } else if (srcOp.kind == LirOperandKind::SymbolRef) {
             // Plan 13 AS4 — symbol-bearing wire emits a Relocation.
             // Cycle scope: only Disp32 supports the symbol-relative
@@ -319,8 +457,13 @@ bool encode(Lir const&                  lir,
     // 4) ModR/M byte. Emit iff any slot wired into ModR/M, OR the
     //    template uses `modrmRegExt` (which is a ModR/M.reg digit
     //    extension and only meaningful WITH a ModR/M byte).
+    //    D-AS4-1: `modMode` selects mod=11 (register-direct) vs
+    //    mod=10 (memory + disp32). The walker accumulates modMode
+    //    via the slot-wiring loop (ModRmRm → RegDirect, ModRmRmMem →
+    //    MemDisp32).
     if (st.hasModRm || selected->tmpl.modrmRegExt.has_value()) {
-        std::uint8_t const modField = 0b11u;  // mod=3, register-direct
+        std::uint8_t const modField =
+            static_cast<std::uint8_t>(st.modMode);
         std::uint8_t const regField =
             selected->tmpl.modrmRegExt.has_value()
                 ? static_cast<std::uint8_t>(*selected->tmpl.modrmRegExt & 0x7u)
@@ -331,11 +474,44 @@ bool encode(Lir const&                  lir,
         out.push_back(modrm);
     }
 
-    // 5) SIB byte: not yet (register-direct mod=3 needs no SIB; the
-    //    "forced SIB when ModR/M.rm == 4" rule applies only to
-    //    memory addressing modes, which land alongside Load/Store).
+    // 5) SIB byte. The x86-64 ABI requires a SIB byte when ModR/M.mod
+    //    is not 11 AND ModR/M.rm.lo3 == 4 (the rsp/r12 family — bit
+    //    pattern that would otherwise mean "SIB follows"). v1 cycle
+    //    scope uses no index register; SIB encodes `[base + 0 + disp]`
+    //    with index=4 (no-index marker) and scale=0.
+    //
+    //    SIB byte layout: scale<<6 | index<<3 | base
+    //    For our use: scale=0, index=4, base=st.modRmRm3 → 0x24 when
+    //    the base is rsp (rm.lo3=4 + REX.B=0). When base is r12
+    //    (rm.lo3=4 + REX.B=1) the high bit lives in REX.B and the
+    //    SIB byte stays 0x24 too.
+    bool const memModeNeedsSib =
+        (st.modMode != EncodingState::ModMode::RegDirect)
+        && (st.modRmRm3 == 0b100u);  // rsp/r12 family
+    if (memModeNeedsSib) {
+        std::uint8_t const sib = static_cast<std::uint8_t>(
+            (0u << 6) | (0b100u << 3) | st.modRmRm3);
+        out.push_back(sib);
+    }
 
-    // 6) Displacement: not yet (same — memory addressing modes).
+    // 6) Memory displacement (D-AS4-1). When modMode == MemDisp32,
+    //    emit the 4-byte LE displacement from the Disp32Mem slot.
+    //    Missing displacement in mem-mode is fail-loud (a schema
+    //    that wires ModRmRmMem without a paired Disp32Mem is a
+    //    malformed variant — surfacing here rather than silently
+    //    emitting zero).
+    if (st.modMode == EncodingState::ModMode::MemDisp32) {
+        if (!st.disp32Mem.has_value()) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': variant uses ModRmRmMem "
+                               "(memory addressing) but no Disp32Mem "
+                               "wire — schema is malformed",
+                               info->mnemonic));
+            return false;
+        }
+        asm_byte_emit::appendImm32LE(out, *st.disp32Mem);
+    }
 
     // 7) Immediates: append in slot-wiring order.
     for (auto v : st.imm32s) {

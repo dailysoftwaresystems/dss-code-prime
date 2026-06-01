@@ -76,6 +76,15 @@
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "modrm.reg" }
             ]
+          },
+          {
+            "$comment": "add reg-imm32 — REX.W 0x81 /0 imm32 (ADD r/m64, imm32). Used by ML7 epilogue's `add rsp, N` stack-frame teardown. 2-address shape: operands[0] is dest, imm32 is immediate. modrmRegExt=0 fills ModR/M.reg with the opcode-extension digit (/0 for ADD).",
+            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
           }
         ]
       }
@@ -99,6 +108,15 @@
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "sub reg-imm32 — REX.W 0x81 /5 imm32 (SUB r/m64, imm32). Used by ML7 prologue's `sub rsp, N` stack-frame setup. 2-address shape (operands[0] is dest, imm32 is immediate). modrmRegExt=5 fills ModR/M.reg with the opcode-extension digit (/5 for SUB).",
+            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
             ]
           }
         ]
@@ -215,6 +233,7 @@
         "format": "x86-variable",
         "variants": [
           {
+            "$comment": "ret — no operands at the LIR level. ML7 cycle 2's callee-side return-value materialization moves the MIR Return's vreg into cc.returnGprs[0]/returnFprs[0] BEFORE the ret, so the assembler sees a 0-operand ret form.",
             "guard":    { "operandKinds": [] },
             "template": { "opcode": [195] }
           }
@@ -232,24 +251,54 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Load from memory. Operands: [base_reg, MemBase(scale=1), MemOffset(disp)]. Optional index-reg arm added in cycle 3d. AS1 emits `mov reg, [base + disp]` or RIP-relative for global addresses.",
+      "$comment": "Load from memory. Operands: [base_reg, MemBase(scale=1), MemOffset(disp)]. Optional index-reg arm added in cycle 3d. Emits `mov reg, [base + disp]`: REX.W 0x8B /r ModR/M(mod=10, reg=result, rm=base) [SIB 0x24 when base.lo3==4] disp32. Plan 13 §3.1 D-AS4-1 — landed alongside ML7 cycle 2 to close D-LK10-2 byte-on-disk path.",
       "mnemonic":      "load",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   3,
       "maxOperands":   3,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)]. No result. AS1 emits `mov [base + disp], reg`.",
+      "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)]. No result. Emits `mov [base + disp], reg`: REX.W 0x89 /r ModR/M(mod=10, reg=value, rm=base) [SIB 0x24 when base.lo3==4] disp32. Plan 13 §3.1 D-AS4-1.",
       "mnemonic":      "store",
       "result":        "none",
       "hasSideEffects": true,
       "minOperands":   4,
       "maxOperands":   4,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)]. AS1 emits x86_64 `lea reg, [base + index*scale + disp]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm in cycle 3d.",

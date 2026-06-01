@@ -380,7 +380,19 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             auto const isDestSlot = [](EncodingSlotKind s) noexcept {
                 return s == EncodingSlotKind::ModRmReg
                     || s == EncodingSlotKind::ModRmRm
+                    || s == EncodingSlotKind::ModRmRmMem
                     || s == EncodingSlotKind::Rd;
+                // ModRmRmMem IS a destination slot when an opcode
+                // is `requires2Address: true` AND its operand 0 is
+                // a memory destination (e.g. a future `add r/m64,
+                // imm32` arithmetic-to-memory form). Disp32Mem +
+                // MemBaseScale are NEVER destinations (the first
+                // carries the displacement value, the second
+                // carries the scale shape) — exclude them. (D-AS4-1
+                // post-fold: silent-failure F-G1 — without this
+                // addition, future memory-destination 2-addr forms
+                // silently fail rule-G validation with a misleading
+                // "destination would be silently dropped" message.)
             };
             bool const has2AddrDestWire = o.requires2Address
                 && std::any_of(v.wires.begin(), v.wires.end(),

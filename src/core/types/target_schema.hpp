@@ -344,12 +344,23 @@ enum class OperandKindFilter : std::uint8_t {
                     // Global-address load/store forms (x86 RIP-relative
                     // mov, ARM64 ADRP+ADD pair) join with their
                     // consumer cycle (plan 13 §3.1 D-AS4-1 / D-AS4-2).
+    MemBase   = 3,  // `LirOperand{kind == MemBase}` — carries the scale
+                    // factor for base+index*scale addressing. Cycle 2's
+                    // load/store/lea walkers consume this for shape
+                    // validation only (scale==1 in v1; D-AS4-1 anchors
+                    // index+scale support).
+    MemOffset = 4,  // `LirOperand{kind == MemOffset}` — carries the
+                    // signed 32-bit displacement for [base+disp]
+                    // addressing. Wired to `Disp32Mem` to emit 4 LE
+                    // bytes after the ModR/M (and SIB when present).
 };
 
-inline constexpr EnumNameTable<OperandKindFilter, 3> kOperandKindFilterTable{{{
-    { OperandKindFilter::Reg,       "reg"    },
-    { OperandKindFilter::ImmInt,    "imm32"  },  // JSON-side width label
-    { OperandKindFilter::SymbolRef, "symbol" },
+inline constexpr EnumNameTable<OperandKindFilter, 5> kOperandKindFilterTable{{{
+    { OperandKindFilter::Reg,       "reg"      },
+    { OperandKindFilter::ImmInt,    "imm32"    },  // JSON-side width label
+    { OperandKindFilter::SymbolRef, "symbol"   },
+    { OperandKindFilter::MemBase,   "membase"  },
+    { OperandKindFilter::MemOffset, "memoffset"},
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -404,20 +415,46 @@ enum class EncodingSlotKind : std::uint8_t {
     // 13 §3.1 D-AS4-4.)
     Disp32   = 6,  // x86 PC-relative 32-bit displacement (e.g. `call rel32`)
     Imm26    = 7,  // ARM64 26-bit branch offset / 4 (e.g. `bl imm26`)
+    // ── x86 memory-addressing slots (plan 13 §3.1 D-AS4-1) ──────────
+    //
+    // Closes the load/store/lea byte-encoding gap for `[base + disp32]`
+    // addressing. The trio MemBaseScale + ModRmRmMem + Disp32Mem
+    // models the LIR shape `<base_reg> <MemBase(scale)> <MemOffset(disp)>`:
+    //
+    //   ModRmRmMem    — operand is a base Reg; writes ModR/M.rm with
+    //                   mod = 10 (memory + 32-bit disp) and forces a
+    //                   SIB byte when base.lo3 == 4 (the x86-64 rule
+    //                   for rsp/r12). REX.B from base hwEncoding bit 3
+    //                   as usual.
+    //   MemBaseScale  — operand is a MemBase; defense-in-depth shape
+    //                   check (cycle scope: scale == 1 only). Future
+    //                   `[base + index*scale]` would re-use this slot
+    //                   with a paired SibIndex.
+    //   Disp32Mem     — operand is a MemOffset; emits 4 LE bytes of
+    //                   the offset field after ModR/M (and SIB when
+    //                   present). Distinct from `Disp32` which is
+    //                   symbol-relative; `Disp32Mem` is an immediate
+    //                   memory displacement.
+    ModRmRmMem    = 8,
+    MemBaseScale  = 9,
+    Disp32Mem     = 10,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
     //   ImmShift / Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 8> kEncodingSlotKindTable{{{
-    { EncodingSlotKind::ModRmReg, "modrm.reg" },
-    { EncodingSlotKind::ModRmRm,  "modrm.rm"  },
-    { EncodingSlotKind::Imm32,    "imm32"     },
-    { EncodingSlotKind::Rd,       "rd"        },
-    { EncodingSlotKind::Rn,       "rn"        },
-    { EncodingSlotKind::Rm,       "rm"        },
-    { EncodingSlotKind::Disp32,   "disp32"    },
-    { EncodingSlotKind::Imm26,    "imm26"     },
+inline constexpr EnumNameTable<EncodingSlotKind, 11> kEncodingSlotKindTable{{{
+    { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
+    { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
+    { EncodingSlotKind::Imm32,        "imm32"         },
+    { EncodingSlotKind::Rd,           "rd"            },
+    { EncodingSlotKind::Rn,           "rn"            },
+    { EncodingSlotKind::Rm,           "rm"            },
+    { EncodingSlotKind::Disp32,       "disp32"        },
+    { EncodingSlotKind::Imm26,        "imm26"         },
+    { EncodingSlotKind::ModRmRmMem,   "modrm.rm.mem"  },
+    { EncodingSlotKind::MemBaseScale, "membase.scale" },
+    { EncodingSlotKind::Disp32Mem,    "disp32.mem"    },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -436,7 +473,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 8,
+static_assert(kEncodingSlotKindCount == 11,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -455,6 +492,9 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Disp32:
+        case EncodingSlotKind::ModRmRmMem:
+        case EncodingSlotKind::MemBaseScale:
+        case EncodingSlotKind::Disp32Mem:
             return TargetEncodingShape::X86Variable;
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
@@ -540,6 +580,15 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::ModRmRmMem:
+        case EncodingSlotKind::MemBaseScale:
+        case EncodingSlotKind::Disp32Mem:
+            // D-AS4-1 memory-addressing slots write immediate
+            // displacements (not symbol-relative). Symbol-bearing
+            // memory addressing (RIP-relative `mov reg, [sym]` /
+            // ARM64 ADRP+ADD pair) is anchored at D-AS4-1 as a
+            // separate symbol-bearing variant when that consumer
+            // lands.
             return false;
     }
     return false;

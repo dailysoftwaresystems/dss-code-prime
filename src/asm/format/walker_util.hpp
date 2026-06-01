@@ -96,6 +96,8 @@ filterToLirKind(OperandKindFilter f) noexcept {
         case OperandKindFilter::Reg:       return LirOperandKind::Reg;
         case OperandKindFilter::ImmInt:    return LirOperandKind::ImmInt;
         case OperandKindFilter::SymbolRef: return LirOperandKind::SymbolRef;
+        case OperandKindFilter::MemBase:   return LirOperandKind::MemBase;
+        case OperandKindFilter::MemOffset: return LirOperandKind::MemOffset;
     }
     return std::nullopt;
 }

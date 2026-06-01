@@ -623,6 +623,39 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     && info->result == TargetResultRule::None;
                 auto const succs = src.blockSuccessors(srcBlock);
                 if (isReturn && succs.empty()) {
+                    // ML7 cycle 2: callee-side return-value
+                    // materialization. If `ret` carries a [reg]
+                    // operand (value-returning function), move the
+                    // value into cc.returnGprs[0]/returnFprs[0]
+                    // BEFORE the epilogue runs, then emit the ret
+                    // with NO operand (the value is implicit via
+                    // the ABI). Mirror of the caller-side mov-from-
+                    // returnReg in the `call` materialization
+                    // above. Void-returning functions (empty ops)
+                    // skip this block and fall through to the
+                    // epilogue + no-op-operand ret.
+                    if (!ops.empty()) {
+                        if (ops.size() != 1
+                            || ops[0].kind != LirOperandKind::Reg
+                            || ops[0].reg.isPhysical == 0) {
+                            report(reporter,
+                                   DiagnosticCode::L_VirtualRegInPostRegalloc,
+                                   DiagnosticSeverity::Error,
+                                   std::format("callconv: ret inst {} has "
+                                               "non-physical-reg operand "
+                                               "after regalloc", inst.v));
+                            return false;
+                        }
+                        LirReg const valReg = ops[0].reg;
+                        auto const retReg =
+                            returnReg(schema, cc, valReg.regClass(),
+                                      "materializeOneFunc: ret", reporter);
+                        if (!retReg.has_value()) return false;
+                        maybeMov(b, h.mov, *retReg, valReg);
+                        // Strip the operand from the ret — the
+                        // value is now in the cc's return reg.
+                        newOps.clear();
+                    }
                     // Emit epilogue BEFORE the return.
                     emitEpilogue(b, outLayout, sp, h.add, h.load);
                 }

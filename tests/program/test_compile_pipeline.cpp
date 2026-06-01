@@ -157,32 +157,29 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
         "c-subset",
         {"x86_64:elf64-x86_64-linux"});
 
-    // The output directory MUST exist — proves the driver routed
-    // past schema loading + target-spec parsing into the actual
-    // pipeline (the `create_directories` call sits between schema
-    // resolution and `compileSingleUnit`).
+    // D-LK10-2 closed at AS load/store + ret/add/sub-imm32 cycle
+    // (2026-06-01). The full driver pipeline now produces a real
+    // ELF .o file with `\x7fELF` magic for a zero-arg c-subset
+    // function. Plan 12 ML7 cycle 2 closed the IR-tier half
+    // (arg + call + ret virtual-op materialization); plan 13 AS
+    // cycle (D-AS4-1) closed the encoder half (load/store with
+    // [base+disp32] addressing + ret with optional-reg operand +
+    // add/sub reg+imm32 for prologue/epilogue SP adjustment).
     auto const outDir = scratch.path() / "target" / "elf64-x86_64-linux";
     ASSERT_TRUE(fs::is_directory(outDir));
+    ASSERT_EQ(rc, 0)
+        << "byte-on-disk e2e must succeed post-D-LK10-2 closure";
 
-    // When upstream gaps close, rc == 0 AND `forty_two.o` exists
-    // with ELF magic; tighten via the alternative-branch below.
     auto const out = outDir / "forty_two.o";
-    if (rc == 0) {
-        ASSERT_TRUE(fs::exists(out));
-        ASSERT_GT(fs::file_size(out), 0u);
-        std::ifstream in(out, std::ios::binary);
-        char hdr[4] = {0};
-        in.read(hdr, 4);
-        EXPECT_EQ(static_cast<unsigned char>(hdr[0]), 0x7Fu);
-        EXPECT_EQ(hdr[1], 'E');
-        EXPECT_EQ(hdr[2], 'L');
-        EXPECT_EQ(hdr[3], 'F');
-    }
-    // Otherwise: rc != 0 means an upstream tier (ASM, today)
-    // emitted a diagnostic — the wiring still passed (the directory
-    // exists), just the byte production is blocked. This branch
-    // disappears when plan 12 ML7 cycle 2 + plan 13 AS cycles
-    // close and the e2e produces ELF bytes natively.
+    ASSERT_TRUE(fs::exists(out));
+    ASSERT_GT(fs::file_size(out), 0u);
+    std::ifstream in(out, std::ios::binary);
+    char hdr[4] = {0};
+    in.read(hdr, 4);
+    EXPECT_EQ(static_cast<unsigned char>(hdr[0]), 0x7Fu);
+    EXPECT_EQ(hdr[1], 'E');
+    EXPECT_EQ(hdr[2], 'L');
+    EXPECT_EQ(hdr[3], 'F');
 }
 
 TEST(Program_CompileFiles, MultiTargetWiresDistinctArtifactDirs) {
