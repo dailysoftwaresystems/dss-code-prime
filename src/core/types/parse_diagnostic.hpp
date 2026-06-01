@@ -850,9 +850,10 @@ enum class DiagnosticCode : std::uint16_t {
     //   the correct strict-mode behavior. Member of `kUnsuppressableCodes`
     //   per the silent-failure-hunter 2nd-order audit: cap saturation
     //   would otherwise silently drop the very signal this code was
-    //   introduced to surface. Open anchor:
-    //   D-FF1-PARTIAL-CORRUPTION-MACHO (apply same counter+emit
-    //   pattern to Mach-O reader when FF1-MachO lands).
+    //   introduced to surface.
+    //   D-FF1-PARTIAL-CORRUPTION-MACHO CLOSED (FF1-MachO cycle
+    //   2026-06-01): Mach-O reader emits the same counter+Warning
+    //   contract; see src/ffi/binary_readers/macho_reader.cpp.
     F_BinaryReaderPartialCorruption = 0x5018,
 };
 

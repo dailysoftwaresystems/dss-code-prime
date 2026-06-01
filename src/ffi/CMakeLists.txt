@@ -3,6 +3,9 @@ add_subdirectory(mangling)
 
 add_library(ffi OBJECT
     binary_reader.cpp
+    binary_readers/elf_reader.cpp
+    binary_readers/macho_reader.cpp
+    binary_readers/pe_reader.cpp
     c_header_parser.cpp
     ingest.cpp
 )

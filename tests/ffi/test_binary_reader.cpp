@@ -3,10 +3,12 @@
 // Pins:
 //   * ELF magic + ELFCLASS64 + ELFDATA2LSB detection.
 //   * `.dynsym` + `.dynstr` round-trip from a synthesized ELF.
-//   * Format-blind dispatch: Mach-O magic emits UnsupportedFormat
-//     citing the future FF1-MachO anchor; PE magic now dispatches
-//     into the readPe path (see test_binary_reader_pe.cpp for the
-//     PE-specific surface).
+//   * Format-blind dispatch: PE magic dispatches into the readPe
+//     path (see test_binary_reader_pe.cpp); Mach-O 64-bit magic
+//     dispatches into readMacho (see test_binary_reader_macho.cpp);
+//     Mach-O FAT (0xCAFEBABE) and Mach-O 32 (0xFEEDFACE) surface
+//     UnsupportedFormat with remediation-specific detail (anchors
+//     D-FF1-MACHO-FAT and D-FF1-MACHO-32).
 //   * Failure modes: empty file, unknown magic, ELFCLASS32 reject,
 //     truncated section table, missing .dynsym.
 //   * Symbol kind / visibility / linkage mapping from ELF
@@ -257,13 +259,34 @@ TEST(BinaryReader, PeMagicTooShortToBeValidIsCorrupted) {
               std::string::npos);
 }
 
-TEST(BinaryReader, MachoMagicEmitsUnsupportedFormatCitingFutureAnchor) {
-    std::vector<std::uint8_t> macho = {0xCF, 0xFA, 0xED, 0xFE, 0x00};  // 0xFEEDFACF LE
+// FF1-MachO 2026-06-01: Mach-O 64-bit magic now dispatches into
+// readMacho(); see tests/ffi/test_binary_reader_macho.cpp for the
+// happy-path + corruption coverage. Here we pin the two
+// UnsupportedFormat arms that the dispatch still surfaces:
+// universal/FAT binaries and 32-bit Mach-O (both recognised, both
+// route to UnsupportedFormat with remediation-specific messages —
+// anchors D-FF1-MACHO-FAT and D-FF1-MACHO-32).
+TEST(BinaryReader, MachoFatMagicDispatchesToUnsupportedFormat) {
+    // 0xCAFEBABE LE — universal/FAT binary header.
+    std::vector<std::uint8_t> fat = {0xBE, 0xBA, 0xFE, 0xCA, 0x00};
     DiagnosticReporter rep;
-    auto r = readImportsFromBytes(macho, "fake.dylib", rep);
+    auto r = readImportsFromBytes(fat, "fake.dylib", rep);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnsupportedFormat);
-    EXPECT_NE(r.error().detail.find("FF1-MachO"), std::string::npos);
+    EXPECT_NE(r.error().detail.find("FAT"), std::string::npos)
+        << "operator must see remediation guidance (lipo -thin)";
+    EXPECT_NE(r.error().detail.find("D-FF1-MACHO-FAT"), std::string::npos);
+}
+
+TEST(BinaryReader, Macho32MagicDispatchesToUnsupportedFormat) {
+    // 0xFEEDFACE LE — 32-bit Mach-O (mach_header, not mach_header_64).
+    std::vector<std::uint8_t> macho32 = {0xCE, 0xFA, 0xED, 0xFE, 0x00};
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(macho32, "fake.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnsupportedFormat);
+    EXPECT_NE(r.error().detail.find("32-bit Mach-O"), std::string::npos);
+    EXPECT_NE(r.error().detail.find("D-FF1-MACHO-32"), std::string::npos);
 }
 
 TEST(BinaryReaderElf, RejectsElfClass32) {

@@ -21,16 +21,16 @@
 // = add a magic check + a per-format `readImports*` implementation
 // in `ffi/<format>_binary_reader.{hpp,cpp}` + a dispatch arm.
 //
-// **Closure scope (FF1)**: ELF + PE readers shipped (FF1-ELF
-// 2026-06-01, FF1-PE 2026-06-01). Mach-O reader still pending
-// (FF1-MachO anchor) — same dispatch shape, different binary-parser
-// body. The detection arm for Mach-O fails loud with
-// `F_UnsupportedBinaryFormat` until that lands.
+// **Closure scope (FF1)**: ELF + PE + Mach-O readers shipped
+// (FF1-ELF 2026-06-01, FF1-PE 2026-06-01, FF1-MachO 2026-06-01).
+// Mach-O FAT (`0xCAFEBABE` universal) and 32-bit Mach-O
+// (`0xFEEDFACE`) recognised but route to `UnsupportedFormat`
+// with remediation-specific messages — anchors D-FF1-MACHO-FAT
+// and D-FF1-MACHO-32 reserve the future arms.
 //
-// Currently both ELF and PE readers live as anonymous-namespace
-// functions inside binary_reader.cpp; the per-format TU split
-// (advertised in the "add a new format" recipe above) activates at
-// the 3rd reader — see anchor D-FF1-NEST.
+// D-FF1-NEST CLOSED (FF1-MachO cycle 2026-06-01): per-format reader
+// TUs live in `binary_readers/{elf,pe,macho}_reader.{hpp,cpp}` —
+// shared byte primitives in `binary_readers/reader_common.hpp`.
 
 namespace dss::ffi {
 
@@ -47,7 +47,7 @@ enum class BinaryReadErrorKind : std::uint8_t {
     FileOpenFailed     = 0,  // path doesn't exist / permission / IO
     FileEmpty          = 1,  // zero-byte file
     UnknownFormat      = 2,  // no recognised magic bytes
-    UnsupportedFormat  = 3,  // magic recognised but reader not yet shipped (Mach-O pending)
+    UnsupportedFormat  = 3,  // magic recognised but variant unsupported (Mach-O FAT / Mach-O 32)
     CorruptedBinary    = 4,  // truncated section, invalid offsets, etc.
     UnsupportedElfClass = 5, // ELF32 / non-LE / etc. — v1 supports ELF64 LE only
     SectionNotFound    = 6,  // expected .dynsym / .dynstr missing

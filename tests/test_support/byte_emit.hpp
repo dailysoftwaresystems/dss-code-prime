@@ -3,14 +3,13 @@
 #include <cstdint>
 #include <vector>
 
-// D-FF1-TEST-BYTE-EMIT: little-endian byte-emit helpers used by
-// binary-reader tests that synthesize minimal ELF/PE/Mach-O binaries
-// in-test. Hoisted from per-test-file duplication at FF1-MachO cycle —
-// the same `appU16/appU32/appU64 + putU32` shape was duplicated
-// across tests/ffi/test_binary_reader.cpp + tests/ffi/test_binary_reader_pe.cpp
-// + (incoming) tests/ffi/test_binary_reader_macho.cpp. Matches the
-// `diagnostic_count.hpp` + `scratch_dir.hpp` hoist precedent — pull
-// the helper once 3 structurally-identical consumers exist.
+// D-FF1-TEST-BYTE-EMIT CLOSED (FF1-MachO cycle 2026-06-01):
+// little-endian byte-emit helpers used by binary-reader tests that
+// synthesize minimal ELF/PE/Mach-O binaries in-test. The 3rd consumer
+// (`tests/ffi/test_binary_reader_macho.cpp`) lands with FF1-MachO,
+// satisfying the hoist precedent (same shape as
+// `diagnostic_count.hpp` + `scratch_dir.hpp` — pull the helper once
+// 3 structurally-identical consumers exist).
 //
 // Distinct from `src/link/format/byte_emit.hpp` + `src/asm/format/byte_emit.hpp`
 // (production helpers that write into pre-sized buffers via
