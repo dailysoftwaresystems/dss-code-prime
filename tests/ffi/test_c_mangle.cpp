@@ -9,8 +9,11 @@
 //   * Undecorated input through unapplyCMangling on a "decorated"
 //     format passes through unchanged (conservative).
 
+#include "core/types/diagnostic_reporter.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "ffi/mangling/c_mangle.hpp"
 #include "link/object_format_schema.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -18,6 +21,7 @@
 
 using namespace dss;
 using namespace dss::ffi;
+using dss::test_support::countCode;
 
 // ── Per-format decoration rule pin ─────────────────────────
 
@@ -122,6 +126,78 @@ TEST(FfiCMangle, ApplyUnapplyRoundTripPreservesCanonicalForm) {
         EXPECT_EQ(roundTrip("really_long_libc_function_name_123", k),
                   "really_long_libc_function_name_123");
     }
+}
+
+// ── D-FF4-3: strict unapply mode ──────────────────────────────
+
+TEST(FfiCMangleStrict, ElfPassesThroughCleanly) {
+    // No-decoration formats: strict mode is a no-op success path.
+    DiagnosticReporter rep;
+    auto r = unapplyCManglingStrict("printf", ObjectFormatKind::Elf, rep);
+    ASSERT_TRUE(r.has_value()) << mangleErrorKindName(r.error().kind);
+    EXPECT_EQ(*r, "printf");
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(FfiCMangleStrict, MachOStripsLeadingUnderscoreCleanly) {
+    DiagnosticReporter rep;
+    auto r = unapplyCManglingStrict("_printf", ObjectFormatKind::MachO, rep);
+    ASSERT_TRUE(r.has_value()) << mangleErrorKindName(r.error().kind);
+    EXPECT_EQ(*r, "printf");
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(FfiCMangleStrict, MachOMissingPrefixFailsLoud) {
+    // The core D-FF4-3 contract: a MachO input without leading `_`
+    // is a structural anomaly. Strict mode rejects it loudly
+    // instead of silently passing through (which is what
+    // `unapplyCMangling` does).
+    DiagnosticReporter rep;
+    auto r = unapplyCManglingStrict("printf", ObjectFormatKind::MachO, rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, MangleErrorKind::MissingExpectedPrefix);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_MangleMissingExpectedPrefix), 1u);
+    // Detail must name the offending input so a log grep can locate it.
+    EXPECT_NE(r.error().detail.find("printf"), std::string::npos);
+}
+
+TEST(FfiCMangleStrict, EmptyInputReturnsEmptySuccess) {
+    DiagnosticReporter rep;
+    auto r = unapplyCManglingStrict("", ObjectFormatKind::MachO, rep);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, "");
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(FfiCMangleStrict, ApplyThenStrictUnapplyRoundTrip) {
+    // Apply + strict unapply must always succeed (the canonical
+    // FF5 ingest path: produce a decorated name, ship it, ingest
+    // it back through strict mode). Iterate over every
+    // ObjectFormatKind variant via the canonical name table so a
+    // future variant is automatically exercised.
+    for (auto const& row : kObjectFormatKindTable.rows) {
+        ObjectFormatKind const k = row.first;
+        std::string const decorated = applyCMangling("printf", k);
+        DiagnosticReporter rep;
+        auto r = unapplyCManglingStrict(decorated, k, rep);
+        ASSERT_TRUE(r.has_value())
+            << "round-trip failed for format kind "
+            << static_cast<unsigned>(k);
+        EXPECT_EQ(*r, "printf")
+            << "round-trip wrong result for format kind "
+            << static_cast<unsigned>(k);
+        EXPECT_EQ(rep.errorCount(), 0u);
+    }
+}
+
+TEST(FfiCMangleStrict, MangleErrorKindNameRoundTrip) {
+    EXPECT_EQ(mangleErrorKindName(MangleErrorKind::MissingExpectedPrefix),
+              "MissingExpectedPrefix");
+}
+
+TEST(FfiCMangleStrict, DiagnosticCodeNameRoundTrip) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_MangleMissingExpectedPrefix),
+              "F_MangleMissingExpectedPrefix");
 }
 
 TEST(FfiCMangle, AllFormatKindsHaveExplicitRulePin) {

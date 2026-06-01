@@ -219,6 +219,9 @@ resolveAbi(TargetSchema const&       target,
             reporter));
     }
 
+    // (D-FF3-Coherence redundant — schema loader's `validate()`
+    // already rejects cc rows with unresolvable register names
+    // at JSON-load time. See abi_catalog.hpp comment block.)
     return AbiTuple{row->callingConvention, cc};
 }
 

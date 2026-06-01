@@ -735,6 +735,21 @@ enum class DiagnosticCode : std::uint16_t {
     F_AbiUnknownTuple              = 0x5010,
     F_AbiNoMatchingCcInTarget      = 0x5011,
     F_AbiFormatAbiModelMismatch    = 0x5012,
+    // (0x5013 was reserved for F_AbiCcRegistersInconsistent
+    // pending D-FF3-Coherence; trigger EVALUATED 2026-06-01 and
+    // the surface was found to be already closed by
+    // `TargetSchemaData::validate()`'s cc-register cross-check at
+    // JSON load. Code stays reserved for ABI stability — adding a
+    // new F_* code in this band requires using 0x5014 or higher.)
+    // F_MangleMissingExpectedPrefix: `unapplyCManglingStrict` was
+    //   called on a decorated input that lacks the per-format
+    //   prefix the rule expects (e.g. a Mach-O symbol passed in as
+    //   `printf` instead of `_printf`). Distinct from the
+    //   conservative `unapplyCMangling` which silently passes such
+    //   input through. Used by FF5 ingest where the format-kind
+    //   is authoritative and a missing prefix is a structural
+    //   anomaly. (D-FF4-3 post-fold-#3.)
+    F_MangleMissingExpectedPrefix  = 0x5014,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

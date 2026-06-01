@@ -1,8 +1,11 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/diagnostic_reporter.hpp"
 #include "link/object_format_schema.hpp"
 
+#include <cstdint>
+#include <expected>
 #include <string>
 #include <string_view>
 
@@ -75,5 +78,40 @@ unapplyCMangling(std::string_view decoratedName, ObjectFormatKind format);
 // 32-bit PE branch lands when D-FF4-1 fires.
 [[nodiscard]] DSS_EXPORT bool
 cFormatAddsLeadingUnderscore(ObjectFormatKind format) noexcept;
+
+// Closed-set failure modes for `unapplyCManglingStrict`.
+enum class MangleErrorKind : std::uint8_t {
+    MissingExpectedPrefix = 0,  // format expects decoration; input lacks it
+    Count_                      // table-size sentinel — keep LAST
+};
+
+struct DSS_EXPORT MangleError {
+    MangleErrorKind kind = MangleErrorKind::MissingExpectedPrefix;
+    std::string     detail;
+};
+
+[[nodiscard]] DSS_EXPORT std::string_view
+    mangleErrorKindName(MangleErrorKind k) noexcept;
+
+// Strict-mode inverse of `applyCMangling`: returns an error if the
+// `decoratedName` does NOT carry the per-format decoration the rule
+// expects. Used by FF5 ingest where the format-kind is authoritative
+// — a Mach-O binary's `.dynsym` entry that lacks the leading `_` is
+// a structural anomaly worth surfacing rather than the conservative
+// pass-through that `unapplyCMangling` does.
+//
+// For formats with no decoration (ELF/Pe/Wasm/Spirv/Unknown), strict
+// mode is structurally a no-op: input passes through unchanged and
+// success is returned. The strict check only fires for decorated
+// formats (MachO today; PE32 cdecl post-D-FF4-1).
+//
+// Empty input → empty output success (mirrors `applyCMangling`
+// empty-input contract; an empty name is never "decorated" so there's
+// nothing to enforce). `reporter` receives an `F_*` diagnostic on
+// the error path.
+[[nodiscard]] DSS_EXPORT std::expected<std::string, MangleError>
+unapplyCManglingStrict(std::string_view    decoratedName,
+                       ObjectFormatKind    format,
+                       DiagnosticReporter& reporter);
 
 } // namespace dss::ffi

@@ -1,7 +1,10 @@
 #include "ffi/mangling/c_mangle.hpp"
 
+#include "core/types/parse_diagnostic.hpp"
+
 #include <array>
 #include <string>
+#include <utility>
 
 namespace dss::ffi {
 
@@ -92,6 +95,70 @@ unapplyCMangling(std::string_view decoratedName, ObjectFormatKind format) {
     // symbol equality. FF1 binary readers feed
     // already-as-on-disk strings; FF4's job is to compute the
     // canonical form, not validate the producer.
+    return std::string{decoratedName};
+}
+
+namespace {
+
+// Closed-table mapping MangleErrorKind → (name, F_* code). Same
+// shape as kAbiResolveErrorTable / kHeaderReadErrorTable. Pinned
+// against `MangleErrorKind::Count_` (codebase precedent — `HirOpKind::Count_`,
+// `AbiResolveErrorKind::Count_`).
+struct MangleErrorRow {
+    MangleErrorKind  kind;
+    std::string_view name;
+    DiagnosticCode   code;
+};
+
+constexpr std::array<MangleErrorRow,
+                     static_cast<std::size_t>(MangleErrorKind::Count_)>
+    kMangleErrorTable{{
+    { MangleErrorKind::MissingExpectedPrefix, "MissingExpectedPrefix",
+      DiagnosticCode::F_MangleMissingExpectedPrefix },
+}};
+
+consteval bool kMangleErrorTableRowsAligned() {
+    for (std::size_t i = 0; i < kMangleErrorTable.size(); ++i) {
+        if (static_cast<std::size_t>(kMangleErrorTable[i].kind) != i) return false;
+    }
+    return true;
+}
+static_assert(kMangleErrorTableRowsAligned(),
+              "kMangleErrorTable row order must match MangleErrorKind "
+              "underlying values.");
+
+} // namespace
+
+std::string_view
+mangleErrorKindName(MangleErrorKind k) noexcept {
+    auto const idx = static_cast<std::size_t>(k);
+    if (idx >= kMangleErrorTable.size()) return "Unknown";
+    return kMangleErrorTable[idx].name;
+}
+
+std::expected<std::string, MangleError>
+unapplyCManglingStrict(std::string_view    decoratedName,
+                       ObjectFormatKind    format,
+                       DiagnosticReporter& reporter) {
+    if (decoratedName.empty()) return std::string{};
+    if (cFormatAddsLeadingUnderscore(format)) {
+        if (decoratedName.empty() || decoratedName.front() != '_') {
+            MangleError err{
+                MangleErrorKind::MissingExpectedPrefix,
+                std::string{"format expects leading '_' decoration but "
+                            "input '"} + std::string{decoratedName}
+                    + "' does not carry it"
+            };
+            ParseDiagnostic p;
+            p.code     = DiagnosticCode::F_MangleMissingExpectedPrefix;
+            p.severity = DiagnosticSeverity::Error;
+            p.actual   = err.detail;
+            reporter.report(std::move(p));
+            return std::unexpected(std::move(err));
+        }
+        return std::string{decoratedName.substr(1)};
+    }
+    // No-decoration formats: strict mode is structurally a no-op.
     return std::string{decoratedName};
 }
 

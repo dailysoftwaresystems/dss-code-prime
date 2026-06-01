@@ -288,3 +288,72 @@ TEST(FfiAbiCatalog, AbiResolveErrorKindNameRoundTrip) {
     EXPECT_EQ(abiResolveErrorKindName(AbiResolveErrorKind::FormatAbiModelMismatch),
               "FormatAbiModelMismatch");
 }
+
+// ── D-FF3-Coherence trigger evaluation ────────────────────────
+//
+// The audit-flagged silent-failure surface "FF3 cc-resolution
+// returns a pointer to structurally-wrong register data" does NOT
+// exist — `TargetSchemaData::validate()` rejects any cc row with
+// unresolvable register names at JSON load (target_schema.cpp:901-908).
+// The tests below pin that contract via the schema loader so a
+// future refactor that loosens the loader-side check would trip
+// here, forcing FF3 to add its own pass at that time.
+
+TEST(FfiAbiCatalog, SchemaLoaderRejectsPasteErrorRegistersInCc) {
+    // Pin the existing schema-loader gate: a cc row carrying a
+    // register name that's not in the target's register table
+    // fails loadFromText. If this test breaks, the loader-side
+    // check was removed and FF3 needs to re-implement
+    // D-FF3-Coherence's structural pass.
+    auto badTarget = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"x86_64","version":"0.0","abiModel":"register-machine"},
+      "opcodes": [ {"mnemonic":"invalid","result":"none"} ],
+      "registers": [
+        {"name":"rdi","class":"gpr","widthBytes":8,"hwEncoding":7}
+      ],
+      "callingConventions": [
+        {
+          "name":"sysv_amd64",
+          "argGprs":["rdi","x0_paste_error_not_in_register_table"],
+          "argFprs":[], "returnGprs":["rdi"], "returnFprs":[],
+          "callerSaved":[], "calleeSaved":[],
+          "stackAlignment":16
+        }
+      ]
+    })");
+    EXPECT_FALSE(badTarget.has_value())
+        << "TargetSchema loader must reject a cc carrying a register "
+           "name absent from target.registers[] — this is the gate "
+           "that closes D-FF3-Coherence at load time, NOT at resolveAbi.";
+}
+
+TEST(FfiAbiCatalog, SchemaLoaderRejectsCcRoleClassMismatch) {
+    // Pin a structurally-different gate: a cc with an FPR-class
+    // register listed under `argGprs` (GPR role). validate() at
+    // target_schema.cpp:892-898 enforces role↔class alignment;
+    // any future loosening would silently let mis-classed
+    // registers reach ML7.
+    auto badTarget = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"x86_64","version":"0.0","abiModel":"register-machine"},
+      "opcodes": [ {"mnemonic":"invalid","result":"none"} ],
+      "registers": [
+        {"name":"xmm0","class":"fpr","widthBytes":16,"hwEncoding":0}
+      ],
+      "callingConventions": [
+        {
+          "name":"sysv_amd64",
+          "argGprs":["xmm0"],
+          "argFprs":[], "returnGprs":[], "returnFprs":[],
+          "callerSaved":[], "calleeSaved":[],
+          "stackAlignment":16
+        }
+      ]
+    })");
+    EXPECT_FALSE(badTarget.has_value())
+        << "TargetSchema loader must reject an FPR-class register "
+           "listed under argGprs — closes the role/class silent-"
+           "miscompile surface alongside D-FF3-Coherence's name-"
+           "resolution check.";
+}
