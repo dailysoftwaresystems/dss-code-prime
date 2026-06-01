@@ -26,9 +26,17 @@ namespace dss::ffi {
 //
 // All defined exports are mapped to `SymbolKind::Function` (v1, like
 // PE); the section-table walk that distinguishes __TEXT vs __DATA vs
-// __TLS is deferred — anchor D-FF1-MACHO-SECT-KIND. Weak-def
-// detection (`n_desc & N_WEAK_DEF`) is deferred — anchor
-// D-FF1-MACHO-WEAK-DEF.
+// __TLS is deferred — anchor D-FF1-MACHO-SECT-KIND. Trigger: first
+// downstream FFI consumer needs to distinguish data-symbol exports
+// from function-symbol exports (likely FF6 libc smoke on macOS
+// reading a real `__DATA` global, OR an FFI ingest path that
+// surfaces a misclassified TLS variable).
+//
+// Weak-def detection (`n_desc & N_WEAK_DEF`) is deferred — anchor
+// D-FF1-MACHO-WEAK-DEF. Trigger: first symbol with `n_desc &
+// N_WEAK_DEF` observed in a real corpus that the FFI pipeline
+// surfaces as `SymbolLinkage::External` and downstream
+// `applyCMangling` / abi-catalog dispatch needs to disambiguate.
 [[nodiscard]] DSS_EXPORT
 std::expected<std::vector<ImportSurface>, BinaryReadError>
 readMacho(std::span<std::uint8_t const> bytes,

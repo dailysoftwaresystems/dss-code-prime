@@ -16,10 +16,12 @@
 //
 // Format-blind dispatch: the entry point `readImports(path, reporter)`
 // detects the format from the file's first bytes (ELF magic
-// `\x7FELF`, PE `MZ`...`PE\0\0`, Mach-O `0xFEEDFACF` / `0xCAFEBABE`)
-// and routes to the per-format implementation. Adding a new format
-// = add a magic check + a per-format `readImports*` implementation
-// in `ffi/<format>_binary_reader.{hpp,cpp}` + a dispatch arm.
+// `\x7FELF`, PE `MZ`...`PE\0\0`, Mach-O `0xFEEDFACF` / `0xCAFEBABE`
+// / `0xFEEDFACE`) and routes to the per-format implementation.
+// Adding a new format = add a magic check in `guessFormat` + a
+// per-format reader implementation in
+// `ffi/binary_readers/<format>_reader.{hpp,cpp}` + a dispatch arm
+// in `readImportsFromBytes`.
 //
 // **Closure scope (FF1)**: ELF + PE + Mach-O readers shipped
 // (FF1-ELF 2026-06-01, FF1-PE 2026-06-01, FF1-MachO 2026-06-01).
@@ -85,10 +87,17 @@ rangeExceedsBuffer(std::uint64_t off, std::uint64_t size,
 // per-format implementation.
 //
 // Errors fail loud — none of "file empty / bad magic / corrupted /
-// unsupported format" silently produces an empty surface. Successful
-// returns produce `std::vector<ImportSurface>` with at least one row
-// (an empty `.dynsym` `.so` is a corrupted library — flagged as
-// `CorruptedBinary` rather than returned as an empty list).
+// unsupported format" silently produces an empty surface.
+// Successful returns produce a possibly-empty
+// `std::vector<ImportSurface>`. Per-format empty-surface semantics:
+//   * ELF: a missing `.dynsym` section is flagged loud as
+//     `SectionNotFound`; an empty-but-present `.dynsym` returns an
+//     empty surface (rare; structurally valid).
+//   * PE: ordinal-only exports (`NumberOfNamePointers == 0`) return
+//     an empty surface (no remediation — v1 only walks named exports).
+//   * Mach-O: a binary with `LC_SYMTAB` present but no externally-
+//     defined symbols (e.g. LC_DYSYMTAB.nextdefsym == 0) returns an
+//     empty surface.
 //
 // `reporter` is used for per-row diagnostics during parsing —
 // individual symbols with corrupted name offsets emit

@@ -59,7 +59,17 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
             // slice (e.g. via `lipo -thin`) before feeding the
             // bytes to readImports. Surfacing UnsupportedFormat
             // with a remediation-specific message guides the
-            // operator to the slice action.
+            // operator to the slice action. Trigger to ship FAT
+            // reading: first FFI consumer corpus that ships
+            // universal binaries the toolchain operator cannot
+            // pre-slice (e.g. macOS SDK fixtures bundled in CI).
+            // D-FF1-MACHO-VARIANT-KIND anchor (companion): split
+            // BinaryReadErrorKind::UnsupportedFormat into
+            // UnsupportedFormatVariant when a programmatic
+            // consumer (e.g. driver wrapper) needs to recover
+            // differently from FAT vs 32-bit (auto-slice FAT,
+            // hard-fail 32-bit). Today both share kind +
+            // distinguish via detail.
             return std::unexpected(emitAndReturn(
                 BinaryReadErrorKind::UnsupportedFormat,
                 std::string{"readImports: '"} + std::string{libraryPathLabel}
@@ -73,7 +83,11 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
             // (so we don't misreport as UnknownFormat) but not
             // supported. Surfacing UnsupportedFormat keeps parity
             // with the ELF32 reject (UnsupportedElfClass) — both
-            // are "magic ok, class/width unsupported v1".
+            // are "magic ok, class/width unsupported v1". Trigger
+            // to ship 32-bit reading: first 32-bit Mach-O input
+            // appears in a real corpus the toolchain operator
+            // cannot pre-convert (rare on modern macOS; iOS sim).
+            // See D-FF1-MACHO-VARIANT-KIND companion anchor above.
             return std::unexpected(emitAndReturn(
                 BinaryReadErrorKind::UnsupportedFormat,
                 std::string{"readImports: '"} + std::string{libraryPathLabel}

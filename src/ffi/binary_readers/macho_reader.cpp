@@ -82,11 +82,35 @@ constexpr std::uint8_t  kNExtBit          = 0x01u;
 constexpr std::uint8_t  kNTypeUndf        = 0x00u;  // undefined (imported, not exported)
 constexpr std::uint8_t  kNTypeSect        = 0x0Eu;  // defined in section — the export case
 
-[[nodiscard]] SymbolVisibility nTypeToVisibility(std::uint8_t n_type) noexcept {
-    return ((n_type & kNPextBit) != 0u)
-        ? SymbolVisibility::Hidden
-        : SymbolVisibility::Default;
-}
+// POD wrapper over the raw `n_type` byte with named accessors. The
+// raw `&`/`==` idiom is repeated across the symbol-walk loop + the
+// visibility helper; the type pins the bit semantics into the type
+// system rather than living in repeated bit-ops + comments.
+struct NType {
+    std::uint8_t raw;
+    [[nodiscard]] constexpr bool isStab() const noexcept {
+        return (raw & kNStabMask) != 0u;
+    }
+    [[nodiscard]] constexpr bool isPrivateExtern() const noexcept {
+        return (raw & kNPextBit) != 0u;
+    }
+    [[nodiscard]] constexpr bool isExternal() const noexcept {
+        return (raw & kNExtBit) != 0u;
+    }
+    [[nodiscard]] constexpr std::uint8_t typeBits() const noexcept {
+        return raw & kNTypeMask;
+    }
+    [[nodiscard]] constexpr bool isSectionDefined() const noexcept {
+        return typeBits() == kNTypeSect;
+    }
+    [[nodiscard]] constexpr bool isUndefined() const noexcept {
+        return typeBits() == kNTypeUndf;
+    }
+    [[nodiscard]] constexpr SymbolVisibility toVisibility() const noexcept {
+        return isPrivateExtern() ? SymbolVisibility::Hidden
+                                 : SymbolVisibility::Default;
+    }
+};
 
 } // namespace
 
@@ -103,11 +127,16 @@ readMacho(std::span<std::uint8_t const> bytes,
     }
     std::uint32_t const magic = readU32(bytes, 0);
     if (magic != kMachOMagic64) {
-        // Dispatch contract: guessFormat already separated FAT
-        // (0xCAFEBABE) and 32-bit (0xFEEDFACE) into their own
-        // FormatGuess arms which surface UnsupportedFormat upstream
-        // — this arm catches a host-endian or byte-swapped corrupted
-        // file that slipped through.
+        // Dispatch contract: guessFormat MATCHED kMachOMagic64
+        // before routing to this reader; FAT (0xCAFEBABE) and 32-bit
+        // (0xFEEDFACE) take their own FormatGuess arms upstream and
+        // never reach here. Big-endian Mach-O variants (0xCFFAEDFE,
+        // 0xCEFAEDFE) are intentionally NOT in FormatGuess —
+        // guessFormat reports them as Unknown rather than as a
+        // recognized-but-unsupported variant. This arm thus catches
+        // only a concurrent buffer mutation between guessFormat and
+        // this read (paranoia guard against a TOCTOU on the same
+        // bytes).
         return std::unexpected(emitAndReturn(
             BinaryReadErrorKind::CorruptedBinary,
             "Mach-O reader: header magic is not 0xFEEDFACF "
@@ -163,10 +192,14 @@ readMacho(std::span<std::uint8_t const> bytes,
             }
             symtabOff = lcOff;
         } else if (cmd == kLcDysymtab) {
-            // LC_DYSYMTAB minimum: preamble + 8 dyn fields ×4 bytes = 40
-            // (we only read the first 16 bytes after the preamble:
-            //  ilocalsym/nlocalsym/iextdefsym/nextdefsym). Anything
-            // smaller is corrupted.
+            // LC_DYSYMTAB minimum: preamble (8) + the 4 fields we
+            // read after it (ilocalsym/nlocalsym/iextdefsym/nextdefsym,
+            // 4 × u32 = 16 bytes) = 24 bytes. The full Apple
+            // LC_DYSYMTAB struct is 80 bytes (18 u32 fields after
+            // preamble) — we intentionally read only the 4 fields
+            // needed for the extdef filter v1; the remaining
+            // sub-tables (local syms, undefs, ToC, mod table, refs,
+            // indirect syms) are deferred surfaces.
             if (cmdsize < kMachOLcPreamble + 16u) {
                 return std::unexpected(emitAndReturn(
                     BinaryReadErrorKind::CorruptedBinary,
@@ -252,16 +285,26 @@ readMacho(std::span<std::uint8_t const> bytes,
         std::size_t const symOff = static_cast<std::size_t>(symoff)
                                   + static_cast<std::size_t>(i) * kMachONlist64Sz;
         std::uint32_t const n_strx = readU32(bytes, symOff + 0);
-        std::uint8_t  const n_type = bytes[symOff + 4];
+        NType const nt{bytes[symOff + 4]};
 
-        // Stab debug entries — never exports.
-        if ((n_type & kNStabMask) != 0u) continue;
-        if (!dysymtabFilter) {
-            // Fallback walk: filter by N_EXT + N_TYPE == N_SECT.
-            if ((n_type & kNExtBit) == 0u) continue;  // not external
-            if ((n_type & kNTypeMask) == kNTypeUndf) continue;  // undefined import
-            if ((n_type & kNTypeMask) != kNTypeSect) continue;  // not section-defined
-        }
+        // Stab debug entries — never exports. Applied to BOTH paths
+        // (defense-in-depth: a malformed LC_DYSYMTAB could include
+        // stab entries inside its extdef slice).
+        if (nt.isStab()) continue;
+        // Defense-in-depth N_TYPE filter: even when LC_DYSYMTAB is
+        // present (dysymtabFilter mode), still require the row to
+        // be section-defined. A malformed/corrupted DYSYMTAB whose
+        // slice contains N_UNDF/N_ABS/N_INDR entries would otherwise
+        // silently surface them as Function/Default exports with
+        // garbage `n_value`. Real linkers also pre-filter the slice,
+        // but trust-but-verify is cheap. (code-reviewer H1 +
+        // silent-failure A3 fold, 7-agent audit on 4ca5bff.)
+        if (!nt.isSectionDefined()) continue;
+        // Fallback walk only: also require the N_EXT bit (LC_DYSYMTAB
+        // present means the linker already declared the slice
+        // externally-defined — the bit may or may not be set on every
+        // row but the slice membership is the authoritative signal).
+        if (!dysymtabFilter && !nt.isExternal()) continue;
         if (n_strx == 0u) continue;  // unnamed — by design (not corruption)
 
         ImportSurface row;
@@ -280,7 +323,7 @@ readMacho(std::span<std::uint8_t const> bytes,
         // D-FF1-MACHO-SECT-KIND reserves the section-table walk
         // (n_sect → __TEXT/__DATA/__TLS section name → SymbolKind).
         row.kind        = SymbolKind::Function;
-        row.visibility  = nTypeToVisibility(n_type);
+        row.visibility  = nt.toVisibility();
         // v1: linkage is always External for exports. Anchor
         // D-FF1-MACHO-WEAK-DEF reserves the `n_desc & N_WEAK_DEF`
         // read that would surface weak symbols as SymbolLinkage::Weak.

@@ -75,9 +75,15 @@ constexpr std::uint8_t kNStabFun   = 0x24u;        // N_FUN stab (high bit of st
 //
 // Each `n_strx` field is rewritten to point at the corresponding
 // `nameOffsets[i]` (within the layout-built string table). Pass
-// `n_strx = kStrxLeaveAsIs` to skip the rewrite and use the value
-// already set on the Nlist row (used for poisoned-strx tests).
-constexpr std::uint32_t kStrxLeaveAsIs = 0xFFFFFFFEu;
+// `n_strx` rewrite semantic (post-4ca5bff audit fold):
+//   * Nlist.n_strx == 0  → rewrite to `nameOffsets[i]` (default layout).
+//   * Nlist.n_strx != 0  → honor caller's value verbatim (poison cases
+//                          like 0xFFFFFFFF for partial-corruption tests).
+// The prior triple-arm ternary with `kStrxLeaveAsIs` sentinel was
+// removed — there was no test that used the sentinel, the dead branch
+// added confusion, and a future test that adds a 2nd name without
+// noticing the rewrite would silently regress (4ca5bff audit:
+// code-reviewer M1 + test-analyzer #5 + simplifier #2 converged).
 
 std::vector<std::uint8_t>
 buildMinimalMacho64(std::vector<Nlist> syms,
@@ -144,17 +150,12 @@ buildMinimalMacho64(std::vector<Nlist> syms,
     // ── Symbol table ──
     for (std::size_t i = 0; i < syms.size(); ++i) {
         std::size_t const off = symtabFileOff + i * kNlist64Sz;
-        std::uint32_t const strx = (syms[i].n_strx == kStrxLeaveAsIs)
-            ? syms[i].n_strx
-            : (i < nameOffsets.size() ? nameOffsets[i] : 0u);
-        // For test rows that explicitly poisoned n_strx, the input
-        // value was a real offset (e.g. 0xFFFFFFFFu); we honor it.
-        // Otherwise rewrite to the layout-built name offset for row i.
-        std::uint32_t const writtenStrx =
-            (syms[i].n_strx != 0u && syms[i].n_strx != kStrxLeaveAsIs
-             && syms[i].n_strx != (i < nameOffsets.size() ? nameOffsets[i] : 0u))
-            ? syms[i].n_strx
-            : strx;
+        // n_strx==0 → rewrite to layout-built nameOffsets[i]; non-zero
+        // honors the caller-supplied value (poison-tests). See helper
+        // docblock above for the rewrite contract.
+        std::uint32_t const writtenStrx = (syms[i].n_strx == 0u)
+            ? (i < nameOffsets.size() ? nameOffsets[i] : 0u)
+            : syms[i].n_strx;
         putU32(b, off + 0,  writtenStrx);
         b[off + 4] = syms[i].n_type;
         b[off + 5] = syms[i].n_sect;
@@ -454,4 +455,123 @@ TEST(BinaryReaderMacho, LcCmdsizeBelowPreambleFailsLoud) {
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
     EXPECT_NE(r.error().detail.find("smaller than the 8-byte preamble"),
               std::string::npos);
+}
+
+// 4ca5bff audit fold (test-analyzer HIGH#1): LC_SYMTAB cmdsize<24
+// must fail loud. Without this guard a too-small LC_SYMTAB body
+// would let `readU32(bytes, *symtabOff + 8..23)` read across into
+// the next LC, pulling whatever happens to follow as
+// symoff/nsyms/stroff/strsize — silent corrupted parse.
+TEST(BinaryReaderMacho, LcSymtabCmdsizeBelowMinimumFailsLoud) {
+    // Hand-build: header + LC_SYMTAB with cmdsize=12 (< 24).
+    std::vector<std::uint8_t> bytes(32 + 12, 0);
+    putU32(bytes, 0,  kMachOMagic64);
+    putU32(bytes, 16, 1u);                                     // ncmds = 1
+    putU32(bytes, 20, 12u);                                    // sizeofcmds = 12
+    putU32(bytes, 32, kLcSymtab);
+    putU32(bytes, 36, 12u);                                    // cmdsize = 12 (< 24)
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "tiny_symtab.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("LC_SYMTAB cmdsize"), std::string::npos);
+}
+
+// 4ca5bff audit fold (test-analyzer HIGH#2): LC_DYSYMTAB cmdsize<24
+// must fail loud. Without this guard a too-small LC_DYSYMTAB body
+// would let `readU32(bytes, *dysymtabOff + 16..23)` read across
+// into the next LC, silently using whatever follows as
+// iextdefsym/nextdefsym — wrong filter slice applied silently.
+TEST(BinaryReaderMacho, LcDysymtabCmdsizeBelowMinimumFailsLoud) {
+    // Hand-build: header + LC_DYSYMTAB with cmdsize=12 (< 24).
+    std::vector<std::uint8_t> bytes(32 + 12, 0);
+    putU32(bytes, 0,  kMachOMagic64);
+    putU32(bytes, 16, 1u);                                     // ncmds = 1
+    putU32(bytes, 20, 12u);                                    // sizeofcmds = 12
+    putU32(bytes, 32, kLcDysymtab);
+    putU32(bytes, 36, 12u);                                    // cmdsize = 12 (< 24)
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "tiny_dysymtab.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("LC_DYSYMTAB cmdsize"), std::string::npos);
+}
+
+// 4ca5bff audit fold (test-analyzer HIGH#3): LC body past sizeofcmds
+// region must fail loud. Without this guard a binary claiming
+// ncmds=2 + sizeofcmds=8 (one LC's worth) would iterate past the
+// declared LC region into raw data, reading symbol-table bytes as
+// LC headers — silent garbage parse.
+TEST(BinaryReaderMacho, LcBodyRunsPastSizeofcmdsRegionFailsLoud) {
+    // Hand-build: header claims ncmds=2 but sizeofcmds covers just
+    // one preamble (8 bytes). The second loop iteration's
+    // `lcOff + preamble > lcEnd` check catches the overrun.
+    std::vector<std::uint8_t> bytes(32 + 16, 0);
+    putU32(bytes, 0,  kMachOMagic64);
+    putU32(bytes, 16, 2u);                                     // ncmds = 2 (LIES)
+    putU32(bytes, 20, 8u);                                     // sizeofcmds = 8 (only one)
+    // LC #1 occupies the full 8-byte sizeofcmds region.
+    putU32(bytes, 32, kLcSegment64);
+    putU32(bytes, 36, 8u);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "overrun_lc.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("preamble runs past sizeofcmds"),
+              std::string::npos);
+}
+
+// 4ca5bff audit fold (test-analyzer MEDIUM#4): LC_DYSYMTAB present
+// with nextdefsym==0 must fall through to the N_EXT walk over the
+// full symtab. Documents the "uniform fallthrough" behavior so a
+// future regression that flips to "return empty" or "treat as
+// full-scan slice" is caught. Real linker behavior: a stripped
+// binary may declare LC_DYSYMTAB with all-zero counts; v1 surfaces
+// whatever N_EXT entries are still in LC_SYMTAB.
+TEST(BinaryReaderMacho, DysymtabWithZeroNextdefsymFallsThroughToNExtWalk) {
+    std::vector<Nlist> syms{sect(1), sect(1)};
+    std::vector<std::string> names{"a", "b"};
+    auto const bytes = buildMinimalMacho64(syms, names,
+                                            /*includeDysymtab=*/true,
+                                            /*iextdefsym=*/0u,
+                                            /*nextdefsym=*/0u);   // ← the case under pin
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "zero_nextdef.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << "kind=" << binaryReadErrorKindName(r.error().kind);
+    // Fallthrough → N_EXT walk → both rows surface (sect() has N_EXT set).
+    ASSERT_EQ(r->size(), 2u)
+        << "nextdefsym==0 MUST fall through to N_EXT walk, not "
+           "return empty silently — see macho_reader.cpp comment "
+           "block at the LC_DYSYMTAB filter branch";
+    EXPECT_EQ((*r)[0].mangledName, "a");
+    EXPECT_EQ((*r)[1].mangledName, "b");
+}
+
+// 4ca5bff audit fold (code-reviewer H1 + silent-failure A3
+// convergence): defense-in-depth N_TYPE filter applies even when
+// LC_DYSYMTAB present. A malformed/corrupted DYSYMTAB whose extdef
+// slice contains N_UNDF entries (undefined imports, n_value=0)
+// must NOT surface them as Function/Default exports. Real linkers
+// pre-filter; trust-but-verify is cheap.
+TEST(BinaryReaderMacho, DysymtabSliceWithUndefinedEntryIsFiltered) {
+    // Slice [0, 2) contains: [0] N_UNDF (undefined import), [1] N_SECT.
+    // Defense-in-depth: [0] gets filtered, only [1] surfaces.
+    std::vector<Nlist> syms{
+        Nlist{0, static_cast<std::uint8_t>(kNTypeUndf | kNExtBit), 0, 0, 0},
+        sect(1),
+    };
+    std::vector<std::string> names{"_undef_in_slice", "real_export"};
+    auto const bytes = buildMinimalMacho64(syms, names,
+                                            /*includeDysymtab=*/true,
+                                            /*iextdefsym=*/0u,
+                                            /*nextdefsym=*/2u);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "did_slice.dylib", rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u)
+        << "defense-in-depth: even with DYSYMTAB declaring 2 extdefs, "
+           "the N_UNDF row must be filtered out (a regression that "
+           "trusts the slice absolutely would surface garbage)";
+    EXPECT_EQ((*r)[0].mangledName, "real_export");
 }

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/binary_reader.hpp"
@@ -9,12 +8,12 @@
 #include <span>
 #include <string>
 
-// D-FF1-NEST split (FF1-MachO cycle 2026-06-01): per-format readers
-// (`elf_reader.cpp`, `pe_reader.cpp`, `macho_reader.cpp`) all share
-// these byte-decode primitives + reporter wiring. Hoisting them out
-// of `binary_reader.cpp`'s anonymous namespace at the 3rd-reader
-// landing prevents three-way duplication and keeps each per-format
-// TU at one architectural concern.
+// Per-format readers (`elf_reader.cpp`, `pe_reader.cpp`,
+// `macho_reader.cpp`) all consume these byte-decode primitives +
+// reporter wiring; centralising prevents three-way duplication and
+// keeps each per-format TU at one architectural concern. Internal
+// header (none of these symbols are `DSS_EXPORT`d — they live one
+// scope above the per-format anonymous namespaces).
 //
 // Source/target/linker agnostic: the helpers operate on
 // `std::span<uint8_t const>` byte buffers and emit through the
