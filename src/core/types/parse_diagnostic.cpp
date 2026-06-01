@@ -151,6 +151,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_ImageWriteCloseFailed:        return "K_ImageWriteCloseFailed";
         case DiagnosticCode::K_ImageEmpty:                   return "K_ImageEmpty";
 
+        case DiagnosticCode::D_TargetFormatMismatch:         return "D_TargetFormatMismatch";
+
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";
         case DiagnosticCode::F_UnknownBinaryFormat:          return "F_UnknownBinaryFormat";

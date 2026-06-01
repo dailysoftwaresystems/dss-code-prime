@@ -8,3 +8,5 @@ dss_add_test(NAME program/test_cli_args
              SOURCES test_cli_args.cpp)
 dss_add_test(NAME program/test_input_resolver
              SOURCES test_input_resolver.cpp)
+dss_add_test(NAME program/test_cross_validate_target_format
+             SOURCES test_cross_validate_target_format.cpp)

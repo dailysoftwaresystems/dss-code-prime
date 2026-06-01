@@ -4,6 +4,7 @@ add_library(program OBJECT
     compile_pipeline.cpp
     cli_args.cpp
     input_resolver.cpp
+    cross_validate_target_format.cpp
 )
 
 target_include_directories(program PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

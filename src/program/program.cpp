@@ -12,6 +12,7 @@
 #include "lsp/transport.hpp"
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
+#include "program/cross_validate_target_format.hpp"
 #include "program/input_resolver.hpp"
 #include "program/target_spec.hpp"
 
@@ -194,6 +195,15 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                    + "' could not be loaded — check that "
                      "src/dss-config/object-formats/" + parsed->formatName
                    + ".format.json exists and parses cleanly.");
+        return false;
+    }
+
+    // D-LK6-8.2 cross-validation: confirm the (target, format) pair's
+    // machine identity matches before linking. Without this guard, a
+    // hand-edited format JSON with the wrong `machine` value would
+    // silently dispatch the linker to the wrong PLT-stub emitter,
+    // producing SIGILL at runtime with no driver diagnostic.
+    if (!crossValidateTargetFormat(**targetR, **formatR, reporter)) {
         return false;
     }
 

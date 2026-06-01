@@ -265,6 +265,16 @@ enum class DiagnosticCode : std::uint16_t {
     // meaning (input dir / input file missing).
     D_OutputDirCreateFailed       = 0xD00A,
     D_DirectoryScanFailed         = 0xD00B,
+    // D_TargetFormatMismatch: D-LK6-8.2 closure — the (target, format)
+    // pair the user supplied via `--target=<target>:<format>` declares
+    // mismatched machine identity. Example: `arm64:elf64-x86_64-linux-exec`
+    // — the format JSON's `elf.machine=62` (EM_X86_64) doesn't match
+    // the target schema's "arm64" arch identity (expected
+    // `elf.machine=183`). Pre-fold this dispatched silently into the
+    // x86_64 PLT-stub emitter, producing SIGILL at runtime. Now fails
+    // loud at the driver tier before linking. (silent-failure-hunter
+    // CRITICAL post-fold #1 on commit 84c68bc; closed 2026-06-01.)
+    D_TargetFormatMismatch        = 0xD00C,
 
     // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
