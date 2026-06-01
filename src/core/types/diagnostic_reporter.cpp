@@ -168,10 +168,32 @@ bool DiagnosticReporter::isRecentDuplicate(ParseDiagnostic const& d) const noexc
 }
 
 void DiagnosticReporter::report(ParseDiagnostic d) {
-    if (hitCap_) return;
-
+    // Policy first so the unsuppressable check below sees the post-
+    // policy code. applyPolicy short-circuits for unsuppressable codes
+    // (returning the diagnostic unmutated), so reordering vs. the
+    // pre-fold hitCap_-first check is invariant for those codes — and
+    // policy work is a few hash lookups, negligible vs. the surrounding
+    // pushes.
     auto filtered = applyPolicy(std::move(d));
     if (!filtered) return;
+
+    // D-FF2-UNSUPP CRITICAL: bypass ALL caps + dedup for unsuppressable
+    // codes. The closed-table contract: emission MUST reach `all_` so
+    // `errorCount()` correctly reflects the severity-gating diagnostic.
+    // Pre-fold the suppress/overrides/warningsAsErrors gates were
+    // bypassed in applyPolicy, but the FOUR cap/dedup gates here
+    // (hitCap_ / dedupWindow / maxPerCode / maxDiagnostics) each
+    // silently drop the diagnostic — re-opening the silent-failure
+    // surface every unsuppressable code was introduced to close.
+    // perCode_ is still incremented so accounting stays consistent;
+    // dedup/recent_ is skipped (we want every instance counted).
+    if (isUnsuppressable(filtered->code)) {
+        ++perCode_[filtered->code];
+        all_.push_back(std::move(*filtered));
+        return;
+    }
+
+    if (hitCap_) return;
 
     if (isRecentDuplicate(*filtered)) {
         return;

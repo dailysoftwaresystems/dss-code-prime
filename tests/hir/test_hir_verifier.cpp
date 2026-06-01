@@ -209,12 +209,20 @@ TEST(HirVerifier, RefusesToCertifyCleanWhenReporterIsCapped) {
     // A reporter capped by a prior phase silently drops further report() calls,
     // so the error-count delta can't prove "no violation" — verify() must NOT
     // hand back a false all-clear even for a genuinely clean module.
+    //
+    // Post-fold #11 F2: filling the cap with `H_TypeUnresolved` no longer
+    // works — that code is now in `kUnsuppressableCodes` and bypasses the
+    // cap entirely (cap is policy; unsuppressable codes must always reach
+    // `all_`). Use `P_UnexpectedToken` (a generic suppressable parser error)
+    // to fill the cap; the test's invariant — "verify must refuse to
+    // certify clean against a capped reporter" — is independent of WHICH
+    // code filled the cap.
     DiagnosticReporter::Config cfg;
     cfg.maxDiagnostics = 2;
     DiagnosticReporter reporter{cfg};
     for (int i = 0; i < 3; ++i) {
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::H_TypeUnresolved;
+        d.code     = DiagnosticCode::P_UnexpectedToken;
         d.severity = DiagnosticSeverity::Error;
         d.span     = dss::SourceSpan::empty(static_cast<dss::ByteOffset>(i + 1));
         reporter.report(std::move(d));

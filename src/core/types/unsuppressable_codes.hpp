@@ -7,7 +7,7 @@
 
 namespace dss {
 
-// D-FF2-4: closed-table of DiagnosticCodes whose emission MUST reach the
+// D-FF2-UNSUPP: closed-table of DiagnosticCodes whose emission MUST reach the
 // reporter regardless of any `--suppress` policy. These codes' emission
 // gates `ok` / `errorCount()` / exit-code semantics — suppressing them
 // would silently re-open the failure surface they were introduced to
@@ -23,21 +23,29 @@ namespace dss {
 // Post-fold: `applyPolicy` consults `isUnsuppressable(d.code)` BEFORE
 // the suppress check; unsuppressable codes pass through unchanged
 // (also bypass `overrides` severity-demotion + `warningsAsErrors`, both
-// of which would defeat the gate in different ways).
+// of which would defeat the gate in different ways). Post-fold #11
+// silent-failure F1: `report()` itself ALSO bypasses cap / dedup /
+// maxPerCode / maxDiagnostics for unsuppressable codes — the four
+// silent-drop gates around applyPolicy would otherwise re-open the
+// surface even when policy correctly let the code through.
 //
-// Membership tiers (informational):
-//   - Permanent architectural exclusions (suppressing → wrong-machine-code
-//     surface):
-//     `D_TargetAbiModelUnsupportedByDriver`, `F_FfiIngestAbiModelUnsupported`,
-//     `F_FfiIngestEmptyCanonical`, `H_ExternHasInitializer`.
-//   - Pending-plan announcements (suppressing → misleading "why did my
-//     build fail?" UX): `D_PlanNotLanded`.
-//   - Lowering / verifier structural invariants (cannot reach codegen):
-//     `H_UnsupportedLoweringForKind`, `H_VerifierFailure`, `H_TypeUnresolved`,
-//     `I_VerifierFailure`, `I_NoEntryBlock`, `I_MultipleEntryBlocks`,
-//     `I_EntryBlockNotFirst`, `I_NotDominated`.
-//   - Linker fail-loud (image refused / undefined symbol):
-//     `K_SymbolUndefined`, `K_ImageNotOk`.
+// Membership tiers (informational — the closed-table at the .cpp is
+// the single source of truth):
+//   - Permanent architectural exclusions / wrong-machine-code
+//     surfaces: D_TargetAbiModelUnsupportedByDriver,
+//     D_TargetMachineCodeMismatch (D-LK6-8.2 SIGILL),
+//     D_TargetAbiModelMismatch (D-LK6-8.2 SIGILL),
+//     F_FfiIngestAbiModelUnsupported, F_FfiIngestEmptyCanonical,
+//     H_ExternHasInitializer.
+//   - Pending-plan announcement (suppressing misleads the user):
+//     D_PlanNotLanded.
+//   - Lowering / verifier structural invariants (cannot reach
+//     codegen): H_UnsupportedLoweringForKind, H_ExternDeclMalformed,
+//     H_VerifierFailure, H_TypeUnresolved + ALL 12 I_* MIR-verifier
+//     codes (frozen-module structural / SSA / dominance invariants).
+//   - Linker fail-loud (image refused / undefined extern / image-
+//     write contract violation): K_SymbolUndefined, K_ImageNotOk,
+//     K_ImageEmpty + 4 K_ImageWrite* codes (LK10 contract).
 //
 // Adding a code here is a commitment: this code's emission MUST be visible
 // to the build pipeline regardless of any --suppress policy. New entries

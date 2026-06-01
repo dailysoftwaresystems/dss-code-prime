@@ -128,9 +128,8 @@ emitAndReturn(HeaderReadErrorKind kind, std::string detail,
 // that drove the bound — without it, file #2's HeaderReadError.at
 // would inherit file #1's leftover span on the shared reporter.
 //
-// Zero-length span filter: spans with length==0 are caret-pointer
-// markers (no covered text); filtered as "no useful locus" today.
-// Revisit if a future lowering deliberately emits zero-width spans.
+// "Useful locus" filter delegates to `HirSourceLoc::spansText()` — see
+// that predicate's docstring for the caret-vs-text-bearing semantic.
 [[nodiscard]] HirSourceLoc
 firstReportedErrorSpan(std::span<ParseDiagnostic const> diags) noexcept {
     for (auto const& d : diags) {

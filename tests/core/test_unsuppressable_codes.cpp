@@ -42,6 +42,26 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::D_PlanNotLanded));
 }
 
+TEST(UnsuppressableCodes, BothH2SplitArmsAreUnsuppressable) {
+    // Post-fold #11 type-design CRITICAL pin: H2 split (post-fold #9)
+    // introduced `H_ExternDeclMalformed` alongside the pre-existing
+    // `H_UnsupportedLoweringForKind` arm in `lowerExternDecl`. Both
+    // terminate lowering with `return errorNode(node)` + gate ok via
+    // errorCount. Pre-fix the new arm was missing from the closed-
+    // table, silently re-opening half the gate's coverage for any
+    // future grammar admitting parse-recovery shapes that reach
+    // lowering. This pin ensures the H2 split's two arms travel
+    // together — any future re-split must add the new code here too.
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::H_UnsupportedLoweringForKind))
+        << "engine-config arm: --suppress would let an extern decl "
+           "with no kindByChild config silently fall through to "
+           "makeExternGlobal, re-opening the D-FF2-3 silent-drop";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::H_ExternDeclMalformed))
+        << "parse-recovery arm: --suppress would let a malformed "
+           "extern decl (incomplete CST) silently fall through, "
+           "same silent-drop surface as the engine-config arm";
+}
+
 TEST(UnsuppressableCodes, RegularDiagnosticsRemainSuppressable) {
     // Stylistic / non-gating codes MUST stay suppressable so --suppress
     // remains a useful policy tool for the codes it was designed for.
@@ -52,7 +72,10 @@ TEST(UnsuppressableCodes, RegularDiagnosticsRemainSuppressable) {
 
 TEST(UnsuppressableCodes, ListSelfConsistent) {
     // Every member of the public closed-table view must report
-    // unsuppressable; no member duplicated.
+    // unsuppressable; no member duplicated; every entry must be a
+    // real enumerated DiagnosticCode (not a static_cast from a stray
+    // integer that slipped past type-checking); no member listed at
+    // the "Unknown" sentinel.
     auto const codes = unsuppressableCodes();
     EXPECT_GT(codes.size(), 0u);
     std::unordered_set<DiagnosticCode> seen;
@@ -62,6 +85,9 @@ TEST(UnsuppressableCodes, ListSelfConsistent) {
             << " is in the closed-table list but isUnsuppressable returns false";
         EXPECT_TRUE(seen.insert(c).second)
             << "duplicate entry for " << diagnosticCodeName(c);
+        EXPECT_STRNE(diagnosticCodeName(c).data(), "Unknown")
+            << "code value 0x" << std::hex << static_cast<unsigned>(c)
+            << " does not name a real DiagnosticCode (sentinel reached)";
     }
 }
 
@@ -98,6 +124,75 @@ TEST(Reporter, OverrideCannotDemoteUnsuppressableCodeBelowError) {
         << "overrides must not demote an unsuppressable code; "
            "applyPolicy short-circuits before overrides apply";
     EXPECT_EQ(r.errorCount(), 1u);
+}
+
+TEST(Reporter, UnsuppressableBypassesGlobalCap) {
+    // Post-fold #11 silent-failure F1 CRITICAL: pre-fold a noisy parse
+    // hitting `maxDiagnostics` would mask every subsequent
+    // unsuppressable code. With the F1 fix, unsuppressable codes
+    // bypass the global cap entirely — they always reach `all_` so
+    // `errorCount()` correctly reflects the severity-gating diagnostic.
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    DiagnosticReporter r{cfg};
+    // Fill the cap with regular suppressable errors — 1st lands, 2nd
+    // trips the cap marker. (cap check fires when `all_.size() >=
+    // maxDiagnostics` on the SECOND report.)
+    r.report(makeDiag(DiagnosticCode::P_UnexpectedToken));
+    auto d2 = makeDiag(DiagnosticCode::P_UnknownToken);
+    d2.span = SourceSpan::of(5, 6);  // distinct from d1 so dedup doesn't collapse
+    r.report(std::move(d2));
+    ASSERT_TRUE(r.hitCap())
+        << "test setup: cap must be hit before the unsuppressable report";
+    // Unsuppressable code MUST still land despite hitCap_.
+    r.report(makeDiag(DiagnosticCode::H_ExternHasInitializer));
+    bool found = false;
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::H_ExternHasInitializer) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "unsuppressable code must bypass the global cap; pre-F1 "
+           "the `if (hitCap_) return;` short-circuit would have eaten "
+           "this report";
+}
+
+TEST(Reporter, UnsuppressableBypassesPerCodeCap) {
+    // Post-fold #11 F1: per-code coalescing must not silently drop a
+    // 2nd / 3rd / ... unsuppressable diagnostic. 12 I_NotDominated
+    // violations in a module against maxPerCode=10 must all surface.
+    DiagnosticReporter::Config cfg;
+    cfg.maxPerCode = 1;
+    DiagnosticReporter r{cfg};
+    for (int i = 0; i < 5; ++i) {
+        auto d = makeDiag(DiagnosticCode::I_NotDominated);
+        d.span = SourceSpan::of(static_cast<ByteOffset>(i),
+                                static_cast<ByteOffset>(i + 1));
+        r.report(std::move(d));
+    }
+    EXPECT_EQ(r.all().size(), 5u)
+        << "all 5 unsuppressable diagnostics must reach `all_` "
+           "despite maxPerCode=1; pre-F1 would have coalesced to 1";
+}
+
+TEST(Reporter, UnsuppressableBypassesDedupWindow) {
+    // Post-fold #11 F1: dedup window is policy too. Two structurally
+    // identical unsuppressable diagnostics in the dedup window MUST
+    // both land — every instance gates ok.
+    DiagnosticReporter::Config cfg;
+    cfg.dedupWindow = 4;  // default
+    DiagnosticReporter r{cfg};
+    auto d1 = makeDiag(DiagnosticCode::K_ImageWriteShort);
+    auto d2 = makeDiag(DiagnosticCode::K_ImageWriteShort);
+    // Same code, same buffer, same span, same actual — dedup would
+    // normally collapse these.
+    r.report(std::move(d1));
+    r.report(std::move(d2));
+    EXPECT_EQ(r.all().size(), 2u)
+        << "dedup must not collapse unsuppressable diagnostics; "
+           "the second image-write failure carries distinct signal";
 }
 
 TEST(Reporter, NormalCodeSuppressedAlongsideUnsuppressableInSameReporter) {
