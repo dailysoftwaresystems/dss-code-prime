@@ -22,6 +22,7 @@ function(dss_add_test)
 endfunction()
 
 add_subdirectory(core)
+add_subdirectory(test_support)
 add_subdirectory(tokenizer)
 add_subdirectory(analysis/syntactic)
 add_subdirectory(analysis/compilation_unit)

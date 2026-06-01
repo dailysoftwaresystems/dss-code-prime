@@ -212,30 +212,11 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
     EXPECT_TRUE(sawSubstrateMention);
 }
 
-// CRITICAL silent-failure audit post-fold #1 (D-LK6-8 machine-guard):
-// extern imports + non-x86_64 machine code MUST fail loud at the
-// walker. Without this guard, the walker would silently emit x86_64
-// 6-byte FF 25 disp32 PLT stubs into an ARM64 image → SIGILL at the
-// first extern call.
-TEST(ElfExecWriter, ExternImportsOnArm64MachineFailsLoudCitingDLK68) {
-    auto target = TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
-    // Synthesize an ARM64 ET_EXEC format (machine=183) with a valid
-    // interpreter so the existing empty-interpreter guard doesn't
-    // fire first. The walker's machine-dispatch guard should reject
-    // before reaching `encodeElfExecDynamic`.
-    auto fmt = ObjectFormatSchema::loadFromText(R"({
-      "dssObjectFormatVersion": 1,
-      "format": {"name":"arm64-exec","kind":"elf"},
-      "elf": {
-        "class":"elf64", "data":"lsb", "machine": 183, "type":"exec",
-        "pageAlign": 4096, "interpreter": "/lib/ld-linux-aarch64.so.1", "bindNow": true
-      },
-      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4194304}]
-    })");
-    ASSERT_TRUE(fmt.has_value()) << [&]{
-        std::string s; for (auto const& d : fmt.error()) s += d.message + "\n"; return s;
-    }();
+namespace {
+// Build a minimal AssembledModule + ExternImport pair for the
+// non-x86_64 machine-guard tests. The walker should reject before
+// reading any of these fields beyond externImports.size() > 0.
+AssembledModule makeModuleWithOneExtern() {
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -247,10 +228,65 @@ TEST(ElfExecWriter, ExternImportsOnArm64MachineFailsLoudCitingDLK68) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     ExternImport imp;
-    imp.symbol = SymbolId{99};
+    imp.symbol      = SymbolId{99};
     imp.mangledName = "printf";
     imp.libraryPath = "libc.so.6";
     mod.externImports.push_back(std::move(imp));
+    return mod;
+}
+} // namespace
+
+// CRITICAL silent-failure audit post-fold #1 (D-LK6-8 machine-guard):
+// extern imports + non-x86_64 machine code MUST fail loud at the
+// walker. Without this guard, the walker would silently emit x86_64
+// 6-byte FF 25 disp32 PLT stubs into an ARM64 image → SIGILL at the
+// first extern call.
+//
+// Uses the shipped `elf64-aarch64-linux-exec.format.json` rather than
+// inlining a synthetic JSON — pins the guard against the real
+// production schema (code-simplifier audit post-fold #1).
+TEST(ElfExecWriter, ExternImportsOnArm64MachineFailsLoudCitingDLK68) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(fmt.has_value()) << [&]{
+        std::string s; for (auto const& d : fmt.error()) s += d.message + "\n"; return s;
+    }();
+    auto mod = makeModuleWithOneExtern();
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawMachineMention = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport
+         && d.actual.find("D-LK6-8") != std::string::npos) {
+            sawMachineMention = true;
+        }
+    }
+    EXPECT_TRUE(sawMachineMention);
+}
+
+// Universality pin: the guard is `!= 62` (not `== 183`). A regression
+// flipping the comparator to `== 183` would pass the ARM64 test but
+// silently emit x86_64 PLT stubs into RISC-V / MIPS / PPC64 images.
+// EM_RISCV = 243 per RISC-V ELF psABI.
+TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingDLK68) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"riscv-exec","kind":"elf"},
+      "elf": {
+        "class":"elf64", "data":"lsb", "machine": 243, "type":"exec",
+        "pageAlign": 4096, "interpreter": "/lib/ld-linux-riscv64-lp64d.so.1", "bindNow": true
+      },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4194304}]
+    })");
+    ASSERT_TRUE(fmt.has_value()) << [&]{
+        std::string s; for (auto const& d : fmt.error()) s += d.message + "\n"; return s;
+    }();
+    auto mod = makeModuleWithOneExtern();
 
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, **target, **fmt, rep);
