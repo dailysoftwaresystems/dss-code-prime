@@ -32,15 +32,29 @@ namespace {
 //
 // Anchored but NOT yet shipped (FF3 will fail loud
 // `NoMatchingCcInTarget` if used; remediation = ship the matching
-// format.json + add the cc row in target.json):
-//   arm64 + Pe    → ms_arm64       (Microsoft ARM64 ABI)
-//   arm64 + MachO → apple_arm64    (Apple ARM64 ABI — divergent from AAPCS64 on varargs + indirect-result)
+// format.json + add the cc row in target.json + ALSO add a
+// matching CallConv enum variant when the convention is
+// arch-distinct):
+//   arm64 + Pe    → ms_arm64    — Microsoft ARM64 ABI. PLACEHOLDER
+//                                  CallConv: re-uses `CcMS64`
+//                                  pending a proper `CcMSARM64`
+//                                  variant; the two share `MS_*`
+//                                  history but differ in arg
+//                                  registers (x0..x7 vs rcx/rdx/r8/r9)
+//                                  + return-reg + shadow space.
+//                                  D-FF3-4 anchor: split CallConv.
+//   arm64 + MachO → apple_arm64 — Apple ARM64 ABI. Divergent from
+//                                  AAPCS64 (developer.apple.com:
+//                                  /documentation/xcode/writing-arm64-code-for-apple-platforms)
+//                                  on varargs (always-stack) and
+//                                  indirect-result. CcApple
+//                                  variant exists.
 constexpr std::array<AbiCatalogRow, 6> kAbiCatalog{{
     { "x86_64", ObjectFormatKind::Elf,   CallConv::CcSysV,    "sysv_amd64"  },
     { "x86_64", ObjectFormatKind::Pe,    CallConv::CcMS64,    "ms_x64"      },
     { "x86_64", ObjectFormatKind::MachO, CallConv::CcSysV,    "sysv_amd64"  },
     { "arm64",  ObjectFormatKind::Elf,   CallConv::CcAAPCS64, "aapcs64"     },
-    { "arm64",  ObjectFormatKind::Pe,    CallConv::CcMS64,    "ms_arm64"    },
+    { "arm64",  ObjectFormatKind::Pe,    CallConv::CcMS64,    "ms_arm64"    },  // placeholder CallConv — see D-FF3-4
     { "arm64",  ObjectFormatKind::MachO, CallConv::CcApple,   "apple_arm64" },
 }};
 
@@ -74,14 +88,11 @@ lookupCatalog(std::string_view targetName, ObjectFormatKind kind) noexcept {
     return nullptr;
 }
 
-[[nodiscard]] TargetCallingConvention const*
-findCcByName(std::span<TargetCallingConvention const> ccs,
-             std::string_view expectedName) noexcept {
-    for (auto const& cc : ccs) {
-        if (cc.name == expectedName) return &cc;
-    }
-    return nullptr;
-}
+// (`findCcByName` helper retired post-FF3-#2 — replaced by
+// `TargetSchema::callingConventionByName` which is the existing
+// O(1) hashmap lookup, not a linear scan. code-reviewer HIGH
+// fold; matches the codebase rule "use existing index when one
+// exists".)
 
 // Closed-table error-kind → name + F_* code mapping. Mirrors the
 // pattern from `kHeaderReadErrorTable` (c_header_parser.cpp).
@@ -191,7 +202,7 @@ resolveAbi(TargetSchema const&       target,
     }
 
     TargetCallingConvention const* cc =
-        findCcByName(target.callingConventions(), row->expectedCcName);
+        target.callingConventionByName(row->expectedCcName);
     if (cc == nullptr) {
         return std::unexpected(emitAndReturn(
             AbiResolveErrorKind::NoMatchingCcInTarget,

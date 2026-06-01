@@ -726,8 +726,10 @@ enum class DiagnosticCode : std::uint16_t {
     //   that name. Remediation: extend the target.json's
     //   callingConventions array OR drop the (target, format) pair.
     // F_AbiFormatAbiModelMismatch: defensive — (format.kind, target.abiModel)
-    //   pair reached FF3 in an unexpected state (e.g. WASM format
-    //   with register-machine target). crossValidateTargetFormat
+    //   pair reached FF3 in an unexpected state (e.g. an
+    //   `operand-stack` abi-model target paired with a non-WASM
+    //   format-kind, or a `result-id` abi-model target paired with
+    //   a non-SPIR-V format-kind). crossValidateTargetFormat
     //   should reject this upstream; FF3 emits the code if it slips
     //   past as a defense-in-depth.
     F_AbiUnknownTuple              = 0x5010,

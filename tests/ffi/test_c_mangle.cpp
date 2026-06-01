@@ -108,21 +108,45 @@ TEST(FfiCMangle, UnapplyEmptyInputReturnsEmpty) {
 
 TEST(FfiCMangle, ApplyUnapplyRoundTripPreservesCanonicalForm) {
     // For every format-kind variant, apply→unapply must yield the
-    // original canonical name back. This is the systemic invariant
-    // FF4's caller (FF5 ingestion) relies on.
+    // original canonical name back. Iteration is driven by
+    // `kObjectFormatKindTable` so a future ObjectFormatKind variant
+    // is exercised automatically (post-fold #2 test-analyzer P7).
     auto roundTrip = [](std::string_view canonical, ObjectFormatKind format) {
         std::string decorated = applyCMangling(canonical, format);
         return unapplyCMangling(decorated, format);
     };
-    for (ObjectFormatKind k : { ObjectFormatKind::Unknown,
-                                ObjectFormatKind::Elf,
-                                ObjectFormatKind::Pe,
-                                ObjectFormatKind::MachO,
-                                ObjectFormatKind::Wasm,
-                                ObjectFormatKind::Spirv }) {
+    for (auto const& row : kObjectFormatKindTable.rows) {
+        ObjectFormatKind const k = row.first;
         EXPECT_EQ(roundTrip("printf", k), "printf")
             << "format kind = " << static_cast<unsigned>(k);
         EXPECT_EQ(roundTrip("really_long_libc_function_name_123", k),
                   "really_long_libc_function_name_123");
+    }
+}
+
+TEST(FfiCMangle, AllFormatKindsHaveExplicitRulePin) {
+    // Enum-driven pin: a new ObjectFormatKind variant added without
+    // a matching kCManglingRules row would be caught by the impl-
+    // side static_assert at compile time, but the per-variant rule
+    // semantics also need a test pin so a maintainer who updates
+    // the table can't silently regress the decoration policy.
+    // Iteration over kObjectFormatKindTable.rows means new variants
+    // are automatically exercised (post-fold #2 test-analyzer P6).
+    auto expectRule = [](ObjectFormatKind k) -> bool {
+        switch (k) {
+            case ObjectFormatKind::Unknown: return false;
+            case ObjectFormatKind::Elf:     return false;
+            case ObjectFormatKind::Pe:      return false;  // v1 PE64-only
+            case ObjectFormatKind::MachO:   return true;
+            case ObjectFormatKind::Wasm:    return false;
+            case ObjectFormatKind::Spirv:   return false;
+        }
+        return false;  // closed-enum exhaustive switch — fallthrough is dead
+    };
+    for (auto const& row : kObjectFormatKindTable.rows) {
+        ObjectFormatKind const k = row.first;
+        EXPECT_EQ(cFormatAddsLeadingUnderscore(k), expectRule(k))
+            << "rule mismatch for format kind " << static_cast<unsigned>(k)
+            << " (" << row.second << ")";
     }
 }

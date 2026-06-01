@@ -14,11 +14,17 @@
 
 // Plan 11 FF3 — ABI catalog. Resolves a (target × format) pair to
 // a calling-convention selection plus a pointer into the target
-// schema's `callingConventions` array. Closes the silent-failure
-// surface where ML7's callconv lowering blindly picked
-// `callingConventions[0]` regardless of the binary format: a
-// `target=x86_64 format=pe64-x86_64-windows` pair would silently
-// dispatch to `sysv_amd64` (index 0) when it should be `ms_x64`.
+// schema's `callingConventions` array.
+//
+// Substrate-only at this cycle: provides the resolver, does NOT
+// yet rewire ML7. The silent-failure surface where
+// `src/lir/lir_regalloc.cpp::317` hardcodes
+// `callingConventionIndex = 0` regardless of format remains open
+// until D-FF3-3 (FF5 integration cycle) threads `AbiTuple` into
+// `compileOneTarget` → `compileSingleUnit` → `allocateRegisters`.
+// Until then a `target=x86_64 format=pe64-x86_64-windows` pair
+// still silently dispatches to `sysv_amd64` (index 0) when it
+// should be `ms_x64`; FF3 ships the resolver that closes it.
 //
 // Closed-table dispatch keyed on (target.name, format.kind) →
 // (CallConv enum, expected cc name string). FF3 looks up the row,

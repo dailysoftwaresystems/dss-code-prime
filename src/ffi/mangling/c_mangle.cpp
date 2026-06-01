@@ -31,10 +31,15 @@ constexpr std::array<CManglingRule, 6> kCManglingRules{{
 // inherit the linear-scan default (false / no decoration), masking
 // the design decision. The static_assert + the
 // `kCManglingRulesAlignedWithEnum` consteval pin force a fold-now.
-static_assert(kCManglingRules.size()
-                  == static_cast<std::size_t>(ObjectFormatKind::Spirv) + 1u,
+// Anchored against `kObjectFormatKindTable` (the canonical
+// variant-count source in `link/object_format_schema.hpp`) rather
+// than `Spirv+1u` — the latter would silently accept any future
+// variant appended after Spirv as long as the row count happened
+// to match. (silent-failure H1 + code-reviewer post-fold #2.)
+static_assert(kCManglingRules.size() == kObjectFormatKindTable.rows.size(),
               "kCManglingRules row count must equal the ObjectFormatKind "
-              "variant count — adding a kind requires adding a rule.");
+              "variant count (anchored against kObjectFormatKindTable). "
+              "Adding a kind requires adding a rule.");
 
 consteval bool kCManglingRulesAlignedWithEnum() {
     for (std::size_t i = 0; i < kCManglingRules.size(); ++i) {

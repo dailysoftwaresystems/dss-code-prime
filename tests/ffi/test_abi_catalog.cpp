@@ -15,6 +15,7 @@
 #include "core/types/target_schema.hpp"
 #include "ffi/abi/abi_catalog.hpp"
 #include "link/object_format_schema.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -23,17 +24,7 @@
 
 using namespace dss;
 using namespace dss::ffi;
-
-namespace {
-
-[[nodiscard]] std::size_t countCode(DiagnosticReporter const& r,
-                                    DiagnosticCode c) {
-    std::size_t n = 0;
-    for (auto const& d : r.all()) if (d.code == c) ++n;
-    return n;
-}
-
-} // namespace
+using dss::test_support::countCode;
 
 // ── Shipped happy paths ──────────────────────────────────────
 
@@ -95,6 +86,14 @@ TEST(FfiAbiCatalog, Arm64ElfResolvesToAAPCS64) {
 
 // ── Catalog anchored but cc not shipped → loud reject ──────
 
+// NOTE: This test FLIPS BEHAVIOR when arm64.target.json ships the
+// `apple_arm64` cc row. Today the catalog says (arm64, MachO) →
+// "apple_arm64" but target.json lacks the row, producing
+// NoMatchingCcInTarget. The cycle that ships the cc row must
+// either DELETE this test and replace with a happy-path mirror
+// (see `Arm64ElfResolvesToAAPCS64`) OR rewrite to assert the
+// successful resolution. Anchored as D-FF3-5 with the trigger
+// "apple_arm64 cc row ships in arm64.target.json".
 TEST(FfiAbiCatalog, Arm64MachOFailsLoudUntilAppleArm64CcShipped) {
     // The catalog has a row for (arm64, MachO) → "apple_arm64",
     // but arm64.target.json doesn't ship that cc yet. FF3 must
@@ -196,12 +195,17 @@ TEST(FfiAbiCatalog, OperandStackTargetWithElfFormatFailsLoud) {
 
 // ── Catalog coverage / contract pins ───────────────────────
 
-TEST(FfiAbiCatalog, CatalogHasShippedTuples) {
+TEST(FfiAbiCatalog, CatalogCountIsExactly6PinsAllAnchoredRows) {
+    // Pin the EXACT count — a silent addition of a row (e.g. a
+    // future arm64+Wasm tuple) should trip the test, not pass
+    // unobserved. Bump to N+1 when shipping the Nth (target,
+    // format) pair AND add the corresponding row pin below.
     auto rows = abiCatalogTable();
-    EXPECT_GE(rows.size(), 4u);  // at minimum the 4 currently-shipped pairs
+    EXPECT_EQ(rows.size(), 6u);
     // Pin the specific shipped rows exist.
     bool sawX86ElfSysV = false, sawX86PeMS = false;
     bool sawX86MachOSysV = false, sawArmElfAAPCS = false;
+    bool sawArmPeMs = false, sawArmMachOApple = false;
     for (auto const& r : rows) {
         if (r.targetName == "x86_64" && r.formatKind == ObjectFormatKind::Elf
             && r.callingConvention == CallConv::CcSysV
@@ -215,11 +219,45 @@ TEST(FfiAbiCatalog, CatalogHasShippedTuples) {
         if (r.targetName == "arm64" && r.formatKind == ObjectFormatKind::Elf
             && r.callingConvention == CallConv::CcAAPCS64
             && r.expectedCcName == "aapcs64") sawArmElfAAPCS = true;
+        if (r.targetName == "arm64" && r.formatKind == ObjectFormatKind::Pe
+            && r.expectedCcName == "ms_arm64") sawArmPeMs = true;
+        if (r.targetName == "arm64" && r.formatKind == ObjectFormatKind::MachO
+            && r.callingConvention == CallConv::CcApple
+            && r.expectedCcName == "apple_arm64") sawArmMachOApple = true;
     }
     EXPECT_TRUE(sawX86ElfSysV);
     EXPECT_TRUE(sawX86PeMS);
     EXPECT_TRUE(sawX86MachOSysV);
     EXPECT_TRUE(sawArmElfAAPCS);
+    // Anchored-but-unshipped rows must remain in the catalog (anchor
+    // is the design statement that these combos are intended targets,
+    // even though target.json doesn't yet ship the matching cc rows).
+    EXPECT_TRUE(sawArmPeMs)
+        << "anchor row arm64+Pe → ms_arm64 was removed; if the design "
+        << "decision has changed, update D-FF3-4 anchor too";
+    EXPECT_TRUE(sawArmMachOApple)
+        << "anchor row arm64+MachO → apple_arm64 was removed";
+}
+
+// ── Defensive arm symmetry ─────────────────────────────────
+
+TEST(FfiAbiCatalog, ResultIdTargetWithPeFormatFailsLoud) {
+    // Symmetric mirror of OperandStackTargetWithElfFormatFailsLoud:
+    // pins the result-id arm of the abi-model dispatch fires when
+    // format-kind disagrees with the abi-model.
+    auto target = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"spirv","version":"0.0","abiModel":"result-id"},
+      "opcodes": [ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    ASSERT_TRUE(format.has_value());
+    DiagnosticReporter rep;
+    auto r = resolveAbi(**target, **format, rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, AbiResolveErrorKind::FormatAbiModelMismatch);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_AbiFormatAbiModelMismatch), 1u);
 }
 
 // ── Diagnostic code name round-trips ───────────────────────

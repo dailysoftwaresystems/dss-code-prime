@@ -8,6 +8,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/c_header_parser.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -15,18 +16,8 @@
 
 using namespace dss;
 using namespace dss::ffi;
+using dss::test_support::countCode;
 namespace fs = std::filesystem;
-
-namespace {
-
-[[nodiscard]] std::size_t countCode(DiagnosticReporter const& r,
-                                    DiagnosticCode c) {
-    std::size_t n = 0;
-    for (auto const& d : r.all()) if (d.code == c) ++n;
-    return n;
-}
-
-} // namespace
 
 // ── Happy-path row emission ───────────────────────────────────
 

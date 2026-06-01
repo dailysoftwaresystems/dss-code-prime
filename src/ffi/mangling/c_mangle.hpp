@@ -18,9 +18,12 @@
 //                                `_func@N` deferred until first 32-bit
 //                                PE target)
 //   ObjectFormatKind::MachO   → leading underscore (`_printf`) — Apple
-//                                applies this for BOTH 32-bit and
-//                                64-bit Mach-O; the convention is
-//                                arch-agnostic
+//                                convention. The decoration rule
+//                                reads `ObjectFormatKind` only,
+//                                which is bitness-agnostic by design:
+//                                Apple uses the same convention on
+//                                32-bit and 64-bit Mach-O so no
+//                                bitness axis is needed.
 //   ObjectFormatKind::Wasm    → no decoration (uses import-namespace
 //                                instead of name mangling)
 //   ObjectFormatKind::Spirv   → no decoration (SPIR-V has no C ABI)
@@ -28,9 +31,7 @@
 //
 // Source-language agnostic: this is C-name mangling (FF4's plan
 // row). C++/Rust mangling is post-v1 (FF7/FF8) and lives in its
-// own file. Target-arch agnostic: the decoration rule depends on
-// ObjectFormatKind only — both x86 and ARM Mach-O use the
-// underscore convention.
+// own file.
 
 namespace dss::ffi {
 
@@ -39,6 +40,10 @@ namespace dss::ffi {
 // Pure function — caller assigns the result back into
 // `ImportSurface::mangledName` (FFI ingestion side) or feeds it
 // to the linker's import-resolution path (FFI export side).
+//
+// Mechanical: `applyCMangling("_x", MachO)` returns `"__x"`. The
+// function applies the format rule blindly — caller passes
+// CANONICAL (undecorated) names. No dedup, no idempotence.
 //
 // Empty input → empty output (callers gate empties upstream;
 // FF4 does not synthesize a name).
@@ -55,7 +60,12 @@ applyCMangling(std::string_view canonicalName, ObjectFormatKind format);
 // decoration (e.g. a Mach-O symbol `printf` without underscore),
 // the function returns the input unchanged rather than
 // fabricating semantics — operators usually ship clean libraries
-// and a missing prefix is rarely the user's bug.
+// and a missing prefix is rarely the user's bug. (Strict-mode
+// variant that errors on missing-prefix is anchored at
+// D-FF4-3 — pairs with FF5 ingest where the format-kind is
+// known authoritative.)
+//
+// Empty input → empty output (mirrors `applyCMangling`).
 [[nodiscard]] DSS_EXPORT std::string
 unapplyCMangling(std::string_view decoratedName, ObjectFormatKind format);
 
