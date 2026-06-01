@@ -74,19 +74,23 @@ struct DSS_EXPORT ImportSurface {
     SymbolKind       kind       = SymbolKind::NoType;
     SymbolVisibility visibility = SymbolVisibility::Default;
     SymbolLinkage    linkage    = SymbolLinkage::External;
-    // Reserved for FF2 C-header consumption — populated when an
-    // `extern` decl carries a function signature. `std::nullopt`
-    // for FF1 binary readers (binaries don't carry C signatures,
-    // only mangled names + symbol kinds).
+    // Reserved for FF2 C-header consumption — FF2 (C header parser)
+    // populates this from `extern fn(...)` declarations parsed out
+    // of `*.h` files; FF1 binary readers leave it nullopt (binaries
+    // don't carry C signatures, only mangled names + symbol kinds).
+    // FF3 (ABI catalog) then CONSUMES the structured signature to
+    // compute calling-convention + layout for the import — FF3's
+    // role is signature APPLICATION, not signature PARSING; the
+    // parsing happens at FF2 via the c-subset frontend reuse.
     //
-    // Free-form opaque string (e.g. `"int(const char*)"`) — parsed
-    // structurally by plan 11's ABI catalog (FF3) when the user's
-    // source declaration is validated against this surface. `optional`
-    // makes "no signature attached" semantically distinct from "header
-    // declared with empty parens" (which is invalid C and should
-    // surface as a parse diagnostic). post-fold #1 type-design fix —
-    // was a free-form `std::string` with the "empty means absent"
-    // convention, an SoT smell that FF2 + FF3 would have inherited.
+    // Free-form opaque string (e.g. `"int(const char*)"`) at this
+    // level. `optional` makes "no signature attached" semantically
+    // distinct from "header declared with empty parens" (which is
+    // invalid C and should surface as a parse diagnostic).
+    // post-fold #1 type-design fix — was a free-form `std::string`
+    // with the "empty means absent" convention, an SoT smell that
+    // FF2 + FF3 would have inherited. (FF3 attribution corrected
+    // at post-fold #2: parsing is FF2, not FF3.)
     std::optional<std::string> cSignature;
 };
 

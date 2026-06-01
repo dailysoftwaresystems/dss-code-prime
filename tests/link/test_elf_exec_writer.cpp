@@ -338,12 +338,28 @@ TEST(ElfExecWriter, Arm64PltStubLayoutPinsAdrpLdrBrNop) {
     // For the test layout, immhi top bits are zero (small page-pair
     // values), so byte 3 should be exactly 0x90.
     ASSERT_GE(brIdx, 8u);
+    // ADRP opcode pin: byte 3 high 5 bits = 0x90 mask 0x9F (the
+    // immlo bits at [30:29] vary with page-pair value; mask them
+    // out for the opcode marker). Also pin Rd=x16 in the inst's
+    // low 5 bits (byte 0 low 5 bits = 16 = 0b10000 = 0x10).
     EXPECT_EQ(bytes[brIdx - 8 + 3] & 0x9Fu, 0x90u)
         << "ADRP opcode marker missing at PLT stub byte 3";
+    EXPECT_EQ(bytes[brIdx - 8 + 0] & 0x1Fu, 0x10u)
+        << "ADRP Rd must be x16 (IP0) per AArch64 PCS PLT contract";
     // LDR opcode pin: instruction at brIdx-4, byte 3 = 0xF9 fixed
-    // for LDR (immediate, unsigned offset, 64-bit).
+    // for LDR (immediate, unsigned offset, 64-bit, size=11 + opc=01).
     EXPECT_EQ(bytes[brIdx - 4 + 3], 0xF9u)
         << "LDR opcode marker missing at PLT stub byte 7";
+    // LDR Rt + low Rn bits: low byte holds Rt (bits[4:0]) +
+    // Rn low 3 bits (bits[7:5]). For Rn=16, Rt=17 → byte 0 =
+    // (16 << 5 | 17) & 0xFF = 0x211 & 0xFF = 0x11.
+    EXPECT_EQ(bytes[brIdx - 4 + 0], 0x11u)
+        << "LDR Rn/Rt regression — must be Rn=x16, Rt=x17 per "
+           "PCS PLT contract";
+    // LDR Rn high 2 bits live in byte 1 bits[1:0] — for Rn=16
+    // (high bits = 0b10), byte 1 low 2 bits = 0b10 = 2.
+    EXPECT_EQ(bytes[brIdx - 4 + 1] & 0x03u, 0x02u)
+        << "LDR Rn upper bits regression";
 }
 
 // D-LK6-8 defense-in-depth: out-of-range ADRP page-pair must be

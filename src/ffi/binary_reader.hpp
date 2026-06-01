@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "ffi/import_surface.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <string>
@@ -54,6 +55,24 @@ struct DSS_EXPORT BinaryReadError {
 
 [[nodiscard]] DSS_EXPORT std::string_view
     binaryReadErrorKindName(BinaryReadErrorKind k) noexcept;
+
+// Test-exposed overflow-safe bounds check: does `[off, off+size)` lie
+// inside `[0, totalSize)`? The naive `off + size > totalSize` wraps
+// when `off + size` overflows u64; this guards via subtraction. Used
+// internally by every binary reader's section-bounds validation.
+//
+// Exposed via the public header (not just .cpp) so tests can pin the
+// wrap-bypass case directly — the silent-failure surface this guards
+// is exactly what the post-fold #1 closed (a hostile/corrupted `.so`
+// with `sh_offset = UINT64_MAX-4, sh_size = 8` would have slipped
+// past the pre-fold check). Indirect ELF-synthesis coverage is
+// fragile against parser-order refactors. (pr-test-analyzer Gap 1
+// priority 9, post-fold #2.)
+[[nodiscard]] DSS_EXPORT constexpr bool
+rangeExceedsBuffer(std::uint64_t off, std::uint64_t size,
+                   std::uint64_t totalSize) noexcept {
+    return off > totalSize || size > totalSize - off;
+}
 
 // Read the import surface (exported symbols) from a shared library
 // on disk. Detection is format-blind: the dispatch reads the first

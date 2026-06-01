@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asm/asm.hpp"
+#include "core/cpp_invariants.hpp"  // arithmetic-right-shift assert (Aarch64AdrPrelPgHi21)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"

@@ -436,3 +436,127 @@ TEST(BinaryReaderError, FCodePrefixUsesFLetter) {
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::F_SectionNotFound),
               "F0007");
 }
+
+// ── Post-fold #2 (pr-test-analyzer Gap 1, P9):
+//      rangeExceedsBuffer u64-wrap-bypass direct unit test ──
+//
+// The CRITICAL silent-failure the post-fold #1 closed was the naive
+// `off + size > totalSize` wrapping on u64 — a hostile/corrupted
+// `.so` with `sh_offset = UINT64_MAX-4, sh_size = 8` would slip past
+// the check. Pinning the helper directly (vs only the end-to-end
+// ELF synthesis) defends against future parser-order refactors that
+// could move the bounds check past earlier validations.
+
+TEST(RangeExceedsBuffer, ZeroSizeAtStartFits) {
+    EXPECT_FALSE(rangeExceedsBuffer(0, 0, 100));
+}
+
+TEST(RangeExceedsBuffer, ZeroSizeAtExactEndFits) {
+    EXPECT_FALSE(rangeExceedsBuffer(100, 0, 100));
+}
+
+TEST(RangeExceedsBuffer, OneByteOverrunExceeds) {
+    EXPECT_TRUE(rangeExceedsBuffer(99, 2, 100));
+}
+
+TEST(RangeExceedsBuffer, OffsetAtTotalWithSizeExceeds) {
+    EXPECT_TRUE(rangeExceedsBuffer(100, 1, 100));
+}
+
+TEST(RangeExceedsBuffer, OffsetBeyondTotalExceeds) {
+    EXPECT_TRUE(rangeExceedsBuffer(101, 0, 100));
+}
+
+TEST(RangeExceedsBuffer, U64WrapBypassCatchesHostileOffset) {
+    // The exact silent-failure CRITICAL: hostile sh_offset =
+    // UINT64_MAX - 4 + sh_size = 8 would wrap to 4 under naive
+    // `off + size`, slipping under any `totalSize`. The safe form
+    // computes `size > totalSize - off`, catching the overflow.
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    EXPECT_TRUE(rangeExceedsBuffer(kMax - 4, 8, 100));
+}
+
+TEST(RangeExceedsBuffer, MaxOffsetMaxTotalExceeds) {
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    EXPECT_TRUE(rangeExceedsBuffer(kMax, 1, kMax));
+}
+
+// ── Post-fold #2: pin every failure path to reporter F_* emission ─
+
+// pr-test-analyzer Gap 2 (priority 8): the toDiagnosticCode mapping
+// + emitAndReturn wiring is what makes `--suppress=F_*` work. The
+// existing tests assert error().kind but didn't scan the reporter
+// for the matching F_* code. A regression that bypasses
+// emitAndReturn (e.g. `return std::unexpected(BinaryReadError{...})`
+// directly) would compile clean + ship — and `--suppress` would
+// silently stop working for that path.
+TEST(BinaryReaderReporter, UnknownMagicAlsoEmitsFCodeThroughReporter) {
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(
+        std::vector<std::uint8_t>{0xAA, 0xBB, 0xCC, 0xDD, 0xEE},
+        "garbage.bin", rep);
+    ASSERT_FALSE(r.has_value());
+    bool sawF = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_UnknownBinaryFormat) sawF = true;
+    }
+    EXPECT_TRUE(sawF);
+}
+
+TEST(BinaryReaderReporter, PeMagicAlsoEmitsFCodeThroughReporter) {
+    DiagnosticReporter rep;
+    std::vector<std::uint8_t> pe = {'M', 'Z', 0x00, 0x00};
+    auto r = readImportsFromBytes(pe, "fake.dll", rep);
+    ASSERT_FALSE(r.has_value());
+    bool sawF = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_UnsupportedBinaryFormat) sawF = true;
+    }
+    EXPECT_TRUE(sawF);
+}
+
+TEST(BinaryReaderReporter, Elf32AlsoEmitsFCodeThroughReporter) {
+    std::vector<std::uint8_t> bytes(64, 0);
+    bytes[0] = 0x7F; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
+    bytes[4] = 1; bytes[5] = 1;  // ELFCLASS32
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "32bit.so", rep);
+    ASSERT_FALSE(r.has_value());
+    bool sawF = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_UnsupportedElfClass) sawF = true;
+    }
+    EXPECT_TRUE(sawF);
+}
+
+TEST(BinaryReaderReporter, CorruptedBinaryAlsoEmitsFCodeThroughReporter) {
+    std::vector<std::uint8_t> bytes(32, 0);
+    bytes[0] = 0x7F; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
+    bytes[4] = 2; bytes[5] = 1;
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "tiny.so", rep);
+    ASSERT_FALSE(r.has_value());
+    bool sawF = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_CorruptedBinary) sawF = true;
+    }
+    EXPECT_TRUE(sawF);
+}
+
+// pr-test-analyzer Gap 3 (priority 8): cSignature optional contract.
+// FF1 ELF readers must produce nullopt — distinct from "empty parens"
+// (invalid C). A regression that sets `cSignature = std::string{}`
+// would silently flip the FF1 vs FF2 semantic.
+TEST(BinaryReaderElf, Ff1ProducedRowsHaveNoCSignature) {
+    std::vector<std::string> names = {"printf"};
+    std::vector<Sym> syms;
+    syms.push_back({0, info(1, 2), 0, 1, 0x1000, 16});
+    auto const bytes = buildMinimalElf64(syms, names);
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(bytes, "lib.so", rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_FALSE((*r)[0].cSignature.has_value())
+        << "FF1 binary readers must leave cSignature nullopt; "
+           "FF2 (C header parser) is the populator.";
+}
