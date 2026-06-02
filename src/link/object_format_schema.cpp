@@ -835,6 +835,22 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "trampoline to resolve a cc against. (D-LK10-ENTRY §2.13.)");
     }
 
+    // D-LK2-RODATA closure: producer-data-section capability is only
+    // meaningful on exec-flavored formats. Relocatable artifacts
+    // (PE Obj / ELF ET_REL / Mach-O MH_OBJECT) emit rodata via the
+    // symbol+section table at .obj time, not through the dataItems
+    // capability gate; declaring `supportedDataSections` on a
+    // relocatable schema is dead data that would silently confuse
+    // anyone diffing format schemas.
+    if (!supportedDataSections.empty() && !isExecFlavor) {
+        fail("/supportedDataSections",
+             "supportedDataSections is only legal on exec-flavored "
+             "formats (ELF ET_EXEC / PE PE32+ Exec/Dll / Mach-O "
+             "MH_EXECUTE). Relocatable artifacts (.o / Obj / Object) "
+             "emit rodata via symbol tables, not via the dataItems "
+             "capability gate. (D-LK2-RODATA closure.)");
+    }
+
     return problems;
 }
 

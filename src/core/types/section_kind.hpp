@@ -138,4 +138,12 @@ dataSectionKindName(DataSectionKind d) noexcept {
     return sectionKindName(toSectionKind(d));
 }
 
+[[nodiscard]] constexpr std::optional<DataSectionKind>
+dataSectionKindFromName(std::string_view s) noexcept {
+    if (s == "rodata") return DataSectionKind::Rodata;
+    if (s == "data")   return DataSectionKind::Data;
+    if (s == "bss")    return DataSectionKind::Bss;
+    return std::nullopt;
+}
+
 } // namespace dss

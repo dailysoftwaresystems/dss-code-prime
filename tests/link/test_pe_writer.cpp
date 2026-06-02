@@ -24,6 +24,7 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -1200,5 +1201,426 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     EXPECT_TRUE(img.bytes.empty());
     EXPECT_FALSE(img.ok());
     EXPECT_EQ(img.resolvedFuncCount, 0u);
+}
+
+// ── D-LK2-RODATA: PE walker emits .rdata from AssembledData ────
+//
+// The PE walker emits a `.rdata` section between `.text` and
+// `.idata` whenever `module.dataItems` carries any item with
+// `section == DataSectionKind::Rodata`. Layout discipline:
+//   * Per-item Alignment padding within the section.
+//   * Section header characteristics 0x40000040 from the format
+//     schema's Rodata row (IMAGE_SCN_CNT_INITIALIZED_DATA |
+//     IMAGE_SCN_MEM_READ).
+//   * Section ordering: [.text, .rdata?, .idata?].
+//   * SizeOfInitializedData sums rdataRawSize + idataRawSize.
+//   * Linker's F1 capability gate lowers for PE only.
+
+TEST(PeExecWriter, RodataSectionEmittedWhenDataItemsNonEmpty) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Rodata;
+    d.bytes   = {'h', 'e', 'l', 'l', 'o', '\n', '\0'};
+    d.alignment = Alignment::of<1>();
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // NumberOfSections at IMAGE_FILE_HEADER offset 0x86: 2 sections
+    // (.text + .rdata; no .idata since externImports empty).
+    EXPECT_EQ(readU16LE(bytes, 0x86), 2u)
+        << ".text + .rdata = 2 sections (idata absent)";
+    // Section header table starts at 0x188 (DOS + stub + PE sig +
+    // file header + optional header64). .rdata is sectionHeaders[1]
+    // (after .text). Each section header is 40 bytes.
+    constexpr std::size_t kSecHdrTable = 0x188;
+    constexpr std::size_t kSecHdrSize  = 40;
+    constexpr std::size_t kRdataHdr    = kSecHdrTable + kSecHdrSize;
+    // Section header name: ".rdata\0\0" (8 bytes).
+    EXPECT_EQ(bytes[kRdataHdr + 0], '.');
+    EXPECT_EQ(bytes[kRdataHdr + 1], 'r');
+    EXPECT_EQ(bytes[kRdataHdr + 2], 'd');
+    EXPECT_EQ(bytes[kRdataHdr + 3], 'a');
+    EXPECT_EQ(bytes[kRdataHdr + 4], 't');
+    EXPECT_EQ(bytes[kRdataHdr + 5], 'a');
+    EXPECT_EQ(bytes[kRdataHdr + 6], 0u);
+    EXPECT_EQ(bytes[kRdataHdr + 7], 0u);
+    // VirtualSize @ +8 = 7 (the item's byte count).
+    EXPECT_EQ(readU32LE(bytes, kRdataHdr + 8), 7u);
+    // Characteristics @ +36 = 0x40000040.
+    EXPECT_EQ(readU32LE(bytes, kRdataHdr + 36), 0x40000040u);
+    // Bytes at the rdata file pointer should match "hello\n\0".
+    std::uint32_t const rdataFileOff =
+        readU32LE(bytes, kRdataHdr + 20);
+    ASSERT_GE(bytes.size(), rdataFileOff + 7u);
+    EXPECT_EQ(bytes[rdataFileOff + 0], 'h');
+    EXPECT_EQ(bytes[rdataFileOff + 1], 'e');
+    EXPECT_EQ(bytes[rdataFileOff + 2], 'l');
+    EXPECT_EQ(bytes[rdataFileOff + 3], 'l');
+    EXPECT_EQ(bytes[rdataFileOff + 4], 'o');
+    EXPECT_EQ(bytes[rdataFileOff + 5], '\n');
+    EXPECT_EQ(bytes[rdataFileOff + 6], '\0');
+}
+
+TEST(PeExecWriter, RodataAndIdataCoexistInCorrectOrder) {
+    // When BOTH dataItems and externImports are non-empty, the
+    // walker emits 3 sections: .text, .rdata, .idata in that VA
+    // order. The .idata RVA shifts to (rdataRva + rdataVirtualSize).
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeModuleWithOneExtern(
+        {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Rodata;
+    d.bytes   = {'x'};
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // 3 sections.
+    EXPECT_EQ(readU16LE(bytes, 0x86), 3u);
+    constexpr std::size_t kSecHdrTable = 0x188;
+    constexpr std::size_t kSecHdrSize  = 40;
+    // .text @ [0], .rdata @ [1], .idata @ [2].
+    auto const hdrAt = [&](std::size_t i) {
+        return kSecHdrTable + i * kSecHdrSize;
+    };
+    std::uint32_t const textVa  = readU32LE(bytes, hdrAt(0) + 12);
+    std::uint32_t const rdataVa = readU32LE(bytes, hdrAt(1) + 12);
+    std::uint32_t const idataVa = readU32LE(bytes, hdrAt(2) + 12);
+    // VAs in ascending order — .rdata between .text and .idata.
+    EXPECT_LT(textVa, rdataVa);
+    EXPECT_LT(rdataVa, idataVa);
+    // .idata name pinned (regression: section ordering swap would
+    // place .rdata at [2] and .idata at [1]).
+    EXPECT_EQ(bytes[hdrAt(2) + 0], '.');
+    EXPECT_EQ(bytes[hdrAt(2) + 1], 'i');
+    EXPECT_EQ(bytes[hdrAt(2) + 2], 'd');
+    EXPECT_EQ(bytes[hdrAt(2) + 3], 'a');
+    EXPECT_EQ(bytes[hdrAt(2) + 4], 't');
+    EXPECT_EQ(bytes[hdrAt(2) + 5], 'a');
+}
+
+TEST(PeExecWriter, MultipleRodataItemsLayWithAlignmentPadding) {
+    // Per-item Alignment padding within the section. Item 0 is 3
+    // bytes byte-aligned; item 1 is 1 byte but 8-byte aligned →
+    // item 1 lands at offset 8 (3 bytes padded up to 8).
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData a;
+    a.symbol  = SymbolId{42};
+    a.section = DataSectionKind::Rodata;
+    a.bytes   = {0x11, 0x22, 0x33};
+    a.alignment = Alignment::of<1>();
+    mod.dataItems.push_back(std::move(a));
+    AssembledData b;
+    b.symbol  = SymbolId{43};
+    b.section = DataSectionKind::Rodata;
+    b.bytes   = {0xFF};
+    b.alignment = Alignment::of<8>();
+    mod.dataItems.push_back(std::move(b));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    constexpr std::size_t kSecHdrTable = 0x188;
+    constexpr std::size_t kSecHdrSize  = 40;
+    constexpr std::size_t kRdataHdr    = kSecHdrTable + kSecHdrSize;
+    // VirtualSize = 3 (item 0) + 5 padding + 1 (item 1) = 9.
+    EXPECT_EQ(readU32LE(bytes, kRdataHdr + 8), 9u);
+    std::uint32_t const rdataFileOff =
+        readU32LE(bytes, kRdataHdr + 20);
+    // Item 0 bytes at offset 0..3.
+    EXPECT_EQ(bytes[rdataFileOff + 0], 0x11);
+    EXPECT_EQ(bytes[rdataFileOff + 1], 0x22);
+    EXPECT_EQ(bytes[rdataFileOff + 2], 0x33);
+    // Padding bytes 3..7 are zero.
+    for (std::size_t i = 3; i < 8; ++i) {
+        EXPECT_EQ(bytes[rdataFileOff + i], 0u)
+            << "padding byte " << i << " must be zero";
+    }
+    // Item 1's byte at offset 8 (aligned).
+    EXPECT_EQ(bytes[rdataFileOff + 8], 0xFFu);
+}
+
+TEST(PeExecWriter, NoRodataItemsEmitsNoRdataSection) {
+    // Regression: empty dataItems must NOT introduce a .rdata
+    // section (preserves the pre-D-LK2-RODATA single-section
+    // shape for modules without rodata).
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Single section (.text only).
+    EXPECT_EQ(readU16LE(bytes, 0x86), 1u);
+}
+
+namespace {
+// Helper that builds a one-function module + one Rodata data item
+// and runs the linker against the given (target, format), returning
+// the reporter for inspection. Used by the per-format capability-
+// gate tests below.
+[[nodiscard]] LinkedImage runLinkerWithRodataItem(
+    TargetSchema const& target,
+    ObjectFormatSchema const& fmt,
+    DiagnosticReporter& rep,
+    DataSectionKind kind = DataSectionKind::Rodata) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = kind;
+    if (kind != DataSectionKind::Bss) {
+        d.bytes = {'x'};
+    }
+    mod.dataItems.push_back(std::move(d));
+    return linker::link(mod, target, fmt, rep);
+}
+} // namespace
+
+TEST(LinkerEndToEnd, ElfRejectsDataItemsUntilD_LK1_RODATA) {
+    // Format capability gate (linker.cpp): ELF declares NO
+    // `supportedDataSections` in its JSON, so the schema-declared
+    // gate rejects all dataItems with K_NoMatchingObjectFormat
+    // (D-LK1-RODATA still anchored). Pin the diagnostic identity
+    // so a future capability-gate refactor doesn't silently let
+    // dataItems pass through to the ELF walker before its arm
+    // closes.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped(
+        "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(fmt.has_value());
+    DiagnosticReporter rep;
+    LinkedImage img =
+        runLinkerWithRodataItem(**target, **fmt, rep);
+    EXPECT_FALSE(img.ok());
+    EXPECT_EQ(::dss::test_support::countCode(rep,
+                  DiagnosticCode::K_NoMatchingObjectFormat),
+              1u);
+    EXPECT_EQ(img.resolvedFuncCount, 0u);
+    EXPECT_FALSE((**fmt).acceptsDataSection(
+        DataSectionKind::Rodata))
+        << "ELF exec format JSON must not advertise rodata until "
+           "D-LK1-RODATA closes";
+}
+
+TEST(LinkerEndToEnd, MachORejectsDataItemsUntilD_LK3_RODATA) {
+    // Parallel to the ELF test — Mach-O declares no
+    // `supportedDataSections`; D-LK3-RODATA still anchored.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped(
+        "macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    DiagnosticReporter rep;
+    LinkedImage img =
+        runLinkerWithRodataItem(**target, **fmt, rep);
+    EXPECT_FALSE(img.ok());
+    EXPECT_EQ(::dss::test_support::countCode(rep,
+                  DiagnosticCode::K_NoMatchingObjectFormat),
+              1u);
+    EXPECT_EQ(img.resolvedFuncCount, 0u);
+    EXPECT_FALSE((**fmt).acceptsDataSection(
+        DataSectionKind::Rodata))
+        << "Mach-O exec format JSON must not advertise rodata "
+           "until D-LK3-RODATA closes";
+}
+
+TEST(PeExecWriter, RejectsDataKindDataItemUntilD_LK4_RODATA_PRODUCER) {
+    // PE-Exec walker accepts ONLY Rodata. Data items must fail
+    // loud at the walker's pre-loop scan (the schema-declared
+    // capability gate stops Bss-only-walker formats earlier; the
+    // walker's own pre-loop scan stops Data/Bss items even when
+    // the format advertises Rodata).
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Data;
+    d.bytes   = {0x11};
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    // Bypass the linker (whose schema gate would also reject) to
+    // exercise the walker's OWN guard.
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_EQ(::dss::test_support::countCode(rep,
+                  DiagnosticCode::K_NoMatchingObjectFormat),
+              1u);
+}
+
+TEST(PeExecWriter, RejectsBssDataItemViaLinkerSchemaGate) {
+    // Bss items are rejected by the linker's schema-declared
+    // capability gate (PE-Exec advertises only Rodata) BEFORE
+    // reaching the walker. `validateAssembledData` runs FIRST and
+    // accepts Bss-with-empty-bytes; the schema gate then fires
+    // K_NoMatchingObjectFormat. Ordering is load-bearing — flipping
+    // these two blocks would surface the wrong diagnostic class.
+    auto loaded = loadShippedExec();
+    DiagnosticReporter rep;
+    LinkedImage img = runLinkerWithRodataItem(
+        *loaded.target, *loaded.format, rep,
+        DataSectionKind::Bss);
+    EXPECT_FALSE(img.ok());
+    EXPECT_EQ(::dss::test_support::countCode(rep,
+                  DiagnosticCode::K_NoMatchingObjectFormat),
+              1u);
+}
+
+TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
+    // Synthesize a PE-Exec format JSON that advertises rodata
+    // capability but does NOT declare a `.rdata` sections[] row
+    // — the walker's `requireSection(Rodata)` must fail loud
+    // (silent emission without a section is forbidden).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    char const* const kJson = R"({
+      "$comment": "Synthetic PE-Exec schema for D-LK2-RODATA require-section test — declares rodata capability but omits the section row.",
+      "dssObjectFormatVersion": 1,
+      "format": {"name": "pe-exec-rodata-no-row", "version": "1.0", "kind": "pe"},
+      "entryPoint": "",
+      "processExit": {"mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess"},
+      "entryCallingConvention": "ms_x64",
+      "supportedDataSections": ["rodata"],
+      "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
+      "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096},
+      "sections": [
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
+      ],
+      "relocations": [
+        {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
+        {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
+        {"name":"IMAGE_REL_AMD64_ADDR32","kind":3,"nativeId":2}
+      ]
+    })";
+    auto fmt = ObjectFormatSchema::loadFromText(kJson, "synthetic");
+    ASSERT_TRUE(fmt.has_value());
+    DiagnosticReporter rep;
+    LinkedImage img = runLinkerWithRodataItem(
+        **target, **fmt, rep);
+    EXPECT_FALSE(img.ok());
+    EXPECT_EQ(::dss::test_support::countCode(rep,
+                  DiagnosticCode::K_NoMatchingObjectFormat),
+              1u);
+}
+
+TEST(PeExecWriter, SizeOfInitializedDataSumsRdataAndIdata) {
+    // PE/COFF §3.4: SizeOfInitializedData = Σ rawSize of sections
+    // carrying IMAGE_SCN_CNT_INITIALIZED_DATA. With `.rdata` +
+    // `.idata` both present and fileAlignment=512, this is
+    // 2 * 512 = 1024 (both single-byte payloads file-pad to 512).
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeModuleWithOneExtern(
+        {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Rodata;
+    d.bytes   = {'x'};
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // OH64 starts at file-offset 0x98 (DOS 64 + stub 64 + PE sig 4
+    // + file hdr 20 = 152 = 0x98); SizeOfInitializedData is at +8.
+    EXPECT_EQ(readU32LE(bytes, 0x98 + 8), 1024u);
+}
+
+TEST(PeExecWriter, SizeOfImageReflectsRdataExtentInRodataOnlyArm) {
+    // SizeOfImage = alignUp(highest_section_va_end, sectionAlign).
+    // With rodata-only (no imports), the highest VA-extent is
+    // rdata->rva + rdata->virtualSize. text_VA = 0x1000, text_VS
+    // section-aligned = 0x1000, rdata_VA = 0x2000, rdata_VS
+    // section-aligned = 0x1000 → SizeOfImage = 0x3000.
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Rodata;
+    d.bytes   = {'x'};
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // SizeOfImage field at OH64+56 (per the existing
+    // LoadBearingOptionalHeaderFieldsPinnedByteForByte test).
+    EXPECT_EQ(readU32LE(bytes, 0x98 + 56), 0x3000u);
+}
+
+TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
+    // Synthesize a PE-Exec format with non-zero
+    // `attributeCertReserveSize` so the walker emits a non-zero
+    // cert table file offset at IMAGE_DATA_DIRECTORY[4]. The
+    // offset must sit STRICTLY past the LAST section's raw end —
+    // a regression that forgot to shift past rdata would silently
+    // place the cert table inside rdata bytes, corrupting the
+    // signed image. (The shipped exec JSON ships with
+    // attributeCertReserveSize=0 today; this test exercises the
+    // shift code that triggers when LK7 codesign lands the
+    // reservation field.)
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    char const* const kJson = R"({
+      "$comment": "Synthetic PE-Exec schema for D-LK2-RODATA cert-table-shift test — declares non-zero attributeCertReserveSize so the walker computes cert table offset past rdata+idata.",
+      "dssObjectFormatVersion": 1,
+      "format": {"name": "pe-exec-cert-shift", "version": "1.0", "kind": "pe"},
+      "entryPoint": "",
+      "processExit": {"mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess"},
+      "entryCallingConvention": "ms_x64",
+      "supportedDataSections": ["rodata"],
+      "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
+      "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096, "attributeCertReserveSize": 64},
+      "sections": [
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096},
+        {"kind":"rodata","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
+      ],
+      "relocations": [
+        {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
+        {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
+        {"name":"IMAGE_REL_AMD64_ADDR32","kind":3,"nativeId":2}
+      ]
+    })";
+    auto fmt = ObjectFormatSchema::loadFromText(kJson, "synthetic");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeModuleWithOneExtern(
+        {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Rodata;
+    d.bytes   = {'x'};
+    mod.dataItems.push_back(std::move(d));
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Data directory base in OH64: per PE §3.4 the directories
+    // sit at offset 112 from OH64 start. Cert is entry 4 → +32.
+    // IMAGE_DATA_DIRECTORY[4].VirtualAddress is the (file-offset)
+    // base of the cert table.
+    constexpr std::size_t kOH64       = 0x98;
+    constexpr std::size_t kDirsBase   = kOH64 + 112;
+    constexpr std::size_t kCertVaOff  = kDirsBase + 4 * 8;
+    std::uint32_t const certFileOff =
+        readU32LE(bytes, kCertVaOff);
+    EXPECT_NE(certFileOff, 0u)
+        << "Cert reservation declared; non-zero offset expected";
+    // Cert offset must land STRICTLY past the section raw bytes —
+    // a regression that placed the cert table inside rdata or
+    // idata would silently corrupt them.
+    constexpr std::size_t kSecHdrTable = 0x188;
+    constexpr std::size_t kSecHdrSize  = 40;
+    // .idata is sectionHeaders[2] here (text=0, rdata=1, idata=2).
+    constexpr std::size_t kIdataHdr    = kSecHdrTable + 2 * kSecHdrSize;
+    std::uint32_t const idataFileOff   =
+        readU32LE(bytes, kIdataHdr + 20);
+    std::uint32_t const idataRawSize   =
+        readU32LE(bytes, kIdataHdr + 16);
+    EXPECT_GE(certFileOff, idataFileOff + idataRawSize)
+        << "cert table must sit past the last section's raw end";
 }
 

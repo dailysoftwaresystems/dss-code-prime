@@ -245,18 +245,18 @@ LinkedImage link(AssembledModule const&    inputModule,
     // an unrelated VA. Fail-loud HERE so the producer cycle is
     // sequenced after at least one walker arm.
     //
-    // **Removal trigger**: when the first per-format walker arm
-    // closes, replace this unconditional reject with a per-format
-    // capability gate (walker arms advertise rodata support; the
-    // others reject only if their bit is unset).
-    // D-LK4-RODATA-BSS-INVARIANT + duplicate-SymbolId + zero-
-    // alignment guards: validate the substrate invariants on
-    // `dataItems` BEFORE the F1 walker-precondition guard. The
+    // **D-LK4-RODATA-BSS-INVARIANT + duplicate-SymbolId + zero-
+    // alignment guards**: validate the substrate invariants on
+    // `dataItems` BEFORE the per-format capability gate. The
     // validate() function fail-louds on each violation so a
     // future producer landing malformed items hits a precise
     // diagnostic naming the violation, not a generic "no walker
     // yet" rejection. Order matters: invariant failures point
-    // at the producer; F1 only points at the missing walker.
+    // at the producer; the capability gate points at the missing
+    // walker. (INVARIANT — multi-agent audit fold pin: this
+    // ordering is load-bearing; swapping the two blocks would
+    // surface a missing-walker rejection on an already-malformed
+    // dataItems payload and obscure the real producer defect.)
     if (!module.dataItems.empty()) {
         bool const dataItemsValid =
             validateAssembledData(module.dataItems, reporter);
@@ -266,21 +266,44 @@ LinkedImage link(AssembledModule const&    inputModule,
         }
     }
 
-    if (!module.dataItems.empty()) {
-        report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-               DiagnosticSeverity::Error,
-               std::format(
-                   "linker: module carries {} AssembledData item(s) "
-                   "but no format walker has the rodata-emission arm "
-                   "yet — anchored as D-LK2-RODATA (PE) / D-LK1-"
-                   "RODATA (ELF) / D-LK3-RODATA (Mach-O). The "
-                   "producer cycle must sequence after the matching "
-                   "walker arm, or this guard must be lowered per-"
-                   "format when the walker advertises rodata "
-                   "capability.",
-                   module.dataItems.size()));
-        image.resolvedFuncCount = 0;
-        return image;
+    // ── Per-format walker capability gate for `dataItems` ──────
+    //
+    // **Schema-declared, not enumerated in C++** (D-LK2-RODATA
+    // audit fold — agnosticism rule). Each format's JSON ships a
+    // `supportedDataSections: ["rodata", ...]` array advertising
+    // which `DataSectionKind` values its walker accepts. The gate
+    // below consults that set per-item — formats whose walker arm
+    // has not landed (ELF + Mach-O until D-LK1-RODATA / D-LK3-
+    // RODATA close), AND format flavors that cannot carry rodata
+    // (PE Obj — relocatable .obj emits rodata via the symbol
+    // table, not via the dataItems pipeline), reject loudly.
+    //
+    // Adding a fourth executable format that supports rodata =
+    // drop `"supportedDataSections": ["rodata"]` into its JSON;
+    // zero source changes in this gate. **NO `kind == Pe` style
+    // format-name branches here** — the standing veto on source/
+    // target/format-name branching in shared substrate is held.
+    for (auto const& d : module.dataItems) {
+        if (!objectFormatSchema.acceptsDataSection(d.section)) {
+            report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                   DiagnosticSeverity::Error,
+                   std::format(
+                       "linker: module carries an AssembledData "
+                       "item with section={} but format '{}' "
+                       "(kind={}) does not advertise that section "
+                       "in its 'supportedDataSections' set. Either "
+                       "the format's walker arm has not yet closed "
+                       "(see plan §3.1: D-LK1-RODATA / D-LK2-RODATA "
+                       "/ D-LK3-RODATA / D-LK4-RODATA-PRODUCER) or "
+                       "the format flavor cannot carry that "
+                       "section (e.g. relocatable .obj).",
+                       dataSectionKindName(d.section),
+                       objectFormatSchema.name(),
+                       objectFormatKindName(
+                           objectFormatSchema.kind())));
+            image.resolvedFuncCount = 0;
+            return image;
+        }
     }
 
     // Format-keyed dispatch — closed-enum switch, fail-loud on

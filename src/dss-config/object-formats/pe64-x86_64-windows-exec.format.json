@@ -22,6 +22,9 @@
   "$entryCallingConventionComment": "MS x64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rcx before the indirect ExitProcess call. Read via `target.callingConventionByName(\"ms_x64\")` at trampoline-build time.",
   "entryCallingConvention": "ms_x64",
 
+  "$supportedDataSectionsComment": "D-LK2-RODATA closure: PE-Exec walker emits `.rdata` from `AssembledModule.dataItems` items with `section=Rodata`. The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data` and `Bss` remain anchored under D-LK4-RODATA-PRODUCER. Cross-format agnosticism: ELF and Mach-O exec formats will declare their own row when D-LK1-RODATA / D-LK3-RODATA close; zero linker source changes.",
+  "supportedDataSections": ["rodata"],
+
   "pe": {
     "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = IMAGE_FILE_EXECUTABLE_IMAGE (0x0002) | IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) = 0x0022. type = exec.",
     "machine": 34404,

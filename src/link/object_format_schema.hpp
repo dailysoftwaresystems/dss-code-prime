@@ -631,6 +631,31 @@ struct DSS_EXPORT ObjectFormatData {
     // together).
     std::string entryCallingConvention;
 
+    // ── D-LK2-RODATA closure: producer-data-section capability set ──
+    //
+    // Schema-declared set of `DataSectionKind` values the format's
+    // walker accepts on `AssembledModule.dataItems`. The linker's
+    // pre-walker gate consults this BEFORE handing the module to
+    // the walker — a format whose walker arm has not yet wired
+    // (e.g. ELF + Mach-O until D-LK1-RODATA / D-LK3-RODATA close,
+    // PE Obj indefinitely because relocatable .obj does not carry
+    // rdata sections) declares an empty set and fails loud on any
+    // dataItems carrying a section the format does not advertise.
+    //
+    // **Agnosticism discipline (HARD VETO — standing rule)**: this
+    // field replaces the prior `kind == ObjectFormatKind::Pe`
+    // format-name branch in `linker.cpp`. The gate is now schema-
+    // declared per-format, not enumerated in C++ — adding a fourth
+    // format that supports rodata = drop `"supportedDataSections":
+    // ["rodata"]` into its JSON, zero linker source changes.
+    //
+    // Empty by default — only formats that explicitly declare the
+    // capability accept dataItems. Image-flavor-only by validate()
+    // rule: a relocatable .obj schema declaring rodata support is
+    // a config error (relocatable object files emit rodata via
+    // .obj symbol tables, not via this capability gate).
+    std::vector<DataSectionKind> supportedDataSections;
+
     // Cross-field invariants:
     //   * relocations: kind != 0, kind unique cross-row, name unique
     //     + non-empty, nativeId != 0 when relocations are non-empty.
@@ -743,6 +768,25 @@ public:
     }
     [[nodiscard]] std::string_view entryCallingConvention() const noexcept {
         return d_.entryCallingConvention;
+    }
+
+    // ── D-LK2-RODATA producer-data-section capability gate ─────
+    //
+    // `acceptsDataSection(k)` is true iff this format's walker is
+    // wired to emit producer `AssembledData` items of kind `k`.
+    // The linker consults this BEFORE invoking the walker, so a
+    // format whose walker arm has not landed (or has landed for a
+    // strict subset of kinds) fails loud rather than silently
+    // dropping bytes. Schema-declared, not enumerated in C++.
+    [[nodiscard]] bool acceptsDataSection(DataSectionKind k) const noexcept {
+        for (auto const& s : d_.supportedDataSections) {
+            if (s == k) return true;
+        }
+        return false;
+    }
+    [[nodiscard]] std::span<DataSectionKind const>
+    supportedDataSections() const noexcept {
+        return d_.supportedDataSections;
     }
 
     // ── Loaders ───────────────────────────────────────────────

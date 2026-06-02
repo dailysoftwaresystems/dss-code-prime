@@ -173,6 +173,12 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // format-native). Defense-in-depth: reject loudly
             // rather than silently accept dead data.
             "processExit", "entryCallingConvention",
+            // D-LK2-RODATA closure: the producer-data-section
+            // capability is meaningless on Wasm/SPIR-V (their
+            // walkers emit rodata via format-native section
+            // vocabulary, not via the cross-format dataItems
+            // pipeline).
+            "supportedDataSections",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -353,6 +359,63 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             }
             if (armOk) {
                 data.processExit = std::move(out);
+            }
+        }
+    }
+
+    // D-LK2-RODATA closure — `supportedDataSections`. Optional
+    // top-level array of `DataSectionKind` names ("rodata" / "data" /
+    // "bss") the format's walker accepts on `AssembledModule.
+    // dataItems`. Absent / empty = walker rejects all producer-data-
+    // section items (the format-side validate() rule below also
+    // gates this on isImageFlavor — relocatable .obj cannot declare
+    // the capability since rodata in .obj rides through the symbol
+    // table, not the dataItems pipeline). Cross-format agnosticism:
+    // adding a fourth executable format that supports rodata = drop
+    // `"supportedDataSections": ["rodata"]` into its JSON; zero C++
+    // changes in the linker substrate.
+    if (doc.contains("supportedDataSections")) {
+        if (!doc.at("supportedDataSections").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/supportedDataSections",
+                      "'supportedDataSections' must be an array of "
+                      "DataSectionKind names (\"rodata\" / \"data\" / "
+                      "\"bss\")");
+        } else {
+            auto const& arr = doc.at("supportedDataSections");
+            std::size_t i = 0;
+            for (auto const& elem : arr) {
+                auto const path =
+                    std::format("/supportedDataSections/{}", i);
+                if (!elem.is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "must be a string DataSectionKind name");
+                } else {
+                    auto const name = elem.get<std::string>();
+                    auto const k = dataSectionKindFromName(name);
+                    if (!k.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("unknown DataSectionKind "
+                                              "'{}' (expected 'rodata' "
+                                              "/ 'data' / 'bss')",
+                                              name));
+                    } else {
+                        bool dup = false;
+                        for (auto existing : data.supportedDataSections) {
+                            if (existing == *k) { dup = true; break; }
+                        }
+                        if (dup) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("duplicate "
+                                                  "DataSectionKind '{}' "
+                                                  "in supportedDataSections",
+                                                  name));
+                        } else {
+                            data.supportedDataSections.push_back(*k);
+                        }
+                    }
+                }
+                ++i;
             }
         }
     }
