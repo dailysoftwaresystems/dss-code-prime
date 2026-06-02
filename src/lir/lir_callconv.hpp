@@ -25,15 +25,43 @@
 //   * `frame_load` pseudo-ops become `load result, [SP + slotOffset]`.
 //   * `frame_store` pseudo-ops become `store value, [SP + slotOffset]`.
 //
-// **Frame layout (target-blind)**:
-//   [SP+0 .. SP+savedRegAreaSize)         saved callee-saved regs
-//   [SP+savedRegAreaSize ..)              spill slots
-//   [SP+totalFrameSize)                   the original pre-prologue SP
+// **Frame layout (target-blind, D-ML7-2.2 closure 2026-06-02)**:
+//   [SP+0 .. SP+outgoingArgAreaSize)              outgoing-args area
+//                                                  — THIS fn's reserved
+//                                                  space for ITS calls.
+//                                                  Encompasses BOTH the
+//                                                  callee's shadow space
+//                                                  (Win64=32, SysV=0) at
+//                                                  [SP+0..shadowSpaceBytes)
+//                                                  AND any explicit
+//                                                  stack-arg overflow at
+//                                                  [SP+shadowSpaceBytes..).
+//                                                  Zero on leaf fns (no
+//                                                  calls means no callee
+//                                                  to home args for).
+//   [SP+outgoingArgAreaSize
+//      .. SP+outgoingArgAreaSize+savedRegAreaSize) saved callee-saved regs
+//   [SP+outgoingArgAreaSize+savedRegAreaSize ..)   spill slots
+//   [SP+totalFrameSize)                            the original pre-prologue SP
 //
-// `totalFrameSize = align(savedRegAreaSize + spillAreaSize,
-//                         cc.stackAlignment)`. Slot N is at offset
-// `savedRegAreaSize + N * regWidth`. `regWidth` is the cc's primary
-// integer register width (8 bytes on x86_64/ARM64).
+// `outgoingArgAreaSize = hasCalls ? (cc.shadowSpaceBytes +
+//    max_overflow_slots * slotSize) : 0`. Under slot-aligned cc
+// (Win64 ms_x64) max_overflow_slots = max(0, max_args_across_calls -
+// max(argGprs, argFprs)). Under independent-counters (SysV/AAPCS64)
+// it's the per-class overflow sum across calls.
+//
+// `totalFrameSize = hasCalls
+//    ? alignedSizeWithBias(rawPreShadow, cc.stackAlignment,
+//                          cc.callPushBytes)
+//    : alignUp(rawPreShadow, cc.stackAlignment)`
+// where `rawPreShadow = outgoingArgAreaSize + savedRegAreaSize +
+// spillAreaSize`. The Win64 shadow-space requirement collapses INTO
+// outgoingArgAreaSize (no separate max() with shadowSpaceBytes —
+// it's already there).
+//
+// Spill slot N is at offset `outgoingArgAreaSize + savedRegAreaSize +
+// N * regWidth`. `regWidth` is the cc's primary integer register
+// width (8 bytes on x86_64/ARM64).
 //
 // **Target-blind output**: prologue/epilogue use the schema's
 // `load`/`store`/`add`/`sub` opcodes (resolved by mnemonic) plus the
@@ -133,9 +161,11 @@ alignedSizeWithBias(std::uint32_t rawBytes,
 // misclassify FPR/VR callee-saves (MS-x64's xmm6..xmm15) as GPR.
 struct DSS_EXPORT FrameLayout {
     std::uint32_t       totalFrameSize    = 0;  // bytes the prologue subtracts from SP
+    std::uint32_t       outgoingArgAreaSize = 0; // bytes reserved at [SP+0..) for THIS function's outgoing stack args
     std::uint32_t       savedRegAreaSize  = 0;  // bytes occupied by callee-saved regs
     std::uint32_t       spillAreaSize     = 0;  // bytes occupied by spill slots
-    std::uint32_t       slotSize          = 0;  // uniform per-class slot width (bytes)
+    std::uint32_t       slotSize          = 0;  // uniform per-class spill-slot width (bytes; = max(GPR width, FPR width))
+    std::uint32_t       outgoingSlotSize  = 0;  // outgoing-arg slot width (bytes; = pointer width = GPR width)
     std::vector<LirReg> savedRegs;              // callee-saved phys regs actually used
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: did this function contain at
     // least one call-shaped opcode (per `TargetOpcodeInfo::isCall`)
@@ -148,9 +178,22 @@ struct DSS_EXPORT FrameLayout {
     // the source LIR.
     bool                hasCalls          = false;
 
-    // Derived: spill area starts immediately after the saved-reg area.
+    // Derived: saved-reg area starts immediately after the outgoing-
+    // args area. Updated by D-ML7-2.2 closure (2026-06-02) — the
+    // outgoing area is the new SP+0 zone for stack-arg overflow on
+    // ANY cc that overflows its argGprs/argFprs pool. Zero when this
+    // function makes no calls or every call fits in the register
+    // pool — backward-compatible with leaf-fn / register-only-call
+    // shapes.
     [[nodiscard]] constexpr std::uint32_t
-    spillAreaOffset() const noexcept { return savedRegAreaSize; }
+    savedRegAreaOffset() const noexcept { return outgoingArgAreaSize; }
+
+    // Derived: spill area starts immediately after the saved-reg area
+    // (which itself starts after the outgoing-args area).
+    [[nodiscard]] constexpr std::uint32_t
+    spillAreaOffset() const noexcept {
+        return outgoingArgAreaSize + savedRegAreaSize;
+    }
 };
 
 struct DSS_EXPORT LirCallconvResult {

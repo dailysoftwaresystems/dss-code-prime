@@ -399,6 +399,68 @@ TEST(TargetSchema, CallPushBytesShippedX8664SysVDeclaresEight) {
            "(diverges on entryStackPointerBias)";
 }
 
+TEST(TargetSchema, SlotAlignedShippedMsX64IsTrueOthersFalse) {
+    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): the shipped
+    // schemas must declare `slotAligned: true` on ms_x64 (the only
+    // SLOT-ALIGNED cc DSS supports today) and leave it false elsewhere.
+    // A schema regression that silently flipped this would: (a) flip
+    // SysV's arg-passing semantics from independent counters to
+    // slot-aligned (wrong code for mixed int/float calls); (b) flip
+    // Win64's mixed int/float overflow to count by independent
+    // counters (wrong code for the same case in reverse).
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+    auto const* sysv = (*x86)->callingConvention(0);
+    ASSERT_NE(sysv, nullptr);
+    EXPECT_STREQ(sysv->name.c_str(), "sysv_amd64");
+    EXPECT_FALSE(sysv->slotAligned)
+        << "sysv_amd64 uses independent per-class arg counters";
+    auto const* msx64 = (*x86)->callingConvention(1);
+    ASSERT_NE(msx64, nullptr);
+    EXPECT_STREQ(msx64->name.c_str(), "ms_x64");
+    EXPECT_TRUE(msx64->slotAligned)
+        << "ms_x64 uses Win64 SLOT-ALIGNED arg passing — slot N "
+           "consumes both argGprs[N] AND argFprs[N]";
+
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    auto const* aapcs = (*arm)->callingConvention(0);
+    ASSERT_NE(aapcs, nullptr);
+    EXPECT_STREQ(aapcs->name.c_str(), "aapcs64");
+    EXPECT_FALSE(aapcs->slotAligned)
+        << "AAPCS64 uses independent per-class arg counters (x0..x7 "
+           "for integers, v0..v7 for floats; separate pools)";
+}
+
+TEST(TargetSchema, SlotAlignedRejectsNonBoolean) {
+    // D-ML7-2.6 validator: the slotAligned field must be a JSON
+    // boolean. A non-boolean value (string "true", number 1, null,
+    // etc.) is rejected loud with C_MalformedJson — matches the
+    // sibling fields' (`isCall`, `pcRelative`, `rexW`) discipline.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rsp","class":"gpr"}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rsp"],
+               "stackAlignment":16,"callPushBytes":8,
+               "slotAligned":"true"}
+            ]})");
+    EXPECT_FALSE(r.has_value());
+    if (!r.has_value()) {
+        bool sawSlotAlignedMsg = false;
+        for (auto const& d : r.error()) {
+            if (d.message.find("slotAligned") != std::string::npos) {
+                sawSlotAlignedMsg = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(sawSlotAlignedMsg)
+            << "loader must surface slotAligned in the diagnostic "
+               "for triage";
+    }
+}
+
 TEST(TargetSchema, CallPushBytesShippedAArch64DeclaresZero) {
     // ARM64 BL writes LR/x30 — no stack push. callPushBytes=0.
     auto r = TargetSchema::loadShipped("arm64");

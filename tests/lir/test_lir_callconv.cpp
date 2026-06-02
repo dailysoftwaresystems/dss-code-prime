@@ -9,6 +9,7 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "diagnostic_count.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
@@ -288,24 +289,28 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     ASSERT_NE(cc, nullptr);
     for (std::size_t i = 0; i < result.perFunc.size(); ++i) {
         auto const& layout = result.perFunc[i];
-        EXPECT_EQ(layout.spillAreaOffset(), layout.savedRegAreaSize);
+        // D-ML7-2.2 (2026-06-02): spillAreaOffset is now
+        // outgoingArgAreaSize + savedRegAreaSize (outgoing area is
+        // the new SP+0 zone; saved regs sit above it).
+        EXPECT_EQ(layout.spillAreaOffset(),
+                  layout.outgoingArgAreaSize + layout.savedRegAreaSize);
+        EXPECT_EQ(layout.savedRegAreaOffset(), layout.outgoingArgAreaSize);
         EXPECT_EQ(layout.savedRegAreaSize,
                   static_cast<std::uint32_t>(layout.savedRegs.size()) * layout.slotSize);
         EXPECT_EQ(layout.spillAreaSize,
                   bundle.alloc.perFunc[i].numSpillSlots * layout.slotSize);
-        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02): expected
-        // formula now branches on `hasCalls`. Non-leaf functions
-        // reserve at least `cc.shadowSpaceBytes` AND satisfy the
-        // `callPushBytes` alignment-bias congruence (so post-prologue
-        // RSP lands at 0 mod stackAlignment for the next call). Leaf
-        // functions use the pre-fix `alignUp(raw, alignment)` rule.
-        std::uint32_t const raw = layout.savedRegAreaSize + layout.spillAreaSize;
+        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02) + D-ML7-2.2
+        // (2026-06-02): expected formula now incorporates
+        // outgoingArgAreaSize directly (which already includes the
+        // callee's shadow-space when hasCalls). No separate max()
+        // with shadowSpaceBytes — already baked into outgoingArgAreaSize.
+        std::uint32_t const raw = layout.outgoingArgAreaSize
+                                + layout.savedRegAreaSize
+                                + layout.spillAreaSize;
         std::uint32_t expected;
         if (layout.hasCalls) {
-            std::uint32_t const rawWithShadow = std::max(
-                raw, static_cast<std::uint32_t>(cc->shadowSpaceBytes));
             expected = dss::alignedSizeWithBias(
-                rawWithShadow,
+                raw,
                 static_cast<std::uint32_t>(cc->stackAlignment),
                 static_cast<std::uint32_t>(cc->callPushBytes));
         } else {
@@ -814,15 +819,24 @@ TEST(LirCallconvAbi, MultiArgFunctionMaterializesEveryArgGpr) {
 
 // ── Fail-loud surfaces ────────────────────────────────────────────────
 
-TEST(LirCallconvAbi, RejectsStackPassedGprArgLoud) {
-    // SysV AMD64 has 6 GPR arg registers (rdi/rsi/rdx/rcx/r8/r9). A
-    // 7-arg int function trips `arg 6` which exceeds the pool; the
-    // materialization must fail loud with `L_StackPassedArgUnsupported`
-    // citing D-ML7-2.2 — not silently miscompile by reading past the
-    // argGprs vector.
+TEST(LirCallconvAbi, SysVSevenArgFunctionStackPassesOverflowArg) {
+    // D-ML7-2.2 (closed 2026-06-02): SysV AMD64 has 6 GPR arg
+    // registers (rdi/rsi/rdx/rcx/r8/r9). A 7-arg int function
+    // overflows arg 6 onto the stack; the materialization must
+    // succeed cleanly + emit a `frame_load` (the schema's `load`
+    // opcode) at the callee side reading from
+    // `[sp + totalFrameSize + callPushBytes + shadowSpaceBytes +
+    // overflowIdx * slotSize]`. For SysV: shadowSpaceBytes=0,
+    // callPushBytes=8, overflowIdx=0, slotSize=8 → offset =
+    // totalFrameSize + 8. The fixture also CALLS f7 to exercise
+    // the caller-side `frame_store` arm (offset 0 within outgoing
+    // area = [sp+0] under SysV).
     auto bundle = lowerThroughRewrite(
         "int f7(int a, int b, int c, int d, int e, int f, int g) {\n"
         "    return g;\n"
+        "}\n"
+        "int caller_of_f7() {\n"
+        "    return f7(1, 2, 3, 4, 5, 6, 7);\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
@@ -830,22 +844,159 @@ TEST(LirCallconvAbi, RejectsStackPassedGprArgLoud) {
     auto result = materializeCallingConvention(bundle.rewritten.lir,
                                                *bundle.lowered.target,
                                                bundle.alloc, ccRep);
-    EXPECT_FALSE(result.ok())
-        << "7-arg function must trip the stack-passed guard";
-    bool sawCode = false;
-    bool sawAnchor = false;
-    for (auto const& d : ccRep.all()) {
-        if (d.code == DiagnosticCode::L_StackPassedArgUnsupported) {
-            sawCode = true;
-            if (d.actual.find("D-ML7-2.2") != std::string::npos) {
-                sawAnchor = true;
+    ASSERT_TRUE(result.ok())
+        << "D-ML7-2.2 closure: 7-arg SysV fn + call must lower cleanly";
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+    // L_StackPassedArgUnsupported must NOT fire — the substrate
+    // now handles the overflow via stack-spill rather than rejecting.
+    EXPECT_EQ(::dss::test_support::countCode(
+                  ccRep, DiagnosticCode::L_StackPassedArgUnsupported),
+              0u)
+        << "stack-passed guard must NOT fire on D-ML7-2.2-closed substrate";
+
+    // f7's frame must reserve outgoing-args area sized for the
+    // function's CALLS (none — f7 is leaf), but its non-leaf flag
+    // is false. caller_of_f7 makes ONE call passing 7 args; its
+    // outgoingArgAreaSize = shadowSpaceBytes (SysV=0) + 1 slot * 8 = 8.
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->callPushBytes, 8u);
+    EXPECT_EQ(cc->shadowSpaceBytes, 0u);
+    EXPECT_FALSE(cc->slotAligned);
+
+    // Find caller_of_f7 in the result (it makes the 7-arg call).
+    FrameLayout const* callerLayout = nullptr;
+    for (std::uint32_t i = 0; i < result.lir.moduleFuncCount(); ++i) {
+        auto const* layout = result.forFuncByIndex(i);
+        ASSERT_NE(layout, nullptr);
+        if (layout->hasCalls) {
+            EXPECT_EQ(callerLayout, nullptr)
+                << "fixture should have exactly one call-making fn";
+            callerLayout = layout;
+        }
+    }
+    ASSERT_NE(callerLayout, nullptr);
+    // SysV: shadow=0, 1 overflow slot → outgoingArgAreaSize = 8.
+    EXPECT_EQ(callerLayout->outgoingArgAreaSize, 8u)
+        << "SysV 7-arg call → 1 stack-spilled slot × 8 bytes "
+           "(shadowSpaceBytes=0 contributes nothing under SysV)";
+    // Frame congruence: totalFrameSize ≡ callPushBytes mod stackAlignment.
+    EXPECT_EQ(callerLayout->totalFrameSize % cc->stackAlignment,
+              static_cast<std::uint32_t>(cc->callPushBytes));
+    // pr-test-analyzer L3 audit fold: pin the EXACT byte offset of
+    // the emitted `frame_store` for the overflow arg. Under SysV
+    // (shadow=0, overflowIdx=0), the spill goes to [sp+0]. A
+    // regression to an off-by-one offset (e.g. [sp+8]) would
+    // silently read garbage on the callee side; the frame-size
+    // count alone wouldn't catch it.
+    auto const storeOpId = bundle.lowered.target->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOpId.has_value());
+    std::uint16_t const storeOp = *storeOpId;
+    bool foundStackArgStore = false;
+    LirFuncId const callerFn = result.lir.funcAt(1);
+    std::uint32_t const blkN = result.lir.funcBlockCount(callerFn);
+    for (std::uint32_t bi = 0; bi < blkN && !foundStackArgStore; ++bi) {
+        LirBlockId const blk = result.lir.funcBlockAt(callerFn, bi);
+        std::uint32_t const n = result.lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = result.lir.blockInstAt(blk, i);
+            if (result.lir.instOpcode(inst) != storeOp) continue;
+            auto const ops = result.lir.instOperands(inst);
+            // store layout: [value_reg, base_reg, MemBase, MemOffset]
+            if (ops.size() != 4) continue;
+            if (ops[3].kind != LirOperandKind::MemOffset) continue;
+            // The overflow arg lands at [sp + 0] under SysV (shadow=0,
+            // overflowIdx=0). Other stores in this fn would be at
+            // higher offsets (saved-reg prologue if any).
+            if (ops[3].offset == 0) {
+                foundStackArgStore = true;
+                break;
             }
         }
     }
-    EXPECT_TRUE(sawCode)
-        << "the 7-arg overflow must surface L_StackPassedArgUnsupported";
-    EXPECT_TRUE(sawAnchor)
-        << "the diagnostic must cite the D-ML7-2.2 anchor for triage";
+    EXPECT_TRUE(foundStackArgStore)
+        << "expected a `store` inst at [sp+0] for the 7th-arg overflow";
+}
+
+TEST(LirCallconvAbi, Win64FiveArgFunctionStackPassesViaSlotAligned) {
+    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64
+    // has 4 GPR arg registers (rcx/rdx/r8/r9). A 5-arg int function
+    // overflows arg 4 onto the stack. Under slot-aligned semantics,
+    // arg-4 lands at [rsp + shadowSpaceBytes + 0 * slotSize] =
+    // [rsp + 0x20] (the canonical Win64 5th-arg location).
+    // Outgoing-area total = shadowSpaceBytes (32) + 1 slot × 8 = 40.
+    auto bundle = lowerThroughRewrite(
+        "int f5(int a, int b, int c, int d, int e) { return e; }\n"
+        "int caller_of_f5() { return f5(1, 2, 3, 4, 5); }\n",
+        /*ccIndex=*/1);  // ms_x64
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "D-ML7-2.6 closure: 5-arg Win64 fn + call must lower cleanly";
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_STREQ(cc->name.c_str(), "ms_x64");
+    EXPECT_TRUE(cc->slotAligned)
+        << "ms_x64 MUST declare slotAligned=true (D-ML7-2.6 closure)";
+    EXPECT_EQ(cc->shadowSpaceBytes, 32u);
+    EXPECT_EQ(cc->callPushBytes, 8u);
+
+    // Find caller_of_f5.
+    FrameLayout const* callerLayout = nullptr;
+    for (std::uint32_t i = 0; i < result.lir.moduleFuncCount(); ++i) {
+        auto const* layout = result.forFuncByIndex(i);
+        ASSERT_NE(layout, nullptr);
+        if (layout->hasCalls) {
+            EXPECT_EQ(callerLayout, nullptr);
+            callerLayout = layout;
+        }
+    }
+    ASSERT_NE(callerLayout, nullptr);
+    // Win64 5-arg call: shadow=32, 1 overflow slot × 8 → outgoingArgAreaSize = 40.
+    // Pinning outgoingArgAreaSize directly (not totalFrameSize, which
+    // varies with regalloc-chosen callee-saved spills under ms_x64's
+    // many callee-saved regs).
+    EXPECT_EQ(callerLayout->outgoingArgAreaSize, 40u)
+        << "Win64 5-arg call → shadowSpaceBytes (32) + 1 overflow × 8 = 40";
+    // Frame congruence holds regardless of saved-reg count:
+    // alignedSizeWithBias result must always satisfy N ≡ 8 mod 16
+    // under Win64 (callPushBytes=8, stackAlignment=16).
+    EXPECT_GE(callerLayout->totalFrameSize, 40u);
+    EXPECT_EQ(callerLayout->totalFrameSize % 16u, 8u);
+    // pr-test-analyzer L3 audit fold: pin the EXACT byte offset of
+    // the emitted `frame_store` for the 5th-arg overflow. Under
+    // Win64 (shadow=32, overflowIdx=0), the spill goes to
+    // [sp+0x20] = [sp+32]. The canonical Win64 5th-arg location.
+    auto const storeOpId = bundle.lowered.target->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOpId.has_value());
+    std::uint16_t const storeOp = *storeOpId;
+    bool foundStackArgStoreAt0x20 = false;
+    LirFuncId const callerFn = result.lir.funcAt(1);
+    std::uint32_t const blkN = result.lir.funcBlockCount(callerFn);
+    for (std::uint32_t bi = 0; bi < blkN && !foundStackArgStoreAt0x20; ++bi) {
+        LirBlockId const blk = result.lir.funcBlockAt(callerFn, bi);
+        std::uint32_t const n = result.lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = result.lir.blockInstAt(blk, i);
+            if (result.lir.instOpcode(inst) != storeOp) continue;
+            auto const ops = result.lir.instOperands(inst);
+            if (ops.size() != 4) continue;
+            if (ops[3].kind != LirOperandKind::MemOffset) continue;
+            if (ops[3].offset == 0x20) {
+                foundStackArgStoreAt0x20 = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(foundStackArgStoreAt0x20)
+        << "Win64 5th-arg overflow MUST emit a `store` at [sp+0x20] "
+           "(the canonical Win64 stack-arg location AFTER shadow space)";
 }
 
 TEST(LirCallconvAbi, RejectsIndirectCallLoud) {
@@ -1211,13 +1362,16 @@ TEST(LirCallconv, NonLeafFunctionReservesShadowSpaceAndAlignmentBias) {
         << "g is leaf; FrameLayout.hasCalls must reflect that";
 
     // f (non-leaf): totalFrameSize >= shadowSpaceBytes AND
-    // satisfies the callPushBytes congruence. Same formula the
-    // implementation uses — pinning the mechanism.
-    std::uint32_t const fRaw =
-        fLayout->savedRegAreaSize + fLayout->spillAreaSize;
+    // satisfies the callPushBytes congruence. D-ML7-2.2 (2026-06-02):
+    // outgoingArgAreaSize already incorporates the shadow-space
+    // requirement (when hasCalls; for SysV it adds 0), so the
+    // expected formula folds shadow into raw via outgoingArgAreaSize
+    // rather than via a separate max().
+    std::uint32_t const fRaw = fLayout->outgoingArgAreaSize
+                             + fLayout->savedRegAreaSize
+                             + fLayout->spillAreaSize;
     std::uint32_t const fExpected = ::dss::alignedSizeWithBias(
-        std::max(fRaw, static_cast<std::uint32_t>(cc->shadowSpaceBytes)),
-        cc->stackAlignment, cc->callPushBytes);
+        fRaw, cc->stackAlignment, cc->callPushBytes);
     EXPECT_EQ(fLayout->totalFrameSize, fExpected);
     EXPECT_GE(fLayout->totalFrameSize, cc->shadowSpaceBytes)
         << "non-leaf must reserve at least shadowSpaceBytes";

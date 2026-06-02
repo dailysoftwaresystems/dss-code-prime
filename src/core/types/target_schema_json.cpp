@@ -851,6 +851,20 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // contract).
                 readBoundedInt(c, coll, ccPath, "callPushBytes",
                                cc.callPushBytes);
+                // D-ML7-2.6: slot-aligned arg passing (Win64 ms_x64).
+                // Defaults to false (independent counters — SysV/AAPCS64
+                // semantics). A cc declaring `slotAligned: true` means
+                // each arg consumes one shared slot index regardless of
+                // class.
+                if (c.contains("slotAligned")) {
+                    if (!c.at("slotAligned").is_boolean()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/slotAligned", ccPath),
+                                  "'slotAligned' must be a boolean");
+                    } else {
+                        cc.slotAligned = c.at("slotAligned").get<bool>();
+                    }
+                }
                 if (c.contains("linkRegister")) {
                     if (!c.at("linkRegister").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,

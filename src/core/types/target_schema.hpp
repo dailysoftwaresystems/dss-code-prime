@@ -343,6 +343,34 @@ struct DSS_EXPORT TargetCallingConvention {
     // implementation detail.
     std::uint16_t callPushBytes = 0;
 
+    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): when true,
+    // the cc uses SLOT-ALIGNED arg passing — each arg consumes ONE
+    // shared slot index regardless of its register class, AND both
+    // argGprs[N] AND argFprs[N] are reserved by slot N (matters for
+    // mixed int/float arg sequences). When false, the cc uses
+    // INDEPENDENT counters — gprIdx and fprIdx advance separately.
+    //
+    // Concrete shipped values:
+    //   * `ms_x64`     (Windows PE):           true  — `f(int, double,
+    //                                                   int, double,
+    //                                                   int)` consumes
+    //                                                   slots 0..4; slot 4
+    //                                                   overflows to stack.
+    //   * `sysv_amd64` (Linux ELF / Mach-O):   false — independent
+    //                                                   counters; ints fill
+    //                                                   rdi..r9, floats fill
+    //                                                   xmm0..xmm7 separately.
+    //   * `aapcs64`    (ARM64):                false — independent counters.
+    //
+    // Consumed by ML7 `materializeOneFunc`'s `arg` + `call` arms +
+    // `computeMaxOutgoingStackArgs` pre-scan. Under slot-aligned the
+    // outgoing-arg-area overflow count is `max(0, total_args -
+    // max(argGprs.size(), argFprs.size()))`; under independent it's
+    // `max(0, gprArgs - argGprs.size()) + max(0, fprArgs - argFprs.size())`.
+    // Pure-GPR calls (WriteFile, GetStdHandle, etc.) coincide between
+    // the two shapes; only mixed-class 5+ arg calls diverge.
+    bool slotAligned = false;
+
     // Named register reference. Used for distinguished-role registers
     // (link register, stack pointer, frame pointer in future cycles).
     // The struct shape co-locates the JSON-side `name` (kept for
