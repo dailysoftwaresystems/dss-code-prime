@@ -22,6 +22,7 @@
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "link/object_format_schema.hpp"  // FLIP-MARKER test loads shipped formats
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir_node.hpp"
 
@@ -73,6 +74,139 @@ TEST(AsmSubstrate, ExternsSpanCopiesIntoAssembledModule) {
     EXPECT_EQ(result.externImports[0].mangledName, "printf");
     EXPECT_EQ(result.externImports[0].libraryPath, "libc.so.6");
     EXPECT_EQ(result.externImports[1].mangledName, "_objc_msgSend");
+}
+
+// ── D-LK4-RODATA-SUBSTRATE: AssembledData on AssembledModule ───────
+//
+// First slice toward FF6 hello-world (plan 11). The assembler now
+// carries `dataItems` parallel to `functions` and `externImports`.
+// Each item is a SymbolId-keyed byte blob tagged with a SectionKind
+// (typically `Rodata`) for downstream walker emission to `.rdata` /
+// `.rodata` / `__cstring`. The per-format walker arms are anchored
+// as follow-up cycles (D-LK2-RODATA (PE), D-LK1-RODATA (ELF), D-LK3-RODATA (Mach-O)).
+//
+// This slice ships the SUBSTRATE only: the struct exists, lives on
+// `AssembledModule`, and round-trips through `assemble()` (which
+// today is a no-op for `dataItems` — the assembler doesn't yet
+// produce them; hand-built tests are the consumer surface). The
+// MIR-global → AssembledData producer (from string-literal
+// promotion) lands in the next cycle paired with the per-format
+// walker emission.
+
+TEST(AsmSubstrate, AssembledDataDefaultIsRodataSectionEmptyBytes) {
+    // Default-constructed AssembledData should default to Rodata
+    // (the typical kind for string-literal-promoted bytes), an
+    // invalid SymbolId (sentinel), alignment 1, and empty
+    // bytes/relocations. A regression that flipped the default to
+    // a different kind (e.g. Bss) would silently route producer
+    // output to the wrong walker arm.
+    AssembledData d;
+    EXPECT_EQ(d.section, SectionKind::Rodata);
+    EXPECT_EQ(d.symbol, SymbolId{});
+    EXPECT_EQ(d.alignment, 1u);
+    EXPECT_TRUE(d.bytes.empty());
+    EXPECT_TRUE(d.relocations.empty());
+}
+
+TEST(AsmSubstrate, AssembledModuleCarriesDataItemsField) {
+    // The field exists, is default-empty, and accepts hand-built
+    // items — the substrate surface tests/walker code will rely on.
+    AssembledModule m;
+    EXPECT_TRUE(m.dataItems.empty());
+
+    AssembledData d;
+    d.symbol  = SymbolId{77};
+    d.section = SectionKind::Rodata;
+    d.bytes   = {'h', 'e', 'l', 'l', 'o', '\n', '\0'};
+    d.alignment = 1u;
+    m.dataItems.push_back(std::move(d));
+
+    ASSERT_EQ(m.dataItems.size(), 1u);
+    EXPECT_EQ(m.dataItems[0].symbol, SymbolId{77});
+    EXPECT_EQ(m.dataItems[0].section, SectionKind::Rodata);
+    EXPECT_EQ(m.dataItems[0].bytes.size(), 7u);
+    EXPECT_EQ(m.dataItems[0].bytes.back(), '\0')
+        << "C-string nul terminator must round-trip verbatim";
+}
+
+// FLIP-MARKER (silent-failure F2 fold): no shipped exec format
+// declares a `rodata` section row YET. When the first per-format
+// walker arm closes (D-LK2-RODATA / D-LK1-RODATA / D-LK3-RODATA),
+// the corresponding `EXPECT_EQ(... nullptr)` flips to `EXPECT_NE`.
+// Acts as a tripwire: a JSON edit that adds the row WITHOUT also
+// closing the walker arm surfaces here.
+TEST(AsmSubstrate, ShippedExecFormatsLackRodataSectionUntilWalkerLands) {
+    for (auto const* formatName : {
+             "pe64-x86_64-windows-exec",
+             "elf64-x86_64-linux-exec",
+             "macho64-x86_64-darwin-exec"}) {
+        auto fmt = ObjectFormatSchema::loadShipped(formatName);
+        ASSERT_TRUE(fmt.has_value()) << formatName;
+        EXPECT_EQ((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
+            << formatName
+            << " declares a rodata section row — the matching walker "
+               "arm (D-LK2-RODATA / D-LK1-RODATA / D-LK3-RODATA) must "
+               "land in the SAME slice; flip this assertion from "
+               "EQ(nullptr) to NE(nullptr) when that closes.";
+    }
+}
+
+// Bss-with-bytes is semantically nonsensical (Bss is zero-fill;
+// the wire format reserves `sh_size` without storing bytes). The
+// substrate type-allows the contradiction today; the linker's
+// dataItems-precondition guard catches non-empty `dataItems`
+// unconditionally for now. When the walker arm lowers that guard
+// per-format, a follow-up validate() will reject Bss+bytes. This
+// test pins the current (wrong) behavior as a FLIP-MARKER:
+// silent-failure F3 fold.
+TEST(AsmSubstrate, AssembledDataBssWithNonEmptyBytesIsTypeAllowedTripwire) {
+    AssembledData d;
+    d.section = SectionKind::Bss;
+    d.bytes   = {0xAAu};  // semantic contradiction: Bss + non-empty
+    // The struct doesn't validate. The contract is comment-only.
+    // FLIP-MARKER: when validateAssembledData() lands per D-LK4-
+    // RODATA-BSS-INVARIANT, replace the EXPECT_FALSE below with
+    // an assertion that construction (or validation) emits an
+    // error diagnostic.
+    EXPECT_EQ(d.section, SectionKind::Bss);
+    EXPECT_FALSE(d.bytes.empty())
+        << "FLIP-MARKER for D-LK4-RODATA-BSS-INVARIANT: when "
+           "validateAssembledData() lands, this assertion becomes "
+           "an emit-loud check against constructing such an item.";
+}
+
+// Cross-tier canary (test-analyzer MEDIUM-7 fold): the SectionKind
+// extract's load-bearing rationale is "asm-tier consumers can
+// speak the vocabulary without dragging in link/...". If a future
+// refactor accidentally relocated `SectionKind` back into the
+// link tier, this test file (which only includes asm/asm.hpp at
+// the top of the source) would still compile against the
+// transitive include chain — silently re-coupling tiers. Pin
+// the constant at the asm-tier surface so a `static_assert` on
+// the enum value documents the contract: any reshuffle that
+// changes Rodata's underlying value (or moves the enum) would
+// fail compilation here.
+static_assert(static_cast<int>(SectionKind::Rodata) == 1,
+              "D-LK4-RODATA-SUBSTRATE cross-tier vocabulary canary: "
+              "SectionKind::Rodata must remain at value 1 and "
+              "reachable through asm/asm.hpp's include chain. If "
+              "this fails, the SectionKind extract regressed.");
+
+TEST(AsmSubstrate, AssembleProducesEmptyDataItemsByDefault) {
+    // The current `assemble()` produces `dataItems`-empty modules:
+    // there is no MIR/LIR → data producer yet. The field is reserved
+    // for the future producer (HIR→MIR string-literal promotion).
+    // This pin proves the substrate doesn't accidentally introduce
+    // spurious items when none are configured upstream.
+    Lir empty{};
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    DiagnosticReporter rep;
+    auto result = assemble(empty, **schema, {}, rep);
+    EXPECT_TRUE(result.dataItems.empty())
+        << "assemble() must not synthesize unsolicited data items "
+           "— the producer thread-through is anchored for a follow-"
+           "up cycle";
 }
 
 TEST(AsmSubstrate, DefaultExternsSpanProducesEmptyExternImports) {

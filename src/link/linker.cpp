@@ -233,6 +233,38 @@ LinkedImage link(AssembledModule const&    inputModule,
         return image;
     }
 
+    // D-LK4-RODATA-SUBSTRATE precondition guard: until the per-
+    // format walker arms (D-LK2-RODATA / D-LK1-RODATA / D-LK3-
+    // RODATA) close, no walker consumes `module.dataItems`. A
+    // future producer (HIR string-literal promotion → MIR global →
+    // assembler) that lands `dataItems` BEFORE the matching walker
+    // arm would silently emit a binary with NO `.rdata`/`.rodata`/
+    // `__cstring` section — every string literal silently drops on
+    // the floor; downstream `printf("hello")` reads garbage from
+    // an unrelated VA. Fail-loud HERE so the producer cycle is
+    // sequenced after at least one walker arm.
+    //
+    // **Removal trigger**: when the first per-format walker arm
+    // closes, replace this unconditional reject with a per-format
+    // capability gate (walker arms advertise rodata support; the
+    // others reject only if their bit is unset).
+    if (!module.dataItems.empty()) {
+        report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+               DiagnosticSeverity::Error,
+               std::format(
+                   "linker: module carries {} AssembledData item(s) "
+                   "but no format walker has the rodata-emission arm "
+                   "yet — anchored as D-LK2-RODATA (PE) / D-LK1-"
+                   "RODATA (ELF) / D-LK3-RODATA (Mach-O). The "
+                   "producer cycle must sequence after the matching "
+                   "walker arm, or this guard must be lowered per-"
+                   "format when the walker advertises rodata "
+                   "capability.",
+                   module.dataItems.size()));
+        image.resolvedFuncCount = 0;
+        return image;
+    }
+
     // Format-keyed dispatch — closed-enum switch, fail-loud on
     // any format whose walker hasn't landed yet so the substrate
     // discipline reports the missing walker instead of silently

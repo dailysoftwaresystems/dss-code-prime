@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
+#include "core/types/section_kind.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
@@ -98,6 +99,57 @@ struct DSS_EXPORT AssembledFunction {
     std::vector<SourceMapEntry> sourceMap;
 };
 
+// One assembled data item — bytes + symbol identity, destined for a
+// non-executable section in the output object file (typically PE
+// `.rdata`, ELF `.rodata`, Mach-O `__cstring`/`__const`). Mirrors
+// `AssembledFunction`'s symbol-keyed shape so the linker's symbol→
+// VA resolution treats functions and data uniformly.
+//
+// **Bucket discipline**: this struct is target-blind and format-blind
+// — the bytes are whatever the upstream producer (MIR global
+// initializer, HIR string-literal promotion) decided; the format
+// walker decides which on-disk section receives them based on
+// `section`. Adding a new data category that is NOT already in the
+// `SectionKind` enum (e.g. `TlsData` for thread-local storage,
+// `InitArray` for static-init function pointer tables) is a new
+// enum value + walker arm, NOT a new struct.
+//
+// `alignment` is the byte alignment the producer requires (e.g. 1
+// for C-string concatenation; 8 for pointer-aligned tables; 16 for
+// SSE vectors). The walker pads between items to satisfy each
+// item's alignment, then aligns the section itself to the format's
+// section-alignment requirement. Alignment=1 is the safe default
+// (byte-string layout).
+//
+// `relocations` carry references from THIS data into other symbols
+// (e.g. a vtable pointing at functions, a const struct containing a
+// pointer field). Same shape as `AssembledFunction.relocations` —
+// the reloc's `offset` is relative to the START OF THIS ITEM, the
+// walker translates to section-relative when emitting:
+//
+//     section_offset(item_N) = Σ aligned_size(items[0..N-1])
+//
+// where `aligned_size(item)` rounds `item.bytes.size()` up to the
+// NEXT item's `alignment`. A walker that uses the per-item `offset`
+// verbatim against the section base would silently mis-resolve
+// every relocation in `items[1..]`. D-LK4-RODATA-WALKER-RELOC-BASE-
+// OFFSET (sub-anchor of D-LK4-RODATA-SUBSTRATE) — test at the
+// first walker-arm landing pins the Σ translation correctness.
+//
+// D-LK4-RODATA-SUBSTRATE: substrate-only landing (no MIR→LIR
+// producer yet). Hand-built `AssembledData` items exercise the
+// walker emission. The MIR-global → AssembledData thread-through
+// + the assembler's RIP-rel `lea` encoding variant + the HIR
+// string-literal-to-global promotion are anchored as follow-up
+// cycles toward FF6 (plan 11) hello-world.
+struct DSS_EXPORT AssembledData {
+    SymbolId                  symbol{};
+    SectionKind               section = SectionKind::Rodata;
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t             alignment = 1u;
+    std::vector<Relocation>   relocations;
+};
+
 // One assembled module — parallel-indexed with the LIR input. Mirrors
 // the `ok()`-derivation discipline pioneered by `LirAllocation::ok()`
 // (ML6 cycle 3a) and adopted by `LirCallconvResult::ok()` (ML7 cycle
@@ -150,6 +202,22 @@ struct DSS_EXPORT AssembledModule {
     // lands (D-LK6-6). Linker consults this AFTER `functions` for
     // any unresolved `Relocation::target`.
     std::vector<ExternImport>      externImports;
+
+    // Read-only / initialized / zero-fill data items (D-LK-RODATA-
+    // SUBSTRATE). Each entry carries a SymbolId, the section it
+    // belongs to (typically `SectionKind::Rodata`), the raw bytes,
+    // and an alignment hint. The linker walker concatenates items
+    // sharing a `section` (with per-item alignment padding), emits
+    // the resulting bytes as the format's matching on-disk section,
+    // and maps each item's `symbol` to its section-relative address
+    // for relocation resolution.
+    //
+    // Substrate-only at this slice: hand-built `AssembledData`
+    // items exercise the walker emission. The MIR-global →
+    // AssembledData thread-through (`hir_to_mir.cpp` string-literal
+    // promotion → `mir_to_lir.cpp` global-data routing → assembler
+    // `dataItems` populate) is anchored as a follow-up cycle.
+    std::vector<AssembledData>     dataItems;
 
     // D-LK10-ENTRY Slice C (plan 14 §2.13): override of the image
     // entry-point function index. When set, the format walker

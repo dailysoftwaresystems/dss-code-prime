@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
+#include "core/types/section_kind.hpp"     // SectionKind + kSectionKindTable
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"    // EnumNameTable<E,N>
 
@@ -75,52 +76,12 @@ objectFormatKindFromName(std::string_view s) noexcept {
     return kObjectFormatKindTable.fromName(s);
 }
 
-// Canonical section taxonomy — format-blind names the engine speaks.
-// Each format JSON declares which platform-native section a given
-// SectionKind maps to (e.g. ELF `.text` / PE `.text` / Mach-O
-// `__TEXT,__text` all map to `SectionKind::Text`). The engine reads
-// the kind; per-format JSON owns the name + flags.
-enum class SectionKind : std::uint8_t {
-    Text       = 0,  // executable code
-    Rodata     = 1,  // read-only data
-    Data       = 2,  // initialised mutable data
-    Bss        = 3,  // zero-initialised mutable data
-    Symtab     = 4,  // symbol table
-    Strtab     = 5,  // symbol-name string table
-    ShStrtab   = 6,  // section-name string table (ELF .shstrtab;
-                     // distinct from Strtab — the consumer code
-                     // path is "find names of OTHER sections" vs
-                     // "find symbol names")
-    RelocTable = 7,  // relocation entries
-    Dynamic    = 8,  // ELF .dynamic / PE .idata / Mach-O LC_DYLD_INFO
-    Note       = 9,  // build-id / vendor notes
-    Debug      = 10, // DWARF / CodeView debug info
-    Custom     = 11, // anything else the format JSON names
-};
-
-inline constexpr EnumNameTable<SectionKind, 12> kSectionKindTable{{{
-    { SectionKind::Text,       "text"       },
-    { SectionKind::Rodata,     "rodata"     },
-    { SectionKind::Data,       "data"       },
-    { SectionKind::Bss,        "bss"        },
-    { SectionKind::Symtab,     "symtab"     },
-    { SectionKind::Strtab,     "strtab"     },
-    { SectionKind::ShStrtab,   "shstrtab"   },
-    { SectionKind::RelocTable, "reloc"      },
-    { SectionKind::Dynamic,    "dynamic"    },
-    { SectionKind::Note,       "note"       },
-    { SectionKind::Debug,      "debug"      },
-    { SectionKind::Custom,     "custom"     },
-}}};
-
-[[nodiscard]] constexpr std::string_view
-sectionKindName(SectionKind k) noexcept {
-    return kSectionKindTable.name(k);
-}
-[[nodiscard]] constexpr std::optional<SectionKind>
-sectionKindFromName(std::string_view s) noexcept {
-    return kSectionKindTable.fromName(s);
-}
+// `SectionKind` + helpers extracted to `core/types/section_kind.hpp`
+// at the D-LK4-RODATA-SUBSTRATE slice so the upstream assembler can
+// tag `AssembledData` outputs with the same vocabulary the linker
+// walkers consume. The enum + name table + accessors remain visible
+// here via the include above — every existing consumer continues to
+// work without touching its `#include`s.
 
 // Symbol binding — visibility within the linker's symbol-resolution
 // algorithm. Local symbols never resolve across translation units;
