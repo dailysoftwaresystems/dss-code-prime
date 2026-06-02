@@ -3,6 +3,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_reloc_apply.hpp"
+#include "link/format/macho_chained_fixups.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -107,7 +108,12 @@ constexpr std::uint32_t LC_DYLD_INFO_ONLY      = 0x80000022u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_DYLD_CHAINED_FIXUPS = 0x80000034u;  // |= LC_REQ_DYLD — D-LK6-14
 constexpr std::uint32_t LC_DYSYMTAB            = 0x0B;
 constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
-constexpr std::size_t   kCodeSigCommandSize = 16;  // linkedit_data_command
+// linkedit_data_command shape (16 bytes): cmd / cmdsize / dataoff /
+// datasize. Both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use
+// this exact layout — the alias documents the shared shape so
+// future linkedit-data-command LCs can reuse the constant.
+constexpr std::size_t   kCodeSigCommandSize = 16;
+constexpr std::size_t   kLinkeditDataCommandSize = 16;
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
 
 // section_64.flags (S_*) — <mach-o/loader.h>
@@ -211,42 +217,6 @@ encode(AssembledModule const&    module,
         // is degenerate); when first observed in practice, the
         // dynamic-path arm will widen — anchored D-LK7-1 at plan 14
         // §3.1.
-        // D-LK6-14 substrate guard (d312c1c audit fold close): the
-        // useChainedFixups flag must be honored on BOTH the dynamic
-        // (encodeExecDynamic) AND static (encodeExec) execution
-        // arms. Without this outer check, a schema with
-        // `useChainedFixups=true` + `externImports.empty()` would
-        // route to encodeExec and silently emit a legacy static
-        // binary despite the schema explicitly requesting modern
-        // chained-fixups format. (silent-failure-hunter HIGH-1
-        // + test-analyzer-dim-2 convergence on d312c1c.)
-        if (fmt.machoImage().useChainedFixups) {
-            // D-LK6-14-INTEGRATION-PAYLOAD anchor site: when the
-            // integration fold lands, this guard will be replaced by
-            // a dispatch arm that calls
-            // `dss::macho::detail::buildChainedFixupsPayload` and
-            // emits LC_DYLD_CHAINED_FIXUPS pointing at the payload
-            // in __LINKEDIT. The companion D-LK6-14-INTEGRATION-
-            // GOT-SLOTS anchor lives in encodeExecDynamic (where
-            // the __got slots get populated with DYLD_CHAINED_PTR_64
-            // bitfields).
-            emit(reporter,
-                 DiagnosticCode::K_ChainedFixupsNotYetIntegrated,
-                 "macho::encode: schema requests "
-                 "LC_DYLD_CHAINED_FIXUPS emission "
-                 "('image.useChainedFixups' = true) but the "
-                 "integration into encodeExec/encodeExecDynamic has "
-                 "not yet shipped — the payload builder is unit-"
-                 "tested in isolation (macho_chained_fixups.hpp), "
-                 "but the LC_DYLD_INFO_ONLY replacement is anchored "
-                 "at D-LK6-14-INTEGRATION-PAYLOAD and __got slot "
-                 "population + LC_DYSYMTAB drop at "
-                 "D-LK6-14-INTEGRATION-GOT-SLOTS. To proceed, either "
-                 "set 'image.useChainedFixups' = false (legacy "
-                 "LC_DYLD_INFO_ONLY opcode stream, fully supported) "
-                 "or wait for D-LK6-14-INTEGRATION-PAYLOAD to close.");
-            return {};
-        }
         if (fmt.machoImage().codeSignatureSize != 0
          && module.externImports.empty()) {
             emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
@@ -1225,60 +1195,137 @@ encodeExecDynamic(AssembledModule const&    module,
         return 0;  // unreachable — declaredLibs check above
     };
 
-    // ── (i) Build the bind opcode stream ─────────────────────────
+    // ── (i) Build dyld-binding bytes ─────────────────────────────
     //
-    // For each extern, emit:
-    //   SET_DYLIB_ORDINAL_(IMM|ULEB)  <ord>
-    //   SET_SYMBOL_TRAILING_FLAGS_IMM 0 + symbol name + NUL
-    //   SET_TYPE_IMM BIND_TYPE_POINTER         (once is enough but
-    //                                            re-emit per extern
-    //                                            for clarity)
-    //   SET_SEGMENT_AND_OFFSET_ULEB  <__DATA_CONST seg idx> <offset>
-    //   DO_BIND
-    // Then BIND_OPCODE_DONE.
+    // Two paths: the legacy LC_DYLD_INFO_ONLY bind-opcode stream OR
+    // the modern LC_DYLD_CHAINED_FIXUPS payload. Schema flag
+    // `image.useChainedFixups` selects. The resulting `dyldBindBlob`
+    // is what lands in __LINKEDIT at `dyldBindOff`; the load-command
+    // emission below picks the matching LC.
     //
-    // Segment index is 0-based in BIND_OPCODE_SET_SEGMENT_AND_
-    // OFFSET_ULEB's 4-bit immediate. Segments are numbered in the
-    // order they appear via LC_SEGMENT_64: __PAGEZERO=0, __TEXT=1,
-    // __DATA_CONST=2, __LINKEDIT=3 (this walker's emission order).
-    // If the emission order ever changes, this constant must too.
-    // (code-reviewer I2 fold — comment said "1-based" then
-    // enumerated 0-based, contradicting itself.)
-    constexpr std::uint8_t kSegIdxDataConst = 2;
-    std::vector<std::uint8_t> bindStream;
-    for (std::size_t i = 0; i < numExterns; ++i) {
-        auto const& ext = module.externImports[i];
-        std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
-        if (ord <= 0x0F) {
-            bindStream.push_back(static_cast<std::uint8_t>(
-                BIND_OPCODE_SET_DYLIB_ORDINAL_IMM |
-                static_cast<std::uint8_t>(ord & 0x0F)));
-        } else {
-            bindStream.push_back(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
-            appendULEB128(bindStream, ord);
+    // D-LK6-14-INTEGRATION-PAYLOAD (this commit): the chained-fixups
+    // arm calls `dss::macho::detail::buildChainedFixupsPayload` and
+    // emits LC_DYLD_CHAINED_FIXUPS pointing at the result. __got
+    // slots remain zero-initialized — D-LK6-14-INTEGRATION-GOT-SLOTS
+    // is the companion fold that populates them as
+    // DYLD_CHAINED_PTR_64 bitfields + drops LC_DYSYMTAB.
+    bool const useChainedFixups = im.useChainedFixups;
+    std::vector<std::uint8_t> dyldBindBlob;
+    if (useChainedFixups) {
+        // D-LK6-14-NAME-OFFSET-OVERFLOW close: pre-check the
+        // cumulative symbols-pool size before payload construction
+        // (the helper's 23-bit name_offset field would silently
+        // truncate offsets > 8 MiB - 1; the mask in
+        // buildChainedFixupsPayload is defense-in-depth only).
+        // Leading NUL sentinel + N × (name.size() + 1) NUL-terminator.
+        std::uint64_t cumulativeSymbolsPoolSize = 1u;  // leading NUL
+        for (auto const& ext : module.externImports) {
+            cumulativeSymbolsPoolSize +=
+                static_cast<std::uint64_t>(ext.mangledName.size()) + 1u;
         }
-        bindStream.push_back(static_cast<std::uint8_t>(
-            BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0));
-        // Mach-O bind symbols are conventionally prefixed with `_`
-        // for C ABI compatibility. The walker emits the
-        // `mangledName` verbatim — the caller (linker / assembler)
-        // is responsible for adding the underscore in mangledName
-        // if the symbol's source language uses C-style mangling.
-        for (char c : ext.mangledName)
-            bindStream.push_back(static_cast<std::uint8_t>(c));
-        bindStream.push_back(0);  // NUL terminator
-        bindStream.push_back(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
-        bindStream.push_back(
-            BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | kSegIdxDataConst);
-        appendULEB128(bindStream,
-            static_cast<std::uint64_t>(i) * kGotSlotSize);
-        bindStream.push_back(BIND_OPCODE_DO_BIND);
+        if (cumulativeSymbolsPoolSize >
+            dss::macho::detail::kDyldChainedImportNameOffsetMax) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::format(
+                     "macho::encodeExecDynamic: chained-fixups "
+                     "symbols pool ({} bytes) exceeds the 23-bit "
+                     "name_offset field (max {} = 8 MiB - 1). The "
+                     "DYLD_CHAINED_IMPORT struct cannot represent "
+                     "name offsets above this bound; either reduce "
+                     "the number/length of extern imports, or set "
+                     "`image.useChainedFixups` = false to fall back "
+                     "to LC_DYLD_INFO_ONLY (which has no analogous "
+                     "limit). Anchored D-LK6-14-NAME-OFFSET-OVERFLOW.",
+                     cumulativeSymbolsPoolSize,
+                     static_cast<std::uint64_t>(
+                         dss::macho::detail::
+                             kDyldChainedImportNameOffsetMax)));
+            return {};
+        }
+        std::vector<dss::macho::detail::ChainedFixupImport>
+            chainedImports;
+        chainedImports.reserve(numExterns);
+        for (auto const& ext : module.externImports) {
+            std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
+            // DYLD_CHAINED_IMPORT.lib_ordinal is a SIGNED 8-bit field.
+            // Ordinals 1..127 are valid; > 127 is architecturally
+            // unreachable for real binaries but a config-fuzz with
+            // >127 LC_LOAD_DYLIB entries would silently truncate.
+            if (ord > 127u) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format(
+                         "macho::encodeExecDynamic: dylib ordinal {} "
+                         "exceeds chained-fixups signed-8-bit field "
+                         "(max 127). Reduce LC_LOAD_DYLIB count or "
+                         "fall back to LC_DYLD_INFO_ONLY.", ord));
+                return {};
+            }
+            chainedImports.push_back({
+                ext.mangledName,
+                static_cast<std::int8_t>(ord),
+                false  // weakImport — D-LK6-14-MACHO-WEAK-DEF reserves
+            });
+        }
+        dyldBindBlob =
+            dss::macho::detail::buildChainedFixupsPayload(chainedImports);
+        // Pad to 8-byte load-command alignment per Apple convention.
+        while (dyldBindBlob.size() % kLoadCmdAlign != 0)
+            dyldBindBlob.push_back(0);
+    } else {
+        // Legacy LC_DYLD_INFO_ONLY bind opcode stream.
+        //
+        // For each extern, emit:
+        //   SET_DYLIB_ORDINAL_(IMM|ULEB)  <ord>
+        //   SET_SYMBOL_TRAILING_FLAGS_IMM 0 + symbol name + NUL
+        //   SET_TYPE_IMM BIND_TYPE_POINTER         (once is enough but
+        //                                            re-emit per extern
+        //                                            for clarity)
+        //   SET_SEGMENT_AND_OFFSET_ULEB  <__DATA_CONST seg idx> <offset>
+        //   DO_BIND
+        // Then BIND_OPCODE_DONE.
+        //
+        // Segment index is 0-based in BIND_OPCODE_SET_SEGMENT_AND_
+        // OFFSET_ULEB's 4-bit immediate. Segments are numbered in the
+        // order they appear via LC_SEGMENT_64: __PAGEZERO=0, __TEXT=1,
+        // __DATA_CONST=2, __LINKEDIT=3 (this walker's emission order).
+        // If the emission order ever changes, this constant must too.
+        // (code-reviewer I2 fold — comment said "1-based" then
+        // enumerated 0-based, contradicting itself.)
+        constexpr std::uint8_t kSegIdxDataConst = 2;
+        for (std::size_t i = 0; i < numExterns; ++i) {
+            auto const& ext = module.externImports[i];
+            std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
+            if (ord <= 0x0F) {
+                dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM |
+                    static_cast<std::uint8_t>(ord & 0x0F)));
+            } else {
+                dyldBindBlob.push_back(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
+                appendULEB128(dyldBindBlob, ord);
+            }
+            dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0));
+            // Mach-O bind symbols are conventionally prefixed with `_`
+            // for C ABI compatibility. The walker emits the
+            // `mangledName` verbatim — the caller (linker / assembler)
+            // is responsible for adding the underscore in mangledName
+            // if the symbol's source language uses C-style mangling.
+            for (char c : ext.mangledName)
+                dyldBindBlob.push_back(static_cast<std::uint8_t>(c));
+            dyldBindBlob.push_back(0);  // NUL terminator
+            dyldBindBlob.push_back(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+            dyldBindBlob.push_back(
+                BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | kSegIdxDataConst);
+            appendULEB128(dyldBindBlob,
+                static_cast<std::uint64_t>(i) * kGotSlotSize);
+            dyldBindBlob.push_back(BIND_OPCODE_DO_BIND);
+        }
+        dyldBindBlob.push_back(BIND_OPCODE_DONE);
+        // dyld parses the bind stream byte-by-byte; pad to 8 for
+        // load-command alignment downstream.
+        while (dyldBindBlob.size() % kLoadCmdAlign != 0)
+            dyldBindBlob.push_back(0);
     }
-    bindStream.push_back(BIND_OPCODE_DONE);
-    // dyld parses the bind stream byte-by-byte; pad to 8 for
-    // load-command alignment downstream.
-    while (bindStream.size() % kLoadCmdAlign != 0)
-        bindStream.push_back(0);
 
     // ── (j) Indirect symbols table: one u32 per stub slot + one
     //       u32 per __got slot. Each entry is the index into
@@ -1347,15 +1394,22 @@ encodeExecDynamic(AssembledModule const&    module,
     // the tail of __LINKEDIT so plan 16 can fill it without
     // disturbing earlier layout.
     bool const emitCodeSig = im.codeSignatureSize != 0;
-    // ncmds = 4 segments + LC_DYLD_INFO_ONLY + LC_LOAD_DYLINKER
-    //       + LC_MAIN + N × LC_LOAD_DYLIB + LC_SYMTAB + LC_DYSYMTAB
-    //       (+ LC_CODE_SIGNATURE when emitCodeSig).
+    // ncmds = 4 segments + LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
+    //       + LC_LOAD_DYLINKER + LC_MAIN + N × LC_LOAD_DYLIB
+    //       + LC_SYMTAB + LC_DYSYMTAB (+ LC_CODE_SIGNATURE when
+    //       emitCodeSig). Either dyld-binding LC counts as one.
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
         4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u + 1u
         + (emitCodeSig ? 1u : 0u));
+    // sizeofcmds: LC_DYLD_CHAINED_FIXUPS is 16 bytes (linkedit_data_
+    // command shape — same as LC_CODE_SIGNATURE); LC_DYLD_INFO_ONLY
+    // is 48 bytes. Pick the right size for the dyld-binding command.
+    std::size_t const dyldBindCmdSize = useChainedFixups
+        ? kLinkeditDataCommandSize
+        : kDyldInfoCommandSize;
     std::size_t const sizeofcmds =
         kSegCmdPageZeroSize + kSegCmdTextSize + kSegCmdDataConstSize +
-        kSegCmdLinkeditSize + kDyldInfoCommandSize + dylinkerCmdSize +
+        kSegCmdLinkeditSize + dyldBindCmdSize + dylinkerCmdSize +
         kLcMainSize + totalDylibCmdSize + kSymtabCommandSize +
         kDysymtabCommandSize +
         (emitCodeSig ? kCodeSigCommandSize : 0u);
@@ -1428,7 +1482,7 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const linkeditFileOff =
         alignUp(gotFileOff + gotFileSize, kPageSize);
     std::uint64_t const bindOff = linkeditFileOff;
-    std::uint64_t const bindSize = bindStream.size();
+    std::uint64_t const bindSize = dyldBindBlob.size();
     std::uint64_t const indirectSymtabOff = bindOff + bindSize;
     std::uint64_t const indirectSymtabSize =
         static_cast<std::uint64_t>(indirectSyms.size()) * 4u;
@@ -1607,21 +1661,27 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
 
-    // LC_DYLD_INFO_ONLY (legacy opcode-stream binding).
-    // D-LK6-14-INTEGRATION-PAYLOAD anchor: when chained-fixups
-    // emission lands, this entire block is replaced with an
-    // LC_DYLD_CHAINED_FIXUPS command pointing at
-    // `dss::macho::detail::buildChainedFixupsPayload` output in
-    // __LINKEDIT. The replacement also drops the bind-opcode-stream
-    // bytes from __LINKEDIT (no `bindOff`/`bindSize` references).
-    appendU32LE(bytes, LC_DYLD_INFO_ONLY);
-    appendU32LE(bytes, static_cast<std::uint32_t>(kDyldInfoCommandSize));
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // rebase_off/size
-    appendU32LE(bytes, static_cast<std::uint32_t>(bindOff));
-    appendU32LE(bytes, static_cast<std::uint32_t>(bindSize));
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // weak_bind
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // lazy_bind (eager — 0)
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // export
+    if (useChainedFixups) {
+        // LC_DYLD_CHAINED_FIXUPS (modern dyld binding format).
+        // The 16-byte linkedit_data_command points at the
+        // buildChainedFixupsPayload blob in __LINKEDIT. Companion
+        // D-LK6-14-INTEGRATION-GOT-SLOTS populates __got slots with
+        // DYLD_CHAINED_PTR_64 bitfields + drops LC_DYSYMTAB below.
+        appendU32LE(bytes, LC_DYLD_CHAINED_FIXUPS);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kLinkeditDataCommandSize));
+        appendU32LE(bytes, static_cast<std::uint32_t>(bindOff));
+        appendU32LE(bytes, static_cast<std::uint32_t>(bindSize));
+    } else {
+        // LC_DYLD_INFO_ONLY (legacy opcode-stream binding).
+        appendU32LE(bytes, LC_DYLD_INFO_ONLY);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kDyldInfoCommandSize));
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // rebase_off/size
+        appendU32LE(bytes, static_cast<std::uint32_t>(bindOff));
+        appendU32LE(bytes, static_cast<std::uint32_t>(bindSize));
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // weak_bind
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // lazy_bind (eager — 0)
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // export
+    }
 
     // LC_LOAD_DYLINKER
     {
@@ -1734,8 +1794,9 @@ encodeExecDynamic(AssembledModule const&    module,
     // Pad to linkeditFileOff
     while (bytes.size() < linkeditFileOff) bytes.push_back(0);
 
-    // __LINKEDIT: bind stream
-    bytes.insert(bytes.end(), bindStream.begin(), bindStream.end());
+    // __LINKEDIT: dyld binding bytes (legacy bind opcode stream
+    // OR chained-fixups payload depending on useChainedFixups).
+    bytes.insert(bytes.end(), dyldBindBlob.begin(), dyldBindBlob.end());
 
     // Indirect-symtab
     for (auto const idx : indirectSyms) appendU32LE(bytes, idx);

@@ -23,9 +23,11 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/format/byte_emit.hpp"
 #include "link/format/macho.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "macho_test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -1043,17 +1045,25 @@ TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
     ASSERT_FALSE(r.has_value());
 }
 
-// D-LK6-14 substrate guard: until D-LK6-14-INTEGRATION lands the
-// actual chained-fixups emission inside encodeExecDynamic, the
-// substrate fails loud with K_FormatLacksImportSupport when the
-// schema requests `useChainedFixups=true`. Mirrors the BindNowFalse
-// fail-loud pattern for D-LK6-13.
-TEST(MachOExecWriter, UseChainedFixupsFailsLoudCitingDLK614Integration) {
-    auto target = TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
+// D-LK6-14-INTEGRATION-PAYLOAD close (next 2026-06-01): wire
+// `dss::macho::detail::buildChainedFixupsPayload` into
+// encodeExecDynamic — when `useChainedFixups=true`, replace the
+// legacy LC_DYLD_INFO_ONLY emission with LC_DYLD_CHAINED_FIXUPS
+// pointing at the payload in __LINKEDIT. Companion
+// D-LK6-14-INTEGRATION-GOT-SLOTS (open) populates __got slots
+// with DYLD_CHAINED_PTR_64 bitfields + drops LC_DYSYMTAB.
+// Byte-level tests pin LC structure; runtime loadability is FF6
+// territory.
+namespace {
+// Inline-test fixture used by the 4 chained-fixups integration
+// pins below. Same shape as the legacy BindNowFalse fixture —
+// one extern, one function, one BRANCH relocation — but with
+// `image.useChainedFixups = true`.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadChainedFixupsExecFormat() {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
-      "format": {"name":"macho-cfx-substrate","kind":"macho"},
+      "format": {"name":"macho-cfx-integration","kind":"macho"},
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -1071,7 +1081,10 @@ TEST(MachOExecWriter, UseChainedFixupsFailsLoudCitingDLK614Integration) {
         {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
       ]
     })");
-    ASSERT_TRUE(fmt.has_value());
+    if (!fmt.has_value()) return nullptr;
+    return *fmt;
+}
+[[nodiscard]] AssembledModule chainedFixupsTestModule() {
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -1085,79 +1098,141 @@ TEST(MachOExecWriter, UseChainedFixupsFailsLoudCitingDLK614Integration) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "_printf",
                      "/usr/lib/libSystem.B.dylib"});
-    DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty());
-    bool sawAnchor = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_ChainedFixupsNotYetIntegrated
-         && d.actual.find("D-LK6-14-INTEGRATION") != std::string::npos) {
-            sawAnchor = true;
-        }
-    }
-    EXPECT_TRUE(sawAnchor)
-        << "substrate guard must fire K_ChainedFixupsNotYetIntegrated "
-           "(NOT K_FormatLacksImportSupport — type-design Q4 fold "
-           "disambiguated the temporary substrate gap from the "
-           "permanent structural-no-imports case) and cite "
-           "D-LK6-14-INTEGRATION so operators see the gap and can "
-           "fall back to legacy LC_DYLD_INFO_ONLY by clearing the flag";
+    return mod;
 }
+// LC_DYLD_CHAINED_FIXUPS = 0x80000034 (LC_REQ_DYLD bit set).
+constexpr std::uint32_t kLcDyldChainedFixups = 0x80000034u;
+constexpr std::uint32_t kLcDyldInfoOnly      = 0x80000022u;
 
-// d312c1c audit fold (silent-failure-hunter HIGH-1 + test-analyzer-
-// dim-2 convergence): the substrate guard must ALSO fire on the
-// static encodeExec path. Without the outer guard, a schema with
-// useChainedFixups=true + zero externImports would route to
-// encodeExec and silently emit a legacy static binary despite the
-// schema explicitly requesting modern chained-fixups format.
-TEST(MachOExecWriter, UseChainedFixupsOnStaticPathFailsLoud) {
+// Local LE-u32 reader for chained-fixups test byte-walk. Sibling to
+// the helper in tests/link/test_macho_chained_fixups.cpp; both will
+// promote to tests/test_support/le_read.hpp when a 3rd consumer
+// lands (anchor D-TEST-LE-READ-HELPERS).
+[[nodiscard]] inline std::uint32_t
+readLE32(std::vector<std::uint8_t> const& b, std::size_t off) {
+    return  static_cast<std::uint32_t>(b[off + 0])
+         | (static_cast<std::uint32_t>(b[off + 1]) <<  8)
+         | (static_cast<std::uint32_t>(b[off + 2]) << 16)
+         | (static_cast<std::uint32_t>(b[off + 3]) << 24);
+}
+} // namespace
+
+TEST(MachOExecWriter, ChainedFixupsLcPresent) {
+    // Primary mutual-exclusion pin: useChainedFixups=true emits
+    // LC_DYLD_CHAINED_FIXUPS AND no LC_DYLD_INFO_ONLY. A regression
+    // that re-introduces both LCs (or the wrong one) fails this.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
-    auto fmt = ObjectFormatSchema::loadFromText(R"({
-      "dssObjectFormatVersion": 1,
-      "format": {"name":"macho-cfx-static-path","kind":"macho"},
-      "entryPoint": "",
-      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
-      "image": {
-        "pageZeroSize": 4294967296,
-        "dylinkerPath": "/usr/lib/dyld",
-        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
-        "useChainedFixups": true
-      },
-      "sections":[
-        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
-      ],
-      "relocations":[
-        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
-        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
-        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
-      ]
-    })");
-    ASSERT_TRUE(fmt.has_value());
-    AssembledModule mod;
-    mod.expectedFuncCount = 1;
-    AssembledFunction fn;
-    fn.symbol = SymbolId{1};
-    fn.bytes  = {0xC3};                                        // ret
-    mod.functions.push_back(std::move(fn));
-    // NO externImports — this would route to encodeExec (static
-    // path) without the outer guard.
+    auto fmt = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmt, nullptr);
+    auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty())
-        << "static path must NOT silently emit a legacy binary "
-           "when useChainedFixups=true was requested";
-    bool sawAnchor = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_ChainedFixupsNotYetIntegrated
-         && d.actual.find("D-LK6-14-INTEGRATION") != std::string::npos) {
-            sawAnchor = true;
-        }
+    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_TRUE(dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups).has_value())
+        << "LC_DYLD_CHAINED_FIXUPS must be emitted on the chained "
+           "path";
+    EXPECT_FALSE(dss::macho::test::findLoadCommand(bytes, kLcDyldInfoOnly).has_value())
+        << "LC_DYLD_INFO_ONLY must NOT be emitted when "
+           "useChainedFixups=true — legacy + modern are mutually "
+           "exclusive";
+}
+
+TEST(MachOExecWriter, ChainedFixupsLcCmdsizeIs16Bytes) {
+    // LC_DYLD_CHAINED_FIXUPS uses the linkedit_data_command shape:
+    // cmd / cmdsize / dataoff / datasize = 4+4+4+4 = 16 bytes.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmt, nullptr);
+    auto mod = chainedFixupsTestModule();
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
+    ASSERT_TRUE(lcOff.has_value());
+    std::uint32_t const cmdsize =
+        readLE32(bytes, static_cast<std::size_t>(*lcOff + 4));
+    EXPECT_EQ(cmdsize, 16u)
+        << "linkedit_data_command shape: cmd+cmdsize+dataoff+datasize "
+           "= 4+4+4+4 = 16 bytes";
+    // dataoff must lie within the buffer + datasize must be non-zero
+    // (we have 1 import → at least 1 byte name + NUL + header + starts
+    // + import row).
+    std::uint32_t const dataoff =
+        readLE32(bytes, static_cast<std::size_t>(*lcOff + 8));
+    std::uint32_t const datasize =
+        readLE32(bytes, static_cast<std::size_t>(*lcOff + 12));
+    EXPECT_GT(datasize, 0u);
+    EXPECT_LE(static_cast<std::uint64_t>(dataoff) +
+              static_cast<std::uint64_t>(datasize),
+              bytes.size())
+        << "dataoff + datasize must lie within the emitted binary";
+}
+
+TEST(MachOExecWriter, ChainedFixupsPayloadImportsCountMatchesExterns) {
+    // Read the payload's dyld_chained_fixups_header.imports_count
+    // field (at payload offset 16) and assert it equals the number
+    // of externImports (1 in the fixture).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmt, nullptr);
+    auto mod = chainedFixupsTestModule();
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
+    ASSERT_TRUE(lcOff.has_value());
+    std::uint32_t const dataoff =
+        readLE32(bytes, static_cast<std::size_t>(*lcOff + 8));
+    // dyld_chained_fixups_header layout:
+    //   [ 0.. 3] fixups_version
+    //   [ 4.. 7] starts_offset
+    //   [ 8..11] imports_offset
+    //   [12..15] symbols_offset
+    //   [16..19] imports_count
+    std::uint32_t const importsCount =
+        readLE32(bytes, static_cast<std::size_t>(dataoff + 16));
+    EXPECT_EQ(importsCount, mod.externImports.size())
+        << "payload imports_count must equal module.externImports.size()";
+}
+
+TEST(MachOExecWriter, ChainedFixupsSymbolsPoolContainsExternName) {
+    // Read symbols_offset from the payload header (at payload+12),
+    // then walk into the symbols pool past the NUL sentinel and
+    // assert the first name is "_printf" (the fixture's mangledName).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmt, nullptr);
+    auto mod = chainedFixupsTestModule();
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
+    ASSERT_TRUE(lcOff.has_value());
+    std::uint32_t const dataoff =
+        readLE32(bytes, static_cast<std::size_t>(*lcOff + 8));
+    std::uint32_t const symbolsOffset =
+        readLE32(bytes, static_cast<std::size_t>(dataoff + 12));
+    // Symbols pool: leading NUL sentinel at relative offset 0; first
+    // import's name at offset 1.
+    std::size_t const firstNameOff =
+        static_cast<std::size_t>(dataoff) +
+        static_cast<std::size_t>(symbolsOffset) + 1u;
+    ASSERT_LT(firstNameOff, bytes.size());
+    std::string firstName;
+    for (std::size_t i = firstNameOff;
+         i < bytes.size() && bytes[i] != 0u; ++i) {
+        firstName.push_back(static_cast<char>(bytes[i]));
     }
-    EXPECT_TRUE(sawAnchor)
-        << "outer encode() guard must fire on the static path too "
-           "(HIGH-1 silent surface: zero externs + useChainedFixups "
-           "→ encodeExec → silent legacy emission)";
+    EXPECT_EQ(firstName, "_printf")
+        << "symbols pool's first NUL-terminated name must be the "
+           "fixture's extern mangledName ('_printf'); this pins the "
+           "end-to-end ExternImport.mangledName → ChainedFixupImport.name "
+           "→ payload pool flow";
 }
 
 TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {

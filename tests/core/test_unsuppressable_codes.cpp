@@ -109,28 +109,6 @@ TEST(Reporter, SuppressIsIgnoredForUnsuppressableCode) {
            "downstream exit-code gates fire correctly";
 }
 
-// 9945457 audit fold (test-analyzer Gap 1 + test-analyzer-dim-2 #2):
-// the new K_ChainedFixupsNotYetIntegrated code joined kUnsuppressableCodes
-// at the d312c1c audit fold. Per the H2-split anti-pattern lesson, every
-// added unsuppressable code needs its own SuppressIsIgnoredFor* pin —
-// the existing UnsuppressableCodes.ListSelfConsistent only pins
-// table-membership + name-presence, not the applyPolicy bypass.
-TEST(Reporter, SuppressIsIgnoredForKChainedFixupsNotYetIntegrated) {
-    DiagnosticReporter::Config cfg;
-    cfg.policy.suppress.insert(
-        DiagnosticCode::K_ChainedFixupsNotYetIntegrated);
-    DiagnosticReporter r{cfg};
-    r.report(makeDiag(DiagnosticCode::K_ChainedFixupsNotYetIntegrated));
-    EXPECT_EQ(r.all().size(), 1u)
-        << "K_ChainedFixupsNotYetIntegrated must reach `all_` despite "
-           "--suppress — the whole reason this code exists separate "
-           "from K_FormatLacksImportSupport is to let operators "
-           "disambiguate the temporary substrate gap from the "
-           "permanent structural-no-imports case; suppressing it "
-           "defeats the purpose";
-    EXPECT_EQ(r.errorCount(), 1u);
-}
-
 TEST(Reporter, OverrideCannotDemoteUnsuppressableCodeBelowError) {
     // The suppress check is the headline, but `overrides` is a parallel
     // attack surface: a user could demote H_ExternHasInitializer to

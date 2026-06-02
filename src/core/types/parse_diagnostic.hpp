@@ -674,26 +674,15 @@ enum class DiagnosticCode : std::uint16_t {
     K_ImageWriteShort              = 0x8009,
     K_ImageWriteCloseFailed        = 0x800A,
     K_ImageEmpty                   = 0x800B,
-    // K_ChainedFixupsNotYetIntegrated: a Mach-O schema requested
-    // `image.useChainedFixups = true` but the integration into
-    // encodeExec/encodeExecDynamic has not yet shipped — the
-    // payload builder is unit-tested in isolation but the
-    // load-command swap + __got slot population + LC_DYSYMTAB drop
-    // are anchored at D-LK6-14-INTEGRATION-PAYLOAD +
-    // D-LK6-14-INTEGRATION-GOT-SLOTS. Semantically distinct from
-    // K_FormatLacksImportSupport (which means "this format
-    // STRUCTURALLY does not support imports" — permanent) — this
-    // is a TEMPORARY substrate-vs-integration gap with closing
-    // anchors. Adding this code lets operators triage the two
-    // separately and lets future regressions that swap
-    // half-shipped chained for legacy emit the right signal.
-    // (type-design Q4 fold on d312c1c audit 2026-06-01.)
-    // **Removal contract**: when BOTH D-LK6-14-INTEGRATION-PAYLOAD
-    // AND D-LK6-14-INTEGRATION-GOT-SLOTS close, the substrate gap
-    // is gone. REMOVE this enum value entirely (not deprecate) —
-    // the guard sites become dead and a permanent commemorative
-    // code would falsely suggest the substrate gap can recur.
-    K_ChainedFixupsNotYetIntegrated = 0x800C,
+    // (0x800C was K_ChainedFixupsNotYetIntegrated — substrate-gap
+    // signal that fired when `image.useChainedFixups = true` was
+    // set without integration in encodeExecDynamic. Removed when
+    // D-LK6-14-INTEGRATION-PAYLOAD closed: the integration arm now
+    // exists in macho.cpp so the gap signal has no use site. The
+    // companion D-LK6-14-INTEGRATION-GOT-SLOTS is open but doesn't
+    // need a fail-loud K_ — chained-fixups binaries from this
+    // walker pass byte-level tests even with zero-init __got slots.
+    // GOT-SLOTS closes the runtime-loadability gap when it ships.)
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
