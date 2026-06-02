@@ -3,6 +3,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_span.hpp"
+#include "core/types/target_schema.hpp"  // callConvName / callConvFromName
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
@@ -58,32 +59,15 @@ namespace {
 
 // ── shared name tables (small fixed enums local to the grammar) ──────────────
 
-[[nodiscard]] std::string_view ccName(CallConv cc) noexcept {
-    switch (cc) {
-        case CallConv::CcSysV:       return "sysv";
-        case CallConv::CcMS64:       return "ms64";
-        case CallConv::CcAAPCS64:    return "aapcs64";
-        case CallConv::CcApple:      return "apple";
-        case CallConv::CcFastcall:   return "fastcall";
-        case CallConv::CcThiscall:   return "thiscall";
-        case CallConv::CcVectorcall: return "vectorcall";
-        case CallConv::CcWasm:       return "wasm";
-        case CallConv::CcSpirv:      return "spirv";
-    }
-    return "sysv";
-}
-[[nodiscard]] std::optional<CallConv> ccFromName(std::string_view s) noexcept {
-    if (s == "sysv") return CallConv::CcSysV;
-    if (s == "ms64") return CallConv::CcMS64;
-    if (s == "aapcs64") return CallConv::CcAAPCS64;
-    if (s == "apple") return CallConv::CcApple;
-    if (s == "fastcall") return CallConv::CcFastcall;
-    if (s == "thiscall") return CallConv::CcThiscall;
-    if (s == "vectorcall") return CallConv::CcVectorcall;
-    if (s == "wasm") return CallConv::CcWasm;
-    if (s == "spirv") return CallConv::CcSpirv;
-    return std::nullopt;
-}
+// CallConv name mapping previously hand-rolled here (and in
+// mir_text.cpp) — duplication caught in the 2026-06-02 cross-
+// codebase audit. Call sites now use `callConvName(cc)` /
+// `callConvFromName(s)` directly from the single source of truth
+// (`kCallConvTable` in target_schema.hpp alongside the other 5
+// enum name tables). 2nd-order simplifier fold dropped the
+// indirection wrappers per "no follow ups" — the wrappers' only
+// remaining value was diff-minimalism, which the explicit call-
+// site migration removes.
 
 [[nodiscard]] std::string_view primName(TypeKind k) noexcept {
     switch (k) {
@@ -426,7 +410,7 @@ private:
                 auto sc = in.scalars(t);
                 if (!sc.empty()) {
                     auto const cc = static_cast<CallConv>(sc[0]);
-                    if (cc != CallConv::CcSysV) { out_ += " cc "; out_ += ccName(cc); }
+                    if (cc != CallConv::CcSysV) { out_ += " cc "; out_ += callConvName(cc); }
                 }
                 return;
             }
@@ -1719,7 +1703,7 @@ private:
             expect(Tk::LParen, "'('"); auto params = parseTypeListUntil(Tk::RParen); expect(Tk::RParen, "')'");
             expect(Tk::Arrow, "'->'"); TypeId result = parseType();
             CallConv cc = CallConv::CcSysV;
-            if (acceptKeyword("cc")) { std::string n = takeIdent(); cc = orMalformed(ccFromName(n), n, "calling convention", CallConv::CcSysV); }
+            if (acceptKeyword("cc")) { std::string n = takeIdent(); cc = orMalformed(callConvFromName(n), n, "calling convention", CallConv::CcSysV); }
             return interner_.fnSig(params, result, cc);
         }
         if (kw == "ext") {

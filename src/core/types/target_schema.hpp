@@ -110,6 +110,64 @@ targetAbiModelFromName(std::string_view s) noexcept {
     return kTargetAbiModelTable.fromName(s);
 }
 
+// Calling-convention name table. The `CallConv` enum itself lives in
+// `core/types/type_lattice/core_type.hpp` (TypeRecord's scalar pool
+// stores it as the underlying integer for FnSig). The name↔enum
+// mapping lives here alongside the 5 other `EnumNameTable` instances
+// so the cross-tier text emit/parse (HIR `.dsshir`, MIR `.dssir`)
+// reads a single source of truth. Adding a row here is the only edit
+// needed when a `CallConv` lands; the round-trip parsers + emitters
+// pick it up automatically. Audit-promoted from per-TU hand-rolled
+// if-chains in `hir_text.cpp` + `mir_text.cpp` (2026-06-02 cycle).
+inline constexpr EnumNameTable<CallConv, 9> kCallConvTable{{{
+    { CallConv::CcSysV,       "sysv"       },
+    { CallConv::CcMS64,       "ms64"       },
+    { CallConv::CcAAPCS64,    "aapcs64"    },
+    { CallConv::CcApple,      "apple"      },
+    { CallConv::CcFastcall,   "fastcall"   },
+    { CallConv::CcThiscall,   "thiscall"   },
+    { CallConv::CcVectorcall, "vectorcall" },
+    { CallConv::CcWasm,       "wasm"       },
+    { CallConv::CcSpirv,      "spirv"      },
+}}};
+
+[[nodiscard]] constexpr std::string_view callConvName(CallConv cc) noexcept {
+    return kCallConvTable.name(cc);
+}
+[[nodiscard]] constexpr std::optional<CallConv>
+callConvFromName(std::string_view s) noexcept {
+    return kCallConvTable.fromName(s);
+}
+
+// Compile-time silent-failure closure (silent-failure 2nd-order
+// audit, 2026-06-02): `EnumNameTable::name(e)` returns `rows[0].second`
+// on miss — `"sysv"` here. A future `CallConv` value added without
+// a matching `kCallConvTable` row would silently mint `"sysv"`-
+// labeled functions into `.dsshir` / `.dssir` text, corrupting
+// round-trip with no diagnostic. Pin: table size MUST cover every
+// enum value, AND each row MUST sit at the index matching its
+// enum's underlying value (also makes the lookup O(1) on a dense
+// enum). Pattern mirrors `c_mangle.cpp:42`. Anchored
+// D-ENUM-NAME-TABLE-STATIC-ASSERTS for retrofit to the 5 sibling
+// tables (TargetAbiModel / TargetCondCode / TargetResultRule /
+// TargetRegClass / TargetEncodingShape) — same silent-fallback
+// shape applies to each.
+static_assert(kCallConvTable.rows.size()
+              == static_cast<std::size_t>(CallConv::CcSpirv) + 1u,
+    "kCallConvTable must cover every CallConv — add the new row "
+    "when extending the enum or HIR/MIR text will silently emit "
+    "row-0 ('sysv') for the missing value.");
+static_assert([]{
+    for (std::size_t i = 0; i < kCallConvTable.rows.size(); ++i) {
+        if (static_cast<std::size_t>(kCallConvTable.rows[i].first) != i) {
+            return false;
+        }
+    }
+    return true;
+}(), "kCallConvTable rows must be ordered by CallConv underlying "
+     "value (enables O(1) name lookup AND surfaces a row-vs-enum "
+     "misorder at constexpr time).");
+
 // Universal integer-comparison condition codes (target-blind). Used by
 // LIR `jcc` (conditional branch) and `setcc` (materialize 0/1 from
 // FLAGS) opcodes via the LIR instruction's `payload` field. Every
