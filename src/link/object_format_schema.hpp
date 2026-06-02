@@ -637,6 +637,39 @@ struct DSS_EXPORT ObjectFormatData {
     // to compute the entry virtual address.
     std::string entryPoint;
 
+    // ── D-LK10-ENTRY Slice B (plan 14 §2.13): ProcessExit substrate ──
+    //
+    // The trampoline emitter (Slice C) reads these two fields to
+    // construct a one-function `Lir` module that calls the user
+    // entry then issues the OS process-exit request.
+    //
+    // `processExit`: per-OS exit mechanism (Syscall or ByNameImport),
+    // populated from the format JSON's `processExit` block.
+    // nullopt = format declared no exit mechanism (`encodeExec` path
+    // is then not runnable; the trampoline emitter fails loud).
+    // Vocabulary types (`ExitMechanism` + `ProcessExit`) live in
+    // `core/types/target_schema.hpp` alongside the other
+    // closed-enum schema vocabulary.
+    std::optional<ProcessExit> processExit;
+
+    // `entryCallingConvention`: name of the calling convention the
+    // trampoline emitter resolves via
+    // `target.callingConventionByName(...)` to look up the
+    // status-arg register (the cc's `argGprs[0]`) the trampoline
+    // moves the user fn's return value into. Per-OS data: PE-Exec =
+    // "ms_x64"; ELF/Mach-O-Exec = "sysv_amd64"; ARM64 = "aapcs64".
+    //
+    // Without this field, the cc selection would be undefined: ML7
+    // callconv lowering (the normal cc selector per function
+    // attribute / driver flag) is BYPASSED by the trampoline
+    // emitter, so the format must declare the active cc explicitly.
+    // Empty on relocatable artifacts (.o) and on exec formats that
+    // do not declare `processExit`. The format-side validate() rule
+    // requires non-empty `entryCallingConvention` whenever
+    // `processExit.has_value()` (paired closure — both fields go
+    // together).
+    std::string entryCallingConvention;
+
     // Cross-field invariants:
     //   * relocations: kind != 0, kind unique cross-row, name unique
     //     + non-empty, nativeId != 0 when relocations are non-empty.
@@ -741,6 +774,14 @@ public:
     // emit time to compute the runtime entry virtual address.
     [[nodiscard]] std::string_view entryPoint() const noexcept {
         return d_.entryPoint;
+    }
+
+    // ── D-LK10-ENTRY Slice B accessors ──────────────────────────
+    [[nodiscard]] std::optional<ProcessExit> const& processExit() const noexcept {
+        return d_.processExit;
+    }
+    [[nodiscard]] std::string_view entryCallingConvention() const noexcept {
+        return d_.entryCallingConvention;
     }
 
     // ── Loaders ───────────────────────────────────────────────

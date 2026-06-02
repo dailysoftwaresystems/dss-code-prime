@@ -9,8 +9,19 @@
     "kind": "elf"
   },
 
-  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol (e.g. '_start' for Linux/glibc, 'main' for hand-rolled execs) and the walker will resolve it by name. For now, leave empty.",
+  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol (e.g. '_start' for Linux/glibc, 'main' for hand-rolled execs) and the walker will resolve it by name. When D-LK10-ENTRY Slice C lands, the linker prepends a synthetic `_start` trampoline as module.functions[0] and the schema's entryPoint names the USER fn (the trampoline's call target).",
   "entryPoint": "",
+
+  "$processExitComment": "D-LK10-ENTRY Slice B (plan 14 §2.13): the Linux runnable-binary spine — raw `exit_group` syscall (no libc, fully hermetic). The trampoline emitter loads the syscall number into rax via `mov eax, 231` (Slice A's `mov` opcode), moves the user fn's return value from rax into rdi (argGprs[0] of sysv_amd64), then issues SYSCALL (Slice A's new `syscall` opcode). x86_64 Linux syscall ABI: rax = syscall number, rdi = arg0 (status). syscallOpcodeBytes [15, 5] = 0x0F 0x05 = SYSCALL.",
+  "processExit": {
+    "mechanism": "syscall",
+    "syscallNumber": 231,
+    "syscallNumGpr": "rax",
+    "syscallOpcodeBytes": [15, 5]
+  },
+
+  "$entryCallingConventionComment": "SysV AMD64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rdi before SYSCALL. Read via `target.callingConventionByName(\"sysv_amd64\")` at trampoline-build time.",
+  "entryCallingConvention": "sysv_amd64",
 
   "elf": {
     "$comment": "Elf64_Ehdr identity for an executable. type = ET_EXEC (2). class = ELFCLASS64; data = ELFDATA2LSB; osabi = sysv; machine = EM_X86_64 (62). pageAlign = 4096 (Linux x86_64 4 KB pages — kernel's PT_LOAD congruence requires p_vaddr % p_align == p_offset % p_align). ARM64 Linux on Apple Silicon / 64K configurations declares 16384 / 65536 in its own schema (D-LK6-3).",

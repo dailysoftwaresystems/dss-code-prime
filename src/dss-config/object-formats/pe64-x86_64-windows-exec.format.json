@@ -9,8 +9,18 @@
     "kind": "pe"
   },
 
-  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention — same as LK1 ELF ET_EXEC). Real-name resolution closes with D-LK1-1 (HIR→LIR symbol-name thread).",
+  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention — same as LK1 ELF ET_EXEC). Real-name resolution closes with D-LK1-1 (HIR→LIR symbol-name thread). When D-LK10-ENTRY Slice C lands, the linker prepends a synthetic `_start` trampoline as module.functions[0] and the schema's entryPoint names the USER fn (the trampoline's call target) — see plan 14 §2.13.",
   "entryPoint": "",
+
+  "$processExitComment": "D-LK10-ENTRY Slice B (plan 14 §2.13): the Windows runnable-binary spine. Trampoline emitter issues `call qword ptr [iat_ExitProcess]` to kernel32.dll's ExitProcess — no CRT needed. The linker injects a synthetic `ExternImport{kernel32.dll, ExitProcess}` into module.externImports; the existing IAT writer (LK6 cycle 2a) emits the IAT slot; the new `call_indirect_via_extern` LIR opcode (Slice A) emits FF 15 disp32 with a REL32 reloc on the disp32 patch site targeting the synthetic import's SymbolId.",
+  "processExit": {
+    "mechanism": "by-name-import",
+    "importLibraryPath": "kernel32.dll",
+    "importMangledName": "ExitProcess"
+  },
+
+  "$entryCallingConventionComment": "MS x64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rcx before the indirect ExitProcess call. Read via `target.callingConventionByName(\"ms_x64\")` at trampoline-build time.",
+  "entryCallingConvention": "ms_x64",
 
   "pe": {
     "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = IMAGE_FILE_EXECUTABLE_IMAGE (0x0002) | IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) = 0x0022. type = exec.",

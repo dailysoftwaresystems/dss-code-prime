@@ -770,6 +770,101 @@ inline constexpr EnumNameTable<RelocFormulaKind, 4> kRelocFormulaTable{{{
 [[nodiscard]] DSS_EXPORT std::string_view
     relocFormulaName(RelocFormulaKind k) noexcept;
 
+// ── D-LK10-ENTRY: ProcessExit substrate (plan 14 §2.13 Slice B) ────
+//
+// Vocabulary types for the runnable-binary spine's process-exit
+// mechanism. The FIELD lives on `ObjectFormatData` (not
+// `TargetSchemaData`) because the mechanism + syscall number +
+// import library are per-OS data, and format JSONs are already
+// keyed per CPU × OS. These types live here in `target_schema.hpp`
+// alongside the other closed-enum vocabulary (RelocFormulaKind,
+// TargetCondCode, TargetAbiModel, ...) — the vocabulary is shared
+// between target + format schema layers even though the field is
+// format-side. The trampoline emitter (Slice C) reads the field
+// via `formatSchema.processExit()` and dispatches on
+// `ExitMechanism` (closed-enum, no `if (os == ...)` branches).
+//
+//   * `Syscall`        — raw kernel transition (Linux `exit_group`,
+//                        macOS BSD `exit`). Per-OS data: syscall
+//                        number, syscall-num register name, syscall
+//                        opcode bytes.
+//   * `ByNameImport`   — call through an extern-import IAT slot
+//                        (Windows `kernel32!ExitProcess`, future
+//                        macOS libSystem). Per-OS data: library
+//                        path, mangled name.
+//   * `None`           — sentinel; format declared no exit
+//                        mechanism. The trampoline emitter fails
+//                        loud `K_NoMatchingObjectFormat` on this
+//                        (silent OS-defaulting would break runnable
+//                        binaries).
+enum class ExitMechanism : std::uint8_t {
+    None         = 0,  // sentinel — format declared no exit mechanism
+    Syscall      = 1,  // raw syscall (Linux exit_group / Mach-O BSD exit)
+    ByNameImport = 2,  // call qword ptr [iat] (Windows ExitProcess)
+};
+
+inline constexpr EnumNameTable<ExitMechanism, 3> kExitMechanismTable{{{
+    { ExitMechanism::None,         "none"           },
+    { ExitMechanism::Syscall,      "syscall"        },
+    { ExitMechanism::ByNameImport, "by-name-import" },
+}}};
+
+[[nodiscard]] constexpr std::string_view exitMechanismName(ExitMechanism m) noexcept {
+    return kExitMechanismTable.name(m);
+}
+[[nodiscard]] constexpr std::optional<ExitMechanism>
+exitMechanismFromName(std::string_view s) noexcept {
+    return kExitMechanismTable.fromName(s);
+}
+
+// Per-OS process-exit descriptor. Lives on `ObjectFormatData`
+// (loaded from format JSON's `processExit` block). The trampoline
+// emitter reads the active arm based on `mechanism`:
+//
+// For Syscall (Linux / macOS-BSD-syscall):
+//   * `syscallNumber`      — syscall-table index (Linux x86_64
+//                            exit_group = 231; ARM64 Linux = 94;
+//                            macOS BSD exit = 0x2000001).
+//   * `syscallNumGpr`      — register that holds the syscall number
+//                            at the syscall transition ("rax" on
+//                            x86_64; "x8" on ARM64).
+//   * `syscallOpcodeBytes` — instruction bytes the emitter writes
+//                            verbatim to invoke the kernel
+//                            ("0F 05" SYSCALL on x86_64; "D4 00 00
+//                            01" SVC #0 on ARM64). NOT used by
+//                            Slice B's LIR-driven emitter (which
+//                            emits the `syscall` opcode through
+//                            the assembler) — kept on the
+//                            substrate for Slice C if the syscall
+//                            instruction differs per kernel (e.g.
+//                            BSD `int 0x80` legacy path) without
+//                            requiring a new LIR opcode.
+//
+// For ByNameImport (Windows / macOS-libSystem):
+//   * `importLibraryPath`  — DLL/dylib path ("kernel32.dll" on
+//                            Windows; future "/usr/lib/libSystem.B
+//                            .dylib" on macOS).
+//   * `importMangledName`  — on-binary symbol name ("ExitProcess"
+//                            on Windows; "_exit" with leading
+//                            underscore via D-FF4 on macOS).
+//
+// The `statusArgGpr` is intentionally NOT a field — it's read from
+// the format's `entryCallingConvention.argGprs[0]` (preserves
+// single source of truth for the calling-convention register
+// vocabulary).
+struct DSS_EXPORT ProcessExit {
+    ExitMechanism mechanism = ExitMechanism::None;
+
+    // Syscall arm
+    std::uint32_t            syscallNumber     = 0;
+    std::string              syscallNumGpr;
+    std::vector<std::uint8_t> syscallOpcodeBytes;
+
+    // ByNameImport arm
+    std::string importLibraryPath;
+    std::string importMangledName;
+};
+
 [[nodiscard]] DSS_EXPORT std::optional<RelocFormulaKind>
     parseRelocFormulaKind(std::string_view s) noexcept;
 

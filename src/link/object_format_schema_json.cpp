@@ -198,6 +198,144 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // D-LK10-ENTRY Slice B (plan 14 §2.13): `entryCallingConvention`
+    // — names the cc the trampoline emitter resolves via
+    // `target.callingConventionByName(...)`. Required (cross-field
+    // rule in validate() below) whenever `processExit` is declared;
+    // shipped values: "ms_x64" for PE-Exec, "sysv_amd64" for ELF/
+    // Mach-O-Exec, "aapcs64" for ARM64.
+    if (doc.contains("entryCallingConvention")) {
+        if (!doc.at("entryCallingConvention").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/entryCallingConvention",
+                      "'entryCallingConvention' must be a string");
+        } else {
+            data.entryCallingConvention =
+                doc.at("entryCallingConvention").get<std::string>();
+        }
+    }
+
+    // D-LK10-ENTRY Slice B: `processExit` block. Two arms keyed on
+    // `mechanism`:
+    //   "syscall"        requires syscallNumber (u32) +
+    //                    syscallNumGpr (string) +
+    //                    syscallOpcodeBytes (array of u8, non-empty).
+    //   "by-name-import" requires importLibraryPath (string,
+    //                    non-empty) + importMangledName (string,
+    //                    non-empty).
+    if (doc.contains("processExit")) {
+        if (!doc.at("processExit").is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/processExit",
+                      "'processExit' must be an object");
+        } else {
+            auto const& pe = doc.at("processExit");
+            ProcessExit out;
+            bool armOk = true;
+            if (!pe.contains("mechanism")
+             || !pe.at("mechanism").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/processExit/mechanism",
+                          "'processExit.mechanism' must be a string "
+                          "(\"syscall\" or \"by-name-import\")");
+                armOk = false;
+            } else {
+                auto const mechName =
+                    pe.at("mechanism").get<std::string>();
+                auto const m = exitMechanismFromName(mechName);
+                if (!m.has_value() || *m == ExitMechanism::None) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/processExit/mechanism",
+                              std::format("unknown processExit.mechanism"
+                                          " '{}' — accepted: "
+                                          "\"syscall\", \"by-name-"
+                                          "import\"", mechName));
+                    armOk = false;
+                } else {
+                    out.mechanism = *m;
+                    if (out.mechanism == ExitMechanism::Syscall) {
+                        if (!pe.contains("syscallNumber")
+                         || !pe.at("syscallNumber").is_number_unsigned()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processExit/syscallNumber",
+                                      "syscall arm requires "
+                                      "'syscallNumber' (u32)");
+                            armOk = false;
+                        } else {
+                            out.syscallNumber =
+                                pe.at("syscallNumber").get<std::uint32_t>();
+                        }
+                        if (!pe.contains("syscallNumGpr")
+                         || !pe.at("syscallNumGpr").is_string()
+                         || pe.at("syscallNumGpr").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processExit/syscallNumGpr",
+                                      "syscall arm requires non-empty "
+                                      "'syscallNumGpr' (string)");
+                            armOk = false;
+                        } else {
+                            out.syscallNumGpr =
+                                pe.at("syscallNumGpr").get<std::string>();
+                        }
+                        if (!pe.contains("syscallOpcodeBytes")
+                         || !pe.at("syscallOpcodeBytes").is_array()
+                         || pe.at("syscallOpcodeBytes").empty()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processExit/syscallOpcodeBytes",
+                                      "syscall arm requires non-empty "
+                                      "'syscallOpcodeBytes' (array of u8)");
+                            armOk = false;
+                        } else {
+                            auto const& arr = pe.at("syscallOpcodeBytes");
+                            for (std::size_t bi = 0; bi < arr.size(); ++bi) {
+                                if (!arr[bi].is_number_unsigned()
+                                 || arr[bi].get<std::uint64_t>() > 0xFFu) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              std::format("/processExit/syscallOpcodeBytes/{}", bi),
+                                              "each entry must be u8 (0..255)");
+                                    armOk = false;
+                                    continue;
+                                }
+                                out.syscallOpcodeBytes.push_back(
+                                    static_cast<std::uint8_t>(
+                                        arr[bi].get<std::uint32_t>()));
+                            }
+                        }
+                    } else {  // ByNameImport
+                        if (!pe.contains("importLibraryPath")
+                         || !pe.at("importLibraryPath").is_string()
+                         || pe.at("importLibraryPath").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processExit/importLibraryPath",
+                                      "by-name-import arm requires "
+                                      "non-empty 'importLibraryPath' "
+                                      "(string)");
+                            armOk = false;
+                        } else {
+                            out.importLibraryPath =
+                                pe.at("importLibraryPath").get<std::string>();
+                        }
+                        if (!pe.contains("importMangledName")
+                         || !pe.at("importMangledName").is_string()
+                         || pe.at("importMangledName").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processExit/importMangledName",
+                                      "by-name-import arm requires "
+                                      "non-empty 'importMangledName' "
+                                      "(string)");
+                            armOk = false;
+                        } else {
+                            out.importMangledName =
+                                pe.at("importMangledName").get<std::string>();
+                        }
+                    }
+                }
+            }
+            if (armOk) {
+                data.processExit = std::move(out);
+            }
+        }
+    }
+
     // relocations[] — substrate-tier; shares the cross-side
     // `relocation_table.hpp` substrate with TargetSchema so the
     // `{name, kind}` shape of plan 13 §2.6's reloc-taxonomy unifier

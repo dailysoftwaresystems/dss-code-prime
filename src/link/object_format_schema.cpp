@@ -794,6 +794,28 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // D-LK10-ENTRY Slice B (plan 14 §2.13): cross-field coherence
+    // between `processExit` and `entryCallingConvention`. Both go
+    // together — the trampoline emitter needs both to construct the
+    // LIR sequence (mechanism dispatch + status-arg-register
+    // lookup). Declaring one without the other is a silent
+    // under-spec that would surface only at Slice C emitter time.
+    if (processExit.has_value() && entryCallingConvention.empty()) {
+        fail("/entryCallingConvention",
+             "format declares `processExit` but `entryCallingConvention`"
+             " is empty — Slice C trampoline emitter requires the "
+             "active calling convention's name to look up "
+             "argGprs[0] (status-arg register). Both fields must "
+             "be declared together. (D-LK10-ENTRY §2.13.)");
+    }
+    if (!processExit.has_value() && !entryCallingConvention.empty()) {
+        fail("/processExit",
+             "format declares `entryCallingConvention` but no "
+             "`processExit` block — both fields are paired "
+             "(D-LK10-ENTRY §2.13). Either declare both or "
+             "neither.");
+    }
+
     return problems;
 }
 
