@@ -166,7 +166,7 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Hard-trap / 'this code path is unreachable'. Cycle 3b lowers MIR Unreachable via `LirBuilder::addUnreachable` (the dedicated zero-successor terminator API added in cycle 3b's review fix-up). AS1 maps to x86_64 ud2; ML6 keeps it block-sealing-equivalent.",
+      "$comment": "Hard-trap / 'this code path is unreachable'. Cycle 3b lowers MIR Unreachable via `LirBuilder::addUnreachable` (the dedicated zero-successor terminator API added in cycle 3b's review fix-up). AS1 maps to x86_64 ud2 (encoding `0F 0B`); ML6 keeps it block-sealing-equivalent. Encoding added at D-LK10-ENTRY Slice A (2026-06-02) so the trampoline emitter can append `unreachable` after noreturn syscall / call_indirect_via_extern call sites — reaches `assemble()` and must emit bytes (the assembler contract is 'walker returns true → at least one byte written'). Shape mirrors `ret` line 224: zero-operand variant, no ModR/M, opcode bytes literal.",
       "mnemonic":      "unreachable",
       "result":        "none",
       "terminatorKind": "unreachable",
@@ -174,7 +174,58 @@
       "minOperands":   0,
       "maxOperands":   0,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [15, 11] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-LK10-ENTRY Slice A: raw kernel transition (Linux exit_group / Mach-O BSD exit). Zero-operand, no result, no successors, NOT a terminator (general-case opcode: FF6 hello-world's `write` syscall returns to the next instruction; only the trampoline's `exit` syscall is noreturn, and that's signaled by the trampoline emitter appending a separate `unreachable` after). Encoding: x86_64 SYSCALL `0F 05` — fixed 2-byte opcode, same shape vocabulary as `ret` and the new `unreachable`. The syscall-number register is loaded into `rax` (or per the target's `syscallNumGpr` field on format schema's `processExit` — Slice B) by a preceding LIR `mov` op, NOT a payload on `syscall` itself.",
+      "mnemonic":      "syscall",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [15, 5] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-LK10-ENTRY Slice A: indirect call through an extern-import IAT slot (Windows kernel32!ExitProcess, future macOS libSystem imports). x86_64 encoding `FF 15 disp32` (call qword ptr [RIP + disp32]) — the same 4-byte disp32 + REL32 reloc shape as the existing `call rel32` (E8 disp32) opcode at line 201, just with a 2-byte opcode literal `[255, 21]` (FF + ModR/M byte 15h = mod=00 reg=/2 rm=101 → [RIP+disp32]). NOT a terminator (general-case indirect call; the trampoline emitter appends `unreachable` after when the callee is noreturn like ExitProcess). 1 operand = ExternImport SymbolRef. The REL32 reloc kind (target schema row line 601) computes `S - P - 4` which is exactly what `[RIP+disp32]` resolution needs at load time (S = IAT slot VA, P = the disp32 patch site, RIP at execution = patch + 4).",
+      "mnemonic":      "call_indirect_via_extern",
+      "result":        "none",
+      "hasSideEffects": true,
+      "isCall":        true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["symbol"] },
+            "template": { "opcode": [255, 21] },
+            "wires":    [
+              { "index": 0, "slotKind": "disp32", "relocationKind": "rel32" }
+            ]
+          }
+        ]
+      }
     },
     {
       "mnemonic":      "jmp",

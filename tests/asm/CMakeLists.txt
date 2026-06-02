@@ -9,6 +9,7 @@ dss_add_test(NAME asm/test_asm_arm64_binops  SOURCES test_asm_arm64_binops.cpp)
 dss_add_test(NAME asm/test_lir_2addr_legalize SOURCES test_lir_2addr_legalize.cpp)
 dss_add_test(NAME asm/test_asm_roundtrip      SOURCES test_asm_roundtrip.cpp)
 dss_add_test(NAME asm/test_asm_pipeline       SOURCES test_asm_pipeline.cpp)
+dss_add_test(NAME asm/test_lk10_entry_slice_a SOURCES test_lk10_entry_slice_a.cpp)
 
 # Tests under tests/asm/ share `asm_test_support.hpp` via this
 # include path. test_asm_substrate additionally reuses the LIR
