@@ -13,15 +13,19 @@ namespace {
 // members — still faster than hash lookup at this size + needs no
 // static-init dance.
 //
-// Post-fold #11 silent-failure F2: table expanded from 16→27 to match
-// the documented taxonomy. Missing entries (D-LK6-8.2 split codes,
-// remaining I_* verifier invariants, image-write K_* codes, FFI
-// architectural codes) were silently re-opening their respective
-// failure surfaces under `--suppress=<code>` — particularly the
-// D-LK6-8.2 SIGILL surface (D_TargetMachineCodeMismatch /
-// D_TargetAbiModelMismatch) and the LK10 image-write contract
-// (K_ImageWrite* + K_ImageEmpty).
-constexpr std::array<DiagnosticCode, 56> kUnsuppressableCodes{{
+// Membership rule: a code is unsuppressable when its surface is a
+// load-bearing structural invariant whose silent re-opening (via
+// `--suppress=<code>`) would let a miscompile / wrong-bytes /
+// undefined-extern artifact ship green. Examples in shipped
+// closed-table: D-LK6-8.2 split codes (silent ABI mismatch ⇒
+// SIGILL at user runtime), I_* verifier invariants (SSA / CFG
+// violations sailing through), K_ImageWrite* (silently truncated
+// on-disk image), F_FfiIngest* architectural exclusions (silent
+// wrong-shape FfiMetadata for the wrong abiModel). Table size
+// grows monotonically as new architectural surfaces close; each
+// addition includes a one-line rationale block alongside the
+// entry.
+constexpr std::array<DiagnosticCode, 57> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -38,6 +42,17 @@ constexpr std::array<DiagnosticCode, 56> kUnsuppressableCodes{{
     // names would silently shadow `bySymbol[""]` rows).
     DiagnosticCode::F_FfiIngestAbiModelUnsupported,
     DiagnosticCode::F_FfiIngestEmptyCanonical,
+    // F_FfiNoImportLibraryForFormat (FF6 Slice 2, 2026-06-02): the
+    // source-declared FFI synthesis path fails loud when the active
+    // language's `DeclarationRule.externLibraryByFormat` map has no
+    // entry for the target's ObjectFormatKind. Suppressing this
+    // would let externs land with `importLibrary=""` → downstream
+    // K_FormatLacksImportSupport or K_SymbolUndefined diagnostics
+    // would fire instead, masking the upstream config gap and
+    // forcing operators to debug from the wrong end of the
+    // pipeline. The closed-table membership pins the upstream
+    // surface.
+    DiagnosticCode::F_FfiNoImportLibraryForFormat,
     // F_BinaryReaderPartialCorruption (silent-failure-hunter
     // 2nd-order audit on 9dbdc8e): the Warning's stated intent is
     // "operators must see this signal". Without unsuppressable

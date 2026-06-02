@@ -146,6 +146,13 @@ struct Lowerer {
 
     // pendingSpans (shared): applied to the result's HirSourceMap after finish().
     std::vector<std::pair<HirNodeId, HirSourceLoc>>& spans;
+    // FF6 Slice 2 (2026-06-02): shared accumulator for source-
+    // declared externs, one record per `lowerExternDecl` call
+    // that successfully produced an ExternFunction / ExternGlobal
+    // HIR node. Consumed by `compileSingleUnit` via
+    // `synthesizeFfiFromSourceDecls` to populate the
+    // `HirFfiMap` between HIR and MIR lowering.
+    std::vector<HirExternRecord>& externDecls;
 
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
@@ -241,9 +248,10 @@ struct Lowerer {
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
-            HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp)
+            HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
+            std::vector<HirExternRecord>& ed)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
-          reporter(r), builder(b), literals(lits), spans(sp) {
+          reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -2546,6 +2554,20 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // FF6 Slice 2 (2026-06-02 + post-fold #1 simplifier): record
+        // the extern for FFI synthesis. The canonical name comes
+        // from the SymbolRecord (unmangled identifier as declared
+        // in source). Empty name when the semantic phase couldn't
+        // resolve the symbol — synthesize() then fails loud with
+        // F_FfiIngestEmptyCanonical PROVIDED the language has a
+        // per-format library entry; if the language config has no
+        // entry the upstream F_FfiNoImportLibraryForFormat fires
+        // FIRST and short-circuits before the per-extern guard.
+        // Both surfaces are unsuppressable + upstream-of-link.
+        auto recordExtern = [&](HirNodeId h) {
+            auto const* rec = model.recordFor(sym);
+            externDecls.push_back({h, rec ? rec->name : std::string{}});
+        };
         if (decl.kindByChild) {
             NodeId disc = descend(node, decl.kindByChild->childPath);
             if (disc.valid() && tree().kind(disc) == NodeKind::Internal
@@ -2553,7 +2575,10 @@ struct Lowerer {
                 std::vector<HirNodeId> params;
                 NodeId paramsNode = descend(disc, decl.kindByChild->paramsPath);
                 if (paramsNode.valid()) collectParams(paramsNode, params);
-                return track(builder.makeExternFunction(type, sym.v, params), node);
+                HirNodeId const n =
+                    track(builder.makeExternFunction(type, sym.v, params), node);
+                recordExtern(n);
+                return n;
             }
         }
         // D-FF2-3: reject `extern int x = 5;` (and `= y`, `= {}`, etc.).
@@ -2623,7 +2648,9 @@ struct Lowerer {
                   "translation unit; remove the initializer");
             return errorNode(node);
         }
-        return track(builder.makeExternGlobal(type, sym.v), node);
+        HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), node);
+        recordExtern(g);
+        return g;
     }
 
     HirNodeId lowerFunction(NodeId node, SymbolId sym, TypeId sig,
@@ -2736,6 +2763,10 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     HirBuilder builder{model.unit().compositeSourceLanguage()};
     HirLiteralPool literals;
     std::vector<std::pair<HirNodeId, HirSourceLoc>> spans;
+    // FF6 Slice 2 (2026-06-02): shared accumulator for source-
+    // declared externs across every per-schema Lowerer. Moved
+    // into the result struct after lowering completes.
+    std::vector<HirExternRecord> externDecls;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -2746,7 +2777,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         if (lowerers.contains(sch.schemaId().v)) continue;
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
-            reporter, builder, literals, spans));
+            reporter, builder, literals, spans, externDecls));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -2762,6 +2793,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
 
     auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
+    result->externDecls = std::move(externDecls);
 
     // verify-on-load.
     HirVerifier verifier{result->hir, &result->sourceMap, &model.lattice().interner()};

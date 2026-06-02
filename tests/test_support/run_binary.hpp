@@ -25,7 +25,25 @@
 // POSIX arm also chmod+x the spawned binary so `posix_spawn`
 // can exec it (the linker writes 0644 by default; a caller that
 // already applied 0755 sees the redundant chmod as a no-op).
+//
+// stdout capture (Plan 11 FF6 Slice 1, 2026-06-02). When
+// `captureStdout=true` the harness redirects the child's
+// STDOUT + STDERR to an anonymous pipe, drains it after the
+// child exits, and reports the captured bytes in
+// `RunResult.capturedStdout`. Defaults to OFF so the existing
+// 8 D-LK10-ENTRY examples (exit-code-only assertions) stay
+// behaviorally identical (the child keeps inheriting the
+// parent's stdio handles when capture is off).
+//
+// The capture path is the prerequisite for the FF6 hello-world
+// example pin — without it, a silent print-failure (e.g. a CRT
+// init bug or a wrong `puts` mangling) would leave `return 42`
+// untouched and the test would pass with no output. We assert
+// captured_stdout == "hello\n" alongside exit==42 so a
+// regression in ANY layer (FFI mangling, .idata layout, CRT
+// init, msvcrt's puts, file-descriptor wiring) trips the pin.
 
+#include <algorithm>  // std::min in the POSIX poll-loop arm
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -46,6 +64,7 @@
   #include <windows.h>
 #else
   #include <errno.h>
+  #include <fcntl.h>
   #include <signal.h>
   #include <spawn.h>
   #include <sys/stat.h>
@@ -62,16 +81,35 @@ struct RunResult {
     bool          timedOut   = false;  // child exceeded the timeout
     std::uint32_t exitCode   = 0;      // valid when spawned && !timedOut
     std::string   diagnostic;          // populated on any failure
+    // FF6 Slice 1: child's stdout+stderr bytes. Populated only
+    // when `captureStdout=true` was passed to runBinary. Empty
+    // string is a VALID outcome (child printed nothing); callers
+    // that care about silent-print regressions must compare
+    // against an explicit expected payload, not "nonempty".
+    std::string   capturedStdout;
 };
 
 // Spawn `binaryPath` and wait up to `timeout` for it to exit.
 // Returns the captured exit code or a diagnostic. The child runs
-// with no arguments and inherits the parent's stdio handles (its
-// stdout/stderr appear in the test runner output).
+// with no arguments.
+//
+// `captureStdout=false` (default): the child inherits the
+// parent's stdio handles; its stdout/stderr appear in the test
+// runner's output. Existing exit-code-only pins use this mode.
+//
+// `captureStdout=true`: STDOUT + STDERR are redirected to an
+// anonymous pipe (merged — both streams land in the same
+// buffer). After the child exits, the harness drains the read
+// end and stores the bytes in `RunResult.capturedStdout`. STDIN
+// is left attached to the parent's handle (no current pin reads
+// stdin; we anchor the split-pipe variant as
+// `D-RUN-HARNESS-STDIO-SPLIT` if a future case needs separate
+// stdout/stderr streams).
 [[nodiscard]] inline RunResult
 runBinary(std::filesystem::path const&     binaryPath,
           std::chrono::milliseconds        timeout =
-              std::chrono::milliseconds{5000}) {
+              std::chrono::milliseconds{5000},
+          bool                             captureStdout = false) {
     RunResult out;
 
 #if defined(_WIN32)
@@ -81,8 +119,45 @@ runBinary(std::filesystem::path const&     binaryPath,
         return out;
     }
 
+    // Pipe for capturing child stdout (+ stderr merged). The
+    // WRITE end is marked inheritable via SECURITY_ATTRIBUTES so
+    // CreateProcess's `bInheritHandles=TRUE` propagates it to
+    // the child; the READ end is then explicitly turned non-
+    // inheritable via SetHandleInformation so the child can't
+    // accidentally inherit it (which would keep the pipe alive
+    // past the child's exit and stall our ReadFile-until-EOF
+    // loop in the parent).
+    HANDLE pipeRead  = nullptr;
+    HANDLE pipeWrite = nullptr;
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength              = sizeof(sa);
+    sa.bInheritHandle       = TRUE;
+    sa.lpSecurityDescriptor = nullptr;
+    if (captureStdout) {
+        if (!::CreatePipe(&pipeRead, &pipeWrite, &sa, 0u)) {
+            out.diagnostic = "CreatePipe failed (GetLastError="
+                           + std::to_string(::GetLastError()) + ")";
+            return out;
+        }
+        if (!::SetHandleInformation(pipeRead, HANDLE_FLAG_INHERIT, 0)) {
+            DWORD const err = ::GetLastError();
+            ::CloseHandle(pipeRead);
+            ::CloseHandle(pipeWrite);
+            out.diagnostic = "SetHandleInformation(pipeRead, !INHERIT) "
+                             "failed (GetLastError="
+                           + std::to_string(err) + ")";
+            return out;
+        }
+    }
+
     STARTUPINFOA si{};
     si.cb = sizeof(si);
+    if (captureStdout) {
+        si.dwFlags    = STARTF_USESTDHANDLES;
+        si.hStdInput  = ::GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = pipeWrite;
+        si.hStdError  = pipeWrite;
+    }
     PROCESS_INFORMATION pi{};
 
     // CreateProcessA's `lpCommandLine` is a writable buffer. Quote
@@ -107,11 +182,26 @@ runBinary(std::filesystem::path const&     binaryPath,
 
     if (!ok) {
         DWORD const err = ::GetLastError();
+        if (captureStdout) {
+            ::CloseHandle(pipeRead);
+            ::CloseHandle(pipeWrite);
+        }
         out.diagnostic = "CreateProcessA failed for '" + pathStr
                        + "' (GetLastError=" + std::to_string(err) + ")";
         return out;
     }
     out.spawned = true;
+
+    // Close the parent's copy of the write end. The child holds
+    // its own duplicated handle; the pipe stays open until the
+    // child exits (or closes its stdout explicitly). If we leave
+    // the parent's copy open the ReadFile-until-EOF drain loop
+    // below would hang forever waiting for ITSELF to close the
+    // write end.
+    if (captureStdout) {
+        ::CloseHandle(pipeWrite);
+        pipeWrite = nullptr;
+    }
 
     DWORD const waitMs = static_cast<DWORD>(timeout.count());
     DWORD const wr     = ::WaitForSingleObject(pi.hProcess, waitMs);
@@ -132,6 +222,50 @@ runBinary(std::filesystem::path const&     binaryPath,
     } else {
         out.diagnostic = "WaitForSingleObject returned "
                        + std::to_string(wr);
+    }
+
+    if (captureStdout) {
+        // Drain pipe AFTER child exit. Buffer is bounded by the
+        // pipe's default kernel allocation (typically 4-64 KiB);
+        // FF6 hello-world prints ~6 bytes so a one-shot ReadFile
+        // typically returns everything, but we loop until EOF
+        // (ReadFile returns FALSE with GetLastError() ==
+        // ERROR_BROKEN_PIPE when the child's write end is closed
+        // AND the read buffer is drained — that's the EOF
+        // signal) so a future large-output test doesn't get a
+        // silently-truncated capture.
+        char readBuf[4096];
+        for (;;) {
+            DWORD bytesRead = 0;
+            BOOL const rok = ::ReadFile(pipeRead, readBuf,
+                                        sizeof(readBuf),
+                                        &bytesRead, nullptr);
+            if (rok && bytesRead > 0) {
+                out.capturedStdout.append(readBuf, bytesRead);
+                continue;
+            }
+            if (!rok) {
+                DWORD const err = ::GetLastError();
+                if (err == ERROR_BROKEN_PIPE) {
+                    // EOF — child closed its write end and we've
+                    // drained everything.
+                    break;
+                }
+                // Any other ReadFile failure: report it but keep
+                // whatever we managed to capture so far.
+                if (out.diagnostic.empty()) {
+                    out.diagnostic = "ReadFile(pipe) failed "
+                                     "(GetLastError="
+                                   + std::to_string(err) + ")";
+                }
+                break;
+            }
+            // rok && bytesRead == 0: anonymous pipes return this
+            // only after EOF in some configurations; treat as
+            // EOF for safety.
+            break;
+        }
+        ::CloseHandle(pipeRead);
     }
 
     ::CloseHandle(pi.hProcess);
@@ -166,30 +300,83 @@ runBinary(std::filesystem::path const&     binaryPath,
         return out;
     }
 
+    // Pipe for stdout+stderr capture. Read end stays in parent
+    // (close-on-exec so children spawned by parent later don't
+    // inherit it); write end is dup'd to the child's STDOUT_FILENO
+    // + STDERR_FILENO via posix_spawn_file_actions, then closed in
+    // both parent and child.
+    int pipeFds[2] = {-1, -1};
+    posix_spawn_file_actions_t actions{};
+    bool actionsInited = false;
+    if (captureStdout) {
+        if (::pipe(pipeFds) != 0) {
+            out.diagnostic = "pipe() failed: errno="
+                           + std::to_string(errno);
+            return out;
+        }
+        // Mark parent's read end FD_CLOEXEC so later spawns from
+        // this process don't accidentally inherit it.
+        int const rdFlags = ::fcntl(pipeFds[0], F_GETFD);
+        if (rdFlags != -1) {
+            ::fcntl(pipeFds[0], F_SETFD, rdFlags | FD_CLOEXEC);
+        }
+        if (::posix_spawn_file_actions_init(&actions) != 0) {
+            ::close(pipeFds[0]);
+            ::close(pipeFds[1]);
+            out.diagnostic = "posix_spawn_file_actions_init failed: "
+                             "errno=" + std::to_string(errno);
+            return out;
+        }
+        actionsInited = true;
+        // Dup write end onto child's stdout (fd 1) + stderr (fd 2).
+        ::posix_spawn_file_actions_adddup2(&actions, pipeFds[1], 1);
+        ::posix_spawn_file_actions_adddup2(&actions, pipeFds[1], 2);
+        // Close the (now-redundant) original write FD in the child
+        // after the dup2 so the pipe gets a clean EOF after exit.
+        ::posix_spawn_file_actions_addclose(&actions, pipeFds[1]);
+        // Also close the read end in the child — leaking it
+        // there would keep our drain loop blocked.
+        ::posix_spawn_file_actions_addclose(&actions, pipeFds[0]);
+    }
+
     char const* const argv[] = {pathStr.c_str(), nullptr};
     pid_t pid = -1;
     int const rc = ::posix_spawn(
         &pid,
         pathStr.c_str(),
-        /*file_actions*/ nullptr,
+        /*file_actions*/ captureStdout ? &actions : nullptr,
         /*attrp*/        nullptr,
         // posix_spawn signature wants `char* const argv[]` — cast
         // here because the strings we own are read-only by contract;
         // the child won't mutate them across exec.
         const_cast<char* const*>(argv),
         environ);
+    if (captureStdout && actionsInited) {
+        ::posix_spawn_file_actions_destroy(&actions);
+    }
     if (rc != 0) {
+        if (captureStdout) {
+            ::close(pipeFds[0]);
+            ::close(pipeFds[1]);
+        }
         out.diagnostic = "posix_spawn('" + pathStr + "') failed: rc="
                        + std::to_string(rc);
         return out;
     }
     out.spawned = true;
+    // Parent closes its write-end copy so EOF reaches the read
+    // end after the child exits.
+    if (captureStdout) {
+        ::close(pipeFds[1]);
+        pipeFds[1] = -1;
+    }
 
     auto const start  = std::chrono::steady_clock::now();
     auto const deadline = start + timeout;
 
     int status = 0;
-    while (true) {
+    bool finished = false;
+    while (!finished) {
         pid_t const w = ::waitpid(pid, &status, WNOHANG);
         if (w == pid) {
             // Child exited.
@@ -211,11 +398,15 @@ runBinary(std::filesystem::path const&     binaryPath,
                 out.diagnostic = "waitpid returned with unknown "
                                  "status word " + std::to_string(status);
             }
-            return out;
+            finished = true;
+            break;
         }
         if (w == -1) {
             out.diagnostic = "waitpid(pid=" + std::to_string(pid)
                            + ") failed: errno=" + std::to_string(errno);
+            if (captureStdout) {
+                ::close(pipeFds[0]);
+            }
             return out;
         }
         // w == 0 → child still running.
@@ -228,6 +419,9 @@ runBinary(std::filesystem::path const&     binaryPath,
             out.timedOut   = true;
             out.diagnostic = "child timed out after "
                            + std::to_string(timeout.count()) + " ms";
+            if (captureStdout) {
+                ::close(pipeFds[0]);
+            }
             return out;
         }
         auto const remaining =
@@ -237,6 +431,35 @@ runBinary(std::filesystem::path const&     binaryPath,
             remaining, std::chrono::milliseconds{10});
         std::this_thread::sleep_for(slice);
     }
+
+    if (captureStdout) {
+        // Drain pipe after child exit. read() returns 0 on EOF
+        // (parent's write end + all child write ends closed).
+        char readBuf[4096];
+        for (;;) {
+            ssize_t const n = ::read(pipeFds[0], readBuf,
+                                     sizeof(readBuf));
+            if (n > 0) {
+                out.capturedStdout.append(readBuf,
+                                          static_cast<std::size_t>(n));
+                continue;
+            }
+            if (n == 0) {
+                // EOF.
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (out.diagnostic.empty()) {
+                out.diagnostic = "read(pipe) failed: errno="
+                               + std::to_string(errno);
+            }
+            break;
+        }
+        ::close(pipeFds[0]);
+    }
+    return out;
 #endif
 }
 

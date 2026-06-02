@@ -2,10 +2,11 @@
 
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"
-#include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
-#include "core/types/section_kind.hpp"     // SectionKind + kSectionKindTable
+#include "core/types/grammar_schema.hpp"      // ConfigDiagnostic + LoadResult
+#include "core/types/object_format_kind.hpp"  // ObjectFormatKind + kObjectFormatKindTable
+#include "core/types/section_kind.hpp"        // SectionKind + kSectionKindTable
 #include "core/types/strong_ids.hpp"
-#include "core/types/target_schema.hpp"    // EnumNameTable<E,N>
+#include "core/types/target_schema.hpp"       // EnumNameTable<E,N>
 
 #include <array>
 #include <cstdint>
@@ -43,38 +44,15 @@ namespace dss {
 // format = JSON file + new enum entry + new walker arm (when the
 // engine grows format-specific emission, anchored at LK1+).
 //
-// `Unknown` is slot 0 (the project's universal invalid-sentinel
-// discipline — see `TargetEncodingShape::None`, `RelocationKind{}`,
-// strong-ids). A default-constructed `LinkedImage{}` reports
-// `format=Unknown`, NOT a spurious ELF identity.
-enum class ObjectFormatKind : std::uint8_t {
-    Unknown = 0,  // invalid sentinel; default-constructed images
-    Elf     = 1,  // Linux + Android
-    Pe      = 2,  // Windows + Windows-ARM64 (PE/COFF)
-    MachO   = 3,  // macOS + iOS
-    Wasm    = 4,  // Web / WASM runtime — enum slot reserved; engine +
-                  // JSON arrive in plan 18
-    Spirv   = 5,  // GPU shaders — enum slot reserved; engine + JSON
-                  // arrive in plan 17
-};
-
-inline constexpr EnumNameTable<ObjectFormatKind, 6> kObjectFormatKindTable{{{
-    { ObjectFormatKind::Unknown, "unknown" },
-    { ObjectFormatKind::Elf,     "elf"     },
-    { ObjectFormatKind::Pe,      "pe"      },
-    { ObjectFormatKind::MachO,   "macho"   },
-    { ObjectFormatKind::Wasm,    "wasm"    },
-    { ObjectFormatKind::Spirv,   "spirv"   },
-}}};
-
-[[nodiscard]] constexpr std::string_view
-objectFormatKindName(ObjectFormatKind k) noexcept {
-    return kObjectFormatKindTable.name(k);
-}
-[[nodiscard]] constexpr std::optional<ObjectFormatKind>
-objectFormatKindFromName(std::string_view s) noexcept {
-    return kObjectFormatKindTable.fromName(s);
-}
+// `ObjectFormatKind` + helpers extracted to
+// `core/types/object_format_kind.hpp` so non-linker layers (FFI
+// mangling, semantic-config loader) can speak the closed enum
+// without pulling in this header's full 800-LOC substrate. The
+// enum + name table + `objectFormatKindName` /
+// `objectFormatKindFromName` accessors remain visible here via the
+// include above — every existing consumer continues to work
+// without touching its `#include`s. Extraction precedent:
+// `SectionKind` at the D-LK4-RODATA-SUBSTRATE slice.
 
 // `SectionKind` + helpers extracted to `core/types/section_kind.hpp`
 // at the D-LK4-RODATA-SUBSTRATE slice so the upstream assembler can

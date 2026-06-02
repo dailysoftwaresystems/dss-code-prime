@@ -895,6 +895,22 @@ enum class DiagnosticCode : std::uint16_t {
     //   2026-06-01): Mach-O reader emits the same counter+Warning
     //   contract; see src/ffi/binary_readers/macho_reader.cpp.
     F_BinaryReaderPartialCorruption = 0x5018,
+    // F_FfiNoImportLibraryForFormat: FF5 `synthesizeFfiFromSourceDecls`
+    //   (the source-declared sibling of `ingest`, used when the
+    //   language's extern declarations ARE their own authority — no
+    //   header / binary surface read) was invoked with an empty
+    //   `importLibrary` for the active `ObjectFormatKind`. Means the
+    //   language's `DeclarationRule.externLibraryByFormat` map has no
+    //   entry for this format. Remediation: extend the language's
+    //   semantics JSON (e.g. c-subset.lang.json) with an
+    //   `externLibraryByFormat: { "pe": "msvcrt.dll", ... }` entry
+    //   for the missing format. Distinct from
+    //   `F_HeaderEmptyImportLibrary` (which means "a HEADER-source
+    //   caller forgot the library identity at FF2 read time") — this
+    //   code means "the LANGUAGE CONFIG has no per-format library
+    //   declaration for source-declared externs". (FF6 Slice 2,
+    //   2026-06-02.)
+    F_FfiNoImportLibraryForFormat  = 0x5019,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

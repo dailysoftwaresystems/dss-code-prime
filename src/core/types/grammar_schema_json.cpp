@@ -8,6 +8,7 @@
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
+#include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 
 #include <nlohmann/json.hpp>
 
@@ -4403,6 +4404,74 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                               "token kind '{}'", name));
                     } else {
                         cfg.pointerToken = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
+            // FF6 Slice 2 + audit fold (2026-06-02): per-language
+            // `externLibraryByFormat` — runtime library identity
+            // per ObjectFormatKind for source-declared externs.
+            // Object: keys are ObjectFormatKind names ("pe", "elf",
+            // "macho", "wasm", "spirv" — validated via
+            // `objectFormatKindFromName`); values are runtime
+            // library identities. Lives at the LANGUAGE level
+            // (not per-declaration-rule — the pre-fold #1 placement
+            // on `DeclarationRule` was fragile: the pipeline
+            // first-match loop gave non-obvious behavior on
+            // grammars with multiple extern-shaped declaration
+            // rules). c-subset's `externDecl` is the only shipped
+            // declaration that needs it; per-symbol overrides
+            // (`extern "otherlib.dll" int foo();`) are anchored
+            // D-CSUBSET-EXTERN-LIBRARY-SYNTAX.
+            if (sem.contains("externLibraryByFormat")) {
+                auto const& obj = sem.at("externLibraryByFormat");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/externLibraryByFormat",
+                              "'externLibraryByFormat' must be an object "
+                              "mapping format-kind names to library "
+                              "identities");
+                } else {
+                    for (auto it = obj.begin(); it != obj.end(); ++it) {
+                        auto const& formatName = it.key();
+                        auto const& val = it.value();
+                        auto const kindPath = std::format(
+                            "/semantics/externLibraryByFormat/{}",
+                            formatName);
+                        if (!objectFormatKindFromName(
+                                formatName).has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics,
+                                kindPath,
+                                std::format(
+                                    "'{}' is not a recognized "
+                                    "object-format kind "
+                                    "(expected one of 'elf', "
+                                    "'pe', 'macho', 'wasm', "
+                                    "'spirv')",
+                                    formatName));
+                            continue;
+                        }
+                        if (!val.is_string()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics,
+                                kindPath,
+                                "library identity must be a "
+                                "string (e.g. \"msvcrt.dll\", "
+                                "\"libc.so.6\")");
+                            continue;
+                        }
+                        auto const libName = val.get<std::string>();
+                        if (libName.empty()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics,
+                                kindPath,
+                                "library identity must be a "
+                                "non-empty string");
+                            continue;
+                        }
+                        cfg.externLibraryByFormat
+                            .emplace(formatName, libName);
                     }
                 }
             }

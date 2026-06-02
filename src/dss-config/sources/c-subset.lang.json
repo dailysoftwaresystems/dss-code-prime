@@ -550,6 +550,12 @@
   "semantics": {
     "identifierToken": "Identifier",
     "pointerToken":    "StarOp",
+    "$externLibraryByFormatComment": "FF6 Slice 2 + audit fold (2026-06-02): per-format runtime library identity for source-declared externs. compileSingleUnit step 2.5 populates HirAttribute<FfiMetadata> per ExternFunction/ExternGlobal by calling synthesizeFfiFromSourceDecls() with the entry whose key matches objectFormatKindName(format.kind()). Per-LANGUAGE field (not per-declaration-rule) — the post-fold #1 placement on DeclarationRule was fragile; the pipeline first-match-loop would silently pick the wrong rule on grammars with multiple extern-shaped decl rules. Library identities: PE → msvcrt.dll (Win32 C runtime for x86_64 hello-world); ELF → libc.so.6 (glibc on Linux); Mach-O → /usr/lib/libSystem.B.dylib (libSystem dispatcher publishes the libc surface). Per-symbol overrides (`extern \"otherlib.dll\" int foo();`) anchored D-CSUBSET-EXTERN-LIBRARY-SYNTAX.",
+    "externLibraryByFormat": {
+      "pe":    "msvcrt.dll",
+      "elf":   "libc.so.6",
+      "macho": "/usr/lib/libSystem.B.dylib"
+    },
     "declarations": [
       { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword", "warnIfUnused": true,

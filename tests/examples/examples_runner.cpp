@@ -31,6 +31,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -63,6 +64,16 @@ struct ExampleManifest {
     std::string                  language;
     std::string                  source;
     std::int64_t                 exitCode = 0;
+    // FF6 Slice 3 (2026-06-02): optional captured-stdout pin. When
+    // present, the harness routes the child's STDOUT through an
+    // anonymous pipe (`captureStdout=true`) and asserts the
+    // drained bytes match this string exactly. When absent (the
+    // pre-FF6 pattern), the child inherits the parent's stdio
+    // and only the exit code is asserted — preserving every
+    // existing example's behavior. Empty-string is a VALID pin
+    // (asserts the binary printed nothing); the `has_value()`
+    // gate distinguishes "no pin" from "pin to empty".
+    std::optional<std::string>   expectedStdout;
     std::vector<ExampleTarget>   targets;
 };
 
@@ -89,6 +100,14 @@ struct ExampleManifest {
         return m;
     }
     m.exitCode = j.at("exitCode").get<std::int64_t>();
+    if (j.contains("expectedStdout")) {
+        if (!j.at("expectedStdout").is_string()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'expectedStdout' must be a string";
+            return m;
+        }
+        m.expectedStdout = j.at("expectedStdout").get<std::string>();
+    }
     if (!j.contains("targets") || !j.at("targets").is_array()
         || j.at("targets").empty()) {
         ADD_FAILURE() << "manifest " << path.generic_string()
@@ -177,7 +196,10 @@ void runOneTarget(fs::path const&        exampleDir,
         return;
     }
 
-    auto const result = runBinary(artifactPath);
+    bool const captureStdout = m.expectedStdout.has_value();
+    auto const result = runBinary(artifactPath,
+                                  std::chrono::milliseconds{5000},
+                                  captureStdout);
     // STRICT: spawn must succeed, no timeout, exact exit code.
     ASSERT_TRUE(result.spawned)
         << "spawn failed for " << artifactPath.generic_string()
@@ -191,6 +213,20 @@ void runOneTarget(fs::path const&        exampleDir,
         << " (manifest expected " << m.exitCode
         << "; OS reported " << result.exitCode << ")"
         << " diag=" << result.diagnostic;
+    // FF6 Slice 3 (2026-06-02): captured-stdout pin. The whole
+    // point of capturing is to catch silent print failures the
+    // exit-code pin can't see — a regression in FFI mangling,
+    // .idata layout, CRT init, or puts itself would leave
+    // `return 42` untouched while puts writes nothing. Comparing
+    // the drained bytes loud-fails on every such regression.
+    if (m.expectedStdout.has_value()) {
+        ASSERT_EQ(result.capturedStdout, *m.expectedStdout)
+            << "stdout mismatch for "
+            << artifactPath.generic_string()
+            << " (manifest expected "
+            << m.expectedStdout->size() << " bytes; OS produced "
+            << result.capturedStdout.size() << " bytes)";
+    }
 }
 
 } // namespace

@@ -342,4 +342,102 @@ ingest(std::span<IngestionSource const> sources,
     return returnWithSnapshot();
 }
 
+HirIngestResult
+synthesizeFfiFromSourceDecls(
+    std::span<ExternDeclRef const> externs,
+    std::string_view               importLibrary,
+    TargetSchema const&            target,
+    ObjectFormatSchema const&      format,
+    HirFfiMap&                     ffiMap,
+    DiagnosticReporter&            reporter) {
+    HirIngestResult result{};
+
+    auto returnWithSnapshot = [&]() -> HirIngestResult {
+        result.snapshotErrorCountOnce(reporter.errorCount());
+        return result;
+    };
+
+    // (1) FF3 cross-validation — same gate as `ingest()`. SPIR-V /
+    // WASM (abiModel: operand-stack / result-id) reject loud: their
+    // import surfaces aren't FF4-mangled. Plan 17/18 own those
+    // paths.
+    {
+        auto abi = resolveAbi(target, format, reporter);
+        if (!abi) return returnWithSnapshot();
+        if (abi->cc == nullptr) {
+            dss::report(reporter,
+                        DiagnosticCode::F_FfiIngestAbiModelUnsupported,
+                        DiagnosticSeverity::Error,
+                        std::format("FF5 synthesizeFfiFromSourceDecls: "
+                                    "target '{}' abiModel '{}' is not "
+                                    "supported by the FF4 C-mangling "
+                                    "path; SPIR-V (plan 17) and WASM "
+                                    "(plan 18) own their own ingest "
+                                    "surfaces.",
+                                    target.name(),
+                                    targetAbiModelName(target.abiModel())));
+            return returnWithSnapshot();
+        }
+    }
+
+    // (2) Per-format library identity must be configured. An empty
+    // string means the active language's
+    // `DeclarationRule.externLibraryByFormat` map has no entry for
+    // `format.kind()`. Fail loud upstream so the operator fixes
+    // the language config rather than chasing a downstream
+    // K_FormatLacksImportSupport.
+    if (importLibrary.empty()) {
+        dss::report(reporter,
+                    DiagnosticCode::F_FfiNoImportLibraryForFormat,
+                    DiagnosticSeverity::Error,
+                    std::format("FF5 synthesizeFfiFromSourceDecls: the "
+                                "active language declared no "
+                                "`externLibraryByFormat` entry for "
+                                "object format '{}'. Add a per-format "
+                                "library name (e.g. \"pe\": "
+                                "\"msvcrt.dll\") to the language's "
+                                "semantics JSON so source-declared "
+                                "externs can resolve to a runtime "
+                                "library.",
+                                objectFormatKindName(format.kind())));
+        return returnWithSnapshot();
+    }
+
+    // (3) Per-extern: validate non-empty canonical, apply FF4
+    // C-mangling, write FfiMetadata. No surface match required —
+    // the source's `extern` declaration IS the authoritative
+    // signature (already in HIR as a FnSig on the ExternFunction
+    // node). The linker will fail loud at the loader stage with
+    // K_SymbolUndefined if the runtime library doesn't actually
+    // export the symbol; that's the correct surface for "library
+    // missing the symbol" (different audience from "language
+    // config missing the library").
+    std::string const libCopy{importLibrary};
+    for (auto const& ext : externs) {
+        if (ext.canonicalName.empty()) {
+            dss::report(reporter,
+                        DiagnosticCode::F_FfiIngestEmptyCanonical,
+                        DiagnosticSeverity::Error,
+                        "FF5 synthesizeFfiFromSourceDecls: caller-"
+                        "supplied ExternDeclRef has empty "
+                        "canonicalName — structural anomaly, "
+                        "skipping match.");
+            continue;
+        }
+
+        FfiMetadata meta{};
+        meta.mangledName   = applyCMangling(ext.canonicalName,
+                                            format.kind());
+        meta.linkage       = FfiLinkage::Strong;
+        meta.visibility    = FfiVisibility::Default;
+        meta.importLibrary = libCopy;
+        // `soname` left empty — same convention as `ingest()`.
+
+        ffiMap.set(ext.node, std::move(meta));
+        ++result.externsAnnotated;
+    }
+
+    return returnWithSnapshot();
+}
+
 } // namespace dss::ffi

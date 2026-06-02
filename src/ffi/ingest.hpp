@@ -37,9 +37,11 @@
 // Linker-blind: produces `FfiMetadata` rows; the linker consumes
 // them downstream via `collectExterns` in MIR lowering.
 //
-// At this cycle ELF-only via FF1's existing reader; FF1-PE +
-// FF1-MachO triggers separately. The dispatch is internal to
-// `binary_reader.cpp` — FF5 transparently picks up new formats.
+// All three FF1 readers (ELF, PE, Mach-O) have landed (see
+// `src/ffi/binary_readers/`); the dispatch is internal to
+// `binary_reader.cpp` and FF5 transparently routes a
+// `BinaryLibrarySource{path}` to the right reader based on the
+// file's magic bytes.
 
 namespace dss::ffi {
 
@@ -86,16 +88,19 @@ struct DSS_EXPORT ExternDeclRef {
 // ── HirIngestResult ─────────────────────────────────────────────
 
 // Result struct. `ok()` returns true iff the reporter held zero
-// errors at the moment `ingest()` returned. The reporter is the
+// errors at the moment the producer (`ingest()` or
+// `synthesizeFfiFromSourceDecls()`) returned. The reporter is the
 // single source of truth — `ok()` is a snapshot taken at return so
 // later reporter activity (by other code on the same reporter)
 // can't mutate it retroactively. Default-constructed value has
 // `ok() == false` (errorCountAtReturn = nullopt) — that's the
 // safe sentinel: any caller that obtains a HirIngestResult through
-// a path bypassing `ingest()` correctly sees ok=false rather than
+// a path bypassing the producers correctly sees ok=false rather than
 // inheriting an accidental ok=true from the default. (post-fold #6
 // type-design Q1 fold: private snapshot + factory-only set; the
-// `ingest()` friend is the only path that can populate it.)
+// producers are the only paths that can populate it. FF6 Slice 2
+// 2026-06-02 extended the producer set to include
+// synthesizeFfiFromSourceDecls.)
 //
 // IMPORTANT: `ok() == false` does NOT imply `ffiMap` is unmodified.
 // Partial annotations are possible alongside !ok() (e.g., a
@@ -117,7 +122,8 @@ public:
         return errorCountAtReturn_.value_or(0u);
     }
 
-    // Snapshot-once setter — only `ingest()`'s internal
+    // Snapshot-once setter — only the producer functions'
+    // (`ingest()` and `synthesizeFfiFromSourceDecls()`) internal
     // `returnWithSnapshot` lambda should call this. The "once"
     // semantic is enforced (a second call is a no-op): the trap
     // we're closing is "default-construct → ok() == true" by
@@ -201,5 +207,52 @@ std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeaderDirectory(std::filesystem::path const& headerDir,
                      std::string_view             importLibrary,
                      DiagnosticReporter&          reporter);
+
+// ── synthesizeFfiFromSourceDecls (FF6 Slice 2, 2026-06-02) ────
+//
+// Source-declared sibling of `ingest()`. Where `ingest()` validates
+// each caller-supplied extern against an aggregated ImportSurface
+// produced by reading external headers / binaries, this function
+// TRUSTS each caller-supplied `ExternDeclRef` as authoritative:
+// the source language's extern declaration IS the signature (the
+// HIR FnSig was minted from it upstream by the CST→HIR lowerer),
+// so all that remains is to (a) apply per-format FF4 C-mangling to
+// produce the linker-visible decorated name and (b) bind every
+// extern to the caller-supplied per-format `importLibrary`. No
+// header / binary read is required.
+//
+// Used by `compileSingleUnit` when the active language declares
+// `DeclarationRule.externLibraryByFormat` for the target's
+// `ObjectFormatKind` — the canonical c-subset path for the FF6
+// hello-world milestone (puts in msvcrt.dll on PE-x86_64). A
+// future cycle layers header-driven validation back in via
+// `ingest()` for languages that want compile-time signature
+// validation against shipped headers (anchored
+// `D-FFI-HEADER-VALIDATION-OPTIONAL`).
+//
+// Failure modes:
+//   * Empty `importLibrary` → `F_FfiNoImportLibraryForFormat`
+//     (unsuppressable). Means the language's `externLibraryByFormat`
+//     map has no entry for `format.kind()`.
+//   * Empty `ExternDeclRef::canonicalName` → `F_FfiIngestEmptyCanonical`
+//     (shared with `ingest()`; same trap — would silently shadow
+//     legitimately-distinct symbols in any downstream by-name
+//     lookup).
+//   * `resolveAbi` cc==nullptr (operand-stack / result-id) →
+//     `F_FfiIngestAbiModelUnsupported` (shared; permanent
+//     architectural exclusion of WASM/SPIR-V from FF4 C-mangling).
+//
+// On success, every extern in `externs` produces one
+// `FfiMetadata{ mangledName, importLibrary, linkage=Strong,
+// visibility=Default }` entry in `ffiMap`, keyed on the extern's
+// HirNodeId. `externsAnnotated == externs.size()` on a clean run.
+[[nodiscard]] DSS_EXPORT HirIngestResult
+synthesizeFfiFromSourceDecls(
+    std::span<ExternDeclRef const> externs,
+    std::string_view               importLibrary,
+    TargetSchema const&            target,
+    ObjectFormatSchema const&      format,
+    HirFfiMap&                     ffiMap,
+    DiagnosticReporter&            reporter);
 
 } // namespace dss::ffi

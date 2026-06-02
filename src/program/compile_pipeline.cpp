@@ -5,6 +5,8 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "ffi/ingest.hpp"
+#include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/linker.hpp"
 #include "link/writer.hpp"
@@ -79,6 +81,70 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         return false;
     }
 
+    // 2.5. FFI metadata synthesis for source-declared externs
+    //      (FF6 Slice 2, 2026-06-02). When the language schema's
+    //      `externDecl` rule declares an `externLibraryByFormat`
+    //      entry for the active object format, every extern the
+    //      HIR lowerer collected gets a FfiMetadata row written to
+    //      the per-CU `HirFfiMap`. HIR→MIR (step 3) consumes the
+    //      map to materialize each `ExternFunction` /
+    //      `ExternGlobal` HIR node as a MIR `ExternImport`.
+    //
+    //      No extern collected (every existing pre-FF6 module) ⇒
+    //      skip the synthesis call entirely; the empty
+    //      `HirFfiMap` flows to step 3 as the FfiMap-pointer arg.
+    //      lowerToMir's extern-walker iterates HIR nodes whose
+    //      kind is ExternFunction / ExternGlobal — modules with
+    //      no such nodes never query the map, so an empty map
+    //      with no `set()` calls is observationally identical to
+    //      passing `nullptr` for callers of empty-extern modules.
+    //
+    //      Agnostic over CPU + format: the per-format library
+    //      identity comes from `grammar.semantics().declarations`'s
+    //      `externLibraryByFormat` map keyed on
+    //      `objectFormatKindName(format.kind())`. ELF / Mach-O
+    //      hosts thread through the same call with their own
+    //      library identities; a future grammar extension to allow
+    //      `extern "otherlib.dll" int foo();` (anchored
+    //      D-CSUBSET-EXTERN-LIBRARY-SYNTAX) layers a per-extern
+    //      override on top of this map without touching the
+    //      synthesis kernel.
+    HirFfiMap ffiMap{hir->hir};
+    if (!hir->externDecls.empty()) {
+        // Find the active language's `externLibraryByFormat`
+        // entry for this object format. Lives at SemanticConfig
+        // scope (post-fold #1 2026-06-02): one map per language,
+        // keyed on `objectFormatKindName(format.kind())`. Empty
+        // string ⇒ no entry; synthesize() fails loud with
+        // F_FfiNoImportLibraryForFormat upstream of the linker.
+        auto const& libMap =
+            grammar.semantics().externLibraryByFormat;
+        std::string const formatKey{
+            objectFormatKindName(format.kind())};
+        std::string importLibrary;
+        if (auto it = libMap.find(formatKey); it != libMap.end()) {
+            importLibrary = it->second;
+        }
+
+        // Build the temporary ExternDeclRef span from the lowerer's
+        // owning records. The views are valid for the duration of
+        // this call only (the underlying strings live on
+        // `hir->externDecls`).
+        std::vector<ffi::ExternDeclRef> refs;
+        refs.reserve(hir->externDecls.size());
+        for (auto const& r : hir->externDecls) {
+            refs.push_back({r.node, r.canonicalName});
+        }
+
+        auto const ffiEntry = reporter.errorCount();
+        auto const ffiResult = ffi::synthesizeFfiFromSourceDecls(
+            refs, importLibrary, target, format, ffiMap, reporter);
+        (void)ffiResult;  // shape inspected via reporter.errorCount()
+        if (!tierClean(reporter, ffiEntry)) {
+            return false;
+        }
+    }
+
     // 3. HIR → MIR. Plug the language schema's globals const-eval
     //    policy into the lowering config (same shape as the
     //    lowered_lir_fixture used by ML6 / AS pipeline tests).
@@ -88,7 +154,7 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         grammar.hirLowering().globalsConstEval.allowFloat;
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
-                          &hir->sourceMap, mirCfg);
+                          &hir->sourceMap, mirCfg, &ffiMap);
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return false;
     }

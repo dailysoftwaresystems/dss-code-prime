@@ -169,7 +169,7 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 | `0x2xxx` | `X_` | Optimizer (pass pipeline / cost-model / verify-after-pass / linkage-liveness) | [`22`](./22-optimizer-plan%20-%20tbd.md) | ⏳ reserved (claimed by plan 22 rev 1; lands with OPT1) |
 | `0x3xxx` | — | (reserved — free) | — | available |
 | `0x4xxx` | `R_` | Register allocator | [`12`](./12-mir-lir-plan%20-%20ok.md) | ✅ shipped (ML6 cycle 3a) |
-| `0x5xxx` | `O_` | Object format / linker | [`14`](./14-linker-plan%20-%20tbd.md) | ⏳ reserved (cpp comment cites this as the explicit hold) |
+| `0x5xxx` | `O_` / `F_` | Object format / linker / FFI | [`14`](./14-linker-plan%20-%20tbd.md), [`11`](./11-ffi-plan%20-%20tbd.md) | ✅ live (FF1–FF5 codes 0x5000–0x5019 shipped — F_* prefix used for the FFI half; linker O_* codes still reserved within the band per the original allocation) |
 | `0x6xxx` | `W_` | WAT/WASM verifier + emit-side | [`18`](./18-wasm-plan%20-%20tbd.md) §2.9b | ⏳ reserved (post-rev-3 allocation) |
 | `0x7xxx` | `V_` | SPIR-V verifier + emit-side | [`17`](./17-shader-gpu-plan%20-%20tbd.md) §2.9 | ⏳ reserved (post-rev-3 allocation) |
 | `0x8xxx` | `K_` | Linker (object format engine + reloc apply + file emission) | [`14`](./14-linker-plan%20-%20tbd.md) | ✅ shipped (LK1–LK10 — 2026-05-30; 11 K_* codes 0x8001–0x800B) |

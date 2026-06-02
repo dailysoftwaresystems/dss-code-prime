@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Per-language semantic config (schema v4 `semantics` block).
@@ -449,6 +450,40 @@ struct DSS_EXPORT SemanticConfig {
     // (InvalidSchemaToken) for languages with no pointer declarator. Full C
     // declarators (function pointers, arrays-of-pointers) stay future surface.
     std::optional<SchemaTokenId>    pointerToken;
+    // FF6 Slice 2 + audit fold (2026-06-02): per-object-format
+    // runtime library identity for SOURCE-DECLARED externs. The
+    // source language's grammar emits a complete `extern int
+    // puts(const char*);`-shape signature; the synthesizeFfi
+    // path trusts that signature as authoritative and binds the
+    // resulting FfiMetadata to this map's per-format entry.
+    //
+    // Key: `ObjectFormatKind` name as a string ("pe", "elf",
+    // "macho", "wasm", "spirv" — matches `objectFormatKindName`).
+    // Value: runtime library identity the linker writes into the
+    // .idata / .dynamic / etc. import descriptor (e.g.
+    // "msvcrt.dll", "libc.so.6", "/usr/lib/libSystem.B.dylib").
+    //
+    // Empty map ⇒ the language declares no source-side externs
+    // OR the active CU has none. When the source DOES declare an
+    // extern AND the active object format has no entry in this
+    // map, the FFI synthesis call fails loud with
+    // `F_FfiNoImportLibraryForFormat` (unsuppressable).
+    //
+    // Per-LANGUAGE field (NOT per-declaration-rule). The pre-fold
+    // 2026-06-02 placement on `DeclarationRule` was fragile: the
+    // pipeline iterated declarations and took the first-match
+    // result, leaving multi-extern-decl-rule grammars with non-
+    // obvious lookup order. Per-language placement matches the
+    // semantic invariant — "when compiling THIS LANGUAGE for THIS
+    // FORMAT, source-declared externs live in THIS LIBRARY" —
+    // and lets the c-subset config retain a single declaration
+    // entry without spurious rule-level coupling.
+    //
+    // The "extern <lib> int foo(...);" per-declaration override
+    // is anchored `D-CSUBSET-EXTERN-LIBRARY-SYNTAX` for a future
+    // grammar extension that would layer per-symbol overrides on
+    // top of this language-level default.
+    std::unordered_map<std::string, std::string> externLibraryByFormat;
 };
 
 } // namespace dss

@@ -1766,6 +1766,102 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroDuplicateElementReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// FF6 Slice 2 + audit fold (2026-06-02 post-fold #1): per-language
+// `externLibraryByFormat` JSON loader. Closes test-analyzer G3 —
+// the 80+ LOC of new validation shipped without direct tests.
+// Validates: shape (object), key (closed-enum ObjectFormatKind
+// name), value (non-empty string). Each failure surface emits
+// C_InvalidSemantics so a typo in a language config can't silently
+// produce an empty map (which would then fire F_FfiNoImportLibraryForFormat
+// at compile time with no anchor at the upstream config gap).
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatHappyPath) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": {
+          "pe":    "msvcrt.dll",
+          "elf":   "libc.so.6",
+          "macho": "/usr/lib/libSystem.B.dylib"
+        }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value()) << "expected clean load";
+    auto const& m = (*r)->semantics().externLibraryByFormat;
+    EXPECT_EQ(m.size(), 3u);
+    EXPECT_EQ(m.at("pe"),    "msvcrt.dll");
+    EXPECT_EQ(m.at("elf"),   "libc.so.6");
+    EXPECT_EQ(m.at("macho"), "/usr/lib/libSystem.B.dylib");
+}
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatNonObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": ["pe", "msvcrt.dll"]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatUnknownKeyReportsInvalid) {
+    // Typo: "pee" (instead of "pe"). Catches the trap at config
+    // load — without this validation, the typo would land silently
+    // and `F_FfiNoImportLibraryForFormat` would fire at compile
+    // time with no breadcrumb pointing at the language JSON.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "pee": "msvcrt.dll" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatNonStringValueReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "pe": 42 }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatEmptyStringValueReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "pe": "" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
 // `literalTypes[i].literal` that names no declared token → C_UnknownToken.
 TEST(GrammarSchema, SemanticsLiteralUnknownTokenReportsUnknownToken) {
     constexpr std::string_view kCfg = R"JSON({
