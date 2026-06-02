@@ -288,13 +288,18 @@
       "stackPointer":     "sp",
       "stackAlignment":   16,
       "shadowSpaceBytes": 0,
-      "redZoneBytes":     0
+      "redZoneBytes":     0,
+      "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: AArch64 BL does NOT push a return address (it writes LR / x30 directly), so process entry — whether by kernel-jump (Linux/Mac) or `RtlUserThreadStart`-BL (Windows) — leaves SP 16-byte-aligned (bias 0 mod 16). Trampoline `sub sp, 0` is emitted as nothing — `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0`.",
+      "entryStackPointerBias": 0,
+      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: AArch64 BL writes the return address into LR/x30 — no stack push. callPushBytes=0 is the right ISA-level fact for ARM64. Non-leaf functions on ARM64 still save x30 in their prologue (via `stp x29, x30, [sp, #-16]!`), which lands in `savedRegAreaSize` via the existing callee-saved tracking — independent of the call-push bias.",
+      "callPushBytes": 0
     }
   ],
-  "$relocationsComment": "AArch64 ELF relocation kinds (plan 13 AS4 — NOT AAPCS64; AAPCS64 is the calling convention above; these are R_AARCH64_* relocation entries that the linker emits into ELF object files). The linker (plan 14) decodes the formula via TargetSchema::relocationInfo(kind). Tag values are arbitrary per-target — only the NAME is the cross-reference key with the format-side `*.format.json`.",
+  "$relocationsComment": "AArch64 ELF relocation kinds (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). The 'formula' field is a closed-enum discriminator (RelocFormulaKind in target_schema.hpp): 'aarch64_call26' = (S+A-P)>>2, signed-26-bit, OR into BL/B inst[25:0]; 'aarch64_adr_prel_pg_hi21' = ((S+A)>>12)-(P>>12), signed-21-bit, ADRP-split into immlo[30:29]+immhi[23:5]; 'aarch64_add_abs_lo12' = (S+A)&0xFFF, ADD imm12[21:10]; 'linear' (used for abs64) writes 8 LE bytes. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference. Paired anchors: D-LK6-8 (ARM64 PLT stub bytes) + D-LK6-14 (Apple Silicon chained-fixups dispatch) remain open and are independent of the formula reshape.",
   "relocations": [
-    { "name": "call26",            "kind": 1, "formula": "(S + A - P) >> 2"           },
-    { "name": "adr_prel_pg_hi21",  "kind": 2, "formula": "((S + A) >> 12) - (P >> 12)" },
-    { "name": "abs64",             "kind": 3, "formula": "S + A"                       }
+    { "name": "call26",            "kind": 1, "formula": "aarch64_call26"          },
+    { "name": "adr_prel_pg_hi21",  "kind": 2, "formula": "aarch64_adr_prel_pg_hi21" },
+    { "name": "add_abs_lo12_nc",   "kind": 3, "formula": "aarch64_add_abs_lo12"     },
+    { "name": "abs64",             "kind": 4, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 8 }
   ]
 }

@@ -16,6 +16,7 @@
 #include "hir/hir_node.hpp"
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -45,6 +46,7 @@ using dss::ParseDiagnostic;
 using dss::TypeId;
 using dss::TypeInterner;
 using dss::TypeKind;
+using dss::test_support::countCode;
 
 // The verifier holds a reference into the module, so it must not bind to a
 // temporary `Hir` in EITHER arity — the HR5 source-map overload's defaulted
@@ -59,13 +61,8 @@ namespace {
 
 TypeInterner makeInterner() { return TypeInterner{CompilationUnitId{1}}; }
 
-std::size_t countCode(DiagnosticReporter const& r, DiagnosticCode c) {
-    std::size_t n = 0;
-    for (ParseDiagnostic const& d : r.all()) {
-        if (d.code == c) ++n;
-    }
-    return n;
-}
+// (former local `countCode` folded to `dss::test_support::countCode`
+// in `tests/test_support/diagnostic_count.hpp` at FF3+FF4 post-fold #3.)
 
 } // namespace
 
@@ -212,12 +209,20 @@ TEST(HirVerifier, RefusesToCertifyCleanWhenReporterIsCapped) {
     // A reporter capped by a prior phase silently drops further report() calls,
     // so the error-count delta can't prove "no violation" — verify() must NOT
     // hand back a false all-clear even for a genuinely clean module.
+    //
+    // Post-fold #11 F2: filling the cap with `H_TypeUnresolved` no longer
+    // works — that code is now in `kUnsuppressableCodes` and bypasses the
+    // cap entirely (cap is policy; unsuppressable codes must always reach
+    // `all_`). Use `P_UnexpectedToken` (a generic suppressable parser error)
+    // to fill the cap; the test's invariant — "verify must refuse to
+    // certify clean against a capped reporter" — is independent of WHICH
+    // code filled the cap.
     DiagnosticReporter::Config cfg;
     cfg.maxDiagnostics = 2;
     DiagnosticReporter reporter{cfg};
     for (int i = 0; i < 3; ++i) {
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::H_TypeUnresolved;
+        d.code     = DiagnosticCode::P_UnexpectedToken;
         d.severity = DiagnosticSeverity::Error;
         d.span     = dss::SourceSpan::empty(static_cast<dss::ByteOffset>(i + 1));
         reporter.report(std::move(d));

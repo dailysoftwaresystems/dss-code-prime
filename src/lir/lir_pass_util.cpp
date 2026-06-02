@@ -5,14 +5,8 @@
 
 namespace dss::lir_pass_util {
 
-void report(DiagnosticReporter& reporter, DiagnosticCode code,
-            DiagnosticSeverity severity, std::string actual) {
-    ParseDiagnostic d;
-    d.code     = code;
-    d.severity = severity;
-    d.actual   = std::move(actual);
-    reporter.report(std::move(d));
-}
+// `report()` moved to `dss::report` in
+// `core/types/diagnostic_reporter.hpp` at LK10 cycle 3 post-fold #2.
 
 LirOperand
 remapBlockRef(LirOperand const& op,

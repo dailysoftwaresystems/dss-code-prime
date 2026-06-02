@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Per-language semantic config (schema v4 `semantics` block).
@@ -169,6 +170,38 @@ struct DSS_EXPORT DeclarationRule {
     // params are intentional) or globals/columns. Default false ⇒ no
     // unused check for this declaration form.
     bool            warnIfUnused = false;
+    // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
+    // insertion rule (source-agnostic). When this declaration is a
+    // FUNCTION declaration AND the declared symbol's name appears
+    // in this list AND the function's return type is non-void AND
+    // the function's body does not structurally terminate on every
+    // path, the HIR lowering appends a synthetic `return <zero>`
+    // (a synthetic literal of the function's return type) as the
+    // last statement of the body's outermost Block. Per C99
+    // §5.1.2.2.3 for `main`; configurable per language so other
+    // source languages can declare their own entry-fn conventions
+    // (Pascal's `program`, Rust's `fn main`, etc.) WITHOUT touching
+    // shared HIR substrate. Empty ⇒ no implicit insertion for any
+    // function of this declaration form (every non-terminating non-
+    // void function then falls through to the verifier's
+    // checkReturnCompleteness loud-fail, which is the language-
+    // strict default).
+    //
+    // Both the synthetic ReturnStmt AND a fresh wrapping Block are
+    // appended (both flagged `HirFlags::Synthetic`); the original
+    // body's children are copied into the new block verbatim with
+    // the synthetic return appended at the tail. The original Block
+    // node is left detached (no in-place node mutation — HIR is
+    // built bottom-up immutable). Restricted to integer return
+    // types (Bool / I8..I128 / U8..U128 / Char / Byte) so a non-
+    // conformant `float main()` or `struct S main()` doesn't get a
+    // silently wrong-typed synthetic return — those fall through
+    // to the verifier's loud-fail. The verifier then sees a
+    // terminating body and downstream MIR/LIR see a defined return
+    // value at the function's exit register — preventing the
+    // "garbage-rax-at-exit" downstream of the runnable-binary
+    // trampoline (D-LK10-ENTRY).
+    std::vector<std::string> implicitReturnZeroForFunctionNames;
     // Optional kind-discriminator. When set, the engine evaluates it at
     // pass 1 and uses the resulting effective kind / params / body
     // instead of the static fields above.
@@ -417,6 +450,40 @@ struct DSS_EXPORT SemanticConfig {
     // (InvalidSchemaToken) for languages with no pointer declarator. Full C
     // declarators (function pointers, arrays-of-pointers) stay future surface.
     std::optional<SchemaTokenId>    pointerToken;
+    // FF6 Slice 2 + audit fold (2026-06-02): per-object-format
+    // runtime library identity for SOURCE-DECLARED externs. The
+    // source language's grammar emits a complete `extern int
+    // puts(const char*);`-shape signature; the synthesizeFfi
+    // path trusts that signature as authoritative and binds the
+    // resulting FfiMetadata to this map's per-format entry.
+    //
+    // Key: `ObjectFormatKind` name as a string ("pe", "elf",
+    // "macho", "wasm", "spirv" — matches `objectFormatKindName`).
+    // Value: runtime library identity the linker writes into the
+    // .idata / .dynamic / etc. import descriptor (e.g.
+    // "msvcrt.dll", "libc.so.6", "/usr/lib/libSystem.B.dylib").
+    //
+    // Empty map ⇒ the language declares no source-side externs
+    // OR the active CU has none. When the source DOES declare an
+    // extern AND the active object format has no entry in this
+    // map, the FFI synthesis call fails loud with
+    // `F_FfiNoImportLibraryForFormat` (unsuppressable).
+    //
+    // Per-LANGUAGE field (NOT per-declaration-rule). The pre-fold
+    // 2026-06-02 placement on `DeclarationRule` was fragile: the
+    // pipeline iterated declarations and took the first-match
+    // result, leaving multi-extern-decl-rule grammars with non-
+    // obvious lookup order. Per-language placement matches the
+    // semantic invariant — "when compiling THIS LANGUAGE for THIS
+    // FORMAT, source-declared externs live in THIS LIBRARY" —
+    // and lets the c-subset config retain a single declaration
+    // entry without spurious rule-level coupling.
+    //
+    // The "extern <lib> int foo(...);" per-declaration override
+    // is anchored `D-CSUBSET-EXTERN-LIBRARY-SYNTAX` for a future
+    // grammar extension that would layer per-symbol overrides on
+    // top of this language-level default.
+    std::unordered_map<std::string, std::string> externLibraryByFormat;
 };
 
 } // namespace dss

@@ -55,29 +55,41 @@ using json = nlohmann::json;
 // Matches the spirit of `DiagnosticReporter::format` but without
 // caret/line context (LSP clients render those themselves via the
 // range).
+//
+// eb2c6c7 audit-fold (2026-06-01): `d.contextPrefix` is prepended so
+// multi-target LSP scenarios route per-target context to the editor's
+// hover/problem-panel. Pre-fold the `[target=...]` stamp was baked
+// into `actual` so this path saw it for free; post-fold the prefix
+// lives in its own field and every render path must spell out the
+// inclusion (CLI `drainDiagnosticsToStderr` performs the symmetric
+// prepend).
 [[nodiscard]] std::string composeMessage(dss::ParseDiagnostic const& d) {
-    std::string msg;
+    // Build the prose first (expected/actual/suggestion) so the
+    // separator logic (`empty?` checks for ` — ` / `: `) is unaffected
+    // by the contextPrefix prepend. Empty-prose fallback to the bare
+    // code name is also gated on the prose alone — a prefix-only
+    // result would be uselessly bare otherwise.
+    std::string prose;
     if (!d.expected.empty()) {
-        msg += "expected ";
+        prose += "expected ";
         for (std::size_t i = 0; i < d.expected.size(); ++i) {
-            if (i > 0) msg += (i + 1 == d.expected.size()) ? " or " : ", ";
-            msg += d.expected[i];
+            if (i > 0) prose += (i + 1 == d.expected.size()) ? " or " : ", ";
+            prose += d.expected[i];
         }
     }
     if (!d.actual.empty()) {
-        if (!msg.empty()) msg += " — ";
-        msg += "got ";
-        msg += d.actual;
+        if (!prose.empty()) prose += " — ";
+        prose += "got ";
+        prose += d.actual;
     }
     if (!d.suggestion.empty()) {
-        if (!msg.empty()) msg += ": ";
-        msg += d.suggestion;
+        if (!prose.empty()) prose += ": ";
+        prose += d.suggestion;
     }
-    if (msg.empty()) {
-        // Fallback to the bare code name so the user sees something.
-        msg = codeName(d.code);
+    if (prose.empty()) {
+        prose = codeName(d.code);
     }
-    return msg;
+    return d.contextPrefix + prose;
 }
 
 } // namespace

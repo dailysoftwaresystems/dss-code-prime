@@ -233,6 +233,31 @@ public:
     [[nodiscard]] HirModuleId id()   const noexcept { return arena_.id(); }
     [[nodiscard]] std::size_t size() const noexcept { return arena_.size(); }
 
+    // Mid-build node inspection. The frozen `Hir` exposes the same
+    // shape via its own const accessors after `finish()`; pre-freeze
+    // lowering passes that need to inspect a just-built subtree
+    // (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN reads the body's structural
+    // termination state via `pathTerminates` to decide whether to
+    // append a synthetic return) read through the builder directly.
+    // Read-only — node mutation remains exclusively via the `make*`
+    // builders so the shape invariants stay intact.
+    [[nodiscard]] HirKind kind(HirNodeId id) const {
+        return arena_.at(id).kind;
+    }
+    [[nodiscard]] HirFlags flags(HirNodeId id) const {
+        return arena_.at(id).flags;
+    }
+    [[nodiscard]] std::span<HirNodeId const>
+    children(HirNodeId id) const;
+    // Sub-structure accessors for `pathTerminates`-style passes that
+    // walk IfStmt / SwitchStmt arms during lowering. Mirror the
+    // frozen-Hir accessors of the same names.
+    [[nodiscard]] HirNodeId                ifThen(HirNodeId id) const;
+    [[nodiscard]] std::optional<HirNodeId> ifElse(HirNodeId id) const;
+    [[nodiscard]] std::span<HirNodeId const> switchArms(HirNodeId id) const;
+    [[nodiscard]] std::span<HirNodeId const> caseArmBody(HirNodeId id) const;
+    [[nodiscard]] bool caseArmIsDefault(HirNodeId id) const;
+
     // Set the module's source-language tag (the value frozen into `Hir` at
     // `finish`). The default ctor leaves it empty; a consumer that learns the
     // language only mid-build — e.g. the `.dsshir` parser, which reads the

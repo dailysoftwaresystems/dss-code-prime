@@ -119,6 +119,53 @@ std::span<HirNodeId const> Hir::children(HirNodeId id) const {
 
 // ── HirBuilder ──────────────────────────────────────────────────────────────
 
+std::span<HirNodeId const> HirBuilder::children(HirNodeId id) const {
+    // Mirror Hir::children's structural guard — a corrupted POD
+    // whose child range escapes the pool aborts loud rather than
+    // returning a span over garbage. Same single-arena child-pool
+    // representation as the frozen Hir; the builder's pool just
+    // hasn't been frozen yet.
+    detail::HirNode const& n = arena_.at(id);
+    if (static_cast<std::size_t>(n.childStart) + n.childCount
+            > childPool_.size()) {
+        std::fprintf(stderr,
+                     "dss::HirBuilder fatal: children: child range "
+                     "[%u, %u) exceeds child pool size %zu\n",
+                     n.childStart, n.childStart + n.childCount,
+                     childPool_.size());
+        std::abort();
+    }
+    return std::span<HirNodeId const>{
+        childPool_.data() + n.childStart, n.childCount};
+}
+
+HirNodeId HirBuilder::ifThen(HirNodeId id) const {
+    auto kids = children(id);
+    return kids.size() >= 2 ? kids[1] : InvalidHirNode;
+}
+
+std::optional<HirNodeId> HirBuilder::ifElse(HirNodeId id) const {
+    auto kids = children(id);
+    return kids.size() >= 3
+         ? std::optional<HirNodeId>{kids[2]} : std::nullopt;
+}
+
+std::span<HirNodeId const> HirBuilder::switchArms(HirNodeId id) const {
+    auto kids = children(id);
+    return kids.empty() ? kids : kids.subspan(1);
+}
+
+bool HirBuilder::caseArmIsDefault(HirNodeId id) const {
+    return (arena_.at(id).payload & kCaseArmIsDefault) != 0;
+}
+
+std::span<HirNodeId const>
+HirBuilder::caseArmBody(HirNodeId id) const {
+    auto kids = children(id);
+    if (!caseArmIsDefault(id) && !kids.empty()) return kids.subspan(1);
+    return kids;
+}
+
 HirModuleId HirBuilder::nextModuleId() noexcept {
     // Aborts on uint32 overflow — see `substrate::mintMonotonicId`.
     return substrate::mintMonotonicId<HirModuleId>();

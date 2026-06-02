@@ -76,6 +76,15 @@
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "modrm.reg" }
             ]
+          },
+          {
+            "$comment": "add reg-imm32 — REX.W 0x81 /0 imm32 (ADD r/m64, imm32). Used by ML7 epilogue's `add rsp, N` stack-frame teardown. 2-address shape: operands[0] is dest, imm32 is immediate. modrmRegExt=0 fills ModR/M.reg with the opcode-extension digit (/0 for ADD).",
+            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
           }
         ]
       }
@@ -99,6 +108,15 @@
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "sub reg-imm32 — REX.W 0x81 /5 imm32 (SUB r/m64, imm32). Used by ML7 prologue's `sub rsp, N` stack-frame setup. 2-address shape (operands[0] is dest, imm32 is immediate). modrmRegExt=5 fills ModR/M.reg with the opcode-extension digit (/5 for SUB).",
+            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
             ]
           }
         ]
@@ -148,7 +166,7 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Hard-trap / 'this code path is unreachable'. Cycle 3b lowers MIR Unreachable via `LirBuilder::addUnreachable` (the dedicated zero-successor terminator API added in cycle 3b's review fix-up). AS1 maps to x86_64 ud2; ML6 keeps it block-sealing-equivalent.",
+      "$comment": "Hard-trap / 'this code path is unreachable'. AS1 maps to x86_64 ud2 (encoding `0F 0B`). Encoding added at D-LK10-ENTRY Slice A (2026-06-02) so the trampoline emitter can append `unreachable` after noreturn syscall / call_indirect_via_extern call sites — reaches `assemble()` and must emit bytes (the `TargetEncodingShape::None` arm in `asm.cpp` fails loud `A_NoEncodingDeclared`). Shape mirrors the `ret` opcode (zero-operand variant, no ModR/M, opcode bytes literal).",
       "mnemonic":      "unreachable",
       "result":        "none",
       "terminatorKind": "unreachable",
@@ -156,7 +174,58 @@
       "minOperands":   0,
       "maxOperands":   0,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [15, 11] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-LK10-ENTRY Slice A: raw kernel transition (Linux exit_group / Mach-O BSD exit). Zero-operand, no result, no successors, NOT a terminator (general-case opcode: FF6 hello-world's `write` syscall returns to the next instruction; only the trampoline's `exit` syscall is noreturn, and that's signaled by the trampoline emitter appending a separate `unreachable` after). Encoding: x86_64 SYSCALL `0F 05` — fixed 2-byte opcode, same shape vocabulary as `ret` and the new `unreachable`. The syscall-number register is loaded into `rax` (or per the target's `syscallNumGpr` field on format schema's `processExit` — Slice B) by a preceding LIR `mov` op, NOT a payload on `syscall` itself.",
+      "mnemonic":      "syscall",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [15, 5] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-LK10-ENTRY Slice A: indirect call through an extern-import IAT slot (Windows kernel32!ExitProcess, future macOS libSystem imports). x86_64 encoding `FF 15 disp32` (call qword ptr [RIP + disp32]) — the same 4-byte disp32 + REL32 reloc shape as the existing direct `call` opcode (E8 disp32), just with a 2-byte opcode literal `[255, 21]` (FF + ModR/M byte 15h = mod=00 reg=/2 rm=101 → [RIP+disp32]). NOT a terminator (general-case indirect call; the trampoline emitter appends `unreachable` after when the callee is noreturn like ExitProcess). 1 operand = ExternImport SymbolRef. The `rel32` reloc-kind row (in this file's `relocations[]` array) computes `S - P - 4` which is exactly what `[RIP+disp32]` resolution needs at load time (S = IAT slot VA, P = the disp32 patch site, RIP at execution = patch + 4). D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): result widened from `none` to `optional` — same shape as `call` — so MIR→LIR's `lowerCall` can emit `call_indirect_via_extern` for an extern returning a non-void value (puts returns int). The materialize pass moves the return register into the result vreg uniformly for both `call` and `call_indirect_via_extern`; the schema's result-rule must permit both void and non-void targets.",
+      "mnemonic":      "call_indirect_via_extern",
+      "result":        "optional",
+      "hasSideEffects": true,
+      "isCall":        true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["symbol"] },
+            "template": { "opcode": [255, 21] },
+            "wires":    [
+              { "index": 0, "slotKind": "disp32", "relocationKind": "rel32" }
+            ]
+          }
+        ]
+      }
     },
     {
       "mnemonic":      "jmp",
@@ -215,6 +284,7 @@
         "format": "x86-variable",
         "variants": [
           {
+            "$comment": "ret — no operands at the LIR level. ML7 cycle 2's callee-side return-value materialization moves the MIR Return's vreg into cc.returnGprs[0]/returnFprs[0] BEFORE the ret, so the assembler sees a 0-operand ret form.",
             "guard":    { "operandKinds": [] },
             "template": { "opcode": [195] }
           }
@@ -232,34 +302,127 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Load from memory. Operands: [base_reg, MemBase(scale=1), MemOffset(disp)]. Optional index-reg arm added in cycle 3d. AS1 emits `mov reg, [base + disp]` or RIP-relative for global addresses.",
+      "$comment": "Load from memory. Operands: [base_reg, MemBase(scale=1), MemOffset(disp)]. Optional index-reg arm added in cycle 3d. Emits `mov reg, [base + disp]`: REX.W 0x8B /r ModR/M(mod=10, reg=result, rm=base) [SIB 0x24 when base.lo3==4] disp32. Plan 13 §3.1 D-AS4-1 — landed alongside ML7 cycle 2 to close D-LK10-2 byte-on-disk path.",
       "mnemonic":      "load",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   3,
       "maxOperands":   3,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "3-op no-index form: `mov reg, [base + disp32]`.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op indexed form (D-AS4-5): `mov reg, [base + index*scale + disp32]`. The walker emits SIB unconditionally when SibIndex wires.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)]. No result. AS1 emits `mov [base + disp], reg`.",
+      "$comment": "Store to memory. Operands: [value_reg, base_reg, MemBase(scale), MemOffset(disp)] OR [value_reg, base_reg, index_reg, MemBase(scale), MemOffset(disp)]. No result. Emits `mov [base (+ index*scale) + disp32], reg`: REX.W 0x89 /r ModR/M(mod=10, reg=value, rm=base) [SIB] disp32. Plan 13 §3.1 D-AS4-1 + D-AS4-5.",
       "mnemonic":      "store",
       "result":        "none",
       "hasSideEffects": true,
       "minOperands":   4,
-      "maxOperands":   4,
+      "maxOperands":   5,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "4-op no-index form (D-AS4-1).",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "5-op indexed form (D-AS4-5).",
+            "guard":    { "operandKinds": ["reg", "reg", "reg", "membase", "memoffset"] },
+            "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "sib.index"     },
+              { "index": 3, "slotKind": "membase.scale" },
+              { "index": 4, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)]. AS1 emits x86_64 `lea reg, [base + index*scale + disp]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm in cycle 3d.",
+      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)] OR [SymbolRef] (RIP-relative form, D-LK4-RODATA-PRODUCER 2026-06-02). AS1 emits x86_64 `lea reg, [base + index*scale + disp]` / `lea reg, [rip + sym]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm via 4-operand form; RIP-relative arm materializes a module-level global's address into a register for downstream loads/stores or function-pointer calls. Encoding: REX.W 0x8D /r ModR/M [SIB?] disp32. Opcode 0x8D is the `lea` mnemonic; the modes differ only in ModR/M.mod (10 for [base+disp], 00 for [rip+disp]).",
       "mnemonic":      "lea",
       "result":        "value",
       "hasSideEffects": false,
-      "minOperands":   3,
+      "minOperands":   1,
       "maxOperands":   4,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "3-op no-index form: `lea reg, [base + disp32]`.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "4-op indexed form: `lea reg, [base + index*scale + disp32]`.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "1-op RIP-relative form: `lea reg, [rip + sym]` (D-LK4-RODATA-PRODUCER 2026-06-02). The lone SymbolRef operand is wired to the RipRelDisp32 slot, which (a) records a rel32 Relocation at the trailing 4-byte position and (b) forces ModR/M to mod=00 rm=101 (the [rip+disp32] encoding in 64-bit mode). Used by `lowerGlobalAddr` to materialize a global's address into a register.",
+            "guard":      { "operandKinds": ["symbol"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). Operands: [src_reg]. Width comes from the result reg's class + the source reg's width-of-record. AS1 emits movsx.",
@@ -473,7 +636,11 @@
       "stackPointer": "rsp",
       "stackAlignment":   16,
       "shadowSpaceBytes": 0,
-      "redZoneBytes":     128
+      "redZoneBytes":     128,
+      "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: at SysV process entry the kernel maps the image and JUMPS to `_start` with RSP 16-byte-aligned and NO return address pushed — so RSP bias mod stackAlignment is 0. The trampoline emitter computes its prologue `sub rsp, N` via `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0` — no prologue emitted, which is correct for SysV (no shadow space + already aligned).",
+      "entryStackPointerBias": 0,
+      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address. ML7 `computeFrameLayout` consumes this as the bias for non-leaf functions so their prologue `sub rsp, N` produces RSP ≡ 0 mod 16 at the next call site. SysV's entry bias is 0 (kernel JMP) but this in-program call-push is 8 — the two distinct facts coincide on Win64 (both 8) and diverge here. Without this wired, the user-fn → extern-call shadow-space + alignment violation reappears one stack frame below the trampoline (the same 0xC0000005 class as D-LK10-ENTRY-TRAMP-PROLOGUE, now recurring at the user-fn boundary).",
+      "callPushBytes": 8
     },
     {
       "name": "ms_x64",
@@ -490,13 +657,17 @@
       "stackPointer": "rsp",
       "stackAlignment":   16,
       "shadowSpaceBytes": 32,
-      "redZoneBytes":     0
+      "redZoneBytes":     0,
+      "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: at Windows process entry, `RtlUserThreadStart` does a CALL into the entry point, so RSP at the first trampoline instruction is ≡8 mod 16. The trampoline emitter computes its prologue `sub rsp, N` via `alignedSizeWithBias(shadowSpaceBytes=32, stackAlignment=16, bias=8)`: smallest N >= 32 with N ≡ 8 mod 16 = 40. That single `sub rsp, 0x28` (a) reserves 32 bytes of caller-side shadow space for ExitProcess + (b) realigns RSP from ≡8 to ≡0 mod 16 so both `call user_entry` and `call [iat_ExitProcess]` enter their callees at the ABI-mandated RSP ≡8 mod 16. Without this field wired, ExitProcess's aligned-SSE stores produced STATUS_ACCESS_VIOLATION on CLI-emitted binaries (smoke test `mov eax,42; ret` hid it because the test fn never touched the stack and the specific ExitProcess code path didn't hit movaps with misaligned RSP).",
+      "entryStackPointerBias": 8,
+      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address (same as SysV — ISA-level fact). ML7 `computeFrameLayout` for any non-leaf Win64 function emits `sub rsp, N` where N satisfies BOTH N >= max(savedRegs+spill, shadowSpaceBytes=32) AND N ≡ callPushBytes=8 (mod stackAlignment=16) — same `alignedSizeWithBias` helper the trampoline emitter uses. For a hello_puts-shape main (no callee-saved, no spills, calls puts): raw = max(0, 32) = 32; N = alignedSizeWithBias(32, 16, 8) = 40. Main's prologue becomes `sub rsp, 0x28`; main calls puts at RSP ≡ 0 mod 16 (Win64 ABI requirement) with 32 bytes of shadow space available for puts's register-arg home area. This closes the actual cause of the 2026-06-02 hello_puts SEGV — NOT a CRT-init gap (msvcrt's DllMain self-inits stdio at DLL load).",
+      "callPushBytes": 8
     }
   ],
-  "$relocationsComment": "Relocation taxonomy (plan 13 AS4). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker (plan 14) reads via TargetSchema::relocationInfo(kind). `formula` is opaque text — documented in plan 14 §2.0 for human cross-reference + future linker-side decoder. Tag values are arbitrary per-target (only the names need to round-trip with format.json cross-reference).",
+  "$relocationsComment": "Relocation taxonomy (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker reads via TargetSchema::relocationInfo(kind). `formula` is a CLOSED-ENUM DISCRIMINATOR (load-bearing — see RelocFormulaKind in target_schema.hpp): 'linear' (S + A + (pcRel ? -P : 0) + addendBias; widthBytes LE), or one of the bit-shift variants ('aarch64_call26' / 'aarch64_adr_prel_pg_hi21' / 'aarch64_add_abs_lo12'). For 'linear', the structured fields (pcRelative + addendBias + widthBytes) parameterize the formula. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference.",
   "relocations": [
-    { "name": "rel32", "kind": 1, "formula": "S + A - P - 4" },
-    { "name": "abs64", "kind": 2, "formula": "S + A"        },
-    { "name": "abs32", "kind": 3, "formula": "S + A"        }
+    { "name": "rel32", "kind": 1, "formula": "linear", "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },
+    { "name": "abs64", "kind": 2, "formula": "linear", "pcRelative": false, "addendBias":  0, "widthBytes": 8 },
+    { "name": "abs32", "kind": 3, "formula": "linear", "pcRelative": false, "addendBias":  0, "widthBytes": 4 }
   ]
 }

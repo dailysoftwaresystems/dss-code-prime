@@ -12,7 +12,7 @@ namespace dss::fixed32_disasm {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 
 struct SlotBitWindow { std::uint8_t lsb; std::uint8_t width; };
 

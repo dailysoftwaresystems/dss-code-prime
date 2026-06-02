@@ -31,4 +31,13 @@ struct DSS_EXPORT ShippedConfigLocator {
 [[nodiscard]] LoadResult<std::filesystem::path>
 findShippedConfig(ShippedConfigLocator const& loc);
 
+// Variant accepting a relative path with directory segments — for
+// shipped FFI headers under `src/dss-config/ffi-headers/<library>/<name>.h`
+// (plan 11 §4 Q1). Single-segment `name` validation does not fit
+// (callers want `"libc/stdio.h"`). Path traversal (`..`) is still
+// rejected. Lives in the same substrate so test code does not
+// re-implement the walk-up. (architect Item B fold post-FF2.)
+[[nodiscard]] LoadResult<std::filesystem::path>
+findShippedFfiHeader(std::string_view headerRelPath);
+
 } // namespace dss

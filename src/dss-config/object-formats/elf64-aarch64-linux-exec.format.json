@@ -1,0 +1,96 @@
+{
+  "$comment": "ELF64 EXECUTABLE (ET_EXEC) for AArch64 Linux. Ships at the D-LK6-1 sibling cycle (2026-06-01) — the closed-enum RelocFormulaKind reshape unblocked ARM64 reloc formula application; intra-module ET_EXEC works via the shared `applyExecRelocations` kernel. Consumed by `src/link/format/elf.cpp`. Self-contained scope: extern imports + PLT stub bytes are anchored at D-LK6-8 (machine-specific PLT — ARM64 needs ADRP+LDR+BR 16-byte sequence vs x86_64's 6-byte `FF 25 disp32`); until that lands, dynamic linking on ARM64 fails loud. Static self-contained execs with intra-module relocations work today.",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "elf64-aarch64-linux-exec",
+    "version": "1.0",
+    "kind": "elf"
+  },
+
+  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol and the walker will resolve it by name.",
+  "entryPoint": "",
+
+  "$processExitDeferredComment": "D-LK10-ENTRY Slice B (plan 14 §2.13) intentionally OMITS `processExit` + `entryCallingConvention` here pending D-LK10-ENTRY-ARM64. Adding them now would create a partial substrate: `arm64.target.json` lacks the `syscall` opcode (encoding 0xD4000001 = SVC #0) + `call_indirect_via_extern` (ADRP+LDR+BLR macro-op) the trampoline emitter needs at Slice C. The schema-side fields land together with the target-side opcodes as one ARM64 cycle. Linux ARM64 values when it lands: mechanism=\"syscall\", syscallNumber=94 (exit_group), syscallNumGpr=\"x8\", syscallOpcodeBytes=[1, 0, 0, 212] (LE-stored SVC #0 = 0xD4000001), entryCallingConvention=\"aapcs64\".",
+
+  "elf": {
+    "$comment": "Elf64_Ehdr identity for an executable. type = ET_EXEC (2). class = ELFCLASS64; data = ELFDATA2LSB; osabi = sysv; machine = EM_AARCH64 (183). pageAlign = 4096 — most ARM64 Linux distributions ship with 4 KB pages. Apple Silicon (16 KB) and high-end ARM64 server configs (64 KB) declare their own values in their respective schemas; the same kernel PT_LOAD congruence rule (`p_vaddr % p_align == p_offset % p_align`) applies uniformly.",
+    "class": "elf64",
+    "data": "lsb",
+    "osabi": "sysv",
+    "abiVersion": 0,
+    "machine": 183,
+    "type": "exec",
+    "pageAlign": 4096,
+    "interpreter": "/lib/ld-linux-aarch64.so.1",
+    "$bindNowComment": "Eager binding — same v1 stance as x86_64 ELF (plan 14 §5 risk row). Emits DT_FLAGS_1 = DF_1_NOW so dyld resolves every GOT slot at load. Lazy upgrade anchored at D-LK6-11.",
+    "bindNow": true
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code section. virtualAddress = 0x400000 — ARM64 Linux convention (Linux loaders place ARM64 ET_EXEC at the same low base as x86_64 by default; AArch64 ELF psABI does not mandate a specific base). sh_flags = SHF_ALLOC | SHF_EXECINSTR (6); sh_addralign = 16 (cache-friendly; ARM64 instructions are 4-byte but section alignment is conventionally larger).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1,
+      "flags": 6,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 4194304
+    },
+    {
+      "$comment": "Symbol table — conventional for debugger support. sh_type = SHT_SYMTAB (2); sh_addralign = 8; sh_entsize = 24 (Elf64_Sym).",
+      "kind": "symtab",
+      "name": ".symtab",
+      "type": 2,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 24,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Symbol-name string table.",
+      "kind": "strtab",
+      "name": ".strtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Section-header string table.",
+      "kind": "shstrtab",
+      "name": ".shstrtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "name": "R_AARCH64_CALL26",
+      "kind": 1,
+      "nativeId": 283
+    },
+    {
+      "name": "R_AARCH64_ADR_PREL_PG_HI21",
+      "kind": 2,
+      "nativeId": 275
+    },
+    {
+      "name": "R_AARCH64_ADD_ABS_LO12_NC",
+      "kind": 3,
+      "nativeId": 277
+    },
+    {
+      "name": "R_AARCH64_ABS64",
+      "kind": 4,
+      "nativeId": 257
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 
+#include "core/types/unsuppressable_codes.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <format>
@@ -90,11 +92,28 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
-    if (cfg_.policy.suppress.contains(d.code)) {
-        return std::nullopt;
-    }
-    if (auto it = cfg_.policy.overrides.find(d.code); it != cfg_.policy.overrides.end()) {
-        d.severity = it->second;
+    // D-FF2-UNSUPP refined contract (eb2c6c7 audit-fold 2026-06-01):
+    // unsuppressable codes bypass SILENCING (`--suppress` drops +
+    // `overrides` demotion) so they always reach `all_`. Elevation
+    // (`--warnings-as-errors`) applies UNIFORMLY — it strengthens the
+    // signal, never silences it. Strict-mode operators legitimately
+    // want Warning-severity unsuppressable codes (like
+    // F_BinaryReaderPartialCorruption) promoted to Error so they
+    // increment errorCount.
+    //
+    // Shape note (eb2c6c7 audit-fold): the previously-duplicated
+    // warningsAsErrors flip was collapsed into a single end-of-
+    // function block. Two literal copies were drift-prone (one in
+    // the unsuppressable arm, one after silencing); the single-flip
+    // shape makes "elevation is universal; only silencing is gated
+    // by unsuppressable" the literal control flow.
+    if (!isUnsuppressable(d.code)) {
+        if (cfg_.policy.suppress.contains(d.code)) {
+            return std::nullopt;
+        }
+        if (auto it = cfg_.policy.overrides.find(d.code); it != cfg_.policy.overrides.end()) {
+            d.severity = it->second;
+        }
     }
     if (cfg_.policy.warningsAsErrors && d.severity == DiagnosticSeverity::Warning) {
         d.severity = DiagnosticSeverity::Error;
@@ -144,6 +163,12 @@ std::uint64_t hashKey(ParseDiagnostic const& d) noexcept {
     // findings collide on the key — the deficiency UnitBuilder's driver reporter
     // sidesteps by disabling dedup wholesale.)
     h = fnv1a64Bytes(h, d.actual);
+    // d.contextPrefix is INTENTIONALLY excluded — see ParseDiagnostic
+    // field comment + D-MERGE-DEDUP-PREFIX-COLLISION fold. Multi-
+    // target merge stamps a per-target prefix at the merge point; two
+    // targets emitting the structurally-identical diagnostic must
+    // collapse at the destination rather than leak through as
+    // duplicates-with-different-prefix.
     return h;
 }
 } // namespace
@@ -155,10 +180,29 @@ bool DiagnosticReporter::isRecentDuplicate(ParseDiagnostic const& d) const noexc
 }
 
 void DiagnosticReporter::report(ParseDiagnostic d) {
-    if (hitCap_) return;
-
+    // Policy first so the unsuppressable check below sees the post-
+    // policy code. See `applyPolicy` above for the canonical
+    // silencing-vs-elevation contract.
     auto filtered = applyPolicy(std::move(d));
     if (!filtered) return;
+
+    // D-FF2-UNSUPP CRITICAL: bypass ALL caps + dedup for unsuppressable
+    // codes. The closed-table contract: emission MUST reach `all_` so
+    // `errorCount()` correctly reflects the severity-gating diagnostic.
+    // Pre-fold the suppress/overrides/warningsAsErrors gates were
+    // bypassed in applyPolicy, but the FOUR cap/dedup gates here
+    // (hitCap_ / dedupWindow / maxPerCode / maxDiagnostics) each
+    // silently drop the diagnostic — re-opening the silent-failure
+    // surface every unsuppressable code was introduced to close.
+    // perCode_ is still incremented so accounting stays consistent;
+    // dedup/recent_ is skipped (we want every instance counted).
+    if (isUnsuppressable(filtered->code)) {
+        ++perCode_[filtered->code];
+        all_.push_back(std::move(*filtered));
+        return;
+    }
+
+    if (hitCap_) return;
 
     if (isRecentDuplicate(*filtered)) {
         return;
@@ -322,11 +366,19 @@ std::string DiagnosticReporter::format(ParseDiagnostic const& d,
                                        BufferRegistry const& bufs) const {
     std::string out;
 
-    // Header line: severity[prefix]: expected/actual prose
+    // Header line: <severityName>[<codePrefix>]: <contextPrefix><expected/actual prose>
+    // The two bracket-rendered fields are distinct concepts: <codePrefix>
+    // is the single-letter band (`P`/`D`/`H`/...) from `diagnosticCodePrefix`,
+    // while <contextPrefix> is the per-target `[target=...]` stamp set by
+    // `program::mergeWithTargetContext`.
+    // D-MERGE-DEDUP-PREFIX-COLLISION: contextPrefix is rendered here
+    // (not stored in `actual`) so the dedup hash key — which includes
+    // `actual` — sees the un-prefixed diagnostic.
     std::format_to(std::back_inserter(out),
                    "{}[{}]: ",
                    severityName(d.severity),
                    diagnosticCodePrefix(d.code));
+    out += d.contextPrefix;
     appendExpectedActual(out, d);
     out += '\n';
 

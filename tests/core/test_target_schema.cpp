@@ -272,6 +272,144 @@ TEST(TargetSchema, ShippedX86_64HasBothSysVAndMsX64) {
     // 32-byte shadow space, no red zone.
     EXPECT_EQ(msx64->shadowSpaceBytes, 32);
     EXPECT_EQ(msx64->redZoneBytes, 0);
+
+    // D-LK10-ENTRY-TRAMP-PROLOGUE: shipped entry-stack-pointer-bias
+    // values must match the OS-loader convention for each cc.
+    // Regression to either would silently mis-emit the trampoline
+    // prologue (caught end-to-end by Slice C's runnable smoke on
+    // Windows, but byte-pin here catches cross-host CI before the
+    // smoke runs).
+    EXPECT_EQ(sysv->entryStackPointerBias, 0)
+        << "SysV kernel JUMPs to _start with RSP 16-aligned and no "
+           "return address — bias must be 0";
+    EXPECT_EQ(msx64->entryStackPointerBias, 8)
+        << "Win64 RtlUserThreadStart CALLs the entry point — bias "
+           "must be 8 (RSP ≡ 8 mod 16 at the first trampoline op)";
+}
+
+TEST(TargetSchema, EntryStackPointerBiasGreaterThanOrEqualAlignmentRejected) {
+    // D-LK10-ENTRY-TRAMP-PROLOGUE validator: the bias is an offset
+    // INTO the stackAlignment quantum and MUST be strictly less
+    // than it. A bias equal to (or greater than) alignment would
+    // denote a full alignment cycle (== 0) or be nonsense — fail
+    // loud at schema-load rather than silently producing the wrong
+    // adjust at the trampoline-emit site.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rsp","class":"gpr"}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rsp"],
+               "stackAlignment":16,"entryStackPointerBias":16}
+            ]})");
+    EXPECT_FALSE(r.has_value());
+    if (!r.has_value()) {
+        bool sawBiasMsg = false;
+        for (auto const& d : r.error()) {
+            if (d.message.find("entryStackPointerBias") != std::string::npos) {
+                sawBiasMsg = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(sawBiasMsg)
+            << "validator must surface entryStackPointerBias in the "
+               "diagnostic so the schema author can triage";
+    }
+}
+
+TEST(TargetSchema, CallPushBytesGreaterThanOrEqualAlignmentRejected) {
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY validator: callPushBytes is
+    // the ISA-level CALL-instruction RSP push width, used by ML7
+    // `computeFrameLayout` as the post-CALL alignment bias for non-
+    // leaf functions. Must be strictly less than stackAlignment —
+    // same invariant as entryStackPointerBias (the bias is an offset
+    // INTO the alignment quantum; equal-to-alignment would denote a
+    // full cycle, semantically zero but expressed wrong).
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rsp","class":"gpr"}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rsp"],
+               "stackAlignment":16,"callPushBytes":16}
+            ]})");
+    EXPECT_FALSE(r.has_value());
+    if (!r.has_value()) {
+        bool sawCallPushMsg = false;
+        for (auto const& d : r.error()) {
+            if (d.message.find("callPushBytes") != std::string::npos) {
+                sawCallPushMsg = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(sawCallPushMsg)
+            << "validator must surface callPushBytes in the "
+               "diagnostic so the schema author can triage";
+    }
+}
+
+TEST(TargetSchema, CallPushBytesStrictlyGreaterThanAlignmentRejected) {
+    // The strict-less-than invariant must also reject callPushBytes
+    // values STRICTLY greater than stackAlignment (not just equal-
+    // to-alignment). A value like 24 with alignment 16 is doubly
+    // wrong: it implies the CALL pushed more than one alignment
+    // quantum, which no register-machine ISA does.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rsp","class":"gpr"}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rsp"],
+               "stackAlignment":16,"callPushBytes":24}
+            ]})");
+    EXPECT_FALSE(r.has_value());
+    if (!r.has_value()) {
+        bool sawCallPushMsg = false;
+        for (auto const& d : r.error()) {
+            if (d.message.find("callPushBytes") != std::string::npos) {
+                sawCallPushMsg = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(sawCallPushMsg);
+    }
+}
+
+TEST(TargetSchema, CallPushBytesShippedX8664SysVDeclaresEight) {
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY happy-path pin: shipped
+    // x86_64.target.json declares callPushBytes=8 on sysv_amd64
+    // (x86_64 CALL pushes 8-byte return address — ISA fact, same
+    // for SysV and Win64). Without this declaration, ML7's frame
+    // formula degenerates back to the pre-fold alignUp shape and
+    // the hello_puts SEGV class returns.
+    auto r = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(r.has_value());
+    auto const* sysvCc = (*r)->callingConvention(0);
+    ASSERT_NE(sysvCc, nullptr);
+    EXPECT_STREQ(sysvCc->name.c_str(), "sysv_amd64");
+    EXPECT_EQ(sysvCc->callPushBytes, 8)
+        << "x86_64 CALL pushes 8-byte return address — ISA fact, "
+           "must be declared on sysv_amd64";
+    auto const* msx64Cc = (*r)->callingConvention(1);
+    ASSERT_NE(msx64Cc, nullptr);
+    EXPECT_STREQ(msx64Cc->name.c_str(), "ms_x64");
+    EXPECT_EQ(msx64Cc->callPushBytes, 8)
+        << "x86_64 CALL pushes 8-byte return address regardless of "
+           "OS — ms_x64 coincides with sysv_amd64 on this ISA fact "
+           "(diverges on entryStackPointerBias)";
+}
+
+TEST(TargetSchema, CallPushBytesShippedAArch64DeclaresZero) {
+    // ARM64 BL writes LR/x30 — no stack push. callPushBytes=0.
+    auto r = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(r.has_value());
+    auto const* cc = (*r)->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_STREQ(cc->name.c_str(), "aapcs64");
+    EXPECT_EQ(cc->callPushBytes, 0)
+        << "ARM64 BL writes LR — no stack push, callPushBytes must "
+           "be 0 (the non-leaf x30-save lands in savedRegAreaSize "
+           "via callee-saved tracking, independent of this bias).";
 }
 
 TEST(TargetSchema, CallingConventionUnknownRegisterRejected) {

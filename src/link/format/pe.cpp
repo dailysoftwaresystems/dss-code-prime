@@ -2,6 +2,8 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/exec_reloc_apply.hpp"
+#include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -9,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -16,9 +19,9 @@
 #include <utility>
 #include <vector>
 
-// PE/COFF relocatable (.obj) writer — plan 14 LK2 cycle 1.
+// PE/COFF writer — plan 14 LK2 cycle 1 (.obj) + cycle 2 (PE32+ .exe).
 //
-// Byte layout (PE/COFF spec §3-5, Microsoft Learn "PE Format"):
+// .obj byte layout (PE/COFF spec §3-5):
 //   [0x00]   IMAGE_FILE_HEADER (20 B)
 //   [0x14]   IMAGE_SECTION_HEADER × N (40 B each)
 //   [...]    section raw data (.text first)
@@ -26,20 +29,31 @@
 //   [ptr]    IMAGE_SYMBOL[] (18 B packed each)
 //   [...]    String table (u32 size + NUL-terminated strings)
 //
+// PE32+ image (.exe) byte layout (PE/COFF §3.2-3.4):
+//   [0x00]   IMAGE_DOS_HEADER (64 B) — `MZ` + e_lfanew → 0x80
+//   [0x40]   MS-DOS stub (~64 B "This program cannot be run in DOS")
+//   [0x80]   PE signature "PE\0\0" (4 B)
+//   [0x84]   IMAGE_FILE_HEADER (20 B)
+//   [0x98]   IMAGE_OPTIONAL_HEADER64 (240 B = 112 fixed + 16×8 data dirs)
+//   [...]    IMAGE_SECTION_HEADER × N (40 B each)
+//   [pad]    pad to fileAlignment (512)
+//   [...]    section raw data (.text first, etc.) padded to fileAlignment
+//
 // The walker is target-blind in shape — every PE-specific number
 // (machine, characteristics, section Characteristics, reloc
-// nativeIds, section names) is read from the format schema. The
-// only hardcoded structural knowledge is the PE/COFF binary record
-// layout.
+// nativeIds, section names, optional-header fields, ImageBase, etc.)
+// is read from the format schema. The only hardcoded structural
+// knowledge is the PE/COFF binary record layout.
 
 namespace dss::pe {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 using link::format::detail::appendU8;
 using link::format::detail::appendU16LE;
 using link::format::detail::appendU32LE;
+using link::format::detail::appendU64LE;
 using link::format::detail::appendI16LE;
 using link::format::detail::emit;
 using link::format::detail::requireSection;
@@ -110,51 +124,11 @@ struct NameField {
     return out;
 }
 
-// ── String table builder ────────────────────────────────────────
-//
-// PE/COFF string tables start with a 4-byte LE u32 size INCLUDING
-// the size field itself (minimum value 4 = empty table). Strings
-// are NUL-terminated. Symbol names > 8 chars are appended here
-// and the symbol's Name field carries `[0][offset]`.
-
-class StringTable {
-public:
-    StringTable() {
-        // Reserve 4 bytes for the size prefix (filled at finalize).
-        bytes_.resize(4, 0);
-    }
-
-    // Append `name` and return its offset within the table.
-    // Offset is RELATIVE to the start of the string table (the
-    // 4-byte size prefix counts), so the smallest legal offset is
-    // 4 (just past the size).
-    [[nodiscard]] std::uint32_t add(std::string_view name) {
-        auto it = offsets_.find(std::string{name});
-        if (it != offsets_.end()) return it->second;
-        std::uint32_t const offset = static_cast<std::uint32_t>(bytes_.size());
-        bytes_.insert(bytes_.end(), name.begin(), name.end());
-        bytes_.push_back(0);
-        offsets_.emplace(std::string{name}, offset);
-        return offset;
-    }
-
-    // Write the size prefix and return the byte buffer for emission.
-    [[nodiscard]] std::vector<std::uint8_t> finish() && {
-        std::uint32_t const total = static_cast<std::uint32_t>(bytes_.size());
-        for (int i = 0; i < 4; ++i) {
-            bytes_[i] = static_cast<std::uint8_t>(total >> (i * 8));
-        }
-        return std::move(bytes_);
-    }
-
-    [[nodiscard]] std::size_t pendingSize() const noexcept {
-        return bytes_.size();
-    }
-
-private:
-    std::vector<std::uint8_t>                       bytes_;
-    std::unordered_map<std::string, std::uint32_t>  offsets_;
-};
+// String-table builder hoisted to `src/link/format/string_table.hpp`
+// (D-LK4-9 closure). PE uses the U32SizePrefix init: bytes 0..3 hold
+// an inclusive u32 size prefix stamped at release() time. Smallest
+// legal offset returned by `add()` is 4 (just past the size).
+using link::format::detail::StringTable;
 
 // ── Section header record (in-memory) ───────────────────────────
 
@@ -187,15 +161,22 @@ void writeSectionHeader(std::vector<std::uint8_t>& out,
 
 } // namespace
 
+// Forward declaration: EXEC arm lives below the Obj body so the
+// .obj path (LK2 cycle 1) keeps its top-of-file position.
+namespace {
+[[nodiscard]] std::vector<std::uint8_t>
+encodeExec(AssembledModule const&    module,
+           TargetSchema const&       targetSchema,
+           ObjectFormatSchema const& fmt,
+           ObjectFormatSectionInfo const& secText,
+           DiagnosticReporter&       reporter);
+} // namespace
+
 std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter) {
-    (void)targetSchema;  // Reserved for the future formula-application
-                         // path (LK6); the assembler stamped the bytes
-                         // and the PE writer just serializes them.
-
     auto const& fmt = objectFormatSchema;
     if (fmt.kind() != ObjectFormatKind::Pe) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -216,6 +197,27 @@ encode(AssembledModule const&    module,
     auto const* secText = requireSection(fmt, SectionKind::Text,
                                           "PE writer", reporter);
     if (!secText) return {};
+
+    // Dispatch between .obj (Obj) and PE32+ image (Exec / Dll). The
+    // two paths share only `secText` lookup + the schema kind check
+    // — every other byte differs (.obj has no MS-DOS stub / PE sig /
+    // optional header; image-side has no IMAGE_RELOCATION[] /
+    // IMAGE_SYMBOL[] tables). validate() guarantees the optional
+    // header is populated for Exec/Dll, so the EXEC arm doesn't
+    // re-check those fields.
+    if (fmt.pe().objectType != PeObjectType::Obj) {
+        if (fmt.pe().objectType == PeObjectType::Dll) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 "pe::encode: PE .dll arm not yet implemented; "
+                 "anchored at a future cycle paired with LK6 dynamic "
+                 "linking (same shape as ELF ET_DYN's D-LK1-4).");
+            return {};
+        }
+        return encodeExec(module, targetSchema, fmt, *secText, reporter);
+    }
+    (void)targetSchema;  // Obj path does not apply relocations — the
+                         // assembler stamped the bytes and the .obj
+                         // writer just serializes them.
 
     // ── Build .text + per-function symbols ─────────────────────
     std::vector<std::uint8_t> text;
@@ -363,7 +365,7 @@ encode(AssembledModule const&    module,
     // symbol name ≤ 8 chars we inline; longer names get appended
     // to the string table.
 
-    StringTable strtab;
+    StringTable strtab{StringTable::Init::U32SizePrefix};
     std::vector<std::uint8_t> symtab;
 
     auto appendSym = [&](NameField const& nameField, std::uint32_t value,
@@ -456,7 +458,7 @@ encode(AssembledModule const&    module,
 
     // ── Emit ──
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(symtabPointer + symtabSizeBytes + strtab.pendingSize());
+    bytes.reserve(symtabPointer + symtabSizeBytes + strtab.size());
 
     // Build the section header for .text (the only emitted section
     // this cycle); push onto the vector so NumberOfSections derives
@@ -501,10 +503,855 @@ encode(AssembledModule const&    module,
     bytes.insert(bytes.end(), symtab.begin(), symtab.end());
 
     // String table (with size prefix)
-    auto strtabBytes = std::move(strtab).finish();
+    auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
 
     return bytes;
 }
+
+// ── PE32+ executable image (.exe) walker — LK2 cycle 2 ──────────
+//
+// Closes plan 14 §3.1 D-LK2-1. Emits a minimal-valid PE32+ .exe
+// the Windows loader will accept: MS-DOS stub + PE signature +
+// IMAGE_FILE_HEADER (with EXECUTABLE_IMAGE flag) +
+// IMAGE_OPTIONAL_HEADER64 + section headers + section data
+// (fileAlignment-padded). Intra-module relocations are applied
+// in-place via the LK6 cycle 1 structured-formula triple
+// (`pcRelative + addendBias + widthBytes`). Extern symbols fail
+// loud (anchored D-LK6-2 — same boundary as ELF ET_EXEC).
+//
+// The validate() pass enforces the optional-header field
+// population, so this function never has to re-check those
+// invariants — read directly from `fmt.peOptionalHeader()`.
+
+namespace {
+
+[[nodiscard]] std::vector<std::uint8_t>
+encodeExec(AssembledModule const&    module,
+           TargetSchema const&       targetSchema,
+           ObjectFormatSchema const& fmt,
+           ObjectFormatSectionInfo const& secText,
+           DiagnosticReporter&       reporter) {
+    auto const& id = fmt.pe();
+    auto const& oh = fmt.peOptionalHeader();
+
+    // ── (a) Build .text body + per-function start map ─────────
+    std::vector<std::uint8_t> text;
+    std::vector<std::uint64_t> funcTextStart;
+    funcTextStart.reserve(module.functions.size());
+    for (auto const& fn : module.functions) {
+        std::uint64_t const start = text.size();
+        funcTextStart.push_back(start);
+        text.insert(text.end(), fn.bytes.begin(), fn.bytes.end());
+    }
+
+    if (text.empty()) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             "pe::encodeExec: `.text` is empty — every "
+             "AssembledFunction contributed zero bytes. An exec "
+             "with no instructions would crash at entry.");
+        return {};
+    }
+
+    // ── (b) Resolve entry-function index from schema.entryPoint
+    //
+    // Mirrors the ELF ET_EXEC arm (D-LK1-1 follow-up): empty
+    // entryPoint defaults to functions[0]; non-empty looks up by
+    // synthesized `sym_<id>` name today (real-name resolution
+    // closes with the HIR→AssembledFunction symbol-name thread).
+    // D-LK10-ENTRY Slice C: image-entry resolution shared across
+    // all 3 walkers via `resolveEntryFnIdx`. Honors
+    // `imageEntryOverride` first (trampoline at functions[index]),
+    // falls back to `format.entryPoint()` string resolution, then
+    // defaults to functions[0]. Synthesized-name prefix is "sym_"
+    // for PE/ELF.
+    auto const entryIdxOpt = link::format::resolveEntryFnIdx(
+        module, fmt, "sym_", "pe::encodeExec", reporter);
+    if (!entryIdxOpt.has_value()) return {};
+    std::size_t const entryFnIdx = *entryIdxOpt;
+
+    // ── (c) Synthesize .idata section for extern imports (LK6
+    //         cycle 2a). PE32+ import-table layout per PE/COFF §6.4:
+    //         ImageImportDescriptor[N+1] (terminator) → ILT[] → IAT[]
+    //         → HINT/NAME table → DLL name strings. Each descriptor
+    //         is 20 B; each ILT/IAT slot is u64; HINT/NAME is u16
+    //         hint=0 + NUL-terminated symbol name (padded to even);
+    //         DLL names are NUL-terminated. The loader uses the IAT
+    //         slot at runtime: it overwrites IAT[i] with the
+    //         resolved function pointer (for PE32+, IAT and ILT are
+    //         identical at file-image time; loader patches IAT
+    //         in-place).
+    //
+    // Build a map `libraryPath → ordered list of extern symbols`
+    // (preserves declaration order within each library; deterministic
+    // build outputs). One ImageImportDescriptor per library.
+    std::vector<std::string> libraryOrder;  // libs in declaration order
+    std::unordered_map<std::string, std::vector<std::size_t>>
+        externsByLib;  // libraryPath → indices into module.externImports
+    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
+        auto const& ext = module.externImports[i];
+        auto const it = externsByLib.find(ext.libraryPath);
+        if (it == externsByLib.end()) {
+            libraryOrder.push_back(ext.libraryPath);
+            externsByLib.emplace(ext.libraryPath, std::vector<std::size_t>{i});
+        } else {
+            it->second.push_back(i);
+        }
+    }
+
+    bool const hasImports = !module.externImports.empty();
+    std::uint32_t const sectionAlignE = oh.sectionAlignment;
+    std::uint32_t const textVirtualSizeE =
+        static_cast<std::uint32_t>(
+            (text.size() + sectionAlignE - 1) & ~(sectionAlignE - 1ull));
+
+    // ── DataSectionLayout: per-section layout vocabulary ──────────
+    //
+    // Consolidates the (rva, virtualSize, rawSize, rawPointer,
+    // headerIndex) tuple that every PE walker section must carry
+    // into a single value. `headerIndex` is captured at the
+    // sectionHeaders push site below, so subsequent patch-ins
+    // (sizeOfRawData / pointerToRawData) index by NAMED field
+    // rather than the magic `sectionHeaders[1u + (rdata ?
+    // 1u : 0u)]` arithmetic that an earlier shape used.
+    //
+    // **Anchor D-LK2-RODATA-SECTION-LAYOUT-RECORD**: this type is
+    // walker-local today (PE is the sole consumer); when D-LK1-
+    // RODATA (ELF) or D-LK3-RODATA (Mach-O) closes, hoist to
+    // `src/link/format/data_section_layout.hpp` as shared
+    // substrate. Trigger: 2nd walker arm.
+    struct DataSectionLayout {
+        std::uint32_t rva         = 0;
+        std::uint32_t virtualSize = 0;  // section-aligned
+        std::uint32_t rawSize     = 0;  // file-aligned
+        std::uint32_t rawPointer  = 0;
+        std::size_t   headerIndex = 0;
+    };
+
+    // ── Build .rdata bytes from AssembledData.dataItems ───────────
+    //
+    // D-LK2-RODATA closure: PE walker emits `.rdata` between `.text`
+    // and `.idata` when the module carries any `AssembledData` item
+    // with `section == DataSectionKind::Rodata`. Per-item bytes are
+    // placed at the item's `Alignment` (padding zero-filled); the
+    // section's raw size is file-aligned, its virtual size section-
+    // aligned (PE/COFF §3.4).
+    //
+    // Schema discipline: requireSection(Rodata) fail-louds if the
+    // format JSON omits the row — silent walker emission is
+    // forbidden. SymbolId→VA resolution for relocations targeting
+    // rodata items is deferred to D-LK4-RODATA-WALKER-RELOC-BASE-
+    // OFFSET (no producer emits such relocations yet — see plan
+    // §3.1 anchor row).
+    //
+    // Discipline pin (multi-agent audit fold convergence): the
+    // non-Rodata fail-loud below runs UNCONDITIONALLY across
+    // `module.dataItems` (NOT guarded by `rdata.has_value()` or a
+    // hasRodata bool), so a module carrying ONLY Data/Bss items
+    // cannot slip past the gate via a dropped scan. The Data and
+    // Bss arms are anchored under D-LK4-RODATA-PRODUCER until
+    // walker support lands.
+    using link::format::detail::alignUp;
+    for (auto const& d : module.dataItems) {
+        if (d.section != DataSectionKind::Rodata) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encodeExec: AssembledData with "
+                             "section={} not yet supported by the "
+                             "PE walker — only Rodata closes at "
+                             "D-LK2-RODATA; Data/Bss arms remain "
+                             "anchored under D-LK4-RODATA-PRODUCER.",
+                             dataSectionKindName(d.section)));
+            return {};
+        }
+    }
+    std::vector<std::uint8_t> rdataBytes;
+    std::optional<DataSectionLayout> rdata;
+    ObjectFormatSectionInfo const* secRodata = nullptr;
+    // Per-dataItems index → section-relative byte offset (the
+    // start of that item's bytes within the concatenated .rdata
+    // payload). Used below to extend the linker's symbolVa map
+    // so .text relocations targeting a rodata SymbolId can
+    // resolve to `imageBase + rdata->rva + offsetInSection`.
+    // D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET (closed 2026-06-02).
+    std::vector<std::uint32_t> rdataItemOffsets;
+    rdataItemOffsets.reserve(module.dataItems.size());
+    if (!module.dataItems.empty()) {
+        secRodata = link::format::detail::requireSection(
+            fmt, SectionKind::Rodata, "pe::encodeExec", reporter);
+        if (secRodata == nullptr) return {};
+        for (auto const& d : module.dataItems) {
+            std::uint64_t const aligned = d.alignment.alignUp(
+                static_cast<std::uint64_t>(rdataBytes.size()));
+            while (rdataBytes.size() < aligned) rdataBytes.push_back(0);
+            rdataItemOffsets.push_back(
+                static_cast<std::uint32_t>(rdataBytes.size()));
+            rdataBytes.insert(rdataBytes.end(),
+                              d.bytes.begin(), d.bytes.end());
+        }
+        // u32 overflow guard (silent-failure audit fold): PE/COFF
+        // SizeOfImage / virtualSize / sizeOfRawData are all u32
+        // wire fields. A producer that lands > 4 GiB of rodata
+        // would silently truncate at the narrowing cast below;
+        // surface it as a loud diagnostic instead.
+        if (rdataBytes.size() >
+            std::numeric_limits<std::uint32_t>::max()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encodeExec: .rdata size {} bytes "
+                             "exceeds PE/COFF u32 wire limit "
+                             "(2^32-1); the format cannot represent "
+                             "this image.",
+                             rdataBytes.size()));
+            return {};
+        }
+        DataSectionLayout layout;
+        layout.rva = static_cast<std::uint32_t>(secText.virtualAddress)
+                     + textVirtualSizeE;
+        layout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(rdataBytes.size(), sectionAlignE));
+        // rawSize / rawPointer / headerIndex filled below once
+        // fileAlign + textRawSize + sectionHeaders are known.
+        rdata = layout;
+    }
+    std::size_t const rdataSize = rdataBytes.size();
+    std::uint32_t const idataRva =
+        hasImports
+            ? (rdata.has_value()
+                   ? rdata->rva + rdata->virtualSize
+                   : static_cast<std::uint32_t>(secText.virtualAddress)
+                       + textVirtualSizeE)
+            : 0u;
+
+    // Lay out .idata bytes (synthesized, NOT raw-data padded yet):
+    //   [0]               ImageImportDescriptor[N+1]
+    //   [...]             ILT/IAT (PE32+ uses identical layout at
+    //                     file-image time — loader patches IAT)
+    //   [hintNameStart]   HINT/NAME table
+    //   [dllNamesStart]   DLL name strings
+    //
+    // Compute offsets first so we know each IAT slot's RVA before
+    // building bytes (the symbol-VA map needs it for reloc apply).
+    constexpr std::size_t kImportDescriptorSize = 20;
+    constexpr std::size_t kThunkSize            = 8;   // PE32+
+    std::size_t const numLibs        = libraryOrder.size();
+    std::size_t const descriptorBlockSize =
+        (numLibs + 1) * kImportDescriptorSize;
+    // Pad to kThunkSize so u64 ILT/IAT slots stay naturally aligned.
+    // (numLibs+1)*20 is 8-aligned only when (numLibs+1) is even —
+    // breaks at numLibs≥2 (code-reviewer #1 convergence). The pad
+    // bytes stay zero in the idata buffer; the data-directory size
+    // for Import Table remains `descriptorBlockSize` (excludes
+    // pad).
+    std::size_t const thunkBlockStart =
+        (descriptorBlockSize + kThunkSize - 1) & ~(kThunkSize - 1);
+    // Per-library ILT and IAT counts include a u64 zero terminator.
+    // The IAT-layout loop ALSO populates `externIatVaBySym` inline
+    // (simplifier #1 fold: was a separate 3rd "iterate libs × externs"
+    // pass with its own slotIdx counter; merged here so the slot
+    // RVA math has a single source of truth).
+    std::vector<std::size_t> iltOffsets(numLibs);
+    std::vector<std::size_t> iatOffsets(numLibs);
+    std::unordered_map<SymbolId, std::uint64_t> externIatVaBySym;
+    externIatVaBySym.reserve(module.externImports.size());
+    std::size_t thunkCursor = thunkBlockStart;
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        iltOffsets[li] = thunkCursor;
+        std::size_t const slots = externsByLib[libraryOrder[li]].size() + 1;
+        thunkCursor += slots * kThunkSize;
+    }
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        iatOffsets[li] = thunkCursor;
+        auto const& externs = externsByLib[libraryOrder[li]];
+        for (std::size_t k = 0; k < externs.size(); ++k) {
+            std::size_t const iatSlotOff =
+                thunkCursor + k * kThunkSize;
+            externIatVaBySym.emplace(
+                module.externImports[externs[k]].symbol,
+                oh.imageBase + idataRva + iatSlotOff);
+        }
+        thunkCursor += (externs.size() + 1) * kThunkSize;  // +1 terminator
+    }
+    // HINT/NAME table starts here. Per extern: 2 bytes hint + name +
+    // NUL + optional padding to even.
+    std::size_t const hintNameStart = thunkCursor;
+    std::vector<std::uint32_t> hintNameRvaBySym;  // per externImport index
+    hintNameRvaBySym.resize(module.externImports.size(), 0u);
+    std::size_t hintCursor = hintNameStart;
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        for (auto extIdx : externsByLib[libraryOrder[li]]) {
+            hintNameRvaBySym[extIdx] =
+                idataRva + static_cast<std::uint32_t>(hintCursor);
+            std::size_t const nameBytes =
+                module.externImports[extIdx].mangledName.size() + 1; // +NUL
+            hintCursor += 2 + nameBytes;                  // 2 = hint
+            if ((hintCursor - hintNameStart) & 1u) ++hintCursor;
+        }
+    }
+    std::size_t const dllNameStart = hintCursor;
+    std::vector<std::uint32_t> dllNameRvaByLib(numLibs, 0u);
+    for (std::size_t li = 0; li < numLibs; ++li) {
+        dllNameRvaByLib[li] =
+            idataRva + static_cast<std::uint32_t>(hintCursor);
+        hintCursor += libraryOrder[li].size() + 1; // +NUL
+    }
+    std::size_t const idataSize = hintCursor;
+    // u32 narrowing guard (silent-failure H2 post-audit fold):
+    // every downstream `.idata` cursor (descriptor RVA, ILT/IAT
+    // thunk offsets, HINT/NAME entry RVAs) is `static_cast<u32>(...)`
+    // from a `size_t` path. PE32+ RVAs are 32-bit per spec; an
+    // out-of-range idataSize would silently truncate at emit.
+    if (idataSize > std::numeric_limits<std::uint32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             std::string{"pe::encodeExec: synthesized .idata size "}
+                 + std::to_string(idataSize)
+                 + " exceeds u32 — PE32+ RVAs are 32-bit. The "
+                   "externImports list is pathologically large or "
+                   "carries names that overflow the section RVA "
+                   "space.");
+        return {};
+    }
+
+    // ── (d) Apply intra-module + extern relocations in-place ──
+    //
+    // Delegated to the shared `applyExecRelocations` kernel
+    // (`link/format/exec_reloc_apply.hpp`). PE-specific input:
+    // patchSectionVa = ImageBase + secText.virtualAddress (RVA).
+    // The symbolVa map merges intra-module function VAs (.text +
+    // funcOffset) with extern import VAs (.idata + iatSlotOffset),
+    // so REL32 calls to either kind work uniformly. Format-side
+    // fmt.relocationByKind(rel.kind) check stays here because its
+    // diagnostic wording cites the PE format name.
+    for (auto const& fn : module.functions) {
+        for (auto const& rel : fn.relocations) {
+            if (fmt.relocationByKind(rel.kind) == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("pe::encodeExec: kind {} not declared "
+                                 "by object format '{}' — substrate-"
+                                 "invariant violation.",
+                                 rel.kind.v, fmt.name()));
+                return {};
+            }
+        }
+    }
+    std::uint64_t const sectionVa = oh.imageBase + secText.virtualAddress;
+    std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+    symbolVa.reserve(module.functions.size()
+                     + module.externImports.size());
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        if (!symbolVa.emplace(module.functions[i].symbol,
+                              sectionVa + funcTextStart[i]).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: duplicate function "
+                             "symbol #"}
+                 + std::to_string(module.functions[i].symbol.v)
+                 + " — caller must give each function a unique "
+                   "SymbolId.");
+            return {};
+        }
+    }
+    for (auto const& [sym, va] : externIatVaBySym) {
+        // Cross-format symmetry with ELF/MachO dynamic walkers
+        // (LK6 cycle 2c post-fold review — code-simplifier flagged
+        // PE as the asymmetric outlier). An extern SymbolId
+        // colliding with a function's SymbolId is a caller bug;
+        // silently overriding the in-text VA with the IAT slot VA
+        // would patch in-text rel32 to point at the wrong target.
+        if (!symbolVa.emplace(sym, va).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: extern SymbolId #"}
+                 + std::to_string(sym.v)
+                 + " collides with another symbol — caller must "
+                   "give each extern a unique SymbolId distinct "
+                   "from function ids.");
+            return {};
+        }
+    }
+    // D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET (closed 2026-06-02):
+    // each rodata `AssembledData` item joins the symbolVa map
+    // at `imageBase + rdata->rva + Σ aligned_size(items[0..i-1])`
+    // (Σ pre-computed as `rdataItemOffsets[i]` above). REL32 (and
+    // future ABS64) relocations in .text that target a rodata
+    // SymbolId now resolve correctly through the shared
+    // `applyExecRelocations` kernel.
+    if (rdata.has_value()) {
+        std::uint64_t const rdataSectionVa =
+            oh.imageBase + rdata->rva;
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            auto const& di = module.dataItems[i];
+            std::uint64_t const va =
+                rdataSectionVa + rdataItemOffsets[i];
+            // A rodata SymbolId colliding with a function or
+            // extern slot is a REDEFINITION (the same SymbolId
+            // was already populated in this map), NOT an
+            // undefined symbol. Use the semantically-correct
+            // `K_DuplicateDataSymbol` code so test pins via
+            // `countCode(rep, K_DuplicateDataSymbol)` won't be
+            // silently satisfied by an UNRELATED undefined-symbol
+            // regression elsewhere in the link path.
+            // (silent-failure HIGH-3 audit fold 2026-06-02.)
+            if (!symbolVa.emplace(di.symbol, va).second) {
+                emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                     std::string{"pe::encodeExec: rodata SymbolId #"}
+                     + std::to_string(di.symbol.v)
+                     + " collides with another symbol — caller must "
+                       "give each data item a unique SymbolId "
+                       "distinct from function/extern ids.");
+                return {};
+            }
+        }
+    }
+    if (!link::format::applyExecRelocations(
+            text, module, funcTextStart, symbolVa, targetSchema,
+            sectionVa, "pe::encodeExec", reporter)) {
+        return {};
+    }
+
+    // ── (d) Layout constants ──────────────────────────────────
+    //
+    // Header layout for PE32+ (spec §3.2-3.4):
+    //   [0x00]  IMAGE_DOS_HEADER     (64 B)
+    //   [0x40]  MS-DOS stub program  (64 B — fixed)
+    //   [0x80]  PE signature "PE\0\0" (4 B)
+    //   [0x84]  IMAGE_FILE_HEADER     (20 B)
+    //   [0x98]  IMAGE_OPTIONAL_HEADER (240 B = 112 fixed + 16×8 data dirs)
+    //   [0x188] IMAGE_SECTION_HEADER  (40 B × N)
+    //
+    // After all headers, pad to fileAlignment (typical 0x200) and
+    // emit section raw data. Section virtualAddress is the RVA;
+    // sizeOfRawData is the file-aligned byte length of `.text`.
+    constexpr std::size_t kDosHeaderSize          = 64;
+    constexpr std::size_t kDosStubSize            = 64;
+    constexpr std::size_t kPeSigSize              = 4;
+    constexpr std::size_t kFileHeaderSize         = 20;
+    constexpr std::size_t kOptionalHeader64Fixed  = 112;
+    constexpr std::size_t kNumberOfRvaAndSizes    = 16;
+    constexpr std::size_t kDataDirectoryEntrySize = 8;
+    constexpr std::size_t kOptionalHeader64Size   =
+        kOptionalHeader64Fixed
+        + kNumberOfRvaAndSizes * kDataDirectoryEntrySize;
+    constexpr std::size_t kSectionHeaderSize = 40;
+
+    // Build the section-header vector NOW so NumberOfSections,
+    // headerBytesUnpadded, sizeOfImage, etc. ALL derive from
+    // `sectionHeaders.size()` — same B-LK1-2 / D-LK2-5 discipline
+    // the .obj arm + ELF walker adopted (architect O3 + code-
+    // reviewer #5 convergence). A future cycle adding .rdata /
+    // .data simply pushes onto this vector; counts update.
+    std::uint32_t const fileAlign    = oh.fileAlignment;
+    std::uint32_t const sectionAlign = oh.sectionAlignment;
+
+    std::vector<PeSectionHeader> sectionHeaders;
+    sectionHeaders.reserve(1u + (rdata.has_value() ? 1u : 0u)
+                              + (hasImports ? 1u : 0u));
+    std::size_t const headerBytesUnpaddedInitial =
+        kDosHeaderSize + kDosStubSize + kPeSigSize
+        + kFileHeaderSize + kOptionalHeader64Size;
+
+    // .text section header (always present).
+    {
+        PeSectionHeader hText{};
+        hText.name                  = encodeSectionName(secText.name, 0);
+        hText.virtualSize           = static_cast<std::uint32_t>(text.size());
+        hText.virtualAddress        = static_cast<std::uint32_t>(secText.virtualAddress);
+        // sizeOfRawData / pointerToRawData filled below.
+        hText.pointerToRelocations  = 0;
+        hText.pointerToLinenumbers  = 0;
+        hText.numberOfRelocations   = 0;
+        hText.numberOfLinenumbers   = 0;
+        hText.characteristics       = secText.type;
+        sectionHeaders.push_back(hText);
+    }
+    std::size_t const textHdrIdx = 0;
+    // .rdata section header (when AssembledData has Rodata items).
+    // Characteristics from the format schema's Rodata row
+    // (0x40000040 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_
+    // READ). sizeOfRawData / pointerToRawData filled below.
+    if (rdata.has_value()) {
+        PeSectionHeader hRData{};
+        hRData.name                  = encodeSectionName(
+                                          secRodata->name, 0);
+        hRData.virtualSize           = static_cast<std::uint32_t>(rdataSize);
+        hRData.virtualAddress        = rdata->rva;
+        hRData.pointerToRelocations  = 0;
+        hRData.pointerToLinenumbers  = 0;
+        hRData.numberOfRelocations   = 0;
+        hRData.numberOfLinenumbers   = 0;
+        hRData.characteristics       = secRodata->type;
+        rdata->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hRData);
+    }
+    // .idata section header (when externImports non-empty).
+    // Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) |
+    //                   IMAGE_SCN_MEM_READ (0x40000000) |
+    //                   IMAGE_SCN_MEM_WRITE (0x80000000)
+    //                 = 0xC0000040. PE32+ images keep the import
+    // table writable so the loader can patch IAT slots in-place.
+    constexpr std::uint32_t kIDataCharacteristics = 0xC0000040u;
+    std::optional<DataSectionLayout> idata;
+    if (hasImports) {
+        PeSectionHeader hIData{};
+        hIData.name                  = encodeSectionName(".idata", 0);
+        hIData.virtualSize           = static_cast<std::uint32_t>(idataSize);
+        hIData.virtualAddress        = idataRva;
+        // sizeOfRawData / pointerToRawData filled below.
+        hIData.pointerToRelocations  = 0;
+        hIData.pointerToLinenumbers  = 0;
+        hIData.numberOfRelocations   = 0;
+        hIData.numberOfLinenumbers   = 0;
+        hIData.characteristics       = kIDataCharacteristics;
+        DataSectionLayout iLayout;
+        iLayout.rva         = idataRva;
+        iLayout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(idataSize, sectionAlign));
+        iLayout.headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hIData);
+        idata = iLayout;
+    }
+
+    std::uint32_t const numSections =
+        static_cast<std::uint32_t>(sectionHeaders.size());
+    std::size_t const headerBytesUnpadded =
+        headerBytesUnpaddedInitial
+        + numSections * kSectionHeaderSize;
+    std::uint32_t const sizeOfHeaders =
+        static_cast<std::uint32_t>(alignUp(headerBytesUnpadded, fileAlign));
+    std::uint32_t const textRawSize =
+        static_cast<std::uint32_t>(alignUp(text.size(), fileAlign));
+    std::uint32_t const textRawPointer = sizeOfHeaders;
+    sectionHeaders[textHdrIdx].sizeOfRawData    = textRawSize;
+    sectionHeaders[textHdrIdx].pointerToRawData = textRawPointer;
+    // .rdata raw size + file pointer (D-LK2-RODATA): file-aligned,
+    // placed immediately after .text. Indices captured at push
+    // time (DataSectionLayout::headerIndex) — no magic-arithmetic
+    // index derivation.
+    if (rdata.has_value()) {
+        rdata->rawSize = static_cast<std::uint32_t>(
+            alignUp(rdataSize, fileAlign));
+        rdata->rawPointer = textRawPointer + textRawSize;
+        sectionHeaders[rdata->headerIndex].sizeOfRawData =
+            rdata->rawSize;
+        sectionHeaders[rdata->headerIndex].pointerToRawData =
+            rdata->rawPointer;
+    }
+    if (idata.has_value()) {
+        idata->rawSize = static_cast<std::uint32_t>(
+            alignUp(idataSize, fileAlign));
+        idata->rawPointer = rdata.has_value()
+            ? rdata->rawPointer + rdata->rawSize
+            : textRawPointer + textRawSize;
+        sectionHeaders[idata->headerIndex].sizeOfRawData =
+            idata->rawSize;
+        sectionHeaders[idata->headerIndex].pointerToRawData =
+            idata->rawPointer;
+    }
+    // SizeOfImage = alignUp(highest_section_va + virtualSize,
+    // sectionAlignment) per PE/COFF §3.4. The highest VA-extent
+    // is `.idata` when present, else `.rdata` when present, else
+    // `.text`. The linear walk over present DataSectionLayouts
+    // generalizes naturally when a 4th section type lands.
+    std::uint32_t const textVirtualSize = textVirtualSizeE;
+    std::uint32_t lastSectionVaEnd =
+        static_cast<std::uint32_t>(secText.virtualAddress)
+        + textVirtualSize;
+    if (rdata.has_value()) {
+        lastSectionVaEnd = rdata->rva + rdata->virtualSize;
+    }
+    if (idata.has_value()) {
+        lastSectionVaEnd = idata->rva + idata->virtualSize;
+    }
+    std::uint32_t const sizeOfImage = static_cast<std::uint32_t>(
+        alignUp(lastSectionVaEnd, sectionAlign));
+    std::uint32_t const addressOfEntryPoint =
+        static_cast<std::uint32_t>(secText.virtualAddress
+                                    + funcTextStart[entryFnIdx]);
+    std::uint32_t const baseOfCode =
+        static_cast<std::uint32_t>(secText.virtualAddress);
+
+    // ── (e) Emit bytes ────────────────────────────────────────
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(sizeOfHeaders + textRawSize);
+
+    // IMAGE_DOS_HEADER: "MZ" + zeros + e_lfanew at offset 0x3C
+    // pointing to the PE signature at 0x80.
+    bytes.resize(kDosHeaderSize, 0);
+    bytes[0] = 'M'; bytes[1] = 'Z';
+    constexpr std::size_t kELfaNewOffset = 0x3C;
+    std::uint32_t const peSigFileOff =
+        static_cast<std::uint32_t>(kDosHeaderSize + kDosStubSize);
+    bytes[kELfaNewOffset + 0] = static_cast<std::uint8_t>(peSigFileOff);
+    bytes[kELfaNewOffset + 1] = static_cast<std::uint8_t>(peSigFileOff >> 8);
+    bytes[kELfaNewOffset + 2] = static_cast<std::uint8_t>(peSigFileOff >> 16);
+    bytes[kELfaNewOffset + 3] = static_cast<std::uint8_t>(peSigFileOff >> 24);
+
+    // MS-DOS stub: 64 zero bytes (the kernel doesn't read it; modern
+    // toolchains ship the legacy "This program cannot be run in DOS
+    // mode" message, but a zero-filled stub is loader-legal — the
+    // Windows loader never executes this region).
+    bytes.resize(bytes.size() + kDosStubSize, 0);
+
+    // PE signature "PE\0\0"
+    appendU8(bytes, 'P'); appendU8(bytes, 'E');
+    appendU8(bytes, 0);   appendU8(bytes, 0);
+
+    // IMAGE_FILE_HEADER
+    appendU16LE(bytes, id.machine);
+    appendU16LE(bytes, static_cast<std::uint16_t>(numSections));
+    appendU32LE(bytes, 0);  // TimeDateStamp = 0 (deterministic)
+    appendU32LE(bytes, 0);  // PointerToSymbolTable = 0 (image has no symtab)
+    appendU32LE(bytes, 0);  // NumberOfSymbols = 0
+    appendU16LE(bytes, static_cast<std::uint16_t>(kOptionalHeader64Size));
+    appendU16LE(bytes, id.characteristics);
+
+    // IMAGE_OPTIONAL_HEADER64 (PE/COFF §3.4)
+    appendU16LE(bytes, oh.magic);
+    appendU8(bytes, 0);  // MajorLinkerVersion (not load-bearing)
+    appendU8(bytes, 0);  // MinorLinkerVersion
+    appendU32LE(bytes, textRawSize);           // SizeOfCode
+    // PE/COFF §3.4: SizeOfInitializedData is the sum of file-aligned
+    // sizes of all sections carrying IMAGE_SCN_CNT_INITIALIZED_DATA.
+    // Both `.rdata` (D-LK2-RODATA) and `.idata` carry that flag.
+    std::uint32_t const sizeOfInitializedData =
+        (rdata.has_value() ? rdata->rawSize : 0u)
+        + (idata.has_value() ? idata->rawSize : 0u);
+    appendU32LE(bytes, sizeOfInitializedData);
+    appendU32LE(bytes, 0);                     // SizeOfUninitializedData
+    appendU32LE(bytes, addressOfEntryPoint);   // AddressOfEntryPoint
+    appendU32LE(bytes, baseOfCode);            // BaseOfCode
+    // (PE32+ omits BaseOfData)
+    appendU64LE(bytes, oh.imageBase);
+    appendU32LE(bytes, sectionAlign);
+    appendU32LE(bytes, fileAlign);
+    appendU16LE(bytes, oh.majorOperatingSystemVersion);
+    appendU16LE(bytes, oh.minorOperatingSystemVersion);
+    appendU16LE(bytes, 0);                     // MajorImageVersion
+    appendU16LE(bytes, 0);                     // MinorImageVersion
+    appendU16LE(bytes, oh.majorSubsystemVersion);
+    appendU16LE(bytes, oh.minorSubsystemVersion);
+    appendU32LE(bytes, 0);                     // Win32VersionValue (reserved)
+    appendU32LE(bytes, sizeOfImage);
+    appendU32LE(bytes, sizeOfHeaders);
+    appendU32LE(bytes, 0);                     // CheckSum (loader allows 0)
+    appendU16LE(bytes, oh.subsystem);
+    appendU16LE(bytes, oh.dllCharacteristics);
+    appendU64LE(bytes, oh.sizeOfStackReserve);
+    appendU64LE(bytes, oh.sizeOfStackCommit);
+    appendU64LE(bytes, oh.sizeOfHeapReserve);
+    appendU64LE(bytes, oh.sizeOfHeapCommit);
+    appendU32LE(bytes, 0);                     // LoaderFlags (reserved)
+    appendU32LE(bytes,
+        static_cast<std::uint32_t>(kNumberOfRvaAndSizes));
+    // 16 data directories. PE/COFF §3.4 indices we populate:
+    //   [1] Import Table — RVA to first ImageImportDescriptor;
+    //                       Size covers all descriptors + terminator.
+    //  [12] Import Address Table — RVA to IAT block; Size covers
+    //                       all IAT slots across libraries.
+    // Other directories (Export, Resource, Exception, etc.) remain
+    // zero — minimum-loadable image needs only Import for FFI.
+    std::uint32_t const importDirRva  = hasImports ? idataRva : 0u;
+    std::uint32_t const importDirSize = hasImports
+        ? static_cast<std::uint32_t>(descriptorBlockSize)
+        : 0u;
+    std::uint32_t const iatDirRva = hasImports
+        ? idataRva + static_cast<std::uint32_t>(iatOffsets[0])
+        : 0u;
+    // Sum IAT block sizes explicitly rather than subtracting cursors.
+    // Subtraction-based size silently misreports if a future cycle
+    // inserts data between IATs and the HINT/NAME block (silent-
+    // failure H1 fold). Each library's IAT spans (externCount+1) *
+    // kThunkSize bytes (including the u64-zero terminator slot).
+    std::size_t iatTotal = 0;
+    for (auto const& libName : libraryOrder) {
+        iatTotal +=
+            (externsByLib[libName].size() + 1) * kThunkSize;
+    }
+    std::uint32_t const iatDirSize = hasImports
+        ? static_cast<std::uint32_t>(iatTotal)
+        : 0u;
+    // LK7: Authenticode attribute-cert placeholder reservation.
+    // PE COFF §5.7 directory index 4 (IMAGE_DIRECTORY_ENTRY_SECURITY)
+    // carries a FILE-OFFSET reference (NOT an RVA) and pairs it with
+    // the cert-table byte size. Plan 16 (codesign + publish) fills
+    // the reserved bytes post-link with the WIN_CERTIFICATE table.
+    // Computed AFTER all section file offsets land below; the
+    // reservation sits at the end of the file (8-byte aligned per
+    // §5.9.1) so it doesn't disturb the section table layout.
+    bool const emitCertReservation = oh.attributeCertReserveSize != 0;
+    // sectionsEndFileOff = byte offset immediately after the last
+    // section's raw data. Layout-dependent: `.text` always present;
+    // optional `.rdata` after; optional `.idata` after. All raw
+    // sizes are fileAlignment-padded already; the cert table sits
+    // at the 8-byte-aligned offset past the last section.
+    std::uint64_t sectionsEndFileOff =
+        static_cast<std::uint64_t>(textRawPointer) + textRawSize;
+    if (rdata.has_value()) {
+        sectionsEndFileOff =
+            static_cast<std::uint64_t>(rdata->rawPointer)
+            + rdata->rawSize;
+    }
+    if (idata.has_value()) {
+        sectionsEndFileOff =
+            static_cast<std::uint64_t>(idata->rawPointer)
+            + idata->rawSize;
+    }
+    std::uint64_t const certTableFileOff64 = emitCertReservation
+        ? ((sectionsEndFileOff + 7u) & ~std::uint64_t{7})
+        : 0u;
+    // `IMAGE_DATA_DIRECTORY[4].VirtualAddress` is u32 per the PE
+    // COFF §3.4.6 attribute-cert table contract. If the section
+    // layout pushes the cert table past 4 GiB, a silent u32 cast
+    // would point the Windows loader at section bytes, corrupting
+    // the IAT. Fail loud rather than ship a malformed image.
+    // (silent-failure MEDIUM fold, LK7 review.)
+    if (emitCertReservation
+     && certTableFileOff64
+            > std::numeric_limits<std::uint32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encodeExec: attribute-cert table file "
+                         "offset 0x{:x} exceeds u32 — "
+                         "IMAGE_DATA_DIRECTORY[4].VirtualAddress is "
+                         "u32 by PE COFF §3.4.6.",
+                         certTableFileOff64));
+        return {};
+    }
+    std::uint32_t const certTableFileOff =
+        static_cast<std::uint32_t>(certTableFileOff64);
+    for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
+        if (i == 1u) {
+            appendU32LE(bytes, importDirRva);
+            appendU32LE(bytes, importDirSize);
+        } else if (i == 4u) {
+            // IMAGE_DIRECTORY_ENTRY_SECURITY: file offset, not RVA.
+            appendU32LE(bytes, certTableFileOff);
+            appendU32LE(bytes, oh.attributeCertReserveSize);
+        } else if (i == 12u) {
+            appendU32LE(bytes, iatDirRva);
+            appendU32LE(bytes, iatDirSize);
+        } else {
+            appendU32LE(bytes, 0);
+            appendU32LE(bytes, 0);
+        }
+    }
+
+    // IMAGE_SECTION_HEADER table (derives from sectionHeaders vector)
+    for (auto const& h : sectionHeaders) {
+        writeSectionHeader(bytes, h);
+    }
+
+    // Pad headers area to fileAlignment.
+    while (bytes.size() < sizeOfHeaders) bytes.push_back(0);
+
+    // .text body, padded to fileAlignment.
+    bytes.insert(bytes.end(), text.begin(), text.end());
+    while (bytes.size() < static_cast<std::size_t>(textRawPointer)
+                            + textRawSize) {
+        bytes.push_back(0);
+    }
+
+    // .rdata body (D-LK2-RODATA closure). The bytes are the
+    // concatenated `AssembledData` items with per-item Alignment
+    // padding precomputed in `rdataBytes`. Pad to fileAlignment.
+    if (rdata.has_value()) {
+        bytes.insert(bytes.end(),
+                     rdataBytes.begin(), rdataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(rdata->rawPointer)
+                    + rdata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .idata body (when externImports non-empty), padded to
+    // fileAlignment. Layout precomputed above; emit ImageImport
+    // Descriptors[N+1] + ILT/IAT thunks + HINT/NAME table + DLL
+    // name strings.
+    if (idata.has_value()) {
+        std::vector<std::uint8_t> idataBytes(idataSize, 0);
+        auto putU32 = [&](std::size_t off, std::uint32_t v) {
+            for (int i = 0; i < 4; ++i)
+                idataBytes[off + i] =
+                    static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+        };
+        auto putU64 = [&](std::size_t off, std::uint64_t v) {
+            for (int i = 0; i < 8; ++i)
+                idataBytes[off + i] =
+                    static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+        };
+        // ImageImportDescriptor[i] for each library; entry [numLibs]
+        // is the all-zero terminator.
+        for (std::size_t li = 0; li < numLibs; ++li) {
+            std::size_t const dOff = li * kImportDescriptorSize;
+            std::uint32_t const iltRva =
+                idataRva + static_cast<std::uint32_t>(iltOffsets[li]);
+            std::uint32_t const iatRva =
+                idataRva + static_cast<std::uint32_t>(iatOffsets[li]);
+            putU32(dOff +  0, iltRva);                  // OriginalFirstThunk
+            putU32(dOff +  4, 0);                       // TimeDateStamp
+            putU32(dOff +  8, 0);                       // ForwarderChain
+            putU32(dOff + 12, dllNameRvaByLib[li]);     // Name (DLL path RVA)
+            putU32(dOff + 16, iatRva);                  // FirstThunk (IAT RVA)
+        }
+        // ILT + IAT thunks (PE32+: u64 each; bit 63 = ordinal flag,
+        // we use by-name imports only — set RVA to HINT/NAME entry).
+        for (std::size_t li = 0; li < numLibs; ++li) {
+            std::size_t slotIdx = 0;
+            auto const& externs = externsByLib[libraryOrder[li]];
+            for (auto extIdx : externs) {
+                std::uint64_t const thunk =
+                    static_cast<std::uint64_t>(hintNameRvaBySym[extIdx]);
+                putU64(iltOffsets[li] + slotIdx * kThunkSize, thunk);
+                putU64(iatOffsets[li] + slotIdx * kThunkSize, thunk);
+                ++slotIdx;
+            }
+            // Zero terminator already in place (idataBytes was 0-initialised).
+        }
+        // HINT/NAME table entries: u16 hint=0 + NUL-terminated name.
+        for (std::size_t li = 0; li < numLibs; ++li) {
+            for (auto extIdx : externsByLib[libraryOrder[li]]) {
+                std::uint32_t const rva = hintNameRvaBySym[extIdx];
+                std::size_t const off = rva - idataRva;
+                // hint = 0 (no symbol-table hint); idataBytes already
+                // zero-initialised so we just write the name.
+                auto const& name = module.externImports[extIdx].mangledName;
+                for (std::size_t i = 0; i < name.size(); ++i) {
+                    idataBytes[off + 2 + i] =
+                        static_cast<std::uint8_t>(name[i]);
+                }
+                // NUL + optional pad already zero.
+            }
+        }
+        // DLL name strings.
+        for (std::size_t li = 0; li < numLibs; ++li) {
+            std::uint32_t const rva = dllNameRvaByLib[li];
+            std::size_t const off = rva - idataRva;
+            auto const& dll = libraryOrder[li];
+            for (std::size_t i = 0; i < dll.size(); ++i) {
+                idataBytes[off + i] = static_cast<std::uint8_t>(dll[i]);
+            }
+        }
+        bytes.insert(bytes.end(), idataBytes.begin(), idataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(idata->rawPointer)
+                    + idata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // LK7: pad to 8-byte-aligned cert table file offset, then
+    // append `attributeCertReserveSize` zero bytes. Plan 16
+    // patches the bytes post-link with the WIN_CERTIFICATE
+    // entries (PE COFF §5.9.1). The reservation sits OUTSIDE
+    // the loaded image — the Windows loader maps sections by
+    // RVA, while the cert table is referenced exclusively via
+    // its file-offset directory entry.
+    if (emitCertReservation) {
+        while (bytes.size() < certTableFileOff) bytes.push_back(0);
+        bytes.insert(bytes.end(),
+                     oh.attributeCertReserveSize,
+                     std::uint8_t{0});
+    }
+
+    return bytes;
+}
+
+} // namespace
 
 } // namespace dss::pe

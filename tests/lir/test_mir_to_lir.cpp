@@ -1257,29 +1257,194 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
     // Both functions exist.
     EXPECT_EQ(lir.moduleFuncCount(), 2u);
 
-    auto const movOp  = *sch.opcodeByMnemonic("mov");
+    auto const leaOp  = *sch.opcodeByMnemonic("lea");
     auto const callOp = *sch.opcodeByMnemonic("call");
+    // D-LK4-RODATA-PRODUCER (2026-06-02): GlobalAddr now lowers to
+    // `lea result, SymbolRef` (RIP-relative form) instead of the
+    // prior `mov result, SymbolRef`. The lea encoding has a real
+    // 1-operand variant on the assembler side; the prior `mov`
+    // shape tripped `A_NoMatchingEncodingVariant` at assemble time
+    // for any non-call-peepholed use of a GlobalAddr.
     // The 2nd function `g` must contain:
-    //   - mov result, symbolRef(f)   ← GlobalAddr(f)
+    //   - lea result, symbolRef(f)   ← GlobalAddr(f)
     //   - call calleeReg, argReg     ← the actual Call
     LirFuncId const gFn = lir.funcAt(1);
     LirBlockId const entry = lir.funcEntry(gFn);
-    bool foundGlobalAddrMov = false, foundCall = false;
+    bool foundGlobalAddrLea = false, foundCall = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         LirInstId const inst = lir.blockInstAt(entry, i);
         auto const op = lir.instOpcode(inst);
-        if (op == movOp) {
+        if (op == leaOp) {
             auto const ops = lir.instOperands(inst);
             if (ops.size() == 1 && ops[0].kind == LirOperandKind::SymbolRef) {
-                foundGlobalAddrMov = true;
+                foundGlobalAddrLea = true;
             }
         }
         if (op == callOp) foundCall = true;
     }
-    EXPECT_TRUE(foundGlobalAddrMov)
-        << "GlobalAddr must emit `mov result, symbolRef(symId)`";
+    EXPECT_TRUE(foundGlobalAddrLea)
+        << "GlobalAddr must emit `lea result, symbolRef(symId)` "
+           "(RIP-relative form, D-LK4-RODATA-PRODUCER 2026-06-02)";
     EXPECT_TRUE(foundCall)
         << "Call must emit the `call` opcode";
+}
+
+// ── D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold opcode-selection pins ─
+//
+// MIR→LIR's `lowerCall` MUST pick `call_indirect_via_extern` (FF 15
+// disp32 — indirect through IAT slot) when the GlobalAddr callee's
+// SymbolId is in the caller-supplied `externImports` list, and `call`
+// (E8 disp32 — direct rel32) otherwise. Direct call to an extern
+// would execute the IAT slot's BYTES as code — guaranteed SEGV
+// (the 2nd half of the hello_puts 0xC0000005 the cycle closed).
+// Substrate-tier pin (test-analyzer C1 fold): without this, a
+// refactor of the opcode-selection branch could regress silently
+// even if the e2e hello_puts pin still passes by accident.
+
+TEST(MirToLir, ExternCallEmitsCallIndirectViaExternOpcode) {
+    // Build a tiny MIR with ONE extern import + ONE internal function
+    // + ONE caller that calls BOTH. After lowerToLir(externImports):
+    //   * call to extern symbol → `call_indirect_via_extern` opcode
+    //   * call to internal symbol → `call` opcode
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const ptrT  = interner.primitive(::dss::TypeKind::Ptr);
+    auto const externSig = interner.fnSig(
+        std::array<::dss::TypeId const, 1>{ptrT}, i32,
+        ::dss::CallConv::CcMS64);
+    auto const internalSig = interner.fnSig(
+        std::span<::dss::TypeId const>{}, i32, ::dss::CallConv::CcMS64);
+    (void)externSig;  // referenced via GlobalAddr semantic, not by signature lookup
+
+    constexpr std::uint32_t kExternSym = 100u;
+    constexpr std::uint32_t kInternalSym = 101u;
+    constexpr std::uint32_t kCallerSym = 102u;
+
+    ::dss::MirBuilder mb;
+
+    // Internal function: just returns 0.
+    mb.addFunction(internalSig, ::dss::SymbolId{kInternalSym});
+    {
+        auto const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+        mb.beginBlock(bb);
+        ::dss::MirLiteralValue lv;
+        lv.value = static_cast<std::int64_t>(0);
+        lv.core  = ::dss::TypeKind::I32;
+        ::dss::MirInstId const zero = mb.addConst(lv, i32);
+        mb.addReturn(zero);
+    }
+
+    // Caller function: calls both extern + internal.
+    mb.addFunction(internalSig, ::dss::SymbolId{kCallerSym});
+    {
+        auto const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+        mb.beginBlock(bb);
+        ::dss::MirLiteralValue lv;
+        lv.value = static_cast<std::int64_t>(0);
+        lv.core  = ::dss::TypeKind::I32;
+        ::dss::MirInstId const zero = mb.addConst(lv, i32);
+        // Call extern: callee is GlobalAddr(externSym).
+        ::dss::MirInstId const externAddr =
+            mb.addGlobalAddr(::dss::SymbolId{kExternSym}, ptrT);
+        std::array<::dss::MirInstId, 2> externOps{externAddr, zero};
+        ::dss::MirInstId const externResult = mb.addInst(
+            ::dss::MirOpcode::Call, externOps, i32);
+        // Call internal: callee is GlobalAddr(internalSym).
+        ::dss::MirInstId const intAddr =
+            mb.addGlobalAddr(::dss::SymbolId{kInternalSym}, ptrT);
+        std::array<::dss::MirInstId, 1> intOps{intAddr};
+        ::dss::MirInstId const intResult = mb.addInst(
+            ::dss::MirOpcode::Call, intOps, i32);
+        // Return sum-or-anything to keep the values live.
+        std::array<::dss::MirInstId, 2> addOps{externResult, intResult};
+        ::dss::MirInstId const sum = mb.addInst(
+            ::dss::MirOpcode::Add, addOps, i32);
+        mb.addReturn(sum);
+    }
+    ::dss::Mir m = std::move(mb).finish();
+
+    // Build the externImports list: kExternSym only.
+    ::dss::ExternImport ext{};
+    ext.symbol      = ::dss::SymbolId{kExternSym};
+    ext.mangledName = "extern_fn";
+    ext.libraryPath = "fictional.dll";
+    std::vector<::dss::ExternImport> externImports{ext};
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep,
+                                          externImports);
+    ASSERT_TRUE(result.ok)
+        << "extern-call MIR must lower cleanly with externImports passed";
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    auto const callOp = *sch.opcodeByMnemonic("call");
+    auto const callIndirectOp =
+        *sch.opcodeByMnemonic("call_indirect_via_extern");
+    ASSERT_NE(callOp, callIndirectOp);
+
+    // Caller is the 2nd function (index 1 — internal first, caller
+    // second). Inspect its entry block for the two call opcodes.
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 2u);
+    LirFuncId const callerFn = lir.funcAt(1);
+    LirBlockId const entry = lir.funcEntry(callerFn);
+    std::uint32_t directCalls = 0u;
+    std::uint32_t externCalls = 0u;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        LirInstId const inst = lir.blockInstAt(entry, i);
+        auto const op = lir.instOpcode(inst);
+        if (op == callOp)          ++directCalls;
+        if (op == callIndirectOp)  ++externCalls;
+    }
+    // The fixture issues ONE call to internal + ONE call to extern.
+    // Pin EXACTLY ONE of each — a refactor that lowers extern-as-direct
+    // would produce 2 direct + 0 extern (the silent regression).
+    EXPECT_EQ(directCalls, 1u)
+        << "call to internal symbol must lower to `call` (E8 disp32)";
+    EXPECT_EQ(externCalls, 1u)
+        << "call to extern symbol must lower to `call_indirect_via_extern` "
+           "(FF 15 disp32) — direct E8 would SEGV at runtime";
+}
+
+TEST(MirToLir, NoExternImportsAllCallsLowerAsDirectCall) {
+    // Inverse of the above: with `externImports={}` the lowerer must
+    // NOT mis-classify ANY call as extern. Every call lowers as the
+    // direct `call` opcode.
+    auto L = lowerCSubsetToLir(
+        "int g(int a) { return a; }\n"
+        "int f(int x) { return g(x); }\n");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+    auto const& sch = *L.target;
+    auto const callOp = *sch.opcodeByMnemonic("call");
+    auto const callIndirectOp =
+        *sch.opcodeByMnemonic("call_indirect_via_extern");
+
+    Lir const& lir = L.lir.lir;
+    std::uint32_t directCalls = 0u;
+    std::uint32_t externCalls = 0u;
+    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const bn = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < bn; ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+                LirInstId const inst = lir.blockInstAt(blk, i);
+                auto const op = lir.instOpcode(inst);
+                if (op == callOp)         ++directCalls;
+                if (op == callIndirectOp) ++externCalls;
+            }
+        }
+    }
+    EXPECT_GT(directCalls, 0u)
+        << "module-internal calls must lower as `call`";
+    EXPECT_EQ(externCalls, 0u)
+        << "with no externImports passed, no call must lower as "
+           "`call_indirect_via_extern`";
 }
 
 TEST(MirToLir, VoidCallProducesNoResultReg) {

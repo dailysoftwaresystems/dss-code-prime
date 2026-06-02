@@ -6,6 +6,8 @@
 #include "hir/hir_literal_pool.hpp"
 
 #include <memory>
+#include <string>
+#include <vector>
 
 // CST→HIR lowering (plan 09 HR8) — the single, language-agnostic engine.
 //
@@ -30,6 +32,25 @@ namespace dss {
 class SemanticModel;
 class DiagnosticReporter;
 
+// FF6 Slice 2 (2026-06-02): one row per source-declared extern
+// produced by the lowerer. Caller-owning pair (HirNodeId + canonical
+// name) — the lowerer is the single authority on the source-level
+// identifier that maps to each extern HirNodeId. The FFI synthesis
+// path (`synthesizeFfiFromSourceDecls` in `src/ffi/ingest.cpp`)
+// reads the public `externDecls` field directly (via
+// `compileSingleUnit` step 2.5), builds a transient
+// `vector<ExternDeclRef>` view-list over the records, and produces
+// one `FfiMetadata` entry per row (mangledName via FF4 +
+// importLibrary via the per-language `externLibraryByFormat` map).
+// Owning the canonical-name string here decouples the FFI stage
+// from the lifetime of the analyzer's `SemanticModel` — the
+// lifecycle assumption matches the rest of the result struct
+// (lifetime tied to the unique_ptr returned by `lowerToHir`).
+struct DSS_EXPORT HirExternRecord {
+    HirNodeId   node;
+    std::string canonicalName;  // undecorated source identifier
+};
+
 struct DSS_EXPORT CstToHirResult {
     Hir            hir;
     HirSourceMap   sourceMap;     // bound to `hir` — must stay at a stable address
@@ -38,6 +59,13 @@ struct DSS_EXPORT CstToHirResult {
     // Error-severity diagnostic (delta-computed, so prior diagnostics on the
     // shared reporter don't taint the verdict).
     bool           ok = false;
+    // FF6 Slice 2 (2026-06-02): the source-declared externs the
+    // lowerer produced. Populated by `lowerExternDecl` in
+    // declaration order. Consumed by the FFI synthesis stage at
+    // `compileSingleUnit` between HIR and MIR lowering. Empty
+    // when the source declares no externs (every existing
+    // pre-FF6 test fixture).
+    std::vector<HirExternRecord> externDecls;
 
     // `hir` is declared first so the maps bind to the constructed module.
     CstToHirResult(Hir h, HirLiteralPool lp)

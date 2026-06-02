@@ -22,12 +22,12 @@
 
 namespace dss::lir_pass_util {
 
-// Emit a single diagnostic through the reporter. Identical to the
-// shape used by every pass; centralized so the construction of
-// `ParseDiagnostic` lives in one place.
-DSS_EXPORT void
-report(DiagnosticReporter& reporter, DiagnosticCode code,
-       DiagnosticSeverity severity, std::string actual);
+// Note: the `report(reporter, code, severity, msg)` shim previously
+// lived here. Hoisted to `core/types/diagnostic_reporter.hpp` at LK10
+// cycle 3 post-fold #2 (D-LK10-8 closure) — it's tier-agnostic and
+// driver-tier callers (program/input_resolver) were dragging in LIR
+// headers for it. Consumers now `using dss::report;` (or call
+// `dss::report` qualified) without a LIR dependency.
 
 // Translate a NON-vreg operand: BlockRef gets remapped to dest-side
 // block ids; everything else passes through. Vreg/spill resolution

@@ -151,6 +151,14 @@ enum class DiagnosticCode : std::uint16_t {
     // construction — the schema loader in `core` cannot see the `hir`-layer
     // enums — and reported as H_UnsupportedLoweringForKind.)
     C_InvalidHirLowering          = 0xC033,
+    // C_InvalidShippedFfiHeaderPath: `findShippedFfiHeader` was called
+    // with a relative path that is empty / absolute / starts with `.`
+    // / contains a `..` component. Distinct from C_InvalidLanguageName
+    // because the remediation prose is path-shaped, not name-shaped:
+    // the caller passes something like `"libc/stdio.h"`, NOT a logical
+    // language identifier. Post-FF2-#2 fold (silent-failure HIGH-2 +
+    // code-reviewer HIGH).
+    C_InvalidShippedFfiHeaderPath = 0xC034,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
@@ -233,13 +241,89 @@ enum class DiagnosticCode : std::uint16_t {
     // silently parse the file under the primary grammar. (A single-language CU
     // always routes to its one schema, so this never fires there.)
     D_UnknownFileExtension        = 0xD006,
+    // LK10 cycle 2 (plan 14): driver-tier codes emitted by
+    // `Program::compileFiles` / `compileDirectory` / `compileProject`
+    // when the caller's invocation cannot be honored.
+    //
+    // D_InvalidTargetSpec: a `targets[i]` string did not parse as
+    //   `"<targetName>:<formatName>"` — wrong separator count or
+    //   either half empty. The driver does not infer a default for
+    //   either half because that would silently route to an
+    //   unintended target/format pair on typo.
+    // D_SchemaLoadFailed: one of the three schema loads
+    //   (`GrammarSchema::loadShipped(languageName)`,
+    //   `TargetSchema::loadShipped(targetName)`,
+    //   `ObjectFormatSchema::loadShipped(formatName)`) returned an
+    //   unexpected result. The wrapped C_* / config-side diagnostic
+    //   has the structural detail; this code surfaces the
+    //   driver-tier failure so downstream tooling can route on it.
+    // D_PlanNotLanded: an entry point reached an arm whose backing
+    //   plan substrate is not yet shipped. Currently fires only on
+    //   `compileProject` (plan 06 `.dsp` parser pending); appending
+    //   future plan-gated arms re-uses this code.
+    D_InvalidTargetSpec           = 0xD007,
+    D_SchemaLoadFailed            = 0xD008,
+    D_PlanNotLanded               = 0xD009,
+    // LK10 cycle 2 post-fold review #1 split (silent-failure-hunter
+    // F12): the original cycle-2 fold reused `D_FileNotFound` at 3
+    // distinct sites (missing input dir / mid-scan iterator error /
+    // driver mkdir failure). Tools that route on the diagnostic
+    // code (not message text) couldn't triage which root cause
+    // fired. Splits below — `D_FileNotFound` retains its original
+    // meaning (input dir / input file missing).
+    D_OutputDirCreateFailed       = 0xD00A,
+    D_DirectoryScanFailed         = 0xD00B,
+    // D_TargetFormatMismatch (deprecated alias of
+    // D_TargetMachineCodeMismatch — kept for downstream
+    // tooling already filtering on this code; new emissions use the
+    // remediation-distinct codes below).
+    D_TargetFormatMismatch        = 0xD00C,
+    // D_TargetMachineCodeMismatch: D-LK6-8.2 closure — the machine
+    // code declared on the FORMAT schema doesn't match the TARGET
+    // schema's expected machine code for that format kind. Example:
+    // `arm64:elf64-x86_64-linux-exec` declares `elf.machine=62`
+    // (EM_X86_64) but the "arm64" target expects `elf.machine=183`
+    // (EM_AARCH64). Pre-fold this dispatched silently into the wrong
+    // PLT-stub emitter → SIGILL.
+    // D_TargetAbiModelMismatch: D-LK6-8.2 post-fold #1 closure — the
+    // target's `abiModel` (register-machine / operand-stack /
+    // result-id) doesn't match the format's `kind` (Elf/Pe/MachO vs
+    // Wasm vs Spirv). Example: register-machine x86_64 target paired
+    // with a WASM format. Pre-fold this also silently passed because
+    // the cited `abiModel()` "upstream gate" was fictitious.
+    // The two codes are remediation-distinct: machine-code mismatch
+    // is fixed by changing one of the two schema files' machine
+    // values; abi-model mismatch is fixed by picking a different
+    // target OR format entirely.
+    D_TargetMachineCodeMismatch   = 0xD00D,
+    D_TargetAbiModelMismatch      = 0xD00E,
+    // D_TargetAbiModelUnsupportedByDriver: compileOneTarget reached an
+    //   abiModel (operand-stack / result-id) that the register-machine
+    //   LIR pipeline does not lower. Permanent architectural exclusion
+    //   — plans 17 (SPIR-V) and 18 (WASM) own their own lowering tiers.
+    //   Distinct from `D_PlanNotLanded` (pending-arrival surface).
+    //   (post-fold #6 silent-failure C2 fix.)
+    D_TargetAbiModelUnsupportedByDriver = 0xD00F,
 
-    // ── H0xxx — HIR verifier / lowering (plan 09; the 0xF high nibble renders
+    // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
-    // Emitted by the language-agnostic HIR verifier (`src/hir/hir_verifier`) and
-    // (later) the CST→HIR lowering. Reserved for verifier-/lowering-time
-    // failures only — config-load errors in a `hirLowering` block use the C_*
-    // band (plan §4 Q8). Append, never renumber.
+    // Codes emitted by HIR-tier subsystems — verifier, CST→HIR lowering,
+    // AND the `.dsshir` text-format parser. Four root-cause categories
+    // legitimately coexist in this band:
+    //   - engine config bugs (H_UnsupportedLoweringForKind,
+    //     H_ExternDeclMalformed);
+    //   - user-source contradictions discovered at lowering
+    //     (H_ExternHasInitializer, H_InvalidBreak, H_ShaderViolation);
+    //   - verifier-time structural invariant breaches (H_TypeUnresolved,
+    //     H_VerifierFailure, H_UnknownIntrinsic);
+    //   - HIR-text serialization (`.dsshir`) parse-time failures
+    //     (H_TextMalformed, H_TextVersionMismatch, H_TextUnknownName) —
+    //     these share the band by phase-letter convention rather than by
+    //     verifier/lowering lifecycle alignment, since the text-format
+    //     parser is the HIR-tier analog of the P_* source-parser band.
+    // Config-load errors in a `hirLowering` block (i.e. failures BEFORE any
+    // verifier/lowering runs) use the C_* band (plan §4 Q8). Append, never
+    // renumber.
     // H_TypeUnresolved: an expression / TypeRef / VarDecl node whose `typeId` is
     //   not valid() — i.e. lowering/semantic analysis failed to resolve its type.
     //   A node already flagged `HirFlags::HasError` is skipped (cascade
@@ -285,11 +369,40 @@ enum class DiagnosticCode : std::uint16_t {
     // H_UnsupportedLoweringForKind: the CST→HIR lowering engine (plan 09 HR8)
     //   reached a CST rule/construct it cannot lower — either the language's
     //   `hirLowering` config has no mapping for it, the mapping names an
-    //   unknown HIR kind/op, or the construct is a known-deferred one (extern /
-    //   typedef-of-pointer / compound-assign / ++ / arrays / strings — owned by
-    //   a later plan). An `Error` HIR node is emitted as a recovery sentinel and
-    //   lowering continues (collect-all); never a silent skip or a miscompile.
+    //   unknown HIR kind/op, or the construct is a known-deferred one
+    //   (typedef-of-pointer / compound-assign / ++ / arrays / strings —
+    //   owned by a later plan; extern decls are fully lowered, and
+    //   `extern int x = 5;` rejects via `H_ExternHasInitializer`). An
+    //   `Error` HIR node is emitted as a recovery sentinel and lowering
+    //   continues (collect-all); never a silent skip or a miscompile.
     H_UnsupportedLoweringForKind  = 0xF009,
+    // H_ExternHasInitializer: an `extern` declaration carries an
+    //   initializer (e.g. `extern int x = 5;`, `extern int y = z;`,
+    //   `extern int a[2] = {0,1};`, even `extern int b = {};`). Extern
+    //   announces a symbol whose storage lives in another translation
+    //   unit — an initializer would either redefine the symbol locally
+    //   (contradicting `extern`) or be silently dropped at lowering
+    //   (D-FF2-3 fold replaces that drop). Detection is shape-based:
+    //   any non-arrayDeclSuffix internal child of `varDeclTail` IS the
+    //   init subtree. Distinct remediation from
+    //   `H_UnsupportedLoweringForKind`: "remove the initializer", not
+    //   "extend the engine".
+    H_ExternHasInitializer        = 0xF00A,
+    // H_ExternDeclMalformed: the lowering's defensive arm reached an
+    //   `externDecl` whose CST cannot be navigated to the
+    //   varDeclTail-equivalent subtree — the language config IS
+    //   correct (kindByChild present), but `descend(childPath)`
+    //   returned invalid or a non-Internal node for this particular
+    //   instance. Today's c-subset short-circuits at semantic-error
+    //   time, so this arm is structurally unreachable through shipped
+    //   grammars — but a future grammar permitting recovery shapes
+    //   that reach lowering would trip it. Remediation: fix the input
+    //   (it's incomplete or malformed at this position).
+    //   Distinct from `H_UnsupportedLoweringForKind` (engine config
+    //   error — language hasn't configured kindByChild) and from
+    //   `H_ExternHasInitializer` (user-source init contradiction).
+    //   D-FF2 H2 audit fold (post-fold #8/#9).
+    H_ExternDeclMalformed         = 0xF00B,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -366,6 +479,38 @@ enum class DiagnosticCode : std::uint16_t {
     // L_UnsupportedLoweringForOpcode (which is about opcode-lowering
     // coverage gaps): this code names the malformed substrate shape.
     L_MemOperandMalformed          = 0xB006,
+    // ML7 cycle 2 (plan 12): calling-convention materialization codes.
+    //
+    // L_StackPassedArgUnsupported: an `arg k` or `call` site requires
+    //   passing an argument on the stack because `k >= cc.argGprs.size()`
+    //   (or `argFprs.size()` for an FPR-class arg). Stack-passed args
+    //   need both a callee-side load from `[SP + caller-arg-offset]`
+    //   and a caller-side store/push BEFORE the call. v1 register-only.
+    //   Anchor: D-ML7-2.2.
+    // L_CcRegLookupFailed: the cc declares a register name in
+    //   `argGprs`/`argFprs`/`returnGprs`/`returnFprs` that does not
+    //   resolve via `schema.registerByName(...)` — schema misconfiguration
+    //   (e.g. a typo in the JSON between the `registers[]` and the cc's
+    //   reg list). `TargetSchemaData::validate` is meant to be the first
+    //   line of defense, but defense-in-depth at materialization time
+    //   catches a future schema-loader bug that bypasses validate.
+    //   Renamed from `L_ArgRegLookupFailed` at the post-fold review
+    //   (silent-failure F7: the name said "arg" but the code is also
+    //   used for the return-register lookup path).
+    // L_MoveCycleUnsupported: call-site arg-passing produces a move
+    //   cycle (e.g. swap two args between argGprs[0] and argGprs[1]).
+    //   The v1 emit-in-order materialization would silently miscompile
+    //   such a cycle — second mov reads a clobbered source. v1 detects
+    //   loud; D-ML7-2.3 anchors the proper parallel-copy resolution.
+    // L_IndirectCallUnsupported: the LIR `call` instruction's callee
+    //   operand is not a `SymbolRef`. v1 only encodes direct calls
+    //   (the schema's encoding variant guard is `["symbol"]`); indirect
+    //   calls need a new schema variant + the materializer must emit
+    //   `call <reg>` instead of `call <sym>`. Anchor: D-ML7-2.4.
+    L_StackPassedArgUnsupported    = 0xB007,
+    L_CcRegLookupFailed            = 0xB008,
+    L_MoveCycleUnsupported         = 0xB009,
+    L_IndirectCallUnsupported      = 0xB00A,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //
@@ -454,9 +599,9 @@ enum class DiagnosticCode : std::uint16_t {
     //      `ObjectFormatKind::Unknown` (the invalid sentinel was
     //      not initialized by the format schema's loader path).
     //   2. The switch reaches a format whose walker is not yet
-    //      registered (MachO / Wasm / Spirv until LK3 / plan 18 /
-    //      plan 17 plug them in). ELF + PE walkers landed at LK1
-    //      and LK2 respectively.
+    //      registered (Wasm / Spirv until plan 18 / plan 17 plug
+    //      them in). ELF / PE / Mach-O walkers landed at LK1 /
+    //      LK2 / LK3 respectively.
     //   3. A format walker was invoked for a schema whose `kind()`
     //      does not match the walker (e.g. `elf::encode` called
     //      with a PE-tagged schema, or `pe::encode` called with an
@@ -464,12 +609,308 @@ enum class DiagnosticCode : std::uint16_t {
     //   4. The format schema declares the right `kind()` but omits
     //      a `sections[]` row the walker requires (e.g. ELF writer
     //      requires SectionKind::Text/RelocTable/Symtab/Strtab/
-    //      ShStrtab — any missing row fires this code; PE writer
-    //      only requires SectionKind::Text since PE has no separate
-    //      section headers for symbol/string tables).
+    //      ShStrtab — any missing row fires this code; PE and
+    //      Mach-O writers only require SectionKind::Text since
+    //      their symbol/string tables don't carry section headers).
+    // K_FormatLacksImportSupport: a format walker received an
+    //   AssembledModule with non-empty `externImports` but its
+    //   image-side arm doesn't yet emit import tables. The three
+    //   eager-binding format arms are now all closed (PE IAT —
+    //   LK6 cycle 2a; ELF GOT/PLT — LK6 cycle 2b.2; Mach-O
+    //   LC_DYLD_INFO_ONLY — LK6 cycle 2c). This diagnostic now
+    //   fires only on the lazy-binding upgrade paths (D-LK6-11
+    //   ELF / D-LK6-12 PE delay-load / D-LK6-13 Mach-O lazy-bind)
+    //   and on the ARM64-darwin chained-fixups path (D-LK6-14)
+    //   until those anchors close. Format walkers that can't
+    //   support the requested binding mode fire this loud rather
+    //   than silently producing a binary missing its import table.
+    // K_WalkerInputContractViolation: a format walker received an
+    //   AssembledModule whose SHAPE (not whose imports) violates the
+    //   walker's input contract — e.g. non-empty `functions` on the
+    //   LK8 WASM skeleton (which produces a preamble-only output
+    //   that doesn't consume native-ISA bytes), or `expectedFuncCount
+    //   > 0` with empty `functions`. Distinct from
+    //   `K_NoMatchingObjectFormat` (which signals "no walker registered
+    //   for this kind") — the dispatch IS correct here, but the caller
+    //   wired the wrong shape of input. (type-design fold, LK8
+    //   post-fold review.)
+    // K_ImageNotOk: `linker::writeImage()` refused to write a
+    //   LinkedImage whose `ok()` is false (parallel-index gate
+    //   failed upstream). The walker already emitted a diagnostic
+    //   for the actual failure — this code surfaces the
+    //   contract-violation at the write surface so a misconfigured
+    //   build script can't bypass the gate. Remediation: check
+    //   `reporter.errorCount()` before calling writeImage.
+    // K_ImageEmpty: `linker::writeImage()` saw `ok() == true` but
+    //   `bytes.empty()` — distinct from K_ImageNotOk in that the
+    //   parallel-index gate PASSED, so this is a walker contract
+    //   violation (the walker returned success with no output).
+    //   Remediation: fix the walker, not the caller. Type-design
+    //   post-fold split (LK10 cycle 1 post-fold #2 review).
+    // K_ImageWriteParentMissing: parent directory of the output
+    //   path doesn't exist. Caller responsibility — the substrate
+    //   does not auto-create paths (silent mkdir masks config
+    //   errors that ship artifacts to the wrong target dir).
+    // K_ImageWriteOpenFailed: `std::ofstream::open()` set failbit.
+    //   Causes: permission denied, path is a directory, invalid
+    //   filename, parent dir vanished post-`exists()`-check (TOCTOU
+    //   race).
+    // K_ImageWriteShort: write returned with failbit after starting
+    //   — disk full, I/O error mid-write.
+    // K_ImageWriteCloseFailed: `close()` set failbit while flushing
+    //   buffered writes. The bytes may be partially or fully on
+    //   disk; the file is in an unknown state.
+    // All five codes added plan 14 LK10 cycle 1; type-design
+    // post-fold split from one generic code into four
+    // remediation-distinct codes for log triage.
     K_SymbolUndefined              = 0x8001,
     K_RelocationKindMismatch       = 0x8002,
     K_NoMatchingObjectFormat       = 0x8003,
+    K_FormatLacksImportSupport     = 0x8004,
+    K_WalkerInputContractViolation = 0x8005,
+    K_ImageNotOk                   = 0x8006,
+    K_ImageWriteParentMissing      = 0x8007,
+    K_ImageWriteOpenFailed         = 0x8008,
+    K_ImageWriteShort              = 0x8009,
+    K_ImageWriteCloseFailed        = 0x800A,
+    K_ImageEmpty                   = 0x800B,
+    // (0x800C retired — was K_ChainedFixupsNotYetIntegrated, a
+    // substrate-gap signal removed at D-LK6-14-INTEGRATION-PAYLOAD
+    // closure. Companion D-LK6-14-INTEGRATION-GOT-SLOTS is open but
+    // its failure surfaces at dyld load, not at the walker — outside
+    // K_* scope.)
+    // K_EntryPointResolvesToExtern: format.entryPoint resolved to an
+    //   ExternImport rather than an AssembledFunction. Semantically
+    //   invalid — an extern is a SYMBOL REFERENCE to code that lives
+    //   in another module; it cannot SERVE AS the user entry point.
+    //   Closes D-LK10-ENTRY-EXTERN-ENTRY-DIAG — split from the
+    //   generic K_SymbolUndefined so triage tooling can distinguish
+    //   "entry point name doesn't exist anywhere" from "entry point
+    //   resolved to an extern (the user almost certainly named the
+    //   wrong symbol in the format JSON)". Both fire at trampoline-
+    //   injection time, but the user-visible remediation differs:
+    //   K_SymbolUndefined → check that the user's source declares
+    //   the named entry function; K_EntryPointResolvesToExtern →
+    //   check that the format JSON's `entryPoint` field names a
+    //   declared function rather than an imported symbol.
+    K_EntryPointResolvesToExtern   = 0x800D,
+    // K_DuplicateDataSymbol: two `AssembledData` items in the same
+    //   module share the same non-sentinel `SymbolId`. The linker's
+    //   symbol→VA join is keyed by `SymbolId`; duplicates would
+    //   silently let "whichever item was processed last" win the
+    //   resolution. Distinct from `K_SymbolUndefined` (a symbol
+    //   referenced but never declared) — this is the symmetric
+    //   "doubly declared" failure. Closes the silent-failure
+    //   F-3 + type-design Q5 + comment-analyzer C5 convergence at
+    //   the 3rd-order audit of D-LK4-RODATA-BSS-INVARIANT.
+    // K_BssDataHasBytes: an `AssembledData` item has
+    //   `section == DataSectionKind::Bss` but non-empty `bytes`.
+    //   BSS is zero-fill — the wire format reserves `sh_size`
+    //   without storing bytes; a non-empty Bss item is a substrate-
+    //   shape violation. Distinct from `K_NoMatchingObjectFormat`
+    //   (a format-dispatch failure) — this is a producer-side
+    //   AssembledData invariant violation. Closes the same
+    //   convergence as K_DuplicateDataSymbol above.
+    K_DuplicateDataSymbol          = 0x800E,
+    K_BssDataHasBytes              = 0x800F,
+    // K-NEXT-SLOT: 0x8010 — grep this marker before adding a K_* code.
+
+    // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
+    // F_FileOpenFailed: shared-library path doesn't exist / permission
+    //   denied / I/O error during initial open. Distinct from
+    //   D_FileNotFound (CLI input file) because the remediation is
+    //   "check the project's importLibrary path or distro lib paths",
+    //   not "fix the user's --compile argument".
+    // F_FileEmpty: zero-byte file. Symptomatic of a broken build /
+    //   truncated download.
+    // F_UnknownBinaryFormat: no recognised magic bytes (not ELF, not
+    //   PE, not Mach-O). Distinct from `UnsupportedBinaryFormat` —
+    //   "unknown" means we can't even guess; "unsupported" means we
+    //   recognised the format but the reader for it isn't shipped.
+    // F_UnsupportedBinaryFormat: format recognised but binary-reader
+    //   not yet shipped (Mach-O after FF1-ELF + FF1-PE landed). Cites
+    //   the per-format anchor (FF1-MachO) so the user knows what's
+    //   pending.
+    // F_CorruptedBinary: file structurally invalid — section offset
+    //   past EOF, string-table index out of range, etc.
+    // F_UnsupportedElfClass: ELF32 / non-LE / ELFv0 — v1 supports
+    //   ELF64 little-endian (gABI mainstream).
+    // F_SectionNotFound: expected .dynsym / .dynstr / etc. missing
+    //   from the binary. A stripped library is the typical cause.
+    F_FileOpenFailed               = 0x5001,
+    F_FileEmpty                    = 0x5002,
+    F_UnknownBinaryFormat          = 0x5003,
+    F_UnsupportedBinaryFormat      = 0x5004,
+    F_CorruptedBinary              = 0x5005,
+    F_UnsupportedElfClass          = 0x5006,
+    F_SectionNotFound              = 0x5007,
+    // ── FF2 C header parser (plan 11 §2.3) ──
+    // Codes split per the type-design + silent-failure-hunter post-fold
+    // review of FF2 baseline: distinct user-actionable remediations →
+    // distinct codes (same discipline as the D_FileNotFound 3-way
+    // split + D_TargetFormatMismatch 2-way split + K_Image* 5-way
+    // split). A consumer routing on a single F_HeaderParseFailed
+    // could not triage "caller passed empty importLibrary" (caller
+    // API bug) from "shipped grammar broken" (build/install bug)
+    // from "header syntax error" (user source bug).
+    //
+    // F_HeaderParseFailed: c-subset frontend rejected the header text
+    //   (tokenize / parse / semantic / lowering diagnostics).
+    //   Remediation: fix the source header.
+    // F_HeaderHasFunctionBody: a non-extern function DEFINITION (with
+    //   `{ ... }` body) appeared at top level. Headers in v1 are
+    //   declaration-only — function bodies belong in `.c` translation
+    //   units, not headers.
+    // F_HeaderHasNonExternDecl: a top-level decl that is neither
+    //   `extern` nor `typedef` (e.g. a bare `int x;` global). Header
+    //   mode accepts only the declaration surface FFI ingestion
+    //   consumes.
+    // F_HeaderEmptyImportLibrary: the caller passed an empty
+    //   `importLibrary` — silent-failure surface if accepted (every
+    //   row downstream would be unlinkable). Remediation: caller
+    //   supplies a non-empty library identity (`"libc.so.6"`,
+    //   `"msvcrt.dll"`, etc.).
+    // F_HeaderGrammarLoadFailed: the shipped c-subset grammar JSON
+    //   failed to load. Remediation: ship the grammar artifact /
+    //   investigate the underlying C_* diagnostics also reported.
+    // F_HeaderHasUnsupportedTopLevel: a top-level HIR kind reached the
+    //   header walker that is neither extern decl nor typedef and not
+    //   the function-body / non-extern-global case either. Fires from
+    //   TWO arms: explicit `HirKind::ImportGroup` (#include) AND the
+    //   residual default arm covering Module / statements / expressions
+    //   / Unreachable / Extension / future HirKinds (with the
+    //   numeric kind embedded in the diagnostic detail). Remediation:
+    //   remove the construct from the curated header OR extend FF2 to
+    //   accept it.
+    // F_HeaderInvalidShippedPath: `readCHeaderShipped` was called with
+    //   a relative path that is empty / absolute / contains a `..`
+    //   component / starts with `.` — caller-API bug separate from
+    //   genuine "file not found in any ancestor dir" (F_FileOpenFailed).
+    //   Remediation: caller passes a valid relative path like
+    //   `"libc/stdio.h"`.
+    // F_HeaderInternalInvariant: an internal-invariant violation
+    //   reached the header walker — a compiler bug, not a user-fixable
+    //   issue. Remediation: file a bug.
+    // (D-FF2-3 CLOSED 2026-06-01 via `H_ExternHasInitializer`
+    // (0xF00A) at the lowering tier — the FFI walker reuses the
+    // c-subset frontend, so the reject reaches it through the
+    // shared lowering pipeline; no separate F_* code needed.)
+    F_HeaderParseFailed            = 0x5008,
+    F_HeaderHasFunctionBody        = 0x5009,
+    F_HeaderHasNonExternDecl       = 0x500A,
+    F_HeaderEmptyImportLibrary     = 0x500B,
+    F_HeaderGrammarLoadFailed      = 0x500C,
+    F_HeaderHasUnsupportedTopLevel = 0x500D,
+    F_HeaderInternalInvariant      = 0x500E,
+    F_HeaderInvalidShippedPath     = 0x500F,
+    // ── FF3 ABI catalog (plan 11 §2.4) ──
+    // F_AbiUnknownTuple: the (target.name, format.kind) pair has no
+    //   row in FF3's catalog. Remediation: ship the format.json for
+    //   this combination, OR add the catalog row if the combination
+    //   is genuinely supported.
+    // F_AbiNoMatchingCcInTarget: FF3 catalog says (target, format)
+    //   needs a specific calling-convention name (e.g. "ms_x64"), but
+    //   the target.json does not ship a callingConventions row by
+    //   that name. Remediation: extend the target.json's
+    //   callingConventions array OR drop the (target, format) pair.
+    // F_AbiFormatAbiModelMismatch: defensive — (format.kind, target.abiModel)
+    //   pair reached FF3 in an unexpected state (e.g. an
+    //   `operand-stack` abi-model target paired with a non-WASM
+    //   format-kind, or a `result-id` abi-model target paired with
+    //   a non-SPIR-V format-kind). crossValidateTargetFormat
+    //   should reject this upstream; FF3 emits the code if it slips
+    //   past as a defense-in-depth.
+    F_AbiUnknownTuple              = 0x5010,
+    F_AbiNoMatchingCcInTarget      = 0x5011,
+    F_AbiFormatAbiModelMismatch    = 0x5012,
+    // F_AbiCcRegistersInconsistent: a target.json's
+    //   `callingConventions[i]` row carries one or more register
+    //   names (`argGprs`/`argFprs`/`returnGprs`/`returnFprs`/
+    //   `callerSaved`/`calleeSaved`) that do not resolve in
+    //   `target.registers[]`. Most common cause: paste-error from
+    //   an unrelated arch (e.g. `ms_arm64` cc declared with
+    //   `rcx,rdx,r8,r9` copied from `ms_x64`). Closes the
+    //   silent-failure surface where FF3 would return a `cc *`
+    //   into structurally-wrong data when a caller bypasses the
+    //   JSON loader (TargetSchema ctor is public + skips
+    //   validate()). (D-FF3-Coherence un-retired 2026-06-01 at
+    //   post-fold #4 once the schema-loader-singleton premise
+    //   was disproved.)
+    F_AbiCcRegistersInconsistent   = 0x5013,
+    // F_MangleMissingExpectedPrefix: `unapplyCManglingStrict` was
+    //   called on a decorated input that lacks the per-format
+    //   prefix the rule expects (e.g. a Mach-O symbol passed in as
+    //   `printf` instead of `_printf`). Distinct from the
+    //   conservative `unapplyCMangling` which silently passes such
+    //   input through. Used by FF5 ingest where the format-kind
+    //   is authoritative and a missing prefix is a structural
+    //   anomaly. (D-FF4-3 post-fold-#3.)
+    F_MangleMissingExpectedPrefix  = 0x5014,
+    // F_FfiIngestDuplicateSymbol: FF5 ingest() saw the same canonical
+    //   symbol exposed by more than one IngestionSource. First-source-
+    //   wins per FFI design; this Warning records the shadowed
+    //   definition so an operator can re-order sources or remove the
+    //   redundant declaration. Distinct from F_HeaderParseFailed
+    //   (which means "a single header failed to parse") — the
+    //   duplicate-shadow is a CROSS-source concern. (post-fold #5
+    //   silent-failure C3 / code-reviewer #88 fold.)
+    F_FfiIngestDuplicateSymbol     = 0x5015,
+    // F_FfiIngestAbiModelUnsupported: FF5 ingest() saw a (target, format)
+    //   abiModel pair (operand-stack / result-id) that FF4 C-mangling
+    //   does not cover. Permanent architectural exclusion — plan 17
+    //   (SPIR-V) and plan 18 (WASM) own their own ingest surfaces.
+    //   Distinct from `D_PlanNotLanded` which means "this entry point
+    //   is pending plan landing" — this code means "this entry point
+    //   will NEVER apply to this abiModel". (post-fold #6 silent-
+    //   failure C2 fix.)
+    F_FfiIngestAbiModelUnsupported = 0x5016,
+    // F_FfiIngestEmptyCanonical: FF5 ingest() saw an empty canonical
+    //   name — either a binary-reader / header-parser bug emitted a
+    //   zero-length mangledName, OR a caller passed an
+    //   `ExternDeclRef{node, ""}` value. Both are structural
+    //   anomalies — proceeding with an empty key would silently
+    //   shadow legitimately-distinct symbols in the by-name lookup.
+    //   (post-fold #6 silent-failure C1 fix / D-FF5-EXTERNDECLREF-VALIDATE
+    //   promoted from anchor to close-now.)
+    F_FfiIngestEmptyCanonical      = 0x5017,
+    // F_BinaryReaderPartialCorruption: an FF1 binary reader (ELF / PE /
+    //   Mach-O) skipped one or more symbol-table entries during parse
+    //   due to structural anomalies — out-of-bounds name indices,
+    //   RVAs that don't resolve to any section, NUL-byte indices into
+    //   the string table that wrap past EOF, etc. The reader continues
+    //   parsing other entries; the surviving rows ARE returned. This
+    //   Warning documents the partial loss so operators can investigate
+    //   the source binary's integrity (truncated download, mismatched
+    //   build artifact, ABI breakage at the library boundary).
+    //   Distinct from F_CorruptedBinary (aborts the parse): a
+    //   partially-corrupted .so / .dll / .dylib may still be usable
+    //   for linking, but the operator should verify the library was
+    //   built correctly. Emitted at Warning severity — under
+    //   `--warnings-as-errors` this elevates to fail-loud, which is
+    //   the correct strict-mode behavior. Member of `kUnsuppressableCodes`
+    //   per the silent-failure-hunter 2nd-order audit: cap saturation
+    //   would otherwise silently drop the very signal this code was
+    //   introduced to surface.
+    //   D-FF1-PARTIAL-CORRUPTION-MACHO CLOSED (FF1-MachO cycle
+    //   2026-06-01): Mach-O reader emits the same counter+Warning
+    //   contract; see src/ffi/binary_readers/macho_reader.cpp.
+    F_BinaryReaderPartialCorruption = 0x5018,
+    // F_FfiNoImportLibraryForFormat: FF5 `synthesizeFfiFromSourceDecls`
+    //   (the source-declared sibling of `ingest`, used when the
+    //   language's extern declarations ARE their own authority — no
+    //   header / binary surface read) was invoked with an empty
+    //   `importLibrary` for the active `ObjectFormatKind`. Means the
+    //   language's `DeclarationRule.externLibraryByFormat` map has no
+    //   entry for this format. Remediation: extend the language's
+    //   semantics JSON (e.g. c-subset.lang.json) with an
+    //   `externLibraryByFormat: { "pe": "msvcrt.dll", ... }` entry
+    //   for the missing format. Distinct from
+    //   `F_HeaderEmptyImportLibrary` (which means "a HEADER-source
+    //   caller forgot the library identity at FF2 read time") — this
+    //   code means "the LANGUAGE CONFIG has no per-format library
+    //   declaration for source-declared externs". (FF6 Slice 2,
+    //   2026-06-02.)
+    F_FfiNoImportLibraryForFormat  = 0x5019,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
@@ -515,6 +956,38 @@ struct DSS_EXPORT ParseDiagnostic {
 
     // Optional human-friendly hint ("did you forget a semicolon?").
     std::string suggestion;
+
+    // Optional rendering-only prefix prepended to the expected/actual
+    // prose at `DiagnosticReporter::format()` time (e.g.
+    // `[target=x86_64:elf64-x86_64-linux] ` stamped by
+    // `program::mergeWithTargetContext` so multi-target runs route
+    // per-target context to tooling without polluting the dedup hash).
+    // The CLI `drainDiagnosticsToStderr` and LSP `composeMessage`
+    // render paths perform the symmetric prepend. Excluded from
+    // `hashKey` so cross-source legitimate duplicates (same diagnostic
+    // from different targets) collapse correctly at the merge
+    // destination. D-MERGE-DEDUP-PREFIX-COLLISION fold.
+    //
+    // Anchored D-MERGE-CONTEXT-PREFIX-SIDE-TABLE: the empty-string
+    // overhead (~24 bytes SSO buffer) lands on every ParseDiagnostic,
+    // even single-target runs that never set the field. Negligible
+    // today; trigger to migrate to a side-table on the reporter (or a
+    // `std::unique_ptr<std::string>` 8-byte slot) is "ParseDiagnostic
+    // exceeds 200 bytes" (sizeof check) OR "Tracy/perf-record on a
+    // diagnostic-heavy compile attributes >5% of compile time to
+    // ParseDiagnostic alloc/copy".
+    //
+    // Anchored D-MERGE-CONTEXT-PREFIX-CLOBBER: `mergeWithTargetContext`
+    // uses `copy.contextPrefix = prefix;` (assignment, not append).
+    // Today this is invariant because `mergeWithTargetContext` is the
+    // ONLY producer; a future second producer (e.g. per-file `[file=]`
+    // stamping under a multi-source merge wrapping a multi-target
+    // merge) would have its prefix silently clobbered. Trigger: first
+    // additional contextPrefix writer outside mergeWithTargetContext.
+    // Resolution: switch the merge to append (`copy.contextPrefix +=
+    // prefix`) OR move contextPrefix to a stack (vector<string>) so
+    // nested merges preserve outer context.
+    std::string contextPrefix;
 };
 
 } // namespace dss

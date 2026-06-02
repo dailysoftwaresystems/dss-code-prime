@@ -1,0 +1,101 @@
+{
+  "$comment": "ELF64 EXECUTABLE (ET_EXEC) for x86_64 Linux. Second ELF schema (plan 14 LK1 cycle 2, 2026-05-30). Consumed by `src/link/format/elf.cpp` via the format-blind linker engine. Differs from `elf64-x86_64-linux.format.json` (the .o schema) in: `elf.type = exec`, sections carry `virtualAddress` (used as sh_addr), top-level `entryPoint` names the entry symbol (resolved against AssembledModule at link time). Cycle-2 scope: self-contained modules (zero relocations). Modules with relocations fail loud — the cross-reference applier lives at LK6 (D-LK4-5 + D-LK4-6 + D-LK1-3).",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "elf64-x86_64-linux-exec",
+    "version": "1.0",
+    "kind": "elf"
+  },
+
+  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol (e.g. '_start' for Linux/glibc, 'main' for hand-rolled execs) and the walker will resolve it by name. When D-LK10-ENTRY Slice C lands, the linker prepends a synthetic `_start` trampoline as module.functions[0] and the schema's entryPoint names the USER fn (the trampoline's call target).",
+  "entryPoint": "",
+
+  "$processExitComment": "D-LK10-ENTRY Slice B (plan 14 §2.13): the Linux runnable-binary spine — raw `exit_group` syscall (no libc dependency). The trampoline emitter loads the syscall number into rax via `mov eax, 231` (Slice A's `mov` opcode), moves the user fn's return value from rax into rdi (argGprs[0] of sysv_amd64), then issues SYSCALL (Slice A's new `syscall` opcode). x86_64 Linux syscall ABI: rax = syscall number, rdi = arg0 (status). syscallOpcodeBytes [15, 5] = 0x0F 0x05 = SYSCALL (stored-order byte stream).",
+  "processExit": {
+    "mechanism": "syscall",
+    "syscallNumber": 231,
+    "syscallNumGpr": "rax",
+    "syscallOpcodeBytes": [15, 5]
+  },
+
+  "$entryCallingConventionComment": "SysV AMD64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rdi before SYSCALL. Read via `target.callingConventionByName(\"sysv_amd64\")` at trampoline-build time.",
+  "entryCallingConvention": "sysv_amd64",
+
+  "elf": {
+    "$comment": "Elf64_Ehdr identity for an executable. type = ET_EXEC (2). class = ELFCLASS64; data = ELFDATA2LSB; osabi = sysv; machine = EM_X86_64 (62). pageAlign = 4096 (Linux x86_64 4 KB pages — kernel's PT_LOAD congruence requires p_vaddr % p_align == p_offset % p_align). ARM64 Linux on Apple Silicon / 64K configurations declares 16384 / 65536 in its own schema (D-LK6-3).",
+    "class": "elf64",
+    "data": "lsb",
+    "osabi": "sysv",
+    "abiVersion": 0,
+    "machine": 62,
+    "type": "exec",
+    "pageAlign": 4096,
+    "interpreter": "/lib64/ld-linux-x86-64.so.2",
+    "$bindNowComment": "Eager binding — the v1 stance per plan 14 §5 risk row. Emits DT_FLAGS_1 = DF_1_NOW so dyld resolves every GOT slot at load via R_X86_64_GLOB_DAT in .rela.dyn. Lazy upgrade (.rela.plt + R_X86_64_JUMP_SLOT + 16-byte PLT0 resolver-trampoline) anchored at D-LK6-11; until then, the walker fails loud on bindNow=false.",
+    "bindNow": true
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code section. virtualAddress = 0x401000 — conventional Linux x86_64 base (0x400000) + 0x1000 to leave the first page for the Ehdr and program header table loaded alongside `.text` in the same PT_LOAD. This is a convention, not a kernel hard requirement: any page-aligned VA works as long as `p_vaddr % p_align == p_offset % p_align`. sh_addr is set to this; e_entry derives from this + entry-function offset. sh_flags = SHF_ALLOC | SHF_EXECINSTR (6); sh_addralign = 16 (x86_64 psABI).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1,
+      "flags": 6,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 4198400
+    },
+    {
+      "$comment": "Symbol table — even in ET_EXEC files, .symtab is conventional for debugger support. sh_type = SHT_SYMTAB (2); sh_addralign = 8; sh_entsize = 24 (Elf64_Sym).",
+      "kind": "symtab",
+      "name": ".symtab",
+      "type": 2,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 24,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Symbol-name string table. sh_type = SHT_STRTAB (3); addrAlign = 1.",
+      "kind": "strtab",
+      "name": ".strtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Section-header string table. sh_type = SHT_STRTAB (3); addrAlign = 1.",
+      "kind": "shstrtab",
+      "name": ".shstrtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "Relocation kinds are declared so the linker engine's cross-reference unifier (plan 13 §2.6) accepts any relocation tag the assembler stamps. In ET_EXEC cycle 2, the walker rejects modules whose AssembledFunctions carry ANY relocation entries (cycle scope: self-contained only). Resolved at LK6 D-LK4-5/D-LK4-6 + plan 14 D-LK1-3.",
+      "name": "R_X86_64_PC32",
+      "kind": 1,
+      "nativeId": 2
+    },
+    {
+      "name": "R_X86_64_64",
+      "kind": 2,
+      "nativeId": 1
+    },
+    {
+      "name": "R_X86_64_32",
+      "kind": 3,
+      "nativeId": 10
+    }
+  ]
+}

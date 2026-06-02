@@ -71,6 +71,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_InvalidSemantics:         return "C_InvalidSemantics";
         case DiagnosticCode::C_UnknownArtifactProfile:   return "C_UnknownArtifactProfile";
         case DiagnosticCode::C_InvalidHirLowering:       return "C_InvalidHirLowering";
+        case DiagnosticCode::C_InvalidShippedFfiHeaderPath: return "C_InvalidShippedFfiHeaderPath";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";
@@ -90,6 +91,11 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_UnresolvedImport:         return "D_UnresolvedImport";
         case DiagnosticCode::D_UnresolvedReference:      return "D_UnresolvedReference";
         case DiagnosticCode::D_UnknownFileExtension:     return "D_UnknownFileExtension";
+        case DiagnosticCode::D_InvalidTargetSpec:        return "D_InvalidTargetSpec";
+        case DiagnosticCode::D_SchemaLoadFailed:         return "D_SchemaLoadFailed";
+        case DiagnosticCode::D_PlanNotLanded:            return "D_PlanNotLanded";
+        case DiagnosticCode::D_OutputDirCreateFailed:    return "D_OutputDirCreateFailed";
+        case DiagnosticCode::D_DirectoryScanFailed:      return "D_DirectoryScanFailed";
         case DiagnosticCode::H_TypeUnresolved:           return "H_TypeUnresolved";
         case DiagnosticCode::H_InvalidBreak:             return "H_InvalidBreak";
         case DiagnosticCode::H_VerifierFailure:          return "H_VerifierFailure";
@@ -99,6 +105,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_TextVersionMismatch:      return "H_TextVersionMismatch";
         case DiagnosticCode::H_TextUnknownName:          return "H_TextUnknownName";
         case DiagnosticCode::H_UnsupportedLoweringForKind: return "H_UnsupportedLoweringForKind";
+        case DiagnosticCode::H_ExternHasInitializer:     return "H_ExternHasInitializer";
+        case DiagnosticCode::H_ExternDeclMalformed:      return "H_ExternDeclMalformed";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
@@ -120,6 +128,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_InvalidSpillSlotSentinel:     return "L_InvalidSpillSlotSentinel";
         case DiagnosticCode::L_PhysRegOrdinalOutOfRange:     return "L_PhysRegOrdinalOutOfRange";
         case DiagnosticCode::L_MemOperandMalformed:          return "L_MemOperandMalformed";
+        case DiagnosticCode::L_StackPassedArgUnsupported:    return "L_StackPassedArgUnsupported";
+        case DiagnosticCode::L_CcRegLookupFailed:            return "L_CcRegLookupFailed";
+        case DiagnosticCode::L_MoveCycleUnsupported:         return "L_MoveCycleUnsupported";
+        case DiagnosticCode::L_IndirectCallUnsupported:      return "L_IndirectCallUnsupported";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";
@@ -133,6 +145,48 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_SymbolUndefined:              return "K_SymbolUndefined";
         case DiagnosticCode::K_RelocationKindMismatch:       return "K_RelocationKindMismatch";
         case DiagnosticCode::K_NoMatchingObjectFormat:       return "K_NoMatchingObjectFormat";
+        case DiagnosticCode::K_FormatLacksImportSupport:     return "K_FormatLacksImportSupport";
+        case DiagnosticCode::K_WalkerInputContractViolation: return "K_WalkerInputContractViolation";
+        case DiagnosticCode::K_ImageNotOk:                   return "K_ImageNotOk";
+        case DiagnosticCode::K_ImageWriteParentMissing:      return "K_ImageWriteParentMissing";
+        case DiagnosticCode::K_ImageWriteOpenFailed:         return "K_ImageWriteOpenFailed";
+        case DiagnosticCode::K_ImageWriteShort:              return "K_ImageWriteShort";
+        case DiagnosticCode::K_ImageWriteCloseFailed:        return "K_ImageWriteCloseFailed";
+        case DiagnosticCode::K_ImageEmpty:                   return "K_ImageEmpty";
+        case DiagnosticCode::K_EntryPointResolvesToExtern:   return "K_EntryPointResolvesToExtern";
+        case DiagnosticCode::K_DuplicateDataSymbol:          return "K_DuplicateDataSymbol";
+        case DiagnosticCode::K_BssDataHasBytes:              return "K_BssDataHasBytes";
+
+        case DiagnosticCode::D_TargetFormatMismatch:         return "D_TargetFormatMismatch";
+        case DiagnosticCode::D_TargetMachineCodeMismatch:    return "D_TargetMachineCodeMismatch";
+        case DiagnosticCode::D_TargetAbiModelMismatch:       return "D_TargetAbiModelMismatch";
+        case DiagnosticCode::D_TargetAbiModelUnsupportedByDriver: return "D_TargetAbiModelUnsupportedByDriver";
+
+        case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
+        case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";
+        case DiagnosticCode::F_UnknownBinaryFormat:          return "F_UnknownBinaryFormat";
+        case DiagnosticCode::F_UnsupportedBinaryFormat:      return "F_UnsupportedBinaryFormat";
+        case DiagnosticCode::F_CorruptedBinary:              return "F_CorruptedBinary";
+        case DiagnosticCode::F_UnsupportedElfClass:          return "F_UnsupportedElfClass";
+        case DiagnosticCode::F_SectionNotFound:              return "F_SectionNotFound";
+        case DiagnosticCode::F_HeaderParseFailed:            return "F_HeaderParseFailed";
+        case DiagnosticCode::F_HeaderHasFunctionBody:        return "F_HeaderHasFunctionBody";
+        case DiagnosticCode::F_HeaderHasNonExternDecl:       return "F_HeaderHasNonExternDecl";
+        case DiagnosticCode::F_HeaderEmptyImportLibrary:     return "F_HeaderEmptyImportLibrary";
+        case DiagnosticCode::F_HeaderGrammarLoadFailed:      return "F_HeaderGrammarLoadFailed";
+        case DiagnosticCode::F_HeaderHasUnsupportedTopLevel: return "F_HeaderHasUnsupportedTopLevel";
+        case DiagnosticCode::F_HeaderInternalInvariant:      return "F_HeaderInternalInvariant";
+        case DiagnosticCode::F_HeaderInvalidShippedPath:     return "F_HeaderInvalidShippedPath";
+        case DiagnosticCode::F_AbiUnknownTuple:              return "F_AbiUnknownTuple";
+        case DiagnosticCode::F_AbiNoMatchingCcInTarget:      return "F_AbiNoMatchingCcInTarget";
+        case DiagnosticCode::F_AbiFormatAbiModelMismatch:    return "F_AbiFormatAbiModelMismatch";
+        case DiagnosticCode::F_AbiCcRegistersInconsistent:   return "F_AbiCcRegistersInconsistent";
+        case DiagnosticCode::F_MangleMissingExpectedPrefix:  return "F_MangleMissingExpectedPrefix";
+        case DiagnosticCode::F_FfiIngestDuplicateSymbol:     return "F_FfiIngestDuplicateSymbol";
+        case DiagnosticCode::F_FfiIngestAbiModelUnsupported: return "F_FfiIngestAbiModelUnsupported";
+        case DiagnosticCode::F_FfiIngestEmptyCanonical:      return "F_FfiIngestEmptyCanonical";
+        case DiagnosticCode::F_BinaryReaderPartialCorruption: return "F_BinaryReaderPartialCorruption";
+        case DiagnosticCode::F_FfiNoImportLibraryForFormat:  return "F_FfiNoImportLibraryForFormat";
     }
     return "Unknown";
 }
@@ -148,6 +202,7 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0x5xxx → O0xxx     RESERVED — object format / linker (plan 14;
     //                       holding the slot so plan-14 doesn't accidentally
     //                       land on 0xCxxx (which is C_*) or 0xDxxx (D_*))
+    //   0x5xxx → F0xxx     (FFI binary-reader + C-header-parser; plan 11 §2.6 — allocated 2026-06-01)
     //   0x6xxx → W0xxx     RESERVED — WAT/WASM verifier (plan 18; allocated 2026-05-29)
     //   0x7xxx → V0xxx     RESERVED — SPIR-V verifier  (plan 17; allocated 2026-05-29)
     //   0x9xxx → P9xxx     (parse, internal-invariant range)
@@ -168,6 +223,8 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'A';
     } else if (nibble == 0x4000u) {
         letter = 'R';
+    } else if (nibble == 0x5000u) {
+        letter = 'F';
     } else if (nibble == 0x8000u) {
         letter = 'K';
     } else if (nibble == 0xA000u) {
@@ -187,6 +244,7 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     // marker (A/K/R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
     // P_BuilderInvariant prints as "P9000".
     const bool hasNibbleMarker = (nibble == 0x1000u || nibble == 0x4000u
+                                  || nibble == 0x5000u
                                   || nibble == 0x8000u
                                   || nibble == 0xA000u || nibble == 0xB000u
                                   || nibble == 0xC000u || nibble == 0xD000u

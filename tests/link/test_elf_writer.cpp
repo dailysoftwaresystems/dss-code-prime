@@ -25,6 +25,7 @@
 #include "link/format/elf.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "link_test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -39,26 +40,13 @@ using namespace dss;
 
 namespace {
 
-// Read u16/u32/u64 little-endian out of the byte buffer.
-[[nodiscard]] std::uint16_t readU16LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    return static_cast<std::uint16_t>(b[off])
-         | (static_cast<std::uint16_t>(b[off + 1]) << 8);
-}
-[[nodiscard]] std::uint32_t readU32LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    std::uint32_t v = 0;
-    for (int i = 0; i < 4; ++i)
-        v |= static_cast<std::uint32_t>(b[off + i]) << (i * 8);
-    return v;
-}
-[[nodiscard]] std::uint64_t readU64LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    std::uint64_t v = 0;
-    for (int i = 0; i < 8; ++i)
-        v |= static_cast<std::uint64_t>(b[off + i]) << (i * 8);
-    return v;
-}
+// D-TEST-LE-READ-HELPERS CLOSED at 8aabc04 audit fold; complete-
+// hoist at 5ac97ae audit fold per code-architect Q1 (the partial
+// hoist of just u16 was strictly worse than either consistent
+// choice — 4 consumers across ELF/PE/Mach-O writer tests).
+using dss::link_format::test::readU16LE;
+using dss::link_format::test::readU32LE;
+using dss::link_format::test::readU64LE;
 
 struct Loaded {
     std::shared_ptr<TargetSchema>       target;
@@ -334,7 +322,7 @@ TEST(LinkerEndToEnd, LinkagePassedGateSkipsWalkerOnSymbolUndefined) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.bytes.empty())
         << "walker must not have run when linkagePassed=false";
     EXPECT_FALSE(image.ok())
@@ -359,52 +347,57 @@ loadStubFormat(std::string_view kindName) {
 
 } // namespace
 
-// Note: the Pe arm has a real walker now (`src/link/format/pe.cpp`,
-// LK2 cycle 1) — the no-walker-registered path is exercised by the
-// MachO/Wasm/Spirv arms below; PE end-to-end coverage lives in
-// `tests/link/test_pe_writer.cpp`.
+// Note: ALL five `ObjectFormatKind` arms now have real walkers
+// (Pe: LK2 cycle 1; MachO: LK3 cycle 1; Wasm: LK8 skeleton; Spirv:
+// LK9 skeleton — both skeletons emit format-spec module headers
+// and route walker-input-contract violations to
+// `K_WalkerInputContractViolation`). The closed-enum dispatch in
+// `linker.cpp` has no no-walker-registered path other than the
+// `Unknown` sentinel. PE end-to-end coverage lives in
+// `tests/link/test_pe_writer.cpp`; Mach-O in `test_macho_writer.cpp`;
+// Wasm in `test_wasm_writer.cpp`; Spirv in `test_spirv_writer.cpp`.
 
-TEST(LinkerEndToEnd, MachOFormatDispatchEmitsK_NoMatchingObjectFormat) {
-    auto loaded = loadShipped();
-    auto m = loadStubFormat("macho");
-    ASSERT_TRUE(m);
-    AssembledModule mod = makeTrivialModule({0xC3}, 1);
-    DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *m, rep);
-    EXPECT_TRUE(image.bytes.empty());
-    bool sawCode = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
-    }
-    EXPECT_TRUE(sawCode);
-}
-
-TEST(LinkerEndToEnd, WasmFormatDispatchEmitsK_NoMatchingObjectFormat) {
+TEST(LinkerEndToEnd, WasmFormatDispatchRoutesToWalker) {
+    // LK8 (landed 2026-05-30): Wasm arm now dispatches to the
+    // wasm::encode walker (8-byte module preamble per WASM spec
+    // §5.5). A native-ISA-bytes-bearing AssembledModule routed
+    // here triggers K_WalkerInputContractViolation (0x8005) —
+    // the LK8 skeleton's input-contract guard for
+    // !functions.empty(). The previous K_NoMatchingObjectFormat
+    // is reserved for the still-unimplemented Spirv arm.
     auto loaded = loadShipped();
     auto w = loadStubFormat("wasm");
     ASSERT_TRUE(w);
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *w, rep);
+    auto image = linker::link(mod, *loaded.target, *w, rep);
     EXPECT_TRUE(image.bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
+        if (d.code == DiagnosticCode::K_WalkerInputContractViolation)
+            sawCode = true;
     }
     EXPECT_TRUE(sawCode);
 }
 
-TEST(LinkerEndToEnd, SpirvFormatDispatchEmitsK_NoMatchingObjectFormat) {
+TEST(LinkerEndToEnd, SpirvFormatDispatchRoutesToWalker) {
+    // LK9 (landed 2026-05-30): Spirv arm now dispatches to the
+    // spirv::encode walker (20-byte module header per SPIR-V Spec
+    // §2.3). A native-ISA-bytes-bearing AssembledModule routed
+    // here triggers K_WalkerInputContractViolation (0x8005) —
+    // the LK9 skeleton's input-contract guard for
+    // !functions.empty(). Symmetric with LK8's WASM gate.
     auto loaded = loadShipped();
     auto s = loadStubFormat("spirv");
     ASSERT_TRUE(s);
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *s, rep);
+    auto image = linker::link(mod, *loaded.target, *s, rep);
     EXPECT_TRUE(image.bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
+        if (d.code == DiagnosticCode::K_WalkerInputContractViolation)
+            sawCode = true;
     }
     EXPECT_TRUE(sawCode);
 }
@@ -415,7 +408,7 @@ TEST(LinkerEndToEnd, ElfDispatchProducesNonEmptyBytes) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.ok());
     EXPECT_EQ(image.format, ObjectFormatKind::Elf);
     EXPECT_FALSE(image.bytes.empty()) << "linker dispatch should fire walker";

@@ -27,6 +27,11 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_TypeUnresolved),      "H_TypeUnresolved");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_InvalidBreak),        "H_InvalidBreak");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_VerifierFailure),     "H_VerifierFailure");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_ExternHasInitializer), "H_ExternHasInitializer");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::H_ExternDeclMalformed),  "H_ExternDeclMalformed");
+    // F_* FFI band — binary readers (D-FF1-PARTIAL-CORRUPTION-LOUD).
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_BinaryReaderPartialCorruption),
+              "F_BinaryReaderPartialCorruption");
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {

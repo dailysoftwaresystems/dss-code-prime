@@ -110,7 +110,7 @@ renderPhysReg(LirReg r, TargetSchema const& schema,
               DiagnosticReporter& reporter) {
     auto const* info = schema.registerInfo(static_cast<std::uint16_t>(r.id));
     if (info == nullptr) {
-        lir_pass_util::report(
+        dss::report(
             reporter, DiagnosticCode::L_PhysRegOrdinalOutOfRange,
             DiagnosticSeverity::Warning,
             std::format("emitLir: phys reg ordinal {} not in register table",
@@ -237,7 +237,7 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
     // Fall-through is a substrate-corruption signal — the discriminator
     // landed on the reserved slot 3 (formerly ImmFloat) or on an out-of-
     // band byte. Loud so the caller's reporter audit catches it.
-    lir_pass_util::report(
+    dss::report(
         reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
         DiagnosticSeverity::Warning,
         std::format("emitLir: operand kind tag {} is unknown (substrate corruption)",

@@ -887,3 +887,695 @@ TEST(X86VariableEncoder, VirtualRegInOperandFiresFailLoud) {
     (void)assemble(lir, **schema, lirToMir, rep);
     EXPECT_GT(countDiagnostics(rep, DiagnosticCode::A_NoMatchingEncodingVariant), 0u);
 }
+
+// ── D-AS4-1 + ML7 cycle 2 byte-pin tests ──────────────────────────────
+//
+// Pins byte sequences for the AS encoder variants that close
+// D-LK10-2 (byte-on-disk e2e):
+//   * `add r/m64, imm32`     — REX.W 0x81 /0 imm32
+//   * `sub r/m64, imm32`     — REX.W 0x81 /5 imm32
+//   * `mov reg, [base+disp32]`  (load)  — REX.W 0x8B /r ModR/M(mod=10)
+//                                         [SIB 0x24 when base.lo3==4]
+//                                         disp32
+//   * `mov [base+disp32], reg`  (store) — REX.W 0x89 /r ModR/M(mod=10)
+//                                         [SIB 0x24 when base.lo3==4]
+//                                         disp32
+//
+// silent-failure-hunter post-fold F-G2: the ELF-magic-only e2e check
+// doesn't catch silent miscompiles in REX.W, ModR/M.mod, SIB emission,
+// or disp32 endianness — these byte-pin tests do.
+
+namespace {
+
+[[nodiscard]] LirReg physGprByName(TargetSchema const& schema,
+                                    std::string_view name) {
+    auto const ord = schema.registerByName(name);
+    EXPECT_TRUE(ord.has_value());
+    return LirReg{static_cast<std::uint32_t>(*ord), /*isPhysical=*/1,
+                  /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+}
+
+} // namespace
+
+TEST(X86VariableEncoder, SubRspImm32EmitsExactPrologueBytes) {
+    // `sub rsp, 0x20` → 48 81 EC 20 00 00 00
+    // REX.W = 0x48; opcode = 0x81; ModR/M = 11_101_100 (/5 = 101,
+    // rsp.lo3 = 100) = 0xEC; imm32 = 0x20 LE.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const subOp = (*schema)->opcodeByMnemonic("sub");
+    ASSERT_TRUE(subOp.has_value());
+    LirReg const rsp = physGprByName(**schema, "rsp");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsp),
+            LirOperand::makeImmInt32(0x20),
+        };
+        (void)b.addInst(*subOp, rsp, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x81);
+    EXPECT_EQ(bytes[2], 0xEC);
+    EXPECT_EQ(bytes[3], 0x20);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+}
+
+TEST(X86VariableEncoder, AddRspImm32EmitsExactEpilogueBytes) {
+    // `add rsp, 0x20` → 48 81 C4 20 00 00 00
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const addOp = (*schema)->opcodeByMnemonic("add");
+    ASSERT_TRUE(addOp.has_value());
+    LirReg const rsp = physGprByName(**schema, "rsp");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsp),
+            LirOperand::makeImmInt32(0x20),
+        };
+        (void)b.addInst(*addOp, rsp, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x81);
+    EXPECT_EQ(bytes[2], 0xC4);
+    EXPECT_EQ(bytes[3], 0x20);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+}
+
+TEST(X86VariableEncoder, LoadFromRspForcesSibByte) {
+    // `mov rcx, [rsp + 0x10]` → 48 8B 4C 24 10 00 00 00
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rcx = physGprByName(**schema, "rcx");
+    LirReg const rsp = physGprByName(**schema, "rsp");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsp),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x10),
+        };
+        (void)b.addInst(*loadOp, rcx, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8B);
+    EXPECT_EQ(bytes[2], 0x8C);  // mod=10 reg=rcx(1) rm=rsp(4) → 0x80|0x08|0x04
+    EXPECT_EQ(bytes[3], 0x24);  // SIB 0x24 (scale=0 index=4 base=4)
+    EXPECT_EQ(bytes[4], 0x10);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LoadFromRbpEmitsNoSibByte) {
+    // `mov rcx, [rbp + 0x10]` → 48 8B 4D 10 00 00 00 (NO SIB)
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rcx = physGprByName(**schema, "rcx");
+    LirReg const rbp = physGprByName(**schema, "rbp");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbp),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x10),
+        };
+        (void)b.addInst(*loadOp, rcx, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8B);
+    EXPECT_EQ(bytes[2], 0x8D);  // mod=10 reg=rcx(1) rm=rbp(5) — no SIB; 0x80|0x08|0x05
+    EXPECT_EQ(bytes[3], 0x10);
+    EXPECT_EQ(bytes[4], 0x00);  // disp32 LE bytes 1-3 must all be 0
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+}
+
+TEST(X86VariableEncoder, StoreToRspForcesSibByte) {
+    // `mov [rsp + 0x08], rdx` → 48 89 54 24 08 00 00 00
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const storeOp = (*schema)->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOp.has_value());
+    LirReg const rdx = physGprByName(**schema, "rdx");
+    LirReg const rsp = physGprByName(**schema, "rsp");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rdx),
+            LirOperand::makeReg(rsp),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x08),
+        };
+        (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x89);
+    EXPECT_EQ(bytes[2], 0x94);  // mod=10 reg=rdx(2) rm=rsp(4) → 0x80|0x10|0x04
+    EXPECT_EQ(bytes[3], 0x24);
+    EXPECT_EQ(bytes[4], 0x08);
+    EXPECT_EQ(bytes[5], 0x00);  // disp32 LE bytes 1-3 must all be 0
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {
+    // `mov [r12 + 0x10], rax` → 49 89 44 24 10 00 00 00
+    // r12 is rsp-family in REX-extended space.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const storeOp = (*schema)->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const r12 = physGprByName(**schema, "r12");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rax),
+            LirOperand::makeReg(r12),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x10),
+        };
+        (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x49);  // REX.W + REX.B (r12 has hi bit)
+    EXPECT_EQ(bytes[1], 0x89);
+    EXPECT_EQ(bytes[2], 0x84);  // mod=10 reg=rax(0) rm=r12.lo3(4) → 0x80|0x00|0x04
+    EXPECT_EQ(bytes[3], 0x24);
+    EXPECT_EQ(bytes[4], 0x10);
+    EXPECT_EQ(bytes[5], 0x00);  // disp32 LE bytes 1-3 must all be 0
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LoadFromRbxEmitsNoSibByte) {
+    // Negative-test for non-rsp/r12-family base. `mov rax, [rbx+0x10]`
+    // → 48 8B 43 10 00 00 00 — rbx.lo3 = 3, NOT in {4} (rsp/r12 family),
+    // so NO SIB byte is forcibly emitted. Sister test to
+    // `LoadFromRbpEmitsNoSibByte` (rbp.lo3 = 5) — together they pin
+    // that the SIB-forced rule fires ONLY for lo3 == 4.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x10),
+        };
+        (void)b.addInst(*loadOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8B);
+    EXPECT_EQ(bytes[2], 0x83);  // mod=10 reg=rax(0) rm=rbx(3) → 0x80|0x00|0x03
+    EXPECT_EQ(bytes[3], 0x10);  // disp32 byte 0 — no SIB intervening
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+}
+
+TEST(X86VariableEncoder, NegativeDispEmitsAsTwosComplement) {
+    // `mov rax, [rbp - 8]` → 48 8B 45 F8 FF FF FF
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbp = physGprByName(**schema, "rbp");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbp),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(-8),
+        };
+        (void)b.addInst(*loadOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8B);
+    EXPECT_EQ(bytes[2], 0x85);  // mod=10 reg=rax rm=rbp → 0x80|0x00|0x05
+    EXPECT_EQ(bytes[3], 0xF8);  // -8 LE byte 0
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0xFF);
+    EXPECT_EQ(bytes[6], 0xFF);
+}
+
+// ── D-AS4-5: SIB-with-index (indexed/scaled addressing) ──────
+
+TEST(X86VariableEncoder, LeaWithIndexScale1) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const rcx = physGprByName(**schema, "rcx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(rcx),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8D);
+    EXPECT_EQ(bytes[2], 0x84);  // mod=10 reg=rax rm=4(SIB)
+    EXPECT_EQ(bytes[3], 0x0B);  // SIB: scale=0 index=rcx(1) base=rbx(3)
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LeaWithIndexScale4) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const rcx = physGprByName(**schema, "rcx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(rcx),
+            LirOperand::makeMemBase(4),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[3], 0x8B);  // SIB: scale=10b index=rcx(1) base=rbx(3)
+}
+
+TEST(X86VariableEncoder, LeaWithIndexScale8) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const rcx = physGprByName(**schema, "rcx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(rcx),
+            LirOperand::makeMemBase(8),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[3], 0xCB);  // SIB: scale=11b index=rcx(1) base=rbx(3)
+}
+
+TEST(X86VariableEncoder, LeaWithR12IndexDerivesRexX) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const r12 = physGprByName(**schema, "r12");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(r12),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x4A);  // REX.W | REX.X
+    EXPECT_EQ(bytes[3], 0x23);  // SIB: index=r12.lo3(4) base=rbx(3)
+}
+
+TEST(X86VariableEncoder, LeaWithIndexRejectsRspIndex) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const rsp = physGprByName(**schema, "rsp");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(rsp),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    (void)assembleFirstFn(lir, **schema, rep);
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(X86VariableEncoder, LeaWithIndexRejectsIllegalScale) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const rcx = physGprByName(**schema, "rcx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(rcx),
+            LirOperand::makeMemBase(3),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    (void)assembleFirstFn(lir, **schema, rep);
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+// Post-fold #1: wireMemBaseScale rejects double-writers (silent
+// regression risk if a future variant wires MemBase twice).
+TEST(X86VariableEncoder, RejectsTwoMemBaseScaleWires) {
+    // Construct a synthetic schema with TWO `membase.scale` wires on
+    // the same opcode — schema validate() should reject this, but
+    // even if it slips through (future variant restructure), the
+    // walker's wireMemBaseScale double-write guard catches it.
+    // Since the schema validator already rejects this configuration,
+    // assemble a load with TWO `MemBase` operands (LIR-tier malformation)
+    // and verify the walker's double-write guard fires before the
+    // schema's variant-mismatch.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+
+    // 5-operand load that doesn't match any variant guard — the
+    // walker reaches the "no matching variant" path first; this
+    // confirms the schema validator rejects the malformed shape
+    // upstream so wireMemBaseScale's double-write guard remains
+    // defensive (defense-in-depth, not a primary gate).
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemBase(2),     // second MemBase — illegal
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*loadOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    (void)assembleFirstFn(lir, **schema, rep);
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(X86VariableEncoder, LoadIndexedRcxRsiScale4) {
+    // `mov rcx, [rsi + rdx*4 + 0]` — 4-op indexed load with non-rsp,
+    // non-r12 base and index. mod=10 reg=rcx(1) rm=4(SIB) SIB(scale=2 index=rdx(2) base=rsi(6))
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rcx = physGprByName(**schema, "rcx");
+    LirReg const rsi = physGprByName(**schema, "rsi");
+    LirReg const rdx = physGprByName(**schema, "rdx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),
+            LirOperand::makeReg(rdx),
+            LirOperand::makeMemBase(4),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*loadOp, rcx, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8B);  // load opcode
+    EXPECT_EQ(bytes[2], 0x8C);  // mod=10 reg=rcx(1) rm=4(SIB)
+    EXPECT_EQ(bytes[3], 0x96);  // SIB: scale=10b index=rdx(2) base=rsi(6) = 0x80|0x10|0x06
+    EXPECT_EQ(bytes[4], 0x00);
+}
+
+TEST(X86VariableEncoder, StoreIndexedRdxRbxR12Scale8) {
+    // `mov [rbx + r12*8 + 0x20], rdx` — 5-op indexed store with REX.W
+    // and REX.X (from r12 index). reg=rdx(2), rm=4(SIB), SIB:
+    // scale=11b index=r12.lo3(4) base=rbx(3); REX = 4A (W+X).
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const storeOp = (*schema)->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOp.has_value());
+    LirReg const rdx = physGprByName(**schema, "rdx");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const r12 = physGprByName(**schema, "r12");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rdx),
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(r12),
+            LirOperand::makeMemBase(8),
+            LirOperand::makeMemOffset(0x20),
+        };
+        (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x4A);  // REX.W | REX.X
+    EXPECT_EQ(bytes[1], 0x89);  // store opcode
+    EXPECT_EQ(bytes[2], 0x94);  // mod=10 reg=rdx(2) rm=4(SIB) = 0x80|0x10|0x04
+    EXPECT_EQ(bytes[3], 0xE3);  // SIB: scale=11b index=r12.lo3(4) base=rbx(3) = 0xC0|0x20|0x03
+    EXPECT_EQ(bytes[4], 0x20);  // disp32 LE
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LeaWithIndexAndNonZeroDisp32) {
+    // `lea rax, [rbx + rcx*4 + 0x12345678]` — pin disp32 emission
+    // after SIB byte.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    LirReg const rcx = physGprByName(**schema, "rcx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeReg(rcx),
+            LirOperand::makeMemBase(4),
+            LirOperand::makeMemOffset(0x12345678),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8D);
+    EXPECT_EQ(bytes[2], 0x84);
+    EXPECT_EQ(bytes[3], 0x8B);  // SIB: scale=2(*4) index=rcx(1) base=rbx(3)
+    EXPECT_EQ(bytes[4], 0x78);  // disp32 LE byte 0
+    EXPECT_EQ(bytes[5], 0x56);
+    EXPECT_EQ(bytes[6], 0x34);
+    EXPECT_EQ(bytes[7], 0x12);
+}
+
+TEST(X86VariableEncoder, LeaNoIndexThreeOperandFormStillWorks) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x10),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[1], 0x8D);
+    EXPECT_EQ(bytes[2], 0x83);  // mod=10 reg=rax(0) rm=rbx(3); no SIB
+    EXPECT_EQ(bytes[3], 0x10);
+}
+
+// ── D-AS4-6-byte-pin: no-SIB negative tests for lo3 in {0..3, 5..7} ──
+
+TEST(X86VariableEncoder, LoadFromRaxEmitsNoSibByte) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rcx = physGprByName(**schema, "rcx");
+    LirReg const rax = physGprByName(**schema, "rax");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rax),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x08),
+        };
+        (void)b.addInst(*loadOp, rcx, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[2], 0x88);  // mod=10 reg=rcx(1) rm=rax(0)
+    EXPECT_EQ(bytes[3], 0x08);
+}
+
+TEST(X86VariableEncoder, LoadFromRsiEmitsNoSibByte) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rcx = physGprByName(**schema, "rcx");
+    LirReg const rsi = physGprByName(**schema, "rsi");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x08),
+        };
+        (void)b.addInst(*loadOp, rcx, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[2], 0x8E);  // mod=10 reg=rcx(1) rm=rsi(6)
+    EXPECT_EQ(bytes[3], 0x08);
+}
+
+TEST(X86VariableEncoder, LoadFromRdiEmitsNoSibByte) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const loadOp = (*schema)->opcodeByMnemonic("load");
+    ASSERT_TRUE(loadOp.has_value());
+    LirReg const rcx = physGprByName(**schema, "rcx");
+    LirReg const rdi = physGprByName(**schema, "rdi");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rdi),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0x08),
+        };
+        (void)b.addInst(*loadOp, rcx, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[2], 0x8F);  // mod=10 reg=rcx(1) rm=rdi(7)
+    EXPECT_EQ(bytes[3], 0x08);
+}

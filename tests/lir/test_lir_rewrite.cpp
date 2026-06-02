@@ -52,6 +52,7 @@ lowerAndAllocate(std::string src) {
     out.alloc = allocateRegisters(out.lowered.lir.lir,
                                   *out.lowered.target,
                                   out.liveness,
+                                  /*ccIndex=*/0,
                                   out.regallocRep);
     return out;
 }
@@ -180,7 +181,7 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
     LirAllocation const alloc =
-        allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+        allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     ASSERT_TRUE(alloc.ok());
     ASSERT_GT(alloc.perFunc[0].numSpillSlots, 0u);
 

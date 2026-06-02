@@ -123,7 +123,7 @@ TEST(Linker, EmptyModuleIsNotOk) {
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule empty{};
     DiagnosticReporter rep;
-    auto image = link(empty, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(empty, *loaded.target, *loaded.format, rep);
     EXPECT_FALSE(image.ok());
     EXPECT_EQ(image.expectedFuncCount, 0u);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
@@ -138,7 +138,7 @@ TEST(Linker, NoRelocationsResolvesCleanly) {
     fn.symbol = SymbolId{42};
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.ok());
     EXPECT_EQ(image.resolvedFuncCount, 1u);
     EXPECT_EQ(rep.errorCount(), 0u);
@@ -161,7 +161,7 @@ TEST(Linker, IntraModuleSymbolReferenceResolves) {
     mod.functions.push_back(std::move(caller));
     mod.functions.push_back(std::move(callee));
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.ok());
     EXPECT_EQ(image.resolvedFuncCount, 2u);
     EXPECT_EQ(rep.errorCount(), 0u);
@@ -179,7 +179,7 @@ TEST(Linker, UnknownSymbolEmitsK_SymbolUndefined) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u);
 }
@@ -196,7 +196,7 @@ TEST(Linker, RelocationKindMissingFromFormatEmitsMismatch) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_RelocationKindMismatch), 1u);
 }
@@ -228,7 +228,7 @@ TEST(Linker, PartialResolutionAcrossMultipleFunctions) {
     mod.functions.push_back(std::move(fn2));
 
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_FALSE(image.ok());
     EXPECT_EQ(image.expectedFuncCount, 3u);
     // Architect Decision 4 convergence: on linkage failure the
@@ -260,7 +260,7 @@ TEST(Linker, KindMissingFromTargetEmitsMismatchWithBothSidesNamed) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     bool sawBothSidesNamed = false;
     for (auto const& d : rep.all()) {
@@ -291,7 +291,7 @@ TEST(Linker, MismatchAndUndefinedSymbolFireIndependentlyOnSameReloc) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_GE(countCode(rep, DiagnosticCode::K_RelocationKindMismatch), 1u);
     EXPECT_GE(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u);
@@ -309,7 +309,7 @@ TEST(Linker, UnknownRelocationKindEmitsMismatch) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto image = link(mod, *loaded.target, *loaded.format, rep);
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_RelocationKindMismatch), 1u);
 }

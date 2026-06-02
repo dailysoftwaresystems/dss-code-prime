@@ -1,9 +1,15 @@
 add_library(link OBJECT
+    entry_trampoline.cpp
     linker.cpp
     object_format_schema.cpp
     object_format_schema_json.cpp
     format/elf.cpp
     format/pe.cpp
+    format/macho.cpp
+    format/macho_chained_fixups.cpp
+    format/spirv.cpp
+    format/wasm.cpp
+    writer.cpp
 )
 
 target_include_directories(link PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

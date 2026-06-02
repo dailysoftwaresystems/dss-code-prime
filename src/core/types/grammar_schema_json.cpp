@@ -8,6 +8,7 @@
 #include "core/types/schema_token_interner.hpp"
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
+#include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 
 #include <nlohmann/json.hpp>
 
@@ -3251,6 +3252,86 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: optional
+                        // `implicitReturnZeroForFunctionNames` string-
+                        // array. Function declarations whose declared
+                        // symbol name appears in this list get a
+                        // synthetic `return <zero>` appended to their
+                        // body when the body fails to structurally
+                        // terminate (C99 §5.1.2.2.3 for `main`).
+                        // Source-agnostic: each language declares its
+                        // own entry-fn names. Absent / empty → no
+                        // implicit insertion for this declaration form.
+                        if (entry.contains(
+                                "implicitReturnZeroForFunctionNames")) {
+                            auto const& arr = entry.at(
+                                "implicitReturnZeroForFunctionNames");
+                            if (!arr.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/implicitReturnZeroForFunctionNames",
+                                          "'implicitReturnZeroForFunctionNames' "
+                                          "must be an array of strings");
+                            } else {
+                                rule.implicitReturnZeroForFunctionNames
+                                    .reserve(arr.size());
+                                for (std::size_t ni = 0; ni < arr.size(); ++ni) {
+                                    if (!arr[ni].is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  std::format(
+                                                      "{}/implicitReturnZeroForFunctionNames/{}",
+                                                      path, ni),
+                                                  "each entry must be a string");
+                                        continue;
+                                    }
+                                    auto const s =
+                                        arr[ni].get<std::string>();
+                                    if (s.empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  std::format(
+                                                      "{}/implicitReturnZeroForFunctionNames/{}",
+                                                      path, ni),
+                                                  "function name must be non-empty");
+                                        continue;
+                                    }
+                                    rule.implicitReturnZeroForFunctionNames
+                                        .push_back(s);
+                                }
+                                // Silent-failure F2 fold (3rd-order
+                                // audit on 39897eb): scan for
+                                // duplicate names and emit one
+                                // C_InvalidSemantics per occurrence.
+                                // Functionally idempotent at the
+                                // consumer (`std::ranges::find` is
+                                // find-first-then-stop), but a paste-
+                                // error duplicate in a language config
+                                // is a config bug the user wants to
+                                // catch at load time — mirrors the
+                                // codebase's `kUnsuppressableCodes`
+                                // consteval uniqueness invariant for
+                                // compile-time tables.
+                                std::size_t const n = rule
+                                    .implicitReturnZeroForFunctionNames
+                                    .size();
+                                for (std::size_t a = 0; a < n; ++a) {
+                                    for (std::size_t b = a + 1; b < n; ++b) {
+                                        if (rule.implicitReturnZeroForFunctionNames[a]
+                                         == rule.implicitReturnZeroForFunctionNames[b]) {
+                                            coll.emit(
+                                                DiagnosticCode::C_InvalidSemantics,
+                                                std::format(
+                                                    "{}/implicitReturnZeroForFunctionNames/{}",
+                                                    path, b),
+                                                std::format(
+                                                    "duplicate function name '{}' "
+                                                    "(already declared at index {})",
+                                                    rule.implicitReturnZeroForFunctionNames[a],
+                                                    a));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if (entry.contains("kind")) {
                             if (!entry.at("kind").is_string()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -4323,6 +4404,74 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                               "token kind '{}'", name));
                     } else {
                         cfg.pointerToken = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
+            // FF6 Slice 2 + audit fold (2026-06-02): per-language
+            // `externLibraryByFormat` — runtime library identity
+            // per ObjectFormatKind for source-declared externs.
+            // Object: keys are ObjectFormatKind names ("pe", "elf",
+            // "macho", "wasm", "spirv" — validated via
+            // `objectFormatKindFromName`); values are runtime
+            // library identities. Lives at the LANGUAGE level
+            // (not per-declaration-rule — the pre-fold #1 placement
+            // on `DeclarationRule` was fragile: the pipeline
+            // first-match loop gave non-obvious behavior on
+            // grammars with multiple extern-shaped declaration
+            // rules). c-subset's `externDecl` is the only shipped
+            // declaration that needs it; per-symbol overrides
+            // (`extern "otherlib.dll" int foo();`) are anchored
+            // D-CSUBSET-EXTERN-LIBRARY-SYNTAX.
+            if (sem.contains("externLibraryByFormat")) {
+                auto const& obj = sem.at("externLibraryByFormat");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/externLibraryByFormat",
+                              "'externLibraryByFormat' must be an object "
+                              "mapping format-kind names to library "
+                              "identities");
+                } else {
+                    for (auto it = obj.begin(); it != obj.end(); ++it) {
+                        auto const& formatName = it.key();
+                        auto const& val = it.value();
+                        auto const kindPath = std::format(
+                            "/semantics/externLibraryByFormat/{}",
+                            formatName);
+                        if (!objectFormatKindFromName(
+                                formatName).has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics,
+                                kindPath,
+                                std::format(
+                                    "'{}' is not a recognized "
+                                    "object-format kind "
+                                    "(expected one of 'elf', "
+                                    "'pe', 'macho', 'wasm', "
+                                    "'spirv')",
+                                    formatName));
+                            continue;
+                        }
+                        if (!val.is_string()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics,
+                                kindPath,
+                                "library identity must be a "
+                                "string (e.g. \"msvcrt.dll\", "
+                                "\"libc.so.6\")");
+                            continue;
+                        }
+                        auto const libName = val.get<std::string>();
+                        if (libName.empty()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics,
+                                kindPath,
+                                "library identity must be a "
+                                "non-empty string");
+                            continue;
+                        }
+                        cfg.externLibraryByFormat
+                            .emplace(formatName, libName);
                     }
                 }
             }

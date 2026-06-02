@@ -63,9 +63,50 @@ TEST(LirRegAlloc, EmptyModuleProducesNoResults) {
     Lir empty = std::move(b).finish();
     LirLiveness const lv = analyzeLiveness(empty);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(empty, **target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(empty, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     EXPECT_EQ(out.perFunc.size(), 0u);
+}
+
+// ── Post-fold #5 code-reviewer-#82 pin: ccIndex flow ─────────
+TEST(LirRegAlloc, CcIndex1RecordsThroughToFuncAllocation) {
+    // Pin the D-FF3-3 wiring: passing ccIndex=1 must be recorded
+    // on every LirFuncAllocation. Without this pin a regression
+    // that drops the threaded index back to 0 would silently
+    // re-emit SysV register assignments on PE+x86_64 targets.
+    auto lowered = lowerCSubsetToLir(
+        "int f(int x) { return x + x; }");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/1, regallocRep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_GE(out.perFunc.size(), 1u);
+    for (auto const& fa : out.perFunc) {
+        EXPECT_EQ(fa.callingConventionIndex, 1u);
+    }
+}
+
+TEST(LirRegAlloc, CcIndexOutOfRangeFailsLoud) {
+    // x86_64 ships 2 cc rows; ccIndex=99 must trip
+    // R_CallingConventionLookupFailed per allocateOneFunc's
+    // defensive arm.
+    auto lowered = lowerCSubsetToLir(
+        "int f(int x) { return x + x; }");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/99, regallocRep);
+    EXPECT_FALSE(out.ok());
+    bool sawCcLookupFail = false;
+    for (auto const& d : regallocRep.all()) {
+        if (d.code == DiagnosticCode::R_CallingConventionLookupFailed) {
+            sawCcLookupFail = true;
+        }
+    }
+    EXPECT_TRUE(sawCcLookupFail);
 }
 
 TEST(LirRegAlloc, StraightLineFunctionAssignsAllPhys) {
@@ -74,7 +115,7 @@ TEST(LirRegAlloc, StraightLineFunctionAssignsAllPhys) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -119,7 +160,7 @@ TEST(LirRegAlloc, ForVRegFindsAssignment) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -143,7 +184,7 @@ TEST(LirRegAlloc, ForFuncResolvesByFuncId) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 2u);
     Lir const& lir = lowered.lir.lir;
@@ -151,6 +192,100 @@ TEST(LirRegAlloc, ForFuncResolvesByFuncId) {
     ASSERT_NE(out.forFunc(lir.funcAt(1)), nullptr);
     EXPECT_EQ(out.forFunc(lir.funcAt(0))->fn.v, lir.funcAt(0).v);
     EXPECT_EQ(out.forFunc(lir.funcAt(1))->fn.v, lir.funcAt(1).v);
+}
+
+TEST(LirRegAlloc, Requires2AddressResultExcludesOpsOneThroughN) {
+    // D-CSUBSET-BINOP-RIGHT-CLOBBER mechanism pin (2026-06-02).
+    //
+    // The end-to-end example pins (examples/c-subset/arithmetic +
+    // subtraction + register_pressure) prove the bug-class is
+    // closed AT THE EXIT-CODE LEVEL, but a refactor that "got
+    // lucky" with the chosen inputs would pass those examples
+    // while breaking the regalloc-tier exclusion mechanism (per
+    // code-architect + test-analyzer 7-agent audit findings).
+    // This test pins the MECHANISM directly:
+    //
+    //   For every `requires2Address` LIR instruction in the
+    //   produced module, the result vreg's physical register
+    //   MUST NOT equal any of its source operand[k>=1]'s
+    //   physical registers. Operand[0] alias remains permitted
+    //   (the legitimate 2-addr coalesce case).
+    //
+    // A regression that removes `tryAllocateExcluding`, regresses
+    // the `lir.instResult(producingInst) == r.vreg` guard
+    // (silent-failure HIGH-3 fold), or makes `findSpillCandidate`
+    // exclusion-blind again (silent-failure HIGH-1 fold), would
+    // re-introduce result==ops[k] aliasing — and THIS test would
+    // catch it independently of the end-to-end examples.
+    auto lowered = lowerCSubsetToLir(
+        "int f(int x, int y) {\n"
+        "    return x * y;\n"
+        "}\n");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv,
+        /*ccIndex=*/0, regallocRep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_EQ(out.perFunc.size(), 1u);
+    auto const& alloc = out.perFunc[0];
+    Lir const& lir = lowered.lir.lir;
+
+    // Resolve any LirOperand (vreg-or-physreg form) to a physical
+    // ordinal via the allocation map. Returns nullopt when the
+    // operand isn't a register or the assignment is spilled.
+    auto physOrdinalOf =
+        [&](LirOperand const& op) -> std::optional<std::uint32_t> {
+        if (op.kind != LirOperandKind::Reg) return std::nullopt;
+        if (op.reg.isPhysical) return op.reg.id;
+        auto const* a = alloc.forVReg(op.reg.id);
+        if (a == nullptr || a->isSpilled()) return std::nullopt;
+        return a->physReg().id;
+    };
+
+    bool foundAtLeastOne2AddrInst = false;
+    std::size_t const funcCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            std::uint32_t const instCount = lir.blockInstCount(blk);
+            for (std::uint32_t ii = 0; ii < instCount; ++ii) {
+                LirInstId const inst = lir.blockInstAt(blk, ii);
+                auto const op = lir.instOpcode(inst);
+                auto const* info = lowered.target->opcodeInfo(op);
+                if (info == nullptr || !info->requires2Address) {
+                    continue;
+                }
+                foundAtLeastOne2AddrInst = true;
+                LirReg const resultReg = lir.instResult(inst);
+                auto const resultOrd = physOrdinalOf(
+                    LirOperand::makeReg(resultReg));
+                if (!resultOrd.has_value()) continue;
+                auto const ops = lir.instOperands(inst);
+                for (std::size_t k = 1; k < ops.size(); ++k) {
+                    auto const opOrd = physOrdinalOf(ops[k]);
+                    if (!opOrd.has_value()) continue;
+                    EXPECT_NE(*resultOrd, *opOrd)
+                        << "requires2Address inst "
+                        << info->mnemonic
+                        << " has result physReg = ops[" << k
+                        << "].physReg (= " << *resultOrd
+                        << "); the 2-addr legalize would emit "
+                        << "`mov result, ops[0]` and CLOBBER "
+                        << "ops[" << k
+                        << "]'s value before the binary op reads "
+                        << "it (D-CSUBSET-BINOP-RIGHT-CLOBBER "
+                        << "regression).";
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(foundAtLeastOne2AddrInst)
+        << "test source must produce at least one requires2Address "
+           "instruction to exercise the exclusion mechanism";
 }
 
 TEST(LirRegAlloc, AllPhysicalAssignmentsAreDistinctAtAnyPoint) {
@@ -168,7 +303,7 @@ TEST(LirRegAlloc, AllPhysicalAssignmentsAreDistinctAtAnyPoint) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -226,7 +361,7 @@ TEST(LirRegAlloc, HighPressureFunctionSpillsSome) {
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -246,7 +381,7 @@ TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 2u);
 
@@ -367,7 +502,7 @@ TEST(LirRegAlloc, ReservedStackPointerNeverAllocated) {
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -402,7 +537,7 @@ TEST(LirRegAlloc, FprClassRangesGetFprRegisters) {
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
@@ -429,7 +564,7 @@ TEST(LirRegAlloc, LoopFunctionAllocatesWithoutCrash) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     expectAllocationInvariants(out.perFunc[0]);
@@ -447,7 +582,7 @@ TEST(LirRegAlloc, SwitchFunctionAllocatesWithoutCrash) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     expectAllocationInvariants(out.perFunc[0]);
@@ -485,7 +620,7 @@ TEST(LirRegAlloc, HighPressureFunctionEmitsSpillSummary) {
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
     LirAllocation const out =
-        allocateRegisters(lirResult.lir, **target, lv, regallocRep);
+        allocateRegisters(lirResult.lir, **target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());  // info-severity spill summary doesn't fail
     EXPECT_GT(out.perFunc[0].numSpillSlots, 0u);
     // Exactly ONE summary diagnostic per function with non-zero spills.
@@ -550,7 +685,7 @@ TEST(LirRegAlloc, OkPropagationOnCleanRun) {
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
     LirAllocation const out =
-        allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+        allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     EXPECT_EQ(out.perFunc.size(), 1u);
     EXPECT_TRUE(out.perFunc[0].ok);
@@ -565,7 +700,7 @@ TEST(LirRegAlloc, AssignmentVRegMatchesIndexId) {
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
-    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, regallocRep);
+    LirAllocation const out = allocateRegisters(lowered.lir.lir, *lowered.target, lv, /*ccIndex=*/0, regallocRep);
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];

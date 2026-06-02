@@ -255,44 +255,9 @@ bool isUnconditionalTerminator(HirKind k) noexcept {
         || k == HirKind::BreakStmt  || k == HirKind::ContinueStmt;
 }
 
-// Does control leave `id` on EVERY structural path by returning or diverging?
-// Used by the non-void return-completeness rule. Conservative: a loop does NOT
-// count (lowering appends an `Unreachable` after a provably-infinite loop), and
-// Break/Continue transfer within a loop rather than out of the function.
-bool pathTerminates(Hir const& hir, HirNodeId id) {
-    switch (hir.kind(id)) {
-        case HirKind::ReturnStmt:
-        case HirKind::Unreachable:
-            return true;
-        case HirKind::Block: {
-            auto kids = hir.children(id);
-            return !kids.empty() && pathTerminates(hir, kids.back());
-        }
-        case HirKind::IfStmt: {
-            // Terminates iff there is an else AND both branches terminate.
-            auto elseB = hir.ifElse(id);
-            return elseB.has_value()
-                && pathTerminates(hir, hir.ifThen(id))
-                && pathTerminates(hir, *elseB);
-        }
-        case HirKind::SwitchStmt: {
-            // Terminates iff there is a default arm AND every arm's body does. A
-            // non-CaseArm child is structurally invalid (checkNodeArity reports it
-            // but doesn't flag HasError) — treat it conservatively as
-            // non-terminating rather than calling a CaseArm-only accessor on it.
-            bool hasDefault = false;
-            for (HirNodeId arm : hir.switchArms(id)) {
-                if (hir.kind(arm) != HirKind::CaseArm) return false;
-                auto body = hir.caseArmBody(arm);
-                if (body.empty() || !pathTerminates(hir, body.back())) return false;
-                if (hir.caseArmIsDefault(arm)) hasDefault = true;
-            }
-            return hasDefault;
-        }
-        default:
-            return false;
-    }
-}
+// (pathTerminates lives in hir_verifier.hpp as a header template
+// over `Source` — both `Hir` and `HirBuilder` satisfy the required
+// interface. The check call below resolves to the `Hir` instantiation.)
 
 // Map each declared function's SymbolId.v to its declaring node (Function or
 // ExternFunction). The intra-module call graph keys off this.

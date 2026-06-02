@@ -20,7 +20,7 @@ namespace dss {
 namespace {
 
 // Shorthand: shared diagnostic helper from lir_pass_util.
-using lir_pass_util::report;
+using dss::report;
 
 // Per-class width in bytes. The cc's saved-reg and spill-slot areas
 // use the widest declared width per class as a uniform slot size —
@@ -99,11 +99,59 @@ collectUsedCalleeSaved(Lir const& lir, LirFuncId fn,
 
 // Returns std::nullopt iff the target declares no GPR-class registers
 // (a schema misconfiguration — earlier silent fallback to 8 hid this).
+//
+// D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY closure (2026-06-02): the layout
+// now incorporates the caller-side Win64 shadow-space requirement +
+// post-CALL alignment-bias for any function that makes at least one
+// call (`hasCalls == true`). Leaf functions (no calls) skip both —
+// they don't need to home a callee's register args (no callee exists)
+// and they don't need to re-align RSP for a call site that doesn't
+// exist.
+//
+// Formula (non-leaf, register-machine ABI):
+//   raw_with_shadow = max(savedRegAreaSize + spillAreaSize,
+//                         cc.shadowSpaceBytes)
+//   totalFrameSize  = alignedSizeWithBias(raw_with_shadow,
+//                                          cc.stackAlignment,
+//                                          cc.callPushBytes)
+//
+// Win64 example (ms_x64, no callee-saved, no spills, calls puts):
+//   raw_with_shadow = max(0, 32) = 32
+//   totalFrameSize  = alignedSizeWithBias(32, 16, 8) = 40
+//   Prologue emits `sub rsp, 0x28`. After the sub, RSP ≡ 0 mod 16 at
+//   any subsequent call site, AND 32 bytes of shadow space sit
+//   below the return address for the callee to home rcx/rdx/r8/r9.
+//
+// SysV example (sysv_amd64, no callee-saved, no spills, calls
+// libc.foo):
+//   raw_with_shadow = max(0, 0) = 0       (no shadow space requirement)
+//   totalFrameSize  = alignedSizeWithBias(0, 16, 8) = 8
+//   Prologue emits `sub rsp, 8`. Re-aligns RSP from ≡8 mod 16
+//   (post-CALL) to ≡0 mod 16 (callee-entry-aligned). No shadow
+//   space needed; alignment-only.
+//
+// ARM64 example (aapcs64, no callee-saved beyond x30, no spills,
+// calls foo):
+//   raw_with_shadow = max(0, 0) = 0
+//   totalFrameSize  = alignedSizeWithBias(0, 16, 0) = 0
+//   No SP delta needed — the x30 save lands in `savedRegAreaSize`
+//   via the existing callee-saved tracking.
+//
+// Leaf function (any cc, no calls):
+//   totalFrameSize  = alignUp(savedRegAreaSize + spillAreaSize,
+//                              stackAlignment)   (the existing rule)
+//
+// Closes the SEGV class that caused hello_puts to AV at 0xC0000005 —
+// NOT a CRT-init issue (msvcrt's DllMain self-inits stdio). The same
+// class of bug the trampoline cycle closed for the kernel→trampoline
+// transition, now closed for the user-fn→extern transition one frame
+// down.
 [[nodiscard]] std::optional<FrameLayout>
 computeFrameLayout(LirFuncAllocation const& alloc,
                    TargetSchema const& schema,
                    TargetCallingConvention const& cc,
                    std::vector<LirReg> savedRegs,
+                   bool hasCalls,
                    DiagnosticReporter& reporter) {
     std::uint32_t const slotWidth = std::max(widthForClass(schema, LirRegClass::GPR),
                                              widthForClass(schema, LirRegClass::FPR));
@@ -119,10 +167,59 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     layout.slotSize         = slotWidth;
     layout.savedRegAreaSize = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
     layout.spillAreaSize    = alloc.numSpillSlots * slotWidth;
-    std::uint32_t const raw = layout.savedRegAreaSize + layout.spillAreaSize;
+    layout.hasCalls         = hasCalls;
+    std::uint32_t const rawPreShadow =
+        layout.savedRegAreaSize + layout.spillAreaSize;
     std::uint32_t const align = (cc.stackAlignment > 0) ? cc.stackAlignment : 1u;
-    layout.totalFrameSize   = alignUp(raw, align);
+    if (hasCalls) {
+        // Non-leaf: reserve at least shadow-space + re-align for
+        // post-CALL RSP delta. Same `alignedSizeWithBias` formula
+        // the trampoline emitter uses, with the cc's `callPushBytes`
+        // as the bias (the in-program CALL instruction's RSP push;
+        // distinct from `entryStackPointerBias` which is the kernel→
+        // trampoline transition bias — see `target_schema.hpp`).
+        std::uint32_t const rawWithShadow =
+            std::max(rawPreShadow,
+                     static_cast<std::uint32_t>(cc.shadowSpaceBytes));
+        layout.totalFrameSize = alignedSizeWithBias(
+            rawWithShadow, align,
+            static_cast<std::uint32_t>(cc.callPushBytes));
+    } else {
+        // Leaf: existing rule (no callee to home args for, no call
+        // site to re-align). Shadow space requirement does not
+        // apply — there is no callee that could read it.
+        layout.totalFrameSize = alignUp(rawPreShadow, align);
+    }
     return layout;
+}
+
+// D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: detect whether function `fn` in
+// the source LIR makes any function call. Used by `materializeOneFunc`
+// to gate shadow-space + alignment-bias allocation in the prologue.
+//
+// Scans every instruction in every block. The schema's
+// `TargetOpcodeInfo::isCall` flag is the load-bearing signal — it is
+// set per opcode in the JSON (`"isCall": true`) and is true for BOTH
+// direct `call` AND `call_indirect_via_extern`. Mnemonic-matching
+// would silently miss the indirect variant (the IAT path puts uses).
+// The schema already uses `isCall` for regalloc's cross-call-live
+// exclusion (`lir_regalloc.cpp::collectCallPositions`) — same flag,
+// same surface, no duplication.
+[[nodiscard]] bool
+functionHasCalls(Lir const& src, LirFuncId fn,
+                 TargetSchema const& schema) noexcept {
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const instN = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < instN; ++i) {
+            LirInstId const inst = src.blockInstAt(blk, i);
+            std::uint16_t const op = src.instOpcode(inst);
+            auto const* info = schema.opcodeInfo(op);
+            if (info != nullptr && info->isCall) return true;
+        }
+    }
+    return false;
 }
 
 // Emit `<op> SP, bytes` — destructive 2-operand form. Caller supplies
@@ -198,7 +295,108 @@ struct OpcodeHandles {
     std::uint16_t store;
     std::uint16_t frameLoad;
     std::uint16_t frameStore;
+    // ML7 cycle 2: virtual-op handles materialized by the callconv pass.
+    std::uint16_t arg;
+    std::uint16_t call;
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
+    // indirect call via extern import. Same arg-setup semantics as
+    // `call` (caller places args in the cc's argGprs/argFprs); the
+    // distinction is the call-instruction byte form (FF 15 vs E8) +
+    // how the linker patches disp32 (IAT slot RVA vs callee RVA).
+    // The materialize pass treats both identically for arg setup.
+    std::uint16_t callIndirectViaExtern;
 };
+
+// Resolve a cc register-name reference to a typed `LirReg`. Returns
+// nullopt + a loud diagnostic if the name doesn't exist in the
+// schema's `registers[]` (would be a schema misconfiguration that
+// `TargetSchemaData::validate` should normally catch — defensive
+// here so a loader-bypass path doesn't silently produce a junk reg).
+[[nodiscard]] std::optional<LirReg>
+resolveCcReg(TargetSchema const& schema,
+             std::string_view    name,
+             LirRegClass         cls,
+             std::string_view    contextLabel,
+             DiagnosticReporter& reporter) {
+    auto const ord = schema.registerByName(name);
+    if (!ord.has_value()) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+               DiagnosticSeverity::Error,
+               std::format("{}: calling convention declares register '{}' "
+                           "but the target schema's registers[] does not "
+                           "declare it — schema misconfiguration",
+                           contextLabel, name));
+        return std::nullopt;
+    }
+    return makePhysicalReg(*ord, cls);
+}
+
+// Emit a single-source `mov dest, src`. The mov instruction shape
+// in the substrate is `mov dest, src_reg` — operand layout
+// [src_reg], result = dest. Schema-uniform across SysV/MS-x64/AAPCS64
+// because the cc-blind `mov` opcode operates on regs, not the cc.
+void emitMov(LirBuilder& b, std::uint16_t movOp, LirReg dest, LirReg src) {
+    std::array<LirOperand, 1> ops{LirOperand::makeReg(src)};
+    b.addInst(movOp, dest, ops);
+}
+
+// Emit `mov dest, src` only when `dest.id != src.id` — the regalloc-
+// already-picked-this-reg no-op skip used by every ML7 cycle 2
+// materialization site (arg copy, call arg-passing, call return).
+// Trivial inline at 3 sites; the named helper makes the intent
+// ("skip mov when same reg") immediately readable.
+void maybeMov(LirBuilder& b, std::uint16_t movOp, LirReg dest, LirReg src) {
+    if (dest.id != src.id) emitMov(b, movOp, dest, src);
+}
+
+// Lookup the i-th arg-passing source register for the given class.
+// GPR class uses `cc.argGprs`; FPR uses `cc.argFprs`. Returns nullopt
+// when `index >= pool.size()` (stack-passed; D-ML7-2.2).
+[[nodiscard]] std::optional<LirReg>
+argPassingReg(TargetSchema const&            schema,
+              TargetCallingConvention const& cc,
+              std::uint32_t                  index,
+              LirRegClass                    cls,
+              std::string_view               contextLabel,
+              DiagnosticReporter&            reporter) {
+    auto const& pool = (cls == LirRegClass::FPR) ? cc.argFprs : cc.argGprs;
+    if (index >= pool.size()) {
+        report(reporter, DiagnosticCode::L_StackPassedArgUnsupported,
+               DiagnosticSeverity::Error,
+               std::format("{}: arg index {} requires stack passing "
+                           "(cc '{}' has only {} {} arg-passing registers); "
+                           "stack-passed args are anchored at D-ML7-2.2",
+                           contextLabel,
+                           index, cc.name, pool.size(),
+                           (cls == LirRegClass::FPR) ? "FPR" : "GPR"));
+        return std::nullopt;
+    }
+    return resolveCcReg(schema, pool[index], cls, contextLabel, reporter);
+}
+
+// Lookup the primary return register (slot 0) for the given class.
+// Multi-register returns (SysV's rax+rdx for >64-bit aggregates) are
+// not yet exercised — anchored as a future cycle when the first
+// >64-bit aggregate return surfaces.
+[[nodiscard]] std::optional<LirReg>
+returnReg(TargetSchema const&            schema,
+          TargetCallingConvention const& cc,
+          LirRegClass                    cls,
+          std::string_view               contextLabel,
+          DiagnosticReporter&            reporter) {
+    auto const& pool = (cls == LirRegClass::FPR) ? cc.returnFprs : cc.returnGprs;
+    if (pool.empty()) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+               DiagnosticSeverity::Error,
+               std::format("{}: calling convention '{}' declares no {} "
+                           "return registers but the call has a {} result",
+                           contextLabel, cc.name,
+                           (cls == LirRegClass::FPR) ? "FPR" : "GPR",
+                           (cls == LirRegClass::FPR) ? "float" : "integer"));
+        return std::nullopt;
+    }
+    return resolveCcReg(schema, pool[0], cls, contextLabel, reporter);
+}
 
 [[nodiscard]] std::optional<OpcodeHandles>
 resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
@@ -208,22 +406,55 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
     // are schema-configurable so the target may rename them. Single
     // diagnostic-emission site beats seven copy-pasted if-let-else
     // ladders (simplifier M6).
+    // `optional == true` means: if the schema doesn't declare this
+    // mnemonic, leave the field at 0 (the invalid-sentinel opcode)
+    // and continue rather than failing loud. The materialize loop's
+    // `op == h.callIndirectViaExtern` check then never matches
+    // (a real input opcode is always > 0). This preserves
+    // agnosticism for a target schema that genuinely doesn't NEED
+    // the opcode (e.g. ARM64's GOT/PLT macro-op encoding lands in a
+    // future cycle; the schema may not declare
+    // `call_indirect_via_extern` until then — and a c-subset module
+    // with no extern calls under ARM64 should still lower cleanly).
+    // Required opcodes still fail loud on missing.
+    //
+    // Audit-fold critical (code-reviewer C1): without this, my prior
+    // unconditional addition of `call_indirect_via_extern` to the
+    // table broke ARM64's resolveOpcodes for every function — even
+    // those with no extern calls. Closed-set requiredness only for
+    // opcodes the pass GENUINELY cannot operate without.
     struct Entry {
         std::uint16_t OpcodeHandles::* field;
         std::string_view mnem;
+        bool optional;
     };
-    std::array<Entry, 7> const table{{
-        {&OpcodeHandles::mov,        "mov"},
-        {&OpcodeHandles::add,        "add"},
-        {&OpcodeHandles::sub,        "sub"},
-        {&OpcodeHandles::load,       "load"},
-        {&OpcodeHandles::store,      "store"},
-        {&OpcodeHandles::frameLoad,  schema.frameLoadMnemonic()},
-        {&OpcodeHandles::frameStore, schema.frameStoreMnemonic()},
+    std::array<Entry, 10> const table{{
+        {&OpcodeHandles::mov,        "mov",        false},
+        {&OpcodeHandles::add,        "add",        false},
+        {&OpcodeHandles::sub,        "sub",        false},
+        {&OpcodeHandles::load,       "load",       false},
+        {&OpcodeHandles::store,      "store",      false},
+        {&OpcodeHandles::frameLoad,  schema.frameLoadMnemonic(),  false},
+        {&OpcodeHandles::frameStore, schema.frameStoreMnemonic(), false},
+        // ML7 cycle 2: arg + call materialized inside this pass.
+        {&OpcodeHandles::arg,        "arg",        false},
+        {&OpcodeHandles::call,       "call",       false},
+        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
+        // optional — a target without dynamic-import support legitimately
+        // omits this opcode. MIR→LIR's separate per-call extern check at
+        // `lowerCall` fails loud upstream if a call to a missing-opcode
+        // extern is lowered, so the absence here is safe.
+        {&OpcodeHandles::callIndirectViaExtern,
+         "call_indirect_via_extern", true},
     }};
-    for (auto const& [field, mnem] : table) {
+    for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
         if (!op.has_value()) {
+            if (optional) {
+                // Leave field at 0 (invalid sentinel — never matches
+                // a real input opcode).
+                continue;
+            }
             report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                    DiagnosticSeverity::Error,
                    std::format("target schema missing '{}' opcode required for "
@@ -257,7 +488,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     LirReg const sp = makePhysicalReg(cc.stackPointer->ordinal, LirRegClass::GPR);
 
     std::vector<LirReg> usedSaved = collectUsedCalleeSaved(src, fn, schema, cc);
-    auto layoutOpt = computeFrameLayout(alloc, schema, cc, std::move(usedSaved), reporter);
+    bool const hasCalls = functionHasCalls(src, fn, schema);
+    auto layoutOpt = computeFrameLayout(alloc, schema, cc,
+                                        std::move(usedSaved),
+                                        hasCalls, reporter);
     if (!layoutOpt.has_value()) return false;
     outLayout = std::move(*layoutOpt);
 
@@ -294,6 +528,219 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             auto const* info = schema.opcodeInfo(op);
             bool const isTerm = (info != nullptr && info->isTerminator());
 
+            // ML7 cycle 2: materialize virtual `arg` op.
+            //
+            // After regalloc, `result` is a physical register (whatever
+            // the allocator picked for the parameter's vreg). The cc
+            // declares which physical register the caller placed the
+            // k-th param in (`cc.argGprs[k]` for GPR, `cc.argFprs[k]`
+            // for FPR). Emit a `mov result, sourceArgReg` to copy the
+            // param into the regalloc-chosen home — or skip when
+            // regalloc happened to pick the source reg itself (no-op).
+            //
+            // Out-of-range arg indices fall into D-ML7-2.2 (stack-
+            // passed). A future regalloc pre-coloring hint
+            // (D-ML7-2.5) would eliminate most of these movs by
+            // pre-pinning the param vreg to its cc arg reg; for v1
+            // correctness, the unconditional mov is the right shape.
+            if (op == h.arg) {
+                if (!result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_VirtualRegInPostRegalloc,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: arg inst {} has no "
+                                       "physical-reg result after regalloc",
+                                       inst.v));
+                    return false;
+                }
+                auto const argSrc =
+                    argPassingReg(schema, cc, payload, result.regClass(),
+                                  "materializeOneFunc: arg", reporter);
+                if (!argSrc.has_value()) return false;
+                maybeMov(b, h.mov, result, *argSrc);
+                continue;
+            }
+
+            // ML7 cycle 2: materialize virtual `call` op into the
+            // explicit ABI sequence.
+            //
+            // Input shape (post-regalloc): `result?, call callee, arg0,
+            // arg1, ...` — operands are [callee, arg0..argN-1] where
+            // callee is a SymbolRef (direct call) and each arg is a
+            // physical register holding the value at the call site.
+            //
+            // Output shape:
+            //   mov destArgReg_0, arg0   (per cc.argGprs/argFprs by class)
+            //   mov destArgReg_1, arg1
+            //   ...
+            //   call <callee_symbol>     (only the symbol operand —
+            //                             matches the existing
+            //                             x86-variable encoding variant
+            //                             guard `["symbol"]`)
+            //   mov result, returnReg    (only if result is non-void;
+            //                             returnReg picked from
+            //                             cc.returnGprs[0] / returnFprs[0]
+            //                             by result class)
+            //
+            // Indirect calls (`call <reg>`) are anchored at D-ML7-2.4.
+            // Move-graph cycles (when regalloc pins src args to dest
+            // arg-passing regs in a way that produces a cycle —
+            // e.g. arg0 in argGprs[1], arg1 in argGprs[0] would need
+            // `mov rdi, rsi; mov rsi, rdi`, where the second read sees
+            // the clobbered rdi) trip `L_MoveCycleUnsupported` loud.
+            // Proper parallel-copy resolution is anchored at D-ML7-2.3.
+            // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold: arg-setup
+            // + return-value handling are identical across every call-
+            // shaped opcode (direct `call`, `call_indirect_via_extern`,
+            // and any future variant a target schema adds with
+            // `isCall: true`). Gate on the SAME `TargetOpcodeInfo::isCall`
+            // flag that `functionHasCalls` uses + the `hasCalls`
+            // detection scan uses — single source of truth.
+            // Mnemonic-equality match (`op == h.call || op ==
+            // h.callIndirectViaExtern`) was the prior shape; it would
+            // silently miss a 3rd call-shaped opcode (e.g. a future
+            // `call_indirect_reg` for function-pointer support
+            // anchored at D-ML7-2.4) — the silent-failure audit pin.
+            if (info != nullptr && info->isCall) {
+                if (ops.empty()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: call inst {} has no "
+                                       "operands (expected [callee, args...])",
+                                       inst.v));
+                    return false;
+                }
+                LirOperand const calleeOp = ops[0];
+                if (calleeOp.kind != LirOperandKind::SymbolRef) {
+                    report(reporter,
+                           DiagnosticCode::L_IndirectCallUnsupported,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: call inst {}'s callee "
+                                       "operand is not a SymbolRef — indirect "
+                                       "calls are anchored at D-ML7-2.4",
+                                       inst.v));
+                    return false;
+                }
+                // Plan the move-to-arg-register sequence up front so a
+                // move-cycle check can run BEFORE any mov is emitted.
+                // Each entry is (destination arg-passing physreg,
+                // source physreg holding the value).
+                struct ArgMove {
+                    LirReg dest;
+                    LirReg src;
+                };
+                std::vector<ArgMove> argMoves;
+                argMoves.reserve(ops.size());
+                std::uint32_t gprIdx = 0;
+                std::uint32_t fprIdx = 0;
+                for (std::size_t i = 1; i < ops.size(); ++i) {
+                    LirOperand const& argOp = ops[i];
+                    if (argOp.kind != LirOperandKind::Reg
+                        || argOp.reg.isPhysical == 0) {
+                        report(reporter,
+                               DiagnosticCode::L_VirtualRegInPostRegalloc,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: call inst {} arg {} "
+                                           "is not a physical-reg operand "
+                                           "after regalloc", inst.v, i - 1));
+                        return false;
+                    }
+                    LirReg const srcReg = argOp.reg;
+                    LirRegClass const cls = srcReg.regClass();
+                    std::uint32_t const argIndex =
+                        (cls == LirRegClass::FPR) ? fprIdx++ : gprIdx++;
+                    auto const destReg =
+                        argPassingReg(schema, cc, argIndex, cls,
+                                      "materializeOneFunc: call", reporter);
+                    if (!destReg.has_value()) return false;
+                    argMoves.push_back({*destReg, srcReg});
+                }
+                // Move-ordering hazard detection (silent-failure-hunter
+                // CRITICAL F1 fold + post-fold inversion fix). The
+                // naive emit-in-order shape is correct ONLY when, for
+                // every pair (i, j) with i < j, emitting move i does
+                // not clobber a register that move j still needs to
+                // read. The hazard predicate is:
+                //
+                //     dest_i == src_j   for some j > i
+                //
+                // (Move i WRITES dest_i. Move j READS src_j. If
+                // dest_i == src_j and i runs first, the value move j
+                // needed is gone.)
+                //
+                // The previous version of this loop used the inverted
+                // predicate `dest_j == src_i` which is SAFE in in-order
+                // emission (move i reads src_i before move j writes
+                // dest_j) — that loop accidentally still caught true
+                // 2-cycle swaps because swaps satisfy BOTH predicates
+                // symmetrically, but it false-rejected valid orderable
+                // sequences like (arg0: rdi←rsi, arg1: rsi←rcx). The
+                // current predicate fires on the true hazard only.
+                //
+                // The detector is conservative: it rejects any
+                // orderable chain where a true cycle is structurally
+                // possible (e.g. (a←b, b←a) — a real swap) AND
+                // multi-step shapes that the in-order emission cannot
+                // handle without re-ordering. Proper parallel-copy
+                // resolution (topo-sort + scratch-reg cycle breaking)
+                // is anchored at D-ML7-2.3 and would accept all
+                // orderable shapes by re-sorting moves before emit.
+                for (std::size_t i = 0; i < argMoves.size(); ++i) {
+                    if (argMoves[i].dest.id == argMoves[i].src.id) continue;
+                    for (std::size_t j = i + 1; j < argMoves.size(); ++j) {
+                        if (argMoves[j].dest.id == argMoves[j].src.id) continue;
+                        // Hazard: move i writes dest_i which move j
+                        // still needs to read as src_j.
+                        if (argMoves[i].dest.id == argMoves[j].src.id) {
+                            report(reporter,
+                                   DiagnosticCode::L_MoveCycleUnsupported,
+                                   DiagnosticSeverity::Error,
+                                   std::format("callconv: call inst {} arg-"
+                                               "passing moves have an order "
+                                               "hazard (move {} dest reg #{} "
+                                               "is the source of later move "
+                                               "{} — emitting in order would "
+                                               "clobber it); parallel-copy "
+                                               "resolution is anchored at "
+                                               "D-ML7-2.3",
+                                               inst.v, i,
+                                               static_cast<unsigned>(argMoves[i].dest.id),
+                                               j));
+                            return false;
+                        }
+                    }
+                }
+                // Cycle-free — emit in order.
+                for (auto const& m : argMoves) {
+                    maybeMov(b, h.mov, m.dest, m.src);
+                }
+                // Emit the call instruction. Pass through the input
+                // opcode (h.call OR h.callIndirectViaExtern) so the
+                // assembler picks the right encoding. Single-symbol
+                // operand form for both (matches each schema variant
+                // guard `["symbol"]`).
+                std::array<LirOperand, 1> callOps{calleeOp};
+                b.addInst(op, InvalidLirReg, callOps,
+                          payload, src.instFlags(inst));
+                // Move return register into result (only if non-void).
+                if (result.valid()) {
+                    if (result.isPhysical == 0) {
+                        report(reporter,
+                               DiagnosticCode::L_VirtualRegInPostRegalloc,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: call inst {} result "
+                                           "is not a physical reg after regalloc",
+                                           inst.v));
+                        return false;
+                    }
+                    auto const retReg =
+                        returnReg(schema, cc, result.regClass(),
+                                  "materializeOneFunc: call", reporter);
+                    if (!retReg.has_value()) return false;
+                    maybeMov(b, h.mov, result, *retReg);
+                }
+                continue;
+            }
+
             // Materialize frame_load / frame_store.
             if (op == h.frameLoad) {
                 LirSpillSlot const slot{payload};
@@ -328,6 +775,39 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     && info->result == TargetResultRule::None;
                 auto const succs = src.blockSuccessors(srcBlock);
                 if (isReturn && succs.empty()) {
+                    // ML7 cycle 2: callee-side return-value
+                    // materialization. If `ret` carries a [reg]
+                    // operand (value-returning function), move the
+                    // value into cc.returnGprs[0]/returnFprs[0]
+                    // BEFORE the epilogue runs, then emit the ret
+                    // with NO operand (the value is implicit via
+                    // the ABI). Mirror of the caller-side mov-from-
+                    // returnReg in the `call` materialization
+                    // above. Void-returning functions (empty ops)
+                    // skip this block and fall through to the
+                    // epilogue + no-op-operand ret.
+                    if (!ops.empty()) {
+                        if (ops.size() != 1
+                            || ops[0].kind != LirOperandKind::Reg
+                            || ops[0].reg.isPhysical == 0) {
+                            report(reporter,
+                                   DiagnosticCode::L_VirtualRegInPostRegalloc,
+                                   DiagnosticSeverity::Error,
+                                   std::format("callconv: ret inst {} has "
+                                               "non-physical-reg operand "
+                                               "after regalloc", inst.v));
+                            return false;
+                        }
+                        LirReg const valReg = ops[0].reg;
+                        auto const retReg =
+                            returnReg(schema, cc, valReg.regClass(),
+                                      "materializeOneFunc: ret", reporter);
+                        if (!retReg.has_value()) return false;
+                        maybeMov(b, h.mov, *retReg, valReg);
+                        // Strip the operand from the ret — the
+                        // value is now in the cc's return reg.
+                        newOps.clear();
+                    }
                     // Emit epilogue BEFORE the return.
                     emitEpilogue(b, outLayout, sp, h.add, h.load);
                 }

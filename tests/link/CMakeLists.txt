@@ -4,3 +4,26 @@ dss_add_test(NAME link/test_object_format_schema SOURCES test_object_format_sche
 dss_add_test(NAME link/test_linker               SOURCES test_linker.cpp)
 dss_add_test(NAME link/test_elf_writer           SOURCES test_elf_writer.cpp)
 dss_add_test(NAME link/test_pe_writer            SOURCES test_pe_writer.cpp)
+dss_add_test(NAME link/test_macho_writer         SOURCES test_macho_writer.cpp)
+dss_add_test(NAME link/test_macho_chained_fixups SOURCES test_macho_chained_fixups.cpp)
+dss_add_test(NAME link/test_string_table         SOURCES test_string_table.cpp)
+dss_add_test(NAME link/test_elf_exec_writer      SOURCES test_elf_exec_writer.cpp)
+
+# D-LK6-1 closure — ARM64 bit-shift relocation-formula variants.
+dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_formulas.cpp)
+
+# Plan 14 LK7 — codesign-placeholder reservation tests.
+dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)
+
+# Plan 14 LK8 — WebAssembly module writer (skeleton).
+dss_add_test(NAME link/test_wasm_writer          SOURCES test_wasm_writer.cpp)
+
+# Plan 14 LK9 — SPIR-V module writer (skeleton).
+dss_add_test(NAME link/test_spirv_writer         SOURCES test_spirv_writer.cpp)
+
+# Plan 14 LK10 cycle 1 — file-emission substrate.
+dss_add_test(NAME link/test_link_writer          SOURCES test_link_writer.cpp)
+
+# Plan 14 §2.13 D-LK10-ENTRY Slice C — runnable-binary spine
+# (first DSS-produced binary the OS actually runs).
+dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c.cpp)

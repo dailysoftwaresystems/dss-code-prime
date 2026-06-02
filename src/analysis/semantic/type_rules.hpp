@@ -99,6 +99,29 @@ namespace detail::type_rules {
     if (floatRank(lk) != 0 && floatRank(rk) != 0) {
         return floatRank(rk) <= floatRank(lk);
     }
+    // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING
+    // closure, 2026-06-02): `Array<T,N>` is implicitly assignable to
+    // `Ptr<T>` via the address-of-first-element conversion. Pinned to
+    // same-element-type — covariant element conversions (Array<T> →
+    // Ptr<const T>) wait for const-qualified pointers, anchored as
+    // D-CSUBSET-CONST-PTR-DECAY. The HIR lowering (cst_to_hir.cpp::
+    // coerce) emits a synthetic decay node when this branch admits
+    // the assignment; the MIR-tier sees a Ptr-typed value and
+    // routes through the standard pointer pipeline.
+    //
+    // Agnosticism note: this rule is part of the SHARED type lattice
+    // (not language-specific). A schema-driven language that does
+    // NOT want array decay would have to declare the prohibition
+    // explicitly; the C-family (today's only consumer) wants it.
+    // Anchor: D-LANG-STRUCTURAL-DECAY-OPT-OUT.
+    if (lk == TypeKind::Ptr && rk == TypeKind::Array) {
+        auto const lhsElem = interner.operands(lhs);
+        auto const rhsElem = interner.operands(rhs);
+        if (!lhsElem.empty() && !rhsElem.empty()
+            && lhsElem[0] == rhsElem[0]) {
+            return true;
+        }
+    }
     return false;
 }
 

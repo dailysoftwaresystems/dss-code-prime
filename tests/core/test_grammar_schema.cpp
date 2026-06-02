@@ -1656,6 +1656,212 @@ TEST(GrammarSchema, SemanticsUnknownDeclKindReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// ── D-LK10-ENTRY-MAIN-IMPLICIT-RETURN loader negative tests ───────
+//
+// `implicitReturnZeroForFunctionNames` on `DeclarationRule` accepts
+// an array of non-empty strings. Each malformed shape must emit
+// `C_InvalidSemantics` so a typo in a language config can't silently
+// produce an empty list (which would make the implicit-return-0
+// rule never fire for that language).
+
+TEST(GrammarSchema, SemanticsImplicitReturnZeroNonArrayReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames": "main" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsImplicitReturnZeroNonStringElementReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames": ["main", 42] } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsImplicitReturnZeroEmptyStringElementReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames": ["main", ""] } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// Positive pin: multi-name lists load cleanly and preserve order +
+// identity. The substrate accepts an arbitrary-length vector, but
+// c-subset's shipped config declares only `["main"]`, so the
+// multi-element path has zero in-shipped-config coverage. A
+// regression that silently truncated the list to the first element
+// would pass every negative test + every e2e test (c-subset's single
+// "main" entry still works). Code-architect Q10-A4 FOLD-NOW on
+// 39897eb's 3rd-order audit.
+TEST(GrammarSchema, SemanticsImplicitReturnZeroMultiNameListLoadsCleanly) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames":
+                              ["main", "WinMain", "_start"] } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "multi-element implicitReturnZeroForFunctionNames must load";
+    auto const& decls = (*r)->semantics().declarations;
+    ASSERT_EQ(decls.size(), 1u);
+    auto const& names = decls[0].implicitReturnZeroForFunctionNames;
+    ASSERT_EQ(names.size(), 3u)
+        << "all three entries must be preserved — a silent truncation "
+           "to the first element would still pass downstream lookup "
+           "for `main` but break languages declaring additional names";
+    EXPECT_EQ(names[0], "main");
+    EXPECT_EQ(names[1], "WinMain");
+    EXPECT_EQ(names[2], "_start");
+}
+
+// Duplicate entries are a paste-error class — emit C_InvalidSemantics
+// per duplicate occurrence. Silent-failure F2 fold (3rd-order audit
+// on 39897eb).
+TEST(GrammarSchema, SemanticsImplicitReturnZeroDuplicateElementReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames": ["main", "main"] } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// FF6 Slice 2 + audit fold (2026-06-02 post-fold #1): per-language
+// `externLibraryByFormat` JSON loader. Closes test-analyzer G3 —
+// the 80+ LOC of new validation shipped without direct tests.
+// Validates: shape (object), key (closed-enum ObjectFormatKind
+// name), value (non-empty string). Each failure surface emits
+// C_InvalidSemantics so a typo in a language config can't silently
+// produce an empty map (which would then fire F_FfiNoImportLibraryForFormat
+// at compile time with no anchor at the upstream config gap).
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatHappyPath) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": {
+          "pe":    "msvcrt.dll",
+          "elf":   "libc.so.6",
+          "macho": "/usr/lib/libSystem.B.dylib"
+        }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value()) << "expected clean load";
+    auto const& m = (*r)->semantics().externLibraryByFormat;
+    EXPECT_EQ(m.size(), 3u);
+    EXPECT_EQ(m.at("pe"),    "msvcrt.dll");
+    EXPECT_EQ(m.at("elf"),   "libc.so.6");
+    EXPECT_EQ(m.at("macho"), "/usr/lib/libSystem.B.dylib");
+}
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatNonObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": ["pe", "msvcrt.dll"]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatUnknownKeyReportsInvalid) {
+    // Typo: "pee" (instead of "pe"). Catches the trap at config
+    // load — without this validation, the typo would land silently
+    // and `F_FfiNoImportLibraryForFormat` would fire at compile
+    // time with no breadcrumb pointing at the language JSON.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "pee": "msvcrt.dll" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatNonStringValueReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "pe": 42 }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsExternLibraryByFormatEmptyStringValueReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "externLibraryByFormat": { "pe": "" }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
 // `literalTypes[i].literal` that names no declared token → C_UnknownToken.
 TEST(GrammarSchema, SemanticsLiteralUnknownTokenReportsUnknownToken) {
     constexpr std::string_view kCfg = R"JSON({

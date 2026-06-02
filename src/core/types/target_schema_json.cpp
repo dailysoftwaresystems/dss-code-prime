@@ -364,6 +364,40 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll).release());
     }
     data.name = target.at("name").get<std::string>();
+    // Empty OR whitespace-only `name` would be silently accepted by
+    // the closed-enum cross-validation at the driver tier
+    // (`lookupTargetArch` does exact comparison → no match → skip),
+    // reopening the SIGILL surface D-LK6-8.2 was anchored to close.
+    // Also reject leading/trailing whitespace ("  arm64 " ≠ "arm64").
+    // (silent-failure CRITICAL-2 + HIGH-1 post-fold — D-LK6-8.2 audit
+    // rounds 1 and 2 — empty was caught in round 1, whitespace in
+    // round 2.)
+    auto const isNonAsciiWhitespace = [](char c) noexcept {
+        // ASCII whitespace per POSIX [[:space:]]:
+        // space, tab, newline, CR, vertical tab, form feed.
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+            || c == '\v' || c == '\f';
+    };
+    auto const allWhitespace = [&](std::string_view s) noexcept {
+        for (char c : s) {
+            if (!isNonAsciiWhitespace(c)) return false;
+        }
+        return true;
+    };
+    auto const hasLeadingTrailingWS = [&](std::string_view s) noexcept {
+        return !s.empty()
+            && (isNonAsciiWhitespace(s.front())
+             || isNonAsciiWhitespace(s.back()));
+    };
+    if (data.name.empty() || allWhitespace(data.name)
+        || hasLeadingTrailingWS(data.name)) {
+        coll.emit(DiagnosticCode::C_MissingField, "/target/name",
+                  "'name' must be a non-empty string with no leading "
+                  "or trailing whitespace — would silently bypass the "
+                  "(target, format) machine cross-check (plan 14 §3.1 "
+                  "D-LK6-8.2).");
+        return std::unexpected(std::move(coll).release());
+    }
     if (target.contains("version") && target.at("version").is_string()) {
         data.version = target.at("version").get<std::string>();
     }
@@ -394,29 +428,134 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // lookup at opcode-parse time can resolve against the populated
     // `relocations[]` table. Empty/absent section is legal; non-
     // empty rows must satisfy the validate() contract: unique non-
-    // zero `kind`, non-empty `name`. `formula` is opaque to the
-    // substrate — stored verbatim for diagnostic display and for
-    // the linker's `*.format.json` human-readable cross-reference.
+    // zero `kind`, non-empty `name`.
+    //
+    // Target-side extension fields:
+    //   * `formula` (string, REQUIRED for non-trivial kinds) — closed-
+    //     enum discriminator of the relocation-formula class. Accepted
+    //     values: "linear" (default if absent — x86/ARM abs64/rel32
+    //     style), "aarch64_call26", "aarch64_adr_prel_pg_hi21",
+    //     "aarch64_add_abs_lo12". Load-bearing: dispatches the kernel
+    //     at `applyExecRelocations`. (D-LK6-1 closure — was previously
+    //     accepted-and-discarded as human documentation.)
+    //   * `pcRelative` (bool), `addendBias` (i32), `widthBytes`
+    //     (u8 = 4 or 8) — Linear-only fields; ignored for non-Linear
+    //     formula kinds (the variant fully encodes the formula).
+    //
+    // Coherence rules enforced here:
+    //   - non-Linear ⇒ widthBytes must be 4 OR absent (defaulted to 4)
+    //   - non-Linear ⇒ pcRelative MUST be absent or false
+    //   - non-Linear ⇒ addendBias MUST be absent or zero
     substrate::loadRelocationsTable<TargetRelocationInfo>(
         doc, data.relocations, data.relocationNameIndex,
         data.relocationKindIndex, coll,
         [](nlohmann::json const& r, TargetRelocationInfo& info,
            Collector& c, std::size_t i) -> bool {
-            // Target-side extension field: opaque `formula` text
-            // (e.g. "S + A - P - 4"). Stored verbatim — the linker
-            // applies it; the substrate doesn't parse it. A non-
-            // string formula is a hard malformed-row case: returning
-            // false skips the row entirely so a partially-constructed
-            // TargetRelocationInfo (formula = empty) cannot escape
-            // into the dual indices (multi-agent review convergence).
             if (r.contains("formula")) {
                 if (!r.at("formula").is_string()) {
                     c.emit(DiagnosticCode::C_MalformedJson,
                            std::format("/relocations/{}/formula", i),
-                           "'formula' must be a string");
+                           std::format("'formula' must be a string "
+                                       "discriminator (accepted: {})",
+                                       acceptedRelocFormulaList()));
                     return false;
                 }
-                info.formula = r.at("formula").get<std::string>();
+                auto const formulaStr = r.at("formula").get<std::string>();
+                auto const parsed = parseRelocFormulaKind(formulaStr);
+                if (!parsed.has_value()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/formula", i),
+                           std::format("'{}' is not a recognized "
+                                       "relocation-formula discriminator "
+                                       "(accepted: {}) — see plan 14 "
+                                       "§3.1 D-LK6-1",
+                                       formulaStr,
+                                       acceptedRelocFormulaList()));
+                    return false;
+                }
+                info.formulaKind = *parsed;
+            }
+            // `widthBytes` absent + Linear ⇒ walker fails loud at apply
+            // time (anchored D-LK6-1, retained for legacy declarations).
+            // Non-Linear formulas implicitly use 4-byte ARM64 instruction
+            // words; widthBytes is auto-set to 4 below if not declared.
+            if (r.contains("widthBytes")) {
+                if (!r.at("widthBytes").is_number_integer()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/widthBytes", i),
+                           "'widthBytes' must be an integer (4 or 8)");
+                    return false;
+                }
+                std::int64_t const wb = r.at("widthBytes").get<std::int64_t>();
+                if (wb != 4 && wb != 8) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/widthBytes", i),
+                           std::format("'widthBytes' must be 4 or 8; "
+                                       "got {}", wb));
+                    return false;
+                }
+                info.widthBytes = static_cast<std::uint8_t>(wb);
+            }
+            if (r.contains("pcRelative")) {
+                if (!r.at("pcRelative").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/pcRelative", i),
+                           "'pcRelative' must be a boolean");
+                    return false;
+                }
+                info.pcRelative = r.at("pcRelative").get<bool>();
+            }
+            if (r.contains("addendBias")) {
+                if (!r.at("addendBias").is_number_integer()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/addendBias", i),
+                           "'addendBias' must be an integer");
+                    return false;
+                }
+                std::int64_t const ab = r.at("addendBias").get<std::int64_t>();
+                if (ab < std::numeric_limits<std::int32_t>::min()
+                 || ab > std::numeric_limits<std::int32_t>::max()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/addendBias", i),
+                           std::format("'addendBias' ({}) out of "
+                                       "i32 range", ab));
+                    return false;
+                }
+                info.addendBias = static_cast<std::int32_t>(ab);
+            }
+            // Non-Linear coherence + default widthBytes=4 (ARM64
+            // instruction word).
+            if (info.formulaKind != RelocFormulaKind::Linear) {
+                if (info.widthBytes == 0) info.widthBytes = 4;
+                if (info.widthBytes != 4) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/widthBytes", i),
+                           std::format("non-Linear formula '{}' must use "
+                                       "widthBytes=4 (ARM64 instruction "
+                                       "word); got {}",
+                                       relocFormulaName(info.formulaKind),
+                                       info.widthBytes));
+                    return false;
+                }
+                if (info.pcRelative) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/pcRelative", i),
+                           std::format("non-Linear formula '{}' encodes "
+                                       "PC-relativity intrinsically; "
+                                       "'pcRelative' must be absent or "
+                                       "false",
+                                       relocFormulaName(info.formulaKind)));
+                    return false;
+                }
+                if (info.addendBias != 0) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/addendBias", i),
+                           std::format("non-Linear formula '{}' encodes "
+                                       "any addend bias intrinsically; "
+                                       "'addendBias' must be absent or 0",
+                                       relocFormulaName(info.formulaKind)));
+                    return false;
+                }
             }
             return true;
         });
@@ -697,6 +836,21 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
                 readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);
                 readBoundedInt(c, coll, ccPath, "redZoneBytes",     cc.redZoneBytes);
+                // D-LK10-ENTRY-TRAMP-PROLOGUE: process-entry RSP bias
+                // when this cc is the entry cc. See target_schema.hpp
+                // for the per-cc concrete values. Validated below
+                // (must be < stackAlignment when set).
+                readBoundedInt(c, coll, ccPath, "entryStackPointerBias",
+                               cc.entryStackPointerBias);
+                // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: ISA-level
+                // call-instruction RSP-push width. x86_64 = 8 (CALL
+                // pushes 8-byte return address); ARM64 = 0 (BL writes
+                // LR, no push). Validated below: must be strictly <
+                // `stackAlignment` (the bias is an OFFSET into the
+                // alignment quantum, parallel to `entryStackPointerBias`'s
+                // contract).
+                readBoundedInt(c, coll, ccPath, "callPushBytes",
+                               cc.callPushBytes);
                 if (c.contains("linkRegister")) {
                     if (!c.at("linkRegister").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,

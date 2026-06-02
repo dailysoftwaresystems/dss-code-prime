@@ -19,7 +19,7 @@ namespace dss {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 
 // Per-class scratch register pool. Each class holds the ordered list
 // of physical registers that:

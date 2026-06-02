@@ -20,8 +20,10 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "diagnostic_count.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "link/object_format_schema.hpp"  // FLIP-MARKER test loads shipped formats
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir_node.hpp"
 
@@ -46,6 +48,297 @@ TEST(AsmSubstrate, EmptyLirProducesEmptyAssembledModule) {
     EXPECT_EQ(result.expectedFuncCount, 0u);
     EXPECT_FALSE(result.ok());
     EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// ── LK6 cycle 2d: externs span flows through `assemble()` ─────────────
+
+TEST(AsmSubstrate, ExternsSpanCopiesIntoAssembledModule) {
+    // `assemble()` accepts an `std::span<ExternImport const>` and
+    // copies it verbatim into the returned module's `externImports`.
+    // Cycle-2d thread-through: the HIR→MIR pre-pass builds the
+    // vector (`HirToMirResult.externImports`), MIR→LIR propagates
+    // it, the assembler bundles it for the linker. (D-LK6-6 closure.)
+    Lir empty{};
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    std::vector<ExternImport> externs;
+    externs.push_back(ExternImport{SymbolId{99}, "printf", "libc.so.6"});
+    externs.push_back(ExternImport{SymbolId{100},
+                                   "_objc_msgSend",
+                                   "/usr/lib/libobjc.A.dylib"});
+    DiagnosticReporter rep;
+    auto result = assemble(empty, **schema, {}, rep,
+                           std::span<ExternImport const>{externs});
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(result.externImports.size(), 2u);
+    EXPECT_EQ(result.externImports[0].symbol, SymbolId{99});
+    EXPECT_EQ(result.externImports[0].mangledName, "printf");
+    EXPECT_EQ(result.externImports[0].libraryPath, "libc.so.6");
+    EXPECT_EQ(result.externImports[1].mangledName, "_objc_msgSend");
+}
+
+// ── D-LK4-RODATA-SUBSTRATE: AssembledData on AssembledModule ───────
+//
+// First slice toward FF6 hello-world (plan 11). The assembler now
+// carries `dataItems` parallel to `functions` and `externImports`.
+// Each item is a SymbolId-keyed byte blob tagged with a SectionKind
+// (typically `Rodata`) for downstream walker emission to `.rdata` /
+// `.rodata` / `__cstring`. The per-format walker arms are anchored
+// as follow-up cycles (D-LK2-RODATA (PE), D-LK1-RODATA (ELF), D-LK3-RODATA (Mach-O)).
+//
+// This slice ships the SUBSTRATE only: the struct exists, lives on
+// `AssembledModule`, and round-trips through `assemble()` (which
+// today is a no-op for `dataItems` — the assembler doesn't yet
+// produce them; hand-built tests are the consumer surface). The
+// MIR-global → AssembledData producer (from string-literal
+// promotion) lands in the next cycle paired with the per-format
+// walker emission.
+
+TEST(AsmSubstrate, AssembledDataDefaultIsRodataSectionEmptyBytes) {
+    // Default-constructed AssembledData should default to
+    // DataSectionKind::Rodata (the typical kind for string-
+    // literal-promoted bytes), an invalid SymbolId (sentinel),
+    // alignment 1 (byte-aligned), and empty bytes/relocations.
+    // A regression that flipped the default to a different kind
+    // (e.g. Bss) would silently route producer output to the
+    // wrong walker arm. The `DataSectionKind` narrow + `Alignment`
+    // newtype prevent the wider failure modes (walker-synthesized
+    // sections; non-power-of-two alignment) at compile time.
+    AssembledData d;
+    EXPECT_EQ(d.section, DataSectionKind::Rodata);
+    EXPECT_EQ(d.symbol, SymbolId{});
+    EXPECT_EQ(d.alignment.bytes(), 1u);
+    EXPECT_TRUE(d.bytes.empty());
+    EXPECT_TRUE(d.relocations.empty());
+}
+
+TEST(AsmSubstrate, AssembledModuleCarriesDataItemsField) {
+    // The field exists, is default-empty, and accepts hand-built
+    // items — the substrate surface tests/walker code will rely on.
+    AssembledModule m;
+    EXPECT_TRUE(m.dataItems.empty());
+
+    AssembledData d;
+    d.symbol  = SymbolId{77};
+    d.section = DataSectionKind::Rodata;
+    d.bytes   = {'h', 'e', 'l', 'l', 'o', '\n', '\0'};
+    d.alignment = Alignment::of<1>();
+    m.dataItems.push_back(std::move(d));
+
+    ASSERT_EQ(m.dataItems.size(), 1u);
+    EXPECT_EQ(m.dataItems[0].symbol, SymbolId{77});
+    EXPECT_EQ(m.dataItems[0].section, DataSectionKind::Rodata);
+    EXPECT_EQ(m.dataItems[0].bytes.size(), 7u);
+    EXPECT_EQ(m.dataItems[0].bytes.back(), '\0')
+        << "C-string nul terminator must round-trip verbatim";
+}
+
+// D-LK2-RODATA CLOSED 2026-06-02: PE walker emits `.rdata`. The
+// FLIP-MARKER for PE is now NE(nullptr) — the format JSON declares
+// the row. ELF (D-LK1-RODATA) and Mach-O (D-LK3-RODATA) remain
+// anchored; their assertions stay EQ(nullptr) until the matching
+// walker arm closes.
+TEST(AsmSubstrate, ShippedExecFormatsRodataSectionPerWalkerArm) {
+    // PE: walker arm CLOSED — must declare the row.
+    {
+        auto fmt = ObjectFormatSchema::loadShipped(
+            "pe64-x86_64-windows-exec");
+        ASSERT_TRUE(fmt.has_value());
+        EXPECT_NE((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
+            << "pe64-x86_64-windows-exec: D-LK2-RODATA closed — the "
+               "format JSON must declare a `.rdata` (Rodata) section "
+               "row that the walker reads at emit time. If this fails, "
+               "the JSON row was removed without re-anchoring the "
+               "walker arm.";
+    }
+    // ELF + Mach-O: walker arms still anchored (D-LK1-RODATA /
+    // D-LK3-RODATA) — must NOT yet declare the row. When the walker
+    // arm closes, flip the corresponding EQ to NE.
+    for (auto const* formatName : {
+             "elf64-x86_64-linux-exec",
+             "macho64-x86_64-darwin-exec"}) {
+        auto fmt = ObjectFormatSchema::loadShipped(formatName);
+        ASSERT_TRUE(fmt.has_value()) << formatName;
+        EXPECT_EQ((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
+            << formatName
+            << " declares a rodata section row — the matching walker "
+               "arm (D-LK1-RODATA for ELF / D-LK3-RODATA for Mach-O) "
+               "must land in the SAME slice; flip this assertion from "
+               "EQ(nullptr) to NE(nullptr) when that closes.";
+    }
+}
+
+// D-LK4-RODATA-BSS-INVARIANT (closed by validateAssembledData):
+// Bss + non-empty bytes is a substrate-shape violation. Bss is
+// zero-fill — the wire format reserves `sh_size` without storing
+// bytes; a producer that wrote bytes into a Bss item would either
+// silently embed them (defeating BSS's no-file-footprint property)
+// or silently drop them. `validateAssembledData()` rejects this
+// loud with `K_NoMatchingObjectFormat`.
+TEST(AsmSubstrate, ValidateAssembledDataRejectsBssWithNonEmptyBytes) {
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Bss;
+    d.bytes   = {0xAAu, 0xBBu};  // semantic contradiction
+    DiagnosticReporter rep;
+    EXPECT_FALSE(validateAssembledData(
+        std::span<AssembledData const>{&d, 1}, rep));
+    // Pin the EXACT diagnostic code — silent-failure F-4 fold:
+    // loose `EXPECT_GT(errorCount, 0)` would silently pass even if
+    // the wrong diagnostic fired (e.g. `K_NoMatchingObjectFormat`
+    // before the K_BssDataHasBytes split landed).
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::K_BssDataHasBytes),
+              1u)
+        << "validateAssembledData must emit exactly one "
+           "K_BssDataHasBytes when Bss carries bytes";
+}
+
+TEST(AsmSubstrate, ValidateAssembledDataAcceptsBssWithEmptyBytes) {
+    // The Bss-without-bytes case is the well-formed shape — a
+    // zero-fill reservation. Validate must accept it.
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Bss;
+    // bytes intentionally empty
+    DiagnosticReporter rep;
+    EXPECT_TRUE(validateAssembledData(
+        std::span<AssembledData const>{&d, 1}, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(AsmSubstrate, ValidateAssembledDataRejectsDuplicateSymbolIds) {
+    // Two items sharing the same non-sentinel SymbolId would
+    // silently let "whichever the linker processed last" win
+    // the symbol→VA resolution. validate() rejects loud.
+    AssembledData a;
+    a.symbol = SymbolId{77};
+    a.bytes  = {'a'};
+    AssembledData b;
+    b.symbol = SymbolId{77};  // duplicate
+    b.bytes  = {'b'};
+    std::array<AssembledData, 2> items{a, b};
+    DiagnosticReporter rep;
+    EXPECT_FALSE(validateAssembledData(items, rep));
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::K_DuplicateDataSymbol),
+              1u)
+        << "exactly one K_DuplicateDataSymbol — silent-failure F-4 "
+           "fold tightens loose EXPECT_GT for the dup arm";
+}
+
+TEST(AsmSubstrate, ValidateAssembledDataAcceptsMultipleAnonymousItems) {
+    // The sentinel `SymbolId{}` (.v == 0) is the "anonymous data"
+    // marker — multiple anonymous items are legitimate (e.g.
+    // multiple read-only padding constants with no individual
+    // identity).
+    AssembledData a;
+    a.bytes = {'a'};
+    AssembledData b;
+    b.bytes = {'b'};
+    std::array<AssembledData, 2> items{a, b};
+    DiagnosticReporter rep;
+    EXPECT_TRUE(validateAssembledData(items, rep))
+        << "sentinel SymbolId{} is exempt from duplicate-check — "
+           "anonymous items have no identity to clash";
+}
+
+TEST(AsmSubstrate, AlignmentNewtypeRejectsZero) {
+    // D-LK4-RODATA-WIDE-ALIGNMENT-NEWTYPE: structural rejection
+    // of zero / non-power-of-two alignments at construction time.
+    EXPECT_FALSE(Alignment::fromBytes(0).has_value());
+    EXPECT_FALSE(Alignment::fromBytes(3).has_value());  // not pow2
+    EXPECT_FALSE(Alignment::fromBytes(7).has_value());  // not pow2
+    EXPECT_FALSE(Alignment::fromBytes(257).has_value());  // > 256
+    EXPECT_TRUE(Alignment::fromBytes(1).has_value());
+    EXPECT_TRUE(Alignment::fromBytes(8).has_value());
+    EXPECT_TRUE(Alignment::fromBytes(16).has_value());
+    EXPECT_TRUE(Alignment::fromBytes(256).has_value());
+    EXPECT_EQ(Alignment::of<16>().bytes(), 16u);
+    EXPECT_EQ(Alignment::of<16>().log2(), 4u);
+    // alignUp kernel: rounding via the newtype matches the
+    // canonical formula `(n + a - 1) & ~(a - 1)`.
+    EXPECT_EQ(Alignment::of<16>().alignUp(0u),  0u);
+    EXPECT_EQ(Alignment::of<16>().alignUp(1u),  16u);
+    EXPECT_EQ(Alignment::of<16>().alignUp(15u), 16u);
+    EXPECT_EQ(Alignment::of<16>().alignUp(16u), 16u);
+    EXPECT_EQ(Alignment::of<16>().alignUp(17u), 32u);
+}
+
+TEST(AsmSubstrate, DataSectionKindNarrowAdmitsOnlyDataSections) {
+    // D-LK4-RODATA-SECTION-NARROW: the conversion from the wider
+    // SectionKind to DataSectionKind is partial — only the 3
+    // producer-emittable kinds (Rodata, Data, Bss) round-trip.
+    // The 9 walker-synthesized kinds map to nullopt.
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Rodata),
+              DataSectionKind::Rodata);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Data),
+              DataSectionKind::Data);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Bss),
+              DataSectionKind::Bss);
+    // Walker-synthesized kinds — nullopt:
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Text),       std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Symtab),     std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Strtab),     std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::ShStrtab),   std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::RelocTable), std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Dynamic),    std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Note),       std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Debug),      std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Custom),     std::nullopt);
+    // toSectionKind is total — every DataSectionKind maps:
+    EXPECT_EQ(toSectionKind(DataSectionKind::Rodata),
+              SectionKind::Rodata);
+    EXPECT_EQ(toSectionKind(DataSectionKind::Data),
+              SectionKind::Data);
+    EXPECT_EQ(toSectionKind(DataSectionKind::Bss),
+              SectionKind::Bss);
+}
+
+// Cross-tier canary (test-analyzer MEDIUM-7 fold): the SectionKind
+// extract's load-bearing rationale is "asm-tier consumers can
+// speak the vocabulary without dragging in link/...". If a future
+// refactor accidentally relocated `SectionKind` back into the
+// link tier, this test file (which only includes asm/asm.hpp at
+// the top of the source) would still compile against the
+// transitive include chain — silently re-coupling tiers. Pin
+// the constant at the asm-tier surface so a `static_assert` on
+// the enum value documents the contract: any reshuffle that
+// changes Rodata's underlying value (or moves the enum) would
+// fail compilation here.
+static_assert(static_cast<int>(SectionKind::Rodata) == 1,
+              "D-LK4-RODATA-SUBSTRATE cross-tier vocabulary canary: "
+              "SectionKind::Rodata must remain at value 1 and "
+              "reachable through asm/asm.hpp's include chain. If "
+              "this fails, the SectionKind extract regressed.");
+
+TEST(AsmSubstrate, AssembleProducesEmptyDataItemsByDefault) {
+    // The current `assemble()` produces `dataItems`-empty modules:
+    // there is no MIR/LIR → data producer yet. The field is reserved
+    // for the future producer (HIR→MIR string-literal promotion).
+    // This pin proves the substrate doesn't accidentally introduce
+    // spurious items when none are configured upstream.
+    Lir empty{};
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    DiagnosticReporter rep;
+    auto result = assemble(empty, **schema, {}, rep);
+    EXPECT_TRUE(result.dataItems.empty())
+        << "assemble() must not synthesize unsolicited data items "
+           "— the producer thread-through is anchored for a follow-"
+           "up cycle";
+}
+
+TEST(AsmSubstrate, DefaultExternsSpanProducesEmptyExternImports) {
+    // Backward compatibility: the 4-argument call site continues
+    // to produce an empty `externImports` vector. Every existing
+    // cycle-2a/2b/2c test path is unchanged.
+    Lir empty{};
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    DiagnosticReporter rep;
+    auto result = assemble(empty, **schema, {}, rep);
+    EXPECT_TRUE(result.externImports.empty());
 }
 
 TEST(AsmSubstrate, ForFuncByIndexOutOfRangeReturnsNullptr) {
@@ -234,8 +527,8 @@ TEST(TargetSchemaRelocations, JsonRoundTripsThroughAccessors) {
             { "mnemonic": "invalid", "result": "none" }
         ],
         "relocations": [
-            { "name": "rel32",  "kind": 1, "formula": "S + A - P - 4" },
-            { "name": "abs64",  "kind": 2, "formula": "S + A"         }
+            { "name": "rel32",  "kind": 1, "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },
+            { "name": "abs64",  "kind": 2, "pcRelative": false, "addendBias":  0, "widthBytes": 8 }
         ]
     })";
     auto schema = TargetSchema::loadFromText(kJson, "synth.target.json");
@@ -245,7 +538,9 @@ TEST(TargetSchemaRelocations, JsonRoundTripsThroughAccessors) {
     auto const* rel32 = (*schema)->relocationByName("rel32");
     ASSERT_NE(rel32, nullptr);
     EXPECT_EQ(rel32->kind, RelocationKind{1});
-    EXPECT_EQ(rel32->formula, "S + A - P - 4");
+    EXPECT_TRUE(rel32->pcRelative);
+    EXPECT_EQ(rel32->addendBias, -4);
+    EXPECT_EQ(rel32->widthBytes, 4);
 
     auto const* abs64 = (*schema)->relocationByName("abs64");
     ASSERT_NE(abs64, nullptr);

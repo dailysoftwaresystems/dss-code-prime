@@ -260,6 +260,89 @@ struct DSS_EXPORT TargetCallingConvention {
     std::uint16_t shadowSpaceBytes = 0;   // MS x64: 32 bytes of home space; SysV: 0
     std::uint16_t redZoneBytes     = 0;   // SysV leaf-fn red zone (128); MS x64: 0
 
+    // RSP-bias mod `stackAlignment` at the START of a function that
+    // serves as the PROCESS ENTRY POINT (D-LK10-ENTRY-TRAMP-PROLOGUE).
+    // This is the single new piece of vocabulary that closes the
+    // trampoline ABI-prologue without storing a derived constant:
+    // the bias, together with `stackAlignment` and `shadowSpaceBytes`
+    // already on this struct, determines the smallest `sub sp, N`
+    // the trampoline must emit. Algorithm lives in `lir_callconv.hpp`'s
+    // `alignedSizeWithBias()` so ML7 and the trampoline call ONE
+    // formula.
+    //
+    // Concrete values (encode the OS-loader convention for the entry
+    // cc):
+    //   * `ms_x64`     (Windows PE):   8  — `RtlUserThreadStart` does
+    //                                       a CALL into the entry
+    //                                       point, so the first
+    //                                       instruction sees RSP ≡ 8
+    //                                       mod 16.
+    //   * `sysv_amd64` (Linux ELF /    0  — kernel maps the image and
+    //                  macOS Mach-O):       JUMPS to `_start`/`main`
+    //                                       with RSP 16-byte-aligned
+    //                                       and NO return address
+    //                                       pushed.
+    //   * `aapcs64`    (Linux/Win/Mac  0  — ARM64 BL doesn't push,
+    //                  ARM64):              and the kernel sets SP
+    //                                       aligned at process entry.
+    //
+    // This field is consumed ONLY by the trampoline emitter (the
+    // entry-cc-of-the-program scenario). Normal-function frames
+    // computed by ML7 use the function-entry bias (= the cc's
+    // post-CALL RSP offset, typically equal to `callInstructionPush
+    // Bytes mod stackAlignment` = 8 for x86_64 / 0 for ARM64) — that
+    // bias is NOT this field. Wiring ML7 onto this field is anchored
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY for when normal-function call-
+    // site shadow-space lands (separately tracked; not the
+    // trampoline's concern).
+    //
+    // Validators (target_schema.cpp::validate): MUST be 0 if the cc
+    // has all other stack fields at 0; otherwise MUST be <
+    // `stackAlignment`.
+    std::uint16_t entryStackPointerBias = 0;
+
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: byte count the architecture's
+    // `call` instruction PUSHES onto the stack (the return-address
+    // word). RSP delta at function entry FROM A CALLER, BEFORE the
+    // callee's prologue runs. Distinct from `entryStackPointerBias`
+    // above:
+    //
+    //   * `entryStackPointerBias`: RSP delta at PROCESS-ENTRY (the
+    //     kernel/loader's transition). OS-dependent (Win64 = 8 because
+    //     RtlUserThreadStart issues a CALL; SysV ELF/Mach-O = 0 because
+    //     the kernel JUMPs to `_start`).
+    //   * `callPushBytes`: RSP delta at NORMAL-CALL-ENTRY (the
+    //     in-program CALL instruction's push). ISA-dependent only
+    //     (x86_64 = 8 — `call` pushes a 64-bit return address;
+    //     ARM64 = 0 — `bl` writes LR, no stack push).
+    //
+    // The two fields COINCIDE on Win64 (both = 8) because Windows uses
+    // a CALL-style entry transition; they DIVERGE on Linux x86_64
+    // (entry = 0 via JMP, normal call = 8 via CALL push). Putting the
+    // facts in two distinct fields named for their distinct triggers
+    // prevents a future maintainer from "deduping" them on Win64 and
+    // silently breaking Linux x86_64.
+    //
+    // Consumed by ML7 `computeFrameLayout` for non-leaf functions: the
+    // function's prologue must (a) reserve `shadowSpaceBytes` for any
+    // call it makes AND (b) end at an RSP value that satisfies the
+    // callee's alignment expectation, which means the prologue's
+    // `sub sp, N` must satisfy `N ≡ callPushBytes (mod stackAlignment)`
+    // so that after our entry's `callPushBytes` and our `sub`, RSP is
+    // `(0 - callPushBytes - N) mod alignment = 0` at the next call
+    // site. The formula is the same `alignedSizeWithBias` used by the
+    // trampoline emitter — one helper, two distinct bias inputs.
+    //
+    // Validators: MUST be strictly < `stackAlignment` (the bias is an
+    // OFFSET into the alignment quantum — parallel to
+    // entryStackPointerBias's contract); MUST be 0 when no ABI info
+    // is declared (consistent with entryStackPointerBias's
+    // "zero-when-cc-is-empty" rule). In practice the call instruction
+    // pushes a multiple of pointer-width bytes, but the validator
+    // expresses the alignment-quantum invariant rather than the
+    // implementation detail.
+    std::uint16_t callPushBytes = 0;
+
     // Named register reference. Used for distinguished-role registers
     // (link register, stack pointer, frame pointer in future cycles).
     // The struct shape co-locates the JSON-side `name` (kept for
@@ -344,12 +427,23 @@ enum class OperandKindFilter : std::uint8_t {
                     // Global-address load/store forms (x86 RIP-relative
                     // mov, ARM64 ADRP+ADD pair) join with their
                     // consumer cycle (plan 13 §3.1 D-AS4-1 / D-AS4-2).
+    MemBase   = 3,  // `LirOperand{kind == MemBase}` — carries the scale
+                    // factor for base+index*scale addressing. Cycle 2's
+                    // load/store/lea walkers consume this for shape
+                    // validation only (scale==1 in v1; D-AS4-1 anchors
+                    // index+scale support).
+    MemOffset = 4,  // `LirOperand{kind == MemOffset}` — carries the
+                    // signed 32-bit displacement for [base+disp]
+                    // addressing. Wired to `Disp32Mem` to emit 4 LE
+                    // bytes after the ModR/M (and SIB when present).
 };
 
-inline constexpr EnumNameTable<OperandKindFilter, 3> kOperandKindFilterTable{{{
-    { OperandKindFilter::Reg,       "reg"    },
-    { OperandKindFilter::ImmInt,    "imm32"  },  // JSON-side width label
-    { OperandKindFilter::SymbolRef, "symbol" },
+inline constexpr EnumNameTable<OperandKindFilter, 5> kOperandKindFilterTable{{{
+    { OperandKindFilter::Reg,       "reg"      },
+    { OperandKindFilter::ImmInt,    "imm32"    },  // JSON-side width label
+    { OperandKindFilter::SymbolRef, "symbol"   },
+    { OperandKindFilter::MemBase,   "membase"  },
+    { OperandKindFilter::MemOffset, "memoffset"},
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -404,20 +498,75 @@ enum class EncodingSlotKind : std::uint8_t {
     // 13 §3.1 D-AS4-4.)
     Disp32   = 6,  // x86 PC-relative 32-bit displacement (e.g. `call rel32`)
     Imm26    = 7,  // ARM64 26-bit branch offset / 4 (e.g. `bl imm26`)
+    // ── x86 memory-addressing slots (plan 13 §3.1 D-AS4-1) ──────────
+    //
+    // Closes the load/store/lea byte-encoding gap for `[base + disp32]`
+    // addressing. The trio MemBaseScale + ModRmRmMem + Disp32Mem
+    // models the LIR shape `<base_reg> <MemBase(scale)> <MemOffset(disp)>`:
+    //
+    //   ModRmRmMem    — operand is a base Reg; writes ModR/M.rm with
+    //                   mod = 10 (memory + 32-bit disp) and forces a
+    //                   SIB byte when base.lo3 == 4 (the x86-64 rule
+    //                   for rsp/r12). REX.B from base hwEncoding bit 3
+    //                   as usual.
+    //   MemBaseScale  — operand is a MemBase; defense-in-depth shape
+    //                   check (cycle scope: scale == 1 only). Future
+    //                   `[base + index*scale]` would re-use this slot
+    //                   with a paired SibIndex.
+    //   Disp32Mem     — operand is a MemOffset; emits 4 LE bytes of
+    //                   the offset field after ModR/M (and SIB when
+    //                   present). Distinct from `Disp32` which is
+    //                   symbol-relative; `Disp32Mem` is an immediate
+    //                   memory displacement.
+    ModRmRmMem    = 8,
+    MemBaseScale  = 9,
+    Disp32Mem     = 10,
+    // D-AS4-5 closure (2026-06-01): SIB.index field (bits 3..5 of
+    // the SIB byte). Wires an index register's hwEncoding low 3
+    // bits into SIB.index and the high bit into REX.X (the AS2
+    // pre-declared `rexX` field is finally consumed here). Paired
+    // with `MemBaseScale` (which now also supplies the 2-bit scale
+    // exponent for SIB.scale bits 6..7).
+    //
+    // Schema variant guard adds `Reg` between the base `Reg` and
+    // `MemBase` for the with-index shape:
+    //   3-op no-index: [base, MemBase(scale=1), MemOffset(disp)]
+    //   4-op indexed:  [base, index, MemBase(scale∈{1,2,4,8}), MemOffset(disp)]
+    // The walker dispatches on the presence of `SibIndex` wiring to
+    // emit the SIB byte unconditionally (separate from the rsp/r12
+    // force-presence rule that fires today on no-index addressing).
+    SibIndex      = 11,
+    // RIP-relative 32-bit displacement (D-LK4-RODATA-PRODUCER
+    // 2026-06-02). Symbol-bearing slot like `Disp32`, but the
+    // encoder additionally forces ModR/M to the RIP-relative
+    // form: mod=00 reg=destination rm=101 (no SIB byte, no base
+    // register operand). Used by the new `lea r64, [rip + sym]`
+    // variant that materializes a module-level global's address
+    // into a register. Pairs with `relocationKind: "rel32"`.
+    //
+    // The encoder emits the 4-byte placeholder + Relocation at
+    // the trailing byte position (same byte-emit pattern as
+    // `Disp32`); the only difference is the forced ModR/M state.
+    RipRelDisp32  = 12,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
     //   ImmShift / Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 8> kEncodingSlotKindTable{{{
-    { EncodingSlotKind::ModRmReg, "modrm.reg" },
-    { EncodingSlotKind::ModRmRm,  "modrm.rm"  },
-    { EncodingSlotKind::Imm32,    "imm32"     },
-    { EncodingSlotKind::Rd,       "rd"        },
-    { EncodingSlotKind::Rn,       "rn"        },
-    { EncodingSlotKind::Rm,       "rm"        },
-    { EncodingSlotKind::Disp32,   "disp32"    },
-    { EncodingSlotKind::Imm26,    "imm26"     },
+inline constexpr EnumNameTable<EncodingSlotKind, 13> kEncodingSlotKindTable{{{
+    { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
+    { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
+    { EncodingSlotKind::Imm32,        "imm32"         },
+    { EncodingSlotKind::Rd,           "rd"            },
+    { EncodingSlotKind::Rn,           "rn"            },
+    { EncodingSlotKind::Rm,           "rm"            },
+    { EncodingSlotKind::Disp32,       "disp32"        },
+    { EncodingSlotKind::Imm26,        "imm26"         },
+    { EncodingSlotKind::ModRmRmMem,   "modrm.rm.mem"  },
+    { EncodingSlotKind::MemBaseScale, "membase.scale" },
+    { EncodingSlotKind::Disp32Mem,    "disp32.mem"    },
+    { EncodingSlotKind::SibIndex,     "sib.index"     },
+    { EncodingSlotKind::RipRelDisp32, "riprel.disp32" },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -436,7 +585,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 8,
+static_assert(kEncodingSlotKindCount == 13,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -455,6 +604,11 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Disp32:
+        case EncodingSlotKind::ModRmRmMem:
+        case EncodingSlotKind::MemBaseScale:
+        case EncodingSlotKind::Disp32Mem:
+        case EncodingSlotKind::SibIndex:
+        case EncodingSlotKind::RipRelDisp32:
             return TargetEncodingShape::X86Variable;
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
@@ -533,6 +687,7 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
     switch (s) {
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::Imm26:
+        case EncodingSlotKind::RipRelDisp32:
             return true;
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
@@ -540,6 +695,17 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::ModRmRmMem:
+        case EncodingSlotKind::MemBaseScale:
+        case EncodingSlotKind::Disp32Mem:
+        case EncodingSlotKind::SibIndex:
+            // D-AS4-1 / D-AS4-5 memory-addressing slots write immediate
+            // displacements / register encodings (not symbol-relative).
+            // The companion symbol-bearing slot for RIP-relative `lea`
+            // is `RipRelDisp32` above; it's distinct because it forces
+            // the ModR/M state (mod=00 rm=101) in addition to the
+            // disp32 patch site, where Disp32 alone (e.g. `call rel32`)
+            // has no associated ModR/M byte.
             return false;
     }
     return false;
@@ -611,20 +777,231 @@ struct DSS_EXPORT TargetEncodingInfo {
 // bucket-1 reloc taxonomy facet). Each row defines an opaque
 // `uint32_t kind` tag whose meaning is the row itself — the assembler
 // writes the tag onto `Relocation::kind`; the linker (plan 14) reads
-// it via `schema.relocationInfo(kind)` to resolve the formula. The
-// `formula` is documentation for humans (and future debug tooling) —
-// the substrate treats it as opaque text.
+// it via `schema.relocationInfo(kind)` to resolve the formula.
 //
 // `kind` slot-0 is reserved as an invalid sentinel: every declared
 // row MUST carry a `kind != 0` (loader-enforced). Two rows with the
 // same `kind` are also rejected.
+//
+// **Formula dispatch (D-LK6-1 closure — LK10 cycle 3 post-fold #2
+// sibling cycle, 2026-06-01):** every relocation row carries a
+// `formulaKind: RelocFormulaKind` closed-enum discriminator. The
+// linker (`applyExecRelocations` in `link/format/exec_reloc_apply.hpp`)
+// dispatches ONCE on this enum to compute the patch and write it. The
+// JSON-side `formula` key is **load-bearing** — it accepts exactly the
+// string set declared by `parseRelocFormulaKind`.
+//
+//   * `Linear` covers x86_64 rel32 / abs32 / abs64 + ARM64 abs64:
+//       value = S + A + (pcRel ? -P : 0) + addendBias
+//       written `widthBytes` LE at the patch site. The structured
+//       triple (`pcRelative`, `addendBias`, `widthBytes`) parameterises
+//       the formula.
+//   * `Aarch64Call26` / `Aarch64AdrPrelPgHi21` / `Aarch64AddAbsLo12`
+//       encode bit-shift / bitfield-insert ARM64 formulas — see the
+//       per-variant comments on `RelocFormulaKind` below.
+//
+// Coherence rules (enforced at JSON load + `validate()`):
+//   (a) `widthBytes != 0` ⇒ `widthBytes ∈ {4, 8}`.
+//   (b) Linear, `pcRelative || addendBias != 0` ⇒ `widthBytes != 0`.
+//   (c) Linear, `addendBias != 0` ⇒ `pcRelative` (no absolute-with-bias).
+//   (d) Linear, `widthBytes != 0` ⇒ `|addendBias|` fits signed in widthBytes.
+//   (e) `formulaKind != Linear` ⇒ `widthBytes == 4` (auto-defaulted by
+//       the JSON loader), `pcRelative == false`, `addendBias == 0`
+//       (the variant fully encodes the formula).
+// Rule (e) is what makes the wide-product struct safe: every non-Linear
+// row leaves the Linear sub-triple at default; the kernel ignores them.
+// A `std::variant<LinearReloc, Aarch64Call26, ...>` would make this
+// type-encoded but the three ARM64 variants are stateless tag types
+// (the bit layout lives in code, not on the row), so the variant
+// reshape gives little. Anchored D-LK6-17 — fold when RISC-V's first
+// reloc kind lands (next ISA likely to add a 5th formula class).
+
+// Closed-enum tagged variant — D-LK6-1 closure (plan 14 §3.1, 2026-06-01).
+// Each variant names a concrete relocation-formula class with a fixed
+// bit-layout + shift policy. The kernel dispatches once on this
+// discriminator in `applyExecRelocations` and applies the named formula.
+//
+// Adding a new target's reloc kind (RISC-V, MIPS, etc.) = add a new
+// variant + one switch arm in the kernel. JSON-side: declare the new
+// name string. NO target-name branching in the kernel — the formula
+// class is a property of the target's `*.target.json`, not the kernel.
+//
+// **Source / target / linker agnostic**: the discriminator is on
+// `TargetSchema`; ELF / PE / Mach-O walkers reuse the kernel verbatim.
+// HIR / MIR / LIR see opaque `Relocation::kind` values — they never
+// inspect `formulaKind`.
+enum class RelocFormulaKind : std::uint8_t {
+    // value = S + A + (pcRel ? -P : 0) + addendBias  — write widthBytes LE
+    // bytes. Covers x86_64 rel32 / abs32 / abs64 + ARM64 abs64.
+    Linear                = 0,
+    // ARM64 R_AARCH64_CALL26 / R_AARCH64_JUMP26:
+    //   value = (S + A - P) >> 2
+    //   range-check signed 26-bit; OR (value & 0x03FFFFFF) into the
+    //   ARM64 instruction word's bits[25:0] (BL / B target).
+    Aarch64Call26         = 1,
+    // ARM64 R_AARCH64_ADR_PREL_PG_HI21:
+    //   value = ((S + A) >> 12) - (P >> 12)
+    //   range-check signed 21-bit; ADRP-style split: bits[1:0] of value
+    //   → instruction immlo[30:29]; bits[20:2] → immhi[23:5].
+    Aarch64AdrPrelPgHi21  = 2,
+    // ARM64 R_AARCH64_ADD_ABS_LO12_NC (and LDST equivalents):
+    //   value = (S + A) & 0xFFF
+    //   range-check S+A ∈ [0, UINT32_MAX] (kernel rejects negative or
+    //   out-of-32-bit values — the paired ADRP companion can only
+    //   compute pages within the 32-bit space without an additional
+    //   high-bit reloc); OR (value << 10) into ADD imm12 [21:10].
+    Aarch64AddAbsLo12     = 3,
+};
+
+// Single source of truth — `relocFormulaName` + `parseRelocFormulaKind`
+// + `acceptedRelocFormulaList` all iterate this table. Adding a new
+// variant = add a row here + add the enum entry. The `static_assert`
+// on size catches forgetting one half. (architect + type-design
+// 4-agent convergence at post-fold #2 — was previously 3 independent
+// hand-rolled enumerations, DRY hazard waiting for the 5th variant.)
+inline constexpr EnumNameTable<RelocFormulaKind, 4> kRelocFormulaTable{{{
+    { RelocFormulaKind::Linear,               "linear" },
+    { RelocFormulaKind::Aarch64Call26,        "aarch64_call26" },
+    { RelocFormulaKind::Aarch64AdrPrelPgHi21, "aarch64_adr_prel_pg_hi21" },
+    { RelocFormulaKind::Aarch64AddAbsLo12,    "aarch64_add_abs_lo12" },
+}}};
+
+[[nodiscard]] DSS_EXPORT std::string_view
+    relocFormulaName(RelocFormulaKind k) noexcept;
+
+// ── D-LK10-ENTRY: ProcessExit substrate (plan 14 §2.13 Slice B) ────
+//
+// Vocabulary types for the runnable-binary spine's process-exit
+// mechanism. The FIELD lives on `ObjectFormatData` (not
+// `TargetSchemaData`) because the mechanism + syscall number +
+// import library are per-OS data, and format JSONs are already
+// keyed per CPU × OS. These types live here in `target_schema.hpp`
+// alongside the other closed-enum vocabulary (RelocFormulaKind,
+// TargetCondCode, TargetAbiModel, ...) — the vocabulary is shared
+// between target + format schema layers even though the field is
+// format-side. The trampoline emitter (Slice C) reads the field
+// via `formatSchema.processExit()` and dispatches on
+// `ExitMechanism` (closed-enum, no `if (os == ...)` branches).
+//
+//   * `Syscall`        — raw kernel transition (Linux `exit_group`,
+//                        macOS BSD `exit`). Per-OS data: syscall
+//                        number, syscall-num register name, syscall
+//                        opcode bytes.
+//   * `ByNameImport`   — call through an extern-import IAT slot
+//                        (Windows `kernel32!ExitProcess`, future
+//                        macOS libSystem). Per-OS data: library
+//                        path, mangled name.
+//   * `None`           — default-constructed sentinel. "No
+//                        mechanism" is encoded by the field type
+//                        itself (`optional<ProcessExit>` empty),
+//                        NOT by `None` appearing in a validated
+//                        ProcessExit. The JSON loader explicitly
+//                        rejects `mechanism="none"` so the
+//                        sentinel cannot leak into a validated
+//                        schema.
+enum class ExitMechanism : std::uint8_t {
+    None         = 0,  // default-constructed zero; loader rejects "none"
+    Syscall      = 1,  // raw syscall (Linux exit_group / Mach-O BSD exit)
+    ByNameImport = 2,  // call qword ptr [iat] (Windows ExitProcess)
+};
+
+inline constexpr EnumNameTable<ExitMechanism, 3> kExitMechanismTable{{{
+    { ExitMechanism::None,         "none"           },
+    { ExitMechanism::Syscall,      "syscall"        },
+    { ExitMechanism::ByNameImport, "by-name-import" },
+}}};
+
+[[nodiscard]] constexpr std::string_view exitMechanismName(ExitMechanism m) noexcept {
+    return kExitMechanismTable.name(m);
+}
+[[nodiscard]] constexpr std::optional<ExitMechanism>
+exitMechanismFromName(std::string_view s) noexcept {
+    return kExitMechanismTable.fromName(s);
+}
+
+// Per-OS process-exit descriptor. Lives on `ObjectFormatData`
+// (loaded from format JSON's `processExit` block). The trampoline
+// emitter (Slice C) reads the active arm based on `mechanism`:
+//
+// For Syscall (Linux / macOS-BSD-syscall):
+//   * `syscallNumber`      — syscall-table index (Linux x86_64
+//                            exit_group = 231; ARM64 Linux = 94;
+//                            macOS BSD exit = 0x2000001).
+//   * `syscallNumGpr`      — register that holds the syscall number
+//                            at the syscall transition ("rax" on
+//                            x86_64; "x8" on ARM64).
+//   * `syscallOpcodeBytes` — instruction bytes in STORED ORDER
+//                            (memory-layout order, NOT disassembler
+//                            display order). x86_64 SYSCALL byte
+//                            stream = [0x0F, 0x05]. ARM64 SVC #0
+//                            instruction word = 0xD4000001; in
+//                            ARM64's little-endian memory layout
+//                            this stores as [0x01, 0x00, 0x00, 0xD4]
+//                            — that's what the JSON declares + what
+//                            the emitter writes verbatim. NOT used
+//                            by Slice C's LIR-driven emitter today
+//                            (the Slice A `syscall` LIR opcode emits
+//                            these bytes through the assembler) —
+//                            retained on the substrate as an escape
+//                            hatch for future kernels whose syscall
+//                            instruction differs from the LIR
+//                            opcode's lowering (e.g. legacy BSD
+//                            `int 0x80`) without requiring a new
+//                            LIR opcode.
+//
+// For ByNameImport (Windows / macOS-libSystem):
+//   * `importLibraryPath`  — DLL/dylib path ("kernel32.dll" on
+//                            Windows; future "/usr/lib/libSystem.B
+//                            .dylib" on macOS).
+//   * `importMangledName`  — on-binary symbol name ("ExitProcess"
+//                            on Windows; "_exit" with leading
+//                            underscore via D-FF4 on macOS).
+//
+// The `statusArgGpr` is intentionally NOT a field — it's read from
+// the format's `entryCallingConvention.argGprs[0]` (preserves
+// single source of truth for the calling-convention register
+// vocabulary).
+struct DSS_EXPORT ProcessExit {
+    ExitMechanism mechanism = ExitMechanism::None;
+
+    // Syscall arm
+    std::uint32_t            syscallNumber     = 0;
+    std::string              syscallNumGpr;
+    std::vector<std::uint8_t> syscallOpcodeBytes;
+
+    // ByNameImport arm
+    std::string importLibraryPath;
+    std::string importMangledName;
+};
+
+[[nodiscard]] DSS_EXPORT std::optional<RelocFormulaKind>
+    parseRelocFormulaKind(std::string_view s) noexcept;
+
+// Comma-separated quoted list of accepted formula-discriminator
+// strings — used by the JSON loader's error messages. Driven from
+// `kRelocFormulaTable` so the accepted set never lags the enum.
+[[nodiscard]] DSS_EXPORT std::string acceptedRelocFormulaList();
+
 struct DSS_EXPORT TargetRelocationInfo {
-    std::string    name;            // canonical text key (e.g. "rel32", "abs64")
-    RelocationKind kind{};          // opaque tag — written into Relocation::kind;
-                                    // values flow ONLY from this field + the
-                                    // schema's `relocationInfo`/`relocationByName`
-                                    // accessors, never assembler-fabricated.
-    std::string    formula;         // human-readable formula (e.g. "S + A - P - 4")
+    std::string      name;            // canonical text key (e.g. "rel32", "abs64")
+    RelocationKind   kind{};          // opaque tag — written into Relocation::kind;
+                                      // values flow ONLY from this field + the
+                                      // schema's `relocationInfo`/`relocationByName`
+                                      // accessors, never assembler-fabricated.
+    RelocFormulaKind formulaKind = RelocFormulaKind::Linear; // D-LK6-1 closure
+    bool         pcRelative  = false;  // Linear only: include `-P` (PC-relative)
+    std::int32_t addendBias  = 0;      // Linear only: implicit constant bias
+                                       // (e.g. -4 for x86 rel32 to
+                                       // skip past the 4-byte
+                                       // displacement field)
+    std::uint8_t widthBytes  = 0;      // Linear: 4 / 8 — bytes to write
+                                       // at the patch site. 0 reaches
+                                       // only via legacy / malformed
+                                       // JSON (kernel rejects with
+                                       // K_RelocationKindMismatch).
+                                       // Non-Linear: always 4 (ARM64
+                                       // instruction word; auto-defaulted
+                                       // by the JSON loader if absent).
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode

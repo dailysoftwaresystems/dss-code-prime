@@ -1,0 +1,95 @@
+{
+  "$comment": "ELF64 relocatable + dynamic for AArch64 (Linux / SysV). Ships at the D-LK6-1 sibling cycle (2026-06-01) — the closed-enum RelocFormulaKind reshape unblocked ARM64 reloc formula application. Consumed by `src/link/format/elf.cpp` via the format-blind linker engine. Section names + flags + ELF identity fields are the SAME values readelf prints; relocation `nativeId` values are the ELF type numbers stored in `r_info` low 32 bits (per the AArch64 ELF ABI, https://github.com/ARM-software/abi-aa).",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "elf64-aarch64-linux",
+    "version": "1.0",
+    "kind": "elf"
+  },
+
+  "elf": {
+    "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian — AArch64 is little-endian by convention on Linux); `osabi` = ELFOSABI_NONE (SysV); `machine` = EM_AARCH64 (183).",
+    "class": "elf64",
+    "data": "lsb",
+    "osabi": "sysv",
+    "abiVersion": 0,
+    "machine": 183
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code. sh_type = SHT_PROGBITS (1); sh_flags = SHF_ALLOC | SHF_EXECINSTR (0x6); addralign = 16 (cache-friendly; ARM64 instructions are 4-byte but section alignment is conventionally larger).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1,
+      "flags": 6,
+      "addrAlign": 16,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Relocation table for .text. sh_type = SHT_RELA (4); sh_flags = SHF_INFO_LINK (0x40); addralign = 8; entrysize = 24 (Elf64_Rela). sh_link/sh_info set per-link.",
+      "kind": "reloc",
+      "name": ".rela.text",
+      "type": 4,
+      "flags": 64,
+      "addrAlign": 8,
+      "entrySize": 24
+    },
+    {
+      "$comment": "Symbol table. sh_type = SHT_SYMTAB (2); addralign = 8; entrysize = 24 (Elf64_Sym).",
+      "kind": "symtab",
+      "name": ".symtab",
+      "type": 2,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 24
+    },
+    {
+      "$comment": "Symbol-name string table. sh_type = SHT_STRTAB (3); addralign = 1.",
+      "kind": "strtab",
+      "name": ".strtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Section-header string table. sh_type = SHT_STRTAB (3); addralign = 1.",
+      "kind": "shstrtab",
+      "name": ".shstrtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "26-bit PC-relative branch with link / branch (BL / B target). ELF type R_AARCH64_CALL26 = 283. `kind` = 1 matches arm64.target.json's `call26` row.",
+      "name": "R_AARCH64_CALL26",
+      "kind": 1,
+      "nativeId": 283
+    },
+    {
+      "$comment": "21-bit PC-relative page-pair (ADRP). ELF type R_AARCH64_ADR_PREL_PG_HI21 = 275. `kind` = 2 matches arm64.target.json's `adr_prel_pg_hi21` row.",
+      "name": "R_AARCH64_ADR_PREL_PG_HI21",
+      "kind": 2,
+      "nativeId": 275
+    },
+    {
+      "$comment": "12-bit absolute low (ADD imm12 / LDST imm12). ELF type R_AARCH64_ADD_ABS_LO12_NC = 277. `kind` = 3 matches arm64.target.json's `add_abs_lo12_nc` row.",
+      "name": "R_AARCH64_ADD_ABS_LO12_NC",
+      "kind": 3,
+      "nativeId": 277
+    },
+    {
+      "$comment": "Absolute 64-bit (data pointer). ELF type R_AARCH64_ABS64 = 257. `kind` = 4 matches arm64.target.json's `abs64` row.",
+      "name": "R_AARCH64_ABS64",
+      "kind": 4,
+      "nativeId": 257
+    }
+  ]
+}

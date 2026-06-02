@@ -5,14 +5,17 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <cstring>
 #include <format>
+#include <optional>
+#include <unordered_map>
 
 namespace dss {
 
 namespace {
 
 // Diagnostic-emit shorthand, same convention as ML6/ML7.
-using lir_pass_util::report;
+using dss::report;
 
 // Dispatch shell for a single LIR instruction's byte encoding. Cycle 1
 // substrate has no format walkers registered yet — every shape returns
@@ -136,8 +139,17 @@ using lir_pass_util::report;
 AssembledModule assemble(Lir const&                 lir,
                          TargetSchema const&        schema,
                          std::span<MirInstId const> lirToMir,
-                         DiagnosticReporter&        reporter) {
+                         DiagnosticReporter&        reporter,
+                         std::span<ExternImport const> externs) {
     AssembledModule result;
+    // Copy extern descriptors verbatim so the linker can consume
+    // them. The assembler itself does not validate the contents
+    // (per-extern non-empty `mangledName` + `libraryPath` checks
+    // live on the linker side); the upstream HIR→MIR pre-pass
+    // (`collectExterns` in `hir_to_mir.cpp`) is the canonical
+    // source of these rows when threading from real source
+    // declarations (LK6 cycle 2d — D-LK6-6 closure).
+    result.externImports.assign(externs.begin(), externs.end());
     std::size_t const funcCount = lir.moduleFuncCount();
     result.expectedFuncCount = funcCount;
 
@@ -199,6 +211,291 @@ AssembledModule assemble(Lir const&                 lir,
     }
 
     return result;
+}
+
+bool validateAssembledData(std::span<AssembledData const> items,
+                           DiagnosticReporter& reporter) {
+    auto emit = [&](DiagnosticCode code, std::string msg) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::move(msg);
+        reporter.report(std::move(d));
+    };
+
+    bool ok = true;
+
+    // Invariant 1: Bss items must have empty bytes.
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        auto const& d = items[i];
+        if (d.section == DataSectionKind::Bss && !d.bytes.empty()) {
+            emit(DiagnosticCode::K_BssDataHasBytes,
+                 std::format("AssembledData[{}] has section=Bss "
+                             "but bytes is non-empty ({} bytes). "
+                             "Bss is zero-fill — the wire format "
+                             "reserves the size without storing "
+                             "bytes. Substrate-shape violation "
+                             "(D-LK4-RODATA-BSS-INVARIANT).",
+                             i, d.bytes.size()));
+            ok = false;
+        }
+    }
+
+    // Invariant 2: no two items share the same non-sentinel
+    // SymbolId. Sentinel `SymbolId{}` (.v == 0) is exempt — it's
+    // the "anonymous data" marker and multiple anonymous items
+    // are legitimate.
+    std::unordered_map<std::uint32_t, std::size_t> firstByV;
+    firstByV.reserve(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        auto const v = items[i].symbol.v;
+        if (v == 0u) continue;  // sentinel exempt
+        auto const [it, inserted] = firstByV.emplace(v, i);
+        if (!inserted) {
+            emit(DiagnosticCode::K_DuplicateDataSymbol,
+                 std::format("AssembledData[{}] has SymbolId={{ "
+                             "{} }} which collides with item[{}]. "
+                             "Duplicate SymbolIds would silently "
+                             "let \"whichever was processed last\" "
+                             "win the linker's symbol→VA "
+                             "resolution. Mint distinct SymbolIds "
+                             "per data item or use the sentinel "
+                             "SymbolId{{}} for anonymous data.",
+                             i, v, it->second));
+            ok = false;
+        }
+    }
+
+    // Invariant 3 (alignment power-of-two) is enforced structurally
+    // by the `Alignment` newtype — see `asm.hpp` docblock.
+    return ok;
+}
+
+namespace {
+
+// Byte-width of a primitive TypeKind. Returns nullopt for non-primitive
+// kinds (Array / Struct / Ptr / FnSig / ...) — those require an
+// interner-side recursive computation (anchored D-LK4-RODATA-PRODUCER-
+// AGGREGATE-GLOBAL when the first aggregate global needs encoding).
+[[nodiscard]] std::optional<std::size_t>
+primitiveByteSize(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::Bool:
+        case TypeKind::I8: case TypeKind::U8:
+        case TypeKind::Char: case TypeKind::Byte:
+            return 1u;
+        case TypeKind::I16: case TypeKind::U16: case TypeKind::F16:
+            return 2u;
+        case TypeKind::I32: case TypeKind::U32: case TypeKind::F32:
+            return 4u;
+        case TypeKind::I64: case TypeKind::U64: case TypeKind::F64:
+            return 8u;
+        case TypeKind::I128: case TypeKind::U128: case TypeKind::F128:
+            return 16u;
+        default:
+            return std::nullopt;
+    }
+}
+
+// Little-endian encode `value` into `bytes` (appended). Width=`width`
+// bytes. Trailing zeros are appended verbatim — the integer's high
+// bytes are dropped silently when `value` exceeds the type's range
+// (caller invariant: HIR/MIR const-eval clamps to the type's range
+// before reaching the literal pool).
+void appendLE(std::vector<std::uint8_t>& bytes,
+              std::uint64_t value,
+              std::size_t width) noexcept {
+    for (std::size_t j = 0; j < width; ++j) {
+        bytes.push_back(static_cast<std::uint8_t>(
+            (value >> (j * 8)) & 0xFFu));
+    }
+}
+
+} // namespace
+
+std::vector<AssembledData>
+lowerMirGlobalsToDataItems(Mir const&          mir,
+                           TypeInterner const& interner,
+                           DiagnosticReporter& reporter) {
+    auto emit = [&](DiagnosticCode code, std::string msg) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::move(msg);
+        reporter.report(std::move(d));
+    };
+
+    std::vector<AssembledData> out;
+    out.reserve(mir.moduleGlobalCount());
+
+    for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
+        MirGlobalId const  gid     = mir.globalAt(i);
+        TypeId const       ty      = mir.globalType(gid);
+        SymbolId const     sym     = mir.globalSymbol(gid);
+        std::uint32_t const litIdx = mir.globalInitLiteralIndex(gid);
+        MirFuncId const    initFn  = mir.globalInitFunc(gid);
+
+        // Runtime-init globals: their bytes land via the
+        // `__module_init__` synthesized function at module-load
+        // time. Today this cycle scope produces NO AssembledData
+        // for runtime-init globals (zero-bytes-emit is anchored
+        // under D-LK4-RODATA-PRODUCER-RUNTIME-INIT). A silent
+        // skip would cause downstream `K_SymbolUndefined` at the
+        // linker (the producer-emitted REL32 reloc against the
+        // global's SymbolId would have no symbolVa entry). Raise
+        // a loud actionable diagnostic naming the global so the
+        // user sees the gap at the producer tier (silent-failure
+        // audit HIGH-1 fold, 2026-06-02).
+        if (initFn.valid()) {
+            emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("lowerMirGlobalsToDataItems: global "
+                             "SymbolId={{ {} }} has a runtime "
+                             "initializer (__module_init__-driven) "
+                             "— anchored under D-LK4-RODATA-"
+                             "PRODUCER-RUNTIME-INIT; today's cycle "
+                             "scope emits no AssembledData for "
+                             "this shape.",
+                             sym.v));
+            continue;
+        }
+
+        // Zero-init globals (neither initLiteralIndex nor
+        // initFunc set): semantically belong in `.bss`-style
+        // emission (zero-fill, no on-disk bytes). The current
+        // cycle does not yet wire Bss; emit a loud diagnostic
+        // naming the symbol (same silent-failure rationale as
+        // the runtime-init arm above).
+        if (litIdx == UINT32_MAX) {
+            emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("lowerMirGlobalsToDataItems: global "
+                             "SymbolId={{ {} }} is zero-init (no "
+                             "initializer) — anchored under "
+                             "D-LK4-RODATA-PRODUCER-BSS-EMIT; "
+                             "today's cycle emits no AssembledData "
+                             "for this shape.",
+                             sym.v));
+            continue;
+        }
+
+        MirLiteralValue const& v = mir.literalValue(litIdx);
+        TypeKind const k = interner.kind(ty);
+
+        AssembledData d;
+        d.symbol  = sym;
+        d.section = DataSectionKind::Rodata;
+
+        // String-literal arm: bytes are the literal's std::string
+        // contents. The HIR convention is Array<Char,N+1> where
+        // the +1 counts an implicit NUL terminator; the literal
+        // pool stores the N raw bytes without NUL. Emit N+1 bytes
+        // here (raw bytes + 1 NUL byte) so the on-disk layout
+        // matches what C-style consumers expect when dereferencing
+        // through the array.
+        //
+        // DISPATCH-ORDER INVARIANT (code-architect audit fold,
+        // 2026-06-02 — D-LK4-RODATA-PRODUCER-STRING coupling):
+        // this `std::string` variant check MUST fire BEFORE the
+        // TypeKind-keyed `primitiveByteSize` gate below. String-
+        // literal-promoted MirGlobals carry `TypeKind::Array` (the
+        // HIR string-literal's `Array<Char,N+1>` type), which
+        // `primitiveByteSize` does NOT handle (returns nullopt →
+        // K_NoMatchingObjectFormat with a misleading "non-primitive
+        // global types are anchored under D-LK4-RODATA-PRODUCER-
+        // AGGREGATE-GLOBAL" message). The dispatch on the LITERAL-
+        // POOL VARIANT (not the TypeKind) is the correct
+        // discriminator for the string case. A future refactor
+        // that reorders to "TypeKind check first" would silently
+        // break the D-LK4-RODATA-PRODUCER-STRING closure path.
+        if (std::holds_alternative<std::string>(v.value)) {
+            auto const& s = std::get<std::string>(v.value);
+            d.bytes.assign(s.begin(), s.end());
+            d.bytes.push_back(0);
+            d.alignment = Alignment::of<1>();
+            out.push_back(std::move(d));
+            continue;
+        }
+
+        // Primitive integer arm: encode the variant's u64/i64/
+        // bool value as LE bytes sized by the type. Width is the
+        // type's primitive byte size; HIR/MIR const-eval clamps
+        // the value to the type's range before lowering.
+        auto const widthOpt = primitiveByteSize(k);
+        if (!widthOpt.has_value()) {
+            emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("lowerMirGlobalsToDataItems: global "
+                             "SymbolId={{ {} }} has TypeKind={} "
+                             "— non-primitive global types are "
+                             "anchored under D-LK4-RODATA-PRODUCER-"
+                             "AGGREGATE-GLOBAL.",
+                             sym.v, static_cast<int>(k)));
+            continue;
+        }
+        std::uint64_t value = 0;
+        if (std::holds_alternative<std::uint64_t>(v.value)) {
+            value = std::get<std::uint64_t>(v.value);
+        } else if (std::holds_alternative<std::int64_t>(v.value)) {
+            value = static_cast<std::uint64_t>(
+                std::get<std::int64_t>(v.value));
+        } else if (std::holds_alternative<bool>(v.value)) {
+            value = std::get<bool>(v.value) ? 1u : 0u;
+        } else if (std::holds_alternative<double>(v.value)) {
+            // MirLiteralValue holds floats as `double` only — there
+            // is no `float` variant arm in the pool. For an `f32`
+            // global we MUST narrow `double → float` BEFORE the
+            // bit-cast: writing the low 4 bytes of the binary64
+            // representation directly yields garbage (the low
+            // mantissa bits, not a valid binary32). Same logic for
+            // F16/F128: they cannot be represented losslessly in
+            // the pool's `double` arm; fail loud rather than emit
+            // wrong bytes. (Code-reviewer F1 audit fold — silent
+            // miscompile for `float g = 1.0f;` at file scope.)
+            double const dv = std::get<double>(v.value);
+            if (k == TypeKind::F32) {
+                float const fv = static_cast<float>(dv);
+                std::memcpy(&value, &fv, sizeof(float));
+            } else if (k == TypeKind::F64) {
+                std::memcpy(&value, &dv, sizeof(double));
+            } else {
+                // F16 / F128: literal pool's double arm cannot
+                // represent these losslessly. Anchored
+                // D-LK4-RODATA-PRODUCER-EXOTIC-FLOAT until the
+                // pool grows a typed-float variant.
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: "
+                                 "global SymbolId={{ {} }} has "
+                                 "TypeKind={} with a `double` "
+                                 "literal — the pool cannot "
+                                 "represent f16/f128 losslessly "
+                                 "(D-LK4-RODATA-PRODUCER-EXOTIC-"
+                                 "FLOAT).",
+                                 sym.v, static_cast<int>(k)));
+                continue;
+            }
+        } else {
+            emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("lowerMirGlobalsToDataItems: global "
+                             "SymbolId={{ {} }} has a literal "
+                             "value of an unhandled variant arm "
+                             "(monostate / MirAggregateValue) — "
+                             "anchored under D-LK4-RODATA-PRODUCER-"
+                             "AGGREGATE-GLOBAL.",
+                             sym.v));
+            continue;
+        }
+        appendLE(d.bytes, value, *widthOpt);
+        // `primitiveByteSize()` returns ∈ {1,2,4,8,16} — every
+        // value is a power-of-two in [1,256], so the `optional`
+        // unwrap path is dead. Use the runtime-asserting factory
+        // to express the invariant in the type (type-design audit
+        // fold 2026-06-02 — dead `K_NoMatchingObjectFormat` arm
+        // removed; the wrong-domain diagnostic that arm would
+        // emit was a future-reader trap).
+        d.alignment = Alignment::ofRuntimePow2(
+            static_cast<std::uint32_t>(*widthOpt));
+        out.push_back(std::move(d));
+    }
+
+    return out;
 }
 
 } // namespace dss

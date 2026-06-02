@@ -11,7 +11,7 @@ namespace dss::x86_variable_disasm {
 
 namespace {
 
-using lir_pass_util::report;
+using dss::report;
 
 // Read a 4-byte little-endian int32 starting at `bytes[offset]`.
 // Caller ensures the bounds check.

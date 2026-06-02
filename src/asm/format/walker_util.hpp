@@ -51,7 +51,7 @@ hwEncodingOf(LirReg                 reg,
              std::string_view       mnemonic,
              std::uint8_t           maxBitWidth,
              DiagnosticReporter&    reporter) {
-    using dss::lir_pass_util::report;
+    using dss::report;
     if (!reg.valid() || reg.isPhysical == 0) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
@@ -96,6 +96,8 @@ filterToLirKind(OperandKindFilter f) noexcept {
         case OperandKindFilter::Reg:       return LirOperandKind::Reg;
         case OperandKindFilter::ImmInt:    return LirOperandKind::ImmInt;
         case OperandKindFilter::SymbolRef: return LirOperandKind::SymbolRef;
+        case OperandKindFilter::MemBase:   return LirOperandKind::MemBase;
+        case OperandKindFilter::MemOffset: return LirOperandKind::MemOffset;
     }
     return std::nullopt;
 }

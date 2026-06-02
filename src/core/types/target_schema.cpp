@@ -1,6 +1,7 @@
 #include "core/types/target_schema.hpp"
 
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/ascii_case.hpp"
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -14,6 +15,28 @@
 #include <utility>
 
 namespace dss {
+
+// All three helpers iterate `kRelocFormulaTable` — single source of
+// truth (post-fold #2 — was 3 independent hand-rolled enumerations).
+// Adding a new variant = one row in the table + one enum entry.
+std::string_view relocFormulaName(RelocFormulaKind k) noexcept {
+    return kRelocFormulaTable.name(k);
+}
+
+std::optional<RelocFormulaKind> parseRelocFormulaKind(std::string_view s) noexcept {
+    return kRelocFormulaTable.fromName(asciiToLower(s));
+}
+
+std::string acceptedRelocFormulaList() {
+    std::string out;
+    for (auto const& row : kRelocFormulaTable.rows) {
+        if (!out.empty()) out += ", ";
+        out += "'";
+        out += row.second;
+        out += "'";
+    }
+    return out;
+}
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
     std::filesystem::path const& path) {
@@ -377,9 +400,32 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // legalize-pass "operand 0 IS the destination" assumption
             // there would silently route the destination to a
             // non-destination position.
+            // Destination-bearing slot taxonomy:
+            //   * ModRmReg — x86 register-direct destination (mod=11
+            //     + reg field carries the dest's hwEncoding).
+            //   * ModRmRm — x86 register-direct destination via rm
+            //     field (the `requires2Address: true` 2-addr shape
+            //     where operand 0 IS the dest).
+            //   * ModRmRmMem — x86 memory destination (mod=10 + rm
+            //     field carries the base reg). The 2-addr shape's
+            //     arithmetic-to-memory form (e.g. a future `add
+            //     r/m64, imm32` with a memory dest) routes here.
+            //   * Rd — fixed32 destination.
+            //
+            // Disp32Mem and MemBaseScale are NEVER destinations:
+            // Disp32Mem carries the displacement VALUE (an immediate);
+            // MemBaseScale carries the shape (validates scale==1).
+            // Excluding them here is intentional.
+            //
+            // D-LK10-2 post-fold (silent-failure F-G1): omitting
+            // ModRmRmMem would cause future memory-destination 2-addr
+            // forms to silently fail rule-G validation with a
+            // misleading "destination would be silently dropped"
+            // message.
             auto const isDestSlot = [](EncodingSlotKind s) noexcept {
                 return s == EncodingSlotKind::ModRmReg
                     || s == EncodingSlotKind::ModRmRm
+                    || s == EncodingSlotKind::ModRmRmMem
                     || s == EncodingSlotKind::Rd;
             };
             bool const has2AddrDestWire = o.requires2Address
@@ -695,6 +741,112 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     substrate::validateRelocationsTable<TargetRelocationInfo>(
         relocations, fail);
 
+    // Plan 14 LK6 cycle 1 structured-formula coherence. Four rules
+    // catch silent-misapply hazards at load time:
+    //
+    //   (b) `widthBytes != 0` is required whenever `pcRelative` is
+    //       true or `addendBias != 0` — otherwise the linker would
+    //       silently reject a row that DID declare structured
+    //       semantics (looks like a row author typo, not the
+    //       intended "decline to apply" sentinel).
+    //   (c) `addendBias != 0` ⇒ `pcRelative` — absolute relocations
+    //       with a non-zero constant bias have no real consumer
+    //       across x86_64 / ARM64 / PE / Mach-O. A row in this
+    //       shape is almost certainly a typo (bias on the wrong
+    //       row, or pcRelative dropped by accident). Reject at
+    //       load (type-design O2.a convergence).
+    //   (d) `widthBytes != 0` ⇒ `|addendBias|` fits signed in
+    //       `widthBytes` bytes. A bias that overflows the patch
+    //       slot would silently corrupt every patched site
+    //       (silent-failure M1 convergence).
+    //
+    // Rule (a) — `widthBytes ∈ {4, 8}` — is enforced by the JSON
+    // loader before this code runs.
+    for (std::size_t i = 0; i < relocations.size(); ++i) {
+        auto const& r = relocations[i];
+        bool const hasStructuredSemantics =
+            r.pcRelative || r.addendBias != 0;
+        if (hasStructuredSemantics && r.widthBytes == 0) {
+            fail(std::format("/relocations/{}/widthBytes", i),
+                 std::format("relocation '{}': 'widthBytes' must be "
+                             "declared (4 or 8) when 'pcRelative' is "
+                             "true or 'addendBias' is non-zero — the "
+                             "linker needs the width to apply the "
+                             "structured formula. Omit pcRelative + "
+                             "addendBias for relocations whose "
+                             "application is not yet supported (the "
+                             "LK6 in-place applier will reject them).",
+                             r.name));
+        }
+        if (r.addendBias != 0 && !r.pcRelative) {
+            fail(std::format("/relocations/{}/addendBias", i),
+                 std::format("relocation '{}': 'addendBias' is "
+                             "non-zero ({}) but 'pcRelative' is "
+                             "false — no x86_64 / ARM64 / PE / "
+                             "Mach-O relocation needs an absolute "
+                             "patch with a constant bias. This is "
+                             "almost certainly a typo (bias on the "
+                             "wrong row, or pcRelative dropped).",
+                             r.name, r.addendBias));
+        }
+        if (r.widthBytes != 0 && r.widthBytes < 8) {
+            std::int64_t const sMax =
+                (std::int64_t{1} << (8 * r.widthBytes - 1)) - 1;
+            std::int64_t const sMin = -sMax - 1;
+            if (r.addendBias < sMin || r.addendBias > sMax) {
+                fail(std::format("/relocations/{}/addendBias", i),
+                     std::format("relocation '{}': 'addendBias' "
+                                 "({}) does not fit signed in "
+                                 "widthBytes={} ({} ≤ bias ≤ {}). "
+                                 "A bias that overflows the patch "
+                                 "slot silently corrupts every "
+                                 "patched site.",
+                                 r.name, r.addendBias,
+                                 r.widthBytes, sMin, sMax));
+            }
+        }
+        // Rule (e) — D-LK6-1 closure coherence: non-Linear formulas
+        // encode pcRelative + addendBias + widthBytes intrinsically.
+        // The JSON loader gates this at load time (and the shipped
+        // configs go through that gate), but a programmatically-
+        // constructed schema (test fixture, future variant reshape,
+        // fuzz harness) could bypass the loader and reach `validate()`
+        // with an incoherent row. The kernel would then silently
+        // misapply (e.g. `widthBytes=8` on a non-Linear arm patches
+        // 8 LE bytes into a 32-bit instruction word; `pcRelative=true`
+        // on Call26 double-subtracts P). Defense-in-depth here so
+        // every schema reaching the kernel has rule (e) enforced.
+        // (silent-failure audit CRITICAL-2 post-fold #2.)
+        if (r.formulaKind != RelocFormulaKind::Linear) {
+            if (r.widthBytes != 4) {
+                fail(std::format("/relocations/{}/widthBytes", i),
+                     std::format("relocation '{}': non-Linear formula "
+                                 "'{}' requires widthBytes=4 (ARM64 "
+                                 "instruction word); got {}.",
+                                 r.name,
+                                 relocFormulaName(r.formulaKind),
+                                 r.widthBytes));
+            }
+            if (r.pcRelative) {
+                fail(std::format("/relocations/{}/pcRelative", i),
+                     std::format("relocation '{}': non-Linear formula "
+                                 "'{}' encodes PC-relativity "
+                                 "intrinsically; 'pcRelative' must be "
+                                 "false.",
+                                 r.name,
+                                 relocFormulaName(r.formulaKind)));
+            }
+            if (r.addendBias != 0) {
+                fail(std::format("/relocations/{}/addendBias", i),
+                     std::format("relocation '{}': non-Linear formula "
+                                 "'{}' encodes any addend bias "
+                                 "intrinsically; 'addendBias' must be 0.",
+                                 r.name,
+                                 relocFormulaName(r.formulaKind)));
+            }
+        }
+    }
+
     // ── Calling conventions ──────────────────────────────────────
     // Three gates here, in order:
     //
@@ -779,7 +931,21 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                               || !cc.returnGprs.empty() || !cc.returnFprs.empty()
                               || !cc.callerSaved.empty() || !cc.calleeSaved.empty()
                               || cc.shadowSpaceBytes != 0 || cc.redZoneBytes != 0
-                              || cc.stackAlignment   != 0;
+                              || cc.stackAlignment   != 0
+                              // D-LK10-ENTRY-TRAMP-PROLOGUE: a cc
+                              // declaring ONLY entryStackPointerBias
+                              // (with all other ABI fields zeroed)
+                              // would otherwise silently bypass the
+                              // `< stackAlignment` check below
+                              // (type-design C1 at the standing
+                              // audit). Include it in the trigger.
+                              || cc.entryStackPointerBias != 0
+                              // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY:
+                              // same protection for the new
+                              // callPushBytes field (a cc declaring
+                              // only callPushBytes would bypass the
+                              // multiple-of-alignment check below).
+                              || cc.callPushBytes != 0;
         if (hasAbiInfo) {
             if (!isPow2Nonzero(cc.stackAlignment)) {
                 fail(std::format("/callingConventions/{}/stackAlignment", i),
@@ -797,6 +963,35 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                     fail(std::format("/callingConventions/{}/redZoneBytes", i),
                          std::format("callingConvention '{}': redZoneBytes ({}) must be a multiple of stackAlignment ({})",
                                      cc.name, cc.redZoneBytes, cc.stackAlignment));
+                }
+                // D-LK10-ENTRY-TRAMP-PROLOGUE: entryStackPointerBias
+                // is an offset INTO the alignment quantum, NOT a
+                // multiple of it — must be strictly < stackAlignment.
+                if (cc.entryStackPointerBias >= cc.stackAlignment) {
+                    fail(std::format(
+                             "/callingConventions/{}/entryStackPointerBias", i),
+                         std::format(
+                             "callingConvention '{}': entryStackPointerBias "
+                             "({}) must be < stackAlignment ({}) — bias "
+                             "is an offset INTO the alignment quantum",
+                             cc.name, cc.entryStackPointerBias,
+                             cc.stackAlignment));
+                }
+                // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: callPushBytes is
+                // ALSO an offset INTO the alignment quantum (the
+                // CALL instruction's RSP delta is bounded by the
+                // architecture's pointer width, which divides
+                // stackAlignment). Strict-less-than matches
+                // entryStackPointerBias's invariant.
+                if (cc.callPushBytes >= cc.stackAlignment) {
+                    fail(std::format(
+                             "/callingConventions/{}/callPushBytes", i),
+                         std::format(
+                             "callingConvention '{}': callPushBytes "
+                             "({}) must be < stackAlignment ({}) — bias "
+                             "is an offset INTO the alignment quantum",
+                             cc.name, cc.callPushBytes,
+                             cc.stackAlignment));
                 }
             }
             // ML7 callconv lowering requires a stack-pointer register

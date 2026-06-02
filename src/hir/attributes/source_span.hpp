@@ -37,6 +37,45 @@ struct HirSourceLoc {
     // Byte range within `buffer`. Defaults to empty; `SourceSpan` is factory-only
     // so there is no other zero-state to spell.
     SourceSpan span = SourceSpan::empty(0);
+
+    // Absence predicate. `buffer.valid()` is the single discriminator — a
+    // non-empty span paired with InvalidBuffer is still semantically absent
+    // (the span couldn't index into any registered buffer); a zero-length
+    // span paired with a valid buffer is still present (caret-pointer at a
+    // token boundary). Consumers should prefer `isPresent()` over
+    // `buffer.valid()` at call sites where the question is "do I have a
+    // locus?" — the predicate names the question correctly + decouples
+    // consumers from the BufferId implementation choice.
+    //
+    // Naming note: camelCase per codebase predicate convention (see
+    // `valid()`, `hasErrors()`, `empty()`). Earlier post-fold #8 shipped
+    // snake_case forms; post-fold #9 code-review fold harmonized.
+    [[nodiscard]] constexpr bool isPresent() const noexcept {
+        return buffer.valid();
+    }
+    [[nodiscard]] constexpr bool isAbsent() const noexcept {
+        return !buffer.valid();
+    }
+    [[nodiscard]] static constexpr HirSourceLoc absent() noexcept {
+        return {};
+    }
+
+    // Stronger predicate: locus is present AND covers at least one byte
+    // of source text. Distinct semantic from `isPresent()`: a caret-
+    // pointer locus (valid buffer + zero-length span) IS present per
+    // the type's contract but does NOT span text. Producers that need
+    // a renderable underline (LSP squiggle, terminal caret-with-text)
+    // ask via `spansText()`; producers that need "is this locus
+    // bindable to a buffer" ask via `isPresent()`.
+    //
+    // D-FF2 type-design Q2 fold: the asymmetry was previously baked
+    // into `firstReportedErrorSpan`'s filter as an inline
+    // `span.length() == 0` check — the named predicate makes the
+    // two-axis distinction explicit so future consumers don't have to
+    // re-derive it.
+    [[nodiscard]] constexpr bool spansText() const noexcept {
+        return isPresent() && span.length() > 0;
+    }
 };
 
 } // namespace dss

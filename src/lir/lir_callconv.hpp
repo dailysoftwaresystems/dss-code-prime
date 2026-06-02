@@ -77,6 +77,52 @@
 
 namespace dss {
 
+// D-LK10-ENTRY-TRAMP-PROLOGUE: smallest non-negative integer `N`
+// satisfying BOTH `N >= rawBytes` AND `N ≡ entryBias (mod
+// stackAlignment)`. This is the single formula that decides how
+// many bytes a CALL-MAKING function must subtract from its stack
+// pointer at entry to (a) reserve at least `rawBytes` of frame
+// space and (b) land the call site at the cc's stack-alignment.
+//
+// Consumers:
+//   * Trampoline emitter (`src/link/entry_trampoline.cpp`): passes
+//     `rawBytes = cc.shadowSpaceBytes`, `entryBias =
+//     cc.entryStackPointerBias`. Result: 40 on Win64 (32 shadow +
+//     8 realign), 0 on SysV ELF / Mach-O / ARM64.
+//   * ML7 callconv lowering (`lir_callconv.cpp::computeFrameLayout`):
+//     anchored D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY for when normal-
+//     function call-site shadow-space tightening lands (today ML7
+//     calls `alignUp(savedRegs + spill, alignment)` directly, which
+//     is `alignedSizeWithBias(... , bias=0)` for non-call-makers
+//     after callconv-pass-injected call-site shadow allocates
+//     separately).
+//
+// Algorithm: clamp `rawBytes` up to `entryBias`, then add whole
+// `stackAlignment` quanta until the congruence holds. Closed-form
+// version computes the modular delta in one step.
+//
+// Pre-conditions (caller's responsibility — validator at schema-
+// load time enforces these for cc fields):
+//   * `stackAlignment` is a non-zero power of two.
+//   * `entryBias < stackAlignment` (bias is an offset INTO the
+//     quantum, not a multiple of it).
+//
+// `stackAlignment == 0` returns `rawBytes` verbatim (degenerate
+// case for non-register-machine targets).
+[[nodiscard]] constexpr std::uint32_t
+alignedSizeWithBias(std::uint32_t rawBytes,
+                    std::uint32_t stackAlignment,
+                    std::uint32_t entryBias) noexcept {
+    if (stackAlignment == 0) return rawBytes;
+    std::uint32_t const remainder = rawBytes % stackAlignment;
+    if (remainder == entryBias) return rawBytes;
+    // delta = (entryBias - remainder) mod stackAlignment, computed
+    // in unsigned arithmetic so wrap is well-defined.
+    std::uint32_t const delta =
+        (entryBias + stackAlignment - remainder) % stackAlignment;
+    return rawBytes + delta;
+}
+
 // Per-function frame layout computed before emission. Stored so
 // downstream passes (AS1 unwind info, debug-info DWARF .debug_frame
 // generation) can read it without re-computing.
@@ -91,6 +137,16 @@ struct DSS_EXPORT FrameLayout {
     std::uint32_t       spillAreaSize     = 0;  // bytes occupied by spill slots
     std::uint32_t       slotSize          = 0;  // uniform per-class slot width (bytes)
     std::vector<LirReg> savedRegs;              // callee-saved phys regs actually used
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: did this function contain at
+    // least one call-shaped opcode (per `TargetOpcodeInfo::isCall`)
+    // at frame-layout time? True ⇒ totalFrameSize incorporates
+    // `cc.shadowSpaceBytes` AND satisfies `N ≡ cc.callPushBytes mod
+    // cc.stackAlignment`. False ⇒ totalFrameSize is the existing
+    // `alignUp(raw, cc.stackAlignment)` (leaf-fn rule). Exposed so
+    // downstream consumers (debug-info unwind, audit tests, future
+    // CFI emitters) can verify the invariant without re-scanning
+    // the source LIR.
+    bool                hasCalls          = false;
 
     // Derived: spill area starts immediately after the saved-reg area.
     [[nodiscard]] constexpr std::uint32_t

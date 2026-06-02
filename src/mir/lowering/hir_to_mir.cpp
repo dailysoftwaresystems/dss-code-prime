@@ -6,6 +6,7 @@
 
 #include <array>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -50,7 +51,13 @@ struct Lowerer {
     DiagnosticReporter&      reporter;
     HirSourceMap const*      sourceMap;   // optional — diagnostics carry spans when bound
     MirLoweringConfig const& config;      // schema-driven knobs (plan 12.5 §0.2 D3)
+    HirFfiMap const*         ffiMap;      // optional — populated by CST→HIR or FF5
+                                           // (LK6 cycle 2d, D-LK6-6).
     MirBuilder               mir;
+    // Extern symbols extracted during the pre-pass. Each extern's
+    // SymbolId is also inserted into `functionSymbols` so a `Ref`
+    // to it routes through the existing GlobalAddr emission path.
+    std::vector<ExternImport> externImports;
     // Within one function: HIR `SymbolId.v` → SSA value producer. Used for
     // params that are NOT address-taken (those stay as raw `Arg` instructions);
     // an entry is set iff the symbol resolves as a plain rvalue. A symbol is
@@ -98,6 +105,73 @@ struct Lowerer {
         bool       continueReferenced = false;
     };
     std::vector<BranchFrame> branchStack;
+
+    // D-LK4-RODATA-PRODUCER-STRING (2026-06-02): synthetic-symbol
+    // counter for string-literal-promoted globals. Initialized to
+    // 1 + max(existing function/extern/global SymbolId.v) on first
+    // use so synthetic symbols can't collide with user-declared
+    // ones. Mirrors the `entry_trampoline.cpp::maxExistingSymbolIdV`
+    // pattern used by D-LK10-ENTRY Slice C. Lazy seeding lets the
+    // pre-passes (`collectFunctions` / `collectGlobals` /
+    // `collectExterns`) populate the symbol sets BEFORE the first
+    // expression lowering reaches a string literal.
+    //
+    // Encoded as `optional<uint32_t>` (type-design audit fold,
+    // 2026-06-02): a `(bool seeded, uint32_t value)` two-field
+    // pair admits the contradictory state `(false, 17)` that no
+    // invariant pinned. `optional<uint32_t>` encodes "unseeded +
+    // value" in one type-enforced state; `if (!opt.has_value())`
+    // is the lazy-seed gate.
+    std::optional<std::uint32_t> nextSyntheticGlobalSym_;
+    // Returns a fresh SymbolId, OR an invalid `SymbolId{}` if the
+    // mint would wrap around UINT32_MAX. The caller is expected to
+    // fail loud on the invalid sentinel — silent-failure HIGH-1
+    // audit fold (2026-06-02): mirrors the D-LK10-ENTRY Slice C
+    // discipline `SymbolId{} == 0` sentinel + caller-checked
+    // wraparound, anchored by the prior `3541177` audit fold's
+    // `SymbolIdSpaceExhaustionFailsLoud` precedent. Without this
+    // guard, a 2^32-occurrence string-literal corpus would silently
+    // wrap and collide with SymbolId{0} / user symbols.
+    [[nodiscard]] SymbolId mintSyntheticGlobalSymbol() {
+        if (!nextSyntheticGlobalSym_.has_value()) {
+            std::uint32_t maxV = 0;
+            for (auto v : functionSymbols) {
+                if (v > maxV) maxV = v;
+            }
+            for (auto v : globalSymbols) {
+                if (v > maxV) maxV = v;
+            }
+            // Cross-tier collision protection (code-architect audit
+            // fold, 2026-06-02): `collectExterns` (search by name
+            // — line numbers drift) inserts every extern's
+            // `SymbolId.v` into `functionSymbols`. The scan above
+            // therefore covers functions + externs + globals — the
+            // three user-symbol categories MIR sees. The HIR builder's
+            // `freshSymbol()` runs past `model.symbols().size()`
+            // for HIR-synthesized symbols; those SymbolIds are
+            // ALREADY in `functionSymbols`/`globalSymbols` by the
+            // time `mintSyntheticGlobalSymbol()` first runs, so
+            // the lazy seed naturally clears them too.
+            //
+            // UINT32_MAX seed: refuse to seed at the saturated
+            // edge so the immediate `*nextSyntheticGlobalSym_`
+            // read below never wraps. The caller fail-louds.
+            if (maxV == std::numeric_limits<std::uint32_t>::max()) {
+                return SymbolId{};
+            }
+            nextSyntheticGlobalSym_ = maxV + 1u;
+        }
+        std::uint32_t const minted = *nextSyntheticGlobalSym_;
+        // Wrap detection (silent-failure HIGH-1 audit fold): if
+        // `minted == UINT32_MAX`, advancing would wrap to 0
+        // (collide with the invalid sentinel). Refuse and let the
+        // caller fail loud.
+        if (minted == std::numeric_limits<std::uint32_t>::max()) {
+            return SymbolId{};
+        }
+        nextSyntheticGlobalSym_ = minted + 1u;
+        return SymbolId{minted};
+    }
 
     // Emit an unsupported-construct diagnostic anchored at the HIR node's
     // source span (via the optional source map). The buffer/span both
@@ -535,13 +609,83 @@ struct Lowerer {
                     unsupported(node, "malformed Cast (expect 1 operand)");
                     return InvalidMirInst;
                 }
-                MirInstId const operand = lowerExpr(kids[0]);
-                if (!operand.valid()) return InvalidMirInst;
                 TypeId const fromTy = hir.typeId(kids[0]);
                 TypeKind const fromK = fromTy.valid()
                     ? interner.kind(fromTy) : TypeKind::Void;
                 TypeKind const toK   = t.valid()
                     ? interner.kind(t) : TypeKind::Void;
+                // D-LK4-RODATA-PRODUCER-STRING closure (2026-06-02):
+                // C-standard array-to-pointer decay. CST→HIR's coerce()
+                // emits a synthetic `Cast` HIR node when an Array<T,N>
+                // rvalue reaches a Ptr<T> context. Lower it BEFORE the
+                // general mapCast() path so the operand's array-typed
+                // SSA value never materializes (it would have no encoder
+                // path: an aggregate Const cannot land in a single
+                // register). Cycle scope: string literals only —
+                // synthesize a MirGlobal carrying the string bytes +
+                // emit GlobalAddr returning the Ptr. Local-array decay
+                // (`int arr[10]; foo(arr);`) is anchored as
+                // D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY (needs
+                // `AddressOf(Alloca) + Gep(0)` lowering); non-string
+                // module-scope arrays anchored as
+                // D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY.
+                // Both fail loud here so a future producer can't slip
+                // a silent miscompile through this arm.
+                if (fromK == TypeKind::Array && toK == TypeKind::Ptr) {
+                    if (hir.kind(kids[0]) != HirKind::Literal) {
+                        unsupported(node,
+                            "Array→Pointer decay supported only on "
+                            "string-literal operands today (local + "
+                            "non-string-global arrays anchored "
+                            "D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY "
+                            "/ D-LK4-RODATA-PRODUCER-NONSTRING-GLOBAL-"
+                            "ARRAY-DECAY)");
+                        return InvalidMirInst;
+                    }
+                    std::uint32_t const litIdx0 = hir.payload(kids[0]);
+                    HirLiteralValue const& src = literals.at(litIdx0);
+                    if (!std::holds_alternative<std::string>(src.value)) {
+                        unsupported(node,
+                            "Array→Pointer decay operand is a Literal "
+                            "but its pool entry is not a string arm "
+                            "(non-string array literals anchored "
+                            "D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-"
+                            "LITERAL-DECAY)");
+                        return InvalidMirInst;
+                    }
+                    // Mint a fresh synthetic global for the literal,
+                    // register it in the MIR globals arena with the
+                    // string bytes as its constant-init, and emit a
+                    // `GlobalAddr` that returns the Ptr<T> the Cast
+                    // expression yields. The lowerMirGlobalsToDataItems
+                    // pass (asm/asm.cpp) materializes the rodata bytes
+                    // from this MirGlobal at assembly time.
+                    //
+                    // SymbolId-space-exhaustion guard (silent-failure
+                    // HIGH-1 audit fold, 2026-06-02): the minter
+                    // returns invalid SymbolId{} when the next mint
+                    // would wrap UINT32_MAX. Fail loud rather than
+                    // silently collide with SymbolId{0} (the
+                    // invalid sentinel) or user-declared symbols.
+                    SymbolId const sym = mintSyntheticGlobalSymbol();
+                    if (!sym.valid()) {
+                        unsupported(node,
+                            "string-literal promotion failed: "
+                            "synthetic SymbolId space exhausted "
+                            "(UINT32_MAX wraparound). Source has "
+                            "too many string literals OR the user "
+                            "SymbolId range already saturates the "
+                            "u32 space. Anchor: D-LK4-RODATA-"
+                            "PRODUCER-STRING space-exhaustion pin.");
+                        return InvalidMirInst;
+                    }
+                    std::uint32_t const mirLitIdx =
+                        mir.literalPoolAdd(toMirLiteral(src));
+                    (void)mir.addGlobal(fromTy, sym, mirLitIdx);
+                    return mir.addGlobalAddr(sym, t);
+                }
+                MirInstId const operand = lowerExpr(kids[0]);
+                if (!operand.valid()) return InvalidMirInst;
                 MirOpcode const mop = mapCast(fromK, toK);
                 if (mop == MirOpcode::Invalid) {
                     unsupported(node, std::format(
@@ -1566,6 +1710,140 @@ struct Lowerer {
         }
     }
 
+    // Pre-pass: collect extern function SymbolIds + build per-row
+    // `ExternImport` records by consulting the optional
+    // `HirAttribute<FfiMetadata>` side-table. Extern SymbolIds are
+    // ALSO inserted into `functionSymbols` so a `Ref` to an extern
+    // routes through the existing GlobalAddr emission path —
+    // structurally a direct call to an extern produces
+    // `Call GlobalAddr(externSym), args...`, the same MIR shape as
+    // intra-module calls. The downstream LIR + assembler emit a
+    // relocation against the SymbolId and the linker resolves it
+    // against `AssembledModule.externImports` instead of
+    // `functions`. (LK6 cycle 2d — D-LK6-6 closure.)
+    //
+    // Fail-loud contract (the post-fold review verified this against
+    // the silent-failure rule): if the FFI map is absent OR a per-
+    // node entry is missing OR its `mangledName` / `importLibrary`
+    // is empty OR the extern's SymbolId collides with an intra-
+    // module function OR a prior extern in this module declares
+    // the same SymbolId OR the FnSig is invalid — the pre-pass
+    // emits `H_UnsupportedLoweringForKind` anchored at the HIR
+    // node's source span and the row is NOT pushed. Surfacing at
+    // the HIR tier preserves source-span context that the linker
+    // tier can no longer recover (which would otherwise reduce
+    // every metadata problem to "unresolved extern" with no
+    // pinpoint location).
+    void collectExterns(HirNodeId moduleNode) {
+        // Track extern SymbolIds we've already emitted a row for, to
+        // catch duplicate-extern-declaration drift. The linker
+        // (LK6 cycle 2a) also rejects extern-table duplicates, but
+        // surfacing here keeps the source span attached to the
+        // diagnostic (silent-failure HIGH fold, LK6 cycle 2d
+        // post-fold review).
+        std::unordered_set<std::uint32_t> seenExternSyms;
+        for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+            if (hir.kind(decl) != HirKind::ExternFunction) continue;
+            TypeId const sig = hir.externFunctionSignature(decl);
+            if (!sig.valid()) {
+                // Symmetric with `collectFunctions`'s `sig.valid()`
+                // guard: a malformed extern with no FnSig has no
+                // ABI shape the assembler / linker can resolve
+                // against. Fail loud rather than emit a half-built
+                // row. (silent-failure MEDIUM fold.)
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — invalid TypeId on "
+                    "FnSig; the semantic model failed to resolve "
+                    "this extern's signature.", decl.v));
+                continue;
+            }
+            SymbolId const sym = hir.externFunctionSymbol(decl);
+            if (!sym.valid()) {
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — missing SymbolId; "
+                    "the semantic model failed to bind a symbol to "
+                    "this extern declaration.", decl.v));
+                continue;
+            }
+            if (functionSymbols.contains(sym.v)) {
+                // Cross-table ambiguity: this SymbolId is already
+                // owned by an intra-module `Function`. The linker's
+                // `LK6 cycle 2a` cross-table reject catches this
+                // too, but anchoring the diagnostic at the HIR
+                // node here preserves source-span context that the
+                // linker tier can no longer recover. (silent-
+                // failure HIGH fold.)
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — SymbolId #{} is "
+                    "already declared as an intra-module function. "
+                    "Each SymbolId must belong to either a function "
+                    "OR an extern, never both.", decl.v, sym.v));
+                continue;
+            }
+            if (!seenExternSyms.insert(sym.v).second) {
+                // Two ExternFunction decls with the same SymbolId
+                // — likely a copy-paste in the test fixture or a
+                // multi-CU SymbolId collision the semantic phase
+                // failed to disambiguate. Fail loud.
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — SymbolId #{} is "
+                    "already declared by a prior ExternFunction in "
+                    "this module.", decl.v, sym.v));
+                continue;
+            }
+            FfiMetadata const* meta = (ffiMap != nullptr)
+                ? ffiMap->tryGet(decl)
+                : nullptr;
+            // FfiMetadata population is the caller's responsibility:
+            // - CST→HIR (today, cycle 2d): not yet populating;
+            //   tests build the FFI map manually until plan 11 FF5
+            //   lands the c-subset attribution syntax.
+            // - FF5 binary ingestion: populates from .so/.dll
+            //   reads.
+            // - Missing/empty `mangledName` (the linker-visible
+            //   symbol name) is a hard error: every extern MUST
+            //   carry a name the linker can resolve against.
+            // - Missing/empty `importLibrary` is a hard error too:
+            //   without a library path the linker can't emit a
+            //   DT_NEEDED / LC_LOAD_DYLIB / IMAGE_IMPORT_DESCRIPTOR
+            //   entry — the linker's per-extern validation
+            //   (`linker.cpp`) already enforces this, but we fail
+            //   loud here so the diagnostic anchors at the HIR
+            //   node (with its source span) rather than at the
+            //   linker (where the span has been lost).
+            if (meta == nullptr || meta->mangledName.empty()) {
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — `mangledName` is "
+                    "missing from the HirAttribute<FfiMetadata> "
+                    "side-table. Every extern symbol must carry a "
+                    "non-empty mangled name (the linker's import "
+                    "table key). Plan 11 FF5 populates this from "
+                    "binary ingestion; tests must attach the "
+                    "attribute manually until then.", decl.v));
+                continue;
+            }
+            if (meta->importLibrary.empty()) {
+                unsupported(decl, std::format(
+                    "HIR ExternFunction (id {}) — `importLibrary` "
+                    "is missing from the HirAttribute<FfiMetadata> "
+                    "side-table. Every extern symbol must declare "
+                    "the dynamic library that owns it (e.g. "
+                    "'libc.so.6', 'kernel32.dll', "
+                    "'/usr/lib/libSystem.B.dylib'). Without a "
+                    "library path the linker cannot emit the "
+                    "corresponding DT_NEEDED / LC_LOAD_DYLIB / "
+                    "IMAGE_IMPORT_DESCRIPTOR entry.", decl.v));
+                continue;
+            }
+            ExternImport row;
+            row.symbol      = sym;
+            row.mangledName = meta->mangledName;
+            row.libraryPath = meta->importLibrary;
+            externImports.push_back(std::move(row));
+            functionSymbols.insert(sym.v);
+        }
+    }
+
     // Pre-pass: collect the set of module-level global symbols so that a
     // `Ref` to a global resolves to a `GlobalAddr`-then-`Load` (rvalue) or
     // a `GlobalAddr` (lvalue address). Mirrors `collectFunctions`. The
@@ -1755,8 +2033,16 @@ struct Lowerer {
             unsupported(root, "HIR root is not a Module — cannot lower");
             return;
         }
+        // Pre-pass ordering invariant (architect LOW fold, LK6
+        // cycle 2d post-fold review): `collectFunctions` MUST run
+        // before `collectExterns` because the cross-table guard in
+        // `collectExterns` reads `functionSymbols` to detect a
+        // SymbolId owned by an intra-module function colliding with
+        // an extern declaration. Reordering would silently degrade
+        // the guard to "extern wins, prior function shadowed."
         collectFunctions(root);
         collectGlobals(root);
+        collectExterns(root);
         classifyGlobals(root);
         for (HirNodeId decl : hir.moduleDecls(root)) {
             HirKind const dk = hir.kind(decl);
@@ -1771,10 +2057,17 @@ struct Lowerer {
                     // for ALL runtime-init globals.
                     break;
                 case HirKind::ExternFunction:
-                    unsupported(decl, std::format(
-                        "HIR ExternFunction (id {}) — FFI symbol ingestion "
-                        "is not yet lowered", decl.v));
-                    return;
+                    // Pre-pass (`collectExterns`) already registered
+                    // the SymbolId in `functionSymbols` and pushed
+                    // an `ExternImport` row. No MIR instructions
+                    // are emitted at the decl site itself — the
+                    // declaration is pure metadata that the linker
+                    // consumes via `AssembledModule.externImports`.
+                    // Call sites referencing this extern emit
+                    // `Call GlobalAddr(externSym), args...`, same
+                    // as intra-module calls. (LK6 cycle 2d —
+                    // D-LK6-6 closure.)
+                    break;
                 case HirKind::ExternGlobal:
                     unsupported(decl, std::format(
                         "HIR ExternGlobal (id {}) — FFI symbol ingestion is "
@@ -1812,13 +2105,27 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           TypeInterner&            interner,
                           DiagnosticReporter&      reporter,
                           HirSourceMap const*      sourceMap,
-                          MirLoweringConfig const& config) {
+                          MirLoweringConfig const& config,
+                          HirFfiMap const*         ffiMap) {
     std::size_t const errorsBefore = reporter.errorCount();
-    Lowerer lwr{hir, literals, interner, reporter, sourceMap, config,
-                MirBuilder{}, {}, {}, {}, {}, {}, {}};
+    // Designated initializers (code-simplifier REQUIRED fold, LK6
+    // cycle 2d post-fold review): a future field addition or
+    // reorder is a compile error rather than a silent position
+    // rebind. Trailing default-initialized fields are omitted.
+    Lowerer lwr{
+        .hir       = hir,
+        .literals  = literals,
+        .interner  = interner,
+        .reporter  = reporter,
+        .sourceMap = sourceMap,
+        .config    = config,
+        .ffiMap    = ffiMap,
+        .mir       = MirBuilder{},
+    };
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
+    result.externImports = std::move(lwr.externImports);
     result.ok = (reporter.errorCount() == errorsBefore);
     return result;
 }

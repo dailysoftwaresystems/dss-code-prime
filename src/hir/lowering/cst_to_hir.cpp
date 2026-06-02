@@ -17,6 +17,7 @@
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cerrno>
@@ -25,6 +26,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -87,6 +89,43 @@ namespace {
     return k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64 || k == TypeKind::F128;
 }
 
+// Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-
+// RETURN. Restricted to I32+ / U32+ because the SysV AMD64 + MS x64
+// ABIs do NOT zero-extend sub-32-bit integer returns to the full GPR
+// — the trampoline's 64-bit `mov status, returnGprs[0]` would copy
+// indeterminate upper bits to the exit syscall arg → non-deterministic
+// exit code with no diagnostic. I32-and-up returns are safe because
+// `eax`-write zero-extends to `rax` on x86_64 (ISA invariant); 64-bit
+// types fill the GPR directly. Sub-i32 entry-fn returns are non-
+// conformant C99 (§5.1.2.2.3 requires `int` specifically), so falling
+// through to the verifier's loud-fail is the correct outcome.
+//
+// Placed at file scope alongside `isSignedCore` / `isFloatCore` for
+// consistency — this predicate is stateless and reads no member, so
+// the per-Lowerer `static` placement was unjustified coupling (type-
+// design Q3 fold, 3rd-order audit on 39897eb).
+[[nodiscard]] bool isIntegerReturnCore(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::I32: case TypeKind::I64: case TypeKind::I128:
+        case TypeKind::U32: case TypeKind::U64: case TypeKind::U128:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Post-fold #8 simplifier R2 + code-reviewer I1: the
+// `decl.arraySuffix ? decl.arraySuffix->rule : RuleId{}` pattern
+// appears at lowerTopLevel (global init walk) AND lowerExternDecl
+// (extern-init reject). Stateless — lives at file scope alongside
+// the other anon-namespace helpers. Returns `RuleId{}` when the
+// language has no array decl form; downstream consumers gate on
+// `.valid()` to skip the rule-match.
+[[nodiscard]] RuleId
+arraySuffixSkipRule(DeclarationRule const& decl) noexcept {
+    return decl.arraySuffix ? decl.arraySuffix->rule : RuleId{};
+}
+
 // HR11: one Lowerer is a single-LANGUAGE lowering context bound to one schema's
 // `cfg`/`sem`/`numberStyle` + its schema-specific rule/token index maps. A
 // multi-language CU runs one Lowerer per distinct schema, all sharing the one
@@ -107,6 +146,13 @@ struct Lowerer {
 
     // pendingSpans (shared): applied to the result's HirSourceMap after finish().
     std::vector<std::pair<HirNodeId, HirSourceLoc>>& spans;
+    // FF6 Slice 2 (2026-06-02): shared accumulator for source-
+    // declared externs, one record per `lowerExternDecl` call
+    // that successfully produced an ExternFunction / ExternGlobal
+    // HIR node. Consumed by `compileSingleUnit` via
+    // `synthesizeFfiFromSourceDecls` to populate the
+    // `HirFfiMap` between HIR and MIR lowering.
+    std::vector<HirExternRecord>& externDecls;
 
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
@@ -137,11 +183,45 @@ struct Lowerer {
     [[nodiscard]] E coerce(E child, TypeId target) {
         if (!target.valid() || !child.type.valid()) return child;
         if (child.type == target) return child;
+        TypeKind const ck = interner.kind(child.type);
+        TypeKind const tk = interner.kind(target);
+        // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-
+        // STRING closure, 2026-06-02): `Array<T,N>` rvalue in a
+        // `Ptr<T>` context decays to the address of the first
+        // element. Emitted as a `Cast` HIR node (the universal
+        // type-conversion marker); HIR→MIR's `mapCast` recognizes
+        // the Array→Ptr pair and routes to the appropriate
+        // materialization (for string literals: synthesize the
+        // MirGlobal + emit GlobalAddr; for local arrays: anchored
+        // D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY).
+        //
+        // Pin the same-element-type rule isAssignable already
+        // checked: only matching `Array<T,N>`/`Ptr<T>` qualifies
+        // for the decay. The HIR verifier expects the Cast's
+        // result type matches `target` here.
+        //
+        // Anchor: D-LANG-STRUCTURAL-DECAY-OPT-OUT (per-language
+        // opt-out when a non-C-family schema wants strict-no-
+        // implicit-decay semantics).
+        if (ck == TypeKind::Array && tk == TypeKind::Ptr) {
+            auto const arrElem = interner.operands(child.type);
+            auto const ptrElem = interner.operands(target);
+            if (!arrElem.empty() && !ptrElem.empty()
+                && arrElem[0] == ptrElem[0]) {
+                HirNodeId const decay = builder.makeCast(
+                    child.id, target, HirFlags::Synthetic);
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({decay, it->second});
+                        break;
+                    }
+                }
+                return {decay, target};
+            }
+        }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds) is the implicit-conversion surface.
-        TypeKind const ck = interner.kind(child.type);
-        TypeKind const tk = interner.kind(target);
         auto isArithmetic = [](TypeKind k) noexcept {
             return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
                 || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32
@@ -168,9 +248,10 @@ struct Lowerer {
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
-            HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp)
+            HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
+            std::vector<HirExternRecord>& ed)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
-          reporter(r), builder(b), literals(lits), spans(sp) {
+          reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -260,14 +341,23 @@ struct Lowerer {
         return id;
     }
 
-    void unsupported(NodeId node, std::string detail) {
+    // Parameterized lowering-error emission. Post-fold #7 simplifier
+    // R1 + type-design T2: collapses the previous per-code helpers
+    // (`unsupported`, `externHasInitializer`) into a neutrally-named
+    // core so a third H_* code lands as one inline call site, not a
+    // third near-identical helper.
+    void emitH(DiagnosticCode code, NodeId node, std::string detail) {
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::H_UnsupportedLoweringForKind;
+        d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree().source().id();
         d.span     = node.valid() ? tree().span(node) : SourceSpan::empty(0);
         d.actual   = std::move(detail);
         reporter.report(std::move(d));
+    }
+    void unsupported(NodeId node, std::string detail) {
+        emitH(DiagnosticCode::H_UnsupportedLoweringForKind,
+              node, std::move(detail));
     }
     HirNodeId errorNode(NodeId cst, TypeId type = InvalidType) {
         return track(builder.addLeaf(HirKind::Error, type, 0, HirFlags::HasError), cst);
@@ -2328,7 +2418,7 @@ struct Lowerer {
             discNode = descend(node, decl.kindByChild->childPath);
             if (discNode.valid() && tree().kind(discNode) == NodeKind::Internal
                 && tree().rule(discNode).v == decl.kindByChild->whenRule.v) {
-                return lowerFunction(node, sym, type, *decl.kindByChild, discNode);
+                return lowerFunction(node, sym, type, decl, *decl.kindByChild, discNode);
             }
         }
         // Global.
@@ -2336,7 +2426,7 @@ struct Lowerer {
             return reportedError(node, "array declarator is deferred to HR9 "
                                        "(the lattice has no Array type yet)");
         std::optional<HirNodeId> init;
-        RuleId const skip = decl.arraySuffix ? decl.arraySuffix->rule : RuleId{};
+        RuleId const skip = arraySuffixSkipRule(decl);
         for (NodeId c : descendantsForInit(node, skip)) if (isExprNode(c)) {
             // Coerce the initializer to the declared variable type — the same
             // discipline `lowerVarLike` applies for local VarDecls. Without
@@ -2358,6 +2448,68 @@ struct Lowerer {
     // to c-subset's dual-purpose `topLevelDecl`+kindByChild. Reads the params/body
     // subtrees from the semantic DeclarationRule's `paramsChild`/`bodyChild`
     // visible-child indices.
+    // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN (source-agnostic): if the
+    // language's semantic config declares this function's name in
+    // `implicitReturnZeroForFunctionNames` AND the return type is
+    // non-void AND `body` is a Block AND the body doesn't
+    // structurally terminate, return a new Block that wraps the
+    // original children + a synthetic `return <zero>`. Otherwise
+    // return `body` unchanged. Shared between `lowerFunctionDecl`
+    // (dedicated-rule front-ends like toy) and `lowerFunction`
+    // (kindByChild dispatch like c-subset's `topLevelDecl`) — both
+    // call this AFTER lowering the body and BEFORE handing it to
+    // `builder.makeFunction`.
+    [[nodiscard]] HirNodeId
+    maybeAppendImplicitReturnZero(NodeId node,
+                                  HirNodeId body,
+                                  SymbolId sym,
+                                  TypeId retType,
+                                  DeclarationRule const& decl) {
+        // Fast-path: most declaration forms declare no implicit-
+        // return-0 names — short-circuits before any type / model
+        // lookup.
+        if (decl.implicitReturnZeroForFunctionNames.empty()) return body;
+        // `retType.valid()` subsumes `sig.valid()` (caller computes
+        // retType as `sig.valid() ? interner.fnResult(sig) : InvalidType`).
+        if (!retType.valid()) return body;
+        // Integer-only — silent-failure F3 fold (audit on 3-stream
+        // parallel work). Excludes void, float, struct, ptr, etc.
+        if (!isIntegerReturnCore(interner.kind(retType))) return body;
+        if (builder.kind(body) != HirKind::Block) return body;
+        // `recordFor(sym) == nullptr` means upstream semantic
+        // analysis failed to mint a record for this declaration —
+        // a substrate-shape violation (every reached function decl
+        // must have a SymbolRecord). The earlier `retType.valid()`
+        // gate already implies `sig.valid()` which is set from
+        // `rec->type` at the call site, so this branch is in
+        // practice unreachable through the shipped grammars.
+        // Defensive `nullptr` skip preserved as belt-and-suspenders
+        // — silent-failure F2 fold.
+        auto const* rec = model.recordFor(sym);
+        if (rec == nullptr) return body;
+        if (std::ranges::find(
+                decl.implicitReturnZeroForFunctionNames, rec->name)
+            == decl.implicitReturnZeroForFunctionNames.end())
+            return body;
+        if (pathTerminates(builder, body)) return body;
+
+        // Build the synthetic return — a zero literal of retType
+        // wrapped in a ReturnStmt, both flagged Synthetic. Then
+        // wrap the original body's children + the new return in a
+        // fresh outer Block (also Synthetic). The original Block
+        // node remains in the arena but is orphaned — HIR is built
+        // bottom-up immutable; node mutation is not supported.
+        HirNodeId const zero = synthZeroOrError(node, retType);
+        HirNodeId const ret  = track(
+            builder.makeReturn(zero, HirFlags::Synthetic), node);
+        auto const oldKids = builder.children(body);
+        std::vector<HirNodeId> newKids(
+            oldKids.begin(), oldKids.end());
+        newKids.push_back(ret);
+        return track(
+            builder.makeBlock(newKids, HirFlags::Synthetic), node);
+    }
+
     HirNodeId lowerFunctionDecl(NodeId node) {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "function decl has no semantics rule");
@@ -2377,11 +2529,15 @@ struct Lowerer {
         // around the call to handle nested functions if a future frontend
         // emits them (today's grammars don't).
         TypeId const savedReturn = currentReturnType_;
-        currentReturnType_ = sig.valid() ? interner.fnResult(sig) : InvalidType;
+        TypeId const retType =
+            sig.valid() ? interner.fnResult(sig) : InvalidType;
+        currentReturnType_ = retType;
         HirNodeId body = (decl.bodyChild && *decl.bodyChild < vis.size())
                        ? lowerStmt(vis[*decl.bodyChild])
                        : track(builder.makeBlock({}), node);
         currentReturnType_ = savedReturn;
+        body = maybeAppendImplicitReturnZero(
+            node, body, sym, retType, decl);
         return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 
@@ -2398,6 +2554,20 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // FF6 Slice 2 (2026-06-02 + post-fold #1 simplifier): record
+        // the extern for FFI synthesis. The canonical name comes
+        // from the SymbolRecord (unmangled identifier as declared
+        // in source). Empty name when the semantic phase couldn't
+        // resolve the symbol — synthesize() then fails loud with
+        // F_FfiIngestEmptyCanonical PROVIDED the language has a
+        // per-format library entry; if the language config has no
+        // entry the upstream F_FfiNoImportLibraryForFormat fires
+        // FIRST and short-circuits before the per-extern guard.
+        // Both surfaces are unsuppressable + upstream-of-link.
+        auto recordExtern = [&](HirNodeId h) {
+            auto const* rec = model.recordFor(sym);
+            externDecls.push_back({h, rec ? rec->name : std::string{}});
+        };
         if (decl.kindByChild) {
             NodeId disc = descend(node, decl.kindByChild->childPath);
             if (disc.valid() && tree().kind(disc) == NodeKind::Internal
@@ -2405,22 +2575,99 @@ struct Lowerer {
                 std::vector<HirNodeId> params;
                 NodeId paramsNode = descend(disc, decl.kindByChild->paramsPath);
                 if (paramsNode.valid()) collectParams(paramsNode, params);
-                return track(builder.makeExternFunction(type, sym.v, params), node);
+                HirNodeId const n =
+                    track(builder.makeExternFunction(type, sym.v, params), node);
+                recordExtern(n);
+                return n;
             }
         }
-        return track(builder.makeExternGlobal(type, sym.v), node);
+        // D-FF2-3: reject `extern int x = 5;` (and `= y`, `= {}`, etc.).
+        // An extern announces a symbol whose storage lives in another
+        // translation unit; an initializer would either redefine the
+        // symbol locally (contradicting `extern`) or be silently dropped
+        // at lowering.
+        //
+        // SHAPE-based detection (post-fold #7 silent-failure F4): the
+        // varDeclTail subtree's visible children are at most {
+        // arrayDeclSuffix, AssignOp + initValue, EndStatement }. Any
+        // internal child that isn't arrayDeclSuffix IS the initValue
+        // subtree — even when its contents are empty (`= {}`) or
+        // contain no expression nodes. Pre-fix the check walked for
+        // `isExprNode` descendants which missed empty-brace inits.
+        //
+        // Post-fold #8 silent-failure H1 + post-fold #9 H2 split:
+        // distinguish "engine-config error" (kindByChild absent → the
+        // language hasn't told the engine HOW to navigate the extern's
+        // tail) from "parse-recovery shape" (kindByChild IS configured
+        // but `descend` returned invalid/non-Internal for THIS
+        // particular CST). Different audiences, different remediations,
+        // different codes:
+        //   - H_UnsupportedLoweringForKind: grammar-author config bug
+        //   - H_ExternDeclMalformed: incomplete/malformed user source
+        // Pre-split both arms collapsed into UnsupportedLoweringForKind
+        // and blamed the grammar config for what could be a recovery
+        // shape. No shipped grammar trips either arm today (c-subset
+        // configures kindByChild + the `if (model.hasErrors()) return`
+        // short-circuit in FF2/lowering paths catches malformed
+        // input upstream), but defensive split prevents either future
+        // surface from re-opening the D-FF2-3 silent-drop.
+        if (!decl.kindByChild) {
+            emitH(DiagnosticCode::H_UnsupportedLoweringForKind, node,
+                  "externDecl rule has no kindByChild configuration — "
+                  "the engine cannot locate the varDeclTail-equivalent "
+                  "subtree to check for an initializer. Configure "
+                  "`kindByChild` in the language's semantics so this "
+                  "extern shape can be lowered safely");
+            return errorNode(node);
+        }
+        NodeId const varDeclTail = descend(node, decl.kindByChild->childPath);
+        if (!varDeclTail.valid()
+            || tree().kind(varDeclTail) != NodeKind::Internal) {
+            // Post-fold #12 D-FF2-MSG-JARGON: user-facing message
+            // names the user-source problem ("incomplete declaration")
+            // not the engine internals ("kindByChild->childPath",
+            // "Internal node", "CST"). The diagnostic infrastructure
+            // already carries the source span for the user to inspect.
+            emitH(DiagnosticCode::H_ExternDeclMalformed, node,
+                  "extern declaration is incomplete or malformed at "
+                  "this position — the declaration's body structure "
+                  "could not be located; check that the declaration "
+                  "is complete (e.g. `extern int x;` without an "
+                  "initializer, or `extern int f(int);` for a "
+                  "function declaration)");
+            return errorNode(node);
+        }
+        RuleId const skipRule = arraySuffixSkipRule(decl);
+        for (NodeId c : visible(varDeclTail)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (skipRule.valid()
+                && tree().rule(c).v == skipRule.v) continue;
+            emitH(DiagnosticCode::H_ExternHasInitializer, c,
+                  "extern declarations cannot carry an "
+                  "initializer — storage lives in another "
+                  "translation unit; remove the initializer");
+            return errorNode(node);
+        }
+        HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), node);
+        recordExtern(g);
+        return g;
     }
 
     HirNodeId lowerFunction(NodeId node, SymbolId sym, TypeId sig,
+                            DeclarationRule const& decl,
                             KindDiscriminator const& disc, NodeId discNode) {
         std::vector<HirNodeId> params;
         NodeId paramsNode = descend(discNode, disc.paramsPath);
         if (paramsNode.valid()) collectParams(paramsNode, params);
         NodeId bodyNode = descend(discNode, disc.bodyPath);
         TypeId const savedReturn = currentReturnType_;
-        currentReturnType_ = sig.valid() ? interner.fnResult(sig) : InvalidType;
+        TypeId const retType =
+            sig.valid() ? interner.fnResult(sig) : InvalidType;
+        currentReturnType_ = retType;
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
         currentReturnType_ = savedReturn;
+        body = maybeAppendImplicitReturnZero(
+            node, body, sym, retType, decl);
         return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 
@@ -2516,6 +2763,10 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     HirBuilder builder{model.unit().compositeSourceLanguage()};
     HirLiteralPool literals;
     std::vector<std::pair<HirNodeId, HirSourceLoc>> spans;
+    // FF6 Slice 2 (2026-06-02): shared accumulator for source-
+    // declared externs across every per-schema Lowerer. Moved
+    // into the result struct after lowering completes.
+    std::vector<HirExternRecord> externDecls;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -2526,7 +2777,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         if (lowerers.contains(sch.schemaId().v)) continue;
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
-            reporter, builder, literals, spans));
+            reporter, builder, literals, spans, externDecls));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -2542,6 +2793,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
 
     auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
+    result->externDecls = std::move(externDecls);
 
     // verify-on-load.
     HirVerifier verifier{result->hir, &result->sourceMap, &model.lattice().interner()};
