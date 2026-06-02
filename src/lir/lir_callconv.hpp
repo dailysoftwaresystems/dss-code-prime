@@ -164,6 +164,19 @@ struct DSS_EXPORT FrameLayout {
     std::uint32_t       outgoingArgAreaSize = 0; // bytes reserved at [SP+0..) for THIS function's outgoing stack args
     std::uint32_t       savedRegAreaSize  = 0;  // bytes occupied by callee-saved regs
     std::uint32_t       spillAreaSize     = 0;  // bytes occupied by spill slots
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): byte
+    // count for body-declared local allocas (one `alloca` LIR op =
+    // one `slotSize`-byte slot). Allocas live ABOVE spill slots in
+    // the frame layout (positive RSP offset post-prologue). The
+    // materialize pass rewrites each `alloca` to a `lea result,
+    // [sp + localAreaOffset() + i*slotSize]` using the 3-op LEA
+    // form. Slot assignment is by scan order (first alloca in
+    // function source order = local index 0). The `numLocalAllocas`
+    // field carries the count so the layout can be reproduced by
+    // any consumer (debug-info unwind, audit tests) without
+    // re-scanning the LIR.
+    std::uint32_t       localAreaSize     = 0;  // bytes occupied by local-alloca slots
+    std::uint32_t       numLocalAllocas   = 0;  // count of `alloca` LIR ops in this function
     std::uint32_t       slotSize          = 0;  // uniform per-class spill-slot width (bytes; = max(GPR width, FPR width))
     std::uint32_t       outgoingSlotSize  = 0;  // outgoing-arg slot width (bytes; = pointer width = GPR width)
     std::vector<LirReg> savedRegs;              // callee-saved phys regs actually used
@@ -193,6 +206,31 @@ struct DSS_EXPORT FrameLayout {
     [[nodiscard]] constexpr std::uint32_t
     spillAreaOffset() const noexcept {
         return outgoingArgAreaSize + savedRegAreaSize;
+    }
+
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b): local-alloca area
+    // starts immediately after the spill area (above spills in the
+    // stack-grows-down convention; positive offset from post-prologue
+    // RSP). Each alloca i (0-indexed by scan order) sits at
+    // `localAreaOffset() + i * slotSize`. Zero when this function
+    // has no body-local declarations — backward-compatible with all
+    // pre-13.3b shapes (corpus tests + globals-only examples).
+    //
+    // **Frame-zone ordering [outgoing | saved | spill | LOCALS]
+    // rationale** (7-agent fold A4): locals-on-top is correct for
+    // two compounding reasons. (1) Spills are touched on EVERY
+    // function call's reg-pressure-driven save/restore traffic;
+    // keeping them closer to SP enables smaller disp8 displacement
+    // encodings on x86_64 (1-byte vs 4-byte disp32) — measurable
+    // .text-size win on spill-heavy functions. (2) Saved-reg area
+    // must be adjacent to the prologue's push sequence for unwind-
+    // info correctness on Windows x64 (.pdata FrameRegister offset
+    // pins the saved-reg block at a known position relative to the
+    // post-prologue SP). Locals-above-spill is also LLVM's x86
+    // FrameLowering convention.
+    [[nodiscard]] constexpr std::uint32_t
+    localAreaOffset() const noexcept {
+        return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize;
     }
 };
 

@@ -153,6 +153,7 @@ computeFrameLayout(LirFuncAllocation const& alloc,
                    std::vector<LirReg> savedRegs,
                    bool hasCalls,
                    std::uint32_t outgoingArgSlots,
+                   std::uint32_t numLocalAllocas,
                    DiagnosticReporter& reporter) {
     std::uint32_t const slotWidth = std::max(widthForClass(schema, LirRegClass::GPR),
                                              widthForClass(schema, LirRegClass::FPR));
@@ -189,19 +190,35 @@ computeFrameLayout(LirFuncAllocation const& alloc,
         : 0u;
     layout.savedRegAreaSize    = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
     layout.spillAreaSize       = alloc.numSpillSlots * slotWidth;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): local
+    // allocas sit ABOVE the spill area in the layout (positive RSP
+    // offset post-prologue). Each alloca consumes one slotSize-byte
+    // slot; ordering is by LIR scan order (the same order
+    // `computeNumLocalAllocas` discovers them, so materializeOneFunc
+    // assigns the same indices). slotSize matches the spill stride
+    // (max(GPR, FPR) = 16 on x86_64) for uniformity — locals are
+    // never wider than slotSize today; an aggregate-local cycle
+    // would extend this with per-alloca size encoded in the LIR
+    // alloca instruction's payload.
+    layout.numLocalAllocas     = numLocalAllocas;
+    layout.localAreaSize       = numLocalAllocas * slotWidth;
     layout.hasCalls            = hasCalls;
     // Frame zones stack from SP+0 upward: outgoing-args, saved regs,
-    // spill slots. Caller-side `frame_store srcReg, [sp + outgoingOffset]`
-    // writes into this function's outgoing area at offset
-    // `cc.shadowSpaceBytes + overflowIndex * slotWidth` (the shadow
-    // space occupies the first cc.shadowSpaceBytes bytes; explicit
-    // overflow args begin AFTER it). Callee reads at
-    // `[sp + totalFrameSize + cc.callPushBytes +
-    // cc.shadowSpaceBytes + overflowIndex * slotWidth]` from its
-    // own post-prologue RSP — the caller's outgoing area sits above
-    // the callee's full frame + the post-CALL return-address push.
+    // spill slots, then local-alloca slots. Caller-side `frame_store
+    // srcReg, [sp + outgoingOffset]` writes into this function's
+    // outgoing area at offset `cc.shadowSpaceBytes + overflowIndex *
+    // slotWidth` (the shadow space occupies the first
+    // cc.shadowSpaceBytes bytes; explicit overflow args begin AFTER
+    // it). Callee reads at `[sp + totalFrameSize + cc.callPushBytes +
+    // cc.shadowSpaceBytes + overflowIndex * slotWidth]` from its own
+    // post-prologue RSP — the caller's outgoing area sits above the
+    // callee's full frame + the post-CALL return-address push. Local
+    // allocas at `[sp + localAreaOffset() + i*slotWidth]` post-
+    // prologue (D-CSUBSET-LOCAL-INT-CODEGEN); the materialize pass
+    // emits `lea result, [sp + offset]` for each `alloca` opcode.
     std::uint32_t const rawPreShadow =
-        layout.outgoingArgAreaSize + layout.savedRegAreaSize + layout.spillAreaSize;
+        layout.outgoingArgAreaSize + layout.savedRegAreaSize
+        + layout.spillAreaSize    + layout.localAreaSize;
     std::uint32_t const align = (cc.stackAlignment > 0) ? cc.stackAlignment : 1u;
     if (hasCalls) {
         // Non-leaf: alignedSizeWithBias with callPushBytes as the
@@ -249,6 +266,54 @@ functionHasCalls(Lir const& src, LirFuncId fn,
         }
     }
     return false;
+}
+
+// D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): count the
+// `alloca` virtual ops in `fn`. Each becomes one local-area frame
+// slot of `slotSize` bytes; the materialize pass rewrites it to
+// `lea result, [sp + localAreaOffset() + i * slotSize]` using the
+// 3-op no-index `lea` form.
+//
+// Source-language and target agnostic: the predicate is mnemonic-
+// match on the (per-target) `alloca` opcode handle. A target that
+// declares no `alloca` opcode passes `allocaOp == 0` (invalid
+// sentinel, never matches a real input opcode) and the count is
+// zero for any function — the frame layout collapses to its
+// pre-13.3b shape, preserving backward compatibility with all
+// shader / WASM / operand-stack targets that don't have body-local
+// allocas.
+//
+// Pre-scan happens at materializeOneFunc time (parallel to the
+// `functionHasCalls` + `computeMaxOutgoingStackArgs` pre-scans),
+// not at MIR→LIR time, so the count includes any post-regalloc
+// inserts (none today, but defensive against future passes that
+// could synthesize local slots).
+//
+// D-CSUBSET-ALLOCA-COUNT-CACHE (anchor, 7-agent fold F2): the count
+// IS knowable at MIR→LIR time — each MIR Alloca maps 1:1 to an LIR
+// alloca op. Caching it on `LirFuncAllocation` (one uint32_t per
+// function) would eliminate this O(blocks × insts) re-scan for the
+// common case of "target has alloca, function has 0 allocas". The
+// re-scan is 1 of 4 existing per-function pre-scans (callee-saved
+// collection + `functionHasCalls` + `computeMaxOutgoingStackArgs`)
+// so the incremental cost is marginal today; closure waits for
+// profile evidence. Trigger: profiling shows > 0.5% of compile
+// time in this helper on multi-function modules.
+[[nodiscard]] std::uint32_t
+functionLocalAllocaCount(Lir const& src, LirFuncId fn,
+                         std::uint16_t allocaOp) noexcept {
+    if (allocaOp == 0) return 0u;
+    std::uint32_t count = 0;
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const instN = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < instN; ++i) {
+            LirInstId const inst = src.blockInstAt(blk, i);
+            if (src.instOpcode(inst) == allocaOp) ++count;
+        }
+    }
+    return count;
 }
 
 // D-ML7-2.2 (closed co-with-D-ML7-2.6, 2026-06-02): compute the
@@ -381,6 +446,25 @@ void emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
     b.addInst(loadOp, result, ops);
 }
 
+// D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): emit
+// `result = lea [SP + offset]` — the address of a frame-local slot
+// in a register. `lea` operand layout per x86_64.target.json 3-op
+// no-index variant: [base_reg, MemBase(scale), MemOffset(disp)] —
+// 3 ops + result. Same operand shape as `load`/`store`; the
+// distinction is the opcode (`lea` produces an EFFECTIVE ADDRESS,
+// not a memory access). Used by the materialize pass to rewrite
+// `alloca` instructions into `lea`-of-frame-slot — assigning each
+// alloca a fixed offset above the spill area.
+void emitFrameAddr(LirBuilder& b, std::uint16_t leaOp, LirReg result,
+                   LirReg sp, std::int32_t offset) {
+    std::array<LirOperand, 3> ops{
+        LirOperand::makeReg(sp),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(offset)
+    };
+    b.addInst(leaOp, result, ops);
+}
+
 void emitPrologue(LirBuilder& b, FrameLayout const& layout,
                   LirReg sp, std::uint16_t subOp, std::uint16_t storeOp) {
     emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
@@ -433,6 +517,15 @@ struct OpcodeHandles {
     // how the linker patches disp32 (IAT slot RVA vs callee RVA).
     // The materialize pass treats both identically for arg setup.
     std::uint16_t callIndirectViaExtern;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): the
+    // `alloca` virtual op is materialized by the callconv pass into
+    // `lea result, [sp + localAreaOffset() + i*slotSize]` using the
+    // 3-op no-index `lea` form. The opcode handle pair must both
+    // resolve — a target without `lea` would naturally lack `alloca`
+    // too (both anchored on register-machine ABIs); the loader
+    // rejects loud if either is missing AND `alloca` is exercised.
+    std::uint16_t alloca_;
+    std::uint16_t lea;
 };
 
 // Resolve a cc register-name reference to a typed `LirReg`. Returns
@@ -556,7 +649,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 10> const table{{
+    std::array<Entry, 12> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -574,6 +667,17 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // extern is lowered, so the absence here is safe.
         {&OpcodeHandles::callIndirectViaExtern,
          "call_indirect_via_extern", true},
+        // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+        // optional — a target without body-local allocas (e.g., a
+        // shader / WASM target where locals are operand-stack
+        // values, not stack slots) legitimately omits both. When
+        // present they MUST both resolve: a target declaring
+        // `alloca` without `lea` (or vice versa) is a schema
+        // misconfiguration. The materialize pass fails loud if it
+        // encounters an `alloca` instruction without the `lea`
+        // handle resolved.
+        {&OpcodeHandles::alloca_,    "alloca",     true},
+        {&OpcodeHandles::lea,        "lea",        true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -623,9 +727,17 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     std::uint32_t const outgoingArgSlots = hasCalls
         ? computeMaxOutgoingStackArgs(src, fn, schema, cc)
         : 0u;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): pre-
+    // scan `alloca` opcodes; the prologue reserves one slotSize-byte
+    // slot per body-local declaration. Order-by-scan = order-by-
+    // materialize-arm — the materialize loop assigns the same index
+    // i to the same alloca as the count pre-scan visited.
+    std::uint32_t const numLocalAllocas =
+        functionLocalAllocaCount(src, fn, h.alloca_);
     auto layoutOpt = computeFrameLayout(alloc, schema, cc,
                                         std::move(usedSaved),
                                         hasCalls, outgoingArgSlots,
+                                        numLocalAllocas,
                                         reporter);
     if (!layoutOpt.has_value()) return false;
     outLayout = std::move(*layoutOpt);
@@ -642,6 +754,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     }
 
     std::uint32_t const slotSize = outLayout.slotSize;
+
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): counter
+    // advanced once per `alloca` instruction in scan order. Matches
+    // the order `functionLocalAllocaCount` visited at frame-layout
+    // time, so each alloca's offset is stable + reproducible.
+    std::uint32_t localAllocaIndex = 0;
 
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
@@ -739,6 +857,50 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         + overflowIdx * outLayout.outgoingSlotSize);
                     emitFrameLoad(b, h.load, result, sp, offset);
                 }
+                continue;
+            }
+
+            // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+            // materialize `alloca` virtual op into `lea result,
+            // [sp + localAreaOffset() + i * slotSize]`. Placed next
+            // to the `arg` arm because both produce a frame-resident
+            // value into a physreg result (vs. the call arm which is
+            // an explicit ABI-shaped emission sequence). `h.alloca_`
+            // is the (optional) opcode handle; the loader leaves it
+            // 0 for targets that don't declare alloca (shaders, WASM
+            // — operand-stack ABIs have no body-local stack slots),
+            // and `op == 0` never matches a real input opcode.
+            // `h.lea` MUST resolve when h.alloca_ does — a schema
+            // declaring one without the other is a misconfiguration
+            // that we fail loud on at the per-instruction site.
+            if (h.alloca_ != 0 && op == h.alloca_) {
+                if (h.lea == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: target schema declares "
+                                       "'alloca' opcode but no 'lea' opcode "
+                                       "— required to materialize alloca as "
+                                       "`lea result, [sp + offset]` per "
+                                       "D-CSUBSET-LOCAL-INT-CODEGEN"));
+                    return false;
+                }
+                if (!result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_VirtualRegInPostRegalloc,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: alloca inst {} has no "
+                                       "physical-reg result after regalloc",
+                                       inst.v));
+                    return false;
+                }
+                // Assign this alloca a local index by scan order
+                // (matches functionLocalAllocaCount's traversal —
+                // shared loop nesting + identical instruction visit
+                // order guarantee the two counters stay in sync).
+                std::int32_t const offset = static_cast<std::int32_t>(
+                    outLayout.localAreaOffset()
+                    + localAllocaIndex * outLayout.slotSize);
+                ++localAllocaIndex;
+                emitFrameAddr(b, h.lea, result, sp, offset);
                 continue;
             }
 

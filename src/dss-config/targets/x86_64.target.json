@@ -495,10 +495,23 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
-      "$comment": "Integer two's-complement negate. AS1 emits x86_64 `neg`.",
+      "$comment": "Integer two's-complement negate — REX.W 0xF7 /3 (NEG r/m64). D-CSUBSET-LOCAL-INT-CODEGEN closure (step 13.3b, 2026-06-02): encoding row added so c-subset's unary minus (`-x`) lowers through the assembler. requires2Address mirrors the sub/mul shape — the operand IS the destination, the 2-addr legalize pass guarantees this invariant before encoding (insert a mov when result != operand[0] at MIR→LIR time). modrmRegExt=3 fills ModR/M.reg with the /3 opcode-extension digit.",
       "mnemonic": "neg", "result": "value",
+      "requires2Address": true,
       "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Float arithmetic (cycle 3d FPR wave). FAdd → `addsd`/`addss` per width; cycle 3d emits the abstract opcode and lets AS1 pick the right scalar variant from the operand width.",

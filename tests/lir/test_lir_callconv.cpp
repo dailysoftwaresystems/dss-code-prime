@@ -11,6 +11,8 @@
 #include "core/types/target_schema.hpp"
 #include "diagnostic_count.hpp"
 #include "lir/lir.hpp"
+
+#include <algorithm>
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
@@ -299,14 +301,25 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
                   static_cast<std::uint32_t>(layout.savedRegs.size()) * layout.slotSize);
         EXPECT_EQ(layout.spillAreaSize,
                   bundle.alloc.perFunc[i].numSpillSlots * layout.slotSize);
+        // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+        // localAreaSize == numLocalAllocas * slotSize. Each body-
+        // local declaration (`int a1; int r; ...`) emits one
+        // `alloca` LIR op which the materialize pass rewrites to a
+        // `lea`-of-frame-slot above the spill area.
+        EXPECT_EQ(layout.localAreaSize,
+                  layout.numLocalAllocas * layout.slotSize);
+        EXPECT_EQ(layout.localAreaOffset(),
+                  layout.outgoingArgAreaSize + layout.savedRegAreaSize
+                      + layout.spillAreaSize);
         // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02) + D-ML7-2.2
-        // (2026-06-02): expected formula now incorporates
-        // outgoingArgAreaSize directly (which already includes the
-        // callee's shadow-space when hasCalls). No separate max()
-        // with shadowSpaceBytes — already baked into outgoingArgAreaSize.
+        // (2026-06-02) + D-CSUBSET-LOCAL-INT-CODEGEN (2026-06-02):
+        // expected formula incorporates outgoingArgAreaSize directly
+        // (already includes the callee's shadow-space when hasCalls)
+        // AND the new localAreaSize above the spill area.
         std::uint32_t const raw = layout.outgoingArgAreaSize
                                 + layout.savedRegAreaSize
-                                + layout.spillAreaSize;
+                                + layout.spillAreaSize
+                                + layout.localAreaSize;
         std::uint32_t expected;
         if (layout.hasCalls) {
             expected = dss::alignedSizeWithBias(
@@ -407,14 +420,26 @@ struct InstStats {
     // [SymbolRef] (the post-ML7-cycle-2 shape) or carries extra Reg
     // operands (the pre-cycle-2 shape — would fail at the assembler).
     std::uint32_t callsWithOnlySymbol = 0;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+    // post-materialize, EVERY `alloca` LIR op must be rewritten to
+    // a `lea result, [sp + offset]`. Survival of an `alloca` would
+    // trip A_NoEncodingDeclared at the assembler. The 7-agent F3
+    // audit added these counters + the per-lea-offset capture so
+    // the materialize-loop's offset arithmetic is unit-pinned, not
+    // just the layout-arithmetic invariant.
+    std::uint32_t                 allocaOps  = 0;
+    std::uint32_t                 leaOps     = 0;
+    std::vector<std::int32_t>     leaOffsets;  // per-lea MemOffset value
 };
 
 [[nodiscard]] InstStats
 collectInstStats(Lir const& lir, TargetSchema const& schema) {
     InstStats s;
-    auto const argOp  = schema.opcodeByMnemonic("arg");
-    auto const callOp = schema.opcodeByMnemonic("call");
-    auto const movOp  = schema.opcodeByMnemonic("mov");
+    auto const argOp    = schema.opcodeByMnemonic("arg");
+    auto const callOp   = schema.opcodeByMnemonic("call");
+    auto const movOp    = schema.opcodeByMnemonic("mov");
+    auto const allocaOp = schema.opcodeByMnemonic("alloca");
+    auto const leaOp    = schema.opcodeByMnemonic("lea");
     for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
         LirFuncId const fn = lir.funcAt(fi);
         for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
@@ -424,6 +449,23 @@ collectInstStats(Lir const& lir, TargetSchema const& schema) {
                 std::uint16_t const op = lir.instOpcode(inst);
                 if (argOp.has_value()  && op == *argOp)  ++s.argOps;
                 if (movOp.has_value()  && op == *movOp)  ++s.movOps;
+                if (allocaOp.has_value() && op == *allocaOp) ++s.allocaOps;
+                if (leaOp.has_value() && op == *leaOp) {
+                    ++s.leaOps;
+                    // Capture the disp32 of the 3-op LEA variant
+                    // (`lea result, [base + disp32]` — operand layout
+                    // [base_reg, MemBase, MemOffset]). Other variants
+                    // (4-op indexed; 1-op SymbolRef RipRel) are
+                    // captured as 0 since they're not the alloca-
+                    // materialize shape.
+                    auto const ops = lir.instOperands(inst);
+                    std::int32_t off = 0;
+                    if (ops.size() == 3
+                        && ops[2].kind == LirOperandKind::MemOffset) {
+                        off = ops[2].offset;
+                    }
+                    s.leaOffsets.push_back(off);
+                }
                 if (callOp.has_value() && op == *callOp) {
                     ++s.callOps;
                     auto const ops = lir.instOperands(inst);
@@ -1463,4 +1505,112 @@ TEST(LirCallconv, NonLeafFunctionOnWin64CcReservesFullShadowSpaceFrame) {
            "lands ≡ 0 mod 16 at the call site (the rule that makes "
            "puts's internal SSE movaps NOT fault)";
     EXPECT_TRUE(fLayout->hasCalls);
+}
+
+// D-CSUBSET-LOCAL-INT-CODEGEN substrate-tier tests (7-agent fold F3,
+// 2026-06-02): the FrameLayoutInvariantsHoldPerFunction test pins
+// the layout-arithmetic invariant (localAreaSize == numLocalAllocas
+// * slotSize). It does NOT pin the materialize-loop's behavior:
+// (a) every `alloca` rewrites to a `lea`; (b) the i-th alloca's
+// MemOffset is exactly localAreaOffset() + i*slotSize; (c) two
+// allocas get distinct, monotonically-increasing offsets (an
+// off-by-one in localAllocaIndex would silently alias slot 0 for
+// every alloca, miscompiling a function with multiple locals). The
+// hello_writefile E2E pin only exercises ONE local (`int written;`)
+// so its passing exit code does NOT pin the multi-local case.
+TEST(LirCallconvAbi, AllocaMaterializesToLeaInScanOrder) {
+    // Two body-local int declarations → two `alloca` LIR ops →
+    // two `lea` insts post-materialize, with distinct MemOffsets
+    // that are consecutive `slotSize`-strided from `localAreaOffset`.
+    auto bundle = lowerThroughRewrite(
+        "int f() { int a; int b; return 0; }\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const stats = collectInstStats(result.lir, *bundle.lowered.target);
+    EXPECT_EQ(stats.allocaOps, 0u)
+        << "every `alloca` virtual op must be rewritten by the "
+           "materialize pass — survival trips A_NoEncodingDeclared "
+           "at the assembler";
+    EXPECT_GE(stats.leaOps, 2u)
+        << "two body-local declarations should produce at least two "
+           "`lea` instructions (one per alloca)";
+    // f is the only function (no g), so its layout is at index 0.
+    ASSERT_GE(result.perFunc.size(), 1u);
+    auto const& layout = result.perFunc[0];
+    EXPECT_EQ(layout.numLocalAllocas, 2u);
+    // The first two leas (in scan order) must carry offsets
+    // localAreaOffset() and localAreaOffset() + slotSize. There may
+    // be additional `lea`s from other lowering paths in the LIR
+    // (e.g. global addresses) — pin that AT LEAST the two expected
+    // offsets appear among the captured set.
+    bool const firstFound = std::find(
+        stats.leaOffsets.begin(), stats.leaOffsets.end(),
+        static_cast<std::int32_t>(layout.localAreaOffset()))
+        != stats.leaOffsets.end();
+    bool const secondFound = std::find(
+        stats.leaOffsets.begin(), stats.leaOffsets.end(),
+        static_cast<std::int32_t>(layout.localAreaOffset()
+                                  + layout.slotSize))
+        != stats.leaOffsets.end();
+    EXPECT_TRUE(firstFound)
+        << "expected a `lea` with MemOffset = localAreaOffset() "
+           "for the first body-local (`int a;`)";
+    EXPECT_TRUE(secondFound)
+        << "expected a `lea` with MemOffset = localAreaOffset() + "
+           "slotSize for the second body-local (`int b;`) — an "
+           "off-by-one in localAllocaIndex would alias both to slot 0";
+}
+
+// 7-agent fold F3 negative pin: an `alloca` instruction whose
+// `result` reg is virtual (post-regalloc would have made it
+// physical) fails loud with `L_VirtualRegInPostRegalloc`. The
+// scenario is structurally impossible through the normal pipeline
+// (regalloc always runs before materialize) but matters for
+// hand-built LIR fixtures (synthesizers, JIT paths, future
+// linker-tier helpers per D-LIR-ALLOCA-LOWERING-EXTRACTION).
+TEST(LirCallconvAbi, AllocaWithVirtualResultFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    auto const allocaOp = sch.opcodeByMnemonic("alloca");
+    auto const retOp    = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(allocaOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    // alloca with a VIRTUAL result vreg (not physical). The
+    // materialize pass MUST reject this with the post-regalloc
+    // invariant diagnostic — letting it through would emit a
+    // `lea <virtual>, [sp + offset]` that the encoder can't handle.
+    LirReg const vresult = b.newVReg(LirRegClass::GPR);
+    b.addInst(*allocaOp, vresult, std::span<LirOperand const>{});
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    EXPECT_FALSE(result.ok())
+        << "materialize must reject a hand-built LIR with a virtual "
+           "alloca result — the post-regalloc invariant requires "
+           "all result vregs to be physical";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  ccRep,
+                  DiagnosticCode::L_VirtualRegInPostRegalloc), 1u)
+        << "the diagnostic code must be the post-regalloc invariant "
+           "code specifically, not any other error";
 }
