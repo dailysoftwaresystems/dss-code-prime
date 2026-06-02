@@ -194,6 +194,100 @@ TEST(LirRegAlloc, ForFuncResolvesByFuncId) {
     EXPECT_EQ(out.forFunc(lir.funcAt(1))->fn.v, lir.funcAt(1).v);
 }
 
+TEST(LirRegAlloc, Requires2AddressResultExcludesOpsOneThroughN) {
+    // D-CSUBSET-BINOP-RIGHT-CLOBBER mechanism pin (2026-06-02).
+    //
+    // The end-to-end example pins (examples/c-subset/arithmetic +
+    // subtraction + register_pressure) prove the bug-class is
+    // closed AT THE EXIT-CODE LEVEL, but a refactor that "got
+    // lucky" with the chosen inputs would pass those examples
+    // while breaking the regalloc-tier exclusion mechanism (per
+    // code-architect + test-analyzer 7-agent audit findings).
+    // This test pins the MECHANISM directly:
+    //
+    //   For every `requires2Address` LIR instruction in the
+    //   produced module, the result vreg's physical register
+    //   MUST NOT equal any of its source operand[k>=1]'s
+    //   physical registers. Operand[0] alias remains permitted
+    //   (the legitimate 2-addr coalesce case).
+    //
+    // A regression that removes `tryAllocateExcluding`, regresses
+    // the `lir.instResult(producingInst) == r.vreg` guard
+    // (silent-failure HIGH-3 fold), or makes `findSpillCandidate`
+    // exclusion-blind again (silent-failure HIGH-1 fold), would
+    // re-introduce result==ops[k] aliasing — and THIS test would
+    // catch it independently of the end-to-end examples.
+    auto lowered = lowerCSubsetToLir(
+        "int f(int x, int y) {\n"
+        "    return x * y;\n"
+        "}\n");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter regallocRep;
+    LirAllocation const out = allocateRegisters(
+        lowered.lir.lir, *lowered.target, lv,
+        /*ccIndex=*/0, regallocRep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_EQ(out.perFunc.size(), 1u);
+    auto const& alloc = out.perFunc[0];
+    Lir const& lir = lowered.lir.lir;
+
+    // Resolve any LirOperand (vreg-or-physreg form) to a physical
+    // ordinal via the allocation map. Returns nullopt when the
+    // operand isn't a register or the assignment is spilled.
+    auto physOrdinalOf =
+        [&](LirOperand const& op) -> std::optional<std::uint32_t> {
+        if (op.kind != LirOperandKind::Reg) return std::nullopt;
+        if (op.reg.isPhysical) return op.reg.id;
+        auto const* a = alloc.forVReg(op.reg.id);
+        if (a == nullptr || a->isSpilled()) return std::nullopt;
+        return a->physReg().id;
+    };
+
+    bool foundAtLeastOne2AddrInst = false;
+    std::size_t const funcCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            std::uint32_t const instCount = lir.blockInstCount(blk);
+            for (std::uint32_t ii = 0; ii < instCount; ++ii) {
+                LirInstId const inst = lir.blockInstAt(blk, ii);
+                auto const op = lir.instOpcode(inst);
+                auto const* info = lowered.target->opcodeInfo(op);
+                if (info == nullptr || !info->requires2Address) {
+                    continue;
+                }
+                foundAtLeastOne2AddrInst = true;
+                LirReg const resultReg = lir.instResult(inst);
+                auto const resultOrd = physOrdinalOf(
+                    LirOperand::makeReg(resultReg));
+                if (!resultOrd.has_value()) continue;
+                auto const ops = lir.instOperands(inst);
+                for (std::size_t k = 1; k < ops.size(); ++k) {
+                    auto const opOrd = physOrdinalOf(ops[k]);
+                    if (!opOrd.has_value()) continue;
+                    EXPECT_NE(*resultOrd, *opOrd)
+                        << "requires2Address inst "
+                        << info->mnemonic
+                        << " has result physReg = ops[" << k
+                        << "].physReg (= " << *resultOrd
+                        << "); the 2-addr legalize would emit "
+                        << "`mov result, ops[0]` and CLOBBER "
+                        << "ops[" << k
+                        << "]'s value before the binary op reads "
+                        << "it (D-CSUBSET-BINOP-RIGHT-CLOBBER "
+                        << "regression).";
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(foundAtLeastOne2AddrInst)
+        << "test source must produce at least one requires2Address "
+           "instruction to exercise the exclusion mechanism";
+}
+
 TEST(LirRegAlloc, AllPhysicalAssignmentsAreDistinctAtAnyPoint) {
     // The substrate contract: at any given live point, two
     // simultaneously-live vregs cannot share a physical register.
