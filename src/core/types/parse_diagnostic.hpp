@@ -388,20 +388,30 @@ enum class DiagnosticCode : std::uint16_t {
     //   `H_UnsupportedLoweringForKind`: "remove the initializer", not
     //   "extend the engine".
     H_ExternHasInitializer        = 0xF00A,
-    // H_ExternDeclMalformed: the lowering's defensive arm reached an
-    //   `externDecl` whose CST cannot be navigated to the
-    //   varDeclTail-equivalent subtree — the language config IS
-    //   correct (kindByChild present), but `descend(childPath)`
-    //   returned invalid or a non-Internal node for this particular
-    //   instance. Today's c-subset short-circuits at semantic-error
-    //   time, so this arm is structurally unreachable through shipped
-    //   grammars — but a future grammar permitting recovery shapes
-    //   that reach lowering would trip it. Remediation: fix the input
-    //   (it's incomplete or malformed at this position).
+    // H_ExternDeclMalformed: two user-facing triggers — both surface
+    //   a malformed user-source extern declaration the analyzer
+    //   couldn't recover. Remediation in both arms: fix the input.
+    //   (1) The lowering's defensive arm reached an `externDecl`
+    //   whose CST cannot be navigated to the varDeclTail-equivalent
+    //   subtree — the language config IS correct (kindByChild
+    //   present), but `descend(childPath)` returned invalid or a
+    //   non-Internal node for this particular instance. Today's
+    //   c-subset short-circuits at semantic-error time, so this arm
+    //   is structurally unreachable through shipped grammars — but
+    //   a future grammar permitting recovery shapes that reach
+    //   lowering would trip it. D-FF2 H2 audit fold (post-fold
+    //   #8/#9).
+    //   (2) D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3a,
+    //   2026-06-02): the optional trailing `"libname"` string-literal
+    //   inside `externFuncTail` had a malformed C-escape sequence
+    //   (e.g. `\xZZ`) — `decodeStringLiteralBody` returned nullopt
+    //   and the lowerer could neither honor the override nor
+    //   silently fall back to the format-level default (which would
+    //   leak to a wrong-DLL link with no breadcrumb). 6-agent
+    //   2nd-order audit F4 fold.
     //   Distinct from `H_UnsupportedLoweringForKind` (engine config
     //   error — language hasn't configured kindByChild) and from
     //   `H_ExternHasInitializer` (user-source init contradiction).
-    //   D-FF2 H2 audit fold (post-fold #8/#9).
     H_ExternDeclMalformed         = 0xF00B,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"

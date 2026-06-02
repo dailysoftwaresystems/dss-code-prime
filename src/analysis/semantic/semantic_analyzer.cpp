@@ -1698,41 +1698,39 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // const-eval pre-pass producing a typed integer-zero result that both
 // tiers can recognize uniformly.
 //
-// Implementation: walks the subtree counting visible TOKEN children
-// (rejects if any operator-token child is present) AND visible Internal
-// children (rejects if there are siblings to the typed leaf). The single
-// admitted shape is a chain of single-child wrappers around the
-// IntLiteral leaf — which is what the parser produces for a bare `0`.
+// **Honest behavior note** (2nd-order audit comment-analyzer #3,
+// 2026-06-02): the helper itself rejects `-0` (returns false on the
+// MinusOp non-literal token). But callers thread through
+// `subtreeType` first to compute `argTy`; with `-0` the operator-stop
+// in subtreeType returns InvalidType, and the caller's
+// `if (!argTy.valid()) continue;` cascade-suppression silently
+// skips the assignability check — `f(-0)` neither admits nor fires
+// a diagnostic. Closing this cascade-suppression false-negative
+// requires pass-2 expression typing on unary wrappers (anchored at
+// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS full closure).
 //
-// Source-agnostic: the rule fires only when the active language
-// declares `pointerConversions.nullPointerConstantFromIntegerZero:true`
-// (default false — Rust/Swift-friendly).
+// Implementation: walks the subtree, rejecting on any non-literal
+// token (operator / delimiter / etc.) and requiring exactly one
+// typed integer-literal Token leaf with decoded value 0.
 [[nodiscard]] bool
 isLiteralIntegerZero(EngineState const& s, Tree const& tree, NodeId node) {
     if (!node.valid()) return false;
     NodeId onlyLeaf;
-    int    typedCount    = 0;
-    int    nonEmptyToken = 0;
+    int    typedCount = 0;
     std::vector<NodeId> stack{node};
     while (!stack.empty()) {
         NodeId cur = stack.back();
         stack.pop_back();
         if (tree.kind(cur) == NodeKind::Token) {
             if (isEmptySpace(tree.flags(cur))) continue;
-            // ANY non-empty-space token (operator, delimiter, etc.)
-            // BEYOND the single literal token disqualifies the
-            // admission. Without this, `(0)` (wrappers contribute
-            // ParenOpen+ParenClose tokens) would still admit — which
-            // is actually fine for paren-wrap — but `-0` (MinusOp +
-            // IntLiteral) would admit too, and the HIR coerce()
-            // tier can't match against `UnaryOp(Neg, Literal(0))`.
-            // Reject all operator tokens.
-            ++nonEmptyToken;
             auto const tk = tree.tokenKind(cur);
             auto litIt = s.idx().literalTypeIds.find(tk.v);
             if (litIt == s.idx().literalTypeIds.end()) {
                 // Non-literal token (operator / delimiter / etc.) —
-                // reject.
+                // reject. This is the single gate that rules out
+                // `-0` (MinusOp present), `(0)` (ParenOpen present),
+                // `0 + 0` (PlusOp present), etc. — matching HIR
+                // coerce()'s `HirKind::Literal`-only admit shape.
                 return false;
             }
             if (!s.typeAt(cur).valid()) continue;
@@ -1744,7 +1742,6 @@ isLiteralIntegerZero(EngineState const& s, Tree const& tree, NodeId node) {
             if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
         }
     }
-    (void)nonEmptyToken;  // diagnostic-only future expansion hook
     if (typedCount != 1 || !onlyLeaf.valid()) return false;
     auto const tk = tree.tokenKind(onlyLeaf);
     auto litIt = s.idx().literalTypeIds.find(tk.v);
@@ -1764,7 +1761,11 @@ isLiteralIntegerZero(EngineState const& s, Tree const& tree, NodeId node) {
 // conversion. The shape is shared between checkCall arg-check,
 // checkReturn, and pass-2 decl-init — all three must read it identically
 // so a NULL passed as call-arg, return-value, or initializer behaves
-// the same. Source-agnostic via the per-language config flag.
+// the same. Source-agnostic: the rule fires only when the active
+// language declares `pointerConversions.nullPointerConstantFromIntegerZero:
+// true` (default false — Rust/Swift-friendly). The flag check lives
+// here; `isLiteralIntegerZero` is a structural-only helper that
+// makes no config check.
 [[nodiscard]] bool
 admitsNullPointerConstant(EngineState const& s, Tree const& tree,
                           TypeId lhsTy, NodeId rhsExpr,
@@ -1829,41 +1830,62 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId node) {
     // stop entirely. Trigger: first c-subset feature that needs
     // S_TypeMismatch on a unary/binary call-arg, init, or return.
     auto const& opTable = tree.schema().operatorTable();
+    // 2nd-order audit fix (silent-failure + code-reviewer Critical,
+    // step 13.3a): the previous arity-based check was BROKEN. C-style
+    // operators like `-`, `+`, `*`, `&` are registered for BOTH
+    // Prefix AND Infix arities at the same `SchemaTokenId`. So
+    // `lookup(PlusOp, Prefix)` returns Some EVEN when the token is
+    // appearing in an INFIX position — which silently cascade-
+    // suppressed mismatches on every binary-arithmetic call-arg
+    // (`f(a+b)` where `f` takes a pointer would no-op the strict
+    // mismatch check). The fix is POSITION-BASED:
+    //   * Prefix detection = FIRST non-empty visible child IS a
+    //     prefix-capable token. The first-position discipline
+    //     distinguishes Prefix-USE from Infix-USE of the same
+    //     SchemaTokenId at the CST tier.
+    //   * Ternary detection = ANY visible Token child with Ternary
+    //     arity (the `?` of `c ? a : b` sits in middle position,
+    //     not first; its presence in the wrapper is sufficient).
+    //
+    // EXCLUDED dispatchers (deliberate — no stop):
+    //   * Postfix-grouped CALL wrappers (`f(args)`): typed by pass 2
+    //     at the call-typing arm (`s.nodeToType.set(node, fnTy.result)`),
+    //     so `typeAt(node)` returns the call's result type before
+    //     descent. Subscript wrappers (`a[i]`) are NOT typed by
+    //     pass 2 today — c-subset has no subscript surface, so
+    //     reverting to descend-through is no regression. Pass-2
+    //     subscript typing anchored at the D-SEMANTIC-SUBTREETYPE-
+    //     TRANSPARENT-WRAPPERS full closure trigger.
+    //   * Infix (`a + b`): first-position child is the LHS (an
+    //     Internal), so the prefix check naturally won't fire.
+    //     Type-preserving for integer arithmetic; inner leaf type
+    //     matches the wrapper's evaluated type.
+    //   * Postfix `i++` / `i--`: first-position child is the
+    //     operand (Internal), prefix check won't fire. Value-
+    //     modifying but type-preserving.
+    //
+    // Stops on type-preserving Prefix (`-x`/`+x`/`!x`/`~x`) are
+    // false-positives but match the pre-13.2 cascade-suppression
+    // shape — preferable to the false-NEGATIVE class the operator-
+    // table heuristic was added to prevent. Full closure (pass-2
+    // expression typing) anchored.
     auto holdsOperator = [&](NodeId internal) {
-        // F1 audit fix (6-agent 2nd-order, step 13.3a): match ONLY
-        // Prefix + Ternary arities. EXCLUDE Postfix and Infix:
-        //   * Postfix-grouped (`f(args)` / `a[i]`) shares the
-        //     `ParenOpen`/`BracketOpen` SchemaTokenId with structural
-        //     paren/bracket wrappers — matching them would stop
-        //     descent at any `(p)` / `[expr]` wrapper, silently
-        //     regressing 13.2's bare-identifier mismatch pin.
-        //     Postfix-grouped wrappers are TYPED by pass 2 anyway
-        //     (call results at the standard call-arg arm), so the
-        //     wrapper's typeAt returns valid before descent begins.
-        //   * Infix (`a + b`) is type-preserving for integer
-        //     arithmetic; the inner leaf's type matches the
-        //     wrapper's evaluated type. Returning the inner type
-        //     is correct, no stop needed.
-        //   * Postfix `i++` / `i--` is value-modifying but
-        //     type-preserving (post-increment returns the pre-
-        //     increment value of the same type) — also no stop.
-        //
-        // Prefix stops cover the genuinely-type-changing cases:
-        // `&x` (T → Ptr<T>), `*p` (Ptr<T> → T). Stops on
-        // type-preserving prefix `-x`/`+x`/`!x`/`~x` are
-        // false-positives but match the pre-13.2 cascade-suppress
-        // behavior — preferable to the false-NEGATIVE class the
-        // operator-table heuristic was added to prevent. Full
-        // closure (pass-2 expression typing) anchored.
-        // Ternary `c ? a : b` re-types via unify — stop is correct.
+        bool first = true;
         for (auto child : tree.children(internal)) {
             if (isEmptySpace(tree.flags(child))) continue;
-            if (tree.kind(child) != NodeKind::Token) continue;
+            if (tree.kind(child) != NodeKind::Token) {
+                first = false;
+                continue;
+            }
             auto const tk = tree.tokenKind(child);
-            if (opTable.lookup(tk, OperatorArity::Prefix).has_value()
-                || opTable.lookup(tk, OperatorArity::Ternary).has_value()) {
+            if (first
+                && opTable.lookup(tk, OperatorArity::Prefix).has_value()) {
                 return true;
             }
+            if (opTable.lookup(tk, OperatorArity::Ternary).has_value()) {
+                return true;
+            }
+            first = false;
         }
         return false;
     };

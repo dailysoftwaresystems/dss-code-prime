@@ -378,6 +378,62 @@ TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsInit) {
         << "`int* p = 0;` initializer is a null pointer constant";
 }
 
+// 2nd-order audit pin (code-reviewer Critical, step 13.3a): the
+// initial F1 fix used arity-based `OperatorTable.lookup(tk, Prefix)`,
+// which would have incorrectly matched binary-arithmetic operator
+// tokens (MinusOp/PlusOp/StarOp/BitAndOp are registered for BOTH
+// Prefix and Infix arities at the SAME SchemaTokenId in
+// c-subset.lang.json:128). The position-based fix only fires when
+// the FIRST visible child is a prefix-capable token — distinguishing
+// `-x` (first-position) from `a-b` (first-position is `a`). This
+// pin asserts S_TypeMismatch STILL fires on `f(1+1)` where `f`
+// takes a pointer; pre-position-fix it would have silently
+// cascade-suppressed.
+TEST(SemanticAnalyzerCSubset, InfixArithmeticStillFiresMismatchAtCallArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(char* p);\n"
+        "int main() { f(1+1); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "int (from `1+1`) → char* must fire mismatch — the "
+           "subtreeType operator-stop must NOT match PlusOp on its "
+           "INFIX usage at this wrapper (first-position child is "
+           "the integer literal, not the operator)";
+}
+
+// 2nd-order audit pin (silent-failure B-1, step 13.3a): document
+// the CURRENT cascade-suppression behavior on `f(-0)` so a future
+// tightening of subtreeType (pass-2 expression typing closure)
+// EXPLICITLY surfaces this case. Today the operator-stop returns
+// InvalidType for the `-0` wrapper (MinusOp at first position is
+// a registered Prefix operator); the call-arg check then
+// silently suppresses via `if (!argTy.valid()) continue;`. NO
+// diagnostic fires. This is the documented trade-off: false-
+// negative on Prefix-`-` rather than false-positive on `a-b`. The
+// fix is pass-2 expression typing of unary wrappers (anchored at
+// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS full closure). If a
+// future tightening EITHER emits a diagnostic for `f(-0)` OR
+// admits `-0` as a null-pointer constant, this test will fail and
+// the maintainer will need to consciously update the pin.
+TEST(SemanticAnalyzerCSubset, NegativeZeroSilentlySuppressedAtCallArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(void* p);\n"
+        "int main() { f(-0); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // CURRENT documented behavior: zero diagnostics. Pre-13.3a
+    // (with the original looser arity-check) and post-13.3a (with
+    // the position-based stop) BOTH produce zero diagnostics here
+    // — silent-suppression via cascade. Pin so future closures
+    // surface the change.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+}
+
 // F1 audit-fix pin (6-agent 2nd-order, step 13.3a): paren-wrapped
 // distinct-typed pointers must STILL fire S_TypeMismatch. Pre-fix,
 // subtreeType's operator-stop heuristic matched ParenOpen (shared
