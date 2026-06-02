@@ -74,10 +74,17 @@ struct EncodingState {
     // Addressing mode for the ModR/M.mod field. RegDirect (mod=11)
     // is the cycle-1 register-only shape; MemDisp32 (mod=10) emits
     // a 32-bit displacement and forces SIB when base.lo3 == 4.
+    // RipRel (mod=00) emits [rip + disp32] with ModR/M.rm forced
+    // to 0b101 (D-LK4-RODATA-PRODUCER 2026-06-02).
     // Values chosen so `static_cast<uint8_t>(modMode)` IS the ModR/M.mod
     // field directly (no lookup table needed). RegDirect = 11b (mod=3);
-    // MemDisp32 = 10b (mod=2 + 32-bit displacement follows).
-    enum class ModMode : std::uint8_t { RegDirect = 0b11, MemDisp32 = 0b10 };
+    // MemDisp32 = 10b (mod=2 + 32-bit displacement follows); RipRel =
+    // 00b (mod=0 + 32-bit displacement follows, rm forced to 5).
+    enum class ModMode : std::uint8_t {
+        RegDirect = 0b11,
+        MemDisp32 = 0b10,
+        RipRel    = 0b00,
+    };
     ModMode               modMode    = ModMode::RegDirect;
     // Memory-mode 32-bit displacement (from a Disp32Mem slot —
     // immediate value, NOT relocated). std::optional makes the
@@ -439,17 +446,27 @@ bool encode(Lir const&                  lir,
             }
         } else if (srcOp.kind == LirOperandKind::SymbolRef) {
             // Plan 13 AS4 — symbol-bearing wire emits a Relocation.
-            // Cycle scope: only Disp32 supports the symbol-relative
-            // encoding on x86-variable. validate() pairs Disp32 with
-            // a non-empty `wire.relocationKind`; we re-check
-            // defensively in case a malformed Lir bypassed validate.
-            if (wire.slotKind != EncodingSlotKind::Disp32) {
+            // Two symbol-bearing slots today:
+            //   * Disp32       — pure 4-byte rel32 placeholder (e.g.
+            //                    `call rel32`, `jmp rel32`); no ModR/M
+            //                    involvement.
+            //   * RipRelDisp32 — RIP-relative addressing form (e.g.
+            //                    `lea r64, [rip + sym]`); the encoder
+            //                    additionally forces ModR/M.mod=00 +
+            //                    ModR/M.rm=101 below. D-LK4-RODATA-
+            //                    PRODUCER (2026-06-02).
+            // validate() pairs both with a non-empty `wire.relocationKind`;
+            // we re-check defensively in case a malformed Lir bypassed
+            // validate.
+            bool const isDisp32       = wire.slotKind == EncodingSlotKind::Disp32;
+            bool const isRipRelDisp32 = wire.slotKind == EncodingSlotKind::RipRelDisp32;
+            if (!isDisp32 && !isRipRelDisp32) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': SymbolRef operand wired "
-                                   "to non-Disp32 slot '{}' — cycle-4 "
-                                   "x86-variable scope supports symbol "
-                                   "references only on Disp32 slots",
+                                   "to non-symbol slot '{}' — x86-variable "
+                                   "scope supports symbol references only "
+                                   "on Disp32 or RipRelDisp32 slots",
                                    info->mnemonic,
                                    encodingSlotKindName(wire.slotKind)));
                 return false;
@@ -457,7 +474,7 @@ bool encode(Lir const&                  lir,
             if (!wire.relocationKind.has_value()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
-                       std::format("opcode '{}': wire to Disp32 slot has "
+                       std::format("opcode '{}': wire to symbol slot has "
                                    "no `relocationKind` — validate() "
                                    "should have rejected this schema",
                                    info->mnemonic));
@@ -466,9 +483,9 @@ bool encode(Lir const&                  lir,
             if (st.disp32.has_value()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
-                       std::format("opcode '{}': second writer to Disp32 "
-                                   "slot — only one symbol-relative "
-                                   "slot per instruction in cycle-4",
+                       std::format("opcode '{}': second writer to a "
+                                   "symbol-relative slot — only one "
+                                   "symbol reference per instruction",
                                    info->mnemonic));
                 return false;
             }
@@ -476,6 +493,19 @@ bool encode(Lir const&                  lir,
                 *wire.relocationKind,
                 SymbolId{srcOp.symbolV}
             };
+            // RipRelDisp32: force the ModR/M state to the RIP-
+            // relative form. mod=00 rm=101 names "[rip + disp32]"
+            // in 64-bit mode — this slot repurposes the encoding
+            // that meant "[disp32]" (absolute 32-bit displacement,
+            // no base register) in 32-bit mode. The reg field
+            // carries the result register from the variant's
+            // `resultSlot: "modrm.reg"` wiring, which fired before
+            // the source-operand loop began.
+            if (isRipRelDisp32) {
+                st.hasModRm  = true;
+                st.modMode   = EncodingState::ModMode::RipRel;
+                st.modRmRm3  = 0b101u;
+            }
         } else {
             // Guard already screened by operandsMatchGuard, so this
             // only fires on a corrupted Lir.

@@ -87,6 +87,17 @@ LinkedImage link(AssembledModule const&    inputModule,
     for (auto const& fn : module.functions) {
         declaredSymbols.insert(fn.symbol);
     }
+    // D-LK4-RODATA-PRODUCER (2026-06-02): rodata `AssembledData`
+    // items are also valid reloc targets. The format walker
+    // (pe.cpp::encodeExec for PE) merges them into its symbolVa
+    // map at `rdata->rva + section-offset`. The linker's
+    // pre-walker cross-reference check must accept them here so
+    // a .text → rodata REL32 doesn't fire K_SymbolUndefined.
+    std::unordered_set<SymbolId> dataSymbols;
+    dataSymbols.reserve(module.dataItems.size());
+    for (auto const& di : module.dataItems) {
+        dataSymbols.insert(di.symbol);
+    }
     std::unordered_set<SymbolId> externSymbols;
     externSymbols.reserve(module.externImports.size());
     for (std::size_t i = 0; i < module.externImports.size(); ++i) {
@@ -187,20 +198,25 @@ LinkedImage link(AssembledModule const&    inputModule,
             // target is undefined should surface BOTH diagnostics
             // in one pass, not require two link attempts.
             //
-            // A reloc target resolves if EITHER:
+            // A reloc target resolves if ANY of:
             //   (a) it names a defined function in this module, OR
             //   (b) it names an extern import (LK6 cycle 2 —
             //       resolved at link time via the per-format walker's
-            //       import-table emission).
+            //       import-table emission), OR
+            //   (c) it names a module-level data item — rodata global,
+            //       string literal global, etc. (D-LK4-RODATA-PRODUCER
+            //       2026-06-02 — the per-format walker merges these
+            //       into its symbolVa map at section-relative offsets).
             // Anything else is a hard undefined.
             if (!declaredSymbols.contains(reloc.target)
-             && !externSymbols.contains(reloc.target)) {
+             && !externSymbols.contains(reloc.target)
+             && !dataSymbols.contains(reloc.target)) {
                 std::string msg = "relocation in symbol #";
                 msg += std::to_string(fn.symbol.v);
                 msg += " references undefined symbol #";
                 msg += std::to_string(reloc.target.v);
-                msg += " (not declared by any AssembledFunction "
-                       "nor by any ExternImport)";
+                msg += " (not declared by any AssembledFunction, "
+                       "ExternImport, nor AssembledData item)";
                 report(reporter,
                        DiagnosticCode::K_SymbolUndefined,
                        DiagnosticSeverity::Error,

@@ -1257,27 +1257,34 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
     // Both functions exist.
     EXPECT_EQ(lir.moduleFuncCount(), 2u);
 
-    auto const movOp  = *sch.opcodeByMnemonic("mov");
+    auto const leaOp  = *sch.opcodeByMnemonic("lea");
     auto const callOp = *sch.opcodeByMnemonic("call");
+    // D-LK4-RODATA-PRODUCER (2026-06-02): GlobalAddr now lowers to
+    // `lea result, SymbolRef` (RIP-relative form) instead of the
+    // prior `mov result, SymbolRef`. The lea encoding has a real
+    // 1-operand variant on the assembler side; the prior `mov`
+    // shape tripped `A_NoMatchingEncodingVariant` at assemble time
+    // for any non-call-peepholed use of a GlobalAddr.
     // The 2nd function `g` must contain:
-    //   - mov result, symbolRef(f)   ← GlobalAddr(f)
+    //   - lea result, symbolRef(f)   ← GlobalAddr(f)
     //   - call calleeReg, argReg     ← the actual Call
     LirFuncId const gFn = lir.funcAt(1);
     LirBlockId const entry = lir.funcEntry(gFn);
-    bool foundGlobalAddrMov = false, foundCall = false;
+    bool foundGlobalAddrLea = false, foundCall = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         LirInstId const inst = lir.blockInstAt(entry, i);
         auto const op = lir.instOpcode(inst);
-        if (op == movOp) {
+        if (op == leaOp) {
             auto const ops = lir.instOperands(inst);
             if (ops.size() == 1 && ops[0].kind == LirOperandKind::SymbolRef) {
-                foundGlobalAddrMov = true;
+                foundGlobalAddrLea = true;
             }
         }
         if (op == callOp) foundCall = true;
     }
-    EXPECT_TRUE(foundGlobalAddrMov)
-        << "GlobalAddr must emit `mov result, symbolRef(symId)`";
+    EXPECT_TRUE(foundGlobalAddrLea)
+        << "GlobalAddr must emit `lea result, symbolRef(symId)` "
+           "(RIP-relative form, D-LK4-RODATA-PRODUCER 2026-06-02)";
     EXPECT_TRUE(foundCall)
         << "Call must emit the `call` opcode";
 }

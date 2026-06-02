@@ -151,6 +151,23 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         return false;
     }
 
+    // D-LK4-RODATA-PRODUCER (2026-06-02): materialize MIR globals
+    // into AssembledData items the linker emits as .rodata. The
+    // MIR globals model (MirBuilder::addGlobal) was already wired
+    // by HIR→MIR (e.g. `int g = 42;` at file scope produces a
+    // MirGlobal with constant-init literal pool entry); previously
+    // these globals were declared in MIR but DROPPED at assemble()
+    // since the assembler had no globals-bytes path. The new pass
+    // closes the producer thread end-to-end.
+    auto dataItems = lowerMirGlobalsToDataItems(
+        mir.mir, model.lattice().interner(), reporter);
+    if (!tierClean(reporter, asmEntry)) {
+        // Any per-global encoding error already raised a loud
+        // diagnostic via the function's internal `emit`.
+        return false;
+    }
+    assembled.dataItems = std::move(dataItems);
+
     // 11. Link.
     auto const linkEntry = reporter.errorCount();
     auto image = linker::link(assembled, target, format, reporter);

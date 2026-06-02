@@ -7,7 +7,9 @@
 #include "core/types/section_kind.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
+#include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 
 #include <cstdint>
@@ -330,5 +332,28 @@ assemble(Lir const&                 lir,
          // `externImports` directly on the returned
          // `AssembledModule`. (LK6 cycle 2d — D-LK6-6 closure.)
          std::span<ExternImport const> externs = {});
+
+// D-LK4-RODATA-PRODUCER (2026-06-02) — materialize module-level MIR
+// globals into `AssembledData` items the linker emits as `.rodata`
+// (PE walker) / `.rodata` (ELF) / `__cstring`+`__const` (Mach-O).
+//
+// Reads each MirGlobal from `mir`, looks up its `initLiteralIndex`
+// in the module's `MirLiteralPool`, and encodes the literal value
+// into LE wire bytes sized by the global's `TypeId`. The
+// `TypeInterner` is consulted for primitive byte sizes; aggregate
+// types (Struct / Array / Slice / Vector / Matrix) and pointer
+// types are anchored as follow-up cycles — the function fail-louds
+// (K_NoMatchingObjectFormat) on those today.
+//
+// Caller (`program/compile_pipeline.cpp` after `assemble()`)
+// assigns the returned vector to `AssembledModule::dataItems`
+// before invoking the linker. Empty-MIR-globals is empty-out;
+// runtime-init globals (those with `initFunc.valid()`) are SKIPPED
+// here — their bytes land via the synthesized `__module_init__`
+// function at module-load time, not via the rodata pipeline.
+[[nodiscard]] DSS_EXPORT std::vector<AssembledData>
+lowerMirGlobalsToDataItems(Mir const&          mir,
+                           TypeInterner const& interner,
+                           DiagnosticReporter& reporter);
 
 } // namespace dss

@@ -652,38 +652,44 @@ struct Lowerer {
 
     // ── cycle 3e: Calls + GlobalAddr ─────────────────────────────────
 
-    // MIR GlobalAddr → LIR `mov result, symbolRef(symId)`. The symbol
-    // is materialized as the function/global's address. Cycle 3e uses
-    // the existing `mov` opcode + the `LirOperandKind::SymbolRef`
-    // operand kind (already present in the LirOperand POD since cycle
-    // 1) — no new opcode needed.
+    // MIR GlobalAddr → LIR `lea result, [rip + sym]` (D-LK4-RODATA-
+    // PRODUCER 2026-06-02 — closes the prior `mov SymbolRef` gap).
+    // The address materialization is a pure 7-byte RIP-relative
+    // load-effective-address that emits a `rel32` Relocation
+    // against the symbol. Cross-target shape: ARM64 will declare
+    // its own LEA variant (ADRP+ADD pair, 2-instruction macro-op
+    // — anchored under D-LK10-ENTRY-ARM64).
     //
     // ML7 cycle 2 peephole impact: when this GlobalAddr's result is
     // consumed ONLY by a direct `Call`, the Call lowerer folds the
     // SymbolId straight into the LIR call's SymbolRef operand and
-    // never reads this GlobalAddr's emitted vreg. The Mov is emitted
-    // anyway (every MIR inst lowers in order) and remains in the
-    // stream as a dead def — regalloc handles dead vregs cleanly
-    // (single-instruction live range) but the assembler still emits
-    // bytes for it. Dead-Mov elimination for direct-call-only
-    // GlobalAddrs is anchored at D-ML7-2.9.
+    // never reads this GlobalAddr's emitted vreg. The LEA still
+    // emits 7 bytes into the function body as a dead def; regalloc
+    // handles the dead vreg, but the bytes remain in the binary.
+    // Dead-LEA elimination for direct-call-only GlobalAddrs is
+    // anchored at D-ML7-2.9 (carried forward from the prior `mov`
+    // shape — same elimination opportunity, same trigger).
     //
-    // Assembler-side: the `mov` opcode's current encoding variants
-    // are `["reg"]` and `["imm32"]` — neither accepts SymbolRef.
-    // A symbol-bearing `mov` requires a new variant (AS2/AS3 owns
-    // the rip-relative-lea synthesis); today a non-peepholed
-    // GlobalAddr-Mov would trip `A_NoMatchingEncodingVariant`. The
-    // direct-call peephole in `lowerCall` is what keeps c-subset
-    // running until that variant lands.
+    // Pre-D-LK4-RODATA-PRODUCER shape was `mov result, SymbolRef`,
+    // which tripped `A_NoMatchingEncodingVariant` at assemble-time
+    // because no `mov` variant accepted a SymbolRef operand. The
+    // direct-call peephole sidesteps the LEA's vreg (the call's
+    // SymbolRef operand is folded from the MIR-level GlobalAddr
+    // SymbolId, not from the LEA's result) — but `lowerGlobalAddr`
+    // still RUNS in source order, so the LEA's bytes still land in
+    // the binary as a dead def. Non-call uses (returning a global's
+    // address, loading from a global, etc.) were blocked by the
+    // missing `mov` SymbolRef variant pre-D-LK4-RODATA-PRODUCER;
+    // the LEA-RIP-rel variant unblocks them.
     void lowerGlobalAddr(MirInstId id) {
-        if (!opcode(MnemonicSlot::Mov).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Mov, "MIR GlobalAddr");
+        if (!opcode(MnemonicSlot::Lea).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Lea, "MIR GlobalAddr");
             return;
         }
         SymbolId const sym = mir.globalAddrSymbol(id);
         LirReg const result = lir.newVReg(regClassFor(id));
         std::array<LirOperand, 1> ops{LirOperand::makeSymbolRef(sym.v)};
-        emitInst(*opcode(MnemonicSlot::Mov), result, ops);
+        emitInst(*opcode(MnemonicSlot::Lea), result, ops);
         defineValue(id, result);
     }
 

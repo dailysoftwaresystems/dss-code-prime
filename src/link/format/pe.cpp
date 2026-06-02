@@ -667,6 +667,14 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> rdataBytes;
     std::optional<DataSectionLayout> rdata;
     ObjectFormatSectionInfo const* secRodata = nullptr;
+    // Per-dataItems index → section-relative byte offset (the
+    // start of that item's bytes within the concatenated .rdata
+    // payload). Used below to extend the linker's symbolVa map
+    // so .text relocations targeting a rodata SymbolId can
+    // resolve to `imageBase + rdata->rva + offsetInSection`.
+    // D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET (closed 2026-06-02).
+    std::vector<std::uint32_t> rdataItemOffsets;
+    rdataItemOffsets.reserve(module.dataItems.size());
     if (!module.dataItems.empty()) {
         secRodata = link::format::detail::requireSection(
             fmt, SectionKind::Rodata, "pe::encodeExec", reporter);
@@ -675,6 +683,8 @@ encodeExec(AssembledModule const&    module,
             std::uint64_t const aligned = d.alignment.alignUp(
                 static_cast<std::uint64_t>(rdataBytes.size()));
             while (rdataBytes.size() < aligned) rdataBytes.push_back(0);
+            rdataItemOffsets.push_back(
+                static_cast<std::uint32_t>(rdataBytes.size()));
             rdataBytes.insert(rdataBytes.end(),
                               d.bytes.begin(), d.bytes.end());
         }
@@ -853,6 +863,40 @@ encodeExec(AssembledModule const&    module,
                    "give each extern a unique SymbolId distinct "
                    "from function ids.");
             return {};
+        }
+    }
+    // D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET (closed 2026-06-02):
+    // each rodata `AssembledData` item joins the symbolVa map
+    // at `imageBase + rdata->rva + Σ aligned_size(items[0..i-1])`
+    // (Σ pre-computed as `rdataItemOffsets[i]` above). REL32 (and
+    // future ABS64) relocations in .text that target a rodata
+    // SymbolId now resolve correctly through the shared
+    // `applyExecRelocations` kernel.
+    if (rdata.has_value()) {
+        std::uint64_t const rdataSectionVa =
+            oh.imageBase + rdata->rva;
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            auto const& di = module.dataItems[i];
+            std::uint64_t const va =
+                rdataSectionVa + rdataItemOffsets[i];
+            // A rodata SymbolId colliding with a function or
+            // extern slot is a REDEFINITION (the same SymbolId
+            // was already populated in this map), NOT an
+            // undefined symbol. Use the semantically-correct
+            // `K_DuplicateDataSymbol` code so test pins via
+            // `countCode(rep, K_DuplicateDataSymbol)` won't be
+            // silently satisfied by an UNRELATED undefined-symbol
+            // regression elsewhere in the link path.
+            // (silent-failure HIGH-3 audit fold 2026-06-02.)
+            if (!symbolVa.emplace(di.symbol, va).second) {
+                emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                     std::string{"pe::encodeExec: rodata SymbolId #"}
+                     + std::to_string(di.symbol.v)
+                     + " collides with another symbol — caller must "
+                       "give each data item a unique SymbolId "
+                       "distinct from function/extern ids.");
+                return {};
+            }
         }
     }
     if (!link::format::applyExecRelocations(

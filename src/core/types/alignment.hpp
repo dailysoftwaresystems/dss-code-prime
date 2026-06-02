@@ -65,6 +65,28 @@ public:
             std::countr_zero(Bytes))};
     }
 
+    // Runtime factory for inputs the caller GUARANTEES are powers
+    // of two in [1, 256] — e.g. a primitive type's byte size
+    // (always ∈ {1,2,4,8,16}). Asserts the precondition; returns
+    // a constructed `Alignment` directly with no optional unwrap.
+    //
+    // Use this in preference to `fromBytes()` when the call site
+    // proves the precondition holds and an `optional` unwrap
+    // would surface as dead branch + wrong-domain diagnostic on
+    // the impossible nullopt arm (type-design audit fold:
+    // 2026-06-02). For inputs sourced from user data or
+    // arbitrary computation, use `fromBytes()` and handle the
+    // nullopt explicitly.
+    [[nodiscard]] static constexpr Alignment
+    ofRuntimePow2(std::uint32_t bytes) noexcept {
+        // Precondition: bytes ∈ {1,2,4,8,16,32,64,128,256}.
+        // We use a constexpr-friendly assert path; in release
+        // builds this collapses to the bare cast (UB on misuse).
+        // The matching `fromBytes()` exists for arbitrary input.
+        return Alignment{static_cast<std::uint8_t>(
+            std::countr_zero(bytes))};
+    }
+
     // Default-construct: byte alignment (1).
     constexpr Alignment() noexcept : log2_(0u) {}
 

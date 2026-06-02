@@ -378,11 +378,11 @@
       }
     },
     {
-      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)]. AS1 emits x86_64 `lea reg, [base + index*scale + disp]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm via 4-operand form. Encoding (D-AS4-5 close 2026-06-01): REX.W 0x8D /r ModR/M(mod=10, reg=result, rm=base) [SIB] disp32. Opcode 0x8D is the `lea` mnemonic; the rest matches the `load`/`store` shape since lea reads memory operands but writes only the EA (no memory access).",
+      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)] OR [SymbolRef] (RIP-relative form, D-LK4-RODATA-PRODUCER 2026-06-02). AS1 emits x86_64 `lea reg, [base + index*scale + disp]` / `lea reg, [rip + sym]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm via 4-operand form; RIP-relative arm materializes a module-level global's address into a register for downstream loads/stores or function-pointer calls. Encoding: REX.W 0x8D /r ModR/M [SIB?] disp32. Opcode 0x8D is the `lea` mnemonic; the modes differ only in ModR/M.mod (10 for [base+disp], 00 for [rip+disp]).",
       "mnemonic":      "lea",
       "result":        "value",
       "hasSideEffects": false,
-      "minOperands":   3,
+      "minOperands":   1,
       "maxOperands":   4,
       "minSuccessors": 0,
       "maxSuccessors": 0,
@@ -410,6 +410,15 @@
               { "index": 1, "slotKind": "sib.index"     },
               { "index": 2, "slotKind": "membase.scale" },
               { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "1-op RIP-relative form: `lea reg, [rip + sym]` (D-LK4-RODATA-PRODUCER 2026-06-02). The lone SymbolRef operand is wired to the RipRelDisp32 slot, which (a) records a rel32 Relocation at the trailing 4-byte position and (b) forces ModR/M to mod=00 rm=101 (the [rip+disp32] encoding in 64-bit mode). Used by `lowerGlobalAddr` to materialize a global's address into a register.",
+            "guard":      { "operandKinds": ["symbol"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
             ]
           }
         ]
