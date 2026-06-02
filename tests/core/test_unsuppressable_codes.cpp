@@ -64,6 +64,23 @@ TEST(UnsuppressableCodes, BothH2SplitArmsAreUnsuppressable) {
            "same silent-drop surface as the engine-config arm";
 }
 
+TEST(UnsuppressableCodes, EntryPointResolvesToExternIsUnsuppressable) {
+    // D-LK10-ENTRY-EXTERN-ENTRY-DIAG: extern-as-entry is a schema
+    // misconfiguration that would produce a runnable binary whose
+    // `_start` jumps to an unresolved IAT stub address — SEGV at
+    // process entry with no diagnostic trail. Suppressing this code
+    // would let the linker emit such a binary silently. The
+    // `ListSelfConsistent` test below iterates the closed table and
+    // proves every member is unsuppressable, but a refactor that
+    // dropped THIS member from the table would still pass that test
+    // (the table shrinks consistently). Named pin closes the
+    // membership-by-name regression (test-analyzer severity 8 on the
+    // 3rd-order audit of 39897eb).
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_EntryPointResolvesToExtern))
+        << "suppressing this would silently re-open the SEGV-at-"
+           "process-entry surface this code was added to close";
+}
+
 TEST(UnsuppressableCodes, RegularDiagnosticsRemainSuppressable) {
     // Stylistic / non-gating codes MUST stay suppressable so --suppress
     // remains a useful policy tool for the codes it was designed for.

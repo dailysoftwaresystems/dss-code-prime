@@ -277,15 +277,32 @@ TEST(Program_CompileFiles, NonMainWithoutExplicitReturnStillFailsLoud) {
     scratch.useAsCwd();
 
     Program prog;
+    DiagnosticReporter rep;
     int const rc = prog.compileFiles(
         {src.generic_string()},
         "c-subset",
-        {"x86_64:elf64-x86_64-linux"});
+        {"x86_64:elf64-x86_64-linux"},
+        rep);
     EXPECT_NE(rc, 0)
         << "non-main non-void function without explicit return "
            "must STILL fail the verifier — the implicit-return "
            "rule is scoped to the names the language declares "
            "(only `main` for c-subset)";
+    // test-analyzer C-3 fold (3rd-order audit on 39897eb): pin the
+    // EXACT diagnostic code so a regression that fails this corpus
+    // via a different code path (e.g., bailing in MIR-lowering
+    // before HIR verification) doesn't silently satisfy the loose
+    // rc != 0. The test's PURPOSE is to pin "implicit-return-0
+    // rule is scoped to names in the language config" — that's a
+    // property of `checkReturnCompleteness` firing in HirVerifier,
+    // not any later tier.
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::H_VerifierFailure),
+              1u)
+        << "exactly one H_VerifierFailure (from "
+           "checkReturnCompleteness on `helper`); a different "
+           "diagnostic code firing would mean the scope-restriction "
+           "is in the wrong tier";
 }
 
 TEST(Program_CompileFiles, OutputFlagMultiTargetPlacesArtifactsInFormatSubdirs) {

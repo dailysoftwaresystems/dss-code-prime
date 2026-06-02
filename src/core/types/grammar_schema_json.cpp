@@ -3295,6 +3295,39 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     rule.implicitReturnZeroForFunctionNames
                                         .push_back(s);
                                 }
+                                // Silent-failure F2 fold (3rd-order
+                                // audit on 39897eb): scan for
+                                // duplicate names and emit one
+                                // C_InvalidSemantics per occurrence.
+                                // Functionally idempotent at the
+                                // consumer (`std::ranges::find` is
+                                // find-first-then-stop), but a paste-
+                                // error duplicate in a language config
+                                // is a config bug the user wants to
+                                // catch at load time — mirrors the
+                                // codebase's `kUnsuppressableCodes`
+                                // consteval uniqueness invariant for
+                                // compile-time tables.
+                                std::size_t const n = rule
+                                    .implicitReturnZeroForFunctionNames
+                                    .size();
+                                for (std::size_t a = 0; a < n; ++a) {
+                                    for (std::size_t b = a + 1; b < n; ++b) {
+                                        if (rule.implicitReturnZeroForFunctionNames[a]
+                                         == rule.implicitReturnZeroForFunctionNames[b]) {
+                                            coll.emit(
+                                                DiagnosticCode::C_InvalidSemantics,
+                                                std::format(
+                                                    "{}/implicitReturnZeroForFunctionNames/{}",
+                                                    path, b),
+                                                std::format(
+                                                    "duplicate function name '{}' "
+                                                    "(already declared at index {})",
+                                                    rule.implicitReturnZeroForFunctionNames[a],
+                                                    a));
+                                        }
+                                    }
+                                }
                             }
                         }
 

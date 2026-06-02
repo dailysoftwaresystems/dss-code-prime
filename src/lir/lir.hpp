@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -253,5 +254,22 @@ private:
     // them for the never-terminated check.
     std::vector<LirBlockId> openFuncBlocks_;
 };
+
+// Pin the move-semantics contract at compile time. The `LirBuilder`'s
+// reference member (`target_`) makes move-assignment impossible to
+// implement correctly — the contract is "single-use, consumed by
+// `finish() &&`". A future change that re-defaults the move-assign
+// would silently regress clang's `-Wdefaulted-function-deleted` to
+// "implicitly deleted" again; the static_assert pins the contract
+// independently of compiler warnings. Type-design Q4 fold (3rd-order
+// audit on 39897eb).
+static_assert(!std::is_move_assignable_v<LirBuilder>,
+              "LirBuilder must not be move-assignable — `target_` "
+              "is a reference and the builder is single-use "
+              "(consumed by `finish() &&`).");
+static_assert(std::is_move_constructible_v<LirBuilder>,
+              "LirBuilder must remain move-constructible to support "
+              "transfer-by-rvalue (`Lir lir = std::move(b).finish()` "
+              "patterns + factory returns).");
 
 } // namespace dss

@@ -89,6 +89,31 @@ namespace {
     return k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64 || k == TypeKind::F128;
 }
 
+// Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-
+// RETURN. Restricted to I32+ / U32+ because the SysV AMD64 + MS x64
+// ABIs do NOT zero-extend sub-32-bit integer returns to the full GPR
+// — the trampoline's 64-bit `mov status, returnGprs[0]` would copy
+// indeterminate upper bits to the exit syscall arg → non-deterministic
+// exit code with no diagnostic. I32-and-up returns are safe because
+// `eax`-write zero-extends to `rax` on x86_64 (ISA invariant); 64-bit
+// types fill the GPR directly. Sub-i32 entry-fn returns are non-
+// conformant C99 (§5.1.2.2.3 requires `int` specifically), so falling
+// through to the verifier's loud-fail is the correct outcome.
+//
+// Placed at file scope alongside `isSignedCore` / `isFloatCore` for
+// consistency — this predicate is stateless and reads no member, so
+// the per-Lowerer `static` placement was unjustified coupling (type-
+// design Q3 fold, 3rd-order audit on 39897eb).
+[[nodiscard]] bool isIntegerReturnCore(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::I32: case TypeKind::I64: case TypeKind::I128:
+        case TypeKind::U32: case TypeKind::U64: case TypeKind::U128:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Post-fold #8 simplifier R2 + code-reviewer I1: the
 // `decl.arraySuffix ? decl.arraySuffix->rule : RuleId{}` pattern
 // appears at lowerTopLevel (global init walk) AND lowerExternDecl
@@ -2392,29 +2417,6 @@ struct Lowerer {
     // (kindByChild dispatch like c-subset's `topLevelDecl`) — both
     // call this AFTER lowering the body and BEFORE handing it to
     // `builder.makeFunction`.
-    // Integer-typed return-value predicate for the implicit-
-    // return-0 insertion. C99 §5.1.2.2.3 specifies `int main`;
-    // restricting to integer cores prevents a non-conformant
-    // `float main()` or `struct S main()` from silently getting a
-    // float / struct-typed synthetic return that the trampoline's
-    // `mov status, returnGprs[0]` would mis-read (the user-fn's
-    // return value would land in xmm0 or split GPR slots, not the
-    // integer return register). Non-int main fns fall through to
-    // the verifier's loud-fail — which is the correct outcome
-    // (non-int main is non-conformant C).
-    [[nodiscard]] static bool isIntegerReturnCore(TypeKind k) noexcept {
-        switch (k) {
-            case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32:
-            case TypeKind::I64: case TypeKind::I128:
-            case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
-            case TypeKind::U64: case TypeKind::U128:
-            case TypeKind::Bool: case TypeKind::Char: case TypeKind::Byte:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     [[nodiscard]] HirNodeId
     maybeAppendImplicitReturnZero(NodeId node,
                                   HirNodeId body,
