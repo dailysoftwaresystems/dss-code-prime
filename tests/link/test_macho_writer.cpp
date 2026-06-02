@@ -42,25 +42,15 @@ using namespace dss;
 
 namespace {
 
-[[nodiscard]] std::uint16_t readU16LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    return static_cast<std::uint16_t>(b[off])
-         | (static_cast<std::uint16_t>(b[off + 1]) << 8);
-}
-[[nodiscard]] std::uint32_t readU32LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    std::uint32_t v = 0;
-    for (int i = 0; i < 4; ++i)
-        v |= static_cast<std::uint32_t>(b[off + i]) << (i * 8);
-    return v;
-}
-[[nodiscard]] std::uint64_t readU64LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    std::uint64_t v = 0;
-    for (int i = 0; i < 8; ++i)
-        v |= static_cast<std::uint64_t>(b[off + i]) << (i * 8);
-    return v;
-}
+// D-TEST-LE-READ-HELPERS CLOSED at 8aabc04 audit fold; local LE
+// readers harmonized to the shared substrate at
+// `tests/link/link_test_support.hpp`. The fold left local copies
+// in this file dead-but-present; the 5ac97ae audit fold (4-agent
+// convergence: code-reviewer HIGH-1 + type-design Q5 + simplifier
+// S1 + comment-analyzer) drops them.
+using dss::link_format::test::readU16LE;
+using readU32LE;
+using dss::link_format::test::readU64LE;
 
 struct Loaded {
     std::shared_ptr<TargetSchema>       target;
@@ -131,23 +121,23 @@ TEST(MachOWriter, MachHeader64IdentityBytesMatchAppleAbi) {
     EXPECT_EQ(rep.errorCount(), 0u);
 
     // magic = MH_MAGIC_64 = 0xFEEDFACF
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 0), 0xFEEDFACFu);
+    EXPECT_EQ(readU32LE(bytes, 0), 0xFEEDFACFu);
     // cputype = CPU_TYPE_X86_64 = 0x01000007
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 4), 0x01000007u);
+    EXPECT_EQ(readU32LE(bytes, 4), 0x01000007u);
     // cpusubtype = CPU_SUBTYPE_X86_64_ALL = 3
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 8), 3u);
+    EXPECT_EQ(readU32LE(bytes, 8), 3u);
     // filetype = MH_OBJECT = 1
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 12), 1u);
+    EXPECT_EQ(readU32LE(bytes, 12), 1u);
     // ncmds = 2 (LC_SEGMENT_64 + LC_SYMTAB)
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 16), 2u);
+    EXPECT_EQ(readU32LE(bytes, 16), 2u);
     // sizeofcmds = 72 + 80*1 (segment+section) + 24 (symtab) = 176
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 20), 176u);
+    EXPECT_EQ(readU32LE(bytes, 20), 176u);
     // flags = 0 (MH_SUBSECTIONS_VIA_SYMBOLS deliberately NOT set
     // because cycle 1 emits a flat __text without subsection markers;
     // anchored as D-LK3-2 for the future subsection-emit cycle)
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 24), 0u);
+    EXPECT_EQ(readU32LE(bytes, 24), 0u);
     // reserved = 0
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 28), 0u);
+    EXPECT_EQ(readU32LE(bytes, 28), 0u);
 }
 
 // ── LC_SEGMENT_64 + section_64 two-level naming ─────────────────
@@ -161,8 +151,8 @@ TEST(MachOWriter, LcSegment64ContainsOneSectionWithTwoLevelNaming) {
     ASSERT_GE(bytes.size(), 32u + 72u + 80u);
 
     // LC_SEGMENT_64 at byte 32
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 32), 0x19u);  // LC_SEGMENT_64
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 36), 72u + 80u);  // cmdsize
+    EXPECT_EQ(readU32LE(bytes, 32), 0x19u);  // LC_SEGMENT_64
+    EXPECT_EQ(readU32LE(bytes, 36), 72u + 80u);  // cmdsize
     // segname (16 bytes) starts at 40 — empty for MH_OBJECT
     for (std::size_t i = 0; i < 16; ++i) {
         EXPECT_EQ(bytes[40 + i], 0u) << "LC_SEGMENT_64 segname must be empty";
@@ -170,7 +160,7 @@ TEST(MachOWriter, LcSegment64ContainsOneSectionWithTwoLevelNaming) {
     // nsects @ +72+64 = +136 (segment_command_64 fields:
     // cmd(4)+cmdsize(4)+segname(16)+vmaddr(8)+vmsize(8)+fileoff(8)+
     // filesize(8)+maxprot(4)+initprot(4)+nsects(4)+flags(4)).
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 32 + 64), 1u);  // nsects = 1
+    EXPECT_EQ(readU32LE(bytes, 32 + 64), 1u);  // nsects = 1
 
     // section_64 starts at byte 32 + 72 = 104
     // sectname[16] = "__text\0\0\0\0\0\0\0\0\0\0"
@@ -192,7 +182,7 @@ TEST(MachOWriter, LcSegment64ContainsOneSectionWithTwoLevelNaming) {
     // section_64.flags @ offset 104 + 16 + 16 + 8 + 8 + 4 + 4 + 4 + 4 = 168
     // (sectname[16] + segname[16] + addr(8) + size(8) + offset(4) +
     //  align(4) + reloff(4) + nreloc(4) → flags)
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 168), 0x80000400u);
+    EXPECT_EQ(readU32LE(bytes, 168), 0x80000400u);
 }
 
 // ── LC_SYMTAB locates symbol + string tables ───────────────────
@@ -205,19 +195,19 @@ TEST(MachOWriter, LcSymtabReferencesNlist64AndStringTable) {
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // LC_SYMTAB starts at byte 32 + 72 + 80 = 184
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 184), 0x02u);  // LC_SYMTAB
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 188), 24u);    // cmdsize
-    std::uint32_t const symoff = dss::link_format::test::readU32LE(bytes, 192);
-    std::uint32_t const nsyms = dss::link_format::test::readU32LE(bytes, 196);
-    std::uint32_t const stroff = dss::link_format::test::readU32LE(bytes, 200);
-    std::uint32_t const strsize = dss::link_format::test::readU32LE(bytes, 204);
+    EXPECT_EQ(readU32LE(bytes, 184), 0x02u);  // LC_SYMTAB
+    EXPECT_EQ(readU32LE(bytes, 188), 24u);    // cmdsize
+    std::uint32_t const symoff = readU32LE(bytes, 192);
+    std::uint32_t const nsyms = readU32LE(bytes, 196);
+    std::uint32_t const stroff = readU32LE(bytes, 200);
+    std::uint32_t const strsize = readU32LE(bytes, 204);
     EXPECT_EQ(nsyms, 1u);
     EXPECT_GT(symoff, 0u);
     EXPECT_LE(symoff + 16u, bytes.size());
 
     // nlist_64 record: n_strx(u32) + n_type(u8) + n_sect(u8) +
     // n_desc(u16) + n_value(u64). Total 16 bytes.
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, symoff + 0), 1u)
+    EXPECT_EQ(readU32LE(bytes, symoff + 0), 1u)
         << "n_strx points 1 byte past the leading NUL "
            "('_sym_7' lives at offset 1 in the strtab)";
     // n_type = N_SECT | N_EXT = 0x0F
@@ -262,17 +252,17 @@ TEST(MachOWriter, RelocationInfoPacksTypeLengthPcrelExternSymbolnum) {
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // section_64.reloff @ offset 104 + 16 + 16 + 8 + 8 + 4 + 4 = 160
-    std::uint32_t const relocOff = dss::link_format::test::readU32LE(bytes, 160);
-    std::uint32_t const relocCount = dss::link_format::test::readU32LE(bytes, 164);
+    std::uint32_t const relocOff = readU32LE(bytes, 160);
+    std::uint32_t const relocCount = readU32LE(bytes, 164);
     ASSERT_EQ(relocCount, 1u);
     ASSERT_GT(relocOff, 0u);
     ASSERT_LE(relocOff + 8u, bytes.size());
 
     // r_address = 1 (patch site within .text)
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, relocOff + 0), 1u);
+    EXPECT_EQ(readU32LE(bytes, relocOff + 0), 1u);
     // r_info bits: type(28..31)=2(BRANCH); extern(27)=1; length(25..26)=2;
     // pcrel(24)=1; symbolnum(0..23) = symtab index of target.
-    std::uint32_t const rInfo = dss::link_format::test::readU32LE(bytes, relocOff + 4);
+    std::uint32_t const rInfo = readU32LE(bytes, relocOff + 4);
     EXPECT_EQ((rInfo >> 28) & 0xFu, 2u);          // r_type = BRANCH
     EXPECT_EQ((rInfo >> 27) & 0x1u, 1u);          // r_extern = 1
     EXPECT_EQ((rInfo >> 25) & 0x3u, 2u);          // r_length = 2 (4 bytes)
@@ -399,8 +389,8 @@ TEST(MachOWriter, MultiFunctionModuleEmitsSequentialTextBytesAndIndices) {
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // symoff via LC_SYMTAB at byte 184; symoff field at +8 = 192.
-    std::uint32_t const symoff = dss::link_format::test::readU32LE(bytes, 184 + 8);
-    std::uint32_t const nsyms  = dss::link_format::test::readU32LE(bytes, 184 + 12);
+    std::uint32_t const symoff = readU32LE(bytes, 184 + 8);
+    std::uint32_t const nsyms  = readU32LE(bytes, 184 + 12);
     ASSERT_EQ(nsyms, 2u);
 
     // Sym[0] = function `a`: n_value = 0.
@@ -474,9 +464,9 @@ TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 32u);
     // mach_header_64.filetype @ +12 = MH_EXECUTE = 2.
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 12), 2u);
+    EXPECT_EQ(readU32LE(bytes, 12), 2u);
     // flags @ +24 contains MH_PIE (0x200000) bit.
-    EXPECT_NE(dss::link_format::test::readU32LE(bytes, 24) & 0x200000u, 0u);
+    EXPECT_NE(readU32LE(bytes, 24) & 0x200000u, 0u);
 }
 
 TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
@@ -487,7 +477,7 @@ TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
     ASSERT_EQ(rep.errorCount(), 0u);
     // First load command at offset 32 is LC_SEGMENT_64 (0x19).
     ASSERT_GE(bytes.size(), 32u + 72u);
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, 32), 0x19u);
+    EXPECT_EQ(readU32LE(bytes, 32), 0x19u);
     // segname @ +40 = "__PAGEZERO"
     EXPECT_EQ(bytes[40], '_');
     EXPECT_EQ(bytes[41], '_');
@@ -523,8 +513,8 @@ TEST(MachOExecWriter, LcMainEntryOffPointsToFirstFunction) {
     std::size_t off = 32;  // start of load commands
     bool sawLcMain = false;
     while (off + 8 <= bytes.size()) {
-        std::uint32_t const cmd     = dss::link_format::test::readU32LE(bytes, off);
-        std::uint32_t const cmdsize = dss::link_format::test::readU32LE(bytes, off + 4);
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
         if (cmdsize == 0) break;
         if (cmd == 0x80000028u) {       // LC_MAIN
             std::uint64_t const entryOff = readU64LE(bytes, off + 8);
@@ -568,14 +558,14 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
     std::uint32_t textFileOff = 0;
     int segIdx = 0;
     while (off + 8 <= bytes.size()) {
-        std::uint32_t const cmd     = dss::link_format::test::readU32LE(bytes, off);
-        std::uint32_t const cmdsize = dss::link_format::test::readU32LE(bytes, off + 4);
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
         if (cmdsize == 0) break;
         if (cmd == 0x19u) {  // LC_SEGMENT_64
             ++segIdx;
             if (segIdx == 2) {
                 // section_64 starts at off + 72; section.offset @ +96.
-                textFileOff = dss::link_format::test::readU32LE(bytes, off + 72 + 48);
+                textFileOff = readU32LE(bytes, off + 72 + 48);
                 break;
             }
         }
@@ -583,7 +573,7 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
     }
     ASSERT_NE(textFileOff, 0u);
     EXPECT_EQ(bytes[textFileOff + 0], 0xE8u);
-    EXPECT_EQ(dss::link_format::test::readU32LE(bytes, textFileOff + 1), 1u);
+    EXPECT_EQ(readU32LE(bytes, textFileOff + 1), 1u);
     EXPECT_EQ(bytes[textFileOff + 5], 0xC3u);
 }
 
@@ -743,8 +733,8 @@ TEST(MachOExecWriter, TextSegmentVmaddrEqualsPageZeroEnd) {
     int segIdx = 0;
     bool sawText = false;
     while (off + 8 <= bytes.size()) {
-        std::uint32_t const cmd     = dss::link_format::test::readU32LE(bytes, off);
-        std::uint32_t const cmdsize = dss::link_format::test::readU32LE(bytes, off + 4);
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
         if (cmdsize == 0) break;
         if (cmd == 0x19u) {  // LC_SEGMENT_64
             ++segIdx;
@@ -758,7 +748,7 @@ TEST(MachOExecWriter, TextSegmentVmaddrEqualsPageZeroEnd) {
                 // fileoff @ +40 must equal 0 (mach header is in __TEXT)
                 EXPECT_EQ(readU64LE(bytes, off + 40), 0u);
                 // nsects @ +64 == 1 (just __text this cycle)
-                EXPECT_EQ(dss::link_format::test::readU32LE(bytes, off + 64), 1u);
+                EXPECT_EQ(readU32LE(bytes, off + 64), 1u);
                 sawText = true;
                 break;
             }
@@ -782,17 +772,17 @@ TEST(MachOExecWriter, LcLoadDylibStructurePinnedByteForByte) {
     std::size_t off = 32;
     bool sawDylib = false;
     while (off + 8 <= bytes.size()) {
-        std::uint32_t const cmd     = dss::link_format::test::readU32LE(bytes, off);
-        std::uint32_t const cmdsize = dss::link_format::test::readU32LE(bytes, off + 4);
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
         if (cmdsize == 0) break;
         if (cmd == 0x0Cu) {  // LC_LOAD_DYLIB
             // name offset @ +8 must be 24 (cmd+24)
-            EXPECT_EQ(dss::link_format::test::readU32LE(bytes, off + 8), 24u);
+            EXPECT_EQ(readU32LE(bytes, off + 8), 24u);
             // timestamp / current_version / compat_version @ +12/+16/+20
             // are 0 today (reserved for future cycle).
-            EXPECT_EQ(dss::link_format::test::readU32LE(bytes, off + 12), 0u);
-            EXPECT_EQ(dss::link_format::test::readU32LE(bytes, off + 16), 0u);
-            EXPECT_EQ(dss::link_format::test::readU32LE(bytes, off + 20), 0u);
+            EXPECT_EQ(readU32LE(bytes, off + 12), 0u);
+            EXPECT_EQ(readU32LE(bytes, off + 16), 0u);
+            EXPECT_EQ(readU32LE(bytes, off + 20), 0u);
             // path bytes @ +24 begin with "/usr/lib/libSystem"
             EXPECT_EQ(bytes[off + 24], '/');
             EXPECT_EQ(bytes[off + 25], 'u');
@@ -1141,7 +1131,7 @@ TEST(MachOExecWriter, ChainedFixupsLcCmdsizeIs16Bytes) {
     auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
     ASSERT_TRUE(lcOff.has_value());
     std::uint32_t const cmdsize =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(*lcOff + 4));
+        readU32LE(bytes, static_cast<std::size_t>(*lcOff + 4));
     EXPECT_EQ(cmdsize, 16u)
         << "linkedit_data_command shape: cmd+cmdsize+dataoff+datasize "
            "= 4+4+4+4 = 16 bytes";
@@ -1149,9 +1139,9 @@ TEST(MachOExecWriter, ChainedFixupsLcCmdsizeIs16Bytes) {
     // (we have 1 import → at least 1 byte name + NUL + header + starts
     // + import row).
     std::uint32_t const dataoff =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(*lcOff + 8));
+        readU32LE(bytes, static_cast<std::size_t>(*lcOff + 8));
     std::uint32_t const datasize =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(*lcOff + 12));
+        readU32LE(bytes, static_cast<std::size_t>(*lcOff + 12));
     EXPECT_GT(datasize, 0u);
     EXPECT_LE(static_cast<std::uint64_t>(dataoff) +
               static_cast<std::uint64_t>(datasize),
@@ -1174,7 +1164,7 @@ TEST(MachOExecWriter, ChainedFixupsPayloadImportsCountMatchesExterns) {
     auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
     ASSERT_TRUE(lcOff.has_value());
     std::uint32_t const dataoff =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(*lcOff + 8));
+        readU32LE(bytes, static_cast<std::size_t>(*lcOff + 8));
     // dyld_chained_fixups_header layout:
     //   [ 0.. 3] fixups_version
     //   [ 4.. 7] starts_offset
@@ -1182,7 +1172,7 @@ TEST(MachOExecWriter, ChainedFixupsPayloadImportsCountMatchesExterns) {
     //   [12..15] symbols_offset
     //   [16..19] imports_count
     std::uint32_t const importsCount =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(dataoff + 16));
+        readU32LE(bytes, static_cast<std::size_t>(dataoff + 16));
     EXPECT_EQ(importsCount, mod.externImports.size())
         << "payload imports_count must equal module.externImports.size()";
 }
@@ -1202,9 +1192,9 @@ TEST(MachOExecWriter, ChainedFixupsSymbolsPoolContainsExternName) {
     auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
     ASSERT_TRUE(lcOff.has_value());
     std::uint32_t const dataoff =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(*lcOff + 8));
+        readU32LE(bytes, static_cast<std::size_t>(*lcOff + 8));
     std::uint32_t const symbolsOffset =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(dataoff + 12));
+        readU32LE(bytes, static_cast<std::size_t>(dataoff + 12));
     // Symbols pool: leading NUL sentinel at relative offset 0; first
     // import's name at offset 1.
     std::size_t const firstNameOff =
@@ -1229,6 +1219,9 @@ TEST(MachOExecWriter, ChainedFixupsSymbolsPoolContainsExternName) {
 // slot bitfield population — a premature regression that drops
 // LC_DYSYMTAB here would produce structurally broken chained
 // binaries with no failing test.
+// FLIP-MARKER: when D-LK6-14-INTEGRATION-GOT-SLOTS lands, this
+// test MUST invert (assert LC_DYSYMTAB is ABSENT). Until then it
+// pins presence to catch a premature regression.
 TEST(MachOExecWriter, ChainedFixupsKeepsLcDysymtab) {
     constexpr std::uint32_t kLcDysymtab = 0x0Bu;
     auto target = TargetSchema::loadShipped("x86_64");
@@ -1239,12 +1232,27 @@ TEST(MachOExecWriter, ChainedFixupsKeepsLcDysymtab) {
     DiagnosticReporter rep;
     auto bytes = macho::encode(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
-    EXPECT_TRUE(dss::macho::test::findLoadCommand(bytes, kLcDysymtab).has_value())
+    auto const lcOff =
+        dss::macho::test::findLoadCommand(bytes, kLcDysymtab);
+    ASSERT_TRUE(lcOff.has_value())
         << "LC_DYSYMTAB must STAY emitted on the chained path until "
-           "D-LK6-14-INTEGRATION-GOT-SLOTS drops it together with "
-           "__got slot bitfield population — a premature drop would "
-           "leave the binary structurally broken without a failing "
-           "test signal.";
+           "D-LK6-14-INTEGRATION-GOT-SLOTS drops it; premature drop "
+           "would leave binaries structurally broken silently.";
+    // 5ac97ae audit fold (test-analyzer + test-analyzer-dim-2):
+    // pin LC_DYSYMTAB CONTENT (not just presence). cmdsize=80
+    // (Apple's dysymtab_command shape). nundefsym must equal the
+    // module's externImports count (1 in the fixture).
+    EXPECT_EQ(readU32LE(bytes, *lcOff + 4), 80u)
+        << "LC_DYSYMTAB cmdsize must be 80 (Apple dysymtab_command)";
+    // dysymtab_command layout (bytes after cmd+cmdsize):
+    //   [ 0.. 3] ilocalsym  [ 4.. 7] nlocalsym
+    //   [ 8..11] iextdefsym [12..15] nextdefsym
+    //   [16..19] iundefsym  [20..23] nundefsym
+    EXPECT_EQ(readU32LE(bytes, *lcOff + 8 + 20),
+              mod.externImports.size())
+        << "nundefsym must match externImports.size() — catches "
+           "off-by-one or garbage-field regressions on the dysymtab "
+           "emission path";
 }
 
 // 8aabc04 audit fold (test-analyzer-dim-2 HIGH): multi-import name
@@ -1279,12 +1287,12 @@ TEST(MachOExecWriter, ChainedFixupsTwoImportsHaveCorrectSymbolOrdering) {
     auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
     ASSERT_TRUE(lcOff.has_value());
     std::uint32_t const dataoff =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(*lcOff + 8));
+        readU32LE(bytes, static_cast<std::size_t>(*lcOff + 8));
     // Pool layout for {"_alpha", "_beta"}:
     //   [0]NUL  [1..6]"_alpha"[0]  [8..12]"_beta"[0]
     // Symbols offset in payload from header[12].
     std::uint32_t const symbolsOffset =
-        dss::link_format::test::readU32LE(bytes, static_cast<std::size_t>(dataoff + 12));
+        readU32LE(bytes, static_cast<std::size_t>(dataoff + 12));
     std::size_t const poolBase =
         static_cast<std::size_t>(dataoff) + symbolsOffset;
     EXPECT_EQ(bytes[poolBase + 0], 0u)         << "leading NUL sentinel";
@@ -1294,6 +1302,30 @@ TEST(MachOExecWriter, ChainedFixupsTwoImportsHaveCorrectSymbolOrdering) {
     EXPECT_EQ(bytes[poolBase + 8], '_');
     EXPECT_EQ(bytes[poolBase + 12], 'a')       << "_beta tail char";
     EXPECT_EQ(bytes[poolBase + 13], 0u)        << "NUL after _beta";
+    // 5ac97ae audit fold (test-analyzer + test-analyzer-dim-2 +
+    // code-architect convergence): pin the packed import-row fields
+    // for BOTH imports. Pool-position pin catches push-NUL swap;
+    // packed-row pin catches libOrdinal miscast + weakImport
+    // hardcode regression + dylibOrdinal multi-import mapping.
+    std::uint32_t const importsOffset =
+        readU32LE(bytes, static_cast<std::size_t>(dataoff + 8));
+    std::uint32_t const row0 =
+        readU32LE(bytes, dataoff + importsOffset + 0 * 4);
+    std::uint32_t const row1 =
+        readU32LE(bytes, dataoff + importsOffset + 1 * 4);
+    EXPECT_EQ(row0 & 0xFFu, 1u)
+        << "_alpha libOrdinal must be 1 (libSystem is loadDylibs[0])";
+    EXPECT_EQ(row1 & 0xFFu, 1u)
+        << "_beta libOrdinal must also be 1 (same dylib) — catches "
+           "dylibOrdinal mis-mapping for multi-import path";
+    EXPECT_EQ((row0 >> 8) & 0x1u, 0u)
+        << "weakImport=false hardcode (D-LK6-14-MACHO-WEAK-DEF) "
+           "must not flip on chained-fixups walker path";
+    EXPECT_EQ((row1 >> 8) & 0x1u, 0u);
+    EXPECT_EQ(row0 >> 9, 1u)
+        << "_alpha name_offset = 1 (NUL sentinel at 0)";
+    EXPECT_EQ(row1 >> 9, 8u)
+        << "_beta name_offset = 8 (NUL + '_alpha' + NUL = 7 bytes)";
 }
 
 // 8aabc04 audit fold (test-analyzer + test-analyzer-dim-2 HIGH):

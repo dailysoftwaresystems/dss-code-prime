@@ -1268,21 +1268,15 @@ encodeExecDynamic(AssembledModule const&    module,
                          "fall back to LC_DYLD_INFO_ONLY.", ord));
                 return {};
             }
-            // D-LK6-14-MACHO-WEAK-DEF anchor: hard-coded
-            // weakImport=false for all extern imports. The
-            // DYLD_CHAINED_IMPORT bit-8 weak_import bit lets dyld
-            // treat the binding as optional (resolve-to-null if the
-            // symbol isn't present in any dylib at load time —
-            // useful for forward-compatible code targeting an older
-            // libSystem). Trigger to ship: first schema or extern
-            // source that needs weak-import semantics (e.g.
-            // `__attribute__((weak_import))` from a C header parsed
-            // by FF2). Until then, false matches the eager-bind
-            // posture (D-LK6-13 lazy is also deferred).
+            // D-LK6-14-MACHO-WEAK-DEF: weakImport hardcoded false.
+            // Trigger to ship: first `__attribute__((weak_import))`
+            // from FF2's C-header parser (or first schema field
+            // requesting weak-import semantics). Bit-8 of the
+            // packed DYLD_CHAINED_IMPORT row.
             chainedImports.push_back({
                 ext.mangledName,
                 static_cast<std::int8_t>(ord),
-                false  // weakImport
+                false  // weakImport — D-LK6-14-MACHO-WEAK-DEF
             });
         }
         dyldBindBlob =

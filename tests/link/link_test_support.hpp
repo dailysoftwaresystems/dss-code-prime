@@ -14,9 +14,9 @@ namespace dss::link_format::test {
 
 inline std::uint16_t readU16LE(std::span<std::uint8_t const> bytes,
                                 std::size_t off) {
-    return static_cast<std::uint16_t>(
-        static_cast<std::uint16_t>(bytes[off]) |
-        (static_cast<std::uint16_t>(bytes[off+1]) << 8));
+    return static_cast<std::uint16_t>(bytes[off]) |
+           static_cast<std::uint16_t>(
+               static_cast<std::uint16_t>(bytes[off+1]) << 8);
 }
 
 inline std::uint32_t readU32LE(std::span<std::uint8_t const> bytes,

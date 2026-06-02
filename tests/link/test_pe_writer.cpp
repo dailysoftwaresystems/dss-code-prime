@@ -23,6 +23,7 @@
 #include "link/format/pe.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "link_test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -38,28 +39,16 @@ using namespace dss;
 
 namespace {
 
-[[nodiscard]] std::uint16_t readU16LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    return static_cast<std::uint16_t>(b[off])
-         | (static_cast<std::uint16_t>(b[off + 1]) << 8);
-}
-[[nodiscard]] std::uint32_t readU32LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    std::uint32_t v = 0;
-    for (int i = 0; i < 4; ++i)
-        v |= static_cast<std::uint32_t>(b[off + i]) << (i * 8);
-    return v;
-}
+// D-TEST-LE-READ-HELPERS CLOSED at 8aabc04 audit fold; complete-
+// hoist at 5ac97ae audit fold per code-architect Q1.
+using dss::link_format::test::readU16LE;
+using dss::link_format::test::readU32LE;
+using dss::link_format::test::readU64LE;
+// readI16LE is PE-only (used at one .reloc site); keep local until
+// a 2nd signed-LE consumer lands. Anchor D-TEST-LE-READ-SIGNED.
 [[nodiscard]] std::int16_t readI16LE(std::span<std::uint8_t const> b,
                                       std::size_t off) {
     return static_cast<std::int16_t>(readU16LE(b, off));
-}
-[[nodiscard]] std::uint64_t readU64LE(std::span<std::uint8_t const> b,
-                                       std::size_t off) {
-    std::uint64_t v = 0;
-    for (int i = 0; i < 8; ++i)
-        v |= static_cast<std::uint64_t>(b[off + i]) << (i * 8);
-    return v;
 }
 
 struct Loaded {

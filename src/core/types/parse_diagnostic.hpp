@@ -677,8 +677,9 @@ enum class DiagnosticCode : std::uint16_t {
     // (0x800C retired — was K_ChainedFixupsNotYetIntegrated, a
     // substrate-gap signal removed at D-LK6-14-INTEGRATION-PAYLOAD
     // closure. Companion D-LK6-14-INTEGRATION-GOT-SLOTS is open but
-    // is a runtime-loadability gap that doesn't need a fail-loud K_.)
-    // Next K_* value: 0x800D.
+    // its failure surfaces at dyld load, not at the walker — outside
+    // K_* scope.)
+    // K-NEXT-SLOT: 0x800D — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
