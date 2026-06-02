@@ -62,12 +62,12 @@ constexpr std::size_t   kDyldChainedImportSz       = 4u;
 //   + max_valid_pointer u32 + page_count u16 = 22 bytes.
 constexpr std::size_t   kDyldChainedStartsInSegmentHdrSz = 22u;
 // DYLD_CHAINED_PTR_64 (non-authenticated 64-bit chained pointers).
-// Pairs with the bitfield layout assembled by the writer (ordinal:24
-// addend:8 reserved:19 next:12 bind:1); a pointer_format swap MUST
-// move together with the bits. Anchored D-LK6-14-CHAINEDPTR-FORMAT-
-// COUPLING (trigger: D-LK6-14-ARM64E lands an arm64e pointer_format
-// = 1 / DYLD_CHAINED_PTR_ARM64E with the auth-discriminator variant).
-// Cross-cited from D-LK6-14-ARM64E (still anchored open).
+// Pairs with the bitfield layout assembled by the writer
+// (ordinal:24 addend:8 reserved:19 next:12 bind:1); a pointer_format
+// swap MUST move together with the bits.
+// Anchored: D-LK6-14-CHAINEDPTR-FORMAT-COUPLING.
+// Trigger: D-LK6-14-ARM64E lands an arm64e pointer_format = 1
+// (DYLD_CHAINED_PTR_ARM64E) with the auth-discriminator variant.
 constexpr std::uint16_t kDyldChainedPtrFormat64 = 6u;
 // `next` field stride for DYLD_CHAINED_PTR_64: 4-byte units. Adjacent
 // 8-byte chained-pointer slots are therefore 2 units apart. Apple's

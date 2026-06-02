@@ -580,7 +580,10 @@ struct DSS_EXPORT MachOImage {
     // chained fixups in v1; v2 dyld supports lazy via stub trampolines
     // but the walker rejects that combo loud as
     // K_FormatLacksImportSupport). ARM64e pointer-authentication
-    // (DYLD_CHAINED_PTR_ARM64E) deferred — D-LK6-14-ARM64E. 32-bit
+    // (DYLD_CHAINED_PTR_ARM64E) deferred — D-LK6-14-ARM64E. When that
+    // arm lands, it pairs with D-LK6-14-CHAINEDPTR-FORMAT-COUPLING
+    // (the pointer_format ↔ bitfield-layout coupling — reciprocal cite
+    // at `macho_chained_fixups.hpp::kDyldChainedPtrFormat64`). 32-bit
     // Mach-O chained-fixups deferred — D-LK6-14-32 (paired with
     // FormatGuess::MachO32).
     //

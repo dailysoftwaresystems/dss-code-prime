@@ -1304,11 +1304,21 @@ TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
     // MUST be 0 on the chained path (was numExterns on legacy as
     // an indirect-symtab index; on chained the indirect symtab is
     // dropped so the reference becomes invalid). section_64 starts
-    // at segment_command_64 + 72 (cmd 4 + cmdsize 4 + segname 16
-    // + vmaddr 8 + vmsize 8 + fileoff 8 + filesize 8 + maxprot 4
-    // + initprot 4 + nsects 4 + flags 4); reserved1 within
-    // section_64 is at offset 16+16+8+8+4+4+4+4+4 = 68.
+    // at segment_command_64 + 72 (cmd(4)+cmdsize(4)+segname[16]
+    // +vmaddr(8)+vmsize(8)+fileoff(8)+filesize(8)+maxprot(4)
+    // +initprot(4)+nsects(4)+flags(4)); reserved1 within
+    // section_64 at offset 68 (sectname[16]+segname[16]+addr(8)
+    // +size(8)+offset(4)+align(4)+reloff(4)+nreloc(4)+flags(4)
+    // = 68). a4464fe audit-fold (dim-2 M1 + test-analyzer MEDIUM):
+    // pin sectname == "__got" first so a __const-before-__got
+    // reshape doesn't silently read a sibling section's reserved1.
     std::size_t const sect0Off = *dataConstLcOff + 72;
+    char gotName[17] = {};
+    std::memcpy(gotName, &bytes[sect0Off], 16);
+    EXPECT_EQ(std::string{gotName}, "__got")
+        << "expected __got at section[0] of __DATA_CONST — a sibling "
+           "section reshape would silently shift offsets and read "
+           "the wrong section's reserved1.";
     EXPECT_EQ(readU32LE(bytes, sect0Off + 68), 0u)
         << "section_64.__got.reserved1 must be 0 on the chained path "
            "(was numExterns as indirect-symtab index on legacy; the "
@@ -1376,10 +1386,17 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
     //   [16..19] max_valid_ptr  [20..21] page_count
     std::size_t const segStructOff =
         dataoff + startsOff + segInfoOffset;
-    // size field at struct+0: 22 header bytes + 2 bytes per page_start
-    // (1 page in v1 → 24 bytes). Regression mis-computing this would
-    // still pass downstream field reads.
-    EXPECT_EQ(readU32LE(bytes, segStructOff + 0), 22u + 2u)
+    // size field at struct+0: header bytes + 2 bytes per page_start
+    // entry. v1 single-page → 22 + 2*1 = 24. Symbolized via
+    // kDyldChainedStartsInSegmentHdrSz so a header-size regression
+    // (someone adds a field) surfaces in this test alongside the
+    // producer. FLIP-MARKER: when D-LK6-14-MULTI-PAGE-GOT closes,
+    // expected size becomes `kDyldChainedStartsInSegmentHdrSz +
+    // 2u * page_count` with page_count > 1.
+    EXPECT_EQ(readU32LE(bytes, segStructOff + 0),
+              static_cast<std::uint32_t>(
+                  dss::macho::detail::kDyldChainedStartsInSegmentHdrSz
+                  + 2u * 1u))
         << "dyld_chained_starts_in_segment.size must be header (22) "
            "+ 2*page_count (2) = 24 for the v1 single-page case";
     EXPECT_EQ(readU16LE(bytes, segStructOff + 6),
@@ -1474,12 +1491,18 @@ TEST(MachOExecWriter, ChainedFixupsMultiPageGotFailsLoud) {
     constexpr std::uint32_t kPageSize    = 4096u;
     constexpr std::uint32_t kSlotSize    = 8u;
     constexpr std::uint32_t kSpillCount  = (kPageSize / kSlotSize) + 1u;
+    // FIXTURE-INVARIANT (D-TEST-MULTI-PAGE-FIXTURE-INVARIANT): all
+    // 513 externs share libSystem (libOrdinal=1 << 127 ceiling) and
+    // the symbols-pool stays under 8 MiB (D-LK6-14-NAME-OFFSET-
+    // OVERFLOW). The SOLE failure surface this fixture probes is
+    // the multi-page __DATA_CONST guard. A future refactor of the
+    // fixture (multi-dylib, longer names) MUST re-verify these
+    // boundaries or the test silently re-routes.
     for (std::uint32_t i = 0; i < kSpillCount; ++i) {
-        ExternImport imp;
-        imp.symbol      = SymbolId{100u + i};
-        imp.mangledName = "_x" + std::to_string(i);
-        imp.libraryPath = "/usr/lib/libSystem.B.dylib";
-        mod.externImports.push_back(std::move(imp));
+        mod.externImports.push_back(ExternImport{
+            SymbolId{100u + i},
+            "_x" + std::to_string(i),
+            "/usr/lib/libSystem.B.dylib"});
     }
     DiagnosticReporter rep;
     auto bytes = macho::encode(mod, **target, *fmt, rep);
