@@ -9,6 +9,7 @@
 #include "mir/mir_node.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -149,6 +150,26 @@ struct DSS_EXPORT AssembledModule {
     // lands (D-LK6-6). Linker consults this AFTER `functions` for
     // any unresolved `Relocation::target`.
     std::vector<ExternImport>      externImports;
+
+    // D-LK10-ENTRY Slice C (plan 14 §2.13): override of the image
+    // entry-point function index. When set, the format walker
+    // (PE/ELF/Mach-O) uses `functions[*imageEntryOverride]` as the
+    // image entry instead of falling back to the schema's
+    // `entryPoint` string resolution.
+    //
+    // Set by the linker's `injectEntryTrampoline()` after prepending
+    // a synthetic `_start` trampoline as `functions[0]` — value is
+    // `0u`. The format-schema-declared `entryPoint` continues to
+    // name the USER fn (the trampoline's call target), NOT the
+    // image entry.
+    //
+    // The field is `std::optional<std::size_t>`, NOT a `size_t`
+    // with 0-as-sentinel: index 0 IS a valid override target (the
+    // trampoline genuinely sits at `functions[0]`). Using 0 alone
+    // as "unset" would collide with the valid-0 case — same
+    // `Unknown=0-vs-valid-0` trap LK4 cycle-1 review already
+    // caught.
+    std::optional<std::size_t>     imageEntryOverride;
 
     // Derived: true iff `assemble()` ran on a non-empty LIR module AND
     // every function received its parallel-index slot. The reporter

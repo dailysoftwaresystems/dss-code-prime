@@ -559,7 +559,24 @@ encodeExec(AssembledModule const&    module,
     // synthesized `sym_<id>` name today (real-name resolution
     // closes with the HIR→AssembledFunction symbol-name thread).
     std::size_t entryFnIdx = 0;
-    if (auto const ep = fmt.entryPoint(); !ep.empty()) {
+    // D-LK10-ENTRY Slice C (plan 14 §2.13): when the linker has
+    // prepended a synthetic `_start` trampoline,
+    // `imageEntryOverride` names the trampoline's index in
+    // `functions[]`. Honor it before falling back to the schema's
+    // `entryPoint` string resolution (the schema's `entryPoint`
+    // names the USER fn — the trampoline's CALL target, not the
+    // image entry). Out-of-range = fail loud.
+    if (module.imageEntryOverride.has_value()) {
+        if (*module.imageEntryOverride >= module.functions.size()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: imageEntryOverride="}
+                     + std::to_string(*module.imageEntryOverride)
+                     + " is out-of-range (functions.size()="
+                     + std::to_string(module.functions.size()) + ")");
+            return {};
+        }
+        entryFnIdx = *module.imageEntryOverride;
+    } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
         bool found = false;
         for (std::size_t i = 0; i < module.functions.size(); ++i) {
             std::string const cand =

@@ -23,3 +23,7 @@ dss_add_test(NAME link/test_spirv_writer         SOURCES test_spirv_writer.cpp)
 
 # Plan 14 LK10 cycle 1 — file-emission substrate.
 dss_add_test(NAME link/test_link_writer          SOURCES test_link_writer.cpp)
+
+# Plan 14 §2.13 D-LK10-ENTRY Slice C — runnable-binary spine
+# (first DSS-produced binary the OS actually runs).
+dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c.cpp)

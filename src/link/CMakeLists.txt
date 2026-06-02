@@ -1,4 +1,5 @@
 add_library(link OBJECT
+    entry_trampoline.cpp
     linker.cpp
     object_format_schema.cpp
     object_format_schema_json.cpp

@@ -1,6 +1,7 @@
 #include "link/linker.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/entry_trampoline.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
 #include "link/format/pe.hpp"
@@ -20,13 +21,48 @@ using dss::report;
 
 } // namespace
 
-LinkedImage link(AssembledModule const&    module,
+LinkedImage link(AssembledModule const&    inputModule,
                  TargetSchema const&       targetSchema,
                  ObjectFormatSchema const& objectFormatSchema,
                  DiagnosticReporter&       reporter) {
     LinkedImage image;
     image.format = objectFormatSchema.kind();
-    image.expectedFuncCount = module.expectedFuncCount;
+    image.expectedFuncCount = inputModule.expectedFuncCount;
+
+    // D-LK10-ENTRY Slice C (plan 14 §2.13): when the format declares
+    // a `processExit` block + `entryCallingConvention` (validated by
+    // Slice B's cross-field rule), synthesize a `_start` trampoline
+    // and prepend it as `functions[0]`. The walker's
+    // `imageEntryOverride` path then uses the trampoline as the
+    // image entry, while the schema's `entryPoint` continues to name
+    // the user fn (the trampoline's call target).
+    //
+    // Without this hook, the emitted executables point e_entry /
+    // AddressOfEntryPoint / LC_MAIN.entryoff directly at the user
+    // fn, which SEGVs on its `ret` epilogue (process entry has no
+    // return address). See §2.13 for the full design.
+    //
+    // Bypass conditions: caller-provided `imageEntryOverride` (a
+    // pre-injected trampoline; do not re-inject) OR empty functions
+    // (no module to wrap).
+    AssembledModule moduleCopy;
+    AssembledModule const* moduleP = &inputModule;
+    bool const wantTrampoline =
+        objectFormatSchema.processExit().has_value()
+     && !inputModule.functions.empty()
+     && !inputModule.imageEntryOverride.has_value();
+    if (wantTrampoline) {
+        moduleCopy = inputModule;
+        if (!injectEntryTrampoline(moduleCopy, targetSchema,
+                                    objectFormatSchema, reporter)) {
+            // Diagnostic(s) emitted by the trampoline emitter.
+            image.resolvedFuncCount = 0;
+            return image;
+        }
+        moduleP = &moduleCopy;
+        image.expectedFuncCount = moduleCopy.expectedFuncCount;
+    }
+    AssembledModule const& module = *moduleP;
 
     // Snapshot error count so we can detect whether the cross-
     // reference unifier pass (below) added any new K_* diagnostics

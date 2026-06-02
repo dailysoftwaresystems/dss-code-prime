@@ -911,7 +911,19 @@ encodeElfExecDynamic(
     // `sym_<id>` name today (real-name resolution closes with
     // D-LK1-1 / LK7).
     std::size_t entryFnIdx = 0;
-    if (auto const ep = fmt.entryPoint(); !ep.empty()) {
+    // D-LK10-ENTRY Slice C: honor `imageEntryOverride` before
+    // schema-entryPoint resolution. See pe.cpp for the rationale.
+    if (module.imageEntryOverride.has_value()) {
+        if (*module.imageEntryOverride >= module.functions.size()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"elf::encodeElfExecDynamic: imageEntryOverride="}
+                     + std::to_string(*module.imageEntryOverride)
+                     + " out-of-range (functions.size()="
+                     + std::to_string(module.functions.size()) + ")");
+            return {};
+        }
+        entryFnIdx = *module.imageEntryOverride;
+    } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
         bool found = false;
         for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
             std::string const synthesized =
@@ -1408,8 +1420,18 @@ encode(AssembledModule const&    module,
             return {};
         }
         std::size_t entryFnIdx = 0;
-        auto const ep = fmt.entryPoint();
-        if (!ep.empty()) {
+        // D-LK10-ENTRY Slice C: honor `imageEntryOverride` first.
+        if (module.imageEntryOverride.has_value()) {
+            if (*module.imageEntryOverride >= module.functions.size()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"ELF ET_EXEC writer: imageEntryOverride="}
+                         + std::to_string(*module.imageEntryOverride)
+                         + " out-of-range (functions.size()="
+                         + std::to_string(module.functions.size()) + ")");
+                return {};
+            }
+            entryFnIdx = *module.imageEntryOverride;
+        } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
             bool found = false;
             for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
                 std::string const synthesized =

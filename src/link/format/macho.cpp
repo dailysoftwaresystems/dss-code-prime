@@ -610,7 +610,18 @@ encodeExec(AssembledModule const&    module,
 
     // ── (b) Resolve entry function index from schema.entryPoint
     std::size_t entryFnIdx = 0;
-    if (auto const ep = fmt.entryPoint(); !ep.empty()) {
+    // D-LK10-ENTRY Slice C: honor `imageEntryOverride` first.
+    if (module.imageEntryOverride.has_value()) {
+        if (*module.imageEntryOverride >= module.functions.size()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"macho::encodeExec: imageEntryOverride="}
+                     + std::to_string(*module.imageEntryOverride)
+                     + " out-of-range (functions.size()="
+                     + std::to_string(module.functions.size()) + ")");
+            return {};
+        }
+        entryFnIdx = *module.imageEntryOverride;
+    } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
         bool found = false;
         for (std::size_t i = 0; i < module.functions.size(); ++i) {
             std::string const cand =
@@ -1103,7 +1114,18 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // ── (d) Resolve entry function index from schema.entryPoint
     std::size_t entryFnIdx = 0;
-    if (auto const ep = fmt.entryPoint(); !ep.empty()) {
+    // D-LK10-ENTRY Slice C: honor `imageEntryOverride` first.
+    if (module.imageEntryOverride.has_value()) {
+        if (*module.imageEntryOverride >= module.functions.size()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"macho::encodeExecDynamic: imageEntryOverride="}
+                     + std::to_string(*module.imageEntryOverride)
+                     + " out-of-range (functions.size()="
+                     + std::to_string(module.functions.size()) + ")");
+            return {};
+        }
+        entryFnIdx = *module.imageEntryOverride;
+    } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
         bool found = false;
         for (std::size_t i = 0; i < module.functions.size(); ++i) {
             std::string const cand =
