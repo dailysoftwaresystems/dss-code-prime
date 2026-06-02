@@ -8,6 +8,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/number_decode.hpp"
+#include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/string_style.hpp"
@@ -197,6 +198,10 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node);
+[[nodiscard]] bool admitsNullPointerConstant(
+    EngineState const& s, Tree const& tree,
+    TypeId lhsTy, NodeId rhsExpr,
+    SemanticConfig::PointerConversionRules const& rules);
 
 // True iff a token of kind `kind` appears anywhere in `node`'s subtree.
 // Used by SE4 const-marker detection (walk the type subtree for the
@@ -1379,7 +1384,14 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                    && !isAssignable(s.lattice.interner(),
                                                     rec.type, initTy,
                                                     tree.schema().semantics()
-                                                        .pointerConversions)) {
+                                                        .pointerConversions)
+                                   // D-LANG-NULL-POINTER-CONSTANT (step
+                                   // 13.3): admit `T* p = 0;` initializer
+                                   // per C §6.3.2.3.3.
+                                   && !admitsNullPointerConstant(
+                                          s, tree, rec.type, initNode,
+                                          tree.schema().semantics()
+                                              .pointerConversions)) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::S_TypeMismatch;
                             d.severity = DiagnosticSeverity::Error;
@@ -1647,11 +1659,19 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // that step-13.2 surfaced via DistinctTypedPointersRemainMismatch.
     // The same descent helper already powers checkReturn (`subtreeType`
     // is defined directly below).
+    auto const& ptrRules = tree.schema().semantics().pointerConversions;
     for (std::size_t i = 0; i < checkCount && i < argNodes.size(); ++i) {
         TypeId argTy = subtreeType(s, tree, argNodes[i]);
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
-        if (!isAssignable(s.lattice.interner(), params[i], argTy,
-                          tree.schema().semantics().pointerConversions)) {
+        if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules)) {
+            // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
+            // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
+            // check lives here (NOT in isAssignable) because it is
+            // value-aware (looks at the literal's decoded value).
+            if (admitsNullPointerConstant(s, tree, params[i],
+                                          argNodes[i], ptrRules)) {
+                continue;
+            }
             ParseDiagnostic d;
             d.code     = DiagnosticCode::S_TypeMismatch;
             d.severity = DiagnosticSeverity::Error;
@@ -1661,6 +1681,98 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             s.reporter.report(std::move(d));
         }
     }
+}
+
+// D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C §6.3.2.3.3,
+// an integer constant expression with value 0 is a null pointer constant
+// — convertible WITHOUT cast to any object-pointer or function-pointer
+// type. This helper admits ONLY the bare integer-literal `0` form (not
+// `+0` / `-0` / `0+0` / `(int)0`). Audit fold (6-agent 2nd-order F3,
+// 2026-06-02): the wider unary/cast/const-eval admission was DROPPED to
+// avoid a HIR/semantic divergence — the HIR `coerce()` arm matches on
+// `HirKind::Literal` of the child node, and a `-0` source expression
+// lowers to `UnaryOp(Neg, Literal(0))` whose top-level HIR kind is
+// `UnaryOp`. Semantic admission of `-0` without HIR materialization
+// would leak an un-Cast `I32` into a `Ptr<*>` slot at the verifier. The
+// wider admission lives at D-LANG-NULL-PTR-CONST-EVAL, which adds a
+// const-eval pre-pass producing a typed integer-zero result that both
+// tiers can recognize uniformly.
+//
+// Implementation: walks the subtree counting visible TOKEN children
+// (rejects if any operator-token child is present) AND visible Internal
+// children (rejects if there are siblings to the typed leaf). The single
+// admitted shape is a chain of single-child wrappers around the
+// IntLiteral leaf — which is what the parser produces for a bare `0`.
+//
+// Source-agnostic: the rule fires only when the active language
+// declares `pointerConversions.nullPointerConstantFromIntegerZero:true`
+// (default false — Rust/Swift-friendly).
+[[nodiscard]] bool
+isLiteralIntegerZero(EngineState const& s, Tree const& tree, NodeId node) {
+    if (!node.valid()) return false;
+    NodeId onlyLeaf;
+    int    typedCount    = 0;
+    int    nonEmptyToken = 0;
+    std::vector<NodeId> stack{node};
+    while (!stack.empty()) {
+        NodeId cur = stack.back();
+        stack.pop_back();
+        if (tree.kind(cur) == NodeKind::Token) {
+            if (isEmptySpace(tree.flags(cur))) continue;
+            // ANY non-empty-space token (operator, delimiter, etc.)
+            // BEYOND the single literal token disqualifies the
+            // admission. Without this, `(0)` (wrappers contribute
+            // ParenOpen+ParenClose tokens) would still admit — which
+            // is actually fine for paren-wrap — but `-0` (MinusOp +
+            // IntLiteral) would admit too, and the HIR coerce()
+            // tier can't match against `UnaryOp(Neg, Literal(0))`.
+            // Reject all operator tokens.
+            ++nonEmptyToken;
+            auto const tk = tree.tokenKind(cur);
+            auto litIt = s.idx().literalTypeIds.find(tk.v);
+            if (litIt == s.idx().literalTypeIds.end()) {
+                // Non-literal token (operator / delimiter / etc.) —
+                // reject.
+                return false;
+            }
+            if (!s.typeAt(cur).valid()) continue;
+            if (++typedCount > 1) return false;
+            onlyLeaf = cur;
+            continue;
+        }
+        for (auto child : tree.children(cur)) {
+            if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
+        }
+    }
+    (void)nonEmptyToken;  // diagnostic-only future expansion hook
+    if (typedCount != 1 || !onlyLeaf.valid()) return false;
+    auto const tk = tree.tokenKind(onlyLeaf);
+    auto litIt = s.idx().literalTypeIds.find(tk.v);
+    if (litIt == s.idx().literalTypeIds.end()) return false;
+    // Integer kind only (signed or unsigned). Floats / bools / chars
+    // can never be a NULL pointer constant.
+    auto const kind = s.lattice.interner().kind(litIt->second);
+    using namespace detail::type_rules;
+    if (signedIntRank(kind) == 0 && unsignedIntRank(kind) == 0) return false;
+    auto const decoded =
+        decodeInteger(tree.text(onlyLeaf), s.idx().numberStyle);
+    return decoded.has_value() && *decoded == 0;
+}
+
+// D-LANG-NULL-POINTER-CONSTANT helper (step 13.3): returns true when
+// the conversion `rhsExpr → lhsTy` should be admitted as a null-pointer
+// conversion. The shape is shared between checkCall arg-check,
+// checkReturn, and pass-2 decl-init — all three must read it identically
+// so a NULL passed as call-arg, return-value, or initializer behaves
+// the same. Source-agnostic via the per-language config flag.
+[[nodiscard]] bool
+admitsNullPointerConstant(EngineState const& s, Tree const& tree,
+                          TypeId lhsTy, NodeId rhsExpr,
+                          SemanticConfig::PointerConversionRules const& rules) {
+    if (!rules.nullPointerConstantFromIntegerZero) return false;
+    if (!lhsTy.valid()) return false;
+    if (s.lattice.interner().kind(lhsTy) != TypeKind::Ptr) return false;
+    return isLiteralIntegerZero(s, tree, rhsExpr);
 }
 
 // GAP A: the type carried by an expression subtree. Pass 2 types literal
@@ -1695,11 +1807,75 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 subtreeType(EngineState const& s, Tree const& tree, NodeId node) {
     if (!node.valid()) return InvalidType;
     if (TypeId t = s.typeAt(node); t.valid()) return t;
+    // D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS partial closure
+    // (step 13.3, 2026-06-02): when descending the subtree, STOP at
+    // any internal node that holds an operator-token child (any
+    // arity — prefix `&x` / `*p`, infix `a + b`, postfix `i++`,
+    // ternary `c ? a : b`, grouped postfix `f(args)` / `a[i]`). Such
+    // wrappers RE-TYPE their inner expression and pass 2 hasn't
+    // computed the wrapper's type yet (no semantic-tier expression
+    // typing today). Returning the inner-leaf type would be wrong
+    // — `&x` on an `int x` would return I32 instead of Ptr<I32>.
+    // Returning InvalidType triggers cascade-suppression at the
+    // caller, matching the pre-13.2 false-negative shape for these
+    // wrappers (the bare-identifier / literal / call-result paths
+    // remain correctly typed). Source-agnostic via the schema's
+    // OperatorTable — any language declaring an operator in its
+    // JSON gets the right behavior.
+    //
+    // Full closure (anchor still open): pass 2 needs explicit
+    // expression-typing arms for unary/binary/ternary so the wrapper
+    // node carries the evaluated type — eliminates this descent
+    // stop entirely. Trigger: first c-subset feature that needs
+    // S_TypeMismatch on a unary/binary call-arg, init, or return.
+    auto const& opTable = tree.schema().operatorTable();
+    auto holdsOperator = [&](NodeId internal) {
+        // F1 audit fix (6-agent 2nd-order, step 13.3a): match ONLY
+        // Prefix + Ternary arities. EXCLUDE Postfix and Infix:
+        //   * Postfix-grouped (`f(args)` / `a[i]`) shares the
+        //     `ParenOpen`/`BracketOpen` SchemaTokenId with structural
+        //     paren/bracket wrappers — matching them would stop
+        //     descent at any `(p)` / `[expr]` wrapper, silently
+        //     regressing 13.2's bare-identifier mismatch pin.
+        //     Postfix-grouped wrappers are TYPED by pass 2 anyway
+        //     (call results at the standard call-arg arm), so the
+        //     wrapper's typeAt returns valid before descent begins.
+        //   * Infix (`a + b`) is type-preserving for integer
+        //     arithmetic; the inner leaf's type matches the
+        //     wrapper's evaluated type. Returning the inner type
+        //     is correct, no stop needed.
+        //   * Postfix `i++` / `i--` is value-modifying but
+        //     type-preserving (post-increment returns the pre-
+        //     increment value of the same type) — also no stop.
+        //
+        // Prefix stops cover the genuinely-type-changing cases:
+        // `&x` (T → Ptr<T>), `*p` (Ptr<T> → T). Stops on
+        // type-preserving prefix `-x`/`+x`/`!x`/`~x` are
+        // false-positives but match the pre-13.2 cascade-suppress
+        // behavior — preferable to the false-NEGATIVE class the
+        // operator-table heuristic was added to prevent. Full
+        // closure (pass-2 expression typing) anchored.
+        // Ternary `c ? a : b` re-types via unify — stop is correct.
+        for (auto child : tree.children(internal)) {
+            if (isEmptySpace(tree.flags(child))) continue;
+            if (tree.kind(child) != NodeKind::Token) continue;
+            auto const tk = tree.tokenKind(child);
+            if (opTable.lookup(tk, OperatorArity::Prefix).has_value()
+                || opTable.lookup(tk, OperatorArity::Ternary).has_value()) {
+                return true;
+            }
+        }
+        return false;
+    };
     std::vector<NodeId> stack{node};
     while (!stack.empty()) {
         NodeId cur = stack.back();
         stack.pop_back();
         if (TypeId t = s.typeAt(cur); t.valid()) return t;
+        // Stop descent on a type-changing wrapper.
+        if (tree.kind(cur) == NodeKind::Internal && holdsOperator(cur)) {
+            continue;
+        }
         for (auto child : tree.children(cur)) {
             if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
         }
@@ -1770,8 +1946,14 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // An unknown result OR unknown expr type → skip (cascade suppression).
     TypeId const exprTy = subtreeType(s, tree, valueNode);
     if (!fnResult.valid() || !exprTy.valid()) return;
-    if (!isAssignable(s.lattice.interner(), fnResult, exprTy,
-                      tree.schema().semantics().pointerConversions)) {
+    auto const& ptrRules = tree.schema().semantics().pointerConversions;
+    if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules)) {
+        // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
+        // from a Ptr<*>-returning function per C §6.3.2.3.3.
+        if (admitsNullPointerConstant(s, tree, fnResult,
+                                      valueNode, ptrRules)) {
+            return;
+        }
         emitMismatch(valueNode);
     }
 }

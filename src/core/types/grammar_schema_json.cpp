@@ -4511,6 +4511,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                              cfg.pointerConversions.implicitToVoidPtr);
                     readBool("implicitFromVoidPtr",
                              cfg.pointerConversions.implicitFromVoidPtr);
+                    readBool("nullPointerConstantFromIntegerZero",
+                             cfg.pointerConversions
+                                 .nullPointerConstantFromIntegerZero);
                     // Typo defense: reject unknown sub-keys with a
                     // fail-loud diagnostic. Pre-guard, an editor typo
                     // like `implictToVoidPtr` (missing 'i') would
@@ -4522,16 +4525,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // closed allowlist forecloses unknown subkeys.
                     for (auto const& [k, _] : obj.items()) {
                         if (k != "implicitToVoidPtr" &&
-                            k != "implicitFromVoidPtr") {
+                            k != "implicitFromVoidPtr" &&
+                            k != "nullPointerConstantFromIntegerZero") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       std::format(
                                           "/semantics/pointerConversions/{}",
                                           k),
                                       std::format(
                                           "unknown 'pointerConversions' "
-                                          "field '{}' — expected "
-                                          "'implicitToVoidPtr' or "
-                                          "'implicitFromVoidPtr'",
+                                          "field '{}' — expected one of "
+                                          "'implicitToVoidPtr', "
+                                          "'implicitFromVoidPtr', or "
+                                          "'nullPointerConstantFromIntegerZero'",
                                           k));
                         }
                     }

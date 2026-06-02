@@ -556,6 +556,25 @@ struct DSS_EXPORT SemanticConfig {
         // at compile time). C, Objective-C: implicit. C++, Rust, Swift:
         // requires explicit cast.
         bool implicitFromVoidPtr = false;
+        // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C
+        // §6.3.2.3.3, an integer constant expression with value 0 is a
+        // null pointer constant — convertible WITHOUT cast to any
+        // object-pointer OR function-pointer type. C, C++, Obj-C all
+        // admit. C++11+ also has `nullptr` (a typed `nullptr_t`); the
+        // `0`-form remains valid alongside.
+        //
+        // This rule is VALUE-AWARE (looks at the literal's value, not
+        // just its type), so it lives in the semantic analyzer at the
+        // call-arg / return / init check sites (NOT in `isAssignable`,
+        // which stays type-only). HIR `coerce()` materializes the
+        // admitted conversion as `Cast(IntLiteral(0), Ptr<T>)`.
+        //
+        // Rust / Swift / Zig: false — they have explicit `std::ptr::null`
+        // / `nil` / `null` keywords typed at the source level.
+        // When this is the default-false, an extern signature with a
+        // `Ptr<T>` parameter rejects the literal `0` arg and the user
+        // must use the language's typed-null mechanism.
+        bool nullPointerConstantFromIntegerZero = false;
     };
     PointerConversionRules pointerConversions;
 };

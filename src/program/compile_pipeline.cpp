@@ -133,7 +133,11 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         std::vector<ffi::ExternDeclRef> refs;
         refs.reserve(hir->externDecls.size());
         for (auto const& r : hir->externDecls) {
-            refs.push_back({r.node, r.canonicalName});
+            // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3):
+            // propagate the per-symbol library override decoded by
+            // the lowerer from the optional trailing string literal.
+            // Empty = use format-level default (existing behavior).
+            refs.push_back({r.node, r.canonicalName, r.libraryOverride});
         }
 
         auto const ffiEntry = reporter.errorCount();

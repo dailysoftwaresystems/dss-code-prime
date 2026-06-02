@@ -13,6 +13,7 @@
 #include "core/types/tree_node.hpp"             // isEmptySpace
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "hir/const_eval_arith.hpp"
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
@@ -269,6 +270,55 @@ struct Lowerer {
                     admit = sem.pointerConversions.implicitFromVoidPtr;
                 }
                 if (admit) {
+                    HirNodeId const cast = builder.makeCast(
+                        child.id, target, HirFlags::Synthetic);
+                    for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                        if (it->first == child.id) {
+                            spans.push_back({cast, it->second});
+                            break;
+                        }
+                    }
+                    return {cast, target};
+                }
+            }
+        }
+        // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): when
+        // the source expression is an integer-literal 0 and the target
+        // is a pointer type, materialize the null-pointer conversion
+        // as `Cast(IntLit(0), Ptr<T>)`. The MIR-tier Cast lowering
+        // routes integer→pointer as a zero-extending move into a
+        // pointer-width register (literal 0 → 8-byte zero on Win64
+        // ms_x64), which Windows ABI reads as NULL — synchronous
+        // mode for `lpOverlapped`, NULL handle for HANDLE-typed args.
+        //
+        // Sister rule in `semantic_analyzer.cpp::admitsNullPointerConstant`
+        // — the semantic phase has admitted this site BEFORE reaching
+        // here; this arm only materializes the Cast. The value check
+        // (`payload == 0` in the pool's int64/uint64 arm) duplicates
+        // the semantic-phase check intentionally — the lowering should
+        // not assume external admission state; an unadmitted call here
+        // would have already produced an S_TypeMismatch.
+        if (tk == TypeKind::Ptr
+            && sem.pointerConversions.nullPointerConstantFromIntegerZero
+            && builder.kind(child.id) == HirKind::Literal) {
+            auto const ck2 = interner.kind(child.type);
+            bool const isInt =
+                   ck2 == TypeKind::I8  || ck2 == TypeKind::I16
+                || ck2 == TypeKind::I32 || ck2 == TypeKind::I64
+                || ck2 == TypeKind::I128
+                || ck2 == TypeKind::U8  || ck2 == TypeKind::U16
+                || ck2 == TypeKind::U32 || ck2 == TypeKind::U64
+                || ck2 == TypeKind::U128;
+            if (isInt) {
+                auto const idx = builder.payload(child.id);
+                auto const& lv = literals.at(idx);
+                // Use `dss::detail::asInt64` (const_eval_arith.hpp) to
+                // bridge both int64 and uint64 variant arms uniformly
+                // — matches the existing const-eval convention and
+                // avoids duplicating the variant-dispatch logic.
+                auto const i64 = ::dss::detail::asInt64(lv);
+                bool const isZero = i64.has_value() && *i64 == 0;
+                if (isZero) {
                     HirNodeId const cast = builder.makeCast(
                         child.id, target, HirFlags::Synthetic);
                     for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
@@ -2616,6 +2666,64 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3,
+        // 2026-06-02): scan the tail subtree (varDeclTail or
+        // externFuncTail) for an optional trailing `stringLiteralExpr`
+        // node — when present, decode its body as the per-symbol
+        // import-library override. Source-language agnostic by rule
+        // name (any grammar that produces a child rule named
+        // `stringLiteralExpr` populates the override the same way).
+        // The decoder uses `decodeStringLiteralBody` (the same path
+        // string-literal-arg uses), so all C-family escapes work in
+        // the override string body.
+        auto extractLibraryOverride = [&]() -> std::string {
+            if (!decl.kindByChild) return {};
+            NodeId disc = descend(node, decl.kindByChild->childPath);
+            if (!disc.valid() || tree().kind(disc) != NodeKind::Internal) {
+                return {};
+            }
+            // Match by rule-name to stay source-agnostic. Any language
+            // whose grammar wraps the override in a rule named
+            // `stringLiteralExpr` (StringStart + StringLiteral body)
+            // gets per-symbol library routing for free.
+            RuleId const stringLitRule =
+                tree().schema().rules().find("stringLiteralExpr");
+            if (!stringLitRule.valid()) return {};
+            SchemaTokenId const stringLitTok =
+                tree().schema().schemaTokens().find("StringLiteral");
+            if (!stringLitTok.valid()) return {};
+            for (auto const& c : tree().children(disc)) {
+                if (tree().kind(c) != NodeKind::Internal) continue;
+                if (isEmptySpace(tree().flags(c))) continue;
+                if (tree().rule(c).v != stringLitRule.v) continue;
+                // The body is the inner StringLiteral token.
+                for (auto const& gc : tree().children(c)) {
+                    if (tree().kind(gc) != NodeKind::Token) continue;
+                    if (tree().tokenKind(gc).v != stringLitTok.v) continue;
+                    auto decoded =
+                        decodeStringLiteralBody(tree().text(gc));
+                    if (decoded.has_value()) return std::move(*decoded);
+                    // F4 audit fix (6-agent 2nd-order, step 13.3a):
+                    // fail-loud on malformed escape rather than
+                    // silently falling back to the format-level
+                    // default — pre-fix a user-typed `extern void f()
+                    // "k\xZZ.dll";` would silently link against
+                    // msvcrt.dll with no breadcrumb pointing at the
+                    // malformed override. H_ExternDeclMalformed is
+                    // already used for malformed extern declarations.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::H_ExternDeclMalformed;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree().source().id();
+                    d.span     = tree().span(gc);
+                    d.actual   = std::string{tree().text(gc)};
+                    reporter.report(std::move(d));
+                    return {};
+                }
+            }
+            return {};
+        };
+
         // FF6 Slice 2 (2026-06-02 + post-fold #1 simplifier): record
         // the extern for FFI synthesis. The canonical name comes
         // from the SymbolRecord (unmangled identifier as declared
@@ -2628,7 +2736,9 @@ struct Lowerer {
         // Both surfaces are unsuppressable + upstream-of-link.
         auto recordExtern = [&](HirNodeId h) {
             auto const* rec = model.recordFor(sym);
-            externDecls.push_back({h, rec ? rec->name : std::string{}});
+            externDecls.push_back({h,
+                                   rec ? rec->name : std::string{},
+                                   extractLibraryOverride()});
         };
         if (decl.kindByChild) {
             NodeId disc = descend(node, decl.kindByChild->childPath);

@@ -270,6 +270,43 @@ TEST(HirLoweringCSubset, CoerceEmitsCastForVoidPtrToCharPtrArg) {
         << "Cast target must be Ptr<Char>, not Ptr<Void>";
 }
 
+// D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): pin that
+// `cst_to_hir.cpp`'s coerce() arm materializes literal 0 → Ptr<T> as
+// an explicit `Cast(IntLiteral(0), Ptr<T>)` HIR node. MIR's mapCast
+// routes IntToPtr (literal-0 → pointer-width zero in the dest
+// register); without the explicit Cast, MIR would see I32 where
+// Ptr was expected → silent type-skew at the HIR/MIR boundary.
+TEST(HirLoweringCSubset, NullPointerConstantEmitsCastInCallArg) {
+    SemanticModel model = analyzeCSubset(
+        "extern void f(void* p);\n"
+        "int main() { f(0); return 0; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& ti = model.lattice().interner();
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_GE(decls.size(), 2u);
+    HirNodeId const mainBody = res->hir.functionBody(decls.back());
+    auto const stmts = res->hir.children(mainBody);
+    ASSERT_GE(stmts.size(), 1u);
+    // First statement is the `f(0)` ExprStmt — find its Call.
+    HirNodeId const exprStmt = stmts[0];
+    HirNodeId const call = res->hir.exprStmtExpr(exprStmt);
+    ASSERT_EQ(res->hir.kind(call), HirKind::Call);
+    auto const callKids = res->hir.children(call);
+    ASSERT_EQ(callKids.size(), 2u);
+    HirNodeId const arg0 = callKids[1];
+    ASSERT_EQ(res->hir.kind(arg0), HirKind::Cast)
+        << "literal 0 → void* must materialize as an explicit Cast "
+           "HIR node; otherwise MIR sees I32 where Ptr is expected";
+    TypeId const argTy = res->hir.typeId(arg0);
+    ASSERT_EQ(ti.kind(argTy), TypeKind::Ptr);
+    auto const elem = ti.operands(argTy);
+    ASSERT_FALSE(elem.empty());
+    EXPECT_EQ(ti.kind(elem[0]), TypeKind::Void);
+}
+
 // D5.1: a `struct Foo { int x; int y; };` declaration lowers to a HIR
 // `TypeDecl` whose `typeId` is the composed `structType("Foo", {I32, I32})`.
 TEST(HirLoweringCSubset, StructDeclarationLowersToTypeDecl) {

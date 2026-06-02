@@ -247,6 +247,15 @@ public:
     [[nodiscard]] HirFlags flags(HirNodeId id) const {
         return arena_.at(id).flags;
     }
+    // Mid-build payload read. Frozen `Hir` exposes the same via its
+    // own `payload()`. Added at step 13.3's
+    // D-LANG-NULL-POINTER-CONSTANT closure — the coerce() arm needs
+    // the literal-pool index of a just-built `Literal` child to look
+    // up its decoded integer value (admit when value is 0). Read-only
+    // by contract; payload mutation continues through `make*` only.
+    [[nodiscard]] std::uint32_t payload(HirNodeId id) const {
+        return arena_.at(id).payload;
+    }
     [[nodiscard]] std::span<HirNodeId const>
     children(HirNodeId id) const;
     // Sub-structure accessors for `pathTerminates`-style passes that

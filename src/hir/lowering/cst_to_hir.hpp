@@ -49,6 +49,15 @@ class DiagnosticReporter;
 struct DSS_EXPORT HirExternRecord {
     HirNodeId   node;
     std::string canonicalName;  // undecorated source identifier
+    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3, 2026-06-02):
+    // per-symbol import-library override decoded from an optional
+    // trailing `"libname"` string literal in the source's extern
+    // declaration. Empty when the source declared no override; the
+    // FFI synthesize stage falls back to the language's
+    // `externLibraryByFormat[format]` entry. Source-agnostic: any
+    // language whose grammar produces an externDecl + populates this
+    // string at lowering time gets per-symbol routing for free.
+    std::string libraryOverride;
 };
 
 struct DSS_EXPORT CstToHirResult {
