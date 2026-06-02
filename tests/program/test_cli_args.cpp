@@ -608,3 +608,57 @@ TEST(CliArgs, BarePositionalEmitsUnexpectedPositional) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::UnexpectedPositional);
 }
+
+// ── D-LK10-ENTRY Slice C companion: `--output <dir>` ──────────────
+
+TEST(CliArgs, OutputFlagSpaceFormSetsOutputDir) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--output", "build/bin"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(r->outputDir.has_value());
+    EXPECT_EQ(r->outputDir->generic_string(), "build/bin");
+}
+
+TEST(CliArgs, OutputFlagEqualsFormSetsOutputDir) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--output=dist/x86_64"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(r->outputDir.has_value());
+    EXPECT_EQ(r->outputDir->generic_string(), "dist/x86_64");
+}
+
+TEST(CliArgs, OutputFlagDefaultsToNullopt) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(r->outputDir.has_value())
+        << "absent --output → nullopt; driver uses cwd/target/...";
+}
+
+TEST(CliArgs, OutputFlagEmptyValueRejected) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--output="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    EXPECT_FALSE(r.has_value())
+        << "--output= with empty value must reject";
+}
+
+TEST(CliArgs, OutputFlagMissingValueRejected) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--output"};  // no following arg
+    auto r = parseCliArgs(a.argc(), a.argv());
+    EXPECT_FALSE(r.has_value())
+        << "--output with no following arg must reject";
+}

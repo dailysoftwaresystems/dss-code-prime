@@ -4,6 +4,8 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "program/input_resolver.hpp"
 
+#include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -74,6 +76,26 @@ public:
         const std::vector<std::string>& targets,
         DiagnosticReporter::Config const& reporterConfig = {}
     );
+
+    /// `--output <dir>` (D-LK10-ENTRY Slice C companion): routes
+    /// emitted binaries into the named directory. When set, the
+    /// output-path convention becomes `<outputDir>/<binary>` for
+    /// single-target builds and `<outputDir>/<formatName>/<binary>`
+    /// for multi-target builds (to disambiguate same-named outputs
+    /// across formats). When unset (the default), the existing
+    /// `<cwd>/target/<formatName>/<binary>` convention applies.
+    ///
+    /// Caller is responsible for ensuring the directory exists.
+    /// The driver does NOT auto-mkdir for `--output` (mirrors the
+    /// `writeImage` parent-dir contract — see writer.hpp).
+    void setOutputDir(std::optional<std::filesystem::path> dir) {
+        outputDir_ = std::move(dir);
+    }
+    [[nodiscard]] std::optional<std::filesystem::path> const&
+    outputDir() const noexcept { return outputDir_; }
+
+private:
+    std::optional<std::filesystem::path> outputDir_;
 };
 
 } // namespace dss

@@ -63,6 +63,29 @@ struct DSS_EXPORT CliArgs {
         InputResolver::Mode::Recursive;        // --recursive / --no-recursive
     CompileConfig            config = CompileConfig::Debug;  // --config=release|debug
 
+    // ── Output routing (D-LK10-ENTRY Slice C companion) ─────────
+    //
+    // `--output <dir>` (or `--output=<dir>`) routes every emitted
+    // binary into the named directory. Without this flag, the
+    // driver emits to the current working directory using the
+    // shipped format's natural extension (e.g. `myprog.exe`,
+    // `myprog`, `myprog.o`).
+    //
+    // The directory MUST exist + be writable at compile time (the
+    // driver does NOT auto-mkdir — silent dir creation has bitten
+    // similar features in this codebase; explicit
+    // `D_OutputDirCreateFailed` already exists for the
+    // mkdir-failure path elsewhere). Empty value rejects as
+    // `CliArgsError::MissingFlagValue` (consistent with
+    // `--target=""` / `--language=""`).
+    //
+    // When multiple targets are declared via repeated `--target`,
+    // the driver concatenates the target name as a subdirectory
+    // (`<output>/<target>/<binary>`) so multi-target builds don't
+    // collide on the same file name. With a single target the
+    // binary lands directly in `<output>/<binary>`.
+    std::optional<std::filesystem::path> outputDir;
+
     // ── LSP options ─────────────────────────────────────────────
     std::optional<std::filesystem::path> lspSchemaDir;
 

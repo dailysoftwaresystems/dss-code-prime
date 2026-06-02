@@ -152,11 +152,21 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 
 // Compile one resolved (CU, target, format) triple to one artifact.
 // Returns true on success; emits via `reporter` on failure.
+//
+// `outputDir` (D-LK10-ENTRY Slice C companion): when set, the
+// emitted binary lands at `<outputDir>/<sourceStem><ext>` for
+// single-target builds, or `<outputDir>/<formatName>/<sourceStem>
+// <ext>` for multi-target builds (the multi-target qualifier
+// disambiguates same-named outputs across formats). When unset,
+// the legacy `<cwd>/target/<formatName>/<sourceStem><ext>`
+// convention applies — keeps existing call sites unchanged.
 [[nodiscard]] bool compileOneTarget(CompilationUnit const& cu,
                                     GrammarSchema const&   grammar,
                                     std::string const&     sourceStem,
                                     std::string const&     targetSpecStr,
-                                    DiagnosticReporter&    reporter) {
+                                    DiagnosticReporter&    reporter,
+                                    std::optional<std::filesystem::path> const& outputDir,
+                                    bool                   multiTargetBuild) {
     auto parsed = TargetSpec::parse(targetSpecStr);
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,
@@ -241,11 +251,20 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 
     // Output path convention (cycle 2 v1; plan 6 owns the
     // authoritative artifact-profile-driven scheme):
-    //   <cwd>/target/<formatName>/<sourceStem><ext>
+    //   default      : <cwd>/target/<formatName>/<sourceStem><ext>
+    //   --output dir : <dir>/<sourceStem><ext>               (single target)
+    //                  <dir>/<formatName>/<sourceStem><ext>  (multi target)
     // `formatName` already encodes machine+OS, so we don't add a
     // separate `<targetName>` subdir (redundant + bloats the path).
     auto const ext = parsed->outputExtension(**formatR);
-    auto const outDir = fs::current_path() / "target" / parsed->formatName;
+    fs::path outDir;
+    if (outputDir.has_value()) {
+        outDir = multiTargetBuild
+                   ? (*outputDir / parsed->formatName)
+                   : *outputDir;
+    } else {
+        outDir = fs::current_path() / "target" / parsed->formatName;
+    }
     std::error_code ec;
     fs::create_directories(outDir, ec);
     if (ec) {
@@ -293,6 +312,8 @@ int Program::run(int argc, char* argv[]) {
     // default config and silently ignore the user's policy. (silent-
     // failure audit H2 post-fold #1.)
     auto const cfg = buildReporterConfig(args);
+    // D-LK10-ENTRY Slice C companion: route emitted binaries.
+    setOutputDir(args.outputDir);
     if (args.projectPath.has_value()) {
         return compileProject(*args.projectPath, cfg);
     }
@@ -506,7 +527,9 @@ int Program::compileFiles(
         scratchCfg.dedupWindow    = 0;
         DiagnosticReporter scratch{scratchCfg};
         bool const ok = compileOneTarget(cu, *grammar, sourceStem,
-                                          spec, scratch);
+                                          spec, scratch,
+                                          outputDir_,
+                                          /*multiTargetBuild*/ targets.size() > 1u);
         mergeWithTargetContext(scratch, spec, rep);
         if (!ok || scratch.hasErrors()) exitCode = 1;
     }

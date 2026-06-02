@@ -170,6 +170,9 @@ std::string cliHelpText() {
             "`=`-form is also accepted (--target=spec).\n"
         "  --recursive            scan subdirectories (default)\n"
         "  --no-recursive         only the top-level directory\n"
+        "  --output <dir>         route emitted binaries into "
+            "<dir> (default: <cwd>/target/<formatName>/). Multi-"
+            "target builds get a per-format subdirectory.\n"
         "  --config=<debug|release>  build config "
             "(default: debug; release applies the full optimizer "
             "pipeline — plan 22)\n"
@@ -407,6 +410,16 @@ parseCliArgs(int argc, char* argv[]) {
             if (!m) return std::unexpected(m.error());
             if (m->has_value()) {
                 out.targets.push_back(std::move(**m));
+                continue;
+            }
+        }
+        {
+            // D-LK10-ENTRY Slice C companion: `--output <dir>` /
+            // `--output=<dir>` routes emitted binaries.
+            auto m = valueFlag(a, i, "--output");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                out.outputDir = std::filesystem::path{std::move(**m)};
                 continue;
             }
         }
