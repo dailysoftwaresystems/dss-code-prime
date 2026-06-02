@@ -111,9 +111,17 @@ constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
 // linkedit_data_command shape (16 bytes): cmd / cmdsize / dataoff /
 // datasize. Both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use
 // this exact layout — the alias documents the shared shape so
-// future linkedit-data-command LCs can reuse the constant.
+// future linkedit-data-command LCs can reuse the constant and each
+// emission site is site-specific about WHICH LC is being sized.
+// (Cross-read: type-design Q3 + simplifier #2 voted collapse;
+// code-architect Q6 voted keep — compromise = keep both names for
+// site-specific clarity + static_assert pins the wire-shared shape
+// so a future Apple change to one struct doesn't diverge silently.)
 constexpr std::size_t   kCodeSigCommandSize = 16;
 constexpr std::size_t   kLinkeditDataCommandSize = 16;
+static_assert(kCodeSigCommandSize == kLinkeditDataCommandSize,
+              "linkedit_data_command shape is wire-frozen at 16 bytes; "
+              "both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use it.");
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
 
 // section_64.flags (S_*) — <mach-o/loader.h>
@@ -1260,10 +1268,21 @@ encodeExecDynamic(AssembledModule const&    module,
                          "fall back to LC_DYLD_INFO_ONLY.", ord));
                 return {};
             }
+            // D-LK6-14-MACHO-WEAK-DEF anchor: hard-coded
+            // weakImport=false for all extern imports. The
+            // DYLD_CHAINED_IMPORT bit-8 weak_import bit lets dyld
+            // treat the binding as optional (resolve-to-null if the
+            // symbol isn't present in any dylib at load time —
+            // useful for forward-compatible code targeting an older
+            // libSystem). Trigger to ship: first schema or extern
+            // source that needs weak-import semantics (e.g.
+            // `__attribute__((weak_import))` from a C header parsed
+            // by FF2). Until then, false matches the eager-bind
+            // posture (D-LK6-13 lazy is also deferred).
             chainedImports.push_back({
                 ext.mangledName,
                 static_cast<std::int8_t>(ord),
-                false  // weakImport — D-LK6-14-MACHO-WEAK-DEF reserves
+                false  // weakImport
             });
         }
         dyldBindBlob =
@@ -1729,10 +1748,10 @@ encodeExecDynamic(AssembledModule const&    module,
     // D-LK6-14-INTEGRATION-GOT-SLOTS anchor: chained fixups make
     // this LC redundant — the chained pointers in __got encode the
     // import ordinal directly, so the indirect symbol table is no
-    // longer needed. When the integration fold lands, this entire
-    // block is dropped AND __got slot population switches from
-    // zero-init (filled by dyld via bind-opcodes) to direct
-    // DYLD_CHAINED_PTR_64 bitfield writes.
+    // longer needed. When D-LK6-14-INTEGRATION-GOT-SLOTS lands,
+    // this entire block is dropped AND __got slot population
+    // switches from zero-init (filled by dyld via bind-opcodes)
+    // to direct DYLD_CHAINED_PTR_64 bitfield writes.
     appendU32LE(bytes, LC_DYSYMTAB);
     appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
     appendU32LE(bytes, 0);                    // ilocalsym

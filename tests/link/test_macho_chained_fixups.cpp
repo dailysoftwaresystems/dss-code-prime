@@ -20,6 +20,7 @@
 // otherwise.)
 
 #include "link/format/macho_chained_fixups.hpp"
+#include "link_test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -33,20 +34,11 @@ using dss::macho::detail::ChainedFixupImport;
 using dss::macho::detail::buildChainedFixupsPayload;
 using dss::macho::detail::kDyldChainedFixupsHeaderSz;
 using dss::macho::detail::kDyldChainedImportSz;
-
-// Little-endian readers for assertion-side byte-walk.
-[[nodiscard]] std::uint16_t readU16(std::vector<std::uint8_t> const& b,
-                                     std::size_t off) {
-    return static_cast<std::uint16_t>(b[off])
-         | (static_cast<std::uint16_t>(b[off + 1]) << 8);
-}
-[[nodiscard]] std::uint32_t readU32(std::vector<std::uint8_t> const& b,
-                                     std::size_t off) {
-    return  static_cast<std::uint32_t>(b[off])
-         | (static_cast<std::uint32_t>(b[off + 1]) <<  8)
-         | (static_cast<std::uint32_t>(b[off + 2]) << 16)
-         | (static_cast<std::uint32_t>(b[off + 3]) << 24);
-}
+// D-TEST-LE-READ-HELPERS CLOSED (8aabc04 audit fold 2026-06-01):
+// promoted to the shared `link_test_support.hpp` (where readU64LE
+// already lives); 2nd consumer trigger met.
+using dss::link_format::test::readU16LE;
+using dss::link_format::test::readU32LE;
 
 } // namespace
 
@@ -58,14 +50,14 @@ TEST(MachoChainedFixupsPayload, HeaderFieldsForSingleImport) {
 
     // Header (24 bytes).
     ASSERT_GE(out.size(), kDyldChainedFixupsHeaderSz);
-    EXPECT_EQ(readU32(out,  0), 0u)            << "fixups_version";
-    EXPECT_EQ(readU32(out,  4), 24u)           << "starts_offset (= 24 = sizeof header)";
+    EXPECT_EQ(readU32LE(out,  0), 0u)            << "fixups_version";
+    EXPECT_EQ(readU32LE(out,  4), 24u)           << "starts_offset (= 24 = sizeof header)";
     // starts_in_image = 4 (seg_count) + 4 (offset[0]) = 8 bytes
-    EXPECT_EQ(readU32(out,  8), 32u)           << "imports_offset (= 24 + 8)";
-    EXPECT_EQ(readU32(out, 12), 36u)           << "symbols_offset (= 32 + 4)";
-    EXPECT_EQ(readU32(out, 16), 1u)            << "imports_count";
-    EXPECT_EQ(readU16(out, 20), 1u)            << "imports_format = DYLD_CHAINED_IMPORT";
-    EXPECT_EQ(readU16(out, 22), 0u)            << "symbols_format = uncompressed";
+    EXPECT_EQ(readU32LE(out,  8), 32u)           << "imports_offset (= 24 + 8)";
+    EXPECT_EQ(readU32LE(out, 12), 36u)           << "symbols_offset (= 32 + 4)";
+    EXPECT_EQ(readU32LE(out, 16), 1u)            << "imports_count";
+    EXPECT_EQ(readU16LE(out, 20), 1u)            << "imports_format = DYLD_CHAINED_IMPORT";
+    EXPECT_EQ(readU16LE(out, 22), 0u)            << "symbols_format = uncompressed";
 }
 
 TEST(MachoChainedFixupsPayload, StartsInImageHasOneSegmentZeroOffset) {
@@ -73,8 +65,8 @@ TEST(MachoChainedFixupsPayload, StartsInImageHasOneSegmentZeroOffset) {
         {"_printf", 1, false},
     };
     auto const out = buildChainedFixupsPayload(imports);
-    EXPECT_EQ(readU32(out, 24), 1u)            << "seg_count";
-    EXPECT_EQ(readU32(out, 28), 0u)
+    EXPECT_EQ(readU32LE(out, 24), 1u)            << "seg_count";
+    EXPECT_EQ(readU32LE(out, 28), 0u)
         << "seg_info_offset[0] = 0 (no chains in segment v1); "
            "D-LK6-14-INTEGRATION-GOT-SLOTS populates this";
 }
@@ -85,7 +77,7 @@ TEST(MachoChainedFixupsPayload, ImportPackingLibOrdinalMain) {
         {"_main_sym", /*libOrdinal=*/-2, /*weakImport=*/false},
     };
     auto const out = buildChainedFixupsPayload(imports);
-    std::uint32_t const packed = readU32(out, 32);
+    std::uint32_t const packed = readU32LE(out, 32);
     EXPECT_EQ(packed & 0xFFu, 0xFEu)           << "lib_ordinal = -2 (two's complement low byte)";
     EXPECT_EQ((packed >> 8) & 0x1u, 0u)        << "weak_import bit clear";
     EXPECT_EQ(packed >> 9, 1u)                 << "name_offset = 1 (NUL sentinel at 0)";
@@ -96,7 +88,7 @@ TEST(MachoChainedFixupsPayload, ImportPackingWeakBitSet) {
         {"_weak_sym", /*libOrdinal=*/1, /*weakImport=*/true},
     };
     auto const out = buildChainedFixupsPayload(imports);
-    std::uint32_t const packed = readU32(out, 32);
+    std::uint32_t const packed = readU32LE(out, 32);
     EXPECT_EQ(packed & 0xFFu, 1u);
     EXPECT_EQ((packed >> 8) & 0x1u, 1u)        << "weak_import bit MUST be set";
     EXPECT_EQ(packed >> 9, 1u);
@@ -108,7 +100,7 @@ TEST(MachoChainedFixupsPayload, SymbolPoolHasLeadingNulSentinel) {
         {"bb", 1, false},
     };
     auto const out = buildChainedFixupsPayload(imports);
-    std::size_t const symbolsOff = readU32(out, 12);
+    std::size_t const symbolsOff = readU32LE(out, 12);
     EXPECT_EQ(out[symbolsOff], 0u)
         << "symbols pool MUST start with NUL sentinel (offset 0 is "
            "the empty-name marker per Apple's convention)";
@@ -129,10 +121,10 @@ TEST(MachoChainedFixupsPayload, NameOffsetsAdvancePerImport) {
     };
     auto const out = buildChainedFixupsPayload(imports);
     // Each packed row at importsOff + i*4. Extract name_offset (bits 9..31).
-    std::uint32_t const importsOff = readU32(out, 8);
-    std::uint32_t const off0 = readU32(out, importsOff + 0 * 4) >> 9;
-    std::uint32_t const off1 = readU32(out, importsOff + 1 * 4) >> 9;
-    std::uint32_t const off2 = readU32(out, importsOff + 2 * 4) >> 9;
+    std::uint32_t const importsOff = readU32LE(out, 8);
+    std::uint32_t const off0 = readU32LE(out, importsOff + 0 * 4) >> 9;
+    std::uint32_t const off1 = readU32LE(out, importsOff + 1 * 4) >> 9;
+    std::uint32_t const off2 = readU32LE(out, importsOff + 2 * 4) >> 9;
     // Pool layout: [0]NUL [1..5]"first"[0] [7..12]"second"[0] [14..18]"third"[0]
     EXPECT_EQ(off0, 1u)     << "_first_ at pool offset 1 (after NUL sentinel)";
     EXPECT_EQ(off1, 7u)     << "_second_ at pool offset 7 (after 'first\\0')";
@@ -144,8 +136,8 @@ TEST(MachoChainedFixupsPayload, EmptyImportsListEmitsHeaderPlusEmptyRegions) {
     auto const out = buildChainedFixupsPayload(imports);
     // Total size: header (24) + starts_in_image (8) + imports (0) + pool (1 sentinel) = 33.
     EXPECT_EQ(out.size(), 33u);
-    EXPECT_EQ(readU32(out, 16), 0u)            << "imports_count = 0";
-    EXPECT_EQ(readU32(out, 12), 32u)           << "symbols_offset = 32 (just past starts_in_image)";
+    EXPECT_EQ(readU32LE(out, 16), 0u)            << "imports_count = 0";
+    EXPECT_EQ(readU32LE(out, 12), 32u)           << "symbols_offset = 32 (just past starts_in_image)";
     EXPECT_EQ(out[32], 0u)                     << "pool is just the NUL sentinel";
 }
 

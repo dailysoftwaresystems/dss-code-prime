@@ -674,15 +674,11 @@ enum class DiagnosticCode : std::uint16_t {
     K_ImageWriteShort              = 0x8009,
     K_ImageWriteCloseFailed        = 0x800A,
     K_ImageEmpty                   = 0x800B,
-    // (0x800C was K_ChainedFixupsNotYetIntegrated — substrate-gap
-    // signal that fired when `image.useChainedFixups = true` was
-    // set without integration in encodeExecDynamic. Removed when
-    // D-LK6-14-INTEGRATION-PAYLOAD closed: the integration arm now
-    // exists in macho.cpp so the gap signal has no use site. The
-    // companion D-LK6-14-INTEGRATION-GOT-SLOTS is open but doesn't
-    // need a fail-loud K_ — chained-fixups binaries from this
-    // walker pass byte-level tests even with zero-init __got slots.
-    // GOT-SLOTS closes the runtime-loadability gap when it ships.)
+    // (0x800C retired — was K_ChainedFixupsNotYetIntegrated, a
+    // substrate-gap signal removed at D-LK6-14-INTEGRATION-PAYLOAD
+    // closure. Companion D-LK6-14-INTEGRATION-GOT-SLOTS is open but
+    // is a runtime-loadability gap that doesn't need a fail-loud K_.)
+    // Next K_* value: 0x800D.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
