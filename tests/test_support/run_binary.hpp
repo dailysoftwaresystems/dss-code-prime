@@ -9,22 +9,29 @@
 // exit code — not a mocked/in-memory check — this is the first
 // test that must touch the real loader."
 //
-// Stage 1 — Windows host only via `CreateProcessA` +
-// `WaitForSingleObject` + `GetExitCodeProcess`. POSIX
-// (`posix_spawn` + `waitpid`) anchored D-LK10-ENTRY-POSIX-RUN-
-// HARNESS — Stage 1 ships the Windows-host smoke; cross-host
-// running is the LK10-full hermetic acceptance gate.
+// Platform arms:
+//   * Windows — `CreateProcessA` + `WaitForSingleObject` +
+//     `GetExitCodeProcess` (Stage 1 Slice C 2026-06-02).
+//   * POSIX — `posix_spawn` + `waitpid` with `WNOHANG` poll loop
+//     for timeout (closes D-LK10-ENTRY-POSIX-RUN-HARNESS,
+//     2026-06-02). The poll loop sleeps in increments capped at
+//     remaining-timeout so the harness exits promptly on short
+//     runs (the examples runner spawns dozens per test cycle).
 //
 // Caller writes the bytes to disk first via
 // `dss::linker::writeImage`. Caller-side responsibility for
 // permissions on POSIX + .exe extension on Windows (the parent-
-// directory contract is documented at `writer.hpp:30-34`).
+// directory contract is documented at `writer.hpp:30-34`). The
+// POSIX arm also chmod+x the spawned binary so `posix_spawn`
+// can exec it (the linker writes 0644 by default; a caller that
+// already applied 0755 sees the redundant chmod as a no-op).
 
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
   #ifndef WIN32_LEAN_AND_MEAN
@@ -37,6 +44,15 @@
     #define NOMINMAX
   #endif
   #include <windows.h>
+#else
+  #include <errno.h>
+  #include <signal.h>
+  #include <spawn.h>
+  #include <sys/stat.h>
+  #include <sys/wait.h>
+  #include <unistd.h>
+
+  extern char** environ;
 #endif
 
 namespace dss::test_support {
@@ -122,18 +138,105 @@ runBinary(std::filesystem::path const&     binaryPath,
     ::CloseHandle(pi.hThread);
     return out;
 #else
-    // POSIX path anchored D-LK10-ENTRY-POSIX-RUN-HARNESS. When
-    // LK10-full hermetic acceptance lands, this becomes:
-    //   posix_spawn + waitpid with clock-based timeout loop.
-    // Today: stub returns "not implemented" so non-Windows hosts
-    // compile this header but tests skip via runtime check on
-    // `result.spawned`.
-    (void)binaryPath;
-    (void)timeout;
-    out.diagnostic = "runBinary: POSIX run-harness anchored "
-                     "D-LK10-ENTRY-POSIX-RUN-HARNESS — Stage 1 "
-                     "ships Windows host only.";
-    return out;
+    // POSIX arm — closes D-LK10-ENTRY-POSIX-RUN-HARNESS (2026-06-02).
+    // Uses `posix_spawn` (vs fork+exec) so the harness works
+    // identically on Linux + macOS without ifdef'ing process-image
+    // semantics; on macOS this also avoids the `vfork` deprecation.
+    //
+    // Timeout policy: poll `waitpid(..., WNOHANG)` in increments
+    // bounded by the remaining-timeout. Sleeping the FULL remaining
+    // timeout in one shot would make a short run (< few ms) wait
+    // for the whole budget; capping each sleep at 10 ms keeps short-
+    // run latency bounded while still adapting to long timeouts.
+    auto const pathStr = binaryPath.string();
+    if (pathStr.empty()) {
+        out.diagnostic = "runBinary: empty path";
+        return out;
+    }
+
+    // The linker writes the emitted exec with 0644 mode (the
+    // writer.cpp open() default); POSIX `posix_spawn(execve)` needs
+    // executable bits or it returns EACCES. Apply 0755 idempotently
+    // here so callers don't have to remember the chmod. If chmod
+    // fails (e.g. permission denied on a network volume), report
+    // loud — spawning would fail with a less specific error.
+    if (::chmod(pathStr.c_str(), 0755) != 0) {
+        out.diagnostic = "chmod('" + pathStr + "', 0755) failed: errno="
+                       + std::to_string(errno);
+        return out;
+    }
+
+    char const* const argv[] = {pathStr.c_str(), nullptr};
+    pid_t pid = -1;
+    int const rc = ::posix_spawn(
+        &pid,
+        pathStr.c_str(),
+        /*file_actions*/ nullptr,
+        /*attrp*/        nullptr,
+        // posix_spawn signature wants `char* const argv[]` — cast
+        // here because the strings we own are read-only by contract;
+        // the child won't mutate them across exec.
+        const_cast<char* const*>(argv),
+        environ);
+    if (rc != 0) {
+        out.diagnostic = "posix_spawn('" + pathStr + "') failed: rc="
+                       + std::to_string(rc);
+        return out;
+    }
+    out.spawned = true;
+
+    auto const start  = std::chrono::steady_clock::now();
+    auto const deadline = start + timeout;
+
+    int status = 0;
+    while (true) {
+        pid_t const w = ::waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            // Child exited.
+            if (WIFEXITED(status)) {
+                out.exitCode =
+                    static_cast<std::uint32_t>(WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                // Surface the terminating signal as a high exit
+                // code (128 + signal — POSIX shell convention) so
+                // the caller can distinguish "exited cleanly with
+                // N" from "killed by signal N". The diagnostic
+                // string carries the precise reason for the
+                // strict-asserts in the examples harness.
+                out.exitCode = 128u +
+                    static_cast<std::uint32_t>(WTERMSIG(status));
+                out.diagnostic = "child terminated by signal "
+                               + std::to_string(WTERMSIG(status));
+            } else {
+                out.diagnostic = "waitpid returned with unknown "
+                                 "status word " + std::to_string(status);
+            }
+            return out;
+        }
+        if (w == -1) {
+            out.diagnostic = "waitpid(pid=" + std::to_string(pid)
+                           + ") failed: errno=" + std::to_string(errno);
+            return out;
+        }
+        // w == 0 → child still running.
+        auto const now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            // Timeout — terminate the child with SIGKILL, reap it
+            // so the parent doesn't leave a zombie, and report.
+            ::kill(pid, SIGKILL);
+            ::waitpid(pid, &status, 0);
+            out.timedOut   = true;
+            out.diagnostic = "child timed out after "
+                           + std::to_string(timeout.count()) + " ms";
+            return out;
+        }
+        auto const remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now);
+        auto const slice = std::min(
+            remaining, std::chrono::milliseconds{10});
+        std::this_thread::sleep_for(slice);
+    }
 #endif
 }
 
