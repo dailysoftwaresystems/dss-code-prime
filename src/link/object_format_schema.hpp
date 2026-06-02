@@ -558,6 +558,31 @@ struct DSS_EXPORT MachOImage {
     //  alignment; the walker rejects any other value at
     //  `validate()`).
     std::uint32_t codeSignatureSize = 0;
+    // Modern dyld binding format (Xcode 12+ / macOS 12+). When
+    // `true`, the walker emits `LC_DYLD_CHAINED_FIXUPS` (0x80000034)
+    // pointing at a `dyld_chained_fixups_header` + chained-pointer
+    // table in `__LINKEDIT`, INSTEAD of the legacy
+    // `LC_DYLD_INFO_ONLY` opcode stream. Each `__got` slot becomes
+    // a 64-bit packed chained pointer (DYLD_CHAINED_PTR_64 format):
+    // bit 62 = bind/rebase flag, bit 63 = next-in-chain link, the
+    // low bits encode either a 24-bit import ordinal (bind) or a
+    // 36-bit target offset (rebase). v1 supports BIND-only chains
+    // (extern imports → `__got`); rebase support deferred per
+    // D-LK6-14-REBASE.
+    //
+    // D-LK6-14 closure (chained-fixups emitter for DYLD_CHAINED_PTR_64).
+    // Requires `bindNow == true` (lazy binding is incompatible with
+    // chained fixups in v1; v2 dyld supports lazy via stub trampolines
+    // but the walker rejects that combo loud as
+    // K_FormatLacksImportSupport). ARM64e pointer-authentication
+    // (DYLD_CHAINED_PTR_ARM64E) deferred — D-LK6-14-ARM64E. 32-bit
+    // Mach-O chained-fixups deferred — D-LK6-14-32 (paired with
+    // FormatGuess::MachO32).
+    //
+    // Default `false` preserves the legacy LC_DYLD_INFO_ONLY path so
+    // shipped formats opt in explicitly (currently the new
+    // `macho64-arm64-darwin-exec.format.json` enables it).
+    bool          useChainedFixups = false;
 };
 
 namespace detail {

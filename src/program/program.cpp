@@ -388,8 +388,20 @@ int Program::compileFiles(
     const std::vector<std::string>& targets,
     DiagnosticReporter::Config const& reporterConfig
 ) {
+    // Thin wrapper around the rep-injection overload (closes
+    // D-CAP-MARKER-MULTI-TARGET-E2E-PIN). Existing CLI / Python
+    // call sites that pass `Config` (or use the default-arg)
+    // continue unchanged.
     DiagnosticReporter rep{reporterConfig};
+    return compileFiles(sourceFiles, languageName, targets, rep);
+}
 
+int Program::compileFiles(
+    const std::vector<std::string>& sourceFiles,
+    const std::string& languageName,
+    const std::vector<std::string>& targets,
+    DiagnosticReporter&             rep
+) {
     if (sourceFiles.empty()) {
         emitDriver(rep, DiagnosticCode::D_EmptyInput,
                    "compileFiles: source file list is empty.");
@@ -485,7 +497,7 @@ int Program::compileFiles(
         // into `contextPrefix` (excluded from hashKey) rather than
         // mutating `actual`, so cross-target legitimate duplicates
         // collapse at the merge destination.
-        auto scratchCfg = reporterConfig;
+        auto scratchCfg = rep.config();
         scratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
         scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
         scratchCfg.dedupWindow    = 0;

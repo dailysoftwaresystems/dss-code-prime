@@ -35,6 +35,24 @@ public:
         DiagnosticReporter::Config const& reporterConfig = {}
     );
 
+    /// Rep-injection overload — caller owns `rep` and may inspect it
+    /// after return. The Config-taking overload is a thin wrapper
+    /// that constructs `rep` internally and forwards here.
+    ///
+    /// D-CAP-MARKER-MULTI-TARGET-E2E-PIN (eb2c6c7 audit-fold 2026-06-01):
+    /// the single-chokepoint cap-marker contract cannot be pinned
+    /// from outside without post-run reporter inspection — the
+    /// original Track 3 test became structurally impossible when
+    /// `D_TargetMachineCodeMismatch` joined `kUnsuppressableCodes`
+    /// (cap-gates bypassed). This overload lets tests reach
+    /// `rep.all()` / `countCode(rep, P_TooManyDiagnostics)` directly.
+    int compileFiles(
+        const std::vector<std::string>& sourceFiles,
+        const std::string& languageName,
+        const std::vector<std::string>& targets,
+        DiagnosticReporter&             rep
+    );
+
     /// Compile every matching source file in a directory.
     /// `mode` selects recursive vs flat scan (D-LK10-1 closure axis).
     int compileDirectory(

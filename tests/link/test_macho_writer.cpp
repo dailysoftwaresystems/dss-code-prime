@@ -985,6 +985,122 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
     EXPECT_TRUE(sawAnchor);
 }
 
+// D-LK6-14 substrate (e4508b9 → next 2026-06-01): schema JSON
+// accepts the `useChainedFixups` flag. Defaults to false (legacy
+// LC_DYLD_INFO_ONLY opcode stream path stays fully supported).
+TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-cfx-default","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ]
+    })");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE((*r)->machoImage().useChainedFixups);
+}
+
+TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-cfx-on","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "useChainedFixups": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ]
+    })");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->machoImage().useChainedFixups);
+}
+
+TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-cfx-bad","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "useChainedFixups": "yes"
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ]
+    })");
+    ASSERT_FALSE(r.has_value());
+}
+
+// D-LK6-14 substrate guard: until D-LK6-14-INTEGRATION lands the
+// actual chained-fixups emission inside encodeExecDynamic, the
+// substrate fails loud with K_FormatLacksImportSupport when the
+// schema requests `useChainedFixups=true`. Mirrors the BindNowFalse
+// fail-loud pattern for D-LK6-13.
+TEST(MachOExecWriter, UseChainedFixupsFailsLoudCitingDLK614Integration) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-cfx-substrate","kind":"macho"},
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "useChainedFixups": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_printf",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool sawAnchor = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport
+         && d.actual.find("D-LK6-14-INTEGRATION") != std::string::npos) {
+            sawAnchor = true;
+        }
+    }
+    EXPECT_TRUE(sawAnchor)
+        << "substrate guard must cite D-LK6-14-INTEGRATION so "
+           "operators see the gap and can fall back to legacy "
+           "LC_DYLD_INFO_ONLY by clearing the flag";
+}
+
 TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,

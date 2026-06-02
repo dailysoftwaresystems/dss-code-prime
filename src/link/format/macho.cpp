@@ -103,8 +103,9 @@ void padTo(std::vector<std::uint8_t>& out, std::uint64_t alignment) {
 constexpr std::uint32_t LC_LOAD_DYLINKER  = 0x0E;
 constexpr std::uint32_t LC_MAIN           = 0x80000028u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_LOAD_DYLIB     = 0x0C;
-constexpr std::uint32_t LC_DYLD_INFO_ONLY = 0x80000022u;  // |= LC_REQ_DYLD
-constexpr std::uint32_t LC_DYSYMTAB       = 0x0B;
+constexpr std::uint32_t LC_DYLD_INFO_ONLY      = 0x80000022u;  // |= LC_REQ_DYLD
+constexpr std::uint32_t LC_DYLD_CHAINED_FIXUPS = 0x80000034u;  // |= LC_REQ_DYLD — D-LK6-14
+constexpr std::uint32_t LC_DYSYMTAB            = 0x0B;
 constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
 constexpr std::size_t   kCodeSigCommandSize = 16;  // linkedit_data_command
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
@@ -949,6 +950,134 @@ namespace {
 // constants/helpers at the top of this file (shared with
 // encodeExec; code-simplifier REQUIRED fold, LK6 cycle 2c review).
 
+// ── D-LK6-14 chained-fixups payload builder (substrate) ─────────
+//
+// Apple's modern dyld binding format (Xcode 12+, macOS 12+) packs
+// binding info into a compact chained-pointer table in __LINKEDIT.
+// The LC_DYLD_CHAINED_FIXUPS load command (0x80000034) points at a
+// `dyld_chained_fixups_header` whose offsets locate four regions:
+//   1. dyld_chained_starts_in_image — per-segment page_starts array
+//   2. dyld_chained_imports          — N × DYLD_CHAINED_IMPORT (4B each)
+//   3. symbols pool                   — packed NUL-terminated names
+//   4. (the chained pointers themselves live in the __DATA_CONST
+//      segment, NOT in the __LINKEDIT payload — they are populated
+//      by D-LK6-14-INTEGRATION which restructures encodeExecDynamic
+//      to emit DYLD_CHAINED_PTR_64 bitfields in __got slots.)
+//
+// This helper builds region 1 + 2 + 3 of the __LINKEDIT payload.
+// The chained-pointer population (region 4) + the LC_DYLD_INFO_ONLY
+// replacement in encodeExecDynamic are tracked separately under
+// D-LK6-14-INTEGRATION. v1 substrate ships the payload builder so
+// (a) byte-structure tests pin the wire format and (b) the
+// integration fold has a unit-tested primitive to drop in.
+//
+// Format references (Apple `<mach-o/fixup-chains.h>`, reproduced
+// inline to keep src/link/format/ free of host-OS SDK pulls):
+//   * dyld_chained_fixups_header (24 bytes):
+//       [ 0.. 3] fixups_version  (must be 0)
+//       [ 4.. 7] starts_offset   (offset to dyld_chained_starts_in_image)
+//       [ 8..11] imports_offset  (offset to imports array)
+//       [12..15] symbols_offset  (offset to symbol pool)
+//       [16..19] imports_count   (N — number of extern bindings)
+//       [20..21] imports_format  (1 = DYLD_CHAINED_IMPORT)
+//       [22..23] symbols_format  (0 = uncompressed)
+//   * dyld_chained_starts_in_image (variable):
+//       [ 0.. 3] seg_count       (number of segments — 1 in v1 substrate)
+//       [ 4..]   seg_info_offset[seg_count] (u32 each; 0 = no chains)
+//   * DYLD_CHAINED_IMPORT (4 bytes packed):
+//       bits [ 0]      lib_ordinal_msb (0 for v1 single-dylib case)
+//       bits [ 1..7]   lib_ordinal_low (7-bit signed; -1=SELF, -2=MAIN, ...)
+//       bits [ 8]      weak_import bit
+//       bits [ 9..31]  name_offset (23-bit offset into symbols pool)
+constexpr std::uint32_t kDyldChainedFixupsVersion = 0u;
+constexpr std::uint16_t kDyldChainedImportsFormat  = 1u;  // DYLD_CHAINED_IMPORT
+constexpr std::uint16_t kDyldChainedSymbolsFormat  = 0u;  // uncompressed
+constexpr std::size_t   kDyldChainedFixupsHeaderSz = 24u;
+constexpr std::size_t   kDyldChainedImportSz       = 4u;
+
+// One row supplied by the caller: name = the extern mangled symbol;
+// libOrdinal = signed 7-bit library reference (-2 = MAIN_EXECUTABLE,
+// 1..N for LC_LOAD_DYLIB ordinal in declaration order).
+struct ChainedFixupImport {
+    std::string  name;
+    std::int8_t  libOrdinal   = -2;
+    bool         weakImport   = false;
+};
+
+// Build the LC_DYLD_CHAINED_FIXUPS payload (regions 1+2+3 — see the
+// docblock above). Returns the raw byte blob the linker writes into
+// __LINKEDIT at the offset LC_DYLD_CHAINED_FIXUPS::dataoff points at.
+// Pure byte-emit — no reporter access, no schema dispatch — so
+// unit-testable in isolation.
+[[nodiscard]] inline std::vector<std::uint8_t>
+buildChainedFixupsPayload(
+        std::vector<ChainedFixupImport> const& imports) {
+    using namespace dss::link::format::detail;
+    std::vector<std::uint8_t> out;
+
+    // Region 1: starts_in_image. v1 substrate emits ONE segment slot
+    // with `seg_info_offset[0] = 0` (no chains in this segment).
+    // D-LK6-14-INTEGRATION will populate per-segment page_starts
+    // when the __DATA_CONST chained pointers are emitted.
+    std::size_t const headerOff   = 0;
+    std::size_t const startsOff   = kDyldChainedFixupsHeaderSz;
+    constexpr std::uint32_t kSegCount = 1u;
+    // starts_in_image is 4 (seg_count) + 4*seg_count (offsets).
+    std::size_t const startsSize  = 4u + 4u * kSegCount;
+    std::size_t const importsOff  = startsOff + startsSize;
+    std::size_t const importsSize = kDyldChainedImportSz * imports.size();
+    std::size_t const symbolsOff  = importsOff + importsSize;
+
+    // Header (24 bytes).
+    appendU32LE(out, kDyldChainedFixupsVersion);
+    appendU32LE(out, static_cast<std::uint32_t>(startsOff));
+    appendU32LE(out, static_cast<std::uint32_t>(importsOff));
+    appendU32LE(out, static_cast<std::uint32_t>(symbolsOff));
+    appendU32LE(out, static_cast<std::uint32_t>(imports.size()));
+    appendU16LE(out, kDyldChainedImportsFormat);
+    appendU16LE(out, kDyldChainedSymbolsFormat);
+
+    // Region 1: dyld_chained_starts_in_image (12 bytes for kSegCount=1).
+    appendU32LE(out, kSegCount);
+    appendU32LE(out, 0u);  // seg_info_offset[0] — populated by INTEGRATION
+
+    // Build the symbols pool first so we know each import's name_offset.
+    std::vector<std::uint32_t> nameOffsets;
+    nameOffsets.reserve(imports.size());
+    std::vector<std::uint8_t> symbolsPool;
+    symbolsPool.push_back(0);  // leading NUL sentinel
+    for (auto const& imp : imports) {
+        nameOffsets.push_back(static_cast<std::uint32_t>(symbolsPool.size()));
+        for (char c : imp.name) {
+            symbolsPool.push_back(static_cast<std::uint8_t>(c));
+        }
+        symbolsPool.push_back(0);
+    }
+    (void)headerOff;  // header sits at offset 0 by definition
+
+    // Region 2: imports array. Each DYLD_CHAINED_IMPORT packs into 4 bytes:
+    //   bits [ 0.. 7]  lib_ordinal (signed 8-bit; -2 = MAIN, -1 = SELF,
+    //                                1..N = LC_LOAD_DYLIB index)
+    //   bits [ 8]      weak_import
+    //   bits [ 9..31]  name_offset (23 bits — must fit; > 2^23 invalid)
+    for (std::size_t i = 0; i < imports.size(); ++i) {
+        auto const& imp = imports[i];
+        std::uint32_t packed = 0;
+        packed |= static_cast<std::uint32_t>(
+                    static_cast<std::uint8_t>(imp.libOrdinal)) & 0xFFu;
+        if (imp.weakImport) packed |= 0x100u;
+        packed |= (nameOffsets[i] & 0x7FFFFFu) << 9;
+        appendU32LE(out, packed);
+    }
+
+    // Region 3: symbols pool.
+    for (std::uint8_t b : symbolsPool) {
+        out.push_back(b);
+    }
+
+    return out;
+}
+
 [[nodiscard]] std::vector<std::uint8_t>
 encodeExecDynamic(AssembledModule const&    module,
                   TargetSchema const&       targetSchema,
@@ -970,6 +1099,27 @@ encodeExecDynamic(AssembledModule const&    module,
              "externImports — dynamic-image emission requires at "
              "least one extern; static images route through "
              "encodeExec.");
+        return {};
+    }
+    // D-LK6-14 substrate guard: schema requests chained-fixups
+    // emission, but encodeExecDynamic still emits the legacy
+    // LC_DYLD_INFO_ONLY opcode stream. The integration fold
+    // (D-LK6-14-INTEGRATION) restructures this function to emit
+    // LC_DYLD_CHAINED_FIXUPS + populate __got slots with
+    // DYLD_CHAINED_PTR_64 bitfields. Until that lands, fail loud
+    // so callers see the gap rather than silently get a
+    // legacy-format image when they asked for modern.
+    if (im.useChainedFixups) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             "macho::encodeExecDynamic: schema requests "
+             "LC_DYLD_CHAINED_FIXUPS emission ('image.useChainedFixups' "
+             "= true) but the integration into encodeExecDynamic has "
+             "not yet shipped — the payload builder is unit-tested "
+             "in isolation, but __got slot population + load-command "
+             "swap are anchored at D-LK6-14-INTEGRATION. To proceed, "
+             "either set 'image.useChainedFixups' = false (legacy "
+             "LC_DYLD_INFO_ONLY opcode stream, fully supported) or "
+             "wait for D-LK6-14-INTEGRATION to close.");
         return {};
     }
     if (module.functions.empty()) {

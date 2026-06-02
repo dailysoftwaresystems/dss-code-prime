@@ -790,6 +790,24 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
             }
+            // D-LK6-14 chained-fixups: optional bool. Default false
+            // (legacy LC_DYLD_INFO_ONLY path). When true, the walker
+            // emits LC_DYLD_CHAINED_FIXUPS + DYLD_CHAINED_PTR_64
+            // chained pointers in __got. Requires bindNow==true.
+            if (im.contains("useChainedFixups")) {
+                if (!im.at("useChainedFixups").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/useChainedFixups",
+                              "'useChainedFixups' must be a boolean "
+                              "(true = LC_DYLD_CHAINED_FIXUPS chained-"
+                              "pointer table, false = legacy "
+                              "LC_DYLD_INFO_ONLY opcode stream — "
+                              "D-LK6-14).");
+                } else {
+                    data.machoImage.useChainedFixups =
+                        im.at("useChainedFixups").get<bool>();
+                }
+            }
         }
     }
 

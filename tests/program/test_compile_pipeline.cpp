@@ -23,7 +23,9 @@
 // Anchored at plan 14 §3.1 D-LK10-2 for closure when ML7 cycle 2
 // lands.
 
+#include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "diagnostic_count.hpp"
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
 
@@ -319,6 +321,75 @@ TEST(Program_CompileFiles, StderrIncludesTargetContextPrefixOnPerTargetError) {
         << "drainDiagnosticsToStderr MUST render contextPrefix so "
            "multi-target operators can route per-target diagnostics; "
            "got stderr:\n" << stderrOut;
+}
+
+// D-CAP-MARKER-MULTI-TARGET-E2E-PIN close (e4508b9 → next 2026-06-01):
+// the prior anchor was reserved because `D_TargetMachineCodeMismatch`
+// joined `kUnsuppressableCodes` and bypasses all cap/dedup gates —
+// no `P_TooManyDiagnostics` marker can fire on the cross-validate
+// path regardless of `maxDiagnostics`. The new
+// `compileFiles(..., DiagnosticReporter&)` rep-injection overload
+// (program.hpp / program.cpp) lets us inspect rep post-run and pin
+// the actual single-chokepoint contract: with 2 targets each firing
+// a SUPPRESSABLE per-target error (`D_SchemaLoadFailed`, NOT in
+// kUnsuppressableCodes) and `maxDiagnostics=1`, the cap fires
+// EXACTLY ONCE at the run-wide `rep` during merge — emitting one
+// `P_TooManyDiagnostics` marker. Target 2's error arrives during
+// merge but rep is capped and `report()` no-ops.
+TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "ok.c", "int f() { return 0; }\n");
+    scratch.useAsCwd();
+    Program prog;
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    DiagnosticReporter rep{cfg};
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:no-such-format-A",
+         "x86_64:no-such-format-B"},
+        rep);
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::P_TooManyDiagnostics),
+              1u)
+        << "single-chokepoint contract: cap fires EXACTLY ONCE at "
+           "rep during merge, regardless of how many targets exceed "
+           "their per-target diagnostic count. A regression that "
+           "moved the cap-marker emission into the per-target scratch "
+           "would surface 2 markers; a regression that disabled the "
+           "marker emission entirely would surface 0.";
+}
+
+// Negative pin: with maxDiagnostics at the default (large) cap, no
+// marker should fire — both targets' D_SchemaLoadFailed entries
+// surface intact in rep. Catches a regression that fires the marker
+// unconditionally on multi-target runs.
+TEST(Program_CompileFiles, NoCapMarkerWhenDiagnosticsBudgetExceedsErrorCount) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "ok.c", "int f() { return 0; }\n");
+    scratch.useAsCwd();
+    Program prog;
+    DiagnosticReporter rep;  // default config — large cap
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:no-such-format-A",
+         "x86_64:no-such-format-B"},
+        rep);
+    EXPECT_EQ(rc, 1);
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::P_TooManyDiagnostics),
+              0u)
+        << "default cap is large enough to hold both D_SchemaLoadFailed "
+           "entries; no marker should fire";
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::D_SchemaLoadFailed),
+              2u)
+        << "both per-target schema-load failures must surface in rep";
 }
 
 // ── compileProject: plan 06 fail-loud stub ────────────────────
