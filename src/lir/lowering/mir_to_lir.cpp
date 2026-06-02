@@ -261,6 +261,39 @@ struct Lowerer {
             cache_[i].mnemonic = r.mnemonic;
             cache_[i].id       = target.opcodeByMnemonic(r.mnemonic);
         }
+
+        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY 2nd-order audit fold
+        // (silent-failure H2, 2026-06-02): if the module declares
+        // ANY externs AND the target schema doesn't declare
+        // `call_indirect_via_extern`, the per-call site would
+        // surface the missing-opcode diagnostic mid-lowering —
+        // technically loud (the MnemonicCache's missingReported
+        // flag fires it ONCE per pass) but at a downstream tier
+        // that doesn't name the upstream config gap. Fail loud
+        // UPFRONT at Lowerer construction so the operator sees
+        // "this target schema can't dispatch extern calls" before
+        // any lowering work happens. Targets without dynamic-import
+        // support (no externs in the module) skip the guard — they
+        // legitimately may omit the opcode.
+        if (!externImports.empty()
+            && !cache_[static_cast<std::size_t>(
+                   MnemonicSlot::CallIndirectViaExtern)].id.has_value()
+            && !cache_[static_cast<std::size_t>(
+                   MnemonicSlot::CallIndirectViaExtern)].missingReported) {
+            dss::report(reporter,
+                DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                "MIR→LIR: module declares extern imports but the target "
+                "schema does not declare a `call_indirect_via_extern` "
+                "opcode — extern calls cannot be lowered without it. "
+                "Add the indirect-call encoding to the target's "
+                "`.target.json` `opcodes[]` array (x86_64 PE uses "
+                "`FF 15 disp32`; ARM64 GOT/PLT macro-op is anchored at "
+                "D-LK10-ENTRY-ARM64).");
+            cache_[static_cast<std::size_t>(
+                MnemonicSlot::CallIndirectViaExtern)]
+                    .missingReported = true;
+        }
     }
 
     [[nodiscard]] std::optional<std::uint16_t> opcode(MnemonicSlot s) const {

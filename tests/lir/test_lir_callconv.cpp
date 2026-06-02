@@ -1127,11 +1127,13 @@ TEST(AlignedSizeWithBias, LargeShadowMultipleAlignmentQuanta) {
 // Substrate-tier proof that the post-fold mechanism does what the
 // hello_puts e2e example requires: a non-leaf function under a cc
 // declaring shadowSpaceBytes + callPushBytes gets the correct
-// prologue size + the hasCalls flag set. A refactor that loses
-// either fix would still let hello_puts pass (since e2e tests pin
-// behavior, not mechanism) without this test, but the regression
-// would silently re-open the SEGV class on the next foreign-call
-// example.
+// prologue size + the hasCalls flag set. The e2e example IS the
+// load-bearing pin (it asserts the actual print + exit code via
+// OS-spawned bytes); this substrate test complements it by pinning
+// the FORMULA at the function-by-function tier — so a refactor
+// that breaks the formula for some fixture other than hello_puts
+// gets caught at unit-test latency rather than waiting for the
+// e2e harness to trip.
 
 TEST(LirCallconv, NonLeafFunctionReservesShadowSpaceAndAlignmentBias) {
     // f calls g → f is non-leaf → f's totalFrameSize must satisfy
@@ -1232,4 +1234,79 @@ TEST(LirCallconv, NonLeafFunctionReservesShadowSpaceAndAlignmentBias) {
     EXPECT_EQ(gLayout->totalFrameSize, gExpected);
     EXPECT_EQ(gLayout->totalFrameSize % cc->stackAlignment, 0u)
         << "leaf must be a multiple of stackAlignment";
+}
+
+// D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY 2nd-order audit fold (code-reviewer
+// C3, 2026-06-02): the test above uses `ccIndex=0` which is x86_64's
+// sysv_amd64 cc (shadowSpaceBytes=0). That covers the bias-only branch
+// (non-leaf SysV: raw_with_shadow = max(0,0)=0; frame = bias=8) but
+// does NOT exercise the SHADOW-SPACE branch that hello_puts depends
+// on (Win64: raw_with_shadow = max(0,32)=32; frame =
+// alignedSizeWithBias(32,16,8)=40). Without a Win64-cc substrate pin,
+// a refactor that drops shadowSpaceBytes incorporation only on ms_x64
+// passes ctest silently on Linux CI (where hello_puts skips due to
+// runOn=["windows"]) — the e2e test would only catch it on a Windows
+// host runner. This pin lives at the substrate tier so EVERY host's
+// ctest catches the regression.
+TEST(LirCallconv, NonLeafFunctionOnWin64CcReservesFullShadowSpaceFrame) {
+    // ccIndex=1 = ms_x64 (shadowSpaceBytes=32, callPushBytes=8,
+    // stackAlignment=16). The fixture's `f` calls `g` so f is
+    // non-leaf — its frame MUST be at least 32 bytes (shadow) AND
+    // satisfy N ≡ 8 mod 16. Smallest N >= 32 satisfying that = 40.
+    auto bundle = lowerThroughRewrite(
+        "int g(int a) { return a + 1; }\n"
+        "int f(int x) { return g(x) + g(x); }\n",
+        /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_STREQ(cc->name.c_str(), "ms_x64")
+        << "ccIndex=1 must resolve to ms_x64 (Win64) cc";
+    ASSERT_EQ(cc->shadowSpaceBytes, 32u);
+    ASSERT_EQ(cc->callPushBytes, 8u);
+    ASSERT_EQ(cc->stackAlignment, 16u);
+
+    // Find the non-leaf function via the same independent isCall
+    // scan pattern. The fixture has exactly one (f).
+    FrameLayout const* fLayout = nullptr;
+    for (std::uint32_t i = 0; i < result.lir.moduleFuncCount(); ++i) {
+        LirFuncId const srcFn = bundle.rewritten.lir.funcAt(i);
+        bool hasCall = false;
+        std::uint32_t const blocks = bundle.rewritten.lir.funcBlockCount(srcFn);
+        for (std::uint32_t bi = 0; bi < blocks && !hasCall; ++bi) {
+            LirBlockId const blk = bundle.rewritten.lir.funcBlockAt(srcFn, bi);
+            std::uint32_t const n = bundle.rewritten.lir.blockInstCount(blk);
+            for (std::uint32_t j = 0; j < n; ++j) {
+                LirInstId const inst = bundle.rewritten.lir.blockInstAt(blk, j);
+                auto const* info = bundle.lowered.target->opcodeInfo(
+                    bundle.rewritten.lir.instOpcode(inst));
+                if (info != nullptr && info->isCall) { hasCall = true; break; }
+            }
+        }
+        if (hasCall) {
+            ASSERT_EQ(fLayout, nullptr) << "fixture expects exactly one non-leaf";
+            fLayout = result.forFuncByIndex(i);
+        }
+    }
+    ASSERT_NE(fLayout, nullptr) << "non-leaf f not found";
+
+    // The load-bearing Win64 invariant — the exact shape that
+    // hello_puts depends on. A regression that drops shadowSpace
+    // incorporation flips this from 40 to 0 (current saved regs +
+    // spills happen to be tiny for this fixture). Hardcoded
+    // expected value pins the regression at the byte level.
+    EXPECT_GE(fLayout->totalFrameSize, 32u)
+        << "Win64 non-leaf MUST reserve at least 32 bytes shadow space "
+           "for the callee's register-arg home area";
+    EXPECT_EQ(fLayout->totalFrameSize % 16u, 8u)
+        << "Win64 non-leaf MUST satisfy callPushBytes congruence so RSP "
+           "lands ≡ 0 mod 16 at the call site (the rule that makes "
+           "puts's internal SSE movaps NOT fault)";
+    EXPECT_TRUE(fLayout->hasCalls);
 }
