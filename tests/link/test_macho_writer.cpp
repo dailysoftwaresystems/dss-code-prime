@@ -1274,28 +1274,25 @@ TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
     DiagnosticReporter rep;
     auto bytes = macho::encode(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
-    // Locate __got via the __DATA_CONST segment. The segment's
-    // fileoff is at section_64.__got's offset in load commands;
-    // easier path: read LC_SEGMENT_64 for __DATA_CONST and follow.
-    // For this byte-level pin we read __got via the LC_DYLD_CHAINED_
-    // FIXUPS payload's segment_offset to derive __DATA_CONST file
-    // offset via header values — but a simpler check: parse all
-    // LC_SEGMENT_64s, find __DATA_CONST, read fileoff (offset 32 in
-    // segment_command_64), then read 8-byte slots.
+    // Walk LC_SEGMENT_64s, find __DATA_CONST, read its fileoff so we
+    // can read the 8-byte __got slots directly. segment_command_64
+    // layout: cmd(4) + cmdsize(4) + segname[16] + vmaddr(8) +
+    // vmsize(8) + fileoff(8) → fileoff at lcOff + 40.
     constexpr std::uint32_t kLcSegment64 = 0x19u;
     std::optional<std::size_t> dataConstFileOff;
+    std::optional<std::size_t> dataConstLcOff;
     std::size_t lcOff = 32;  // past mach_header_64
     std::uint32_t const ncmds = readU32LE(bytes, 16);
     for (std::uint32_t i = 0; i < ncmds; ++i) {
         std::uint32_t const cmd = readU32LE(bytes, lcOff);
         std::uint32_t const cmdsize = readU32LE(bytes, lcOff + 4);
         if (cmd == kLcSegment64) {
-            // segname at lcOff+8 (16 bytes); fileoff at lcOff+8+16+16 = lcOff+40
             char name[17] = {};
             std::memcpy(name, &bytes[lcOff + 8], 16);
             if (std::string{name} == "__DATA_CONST") {
                 dataConstFileOff = static_cast<std::size_t>(
-                    readU64LE(bytes, lcOff + 8 + 16 + 16));
+                    readU64LE(bytes, lcOff + 40));
+                dataConstLcOff = lcOff;
                 break;
             }
         }
@@ -1303,6 +1300,19 @@ TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
     }
     ASSERT_TRUE(dataConstFileOff.has_value())
         << "__DATA_CONST LC_SEGMENT_64 must be present";
+    // D-LK6-14-INTEGRATION-GOT-SLOTS: __got section_64.reserved1
+    // MUST be 0 on the chained path (was numExterns on legacy as
+    // an indirect-symtab index; on chained the indirect symtab is
+    // dropped so the reference becomes invalid). section_64 starts
+    // at segment_command_64 + 72 (cmd 4 + cmdsize 4 + segname 16
+    // + vmaddr 8 + vmsize 8 + fileoff 8 + filesize 8 + maxprot 4
+    // + initprot 4 + nsects 4 + flags 4); reserved1 within
+    // section_64 is at offset 16+16+8+8+4+4+4+4+4 = 68.
+    std::size_t const sect0Off = *dataConstLcOff + 72;
+    EXPECT_EQ(readU32LE(bytes, sect0Off + 68), 0u)
+        << "section_64.__got.reserved1 must be 0 on the chained path "
+           "(was numExterns as indirect-symtab index on legacy; the "
+           "indirect symtab is gone so the reference would be stale)";
     // Read slot[0] and slot[1] (8 bytes each).
     std::uint64_t const slot0 = readU64LE(bytes, *dataConstFileOff);
     std::uint64_t const slot1 = readU64LE(bytes, *dataConstFileOff + 8);
@@ -1366,6 +1376,12 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
     //   [16..19] max_valid_ptr  [20..21] page_count
     std::size_t const segStructOff =
         dataoff + startsOff + segInfoOffset;
+    // size field at struct+0: 22 header bytes + 2 bytes per page_start
+    // (1 page in v1 → 24 bytes). Regression mis-computing this would
+    // still pass downstream field reads.
+    EXPECT_EQ(readU32LE(bytes, segStructOff + 0), 22u + 2u)
+        << "dyld_chained_starts_in_segment.size must be header (22) "
+           "+ 2*page_count (2) = 24 for the v1 single-page case";
     EXPECT_EQ(readU16LE(bytes, segStructOff + 6),
               6u)
         << "pointer_format must be 6 (DYLD_CHAINED_PTR_64)";
@@ -1429,6 +1445,59 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
            "LC_DYSYMTAB (80) = 128; chained emits LC_DYLD_CHAINED_"
            "FIXUPS (16) only = 16; delta = 112. Regression in any "
            "arm of the ternary or in the LC sizes would shift this.";
+}
+
+// D-LK6-14-MULTI-PAGE-GOT guard pin (2ba0489 audit fold, test-
+// analyzer + dim-2 + simplifier convergence): >512 externs needs
+// multi-page chains with per-page page_starts[i]. Until that lands,
+// v1 fails loud K_NoMatchingObjectFormat. A regression dropping the
+// guard would silently emit a single-page chain that dyld walks off
+// the end of, producing load failures only at runtime on macOS.
+TEST(MachOExecWriter, ChainedFixupsMultiPageGotFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmt, nullptr);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    // Reloc targets the FIRST extern (SymbolId{100}) so symbol
+    // resolution passes; the guard we're pinning fires later, in
+    // section (l.5) after layout.
+    fn.relocations.push_back(
+        Relocation{1u, SymbolId{100u}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    // 4 KiB page / 8-byte __got slot = 512 externs fits; 513 spills
+    // onto a second page and trips the guard.
+    constexpr std::uint32_t kPageSize    = 4096u;
+    constexpr std::uint32_t kSlotSize    = 8u;
+    constexpr std::uint32_t kSpillCount  = (kPageSize / kSlotSize) + 1u;
+    for (std::uint32_t i = 0; i < kSpillCount; ++i) {
+        ExternImport imp;
+        imp.symbol      = SymbolId{100u + i};
+        imp.mangledName = "_x" + std::to_string(i);
+        imp.libraryPath = "/usr/lib/libSystem.B.dylib";
+        mod.externImports.push_back(std::move(imp));
+    }
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "Multi-page __got must emit no bytes (loud-fail path).";
+    EXPECT_EQ(rep.errorCount(), 1u)
+        << "Exactly one K_NoMatchingObjectFormat must fire.";
+    bool found = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat &&
+            d.actual.find("D-LK6-14-MULTI-PAGE-GOT") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "Diagnostic must cite D-LK6-14-MULTI-PAGE-GOT for "
+           "future-grep navigability";
 }
 
 // 8aabc04 audit fold (test-analyzer-dim-2 HIGH): multi-import name

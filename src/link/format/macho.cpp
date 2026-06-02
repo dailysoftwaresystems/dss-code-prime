@@ -1220,13 +1220,15 @@ encodeExecDynamic(AssembledModule const&    module,
     bool const useChainedFixups = im.useChainedFixups;
     std::vector<std::uint8_t> dyldBindBlob;
     // `chainedImports` is built in section (i) for the chained path
-    // and consumed AFTER layout (section k below) when `segmentOffset`
-    // = `gotVa - textSegVmaddr` is known. The payload contains a
-    // `dyld_chained_starts_in_segment` struct whose `segment_offset`
-    // u64 must reference the actual __DATA_CONST VM offset — that
-    // value depends on `sizeofcmds → textFileOff → gotFileOff → gotVa`
-    // computed in section (j). Hoisting the imports here keeps the
-    // pre-check loud while deferring payload bytes.
+    // and consumed AFTER layout (section l.5 below) when
+    // `segmentOffset = gotVa - im.pageZeroSize` is known (per Apple
+    // convention __TEXT.vmaddr == im.pageZeroSize on PIE binaries).
+    // The payload contains a `dyld_chained_starts_in_segment` struct
+    // whose `segment_offset` u64 must reference the actual
+    // __DATA_CONST VM offset — that value depends on `sizeofcmds →
+    // textFileOff → gotFileOff → gotVa` computed in section (l).
+    // Hoisting the imports here keeps the pre-check loud while
+    // deferring payload bytes.
     std::vector<dss::macho::detail::ChainedFixupImport> chainedImports;
     if (useChainedFixups) {
         // D-LK6-14-NAME-OFFSET-OVERFLOW close: pre-check the
@@ -1502,26 +1504,30 @@ encodeExecDynamic(AssembledModule const&    module,
         stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 24) & 0xFF));
     }
 
-    // Section (k) — D-LK6-14-INTEGRATION-GOT-SLOTS: now that gotVa
-    // is known, build the chained-fixups payload with
-    // `dyld_chained_starts_in_segment.segment_offset` resolved.
-    // (Legacy path's dyldBindBlob was already built in section (i).)
+    // ── (l.5) D-LK6-14-INTEGRATION-GOT-SLOTS: now that gotVa is
+    //          known (section (l) layout complete), build the
+    //          chained-fixups payload with
+    //          `dyld_chained_starts_in_segment.segment_offset`
+    //          resolved. (Legacy path's `dyldBindBlob` was already
+    //          populated in section (i)'s else-arm.)
     if (useChainedFixups) {
         // Single-page __DATA_CONST guard. v1 supports at most one
-        // page of __got (kPageSize / kGotSlotSize = 512 externs at
-        // 8 bytes each on a 4 KiB page). Multi-page support requires
-        // computing page_starts[i] for each page — anchored
-        // D-LK6-14-MULTI-PAGE-GOT (trigger: first module with > 512
-        // extern imports OR first 16 KiB-page target).
+        // page of __got (kPageSize / kGotSlotSize = 4096 / 8 = 512
+        // externs on a 4 KiB page; 2048 on a 16 KiB page). Multi-page
+        // support requires computing page_starts[i] for each page —
+        // anchored D-LK6-14-MULTI-PAGE-GOT (trigger: first module
+        // with > 512 extern imports OR first 16 KiB-page target).
         if (gotFileSize > kPageSize) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("macho::encodeExecDynamic: chained-fixups "
-                             "__got spans {} bytes > kPageSize {} — "
-                             "v1 supports single-page chains only. "
-                             "Reduce extern count or fall back to "
-                             "LC_DYLD_INFO_ONLY. Anchored "
+                             "__got spans {} bytes > kPageSize {} "
+                             "(= {} extern slots at {} bytes each on "
+                             "a 4 KiB page) — v1 supports single-page "
+                             "chains only. Reduce extern count or "
+                             "fall back to LC_DYLD_INFO_ONLY. Anchored "
                              "D-LK6-14-MULTI-PAGE-GOT.",
-                             gotFileSize, kPageSize));
+                             gotFileSize, kPageSize,
+                             kPageSize / kGotSlotSize, kGotSlotSize));
             return {};
         }
         dss::macho::detail::ChainedSegInfo segInfo;
@@ -1551,18 +1557,21 @@ encodeExecDynamic(AssembledModule const&    module,
         //   bits [ 0..23]  ordinal  (24-bit; DYLD_CHAINED_IMPORT row index)
         //   bits [24..31]  addend   (8-bit; 0 for our straightforward binds)
         //   bits [32..50]  reserved (19-bit; must be 0)
-        //   bits [51..62]  next     (12-bit; 8-byte-unit offset to next
-        //                            chained pointer on same page; 0=end)
+        //   bits [51..62]  next     (12-bit; offset in 4-byte units
+        //                            to next chained pointer on same
+        //                            page per DYLD_CHAINED_PTR_64
+        //                            stride rule; 0=end)
         //   bit  [63]      bind     (1=bind, 0=rebase; always 1 here)
         for (std::size_t i = 0; i < numExterns; ++i) {
             std::uint64_t bits = 0;
             bits |= static_cast<std::uint64_t>(i) & 0xFFFFFFull;  // ordinal
             // addend = 0; reserved = 0.
             bool const isLast = (i + 1 == numExterns);
-            // next is in 4-byte units per Apple's spec for
-            // DYLD_CHAINED_PTR_64. Adjacent 8-byte slots are 2 units
-            // apart. 0 = end of chain.
-            std::uint64_t const next = isLast ? 0ull : 2ull;
+            // Adjacent 8-byte slots are 2 four-byte units apart per
+            // kDyldChainedPtr64NextStride; 0 = end of chain.
+            std::uint64_t const next = isLast
+                ? 0ull
+                : dss::macho::detail::kDyldChainedPtr64NextStride;
             bits |= next << 51;
             bits |= 1ull << 63;  // bind = 1
             std::size_t const slotOff = i * kGotSlotSize;
