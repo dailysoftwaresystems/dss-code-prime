@@ -352,15 +352,25 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
          "x86_64:no-such-format-B"},
         rep);
     EXPECT_EQ(rc, 1);
+    // Three-sided assertion (d312c1c audit fold, test-analyzer #2):
+    // pin marker count + total size + cap shape. With maxDiagnostics=1,
+    // target A's FIRST diagnostic (the format-schema JSON load fires
+    // forwardConfigDiagnostics → C_InvalidLanguageName) lands in
+    // scratch, gets merged into rep, fills the cap → marker fires.
+    // Every subsequent diagnostic from both targets is silently
+    // dropped at rep's hitCap_ gate. Final state: exactly 2 entries
+    // in rep.all() — one C_InvalidLanguageName + one
+    // P_TooManyDiagnostics marker.
     EXPECT_EQ(dss::test_support::countCode(
                   rep, DiagnosticCode::P_TooManyDiagnostics),
               1u)
         << "single-chokepoint contract: cap fires EXACTLY ONCE at "
            "rep during merge, regardless of how many targets exceed "
-           "their per-target diagnostic count. A regression that "
-           "moved the cap-marker emission into the per-target scratch "
-           "would surface 2 markers; a regression that disabled the "
-           "marker emission entirely would surface 0.";
+           "their per-target diagnostic count.";
+    EXPECT_EQ(rep.all().size(), 2u)
+        << "rep contents must be exactly {first cap-filling diagnostic, "
+           "P_TooManyDiagnostics marker}; any other diagnostics signal "
+           "a regression in the per-target loop or merge path.";
 }
 
 // Negative pin: with maxDiagnostics at the default (large) cap, no

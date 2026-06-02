@@ -674,6 +674,20 @@ enum class DiagnosticCode : std::uint16_t {
     K_ImageWriteShort              = 0x8009,
     K_ImageWriteCloseFailed        = 0x800A,
     K_ImageEmpty                   = 0x800B,
+    // K_ChainedFixupsNotYetIntegrated: a Mach-O schema requested
+    // `image.useChainedFixups = true` but the integration into
+    // encodeExec/encodeExecDynamic has not yet shipped — the
+    // payload builder is unit-tested in isolation but the
+    // load-command swap + __got slot population + LC_DYSYMTAB drop
+    // are anchored at D-LK6-14-INTEGRATION. Semantically distinct
+    // from K_FormatLacksImportSupport (which means "this format
+    // STRUCTURALLY does not support imports" — permanent) — this
+    // is a TEMPORARY substrate-vs-integration gap with a closing
+    // anchor. Adding this code lets operators triage the two
+    // separately and lets future regressions that swap
+    // half-shipped chained for legacy emit the right signal.
+    // (type-design Q4 fold on d312c1c audit 2026-06-01.)
+    K_ChainedFixupsNotYetIntegrated = 0x800C,
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

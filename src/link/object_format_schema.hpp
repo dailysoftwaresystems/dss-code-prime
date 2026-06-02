@@ -563,12 +563,17 @@ struct DSS_EXPORT MachOImage {
     // pointing at a `dyld_chained_fixups_header` + chained-pointer
     // table in `__LINKEDIT`, INSTEAD of the legacy
     // `LC_DYLD_INFO_ONLY` opcode stream. Each `__got` slot becomes
-    // a 64-bit packed chained pointer (DYLD_CHAINED_PTR_64 format):
-    // bit 62 = bind/rebase flag, bit 63 = next-in-chain link, the
-    // low bits encode either a 24-bit import ordinal (bind) or a
-    // 36-bit target offset (rebase). v1 supports BIND-only chains
-    // (extern imports → `__got`); rebase support deferred per
-    // D-LK6-14-REBASE.
+    // a 64-bit packed chained pointer; the exact bitfield depends
+    // on the variant emitted (DYLD_CHAINED_PTR_64 v1 substrate
+    // target):
+    //   * `dyld_chained_ptr_64_bind`: ordinal:24, addend:8,
+    //     reserved:19, next:12, bind:1 (bind == 1).
+    //   * `dyld_chained_ptr_64_rebase`: target:36, high8:8,
+    //     reserved:7, next:12, bind:1 (bind == 0).
+    // The `next` field is a 12-bit unit-offset to the next chained
+    // pointer on the same page (0 = end of chain). v1 supports
+    // BIND-only chains (extern imports → `__got`); rebase support
+    // deferred per D-LK6-14-REBASE.
     //
     // D-LK6-14 closure (chained-fixups emitter for DYLD_CHAINED_PTR_64).
     // Requires `bindNow == true` (lazy binding is incompatible with

@@ -21,7 +21,7 @@ namespace {
 // D-LK6-8.2 SIGILL surface (D_TargetMachineCodeMismatch /
 // D_TargetAbiModelMismatch) and the LK10 image-write contract
 // (K_ImageWrite* + K_ImageEmpty).
-constexpr std::array<DiagnosticCode, 53> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 54> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -91,6 +91,14 @@ constexpr std::array<DiagnosticCode, 53> kUnsuppressableCodes{{
     DiagnosticCode::K_ImageWriteShort,
     DiagnosticCode::K_ImageWriteCloseFailed,
     DiagnosticCode::K_ImageEmpty,
+    // K_ChainedFixupsNotYetIntegrated — substrate gap signal.
+    // Suppressing this would let an operator silently get a
+    // legacy-format binary when they explicitly requested modern
+    // chained-fixups. The whole reason this code exists separate
+    // from K_FormatLacksImportSupport is to let the user disambiguate
+    // the two — suppressing it defeats the purpose. (d312c1c audit
+    // fold, type-design Q4.)
+    DiagnosticCode::K_ChainedFixupsNotYetIntegrated,
     // Post-fold #12 D-FF2-UNSUPP-FULL-SWEEP additions:
     // K_NoMatchingObjectFormat — format-walker dispatch invariant
     //   (suppressing → wrong walker / corrupted artifact)

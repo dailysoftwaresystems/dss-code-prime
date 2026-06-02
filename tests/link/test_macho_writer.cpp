@@ -1090,15 +1090,74 @@ TEST(MachOExecWriter, UseChainedFixupsFailsLoudCitingDLK614Integration) {
     EXPECT_TRUE(bytes.empty());
     bool sawAnchor = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_FormatLacksImportSupport
+        if (d.code == DiagnosticCode::K_ChainedFixupsNotYetIntegrated
          && d.actual.find("D-LK6-14-INTEGRATION") != std::string::npos) {
             sawAnchor = true;
         }
     }
     EXPECT_TRUE(sawAnchor)
-        << "substrate guard must cite D-LK6-14-INTEGRATION so "
-           "operators see the gap and can fall back to legacy "
-           "LC_DYLD_INFO_ONLY by clearing the flag";
+        << "substrate guard must fire K_ChainedFixupsNotYetIntegrated "
+           "(NOT K_FormatLacksImportSupport — type-design Q4 fold "
+           "disambiguated the temporary substrate gap from the "
+           "permanent structural-no-imports case) and cite "
+           "D-LK6-14-INTEGRATION so operators see the gap and can "
+           "fall back to legacy LC_DYLD_INFO_ONLY by clearing the flag";
+}
+
+// d312c1c audit fold (silent-failure-hunter HIGH-1 + test-analyzer-
+// dim-2 convergence): the substrate guard must ALSO fire on the
+// static encodeExec path. Without the outer guard, a schema with
+// useChainedFixups=true + zero externImports would route to
+// encodeExec and silently emit a legacy static binary despite the
+// schema explicitly requesting modern chained-fixups format.
+TEST(MachOExecWriter, UseChainedFixupsOnStaticPathFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-cfx-static-path","kind":"macho"},
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "useChainedFixups": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};                                        // ret
+    mod.functions.push_back(std::move(fn));
+    // NO externImports — this would route to encodeExec (static
+    // path) without the outer guard.
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "static path must NOT silently emit a legacy binary "
+           "when useChainedFixups=true was requested";
+    bool sawAnchor = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_ChainedFixupsNotYetIntegrated
+         && d.actual.find("D-LK6-14-INTEGRATION") != std::string::npos) {
+            sawAnchor = true;
+        }
+    }
+    EXPECT_TRUE(sawAnchor)
+        << "outer encode() guard must fire on the static path too "
+           "(HIGH-1 silent surface: zero externs + useChainedFixups "
+           "→ encodeExec → silent legacy emission)";
 }
 
 TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {

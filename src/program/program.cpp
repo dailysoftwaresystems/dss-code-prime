@@ -474,10 +474,13 @@ int Program::compileFiles(
         // routed by tooling. (silent-failure-hunter F9 fold.)
         //
         // H1 silent-failure fix 2026-06-01 + F1b/F1c double-policy fix:
-        // scratch inherits `reporterConfig`'s POLICY axes (suppress /
+        // scratch inherits `rep.config()`'s POLICY axes (suppress /
         // overrides / warningsAsErrors / unsuppressable gate) so
         // per-target diagnostics honor the same user policy as run-
-        // wide `rep`. But the CAP / DEDUP axes (maxDiagnostics /
+        // wide `rep`. (Post-d312c1c rep-injection overload: the
+        // source of truth is `rep.config()` not the prior explicit
+        // `reporterConfig` parameter — the Config-taking wrapper
+        // constructs `rep` from `reporterConfig` upstream.) But the CAP / DEDUP axes (maxDiagnostics /
         // maxPerCode / dedupWindow) are intentionally RELAXED on
         // scratch — those are run-wide limits enforced once at `rep`
         // during merge. Without the relax, both scratch AND rep would
