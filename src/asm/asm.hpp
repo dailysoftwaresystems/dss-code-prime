@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/alignment.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/section_kind.hpp"
@@ -132,9 +133,10 @@ struct DSS_EXPORT AssembledFunction {
 // where `aligned_size(item)` rounds `item.bytes.size()` up to the
 // NEXT item's `alignment`. A walker that uses the per-item `offset`
 // verbatim against the section base would silently mis-resolve
-// every relocation in `items[1..]`. D-LK4-RODATA-WALKER-RELOC-BASE-
-// OFFSET (sub-anchor of D-LK4-RODATA-SUBSTRATE) — test at the
-// first walker-arm landing pins the Σ translation correctness.
+// every relocation in `items[1..]`.
+// Anchored: `D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET` (sub-anchor
+// of `D-LK4-RODATA-SUBSTRATE`) — test at the first walker-arm
+// landing pins the Σ translation correctness.
 //
 // D-LK4-RODATA-SUBSTRATE: substrate-only landing (no MIR→LIR
 // producer yet). Hand-built `AssembledData` items exercise the
@@ -144,11 +146,48 @@ struct DSS_EXPORT AssembledFunction {
 // cycles toward FF6 (plan 11) hello-world.
 struct DSS_EXPORT AssembledData {
     SymbolId                  symbol{};
-    SectionKind               section = SectionKind::Rodata;
+    DataSectionKind           section = DataSectionKind::Rodata;
     std::vector<std::uint8_t> bytes;
-    std::uint32_t             alignment = 1u;
+    Alignment                 alignment;  // default = 1-byte
     std::vector<Relocation>   relocations;
 };
+
+// Validate a span of `AssembledData` items against the substrate
+// invariants. Emits one diagnostic per violation; returns true iff
+// every item is well-formed. Called by the linker before walker
+// dispatch — see `linker.cpp`.
+//
+// Invariants enforced (closes D-LK4-RODATA-BSS-INVARIANT +
+// duplicate-SymbolId + zero-alignment guards from the 3rd-order
+// audit):
+//
+//   1. `bytes.empty() iff section == Bss` — `Bss` is zero-fill
+//      and the wire format reserves `sh_size` without storing
+//      bytes; a non-empty `Bss` item would either silently
+//      embed those bytes (defeating BSS's no-file-footprint
+//      property) or silently drop them.
+//   2. No two items share the same `SymbolId` — the linker
+//      resolves relocations against `SymbolId`, so duplicates
+//      would silently let "whichever was processed last" win.
+//      `SymbolId{}` (the invalid sentinel) is exempt from
+//      duplicate-checking — sentinel items signal "no symbol
+//      identity needed", typically for read-only padding /
+//      anonymous constants. Multiple sentinel items are
+//      legitimate.
+//   3. `Alignment` is power-of-two ≥ 1 — already enforced
+//      structurally by the `Alignment` newtype (the type CAN'T
+//      hold non-power-of-two). This invariant is documented
+//      here for the audit trail.
+//
+// Diagnostic codes emitted (all unsuppressable):
+//   * `K_SymbolUndefined` — duplicate `SymbolId` (an item's
+//      identity clashes with another).
+//   * `K_NoMatchingObjectFormat` — Bss + non-empty bytes
+//      (substrate-shape violation; the matching walker arm
+//      can't route this to any meaningful section).
+[[nodiscard]] DSS_EXPORT bool
+validateAssembledData(std::span<AssembledData const> items,
+                      DiagnosticReporter& reporter);
 
 // One assembled module — parallel-indexed with the LIR input. Mirrors
 // the `ok()`-derivation discipline pioneered by `LirAllocation::ok()`

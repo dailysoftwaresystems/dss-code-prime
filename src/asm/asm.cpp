@@ -6,6 +6,7 @@
 #include "lir/lir_pass_util.hpp"
 
 #include <format>
+#include <unordered_map>
 
 namespace dss {
 
@@ -208,6 +209,64 @@ AssembledModule assemble(Lir const&                 lir,
     }
 
     return result;
+}
+
+bool validateAssembledData(std::span<AssembledData const> items,
+                           DiagnosticReporter& reporter) {
+    auto emit = [&](DiagnosticCode code, std::string msg) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::move(msg);
+        reporter.report(std::move(d));
+    };
+
+    bool ok = true;
+
+    // Invariant 1: Bss items must have empty bytes.
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        auto const& d = items[i];
+        if (d.section == DataSectionKind::Bss && !d.bytes.empty()) {
+            emit(DiagnosticCode::K_BssDataHasBytes,
+                 std::format("AssembledData[{}] has section=Bss "
+                             "but bytes is non-empty ({} bytes). "
+                             "Bss is zero-fill — the wire format "
+                             "reserves the size without storing "
+                             "bytes. Substrate-shape violation "
+                             "(D-LK4-RODATA-BSS-INVARIANT).",
+                             i, d.bytes.size()));
+            ok = false;
+        }
+    }
+
+    // Invariant 2: no two items share the same non-sentinel
+    // SymbolId. Sentinel `SymbolId{}` (.v == 0) is exempt — it's
+    // the "anonymous data" marker and multiple anonymous items
+    // are legitimate.
+    std::unordered_map<std::uint32_t, std::size_t> firstByV;
+    firstByV.reserve(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        auto const v = items[i].symbol.v;
+        if (v == 0u) continue;  // sentinel exempt
+        auto const [it, inserted] = firstByV.emplace(v, i);
+        if (!inserted) {
+            emit(DiagnosticCode::K_DuplicateDataSymbol,
+                 std::format("AssembledData[{}] has SymbolId={{ "
+                             "{} }} which collides with item[{}]. "
+                             "Duplicate SymbolIds would silently "
+                             "let \"whichever was processed last\" "
+                             "win the linker's symbol→VA "
+                             "resolution. Mint distinct SymbolIds "
+                             "per data item or use the sentinel "
+                             "SymbolId{{}} for anonymous data.",
+                             i, v, it->second));
+            ok = false;
+        }
+    }
+
+    // Invariant 3 (alignment power-of-two) is enforced structurally
+    // by the `Alignment` newtype — see `asm.hpp` docblock.
+    return ok;
 }
 
 } // namespace dss

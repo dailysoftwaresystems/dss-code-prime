@@ -74,4 +74,68 @@ sectionKindFromName(std::string_view s) noexcept {
     return kSectionKindTable.fromName(s);
 }
 
+// Narrow subset of `SectionKind` that a producer can legitimately
+// emit via `AssembledData`. Closes D-LK4-RODATA-SECTION-NARROW.
+//
+// Of the 12 `SectionKind` values, 9 are walker-synthesized
+// (`Text` = executable code; `Symtab`/`Strtab`/`ShStrtab` = symbol
+// + name tables; `RelocTable` = relocation entries; `Dynamic` =
+// dynamic linking metadata; `Note` = vendor notes; `Debug` =
+// DWARF/CodeView; `Custom` = format-specific anything). A producer
+// constructing `AssembledData{symbol, SectionKind::Symtab, ...}`
+// is semantically nonsense — the assembler doesn't emit symbol
+// tables; the linker walker synthesizes them.
+//
+// The three valid producer-emittable kinds:
+//   * `Rodata` — read-only initialised data (string literals,
+//                const arrays, vtables).
+//   * `Data`   — read-write initialised data (mutable globals).
+//   * `Bss`    — zero-fill mutable data (uninitialised globals).
+//
+// The walker still keys on `SectionKind` (the full enum). The
+// `toSectionKind()` conversion is total — every `DataSectionKind`
+// value maps to its corresponding `SectionKind`. The reverse
+// direction is partial: `dataSectionKindOf()` returns nullopt for
+// the 9 walker-synthesized kinds.
+enum class DataSectionKind : std::uint8_t {
+    Rodata = static_cast<std::uint8_t>(SectionKind::Rodata),
+    Data   = static_cast<std::uint8_t>(SectionKind::Data),
+    Bss    = static_cast<std::uint8_t>(SectionKind::Bss),
+};
+
+[[nodiscard]] constexpr SectionKind
+toSectionKind(DataSectionKind d) noexcept {
+    return static_cast<SectionKind>(static_cast<std::uint8_t>(d));
+}
+
+[[nodiscard]] constexpr std::optional<DataSectionKind>
+dataSectionKindOf(SectionKind k) noexcept {
+    switch (k) {
+        case SectionKind::Rodata: return DataSectionKind::Rodata;
+        case SectionKind::Data:   return DataSectionKind::Data;
+        case SectionKind::Bss:    return DataSectionKind::Bss;
+        default:                  return std::nullopt;
+    }
+}
+
+// Round-trip pins (silent-failure F-1 + type-design Q5 fold,
+// 8-agent audit on D-LK4-RODATA-SECTION-NARROW). `toSectionKind`
+// is a raw `static_cast<SectionKind>(uint8_t)` — fast, but the
+// numeric round-trip would silently break if a future maintainer
+// rebased the explicit values on either enum without touching the
+// other. These compile-time assertions pin both the totality of
+// `toSectionKind` and the round-trip via `dataSectionKindOf`,
+// catching drift at build time before any walker mis-routes bytes.
+static_assert(toSectionKind(DataSectionKind::Rodata) == SectionKind::Rodata);
+static_assert(toSectionKind(DataSectionKind::Data)   == SectionKind::Data);
+static_assert(toSectionKind(DataSectionKind::Bss)    == SectionKind::Bss);
+static_assert(dataSectionKindOf(SectionKind::Rodata) == DataSectionKind::Rodata);
+static_assert(dataSectionKindOf(SectionKind::Data)   == DataSectionKind::Data);
+static_assert(dataSectionKindOf(SectionKind::Bss)    == DataSectionKind::Bss);
+
+[[nodiscard]] constexpr std::string_view
+dataSectionKindName(DataSectionKind d) noexcept {
+    return sectionKindName(toSectionKind(d));
+}
+
 } // namespace dss

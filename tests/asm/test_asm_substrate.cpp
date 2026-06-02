@@ -20,6 +20,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "diagnostic_count.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "link/object_format_schema.hpp"  // FLIP-MARKER test loads shipped formats
@@ -94,16 +95,19 @@ TEST(AsmSubstrate, ExternsSpanCopiesIntoAssembledModule) {
 // walker emission.
 
 TEST(AsmSubstrate, AssembledDataDefaultIsRodataSectionEmptyBytes) {
-    // Default-constructed AssembledData should default to Rodata
-    // (the typical kind for string-literal-promoted bytes), an
-    // invalid SymbolId (sentinel), alignment 1, and empty
-    // bytes/relocations. A regression that flipped the default to
-    // a different kind (e.g. Bss) would silently route producer
-    // output to the wrong walker arm.
+    // Default-constructed AssembledData should default to
+    // DataSectionKind::Rodata (the typical kind for string-
+    // literal-promoted bytes), an invalid SymbolId (sentinel),
+    // alignment 1 (byte-aligned), and empty bytes/relocations.
+    // A regression that flipped the default to a different kind
+    // (e.g. Bss) would silently route producer output to the
+    // wrong walker arm. The `DataSectionKind` narrow + `Alignment`
+    // newtype prevent the wider failure modes (walker-synthesized
+    // sections; non-power-of-two alignment) at compile time.
     AssembledData d;
-    EXPECT_EQ(d.section, SectionKind::Rodata);
+    EXPECT_EQ(d.section, DataSectionKind::Rodata);
     EXPECT_EQ(d.symbol, SymbolId{});
-    EXPECT_EQ(d.alignment, 1u);
+    EXPECT_EQ(d.alignment.bytes(), 1u);
     EXPECT_TRUE(d.bytes.empty());
     EXPECT_TRUE(d.relocations.empty());
 }
@@ -116,14 +120,14 @@ TEST(AsmSubstrate, AssembledModuleCarriesDataItemsField) {
 
     AssembledData d;
     d.symbol  = SymbolId{77};
-    d.section = SectionKind::Rodata;
+    d.section = DataSectionKind::Rodata;
     d.bytes   = {'h', 'e', 'l', 'l', 'o', '\n', '\0'};
-    d.alignment = 1u;
+    d.alignment = Alignment::of<1>();
     m.dataItems.push_back(std::move(d));
 
     ASSERT_EQ(m.dataItems.size(), 1u);
     EXPECT_EQ(m.dataItems[0].symbol, SymbolId{77});
-    EXPECT_EQ(m.dataItems[0].section, SectionKind::Rodata);
+    EXPECT_EQ(m.dataItems[0].section, DataSectionKind::Rodata);
     EXPECT_EQ(m.dataItems[0].bytes.size(), 7u);
     EXPECT_EQ(m.dataItems[0].bytes.back(), '\0')
         << "C-string nul terminator must round-trip verbatim";
@@ -151,28 +155,131 @@ TEST(AsmSubstrate, ShippedExecFormatsLackRodataSectionUntilWalkerLands) {
     }
 }
 
-// Bss-with-bytes is semantically nonsensical (Bss is zero-fill;
-// the wire format reserves `sh_size` without storing bytes). The
-// substrate type-allows the contradiction today; the linker's
-// dataItems-precondition guard catches non-empty `dataItems`
-// unconditionally for now. When the walker arm lowers that guard
-// per-format, a follow-up validate() will reject Bss+bytes. This
-// test pins the current (wrong) behavior as a FLIP-MARKER:
-// silent-failure F3 fold.
-TEST(AsmSubstrate, AssembledDataBssWithNonEmptyBytesIsTypeAllowedTripwire) {
+// D-LK4-RODATA-BSS-INVARIANT (closed by validateAssembledData):
+// Bss + non-empty bytes is a substrate-shape violation. Bss is
+// zero-fill — the wire format reserves `sh_size` without storing
+// bytes; a producer that wrote bytes into a Bss item would either
+// silently embed them (defeating BSS's no-file-footprint property)
+// or silently drop them. `validateAssembledData()` rejects this
+// loud with `K_NoMatchingObjectFormat`.
+TEST(AsmSubstrate, ValidateAssembledDataRejectsBssWithNonEmptyBytes) {
     AssembledData d;
-    d.section = SectionKind::Bss;
-    d.bytes   = {0xAAu};  // semantic contradiction: Bss + non-empty
-    // The struct doesn't validate. The contract is comment-only.
-    // FLIP-MARKER: when validateAssembledData() lands per D-LK4-
-    // RODATA-BSS-INVARIANT, replace the EXPECT_FALSE below with
-    // an assertion that construction (or validation) emits an
-    // error diagnostic.
-    EXPECT_EQ(d.section, SectionKind::Bss);
-    EXPECT_FALSE(d.bytes.empty())
-        << "FLIP-MARKER for D-LK4-RODATA-BSS-INVARIANT: when "
-           "validateAssembledData() lands, this assertion becomes "
-           "an emit-loud check against constructing such an item.";
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Bss;
+    d.bytes   = {0xAAu, 0xBBu};  // semantic contradiction
+    DiagnosticReporter rep;
+    EXPECT_FALSE(validateAssembledData(
+        std::span<AssembledData const>{&d, 1}, rep));
+    // Pin the EXACT diagnostic code — silent-failure F-4 fold:
+    // loose `EXPECT_GT(errorCount, 0)` would silently pass even if
+    // the wrong diagnostic fired (e.g. `K_NoMatchingObjectFormat`
+    // before the K_BssDataHasBytes split landed).
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::K_BssDataHasBytes),
+              1u)
+        << "validateAssembledData must emit exactly one "
+           "K_BssDataHasBytes when Bss carries bytes";
+}
+
+TEST(AsmSubstrate, ValidateAssembledDataAcceptsBssWithEmptyBytes) {
+    // The Bss-without-bytes case is the well-formed shape — a
+    // zero-fill reservation. Validate must accept it.
+    AssembledData d;
+    d.symbol  = SymbolId{42};
+    d.section = DataSectionKind::Bss;
+    // bytes intentionally empty
+    DiagnosticReporter rep;
+    EXPECT_TRUE(validateAssembledData(
+        std::span<AssembledData const>{&d, 1}, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(AsmSubstrate, ValidateAssembledDataRejectsDuplicateSymbolIds) {
+    // Two items sharing the same non-sentinel SymbolId would
+    // silently let "whichever the linker processed last" win
+    // the symbol→VA resolution. validate() rejects loud.
+    AssembledData a;
+    a.symbol = SymbolId{77};
+    a.bytes  = {'a'};
+    AssembledData b;
+    b.symbol = SymbolId{77};  // duplicate
+    b.bytes  = {'b'};
+    std::array<AssembledData, 2> items{a, b};
+    DiagnosticReporter rep;
+    EXPECT_FALSE(validateAssembledData(items, rep));
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::K_DuplicateDataSymbol),
+              1u)
+        << "exactly one K_DuplicateDataSymbol — silent-failure F-4 "
+           "fold tightens loose EXPECT_GT for the dup arm";
+}
+
+TEST(AsmSubstrate, ValidateAssembledDataAcceptsMultipleAnonymousItems) {
+    // The sentinel `SymbolId{}` (.v == 0) is the "anonymous data"
+    // marker — multiple anonymous items are legitimate (e.g.
+    // multiple read-only padding constants with no individual
+    // identity).
+    AssembledData a;
+    a.bytes = {'a'};
+    AssembledData b;
+    b.bytes = {'b'};
+    std::array<AssembledData, 2> items{a, b};
+    DiagnosticReporter rep;
+    EXPECT_TRUE(validateAssembledData(items, rep))
+        << "sentinel SymbolId{} is exempt from duplicate-check — "
+           "anonymous items have no identity to clash";
+}
+
+TEST(AsmSubstrate, AlignmentNewtypeRejectsZero) {
+    // D-LK4-RODATA-WIDE-ALIGNMENT-NEWTYPE: structural rejection
+    // of zero / non-power-of-two alignments at construction time.
+    EXPECT_FALSE(Alignment::fromBytes(0).has_value());
+    EXPECT_FALSE(Alignment::fromBytes(3).has_value());  // not pow2
+    EXPECT_FALSE(Alignment::fromBytes(7).has_value());  // not pow2
+    EXPECT_FALSE(Alignment::fromBytes(257).has_value());  // > 256
+    EXPECT_TRUE(Alignment::fromBytes(1).has_value());
+    EXPECT_TRUE(Alignment::fromBytes(8).has_value());
+    EXPECT_TRUE(Alignment::fromBytes(16).has_value());
+    EXPECT_TRUE(Alignment::fromBytes(256).has_value());
+    EXPECT_EQ(Alignment::of<16>().bytes(), 16u);
+    EXPECT_EQ(Alignment::of<16>().log2(), 4u);
+    // alignUp kernel: rounding via the newtype matches the
+    // canonical formula `(n + a - 1) & ~(a - 1)`.
+    EXPECT_EQ(Alignment::of<16>().alignUp(0u),  0u);
+    EXPECT_EQ(Alignment::of<16>().alignUp(1u),  16u);
+    EXPECT_EQ(Alignment::of<16>().alignUp(15u), 16u);
+    EXPECT_EQ(Alignment::of<16>().alignUp(16u), 16u);
+    EXPECT_EQ(Alignment::of<16>().alignUp(17u), 32u);
+}
+
+TEST(AsmSubstrate, DataSectionKindNarrowAdmitsOnlyDataSections) {
+    // D-LK4-RODATA-SECTION-NARROW: the conversion from the wider
+    // SectionKind to DataSectionKind is partial — only the 3
+    // producer-emittable kinds (Rodata, Data, Bss) round-trip.
+    // The 9 walker-synthesized kinds map to nullopt.
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Rodata),
+              DataSectionKind::Rodata);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Data),
+              DataSectionKind::Data);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Bss),
+              DataSectionKind::Bss);
+    // Walker-synthesized kinds — nullopt:
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Text),       std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Symtab),     std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Strtab),     std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::ShStrtab),   std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::RelocTable), std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Dynamic),    std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Note),       std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Debug),      std::nullopt);
+    EXPECT_EQ(dataSectionKindOf(SectionKind::Custom),     std::nullopt);
+    // toSectionKind is total — every DataSectionKind maps:
+    EXPECT_EQ(toSectionKind(DataSectionKind::Rodata),
+              SectionKind::Rodata);
+    EXPECT_EQ(toSectionKind(DataSectionKind::Data),
+              SectionKind::Data);
+    EXPECT_EQ(toSectionKind(DataSectionKind::Bss),
+              SectionKind::Bss);
 }
 
 // Cross-tier canary (test-analyzer MEDIUM-7 fold): the SectionKind

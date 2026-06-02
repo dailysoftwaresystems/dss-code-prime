@@ -248,6 +248,23 @@ LinkedImage link(AssembledModule const&    inputModule,
     // closes, replace this unconditional reject with a per-format
     // capability gate (walker arms advertise rodata support; the
     // others reject only if their bit is unset).
+    // D-LK4-RODATA-BSS-INVARIANT + duplicate-SymbolId + zero-
+    // alignment guards: validate the substrate invariants on
+    // `dataItems` BEFORE the F1 walker-precondition guard. The
+    // validate() function fail-louds on each violation so a
+    // future producer landing malformed items hits a precise
+    // diagnostic naming the violation, not a generic "no walker
+    // yet" rejection. Order matters: invariant failures point
+    // at the producer; F1 only points at the missing walker.
+    if (!module.dataItems.empty()) {
+        bool const dataItemsValid =
+            validateAssembledData(module.dataItems, reporter);
+        if (!dataItemsValid) {
+            image.resolvedFuncCount = 0;
+            return image;
+        }
+    }
+
     if (!module.dataItems.empty()) {
         report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                DiagnosticSeverity::Error,

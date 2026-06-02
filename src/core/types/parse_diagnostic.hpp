@@ -694,7 +694,26 @@ enum class DiagnosticCode : std::uint16_t {
     //   check that the format JSON's `entryPoint` field names a
     //   declared function rather than an imported symbol.
     K_EntryPointResolvesToExtern   = 0x800D,
-    // K-NEXT-SLOT: 0x800E — grep this marker before adding a K_* code.
+    // K_DuplicateDataSymbol: two `AssembledData` items in the same
+    //   module share the same non-sentinel `SymbolId`. The linker's
+    //   symbol→VA join is keyed by `SymbolId`; duplicates would
+    //   silently let "whichever item was processed last" win the
+    //   resolution. Distinct from `K_SymbolUndefined` (a symbol
+    //   referenced but never declared) — this is the symmetric
+    //   "doubly declared" failure. Closes the silent-failure
+    //   F-3 + type-design Q5 + comment-analyzer C5 convergence at
+    //   the 3rd-order audit of D-LK4-RODATA-BSS-INVARIANT.
+    // K_BssDataHasBytes: an `AssembledData` item has
+    //   `section == DataSectionKind::Bss` but non-empty `bytes`.
+    //   BSS is zero-fill — the wire format reserves `sh_size`
+    //   without storing bytes; a non-empty Bss item is a substrate-
+    //   shape violation. Distinct from `K_NoMatchingObjectFormat`
+    //   (a format-dispatch failure) — this is a producer-side
+    //   AssembledData invariant violation. Closes the same
+    //   convergence as K_DuplicateDataSymbol above.
+    K_DuplicateDataSymbol          = 0x800E,
+    K_BssDataHasBytes              = 0x800F,
+    // K-NEXT-SLOT: 0x8010 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

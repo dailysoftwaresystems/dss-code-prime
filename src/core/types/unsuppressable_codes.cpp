@@ -21,7 +21,7 @@ namespace {
 // D-LK6-8.2 SIGILL surface (D_TargetMachineCodeMismatch /
 // D_TargetAbiModelMismatch) and the LK10 image-write contract
 // (K_ImageWrite* + K_ImageEmpty).
-constexpr std::array<DiagnosticCode, 54> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 56> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -112,6 +112,17 @@ constexpr std::array<DiagnosticCode, 54> kUnsuppressableCodes{{
     // to unrelocated import-stub bytes at process entry → SEGV with
     // no diagnostic trail.
     DiagnosticCode::K_EntryPointResolvesToExtern,
+    // K_DuplicateDataSymbol / K_BssDataHasBytes — producer-side
+    // AssembledData invariant violations caught by
+    // `validateAssembledData()`. Suppressing either would let a
+    // producer ship an `AssembledModule` with two items at the
+    // same SymbolId (last-write-wins silent resolution) or a Bss
+    // item carrying bytes that would either bloat the on-disk
+    // image or silently drop. Both are substrate-shape violations
+    // that must not be silently accepted. 3rd-order audit fold
+    // (D-LK4-RODATA-BSS-INVARIANT).
+    DiagnosticCode::K_DuplicateDataSymbol,
+    DiagnosticCode::K_BssDataHasBytes,
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating
