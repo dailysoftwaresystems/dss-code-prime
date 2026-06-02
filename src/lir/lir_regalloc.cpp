@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <format>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -189,14 +190,82 @@ tryAllocate(FreeListsByClass& free, LirRegClass cls, bool crossesCall) {
     return std::nullopt;
 }
 
+// Pop a free register, SKIPPING any ordinal in `excluded`. Matches
+// the `tryAllocate` policy (callee-saved first, then caller-saved
+// unless crossesCall) but removes the picked entry only when it's
+// admissible. Excluded entries stay in the bucket (will be returned
+// to circulation when an unfettered call site asks for them).
+//
+// Closes D-CSUBSET-BINOP-RIGHT-CLOBBER (2026-06-02): when allocating
+// the result of a `requires2Address` instruction, operand[1..N]'s
+// physical registers must not be selected — the 2-addr legalize
+// would otherwise emit `mov result, ops[0]` and CLOBBER ops[N]'s
+// value before the binary op reads it. Universal across CPUs +
+// commutativity (the alias is a regalloc-tier invariant, not a
+// per-op special case).
+[[nodiscard]] std::optional<AllocPick>
+tryAllocateExcluding(FreeListsByClass& free,
+                     LirRegClass cls,
+                     bool crossesCall,
+                     std::span<std::uint16_t const> excluded) {
+    // Empty-excluded fast path falls back to the standard policy
+    // (preserves existing allocation traces for tests).
+    if (excluded.empty()) {
+        return tryAllocate(free, cls, crossesCall);
+    }
+    auto isExcluded = [&](std::uint16_t ord) noexcept {
+        for (auto e : excluded) if (e == ord) return true;
+        return false;
+    };
+    auto popFiltered = [&](std::vector<std::uint16_t>& regs)
+        -> std::optional<std::uint16_t> {
+        // Scan back-to-front (LIFO, matching popReg's order). The
+        // first non-excluded ordinal is returned and erased.
+        for (auto it = regs.rbegin(); it != regs.rend(); ++it) {
+            if (!isExcluded(*it)) {
+                std::uint16_t const ord = *it;
+                regs.erase(std::next(it).base());
+                return ord;
+            }
+        }
+        return std::nullopt;
+    };
+    auto& bucket = free[static_cast<std::size_t>(cls)];
+    if (auto r = popFiltered(bucket.calleeSaved); r.has_value()) {
+        return AllocPick{*r, true};
+    }
+    if (crossesCall) return std::nullopt;
+    if (auto r = popFiltered(bucket.callerSaved); r.has_value()) {
+        return AllocPick{*r, false};
+    }
+    return std::nullopt;
+}
+
 [[nodiscard]] std::vector<ActiveEntry>::iterator
 findSpillCandidate(std::vector<ActiveEntry>& active, LirRegClass cls,
-                   bool requireCalleeSaved) {
+                   bool requireCalleeSaved,
+                   std::span<std::uint16_t const> excluded = {}) {
+    // D-CSUBSET-BINOP-RIGHT-CLOBBER spill-aware closure (silent-
+    // failure audit HIGH-1, 2026-06-02): when the caller is
+    // resolving a `requires2Address` result whose `tryAllocate
+    // Excluding` returned nullopt, the spill fallback MUST NOT
+    // pick an evictee whose physical ordinal is in the excluded
+    // set — otherwise the freed register lands on operand[k>=1]'s
+    // ordinal and the clobber bug recurs under register pressure
+    // (just-freed-reg → result-vreg → mov clobbers source). Pass
+    // the same excluded span used for tryAllocateExcluding so the
+    // exclusion contract holds end-to-end across the alloc + spill
+    // arms.
+    auto const isExcluded = [&](std::uint16_t ord) noexcept {
+        for (auto e : excluded) if (e == ord) return true;
+        return false;
+    };
     auto best = active.end();
     std::uint32_t bestEnd = 0;
     for (auto it = active.begin(); it != active.end(); ++it) {
         if (it->cls != cls) continue;
         if (requireCalleeSaved && !it->isCalleeSaved) continue;
+        if (isExcluded(it->physOrdinal)) continue;
         if (it->range.end > bestEnd) {
             bestEnd = it->range.end;
             best    = it;
@@ -375,7 +444,105 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
 
         bool const crossesCall = rangeCrossesCall(r, callPositions);
 
-        if (auto pick = tryAllocate(free, cls, crossesCall); pick.has_value()) {
+        // D-CSUBSET-BINOP-RIGHT-CLOBBER closure (2026-06-02): when
+        // this range is the result of a `requires2Address` opcode,
+        // the legalize pass will emit `mov result, ops[0]` to
+        // satisfy the 2-addr constraint when `result != ops[0]`.
+        // That mov CLOBBERS the destination register's prior value
+        // — if the allocator assigned `result` to a register that
+        // also holds operand[k>=1]'s value, the second source is
+        // destroyed before the binary op reads it (`add result,
+        // [result, result]` instead of `add result, [result,
+        // ops[k]]`). Prevent by EXCLUDING operand[1..N]'s physical
+        // registers from this allocation. Operand[0] alias remains
+        // permitted (and preferred — the coalesce case where
+        // legalize emits no mov at all).
+        //
+        // Universal across CPUs: the schema's `requires2Address`
+        // flag drives the exclusion; no `if (target == X)` branch.
+        // Universal across commutativity: the bug fires for both
+        // commutative and non-commutative 2-addr ops; both want
+        // the same exclusion.
+        std::array<std::uint16_t, 4> excludedStorage{};
+        std::size_t excludedCount = 0;
+        if (LirInstId const producingInst =
+                (r.start < flow.positionToInst.size())
+                    ? flow.positionToInst[r.start]
+                    : LirInstId{};
+            producingInst.valid()) {
+            auto const opcode = lir.instOpcode(producingInst);
+            auto const* info  = schema.opcodeInfo(opcode);
+            // HIGH-3 silent-failure fold (2026-06-02): verify the
+            // looked-up instruction actually DEFINES `r.vreg`. The
+            // liveness builder produces `start = 0` for use-only
+            // vregs (a verifier-rejected shape, but defense-in-
+            // depth here): `positionToInst[0]` returns the first
+            // inst in the function, which is unrelated to r.vreg.
+            // Without this check, an unrelated 2-addr op's
+            // operands would silently drive the exclusion set and
+            // misallocate r.vreg. Skip the exclusion when the
+            // looked-up inst isn't this range's definer.
+            if (info != nullptr && info->requires2Address
+                && lir.instResult(producingInst) == r.vreg) {
+                auto const ops = lir.instOperands(producingInst);
+                // HIGH-2 silent-failure fold (2026-06-02): fail
+                // loud BEFORE the loop instead of silently
+                // truncating mid-loop when a future N-ary
+                // `requires2Address` op exceeds the fixed-size
+                // exclusion buffer. Today's 2-operand binops
+                // produce exactly 1 excluded entry (4× headroom);
+                // a future schema row with 5+ source operands at
+                // indices ≥1 would silently regress the clobber-
+                // prevention contract under the prior loop-guard
+                // shape. Hard-abort + clear message names the
+                // path for the schema author.
+                if (ops.size() > excludedStorage.size() + 1u) {
+                    regallocFatal(
+                        "requires2Address opcode has more source "
+                        "operands than the 2-addr exclusion buffer "
+                        "can hold — extend excludedStorage in "
+                        "lir_regalloc.cpp OR re-shape the schema "
+                        "so the high-arity case is encoded as a "
+                        "non-2-addr opcode (D-CSUBSET-BINOP-RIGHT-"
+                        "CLOBBER buffer overflow)");
+                }
+                // Skip operand[0] (legitimate coalesce target).
+                for (std::size_t k = 1; k < ops.size(); ++k) {
+                    if (ops[k].kind != LirOperandKind::Reg) continue;
+                    LirReg const opReg = ops[k].reg;
+                    // Source reg may be already-physical (e.g. from
+                    // an `arg` lowering pre-coalesced to a phys reg)
+                    // or a vreg we've assigned earlier in this loop.
+                    // LirReg's `id` field holds the ordinal in BOTH
+                    // forms — for physical regs the id IS the
+                    // physical ordinal; for vregs it's the vreg id
+                    // and we route through the assignments table.
+                    std::uint16_t ord = 0;
+                    if (opReg.isPhysical) {
+                        ord = static_cast<std::uint16_t>(opReg.id);
+                    } else {
+                        if (opReg.id == 0
+                            || opReg.id >= out.assignments.size()) {
+                            continue;
+                        }
+                        auto const& a = out.assignments[opReg.id];
+                        if (a.isSpilled()) continue;
+                        // Skip if the assignment was never set
+                        // (default-constructed sentinel has zero
+                        // classKind, hence `!valid()`).
+                        if (!a.vreg.valid()) continue;
+                        ord = static_cast<std::uint16_t>(
+                            a.physReg().id);
+                    }
+                    excludedStorage[excludedCount++] = ord;
+                }
+            }
+        }
+        std::span<std::uint16_t const> const excluded{
+            excludedStorage.data(), excludedCount};
+
+        if (auto pick = tryAllocateExcluding(free, cls, crossesCall, excluded);
+            pick.has_value()) {
             LirReg const phys = makePhysicalReg(pick->ordinal, cls);
             out.assignments[r.vreg.id] =
                 LirRegAssignment::makePhys(r.vreg, phys);
@@ -385,7 +552,13 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
 
         // Invariant: every spill emits exactly one slot increment via
         // `mintSlot` and contributes to one `SpillStats` counter.
-        auto const spillIt = findSpillCandidate(active, cls, crossesCall);
+        // The `excluded` set is propagated so the evictee's physical
+        // ordinal is never in operand[1..N]'s set — closes the
+        // silent-failure HIGH-1 audit fold: without this, the spill
+        // fallback could free a register the exclusion explicitly
+        // forbids, recreating the clobber bug under register pressure.
+        auto const spillIt = findSpillCandidate(active, cls, crossesCall,
+                                                 excluded);
         bool const evictCandidate =
             spillIt != active.end() && spillIt->range.end > r.end;
 

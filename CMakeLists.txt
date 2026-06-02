@@ -75,8 +75,16 @@ if(DSS_BUILD_TESTS)
 endif()
 
 add_subdirectory(src)
-add_subdirectory(integrated_tests)
 
 if(DSS_BUILD_TESTS)
+    # `integrated_tests` is a test harness (drives the dss-code-prime
+    # CLI as a subprocess + asserts OS exit codes from spawned
+    # binaries). It uses `enable_testing()` + `add_test()`, so it
+    # must live inside the DSS_BUILD_TESTS gate alongside the unit
+    # tests — otherwise `add_test()` silently no-ops when the gate
+    # is off (no testing context in the calling scope) and CI would
+    # build the binary but never invoke it through ctest. This gate
+    # IS the fix; no separate anchor is tracked.
+    add_subdirectory(integrated_tests)
     add_subdirectory(tests)
 endif()
