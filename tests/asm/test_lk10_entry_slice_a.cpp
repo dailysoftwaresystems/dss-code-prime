@@ -30,19 +30,6 @@
 
 using namespace dss;
 
-namespace {
-
-// Helper: load the shipped x86_64 schema, assert success, run a tiny
-// one-function Lir through assemble(), return the result. Tests use
-// it to keep the boilerplate out of every TEST.
-struct Slice {
-    std::shared_ptr<TargetSchema> schema;
-    AssembledModule               result;
-    DiagnosticReporter            rep;
-};
-
-}  // namespace
-
 TEST(LK10EntrySliceA, UnreachableOpEncodesToUd2) {
     auto schema = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(schema.has_value());
@@ -164,6 +151,12 @@ TEST(LK10EntrySliceA, CallIndirectViaExternEmitsRel32Reloc) {
     EXPECT_EQ(relocs[0].offset, 2u)
         << "reloc patch site is at byte 2 (just after FF 15)";
     EXPECT_EQ(relocs[0].target.v, 99u);
+    EXPECT_EQ(relocs[0].addend, 0)
+        << "addend must be 0 — `rel32` row's addendBias=-4 already "
+           "encodes the displacement bias; a non-zero addend here "
+           "would double-count it and silently skew the IAT-slot VA. "
+           "test-analyzer dim-2 H1 / 2-agent convergence at 756c5ea "
+           "audit (FOLD-NOW pin against D-AS4-4 producer regression).";
     auto const rel32Info =
         (*schema)->relocationByName("rel32");
     ASSERT_NE(rel32Info, nullptr);
@@ -231,12 +224,37 @@ TEST(LK10EntrySliceA, FullTrampolineShapeSyscallArm) {
     // Exactly one relocation on the call (REL32 → SymbolId{88}).
     ASSERT_EQ(relocs.size(), 1u);
     EXPECT_EQ(relocs[0].target.v, 88u);
-    // Final bytes should end in 0F 05 (syscall) then 0F 0B (unreachable).
-    ASSERT_GE(bytes.size(), 4u);
-    EXPECT_EQ(bytes[bytes.size() - 4], 0x0F);
-    EXPECT_EQ(bytes[bytes.size() - 3], 0x05);
-    EXPECT_EQ(bytes[bytes.size() - 2], 0x0F);
-    EXPECT_EQ(bytes[bytes.size() - 1], 0x0B);
+    EXPECT_EQ(relocs[0].addend, 0)
+        << "addend must be 0 — see CallIndirectViaExternEmitsRel32Reloc";
+    // Pin TOTAL byte count + middle byte sequence (3-agent
+    // convergence: test-analyzer H2 + dim-2 H2 + code-architect Q6
+    // FOLD-NOW at 756c5ea audit). A regression in the middle ops'
+    // encodings (REX.W byte, mov-reg variant selection, imm32
+    // bytes) would silently leave the suffix-only pin passing.
+    //   call rel32        : E8 00 00 00 00          = 5 bytes
+    //   mov rdi, rax      : 48 8B F8                = 3 bytes (REX.W 8B /r, ModR/M mod=11 reg=rdi=111 rm=rax=000 = F8)
+    //   mov rax, 231      : 48 C7 C0 E7 00 00 00    = 7 bytes (REX.W C7 /0 imm32, ModR/M mod=11 reg=/0 rm=rax=000 = C0)
+    //   syscall           : 0F 05                   = 2 bytes
+    //   unreachable (ud2) : 0F 0B                   = 2 bytes
+    //                                          total = 19 bytes
+    // The mov-reg-reg variant uses opcode 0x8B (MOV r64, r/m64) with
+    // resultSlot=modrm.reg and operand0 wired to modrm.rm — see the
+    // `mov` opcode's "reg" variant in x86_64.target.json.
+    ASSERT_EQ(bytes.size(), 19u);
+    EXPECT_EQ(bytes[5], 0x48);
+    EXPECT_EQ(bytes[6], 0x8B);
+    EXPECT_EQ(bytes[7], 0xF8);
+    EXPECT_EQ(bytes[8],  0x48);
+    EXPECT_EQ(bytes[9],  0xC7);
+    EXPECT_EQ(bytes[10], 0xC0);
+    EXPECT_EQ(bytes[11], 0xE7);  // 231 LE byte 0
+    EXPECT_EQ(bytes[12], 0x00);
+    EXPECT_EQ(bytes[13], 0x00);
+    EXPECT_EQ(bytes[14], 0x00);
+    EXPECT_EQ(bytes[15], 0x0F);
+    EXPECT_EQ(bytes[16], 0x05);
+    EXPECT_EQ(bytes[17], 0x0F);
+    EXPECT_EQ(bytes[18], 0x0B);
 }
 
 TEST(LK10EntrySliceA, FullTrampolineShapeByNameImportArm) {
@@ -289,8 +307,94 @@ TEST(LK10EntrySliceA, FullTrampolineShapeByNameImportArm) {
     ASSERT_EQ(relocs.size(), 2u);
     EXPECT_EQ(relocs[0].target.v, 88u);
     EXPECT_EQ(relocs[1].target.v, 99u);
-    // Final bytes end in unreachable (0F 0B).
-    ASSERT_GE(bytes.size(), 2u);
-    EXPECT_EQ(bytes[bytes.size() - 2], 0x0F);
-    EXPECT_EQ(bytes[bytes.size() - 1], 0x0B);
+    EXPECT_EQ(relocs[0].addend, 0);
+    EXPECT_EQ(relocs[1].addend, 0);
+    // Reloc emission order is well-defined: direct call (offset 1)
+    // precedes indirect call (offset 5 + 3 + 2 = 10) — dim-2 M2 pin
+    // catches a regression that reorders the relocs vector.
+    EXPECT_LT(relocs[0].offset, relocs[1].offset);
+    // Pin TOTAL byte count:
+    //   call rel32        : E8 00 00 00 00          = 5 bytes
+    //   mov rcx, rax      : 48 8B C8                = 3 bytes (REX.W 8B /r, ModR/M mod=11 reg=rcx=001 rm=rax=000 = C8)
+    //   FF 15 disp32      : FF 15 00 00 00 00       = 6 bytes
+    //   unreachable (ud2) : 0F 0B                   = 2 bytes
+    //                                          total = 16 bytes
+    ASSERT_EQ(bytes.size(), 16u);
+    EXPECT_EQ(bytes[5], 0x48);
+    EXPECT_EQ(bytes[6], 0x8B);
+    EXPECT_EQ(bytes[7], 0xC8);
+    EXPECT_EQ(bytes[8],  0xFF);
+    EXPECT_EQ(bytes[9],  0x15);
+    EXPECT_EQ(bytes[14], 0x0F);
+    EXPECT_EQ(bytes[15], 0x0B);
+}
+
+// dim-2 M1 fold (negative-guard contract pins on the new Slice A
+// opcodes). The encoder's variant-guard match (walker_util.hpp:108)
+// is length+kind exact; a regression to a length-only or
+// prefix-style match would silently accept malformed operands.
+// Three loud-fail pins on the new opcodes specifically.
+
+TEST(LK10EntrySliceA, SyscallWithStrayOperandFailsLoud) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const syscallOp = (*schema)->opcodeByMnemonic("syscall");
+    auto const unreachOp = (*schema)->opcodeByMnemonic("unreachable");
+    ASSERT_TRUE(syscallOp.has_value());
+    ASSERT_TRUE(unreachOp.has_value());
+
+    LirBuilder b{**schema};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    // A stray imm operand on a zero-operand opcode should NOT match
+    // the empty-list variant guard. LirBuilder's per-opcode operand-
+    // count guard (minOperands/maxOperands = 0) rejects this at
+    // addInst time; if that gate is ever relaxed, the encoder's
+    // guard must still reject. This test pins the contract.
+    LirOperand const strayOps[] = { LirOperand::makeImmInt32(42) };
+    // Note: this may fail at addInst (LirBuilder gate) OR at
+    // assemble (encoder guard) — either is acceptable; what's NOT
+    // acceptable is silent emission. We don't assert which gate
+    // catches it, only that errorCount > 0 OR the build aborts.
+    (void)b.addInst(*syscallOp, InvalidLirReg, strayOps);
+    (void)b.addUnreachable(*unreachOp);
+    Lir lir = std::move(b).finish();
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    DiagnosticReporter rep;
+    (void)assemble(lir, **schema, lirToMir, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "syscall with stray operand must fail loud — empty-list "
+           "variant guard cannot match a 1-operand inst.";
+}
+
+TEST(LK10EntrySliceA, CallIndirectViaExternWithRegOperandFailsLoud) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const callIndOp =
+        (*schema)->opcodeByMnemonic("call_indirect_via_extern");
+    auto const unreachOp = (*schema)->opcodeByMnemonic("unreachable");
+    ASSERT_TRUE(callIndOp.has_value());
+    ASSERT_TRUE(unreachOp.has_value());
+    auto const raxOrd = (*schema)->registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+
+    LirBuilder b{**schema};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    // Reg operand instead of SymbolRef — must NOT match the
+    // {operandKinds: ["symbol"]} variant guard.
+    LirOperand const wrongOps[] = {
+        LirOperand::makeReg(makePhysicalReg(*raxOrd, LirRegClass::GPR))
+    };
+    (void)b.addInst(*callIndOp, InvalidLirReg, wrongOps);
+    (void)b.addUnreachable(*unreachOp);
+    Lir lir = std::move(b).finish();
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    DiagnosticReporter rep;
+    (void)assemble(lir, **schema, lirToMir, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "call_indirect_via_extern with Reg operand must fail loud "
+           "— the guard {operandKinds: [\"symbol\"]} requires SymbolRef.";
 }
