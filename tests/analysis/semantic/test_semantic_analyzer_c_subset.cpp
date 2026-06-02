@@ -145,6 +145,152 @@ TEST(SemanticAnalyzerCSubset, PointerDeclaratorTypedAsPtr) {
     EXPECT_EQ(ti.kind(ti.operands(ti.operands(pp->type)[0])[0]), TypeKind::I32);
 }
 
+// D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): `void *p` types
+// as `Ptr<Void>` — the existing pointer-declarator machinery handles
+// the Void element type without special-casing (the grammar parses
+// `void` + StarOp; resolveTypeNode wraps the Void TypeId in
+// interner.pointer()).
+TEST(SemanticAnalyzerCSubset, VoidStarDeclaratorTypedAsPtrVoid) {
+    auto cu = buildShippedUnit("c-subset", { "void f() { void *p; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* p = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "p") p = &model.symbols()[i];
+    }
+    ASSERT_NE(p, nullptr);
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(p->type)[0]), TypeKind::Void)
+        << "void* must intern as Ptr<Void> (the untyped-memory case "
+           "of Void's dual semantics — distinct from void-return)";
+}
+
+// D-LANG-POINTER-VOID-CONVERT: an extern function taking `void*`
+// argument types correctly + the call site passing a `char*` arg
+// must accept without diagnostic (C-standard §6.3.2.3 — c-subset
+// declares both directions implicit in pointerConversions).
+TEST(SemanticAnalyzerCSubset, CharStarToVoidStarArgImplicit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int handler(void* p);\n"
+        "int main() {\n"
+        "    char* s;\n"
+        "    return handler(s);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // countCode discipline (audit-fold G1, step 13.2): strict zero
+    // on S_TypeMismatch AND on adjacent mismatch codes — pre-fix
+    // any-bool would have passed if a wrong-code regression fired
+    // S_ReturnTypeMismatch or S_ArgCountMismatch.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "char* → void* must be implicit in c-subset "
+           "(implicitToVoidPtr: true)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+}
+
+// D-LANG-POINTER-VOID-CONVERT: the reverse direction (`void*` →
+// `char*`) is also implicit under C semantics (c-subset declares
+// `implicitFromVoidPtr: true`) — C++ would forbid this without
+// an explicit cast.
+TEST(SemanticAnalyzerCSubset, VoidStarToCharStarArgImplicit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int handler(const char* s);\n"
+        "extern void* alloc(int n);\n"
+        "int main() {\n"
+        "    return handler(alloc(16));\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "void* → const char* must be implicit in c-subset "
+           "(implicitFromVoidPtr: true). When C++ frontend lands, "
+           "it would declare implicitFromVoidPtr: false and this "
+           "direction would require an explicit cast.";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+}
+
+// D-LANG-POINTER-VOID-CONVERT negative pin: distinct typed pointers
+// remain mismatch under c-subset (only `void*` ↔ `T*` is implicit;
+// `int*` → `char*` requires an explicit cast even in C).
+TEST(SemanticAnalyzerCSubset, DistinctTypedPointersRemainMismatch) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int handler(int* p);\n"
+        "int main() {\n"
+        "    char* s;\n"
+        "    return handler(s);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // Pin EXACTLY ONE S_TypeMismatch (not duplicate cascade) AND
+    // zero adjacent mismatch codes (audit-fold G1, G2 strictness).
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "char* → int* must NOT be implicit even in c-subset — "
+           "void* is the only universal-pointer special case; "
+           "ordinary typed pointers require an explicit cast";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+}
+
+// D-LANG-POINTER-VOID-CONVERT (audit-fold G2 + G3, step 13.2): the
+// `pointerConversions`-gated `isAssignable` now reaches THREE check
+// sites in semantic_analyzer.cpp — call-arg (1629), return (1726),
+// and variable-init/assign (1370). The original 13.2 tests only
+// exercise the call-arg site; G2 + G3 add return + init pins.
+TEST(SemanticAnalyzerCSubset, VoidStarReturnFromTypedPtrImplicit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "void* f(int* p) { return p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u)
+        << "int* → void* via return must be implicit in c-subset "
+           "(implicitToVoidPtr: true)";
+}
+
+TEST(SemanticAnalyzerCSubset, TypedPtrReturnFromVoidStarImplicit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int* f(void* p) { return p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u)
+        << "void* → int* via return must be implicit in c-subset "
+           "(implicitFromVoidPtr: true). C++ would forbid.";
+}
+
+TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int* f(char* p) { return p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 1u)
+        << "char* → int* via return must NOT be implicit even in "
+           "c-subset (only void* gets the universal-pointer pass).";
+}
+
 // SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
 TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
     auto cu = buildShippedUnit("c-subset", { "void f(int *p) {}\n" });

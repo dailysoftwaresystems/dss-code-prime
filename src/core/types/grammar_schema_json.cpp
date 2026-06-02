@@ -4476,6 +4476,68 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02):
+            // per-language `pointerConversions` block. Loads two
+            // independent direction flags:
+            //   * `implicitToVoidPtr`: T* → void* without cast (safe).
+            //   * `implicitFromVoidPtr`: void* → T* without cast (unsafe).
+            // Both default false (strict — opt-in safety relaxation).
+            // C-family languages declare both true; C++ declares only
+            // `implicitToVoidPtr`; Rust/Swift declare neither.
+            if (sem.contains("pointerConversions")) {
+                auto const& obj = sem.at("pointerConversions");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/pointerConversions",
+                              "'pointerConversions' must be an object "
+                              "with optional `implicitToVoidPtr` and "
+                              "`implicitFromVoidPtr` boolean fields");
+                } else {
+                    auto readBool = [&](char const* field, bool& out) {
+                        if (!obj.contains(field)) return;
+                        auto const& val = obj.at(field);
+                        if (!val.is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format(
+                                          "/semantics/pointerConversions/{}",
+                                          field),
+                                      std::format("'{}' must be a boolean",
+                                                  field));
+                            return;
+                        }
+                        out = val.get<bool>();
+                    };
+                    readBool("implicitToVoidPtr",
+                             cfg.pointerConversions.implicitToVoidPtr);
+                    readBool("implicitFromVoidPtr",
+                             cfg.pointerConversions.implicitFromVoidPtr);
+                    // Typo defense: reject unknown sub-keys with a
+                    // fail-loud diagnostic. Pre-guard, an editor typo
+                    // like `implictToVoidPtr` (missing 'i') would
+                    // silently fall back to default-false strict
+                    // mode and flip the language's semantics. Mirrors
+                    // the unknown-field discipline at line 548 (the
+                    // `expr` block's allowlist pattern). Diagnostics
+                    // about expected fields are sufficient — the
+                    // closed allowlist forecloses unknown subkeys.
+                    for (auto const& [k, _] : obj.items()) {
+                        if (k != "implicitToVoidPtr" &&
+                            k != "implicitFromVoidPtr") {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format(
+                                          "/semantics/pointerConversions/{}",
+                                          k),
+                                      std::format(
+                                          "unknown 'pointerConversions' "
+                                          "field '{}' — expected "
+                                          "'implicitToVoidPtr' or "
+                                          "'implicitFromVoidPtr'",
+                                          k));
+                        }
+                    }
+                }
+            }
+
             // A `nameMatch: "lastIdentifier"` rule (declaration or
             // reference) descends a subtree for its LAST identifier token —
             // which requires the engine to know which token kind IS the

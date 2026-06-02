@@ -219,6 +219,65 @@ struct Lowerer {
                 return {decay, target};
             }
         }
+        // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): when
+        // the active language's `pointerConversions` rules admit the
+        // direction-specific `Ptr<Void>` ↔ `Ptr<T>` conversion, emit
+        // a synthetic `Cast` HIR node. MIR-tier `mapCast` already
+        // routes Ptr→Ptr as `Bitcast` (no representation change at
+        // runtime) — every tier below MIR sees Ptr as pointer-width
+        // uniformly regardless of element type.
+        //
+        // The two arms are independent because the C++ self-host
+        // target distinguishes them: `T* → void*` (lhs is void*, rhs
+        // is T*, this is the `tk == Void` arm) is safe widening,
+        // permitted by C and C++; `void* → T*` (lhs is T*, rhs is
+        // void*, this is the `ck == Void` arm) is unsafe narrowing,
+        // permitted by C but FORBIDDEN by C++ (requires explicit
+        // cast). c-subset declares both true in
+        // `c-subset.lang.json`; default-constructed
+        // `PointerConversionRules` has both false (strict typing).
+        //
+        // Sister rule in `type_rules.hpp::isAssignable` — the
+        // semantic phase has already vetoed unsupported directions
+        // before reaching here, so this arm fires only when the
+        // active language admits the conversion. `sem` (Lowerer
+        // field, declared at line 139) is bound by reference to the
+        // active schema's `SemanticConfig` (set via `sch.semantics()`
+        // at Lowerer construction); there is no default-constructed
+        // fallback path. A schema whose `pointerConversions` block
+        // is absent loads as both flags `false` (strict typing) via
+        // the optional-field path in `grammar_schema_json.cpp`'s
+        // pointerConversions loader.
+        if (ck == TypeKind::Ptr && tk == TypeKind::Ptr) {
+            auto const fromElem = interner.operands(child.type);
+            auto const toElem   = interner.operands(target);
+            if (!fromElem.empty() && !toElem.empty()) {
+                bool const fromIsVoid =
+                    interner.kind(fromElem[0]) == TypeKind::Void;
+                bool const toIsVoid =
+                    interner.kind(toElem[0]) == TypeKind::Void;
+                bool admit = false;
+                // T* → void* (toIsVoid && !fromIsVoid)
+                if (toIsVoid && !fromIsVoid) {
+                    admit = sem.pointerConversions.implicitToVoidPtr;
+                }
+                // void* → T* (fromIsVoid && !toIsVoid)
+                else if (fromIsVoid && !toIsVoid) {
+                    admit = sem.pointerConversions.implicitFromVoidPtr;
+                }
+                if (admit) {
+                    HirNodeId const cast = builder.makeCast(
+                        child.id, target, HirFlags::Synthetic);
+                    for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                        if (it->first == child.id) {
+                            spans.push_back({cast, it->second});
+                            break;
+                        }
+                    }
+                    return {cast, target};
+                }
+            }
+        }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds) is the implicit-conversion surface.

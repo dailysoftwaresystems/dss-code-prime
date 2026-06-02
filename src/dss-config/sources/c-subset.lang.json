@@ -556,6 +556,11 @@
       "elf":   "libc.so.6",
       "macho": "/usr/lib/libSystem.B.dylib"
     },
+    "$pointerConversionsComment": "D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): C-standard §6.3.2.3 — `void*` converts implicitly to/from any object-pointer type without a cast. The two directions are configured INDEPENDENTLY (matching C++'s split, where only the safe direction is implicit). c-subset declares BOTH true (C-family semantics). A future C++ frontend would declare {implicitToVoidPtr: true, implicitFromVoidPtr: false} matching ISO C++ §7.11. Rust/Swift would declare both false. DEFAULT is false (struct-init); strict typing is the safety-respecting default, opposite of the Array→Ptr decay opt-out direction (which is pervasive C-family idiom; void-ptr conversion is a safety relaxation). Pointer arithmetic on void* and void*↔fn-pointer conversions are separate concerns anchored at D-LANG-VOIDPTR-ARITH-REJECT and D-LANG-VOIDPTR-FN-CONVERT respectively.",
+    "pointerConversions": {
+      "implicitToVoidPtr":   true,
+      "implicitFromVoidPtr": true
+    },
     "declarations": [
       { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword", "warnIfUnused": true,

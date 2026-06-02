@@ -484,6 +484,80 @@ struct DSS_EXPORT SemanticConfig {
     // grammar extension that would layer per-symbol overrides on
     // top of this language-level default.
     std::unordered_map<std::string, std::string> externLibraryByFormat;
+
+    // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): per-language
+    // rules governing implicit conversion between `Ptr<Void>` (untyped
+    // memory) and `Ptr<T>` (typed memory). The two directions carry
+    // DIFFERENT safety characteristics and are configured INDEPENDENTLY
+    // — C++ (DSS's self-host target) allows the safe direction
+    // (`T* → void*`, widening to untyped) but FORBIDS the unsafe
+    // direction (`void* → T*`, asserting untyped memory IS T-typed;
+    // requires an explicit cast). A single bool would conflate the two
+    // and force a known-future-split when C++ frontend lands.
+    //
+    // Shipped values:
+    //   * c-subset (C semantics): BOTH true (C-standard §6.3.2.3:
+    //     `void*` converts implicitly to/from any object-pointer type).
+    //   * (Future) c++-subset: `{implicitToVoidPtr: true,
+    //     implicitFromVoidPtr: false}` — matching ISO C++ §7.11.
+    //   * (Future) rust-like / swift-like: BOTH false (strict typing;
+    //     explicit cast required in both directions).
+    //   * Default (struct initializer): BOTH false. This is the
+    //     SAFETY-RESPECTING default — a new language schema that
+    //     doesn't think about pointer conversions gets strict typing
+    //     and must explicitly opt into either direction. This default
+    //     direction INTENTIONALLY DIFFERS from the Array→Ptr decay
+    //     opt-out (which defaults ON) because implicit pointer-
+    //     conversion is a type-safety relaxation, not a pervasive
+    //     idiom; relaxations should require explicit opt-in.
+    //
+    // Consumed by:
+    //   * `isAssignable` in `type_rules.hpp` — admits the assignment
+    //     when the relevant direction's flag is true.
+    //   * `coerce()` in `cst_to_hir.cpp` — emits a synthetic `Cast`
+    //     HIR node when admitted (mirror of the existing Array→Ptr
+    //     decay arm). MIR-tier `mapCast` already lowers Ptr→Ptr as
+    //     `Bitcast` (no representation change at runtime).
+    //
+    // Anchored for future:
+    //   * `D-LANG-VOIDPTR-ARITH-REJECT`: pointer arithmetic on void*
+    //     is undefined in standard C (sizeof(void) is invalid); GCC
+    //     permits it as an extension treating void as 1-byte. When
+    //     c-subset gains pointer arithmetic, the void* arm rejects by
+    //     default; a `allowVoidPtrArithmetic: bool` opt-in field
+    //     extends this struct.
+    //   * `D-LANG-VOIDPTR-FN-CONVERT`: `void* ↔ fn-pointer` is
+    //     technically UB in standard C even though every compiler
+    //     permits it. When function-pointer types land (D-ML7-2.4),
+    //     another `allowVoidPtrFnConvert: bool` opt-in extends this
+    //     struct.
+    //   * `D-LANG-VOIDPTR-PREDICATE-GATE` (type-design analyst,
+    //     step 13.2 audit fold): if a future language needs
+    //     per-element-type predicates ("only T* → void* when T ∈
+    //     {char, byte}" or "only when sizeof(T) ≥ alignof(void*)"),
+    //     today's two-bool shape forecloses it. Trigger: first
+    //     language whose `void*` rules depend on the element T.
+    //     Closure: add a `PointerConversionPredicate` variant slot
+    //     beside the bools (additive, doesn't break existing flags).
+    //   * `D-TYPERULES-PTRRULES-PASS-BY-VALUE` (type-design analyst
+    //     D4, step 13.2 audit fold): the `isAssignable` signature
+    //     takes `PointerConversionRules const&` for a 2-byte POD.
+    //     By-value would marginally simplify; const-ref form is
+    //     idiomatic-enough today. Trigger: any post-merge pass
+    //     touching the `isAssignable` signature (e.g. when a 3rd
+    //     rules-block lands).
+    struct PointerConversionRules {
+        // T* → void* (typed → untyped). Information-erasing direction.
+        // Universally safe (no runtime risk; just forgetting type).
+        // C, C++, Objective-C: implicit. Rust, Swift: explicit.
+        bool implicitToVoidPtr   = false;
+        // void* → T* (untyped → typed). Information-asserting direction.
+        // Unsafe (caller asserts untyped memory IS T-typed; unverifiable
+        // at compile time). C, Objective-C: implicit. C++, Rust, Swift:
+        // requires explicit cast.
+        bool implicitFromVoidPtr = false;
+    };
+    PointerConversionRules pointerConversions;
 };
 
 } // namespace dss

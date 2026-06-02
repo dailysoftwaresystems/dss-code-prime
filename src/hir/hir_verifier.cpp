@@ -374,6 +374,20 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
                      sourceMap_);
             continue;  // positions no longer correspond
         }
+        // D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT (anchor; step 13.2
+        // closure, 2026-06-02): the 4th `isAssignable` parameter is
+        // omitted here, so it defaults to `PointerConversionRules{}`
+        // (both flags false → strict reject). The verifier sees the
+        // POST-coerce HIR; all implicit pointer conversions admitted
+        // by the active language's `pointerConversions` block were
+        // already materialized as explicit `HirKind::Cast` nodes by
+        // `cst_to_hir.cpp::coerce()`, so a bare `Ptr<T>→Ptr<Void>`
+        // arg pair reaching this check IS a real bug — not a missed
+        // implicit conversion. Closure: when the first non-`cst_to_hir`
+        // HIR producer arrives (FFI shim, trampoline synthesizer,
+        // JIT path), add an audit test that constructs HIR with a
+        // bare `Ptr<int>→Ptr<Void>` call arg WITHOUT a Cast and pins
+        // `H_VerifierFailure` fires here.
         for (std::size_t a = 0; a < args.size(); ++a) {
             if (!isAssignable(*interner_, params[a], hir_.typeId(args[a]))) {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, args[a],

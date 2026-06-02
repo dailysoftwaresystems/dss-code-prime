@@ -195,6 +195,8 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                  NodeId node, ScopeId scope, ReturnRule const& ret);
 void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
+[[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
+                                 NodeId node);
 
 // True iff a token of kind `kind` appears anywhere in `node`'s subtree.
 // Used by SE4 const-marker detection (walk the type subtree for the
@@ -1203,7 +1205,21 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             if (ma->lhsChild < kids.size() && ma->nameChild < kids.size()) {
                 NodeId const lhsNode  = kids[ma->lhsChild];
                 NodeId const nameNode = kids[ma->nameChild];
-                TypeId lhsType = s.typeAt(lhsNode);
+                // subtreeType (not raw typeAt) — the LHS of `p->x` /
+                // `s.x` is the expression-wrapper node, not the leaf;
+                // pass 2 sets the type on the inner identifier-leaf
+                // for bare references and on the leaf literal for
+                // immediates. typeAt() against the wrapper returns
+                // InvalidType for both, silently bypassing
+                // S_NotAPointer / S_NotAComposite / field-type
+                // write-back. The DFS-descent helper handles both
+                // cases. Mirrors the same fix applied to checkCall
+                // (D-LANG-POINTER-VOID-CONVERT closure, step 13.2 —
+                // the void-pointer negative pin surfaced the
+                // checkCall variant of this gap; the silent-failure
+                // hunt review surfaced the parallel sites here +
+                // initNode below).
+                TypeId lhsType = subtreeType(s, tree, lhsNode);
                 if (lhsType.valid()) {
                     TypeId effectiveType = lhsType;
                     bool   typeOk = true;
@@ -1337,7 +1353,17 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             if (decl.initChild.has_value() && *decl.initChild < kids.size()
                 && decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 NodeId initNode = kids[*decl.initChild];
-                TypeId initTy = s.typeAt(initNode);
+                // subtreeType — bare identifier initializers like
+                // `int *p = q;` carry their type on the leaf, not on
+                // the expression wrapper. typeAt(initNode) returns
+                // InvalidType for the wrapper, the inference branch
+                // silently skips (rec.type stays Invalid), AND the
+                // brand-new pointerConversions-gated isAssignable
+                // check below is bypassed. The DFS-descent helper
+                // closes both. Mirrors the checkCall + member-access
+                // fix (D-LANG-POINTER-VOID-CONVERT closure +
+                // silent-failure hunt fold).
+                TypeId initTy = subtreeType(s, tree, initNode);
                 auto resolved = extractNameNode(
                     tree, kids[*decl.nameChild], decl.nameMatch, cfg.identifierToken);
                 if (resolved.node.valid()) {
@@ -1351,7 +1377,9 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             }
                         } else if (initTy.valid()
                                    && !isAssignable(s.lattice.interner(),
-                                                    rec.type, initTy)) {
+                                                    rec.type, initTy,
+                                                    tree.schema().semantics()
+                                                        .pointerConversions)) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::S_TypeMismatch;
                             d.severity = DiagnosticSeverity::Error;
@@ -1610,10 +1638,20 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     std::size_t const checkCount = variadic
         ? std::min(argNodes.size(), params.size())
         : params.size();
+    // Use subtreeType (not raw typeAt) so the check sees the type of a
+    // bare identifier reference or literal whose type sits on a leaf
+    // descendant of the expression wrapper. Pre-fix, `typeAt(argNodes[i])`
+    // returned InvalidType for bare `x` references (the wrapper isn't in
+    // the type side-table) and the `if (!argTy.valid()) continue;`
+    // silently suppressed the diagnostic — a real silent-failure surface
+    // that step-13.2 surfaced via DistinctTypedPointersRemainMismatch.
+    // The same descent helper already powers checkReturn (`subtreeType`
+    // is defined directly below).
     for (std::size_t i = 0; i < checkCount && i < argNodes.size(); ++i) {
-        TypeId argTy = s.typeAt(argNodes[i]);
+        TypeId argTy = subtreeType(s, tree, argNodes[i]);
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
-        if (!isAssignable(s.lattice.interner(), params[i], argTy)) {
+        if (!isAssignable(s.lattice.interner(), params[i], argTy,
+                          tree.schema().semantics().pointerConversions)) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::S_TypeMismatch;
             d.severity = DiagnosticSeverity::Error;
@@ -1709,7 +1747,8 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // An unknown result OR unknown expr type → skip (cascade suppression).
     TypeId const exprTy = subtreeType(s, tree, valueNode);
     if (!fnResult.valid() || !exprTy.valid()) return;
-    if (!isAssignable(s.lattice.interner(), fnResult, exprTy)) {
+    if (!isAssignable(s.lattice.interner(), fnResult, exprTy,
+                      tree.schema().semantics().pointerConversions)) {
         emitMismatch(valueNode);
     }
 }
