@@ -30,6 +30,12 @@
   #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
   #endif
+  #ifndef NOMINMAX
+    // Prevent <windows.h>'s `max` / `min` macros from clashing with
+    // `std::numeric_limits<...>::max()` in including translation
+    // units (caught at Slice C audit-fold test addition).
+    #define NOMINMAX
+  #endif
   #include <windows.h>
 #endif
 
@@ -63,8 +69,13 @@ runBinary(std::filesystem::path const&     binaryPath,
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
 
-    // CreateProcessA's `lpCommandLine` is a writable buffer.
-    std::string cmdline = pathStr;
+    // CreateProcessA's `lpCommandLine` is a writable buffer. Quote
+    // the path so spaces in the cwd (e.g. "C:\Users\First Last\..."
+    // on dev hosts; ScratchDir resolves under temp_directory_path()
+    // which is environment-dependent) don't cause CreateProcess to
+    // parse the first space-delimited token as argv[0] for the
+    // child. Code-reviewer M1 at Slice C audit fold.
+    std::string cmdline = "\"" + pathStr + "\"";
 
     BOOL const ok = ::CreateProcessA(
         pathStr.c_str(),

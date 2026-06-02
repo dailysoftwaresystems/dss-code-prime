@@ -85,9 +85,10 @@ public:
     /// across formats). When unset (the default), the existing
     /// `<cwd>/target/<formatName>/<binary>` convention applies.
     ///
-    /// Caller is responsible for ensuring the directory exists.
-    /// The driver does NOT auto-mkdir for `--output` (mirrors the
-    /// `writeImage` parent-dir contract — see writer.hpp).
+    /// The driver auto-creates the output directory tree
+    /// (`fs::create_directories`); failure surfaces as
+    /// `D_OutputDirCreateFailed` (same code as the legacy
+    /// `<cwd>/target/...` path's mkdir failure).
     void setOutputDir(std::optional<std::filesystem::path> dir) {
         outputDir_ = std::move(dir);
     }

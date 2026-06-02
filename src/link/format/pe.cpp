@@ -558,39 +558,16 @@ encodeExec(AssembledModule const&    module,
     // entryPoint defaults to functions[0]; non-empty looks up by
     // synthesized `sym_<id>` name today (real-name resolution
     // closes with the HIR→AssembledFunction symbol-name thread).
-    std::size_t entryFnIdx = 0;
-    // D-LK10-ENTRY Slice C (plan 14 §2.13): when the linker has
-    // prepended a synthetic `_start` trampoline,
-    // `imageEntryOverride` names the trampoline's index in
-    // `functions[]`. Honor it before falling back to the schema's
-    // `entryPoint` string resolution (the schema's `entryPoint`
-    // names the USER fn — the trampoline's CALL target, not the
-    // image entry). Out-of-range = fail loud.
-    if (module.imageEntryOverride.has_value()) {
-        if (*module.imageEntryOverride >= module.functions.size()) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"pe::encodeExec: imageEntryOverride="}
-                     + std::to_string(*module.imageEntryOverride)
-                     + " is out-of-range (functions.size()="
-                     + std::to_string(module.functions.size()) + ")");
-            return {};
-        }
-        entryFnIdx = *module.imageEntryOverride;
-    } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
-        bool found = false;
-        for (std::size_t i = 0; i < module.functions.size(); ++i) {
-            std::string const cand =
-                "sym_" + std::to_string(module.functions[i].symbol.v);
-            if (cand == ep) { entryFnIdx = i; found = true; break; }
-        }
-        if (!found) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"pe::encodeExec: entryPoint '"}
-                     + std::string{ep}
-                     + "' not found among module function symbols.");
-            return {};
-        }
-    }
+    // D-LK10-ENTRY Slice C: image-entry resolution shared across
+    // all 3 walkers via `resolveEntryFnIdx`. Honors
+    // `imageEntryOverride` first (trampoline at functions[index]),
+    // falls back to `format.entryPoint()` string resolution, then
+    // defaults to functions[0]. Synthesized-name prefix is "sym_"
+    // for PE/ELF.
+    auto const entryIdxOpt = link::format::resolveEntryFnIdx(
+        module, fmt, "sym_", "pe::encodeExec", reporter);
+    if (!entryIdxOpt.has_value()) return {};
+    std::size_t const entryFnIdx = *entryIdxOpt;
 
     // ── (c) Synthesize .idata section for extern imports (LK6
     //         cycle 2a). PE32+ import-table layout per PE/COFF §6.4:

@@ -319,4 +319,53 @@ namespace dss::link::format {
     return true;
 }
 
+// D-LK10-ENTRY-RESOLVE-ENTRY-FN-IDX (3-agent FOLD-NOW at Slice C
+// audit fold — type-design + simplifier + code-architect): shared
+// resolver for the image-entry function index across PE/ELF/Mach-O
+// walkers. Replaces 5 near-verbatim blocks differing only in the
+// per-walker diagnostic prefix + the synthesized-name prefix
+// (`sym_<id>` on ELF/PE; `_sym_<id>` on Mach-O). Caller passes
+// both as parameters.
+//
+// Resolution order:
+//   1. `module.imageEntryOverride` (D-LK10-ENTRY Slice C) — bounds-
+//      checked; out-of-range emits K_SymbolUndefined.
+//   2. `format.entryPoint()` — non-empty: scan functions[] for
+//      synthesized name match.
+//   3. Default = 0 (first function).
+//
+// Returns nullopt on fail-loud paths (diagnostic already emitted).
+[[nodiscard]] inline std::optional<std::size_t> resolveEntryFnIdx(
+        AssembledModule const&    module,
+        ObjectFormatSchema const& format,
+        std::string_view          synthNamePrefix,
+        std::string_view          diagPrefix,
+        DiagnosticReporter&       reporter) {
+    using ::dss::link::format::detail::emit;
+    auto const prefixStr = std::string{diagPrefix};
+    if (module.imageEntryOverride.has_value()) {
+        if (*module.imageEntryOverride >= module.functions.size()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 prefixStr + ": imageEntryOverride="
+                 + std::to_string(*module.imageEntryOverride)
+                 + " out-of-range (functions.size()="
+                 + std::to_string(module.functions.size()) + ")");
+            return std::nullopt;
+        }
+        return *module.imageEntryOverride;
+    }
+    auto const ep = format.entryPoint();
+    if (ep.empty()) return std::size_t{0};
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        std::string const cand = std::string{synthNamePrefix}
+                               + std::to_string(module.functions[i].symbol.v);
+        if (cand == ep) return i;
+    }
+    emit(reporter, DiagnosticCode::K_SymbolUndefined,
+         prefixStr + ": entryPoint '" + std::string{ep}
+         + "' not found among module function symbols (synthesized "
+           "name prefix: '" + std::string{synthNamePrefix} + "').");
+    return std::nullopt;
+}
+
 } // namespace dss::link::format

@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <vector>
 
 using namespace dss;
@@ -51,10 +52,11 @@ namespace {
 //   B8 2A 00 00 00     mov eax, 42 (sign-extended imm32)
 //   C3                 ret
 //
-// The trampoline ALSO emits a `ret` at the end of its body — no,
-// it doesn't: the trampoline calls user_entry, then issues
-// ExitProcess via the IAT, then `unreachable` (ud2). Control never
-// reaches a trampoline `ret`.
+// The trampoline does NOT emit a trailing `ret`: its control flow
+// is `call user_entry → mov ecx, eax → call_indirect_via_extern
+// ExitProcess → unreachable`. The user fn's `ret` IS reached
+// (returning into the trampoline body), but no `ret` is reachable
+// inside the trampoline itself.
 [[nodiscard]] AssembledModule makeReturn42Module() {
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -162,6 +164,71 @@ TEST(LK10EntrySliceC, SyntheticExitProcessExternThreadsThroughIat) {
         << "trampoline must call the user entry fn via REL32";
     EXPECT_TRUE(mod.imageEntryOverride.has_value());
     EXPECT_EQ(*mod.imageEntryOverride, 0u);
+}
+
+// ── Fail-loud pins added at Slice C audit fold (3-agent convergence) ──
+
+TEST(LK10EntrySliceC, ImageEntryOverrideOutOfRangeFailsLoud) {
+    // test-analyzer H1 (Slice C audit fold): the 5 walker sites
+    // each guard `*override >= functions.size()` with K_SymbolUndefined.
+    // The shared `resolveEntryFnIdx` helper is the single enforcement
+    // point post-fold; this test pins the contract.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42Module();
+    mod.imageEntryOverride = std::optional<std::size_t>{42};  // way out
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, **target, **format, rep);
+    EXPECT_TRUE(image.bytes.empty())
+        << "out-of-range imageEntryOverride must reject (no bytes)";
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "must emit K_SymbolUndefined";
+}
+
+TEST(LK10EntrySliceC, SymbolIdSpaceExhaustionFailsLoud) {
+    // 3-agent convergence (silent-failure + test-analyzer + dim-2):
+    // module with SymbolId at UINT32_MAX boundary would silently
+    // wrap `maxV+1` / `maxV+2` to 0/1 — collide with real SymbolIds.
+    // Slice C audit fold added a fail-loud guard at the mint site.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(format.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{std::numeric_limits<std::uint32_t>::max()};
+    fn.bytes  = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};
+    mod.functions.push_back(std::move(fn));
+    DiagnosticReporter rep;
+    ASSERT_FALSE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep))
+        << "trampoline injection must fail loud at UINT32_MAX wrap";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+TEST(LK10EntrySliceC, LinkerSkipsInjectionWhenOverrideAlreadyPresent) {
+    // test-analyzer M3 + dim-2 HIGH 2 (Slice C audit fold): the
+    // linker's bypass condition `!imageEntryOverride.has_value()`
+    // lets caller-injected trampolines pass through unchanged. A
+    // regression dropping the check would double-inject. Pre-set
+    // override + a sentinel function; the linker must NOT prepend
+    // a second trampoline.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42Module();
+    // Caller pre-states "this module already has its trampoline".
+    mod.imageEntryOverride = std::optional<std::size_t>{0};
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, **target, **format, rep);
+    // 1 user fn + no trampoline added = expectedFuncCount stays 1.
+    EXPECT_EQ(image.expectedFuncCount, 1u)
+        << "linker must NOT double-inject when imageEntryOverride is "
+           "already set by the caller — bypass guard at linker.cpp.";
 }
 
 // ── Stage-1 runnable smoke (Windows host only) ─────────────────────

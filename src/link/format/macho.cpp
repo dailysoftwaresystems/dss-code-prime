@@ -609,33 +609,13 @@ encodeExec(AssembledModule const&    module,
     }
 
     // ── (b) Resolve entry function index from schema.entryPoint
-    std::size_t entryFnIdx = 0;
-    // D-LK10-ENTRY Slice C: honor `imageEntryOverride` first.
-    if (module.imageEntryOverride.has_value()) {
-        if (*module.imageEntryOverride >= module.functions.size()) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"macho::encodeExec: imageEntryOverride="}
-                     + std::to_string(*module.imageEntryOverride)
-                     + " out-of-range (functions.size()="
-                     + std::to_string(module.functions.size()) + ")");
-            return {};
-        }
-        entryFnIdx = *module.imageEntryOverride;
-    } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
-        bool found = false;
-        for (std::size_t i = 0; i < module.functions.size(); ++i) {
-            std::string const cand =
-                "_sym_" + std::to_string(module.functions[i].symbol.v);
-            if (cand == ep) { entryFnIdx = i; found = true; break; }
-        }
-        if (!found) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"macho::encodeExec: entryPoint '"}
-                     + std::string{ep}
-                     + "' not found among module function symbols.");
-            return {};
-        }
-    }
+    // D-LK10-ENTRY Slice C audit fold: shared resolver. Mach-O
+    // synthesized-name prefix is `_sym_` (leading underscore per
+    // Apple convention).
+    auto const entryIdxOpt = link::format::resolveEntryFnIdx(
+        module, fmt, "_sym_", "macho::encodeExec", reporter);
+    if (!entryIdxOpt.has_value()) return {};
+    std::size_t const entryFnIdx = *entryIdxOpt;
 
     // ── (c) Apply intra-module relocations in-place ───────────
     //
@@ -1112,34 +1092,12 @@ encodeExecDynamic(AssembledModule const&    module,
         return {};
     }
 
-    // ── (d) Resolve entry function index from schema.entryPoint
-    std::size_t entryFnIdx = 0;
-    // D-LK10-ENTRY Slice C: honor `imageEntryOverride` first.
-    if (module.imageEntryOverride.has_value()) {
-        if (*module.imageEntryOverride >= module.functions.size()) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"macho::encodeExecDynamic: imageEntryOverride="}
-                     + std::to_string(*module.imageEntryOverride)
-                     + " out-of-range (functions.size()="
-                     + std::to_string(module.functions.size()) + ")");
-            return {};
-        }
-        entryFnIdx = *module.imageEntryOverride;
-    } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
-        bool found = false;
-        for (std::size_t i = 0; i < module.functions.size(); ++i) {
-            std::string const cand =
-                "_sym_" + std::to_string(module.functions[i].symbol.v);
-            if (cand == ep) { entryFnIdx = i; found = true; break; }
-        }
-        if (!found) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"macho::encodeExecDynamic: entryPoint '"}
-                     + std::string{ep}
-                     + "' not found among module function symbols.");
-            return {};
-        }
-    }
+    // ── (d) Resolve entry function index — shared resolver
+    // (D-LK10-ENTRY Slice C audit fold).
+    auto const entryIdxDynOpt = link::format::resolveEntryFnIdx(
+        module, fmt, "_sym_", "macho::encodeExecDynamic", reporter);
+    if (!entryIdxDynOpt.has_value()) return {};
+    std::size_t const entryFnIdx = *entryIdxDynOpt;
 
     // ── (e) Symbol-VA map: intra-fn VAs + extern __stubs slot VAs.
     //       __stubs lives right after __text within __TEXT.

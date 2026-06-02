@@ -910,40 +910,11 @@ encodeElfExecDynamic(
     // to functions[0]; non-empty resolves by synthesized
     // `sym_<id>` name today (real-name resolution closes with
     // D-LK1-1 / LK7).
-    std::size_t entryFnIdx = 0;
-    // D-LK10-ENTRY Slice C: honor `imageEntryOverride` before
-    // schema-entryPoint resolution. See pe.cpp for the rationale.
-    if (module.imageEntryOverride.has_value()) {
-        if (*module.imageEntryOverride >= module.functions.size()) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"elf::encodeElfExecDynamic: imageEntryOverride="}
-                     + std::to_string(*module.imageEntryOverride)
-                     + " out-of-range (functions.size()="
-                     + std::to_string(module.functions.size()) + ")");
-            return {};
-        }
-        entryFnIdx = *module.imageEntryOverride;
-    } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
-        bool found = false;
-        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
-            std::string const synthesized =
-                "sym_" + std::to_string(module.functions[fi].symbol.v);
-            if (synthesized == ep) {
-                entryFnIdx = fi;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                 std::string{"elf::encodeElfExecDynamic: entryPoint '"}
-                     + std::string{ep}
-                     + "' does not match any function in the module. "
-                       "Leave entryPoint empty to default to the "
-                       "first function (D-LK1-1 carries real names).");
-            return {};
-        }
-    }
+    // D-LK10-ENTRY Slice C audit fold: shared resolver.
+    auto const entryIdxOpt = link::format::resolveEntryFnIdx(
+        module, fmt, "sym_", "elf::encodeElfExecDynamic", reporter);
+    if (!entryIdxOpt.has_value()) return {};
+    std::size_t const entryFnIdx = *entryIdxOpt;
     std::uint64_t const entryVa = textVa + funcTextStart[entryFnIdx];
     std::vector<std::uint8_t> ehdr;
     ehdr.reserve(kEhdrSize);
@@ -1419,41 +1390,11 @@ encode(AssembledModule const&    module,
                  "at least one function to serve as the entry point");
             return {};
         }
-        std::size_t entryFnIdx = 0;
-        // D-LK10-ENTRY Slice C: honor `imageEntryOverride` first.
-        if (module.imageEntryOverride.has_value()) {
-            if (*module.imageEntryOverride >= module.functions.size()) {
-                emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                     std::string{"ELF ET_EXEC writer: imageEntryOverride="}
-                         + std::to_string(*module.imageEntryOverride)
-                         + " out-of-range (functions.size()="
-                         + std::to_string(module.functions.size()) + ")");
-                return {};
-            }
-            entryFnIdx = *module.imageEntryOverride;
-        } else if (auto const ep = fmt.entryPoint(); !ep.empty()) {
-            bool found = false;
-            for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
-                std::string const synthesized =
-                    "sym_" + std::to_string(module.functions[fi].symbol.v);
-                if (synthesized == ep) {
-                    entryFnIdx = fi;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                     std::string{"ELF ET_EXEC writer: entryPoint '"}
-                         + std::string{ep}
-                         + "' does not match any function in the module. "
-                           "Function names are synthesized as "
-                           "'sym_<symbolId.v>' today (real names arrive "
-                           "with D-LK1-1 / LK7). Leave entryPoint empty "
-                           "to default to the first function.");
-                return {};
-            }
-        }
+        // D-LK10-ENTRY Slice C audit fold: shared resolver.
+        auto const entryIdxOptInner = link::format::resolveEntryFnIdx(
+            module, fmt, "sym_", "ELF ET_EXEC writer", reporter);
+        if (!entryIdxOptInner.has_value()) return {};
+        std::size_t const entryFnIdx = *entryIdxOptInner;
         std::uint64_t const entryOffsetInText = funcTextStart[entryFnIdx];
         eEntry = secText->virtualAddress + entryOffsetInText;
         ePhoff = kEhdrSize;

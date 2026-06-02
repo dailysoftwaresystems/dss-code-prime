@@ -67,23 +67,25 @@ struct DSS_EXPORT CliArgs {
     //
     // `--output <dir>` (or `--output=<dir>`) routes every emitted
     // binary into the named directory. Without this flag, the
-    // driver emits to the current working directory using the
-    // shipped format's natural extension (e.g. `myprog.exe`,
-    // `myprog`, `myprog.o`).
+    // driver emits to `<cwd>/target/<formatName>/<binary><ext>`
+    // (the cycle-2 v1 convention; plan 6 owns the authoritative
+    // artifact-profile-driven scheme).
     //
-    // The directory MUST exist + be writable at compile time (the
-    // driver does NOT auto-mkdir — silent dir creation has bitten
-    // similar features in this codebase; explicit
-    // `D_OutputDirCreateFailed` already exists for the
-    // mkdir-failure path elsewhere). Empty value rejects as
+    // Directory creation: the driver calls `fs::create_directories`
+    // on the resolved output path — intermediates are auto-created.
+    // Failure surfaces as `D_OutputDirCreateFailed` (existing code
+    // for the legacy `<cwd>/target/...` path; same code on the
+    // `--output` path). Empty value rejects as
     // `CliArgsError::MissingFlagValue` (consistent with
     // `--target=""` / `--language=""`).
     //
     // When multiple targets are declared via repeated `--target`,
-    // the driver concatenates the target name as a subdirectory
-    // (`<output>/<target>/<binary>`) so multi-target builds don't
-    // collide on the same file name. With a single target the
-    // binary lands directly in `<output>/<binary>`.
+    // the driver appends the FORMAT NAME as a subdirectory
+    // (`<output>/<formatName>/<binary>`) so multi-target builds
+    // don't collide on the same file name. With a single target
+    // the binary lands directly in `<output>/<binary>`. (Format
+    // name encodes machine+OS, so it's the right disambiguator —
+    // matches the legacy convention's `<formatName>` subdir.)
     std::optional<std::filesystem::path> outputDir;
 
     // ── LSP options ─────────────────────────────────────────────

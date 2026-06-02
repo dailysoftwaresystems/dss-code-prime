@@ -7,6 +7,7 @@
 #include "lir/lir_reg.hpp"
 
 #include <format>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -192,7 +193,28 @@ bool injectEntryTrampoline(AssembledModule&          module,
     // twice without intermediate module mutation produces a
     // collision (max() of unchanged input is the same — first bug
     // caught at Slice C build).
+    //
+    // SymbolId space-exhaustion guard (3-agent convergence:
+    // silent-failure + test-analyzer + dim-2 at the Slice C audit
+    // fold). `maxV+1` / `maxV+2` are uint32 — at UINT32_MAX they
+    // wrap silently to 0/1 (the InvalidSymbol sentinel + low-ID
+    // user fns), silently colliding with declared symbols. The
+    // BOTH-defined-AND-ExternImport guard at linker.cpp:121 would
+    // catch the ByNameImport arm but the pure Syscall arm has no
+    // cross-table check. Fail loud HERE before the wrap can
+    // corrupt the module.
     std::uint32_t const maxV = maxExistingSymbolIdV(module);
+    std::uint32_t const needed =
+        (pe.mechanism == ExitMechanism::ByNameImport) ? 2u : 1u;
+    if (maxV > std::numeric_limits<std::uint32_t>::max() - needed) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             std::format("entry-trampoline: SymbolId space exhausted "
+                         "— module's max SymbolId is {} + {} fresh "
+                         "IDs would wrap uint32. Reduce module size "
+                         "OR reset CU SymbolId allocator.",
+                         maxV, needed));
+        return false;
+    }
     SymbolId const trampSym{maxV + 1};
     SymbolId exitImportSym{0};
     if (pe.mechanism == ExitMechanism::ByNameImport) {
@@ -304,10 +326,52 @@ bool injectEntryTrampoline(AssembledModule&          module,
     AssembledFunction tramp = std::move(result.functions[0]);
     tramp.symbol = trampSym;
 
-    module.functions.insert(module.functions.begin(), std::move(tramp));
-    if (module.expectedFuncCount > 0) {
-        ++module.expectedFuncCount;
+    // Silent-failure HIGH (Slice C audit fold): empty-bytes reject.
+    // A target schema declaring `syscall` mnemonic but lacking the
+    // encoding bytes would silently emit a 0-byte trampoline → the
+    // walker emits an executable whose `_start` is empty → SEGV at
+    // OS entry. The acceptance test catches this on Windows but
+    // cross-host structural tests would not.
+    if (tramp.bytes.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("entry-trampoline: assemble() returned a "
+                         "0-byte trampoline for target '{}' — at "
+                         "least one of the Slice A opcodes ('call', "
+                         "'mov', 'syscall', 'call_indirect_via_extern',"
+                         " 'unreachable') is declared without an "
+                         "encoding row. Check the target schema's "
+                         "opcode encoding blocks.",
+                         std::string{target.name()}));
+        return false;
     }
+
+    module.functions.insert(module.functions.begin(), std::move(tramp));
+    // code-architect FOLD-NOW (Slice C audit fold): unconditional
+    // increment. The previous `if (expectedFuncCount > 0)` guard
+    // had a latent landmine — a module with expectedFuncCount=0
+    // (default-constructed; or a future caller path that doesn't
+    // populate it) would leave the field at 0 after prepend,
+    // making `LinkedImage::ok()` return false for a structurally
+    // valid trampolined module. The linker's `wantTrampoline`
+    // guard (linker.cpp) requires !functions.empty() which implies
+    // expectedFuncCount >= 1 from the assembler, so the new
+    // unconditional form is safe. Pre-condition assert documents
+    // the invariant the linker hook enforces.
+    if (module.expectedFuncCount == 0) {
+        // Defense-in-depth: if a future caller path injects on a
+        // module with expectedFuncCount=0, that's a substrate-shape
+        // violation. Emit + reject rather than silently incrementing
+        // into a still-broken ok()-state.
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "entry-trampoline: module.expectedFuncCount==0 before "
+             "trampoline prepend — caller must ensure the input "
+             "module is fully-assembled (assemble() populates this) "
+             "before invoking injectEntryTrampoline.");
+        // Roll back the prepend to keep the module consistent.
+        module.functions.erase(module.functions.begin());
+        return false;
+    }
+    ++module.expectedFuncCount;
     module.imageEntryOverride = std::optional<std::size_t>{0};
     return true;
 }
