@@ -515,6 +515,13 @@ int Program::compileFiles(
     return exitCode;
 }
 
+// D-CAP-MARKER-COMPILE-DIR-PIN anchor: compileDirectory has NO
+// rep-injection overload (intentional asymmetry — this entry point
+// is CLI-only; tests reach the cap-marker contract via
+// `compileFiles(..., DiagnosticReporter&)`). Trigger to add a
+// parallel `compileDirectory(..., DiagnosticReporter&)` overload:
+// first test or Python FFI consumer that needs post-run reporter
+// inspection on the directory-scan path.
 int Program::compileDirectory(
     const std::string& directoryPath,
     const std::string& languageName,

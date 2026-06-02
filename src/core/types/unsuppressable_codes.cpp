@@ -9,7 +9,7 @@ namespace {
 
 // D-FF2-UNSUPP closed-table. Sorted by phase letter (D / F / H / I / K
 // / L / R / A) + numeric value within each phase for at-a-glance
-// audit. The linear scan via `std::ranges::find` is O(N) on N=53
+// audit. The linear scan via `std::ranges::find` is O(N) on N=54
 // members — still faster than hash lookup at this size + needs no
 // static-init dance.
 //

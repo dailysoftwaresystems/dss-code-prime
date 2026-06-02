@@ -569,6 +569,23 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "explicitly — LK3 cycle 2)",
                                  s.name));
             }
+            // 9945457 audit fold (silent-failure A1 + test-analyzer-
+            // dim-2 #5): reject MH_OBJECT + useChainedFixups loud at
+            // validate() rather than silently ignoring the flag in
+            // the MH_OBJECT encoder path. Apple's chained fixups are
+            // linker-output-only; .o files have no dyld binding
+            // semantics so the combination is semantically nonsensical.
+            if (macho.filetype == MachOObjectType::Object
+             && machoImage.useChainedFixups) {
+                fail("/image/useChainedFixups",
+                     "'useChainedFixups' = true is invalid for "
+                     "Mach-O MH_OBJECT (filetype = 'object') — "
+                     "chained fixups are a linker-output binding "
+                     "format; relocatable .o files have no dyld "
+                     "binding semantics. Either set 'filetype' = "
+                     "'execute' (and route through encodeExecDynamic) "
+                     "or clear 'useChainedFixups'.");
+            }
         }
         // Mach-O nativeId packing reserves bit 27 (r_extern) and
         // bits 0..23 (r_symbolnum) for walker-filled fields. JSON

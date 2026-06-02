@@ -371,6 +371,20 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
         << "rep contents must be exactly {first cap-filling diagnostic, "
            "P_TooManyDiagnostics marker}; any other diagnostics signal "
            "a regression in the per-target loop or merge path.";
+    // 9945457 audit fold (3-agent convergence: silent-failure H2 +
+    // code-architect Q5 + test-analyzer-dim-2 #6): pin the IDENTITY
+    // of the cap-filling diagnostic. A regression in
+    // forwardConfigDiagnostics that swaps the first emitted code
+    // (e.g. renamed C_InvalidLanguageName or rerouted to a different
+    // C_*/D_*) would leave size==2 + marker==1 green while silently
+    // shifting cap-fill semantics. The comment above already claimed
+    // this identity; the test now enforces it.
+    ASSERT_GE(rep.all().size(), 1u);
+    EXPECT_EQ(rep.all()[0].code, DiagnosticCode::C_InvalidLanguageName)
+        << "first cap-filling diagnostic must be C_InvalidLanguageName "
+           "(forwardConfigDiagnostics fires at format-schema JSON load). "
+           "A different first code signals a refactor in the config-"
+           "diagnostic plumbing.";
 }
 
 // Negative pin: with maxDiagnostics at the default (large) cap, no

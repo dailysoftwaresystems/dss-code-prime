@@ -63,13 +63,13 @@ buildChainedFixupsPayload(std::vector<ChainedFixupImport> const& imports) {
         if (imp.weakImport) packed |= 0x100u;
         // Silent-truncation guard (D-LK6-14-NAME-OFFSET-OVERFLOW):
         // the 23-bit name_offset field cannot represent symbol-pool
-        // offsets > 8MiB-1. Callers MUST validate before calling
-        // (see header docstring). The mask is defensive only —
-        // operators reach this branch only via a contract violation.
-        // We do NOT silently truncate; the assert at the cumulative
-        // pool size before this point would fail loud. Here we
-        // additionally hard-clamp via mask for defense-in-depth so a
-        // contract violation doesn't write nonsense bits 24..31.
+        // offsets > 8MiB-1. Caller-side enforcement is currently
+        // UNENFORCED (anchored; the integration fold ships the
+        // reporter-aware diagnostic). The mask below is defense-in-
+        // depth only — a contract violation cannot write nonsense
+        // bits 24..31, but the resulting truncation IS silent. The
+        // boundary value `kDyldChainedImportNameOffsetMax` is
+        // exported in the header so callers can do the precheck.
         packed |= (nameOffsets[i] & 0x7FFFFFu) << 9;
         appendU32LE(out, packed);
     }

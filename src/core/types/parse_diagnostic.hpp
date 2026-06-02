@@ -679,14 +679,20 @@ enum class DiagnosticCode : std::uint16_t {
     // encodeExec/encodeExecDynamic has not yet shipped — the
     // payload builder is unit-tested in isolation but the
     // load-command swap + __got slot population + LC_DYSYMTAB drop
-    // are anchored at D-LK6-14-INTEGRATION. Semantically distinct
-    // from K_FormatLacksImportSupport (which means "this format
+    // are anchored at D-LK6-14-INTEGRATION-PAYLOAD +
+    // D-LK6-14-INTEGRATION-GOT-SLOTS. Semantically distinct from
+    // K_FormatLacksImportSupport (which means "this format
     // STRUCTURALLY does not support imports" — permanent) — this
-    // is a TEMPORARY substrate-vs-integration gap with a closing
-    // anchor. Adding this code lets operators triage the two
+    // is a TEMPORARY substrate-vs-integration gap with closing
+    // anchors. Adding this code lets operators triage the two
     // separately and lets future regressions that swap
     // half-shipped chained for legacy emit the right signal.
     // (type-design Q4 fold on d312c1c audit 2026-06-01.)
+    // **Removal contract**: when BOTH D-LK6-14-INTEGRATION-PAYLOAD
+    // AND D-LK6-14-INTEGRATION-GOT-SLOTS close, the substrate gap
+    // is gone. REMOVE this enum value entirely (not deprecate) —
+    // the guard sites become dead and a permanent commemorative
+    // code would falsely suggest the substrate gap can recur.
     K_ChainedFixupsNotYetIntegrated = 0x800C,
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──

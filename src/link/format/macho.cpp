@@ -221,6 +221,15 @@ encode(AssembledModule const&    module,
         // chained-fixups format. (silent-failure-hunter HIGH-1
         // + test-analyzer-dim-2 convergence on d312c1c.)
         if (fmt.machoImage().useChainedFixups) {
+            // D-LK6-14-INTEGRATION-PAYLOAD anchor site: when the
+            // integration fold lands, this guard will be replaced by
+            // a dispatch arm that calls
+            // `dss::macho::detail::buildChainedFixupsPayload` and
+            // emits LC_DYLD_CHAINED_FIXUPS pointing at the payload
+            // in __LINKEDIT. The companion D-LK6-14-INTEGRATION-
+            // GOT-SLOTS anchor lives in encodeExecDynamic (where
+            // the __got slots get populated with DYLD_CHAINED_PTR_64
+            // bitfields).
             emit(reporter,
                  DiagnosticCode::K_ChainedFixupsNotYetIntegrated,
                  "macho::encode: schema requests "
@@ -229,12 +238,13 @@ encode(AssembledModule const&    module,
                  "integration into encodeExec/encodeExecDynamic has "
                  "not yet shipped — the payload builder is unit-"
                  "tested in isolation (macho_chained_fixups.hpp), "
-                 "but __got slot population + LC_DYLD_INFO_ONLY "
-                 "replacement + LC_DYSYMTAB drop are anchored at "
-                 "D-LK6-14-INTEGRATION. To proceed, either set "
-                 "'image.useChainedFixups' = false (legacy "
+                 "but the LC_DYLD_INFO_ONLY replacement is anchored "
+                 "at D-LK6-14-INTEGRATION-PAYLOAD and __got slot "
+                 "population + LC_DYSYMTAB drop at "
+                 "D-LK6-14-INTEGRATION-GOT-SLOTS. To proceed, either "
+                 "set 'image.useChainedFixups' = false (legacy "
                  "LC_DYLD_INFO_ONLY opcode stream, fully supported) "
-                 "or wait for D-LK6-14-INTEGRATION to close.");
+                 "or wait for D-LK6-14-INTEGRATION-PAYLOAD to close.");
             return {};
         }
         if (fmt.machoImage().codeSignatureSize != 0
@@ -1597,7 +1607,13 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
 
-    // LC_DYLD_INFO_ONLY
+    // LC_DYLD_INFO_ONLY (legacy opcode-stream binding).
+    // D-LK6-14-INTEGRATION-PAYLOAD anchor: when chained-fixups
+    // emission lands, this entire block is replaced with an
+    // LC_DYLD_CHAINED_FIXUPS command pointing at
+    // `dss::macho::detail::buildChainedFixupsPayload` output in
+    // __LINKEDIT. The replacement also drops the bind-opcode-stream
+    // bytes from __LINKEDIT (no `bindOff`/`bindSize` references).
     appendU32LE(bytes, LC_DYLD_INFO_ONLY);
     appendU32LE(bytes, static_cast<std::uint32_t>(kDyldInfoCommandSize));
     appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // rebase_off/size
@@ -1649,7 +1665,14 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, static_cast<std::uint32_t>(strtabOff));
     appendU32LE(bytes, static_cast<std::uint32_t>(strtabSize));
 
-    // LC_DYSYMTAB
+    // LC_DYSYMTAB (indirect symbol table for __stubs/__got).
+    // D-LK6-14-INTEGRATION-GOT-SLOTS anchor: chained fixups make
+    // this LC redundant — the chained pointers in __got encode the
+    // import ordinal directly, so the indirect symbol table is no
+    // longer needed. When the integration fold lands, this entire
+    // block is dropped AND __got slot population switches from
+    // zero-init (filled by dyld via bind-opcodes) to direct
+    // DYLD_CHAINED_PTR_64 bitfield writes.
     appendU32LE(bytes, LC_DYSYMTAB);
     appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
     appendU32LE(bytes, 0);                    // ilocalsym
