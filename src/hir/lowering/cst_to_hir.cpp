@@ -240,14 +240,17 @@ struct Lowerer {
         // Sister rule in `type_rules.hpp::isAssignable` — the
         // semantic phase has already vetoed unsupported directions
         // before reaching here, so this arm fires only when the
-        // active language admits the conversion. `sem` (Lowerer
-        // field, declared at line 139) is bound by reference to the
-        // active schema's `SemanticConfig` (set via `sch.semantics()`
-        // at Lowerer construction); there is no default-constructed
-        // fallback path. A schema whose `pointerConversions` block
-        // is absent loads as both flags `false` (strict typing) via
-        // the optional-field path in `grammar_schema_json.cpp`'s
-        // pointerConversions loader.
+        // active language admits the conversion. The `sem` field
+        // (Lowerer member, defined near the top of this TU) is
+        // bound by reference to the active schema's `SemanticConfig`
+        // at Lowerer construction (via `sch.semantics()`); there is
+        // no default-constructed fallback path. A schema whose
+        // `pointerConversions` block is absent loads as both flags
+        // `false` (strict typing) via the optional-field path in
+        // `grammar_schema_json.cpp`'s `pointerConversions` loader
+        // (search for the `if (sem.contains("pointerConversions"))`
+        // block — file-line citation deliberately omitted to remain
+        // stable under future reformatting of the loader TU).
         if (ck == TypeKind::Ptr && tk == TypeKind::Ptr) {
             auto const fromElem = interner.operands(child.type);
             auto const toElem   = interner.operands(target);

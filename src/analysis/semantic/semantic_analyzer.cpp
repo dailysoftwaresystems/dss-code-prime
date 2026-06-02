@@ -1668,6 +1668,29 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // but a literal's type lives on the leaf, not the enclosing expression
 // wrapper. So check `node` first, then DFS for the first typed descendant.
 // Generic — no rule names, just the side-table.
+//
+// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS (anchor, audit fold 2026-06-02,
+// silent-failure 2nd-order H1): the DFS descent is correct ONLY when every
+// wrapper rule between `node` and the first typed descendant is
+// TYPE-TRANSPARENT (passes its inner expression's type through unchanged).
+// Today's c-subset has exactly one such wrapper class (paren-expression),
+// which is type-transparent by construction. When c-subset gains
+// TYPE-CHANGING wrappers (cast-expression `(int*)q`, sizeof-expression,
+// future address-of/dereference rules that re-type the result), pass 2
+// MUST type the wrapper node itself with the EVALUATED expression type —
+// otherwise `subtreeType` would descend past the cast and return the
+// inner's pre-cast type. Example failure mode: `int *p = (int*)voidPtr;`
+// with `voidPtr` typed `Ptr<Void>` and pass 2 forgetting to type the
+// castExpr wrapper — subtreeType returns `Ptr<Void>`, the init-arm fires
+// `implicitFromVoidPtr` (admits), and the verifier sees a Ptr<Void> at
+// the slot expecting Ptr<I32>. Latent today (no castExpr in c-subset);
+// closure: when castExpr lands (likely co-cycle with D-CSUBSET-CONST-PTR-DECAY
+// or D-LK10-CRT-INIT-INVOKE's CRT helper imports), promote `subtreeType`
+// to take a wrapper-rule allowlist from `SemanticConfig` declaring which
+// rules are type-transparent — or assert at pass-2-completion that every
+// declared type-changing rule has set its wrapper-node type. Trigger:
+// first c-subset construct whose wrapper-rule semantically re-types its
+// inner expression.
 [[nodiscard]] TypeId
 subtreeType(EngineState const& s, Tree const& tree, NodeId node) {
     if (!node.valid()) return InvalidType;

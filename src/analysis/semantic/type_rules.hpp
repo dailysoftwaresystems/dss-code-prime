@@ -92,7 +92,9 @@ namespace detail::type_rules {
 // default-constructed rules (both false) preserve strict semantics
 // for callers that don't yet thread the schema (e.g., the HIR
 // verifier — post-coerce, implicit conversions are already
-// materialized as explicit `Cast` HIR nodes).
+// materialized as explicit `Cast` HIR nodes; see anchor
+// `D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT` in `hir_verifier.cpp`
+// at the `isAssignable` call site for the post-coerce invariant).
 //
 // Note: `TypeKind::Void` carries DUAL semantics across the type
 // lattice: (a) "no value" as a function-return type, and (b)

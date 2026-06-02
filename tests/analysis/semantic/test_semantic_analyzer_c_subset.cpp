@@ -180,10 +180,10 @@ TEST(SemanticAnalyzerCSubset, CharStarToVoidStarArgImplicit) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    // countCode discipline (audit-fold G1, step 13.2): strict zero
-    // on S_TypeMismatch AND on adjacent mismatch codes — pre-fix
-    // any-bool would have passed if a wrong-code regression fired
-    // S_ReturnTypeMismatch or S_ArgCountMismatch.
+    // Strict countCode pin (replaces an earlier any-bool sawMismatch
+    // loop that would have silently passed a wrong-code regression
+    // — e.g., an S_ReturnTypeMismatch firing in place of S_TypeMismatch
+    // would have masked the assertion).
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "char* → void* must be implicit in c-subset "
@@ -234,7 +234,10 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedPointersRemainMismatch) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
     // Pin EXACTLY ONE S_TypeMismatch (not duplicate cascade) AND
-    // zero adjacent mismatch codes (audit-fold G1, G2 strictness).
+    // zero adjacent mismatch codes — replaces the loose any-bool
+    // sawMismatch loop that would have admitted unrelated mismatch
+    // codes (S_ReturnTypeMismatch / S_ArgCountMismatch) as satisfying
+    // the assertion.
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
         << "char* → int* must NOT be implicit even in c-subset — "
@@ -246,11 +249,13 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedPointersRemainMismatch) {
                         DiagnosticCode::S_ArgCountMismatch), 0u);
 }
 
-// D-LANG-POINTER-VOID-CONVERT (audit-fold G2 + G3, step 13.2): the
-// `pointerConversions`-gated `isAssignable` now reaches THREE check
-// sites in semantic_analyzer.cpp — call-arg (1629), return (1726),
-// and variable-init/assign (1370). The original 13.2 tests only
-// exercise the call-arg site; G2 + G3 add return + init pins.
+// D-LANG-POINTER-VOID-CONVERT (step 13.2 audit fold): the
+// `pointerConversions`-gated `isAssignable` now reaches THREE
+// check sites in semantic_analyzer.cpp — `checkCall`'s call-arg
+// loop, `checkReturn`'s return-type check, and pass-2's
+// declaration-init arm. The original 13.2 tests exercised only
+// the call-arg site; these tests add return-direction + init-
+// direction pins (and a negative-pin via the return path).
 TEST(SemanticAnalyzerCSubset, VoidStarReturnFromTypedPtrImplicit) {
     auto cu = buildShippedUnit("c-subset", {
         "void* f(int* p) { return p; }\n",
@@ -289,6 +294,59 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
                         DiagnosticCode::S_ReturnTypeMismatch), 1u)
         << "char* → int* via return must NOT be implicit even in "
            "c-subset (only void* gets the universal-pointer pass).";
+}
+
+// D-LANG-POINTER-VOID-CONVERT audit fold (silent-failure 2nd-order H2):
+// the `subtreeType()` swap in `checkMemberAccess` (semantic_analyzer.cpp
+// lhsType lookup) had zero existing test coverage — pre-fix the
+// `typeAt(lhsNode)` returning InvalidType for bare-identifier wrappers
+// silently bypassed S_NotAPointer / S_NotAComposite / field-type
+// write-back. These 3 tests pin both the positive arrow-access path
+// AND the negative non-pointer-deref reject — without them, a future
+// regression in the swap (e.g. reverting to typeAt) would silently
+// pass.
+TEST(SemanticAnalyzerCSubset, StructMemberAccessViaArrowOnBareRefIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "void f(struct S *p) { p->x = 1; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAPointer), 0u)
+        << "p->x where p is Ptr<Struct> must NOT fire S_NotAPointer";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAComposite), 0u)
+        << "p->x where Struct has field x must NOT fire S_NotAComposite";
+}
+
+TEST(SemanticAnalyzerCSubset, ArrowAccessOnNonPointerFiresLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "void f(int n) { n->x = 1; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAPointer), 1u)
+        << "n->x where n is int must fire EXACTLY ONE S_NotAPointer "
+           "— pre-subtreeType swap the bare-ref wrapper's InvalidType "
+           "silently suppressed this diagnostic class entirely";
+}
+
+TEST(SemanticAnalyzerCSubset, StructDotMemberAccessOnBareRefIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "void f() { struct S s; s.x = 1; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAPointer), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAComposite), 0u)
+        << "Direct `s.x` access on bare Struct ref must be clean — "
+           "the swap admits both arrow-arm and dot-arm equally";
 }
 
 // SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
