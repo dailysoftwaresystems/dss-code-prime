@@ -280,6 +280,87 @@ TEST(LK10EntrySliceC, LinkerSkipsInjectionWhenOverrideAlreadyPresent) {
            "already set by the caller — bypass guard at linker.cpp.";
 }
 
+// ── D-LK10-ENTRY-TRAMP-PROLOGUE byte pins ──────────────────────────
+//
+// The acceptance test below (RunnableBinaryExitFortyTwo) is gated
+// `#if defined(_WIN32)` and asserts the OS-reported exit code.
+// That's the end-to-end pin, but it's invisible to non-Windows CI.
+//
+// These two tests pin the EMITTED-BYTES surface of the trampoline
+// prologue so a bias regression (e.g. someone "tidying"
+// `ms_x64.entryStackPointerBias` back to 0) is caught on EVERY host,
+// not only the one with `CreateProcess`. Strong convergence at the
+// standing 7-agent audit (test-analyzer Gap 3 + Gap 4 + silent-
+// failure HIGH-3 all flagged the host-dependence of the regression
+// floor).
+
+TEST(LK10EntrySliceC, MsX64TrampolinePrologueIsSubRsp0x28) {
+    // Win64 entry cc has entryStackPointerBias=8 + shadowSpaceBytes=32
+    // → alignedSizeWithBias = 40 = 0x28 → trampoline's first opcode
+    // MUST be `sub rsp, 0x28` (REX.W + opcode 81 /5 + ModR/M C4 +
+    // imm32 LE). Encoded bytes: `48 81 EC 28 00 00 00`.
+    //
+    // A regression to this number re-opens STATUS_ACCESS_VIOLATION
+    // (0xC0000005) on ExitProcess's aligned-SSE stores — the exact
+    // bug closed by D-LK10-ENTRY-TRAMP-PROLOGUE.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42Module();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep));
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(mod.functions.empty());
+    auto const& trampBytes = mod.functions[0].bytes;
+    ASSERT_GE(trampBytes.size(), 7u)
+        << "Win64 trampoline must lead with a 7-byte `sub rsp, imm32`";
+    EXPECT_EQ(trampBytes[0], 0x48u) << "REX.W prefix";
+    EXPECT_EQ(trampBytes[1], 0x81u) << "SUB r/m64, imm32 opcode";
+    EXPECT_EQ(trampBytes[2], 0xECu) << "ModR/M: mod=11 reg=/5 rm=100=rsp";
+    EXPECT_EQ(trampBytes[3], 0x28u)
+        << "imm32 LE byte 0 — value 40 = 32 shadow + 8 align. "
+           "Regression to 0x00 indicates ms_x64.entryStackPointerBias "
+           "was zeroed; regression to other values indicates "
+           "alignedSizeWithBias formula drift.";
+    EXPECT_EQ(trampBytes[4], 0x00u) << "imm32 LE byte 1";
+    EXPECT_EQ(trampBytes[5], 0x00u) << "imm32 LE byte 2";
+    EXPECT_EQ(trampBytes[6], 0x00u) << "imm32 LE byte 3";
+}
+
+TEST(LK10EntrySliceC, SysvElfTrampolineEmitsNoPrologue) {
+    // Negative pin: sysv_amd64 has entryStackPointerBias=0 +
+    // shadowSpaceBytes=0 → alignedSizeWithBias = 0 → NO `sub rsp,
+    // ...` op emitted. The trampoline's first instruction must be
+    // the `call user_entry` (`E8 disp32`), NOT the REX.W SUB
+    // prefix (`0x48`). A regression that always emitted the
+    // prologue (e.g. dropping the `if (adjustBytes > 0)` guard)
+    // would drift every downstream RVA by 7 bytes silently.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42Module();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep));
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(mod.functions.empty());
+    auto const& trampBytes = mod.functions[0].bytes;
+    ASSERT_FALSE(trampBytes.empty());
+    // First byte cannot be the REX.W prefix that begins `sub rsp, ...`
+    // For SysV the trampoline starts with `E8` (CALL rel32) directly.
+    EXPECT_NE(trampBytes[0], 0x48u)
+        << "SysV trampoline must NOT emit a prologue (cc.shadow=0, "
+           "cc.entryBias=0 → adjustBytes=0). A `0x48` first byte "
+           "indicates entryStackPointerBias was set non-zero on "
+           "sysv_amd64 OR the `if (adjustBytes > 0)` guard was lost.";
+    EXPECT_EQ(trampBytes[0], 0xE8u)
+        << "SysV trampoline's first instruction is `call user_entry` "
+           "directly (no prologue).";
+}
+
 // ── Stage-1 runnable smoke (Windows host only) ─────────────────────
 
 #if defined(_WIN32)

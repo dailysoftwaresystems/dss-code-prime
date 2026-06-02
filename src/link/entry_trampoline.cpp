@@ -49,6 +49,12 @@ namespace {
     // Walker-side synthesized name convention: `sym_<id>` on
     // ELF/PE; `_sym_<id>` on Mach-O. Match either form (real-name
     // resolution closes with D-LK1-1 / LK7).
+    //
+    // D-LK10-ENTRY-SYNTH-PREFIX-SCHEMA: the two prefix strings are
+    // hardcoded here pending move into the format schema (see plan
+    // 14 §3.1). Closure trigger: 4th format declares processExit OR
+    // D-LK1-1 lands real-symbol-name preservation through the
+    // emit pipeline.
     for (auto const& fn : module.functions) {
         std::string const elfPeName =
             "sym_"  + std::to_string(fn.symbol.v);
@@ -145,9 +151,10 @@ bool injectEntryTrampoline(AssembledModule&          module,
     // Look up all needed opcodes from the target schema (Slice A
     // ships `syscall`, `call_indirect_via_extern`, and the existing
     // `call` / `mov` / `unreachable` opcodes). `sub` is required
-    // ONLY when the format declares a non-zero
-    // `processExit.preCallStackAdjustBytes` (the ABI-prologue arm
-    // closing D-LK10-ENTRY-TRAMP-PROLOGUE).
+    // ONLY when alignedSizeWithBias(cc.shadowSpaceBytes,
+    // cc.stackAlignment, cc.entryStackPointerBias) > 0 — i.e. when
+    // the entry cc declares shadow space OR a non-zero process-
+    // entry RSP bias (closes D-LK10-ENTRY-TRAMP-PROLOGUE).
     auto const callOp     = target.opcodeByMnemonic("call");
     auto const movOp      = target.opcodeByMnemonic("mov");
     auto const unreachOp  = target.opcodeByMnemonic("unreachable");
@@ -257,10 +264,13 @@ bool injectEntryTrampoline(AssembledModule&          module,
     //
     //    No restoration is emitted — the exit mechanism never
     //    returns (the trampoline ends in `unreachable` / `ud2`).
+    // Integral promotion: cc fields are uint16_t; the helper takes
+    // uint32_t. Explicit casts would obscure that this is widening,
+    // not narrowing.
     std::uint32_t const adjustBytes = alignedSizeWithBias(
-        static_cast<std::uint32_t>(cc->shadowSpaceBytes),
-        static_cast<std::uint32_t>(cc->stackAlignment),
-        static_cast<std::uint32_t>(cc->entryStackPointerBias));
+        cc->shadowSpaceBytes,
+        cc->stackAlignment,
+        cc->entryStackPointerBias);
     if (adjustBytes > 0) {
         if (!cc->stackPointer.has_value()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,

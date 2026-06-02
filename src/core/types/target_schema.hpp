@@ -277,7 +277,7 @@ struct DSS_EXPORT TargetCallingConvention {
     //                                       point, so the first
     //                                       instruction sees RSP ≡ 8
     //                                       mod 16.
-    //   * `sysv_x64`   (Linux ELF /    0  — kernel maps the image and
+    //   * `sysv_amd64` (Linux ELF /    0  — kernel maps the image and
     //                  macOS Mach-O):       JUMPS to `_start`/`main`
     //                                       with RSP 16-byte-aligned
     //                                       and NO return address

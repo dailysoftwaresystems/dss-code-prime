@@ -1016,3 +1016,83 @@ TEST(LirCallconvAbi, MoveCycleInArgPassingFailsLoud) {
     EXPECT_TRUE(sawAnchor)
         << "the diagnostic must cite the D-ML7-2.3 anchor for triage";
 }
+
+// ── alignedSizeWithBias (D-LK10-ENTRY-TRAMP-PROLOGUE) ──────────────
+// The trampoline prologue's frame-size formula. Documented in
+// `src/lir/lir_callconv.hpp`. Anchored shared with ML7's frame
+// computation (D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY). These tests pin
+// the formula in isolation from any TargetSchema / cc — pure
+// arithmetic surface, so a regression to the math is caught BEFORE
+// it manifests as a runtime ABI violation (the failure mode that
+// the standing Slice C smoke test catches end-to-end on Windows,
+// but ONLY when Win64 movaps stores happen to hit a misaligned
+// page during ExitProcess — cross-host CI would not catch).
+
+TEST(AlignedSizeWithBias, ZeroRawZeroBiasIsZero) {
+    // Trivial: no shadow space, no entry bias, no adjustment.
+    // SysV ELF + ARM64 process-entry behavior.
+    EXPECT_EQ(alignedSizeWithBias(0u, 16u, 0u), 0u);
+}
+
+TEST(AlignedSizeWithBias, Win64ShadowAndBiasYieldFortyBytes) {
+    // Concrete Win64 case: shadow=32, alignment=16, bias=8 → 40.
+    // This is THE number the trampoline subtracts from RSP at
+    // process entry on Windows PE; a regression here would re-open
+    // the STATUS_ACCESS_VIOLATION bug closed by
+    // D-LK10-ENTRY-TRAMP-PROLOGUE.
+    EXPECT_EQ(alignedSizeWithBias(32u, 16u, 8u), 40u);
+}
+
+TEST(AlignedSizeWithBias, BiasOnlyWithZeroRawIsBias) {
+    // shadow=0 but entry-bias=8: still need to realign, so
+    // smallest N >= 0 with N ≡ 8 mod 16 is 8 itself.
+    EXPECT_EQ(alignedSizeWithBias(0u, 16u, 8u), 8u);
+}
+
+TEST(AlignedSizeWithBias, AlreadyCongruentIsIdentity) {
+    // Fast path: raw already satisfies the congruence — return
+    // verbatim. 40 % 16 = 8 = bias → no adjustment beyond raw.
+    EXPECT_EQ(alignedSizeWithBias(40u, 16u, 8u), 40u);
+}
+
+TEST(AlignedSizeWithBias, RoundsUpToNextCongruentMultiple) {
+    // raw=24 with bias=8 alignment=16: 24 % 16 = 8 = bias →
+    // already congruent. Returns 24 verbatim (the smallest valid).
+    EXPECT_EQ(alignedSizeWithBias(24u, 16u, 8u), 24u);
+}
+
+TEST(AlignedSizeWithBias, RawAlignedButBiasNonZeroAdjustsUp) {
+    // raw=16 (a multiple of alignment) with bias=8: need to
+    // increase by 8 to satisfy the congruence. 16 → 24.
+    EXPECT_EQ(alignedSizeWithBias(16u, 16u, 8u), 24u);
+}
+
+TEST(AlignedSizeWithBias, BiasZeroRoundsRawToAlignment) {
+    // bias=0 collapses to classic alignUp: raw=40, align=16, bias=0
+    // → smallest N >= 40 with N ≡ 0 mod 16 = 48 (the ML7 frame
+    // computation surface; anchored
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY).
+    EXPECT_EQ(alignedSizeWithBias(40u, 16u, 0u), 48u);
+}
+
+TEST(AlignedSizeWithBias, ZeroAlignmentReturnsRawVerbatim) {
+    // Degenerate-case guard for non-register-machine targets that
+    // declare stackAlignment=0 (operand-stack VMs at LK7/LK8). No
+    // alignment requirement → no adjustment.
+    EXPECT_EQ(alignedSizeWithBias(42u, 0u, 0u), 42u);
+    EXPECT_EQ(alignedSizeWithBias(0u,  0u, 0u),  0u);
+}
+
+TEST(AlignedSizeWithBias, AArch64PostBlBiasIsZero) {
+    // AArch64 BL doesn't push — process entry RSP is already
+    // aligned. cc.shadowSpaceBytes=0 too. Result: no prologue.
+    EXPECT_EQ(alignedSizeWithBias(0u, 16u, 0u), 0u);
+}
+
+TEST(AlignedSizeWithBias, LargeShadowMultipleAlignmentQuanta) {
+    // Hypothetical future cc: shadow=64, alignment=16, bias=8 →
+    // smallest N >= 64 with N ≡ 8 mod 16 = 72. Verifies the
+    // formula scales beyond the single-quantum step that Win64
+    // exercises.
+    EXPECT_EQ(alignedSizeWithBias(64u, 16u, 8u), 72u);
+}

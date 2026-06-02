@@ -272,6 +272,49 @@ TEST(TargetSchema, ShippedX86_64HasBothSysVAndMsX64) {
     // 32-byte shadow space, no red zone.
     EXPECT_EQ(msx64->shadowSpaceBytes, 32);
     EXPECT_EQ(msx64->redZoneBytes, 0);
+
+    // D-LK10-ENTRY-TRAMP-PROLOGUE: shipped entry-stack-pointer-bias
+    // values must match the OS-loader convention for each cc.
+    // Regression to either would silently mis-emit the trampoline
+    // prologue (caught end-to-end by Slice C's runnable smoke on
+    // Windows, but byte-pin here catches cross-host CI before the
+    // smoke runs).
+    EXPECT_EQ(sysv->entryStackPointerBias, 0)
+        << "SysV kernel JUMPs to _start with RSP 16-aligned and no "
+           "return address — bias must be 0";
+    EXPECT_EQ(msx64->entryStackPointerBias, 8)
+        << "Win64 RtlUserThreadStart CALLs the entry point — bias "
+           "must be 8 (RSP ≡ 8 mod 16 at the first trampoline op)";
+}
+
+TEST(TargetSchema, EntryStackPointerBiasGreaterThanOrEqualAlignmentRejected) {
+    // D-LK10-ENTRY-TRAMP-PROLOGUE validator: the bias is an offset
+    // INTO the stackAlignment quantum and MUST be strictly less
+    // than it. A bias equal to (or greater than) alignment would
+    // denote a full alignment cycle (== 0) or be nonsense — fail
+    // loud at schema-load rather than silently producing the wrong
+    // adjust at the trampoline-emit site.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "registers":[{"name":"rsp","class":"gpr"}],
+            "callingConventions":[
+              {"name":"bad","argGprs":["rsp"],
+               "stackAlignment":16,"entryStackPointerBias":16}
+            ]})");
+    EXPECT_FALSE(r.has_value());
+    if (!r.has_value()) {
+        bool sawBiasMsg = false;
+        for (auto const& d : r.error().diags) {
+            if (d.actual.find("entryStackPointerBias") != std::string::npos) {
+                sawBiasMsg = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(sawBiasMsg)
+            << "validator must surface entryStackPointerBias in the "
+               "diagnostic so the schema author can triage";
+    }
 }
 
 TEST(TargetSchema, CallingConventionUnknownRegisterRejected) {

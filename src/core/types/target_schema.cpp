@@ -931,7 +931,15 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                               || !cc.returnGprs.empty() || !cc.returnFprs.empty()
                               || !cc.callerSaved.empty() || !cc.calleeSaved.empty()
                               || cc.shadowSpaceBytes != 0 || cc.redZoneBytes != 0
-                              || cc.stackAlignment   != 0;
+                              || cc.stackAlignment   != 0
+                              // D-LK10-ENTRY-TRAMP-PROLOGUE: a cc
+                              // declaring ONLY entryStackPointerBias
+                              // (with all other ABI fields zeroed)
+                              // would otherwise silently bypass the
+                              // `< stackAlignment` check below
+                              // (type-design C1 at the standing
+                              // audit). Include it in the trigger.
+                              || cc.entryStackPointerBias != 0;
         if (hasAbiInfo) {
             if (!isPow2Nonzero(cc.stackAlignment)) {
                 fail(std::format("/callingConventions/{}/stackAlignment", i),
