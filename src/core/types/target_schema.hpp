@@ -301,6 +301,48 @@ struct DSS_EXPORT TargetCallingConvention {
     // `stackAlignment`.
     std::uint16_t entryStackPointerBias = 0;
 
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: byte count the architecture's
+    // `call` instruction PUSHES onto the stack (the return-address
+    // word). RSP delta at function entry FROM A CALLER, BEFORE the
+    // callee's prologue runs. Distinct from `entryStackPointerBias`
+    // above:
+    //
+    //   * `entryStackPointerBias`: RSP delta at PROCESS-ENTRY (the
+    //     kernel/loader's transition). OS-dependent (Win64 = 8 because
+    //     RtlUserThreadStart issues a CALL; SysV ELF/Mach-O = 0 because
+    //     the kernel JUMPs to `_start`).
+    //   * `callPushBytes`: RSP delta at NORMAL-CALL-ENTRY (the
+    //     in-program CALL instruction's push). ISA-dependent only
+    //     (x86_64 = 8 — `call` pushes a 64-bit return address;
+    //     ARM64 = 0 — `bl` writes LR, no stack push).
+    //
+    // The two fields COINCIDE on Win64 (both = 8) because Windows uses
+    // a CALL-style entry transition; they DIVERGE on Linux x86_64
+    // (entry = 0 via JMP, normal call = 8 via CALL push). Putting the
+    // facts in two distinct fields named for their distinct triggers
+    // prevents a future maintainer from "deduping" them on Win64 and
+    // silently breaking Linux x86_64.
+    //
+    // Consumed by ML7 `computeFrameLayout` for non-leaf functions: the
+    // function's prologue must (a) reserve `shadowSpaceBytes` for any
+    // call it makes AND (b) end at an RSP value that satisfies the
+    // callee's alignment expectation, which means the prologue's
+    // `sub sp, N` must satisfy `N ≡ callPushBytes (mod stackAlignment)`
+    // so that after our entry's `callPushBytes` and our `sub`, RSP is
+    // `(0 - callPushBytes - N) mod alignment = 0` at the next call
+    // site. The formula is the same `alignedSizeWithBias` used by the
+    // trampoline emitter — one helper, two distinct bias inputs.
+    //
+    // Validators: MUST be strictly < `stackAlignment` (the bias is an
+    // OFFSET into the alignment quantum — parallel to
+    // entryStackPointerBias's contract); MUST be 0 when no ABI info
+    // is declared (consistent with entryStackPointerBias's
+    // "zero-when-cc-is-empty" rule). In practice the call instruction
+    // pushes a multiple of pointer-width bytes, but the validator
+    // expresses the alignment-quantum invariant rather than the
+    // implementation detail.
+    std::uint16_t callPushBytes = 0;
+
     // Named register reference. Used for distinguished-role registers
     // (link register, stack pointer, frame pointer in future cycles).
     // The struct shape co-locates the JSON-side `name` (kept for

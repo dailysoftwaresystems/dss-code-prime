@@ -293,9 +293,25 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
                   static_cast<std::uint32_t>(layout.savedRegs.size()) * layout.slotSize);
         EXPECT_EQ(layout.spillAreaSize,
                   bundle.alloc.perFunc[i].numSpillSlots * layout.slotSize);
+        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02): expected
+        // formula now branches on `hasCalls`. Non-leaf functions
+        // reserve at least `cc.shadowSpaceBytes` AND satisfy the
+        // `callPushBytes` alignment-bias congruence (so post-prologue
+        // RSP lands at 0 mod stackAlignment for the next call). Leaf
+        // functions use the pre-fix `alignUp(raw, alignment)` rule.
         std::uint32_t const raw = layout.savedRegAreaSize + layout.spillAreaSize;
-        std::uint32_t const expected = (raw + cc->stackAlignment - 1u)
-                                     & ~(cc->stackAlignment - 1u);
+        std::uint32_t expected;
+        if (layout.hasCalls) {
+            std::uint32_t const rawWithShadow = std::max(
+                raw, static_cast<std::uint32_t>(cc->shadowSpaceBytes));
+            expected = dss::alignedSizeWithBias(
+                rawWithShadow,
+                static_cast<std::uint32_t>(cc->stackAlignment),
+                static_cast<std::uint32_t>(cc->callPushBytes));
+        } else {
+            expected = (raw + cc->stackAlignment - 1u)
+                     & ~(cc->stackAlignment - 1u);
+        }
         EXPECT_EQ(layout.totalFrameSize, expected);
         EXPECT_GT(layout.slotSize, 0u);
         // savedRegs sorted ascending by ordinal (determinism contract).
@@ -343,10 +359,19 @@ TEST(LirCallconv, FrameSizeAlignedToCcStackAlignment) {
     auto const* cc = bundle.lowered.target->callingConvention(0);
     ASSERT_NE(cc, nullptr);
     ASSERT_GT(cc->stackAlignment, 0u);
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02): non-leaf
+    // functions satisfy `totalFrameSize % stackAlignment == callPushBytes`
+    // (the bias the prologue applies so post-sub RSP lands at 0 mod
+    // alignment for the next call site). Leaf functions retain the
+    // pre-fix "divisible-by-alignment" invariant.
     for (auto const& layout : result.perFunc) {
-        EXPECT_EQ(layout.totalFrameSize % cc->stackAlignment, 0u)
-            << "every function's frame size must be a multiple of "
-            << cc->stackAlignment;
+        std::uint32_t const expected = layout.hasCalls
+            ? static_cast<std::uint32_t>(cc->callPushBytes)
+            : 0u;
+        EXPECT_EQ(layout.totalFrameSize % cc->stackAlignment, expected)
+            << "non-leaf frame must satisfy callPushBytes-mod-alignment; "
+            << "leaf frame must be a multiple of stackAlignment ("
+            << cc->stackAlignment << ")";
     }
 }
 
@@ -1095,4 +1120,116 @@ TEST(AlignedSizeWithBias, LargeShadowMultipleAlignmentQuanta) {
     // formula scales beyond the single-quantum step that Win64
     // exercises.
     EXPECT_EQ(alignedSizeWithBias(64u, 16u, 8u), 72u);
+}
+
+// ── D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY closure pins (2026-06-02) ───
+//
+// Substrate-tier proof that the post-fold mechanism does what the
+// hello_puts e2e example requires: a non-leaf function under a cc
+// declaring shadowSpaceBytes + callPushBytes gets the correct
+// prologue size + the hasCalls flag set. A refactor that loses
+// either fix would still let hello_puts pass (since e2e tests pin
+// behavior, not mechanism) without this test, but the regression
+// would silently re-open the SEGV class on the next foreign-call
+// example.
+
+TEST(LirCallconv, NonLeafFunctionReservesShadowSpaceAndAlignmentBias) {
+    // f calls g → f is non-leaf → f's totalFrameSize must satisfy
+    // shadowSpaceBytes AND callPushBytes-mod-alignment. g is leaf →
+    // g's totalFrameSize must satisfy the pre-fix
+    // alignUp(raw, alignment) rule (no shadow space).
+    auto bundle = lowerThroughRewrite(
+        "int g(int a) { return a + 1; }\n"
+        "int f(int x) { return g(x) + g(x); }\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_GT(cc->stackAlignment, 0u);
+
+    // Discriminate non-leaf vs leaf by INDEPENDENTLY scanning the
+    // input LIR for `isCall` opcodes per function — NOT by reading
+    // the SUT's own `FrameLayout.hasCalls` (which would test the
+    // mechanism using its own output; a regression where hasCalls is
+    // mis-set would silently flip which layout the test calls fLayout
+    // vs gLayout). Post-fold audit pin (pr-test-analyzer L1 +
+    // silent-failure M3 convergence). The independent scan uses the
+    // SAME schema-declared `TargetOpcodeInfo::isCall` flag the SUT
+    // uses internally, so it stays format-agnostic.
+    auto countCallsInFunc =
+        [&](LirFuncId fn) -> std::uint32_t {
+        std::uint32_t calls = 0u;
+        auto const& srcLir = bundle.rewritten.lir;
+        std::uint32_t const blocks = srcLir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blocks; ++bi) {
+            LirBlockId const blk = srcLir.funcBlockAt(fn, bi);
+            std::uint32_t const n = srcLir.blockInstCount(blk);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const inst = srcLir.blockInstAt(blk, i);
+                auto const* info = bundle.lowered.target->opcodeInfo(
+                    srcLir.instOpcode(inst));
+                if (info != nullptr && info->isCall) ++calls;
+            }
+        }
+        return calls;
+    };
+    FrameLayout const* fLayout = nullptr;
+    FrameLayout const* gLayout = nullptr;
+    for (std::uint32_t i = 0; i < result.lir.moduleFuncCount(); ++i) {
+        // Note: result.lir is the OUTPUT (post-callconv) module; the
+        // SOURCE module is bundle.rewritten.lir. They share funcId
+        // ordering (1:1 by position per the callconv pass contract).
+        LirFuncId const srcFn = bundle.rewritten.lir.funcAt(i);
+        std::uint32_t const calls = countCallsInFunc(srcFn);
+        auto const* layout = result.forFuncByIndex(i);
+        ASSERT_NE(layout, nullptr);
+        if (calls > 0) {
+            ASSERT_EQ(fLayout, nullptr)
+                << "fixture should have exactly one call-making function";
+            fLayout = layout;
+        } else {
+            ASSERT_EQ(gLayout, nullptr)
+                << "fixture should have exactly one leaf function";
+            gLayout = layout;
+        }
+    }
+    ASSERT_NE(fLayout, nullptr) << "f (call-making) not found";
+    ASSERT_NE(gLayout, nullptr) << "g (leaf) not found";
+    // Cross-check: the SUT's `hasCalls` flag must agree with the
+    // independent scan. A divergence is the bug the discriminator
+    // pin is designed to catch.
+    EXPECT_TRUE(fLayout->hasCalls)
+        << "f makes calls; FrameLayout.hasCalls must reflect that";
+    EXPECT_FALSE(gLayout->hasCalls)
+        << "g is leaf; FrameLayout.hasCalls must reflect that";
+
+    // f (non-leaf): totalFrameSize >= shadowSpaceBytes AND
+    // satisfies the callPushBytes congruence. Same formula the
+    // implementation uses — pinning the mechanism.
+    std::uint32_t const fRaw =
+        fLayout->savedRegAreaSize + fLayout->spillAreaSize;
+    std::uint32_t const fExpected = ::dss::alignedSizeWithBias(
+        std::max(fRaw, static_cast<std::uint32_t>(cc->shadowSpaceBytes)),
+        cc->stackAlignment, cc->callPushBytes);
+    EXPECT_EQ(fLayout->totalFrameSize, fExpected);
+    EXPECT_GE(fLayout->totalFrameSize, cc->shadowSpaceBytes)
+        << "non-leaf must reserve at least shadowSpaceBytes";
+    EXPECT_EQ(fLayout->totalFrameSize % cc->stackAlignment,
+              static_cast<std::uint32_t>(cc->callPushBytes))
+        << "non-leaf must satisfy callPushBytes congruence";
+
+    // g (leaf): totalFrameSize is the pre-fix alignUp result; NOT
+    // forced to include shadowSpaceBytes (no callee exists).
+    std::uint32_t const gRaw =
+        gLayout->savedRegAreaSize + gLayout->spillAreaSize;
+    std::uint32_t const gExpected =
+        (gRaw + cc->stackAlignment - 1u) & ~(cc->stackAlignment - 1u);
+    EXPECT_EQ(gLayout->totalFrameSize, gExpected);
+    EXPECT_EQ(gLayout->totalFrameSize % cc->stackAlignment, 0u)
+        << "leaf must be a multiple of stackAlignment";
 }

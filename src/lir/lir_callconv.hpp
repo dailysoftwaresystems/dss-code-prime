@@ -137,6 +137,16 @@ struct DSS_EXPORT FrameLayout {
     std::uint32_t       spillAreaSize     = 0;  // bytes occupied by spill slots
     std::uint32_t       slotSize          = 0;  // uniform per-class slot width (bytes)
     std::vector<LirReg> savedRegs;              // callee-saved phys regs actually used
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: did this function contain at
+    // least one call-shaped opcode (per `TargetOpcodeInfo::isCall`)
+    // at frame-layout time? True ⇒ totalFrameSize incorporates
+    // `cc.shadowSpaceBytes` AND satisfies `N ≡ cc.callPushBytes mod
+    // cc.stackAlignment`. False ⇒ totalFrameSize is the existing
+    // `alignUp(raw, cc.stackAlignment)` (leaf-fn rule). Exposed so
+    // downstream consumers (debug-info unwind, audit tests, future
+    // CFI emitters) can verify the invariant without re-scanning
+    // the source LIR.
+    bool                hasCalls          = false;
 
     // Derived: spill area starts immediately after the saved-reg area.
     [[nodiscard]] constexpr std::uint32_t

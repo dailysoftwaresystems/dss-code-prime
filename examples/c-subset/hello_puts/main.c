@@ -1,54 +1,48 @@
-// Plan 11 FF5 FFI-metadata wiring pin (2026-06-02). COMPILE-ONLY
-// (runOn=[] in expected.json — no runtime assertion).
+// ★ D-FF6-RUNTIME-PRINT pin (2026-06-02). The first DSS-emitted
+// binary that calls into msvcrt.dll's `puts`, prints "hello\r\n" to
+// captured stdout, and exits 42 — all asserted byte-for-byte by the
+// examples_runner harness (runOn=["windows"], expectedStdout="hello\r\n").
 //
-// What this proves:
-//   * Source-declared `extern int puts(const char* s);` reaches
-//     the linker carrying msvcrt.dll as its `importLibrary` AND
-//     "puts" as its `mangledName` via
-//     `compileSingleUnit`'s step-2.5 `synthesizeFfiFromSourceDecls`
-//     call.
+// What this proves end-to-end:
+//   * Source-declared `extern int puts(const char* s);` reaches the
+//     linker carrying msvcrt.dll as its `importLibrary` AND "puts" as
+//     its `mangledName` via `compileSingleUnit`'s step-2.5
+//     `synthesizeFfiFromSourceDecls` call (FF5 cycle).
 //   * The produced PE binary's .idata section contains TWO
-//     `ImageImportDescriptor` entries (kernel32.dll for the
+//     `ImageImportDescriptor` entries — kernel32.dll for the
 //     trampoline's synthetic `ExitProcess` + msvcrt.dll for the
-//     user-declared `puts`) — the structural shape of the FFI
-//     wiring is observable in the on-disk image.
+//     user-declared `puts`. First DSS binary exercising the
+//     multi-library IAT path at runtime
+//     (D-LK6-2A-MULTI-LIBRARY-PIN structurally + runtime verified).
 //   * Per-language `externLibraryByFormat` config (in
 //     `c-subset.lang.json`) routes the `pe` key to "msvcrt.dll"
-//     without any `if (target == ...)` in the synthesis kernel.
+//     with zero `if (target == ...)` in the synthesis kernel.
+//   * `main`'s prologue emits `sub $0x28, %rsp` (40 bytes — 32 Win64
+//     shadow space + 8 alignment for the post-CALL RSP delta).
+//     Without this, msvcrt's `puts` (which uses SSE `movaps` stores
+//     on its home-area arg-spill path) AVs at runtime with
+//     0xC0000005. The fix lives in ML7 callconv
+//     (`computeFrameLayout` + `hasCalls` + `callPushBytes` field on
+//     TargetCallingConvention) — closed D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY.
+//   * `main`'s call to `puts` uses `FF 15 disp32` (`call qword ptr
+//     [rip + IAT_slot]`), NOT `E8 disp32` (direct rel32). The
+//     direct form would execute the IAT slot's bytes as code →
+//     SEGV. The fix lives in MIR→LIR (`CallIndirectViaExtern`
+//     MnemonicSlot + `externSymbols` set in Lowerer).
 //
-// What this does NOT yet prove (anchored open):
-//   * The binary actually RUNS and PRINTS — anchored
-//     **D-FF6-RUNTIME-PRINT**. Calling msvcrt's `puts` requires
-//     CRT initialization (stdout `FILE*` setup, locale, etc.)
-//     which the current LK10 entry trampoline does not perform —
-//     the OS spawns straight into our trampoline → user `main`
-//     → puts → SEGV (0xC0000005) because the CRT-internal state
-//     puts touches is zero-initialised. The runtime-print
-//     deliverable belongs to the cycle that closes ONE of:
-//       (a) D-LK10-CRT-INIT-INVOKE — invoke msvcrt's
-//           CRT-init shim (`_initterm` / `__main` /
-//           `_get_osfhandle` for the stdio FILE*s) from the
-//           trampoline prologue before `call main`; OR
-//       (b) D-LK10-KERNEL32-WRITE-PATH — a separate example
-//           uses `kernel32.WriteFile` (5 args; needs ML7
-//           L_StackPassedArg + GetStdHandle's HANDLE type
-//           handling) which is CRT-init-free and IS the
-//           runtime-print path the harness's
-//           captureStdout pipe was already wired for in
-//           Slice 1.
-//   * Multi-library IAT runtime correctness — anchored
-//     **D-LK6-2A-MULTI-LIBRARY-PIN** (the on-disk structure is
-//     proven via examples_runner's compile assertion; a runtime
-//     pin that the kernel32 + msvcrt slots BOTH resolve to
-//     correct entry points requires the runtime-print path to
-//     land first).
+// Capture chain: msvcrt's puts writes "hello\n" to its stdout FILE*,
+// which is text-mode by default → CRT translates `\n` → `\r\n` on
+// emit. The DSS test harness's `runBinary(captureStdout=true)`
+// opens an anonymous pipe and feeds it as the child's stdio handle;
+// pipes are binary-mode, but the CRT-side text-mode translation
+// happens BEFORE the bytes reach the pipe, so the parent captures
+// "hello\r\n". A `\r\n` vs `\n` mismatch on this pin would be a
+// harness/CRT-detail issue, NOT a codegen bug — the manifest's
+// `expectedStdout` matches what msvcrt emits through a pipe under
+// text-mode stdio.
 //
-// Slice 1's stdout-capture harness extension (CreatePipe +
-// ReadFile + RunResult.capturedStdout) IS load-bearing
-// infrastructure for the future runtime-print cycle — wiring
-// it here, before the print path lands, means the next cycle's
-// `examples_runner` already speaks the pipe protocol and the
-// `expectedStdout` manifest field already deserializes.
+// A regression in ANY layer flips either the exit code OR the
+// captured stdout and the harness fails immediately.
 
 extern int puts(const char* s);
 

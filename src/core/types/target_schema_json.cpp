@@ -842,6 +842,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // (must be < stackAlignment when set).
                 readBoundedInt(c, coll, ccPath, "entryStackPointerBias",
                                cc.entryStackPointerBias);
+                // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: ISA-level
+                // call-instruction RSP-push width. x86_64 = 8 (CALL
+                // pushes 8-byte return address); ARM64 = 0 (BL writes
+                // LR, no push). Validated below: must be strictly <
+                // `stackAlignment` (the bias is an OFFSET into the
+                // alignment quantum, parallel to `entryStackPointerBias`'s
+                // contract).
+                readBoundedInt(c, coll, ccPath, "callPushBytes",
+                               cc.callPushBytes);
                 if (c.contains("linkRegister")) {
                     if (!c.at("linkRegister").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,

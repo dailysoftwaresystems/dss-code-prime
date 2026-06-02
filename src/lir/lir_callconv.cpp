@@ -99,11 +99,59 @@ collectUsedCalleeSaved(Lir const& lir, LirFuncId fn,
 
 // Returns std::nullopt iff the target declares no GPR-class registers
 // (a schema misconfiguration — earlier silent fallback to 8 hid this).
+//
+// D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY closure (2026-06-02): the layout
+// now incorporates the caller-side Win64 shadow-space requirement +
+// post-CALL alignment-bias for any function that makes at least one
+// call (`hasCalls == true`). Leaf functions (no calls) skip both —
+// they don't need to home a callee's register args (no callee exists)
+// and they don't need to re-align RSP for a call site that doesn't
+// exist.
+//
+// Formula (non-leaf, register-machine ABI):
+//   raw_with_shadow = max(savedRegAreaSize + spillAreaSize,
+//                         cc.shadowSpaceBytes)
+//   totalFrameSize  = alignedSizeWithBias(raw_with_shadow,
+//                                          cc.stackAlignment,
+//                                          cc.callPushBytes)
+//
+// Win64 example (ms_x64, no callee-saved, no spills, calls puts):
+//   raw_with_shadow = max(0, 32) = 32
+//   totalFrameSize  = alignedSizeWithBias(32, 16, 8) = 40
+//   Prologue emits `sub rsp, 0x28`. After the sub, RSP ≡ 0 mod 16 at
+//   any subsequent call site, AND 32 bytes of shadow space sit
+//   below the return address for the callee to home rcx/rdx/r8/r9.
+//
+// SysV example (sysv_amd64, no callee-saved, no spills, calls
+// libc.foo):
+//   raw_with_shadow = max(0, 0) = 0       (no shadow space requirement)
+//   totalFrameSize  = alignedSizeWithBias(0, 16, 8) = 8
+//   Prologue emits `sub rsp, 8`. Re-aligns RSP from ≡8 mod 16
+//   (post-CALL) to ≡0 mod 16 (callee-entry-aligned). No shadow
+//   space needed; alignment-only.
+//
+// ARM64 example (aapcs64, no callee-saved beyond x30, no spills,
+// calls foo):
+//   raw_with_shadow = max(0, 0) = 0
+//   totalFrameSize  = alignedSizeWithBias(0, 16, 0) = 0
+//   No SP delta needed — the x30 save lands in `savedRegAreaSize`
+//   via the existing callee-saved tracking.
+//
+// Leaf function (any cc, no calls):
+//   totalFrameSize  = alignUp(savedRegAreaSize + spillAreaSize,
+//                              stackAlignment)   (the existing rule)
+//
+// Closes the SEGV class that caused hello_puts to AV at 0xC0000005 —
+// NOT a CRT-init issue (msvcrt's DllMain self-inits stdio). The same
+// class of bug the trampoline cycle closed for the kernel→trampoline
+// transition, now closed for the user-fn→extern transition one frame
+// down.
 [[nodiscard]] std::optional<FrameLayout>
 computeFrameLayout(LirFuncAllocation const& alloc,
                    TargetSchema const& schema,
                    TargetCallingConvention const& cc,
                    std::vector<LirReg> savedRegs,
+                   bool hasCalls,
                    DiagnosticReporter& reporter) {
     std::uint32_t const slotWidth = std::max(widthForClass(schema, LirRegClass::GPR),
                                              widthForClass(schema, LirRegClass::FPR));
@@ -119,10 +167,59 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     layout.slotSize         = slotWidth;
     layout.savedRegAreaSize = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
     layout.spillAreaSize    = alloc.numSpillSlots * slotWidth;
-    std::uint32_t const raw = layout.savedRegAreaSize + layout.spillAreaSize;
+    layout.hasCalls         = hasCalls;
+    std::uint32_t const rawPreShadow =
+        layout.savedRegAreaSize + layout.spillAreaSize;
     std::uint32_t const align = (cc.stackAlignment > 0) ? cc.stackAlignment : 1u;
-    layout.totalFrameSize   = alignUp(raw, align);
+    if (hasCalls) {
+        // Non-leaf: reserve at least shadow-space + re-align for
+        // post-CALL RSP delta. Same `alignedSizeWithBias` formula
+        // the trampoline emitter uses, with the cc's `callPushBytes`
+        // as the bias (the in-program CALL instruction's RSP push;
+        // distinct from `entryStackPointerBias` which is the kernel→
+        // trampoline transition bias — see `target_schema.hpp`).
+        std::uint32_t const rawWithShadow =
+            std::max(rawPreShadow,
+                     static_cast<std::uint32_t>(cc.shadowSpaceBytes));
+        layout.totalFrameSize = alignedSizeWithBias(
+            rawWithShadow, align,
+            static_cast<std::uint32_t>(cc.callPushBytes));
+    } else {
+        // Leaf: existing rule (no callee to home args for, no call
+        // site to re-align). Shadow space requirement does not
+        // apply — there is no callee that could read it.
+        layout.totalFrameSize = alignUp(rawPreShadow, align);
+    }
     return layout;
+}
+
+// D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: detect whether function `fn` in
+// the source LIR makes any function call. Used by `materializeOneFunc`
+// to gate shadow-space + alignment-bias allocation in the prologue.
+//
+// Scans every instruction in every block. The schema's
+// `TargetOpcodeInfo::isCall` flag is the load-bearing signal — it is
+// set per opcode in the JSON (`"isCall": true`) and is true for BOTH
+// direct `call` AND `call_indirect_via_extern`. Mnemonic-matching
+// would silently miss the indirect variant (the IAT path puts uses).
+// The schema already uses `isCall` for regalloc's cross-call-live
+// exclusion (`lir_regalloc.cpp::collectCallPositions`) — same flag,
+// same surface, no duplication.
+[[nodiscard]] bool
+functionHasCalls(Lir const& src, LirFuncId fn,
+                 TargetSchema const& schema) noexcept {
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const instN = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < instN; ++i) {
+            LirInstId const inst = src.blockInstAt(blk, i);
+            std::uint16_t const op = src.instOpcode(inst);
+            auto const* info = schema.opcodeInfo(op);
+            if (info != nullptr && info->isCall) return true;
+        }
+    }
+    return false;
 }
 
 // Emit `<op> SP, bytes` — destructive 2-operand form. Caller supplies
@@ -201,6 +298,13 @@ struct OpcodeHandles {
     // ML7 cycle 2: virtual-op handles materialized by the callconv pass.
     std::uint16_t arg;
     std::uint16_t call;
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
+    // indirect call via extern import. Same arg-setup semantics as
+    // `call` (caller places args in the cc's argGprs/argFprs); the
+    // distinction is the call-instruction byte form (FF 15 vs E8) +
+    // how the linker patches disp32 (IAT slot RVA vs callee RVA).
+    // The materialize pass treats both identically for arg setup.
+    std::uint16_t callIndirectViaExtern;
 };
 
 // Resolve a cc register-name reference to a typed `LirReg`. Returns
@@ -302,25 +406,55 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
     // are schema-configurable so the target may rename them. Single
     // diagnostic-emission site beats seven copy-pasted if-let-else
     // ladders (simplifier M6).
+    // `optional == true` means: if the schema doesn't declare this
+    // mnemonic, leave the field at 0 (the invalid-sentinel opcode)
+    // and continue rather than failing loud. The materialize loop's
+    // `op == h.callIndirectViaExtern` check then never matches
+    // (a real input opcode is always > 0). This preserves
+    // agnosticism for a target schema that genuinely doesn't NEED
+    // the opcode (e.g. ARM64's GOT/PLT macro-op encoding lands in a
+    // future cycle; the schema may not declare
+    // `call_indirect_via_extern` until then — and a c-subset module
+    // with no extern calls under ARM64 should still lower cleanly).
+    // Required opcodes still fail loud on missing.
+    //
+    // Audit-fold critical (code-reviewer C1): without this, my prior
+    // unconditional addition of `call_indirect_via_extern` to the
+    // table broke ARM64's resolveOpcodes for every function — even
+    // those with no extern calls. Closed-set requiredness only for
+    // opcodes the pass GENUINELY cannot operate without.
     struct Entry {
         std::uint16_t OpcodeHandles::* field;
         std::string_view mnem;
+        bool optional;
     };
-    std::array<Entry, 9> const table{{
-        {&OpcodeHandles::mov,        "mov"},
-        {&OpcodeHandles::add,        "add"},
-        {&OpcodeHandles::sub,        "sub"},
-        {&OpcodeHandles::load,       "load"},
-        {&OpcodeHandles::store,      "store"},
-        {&OpcodeHandles::frameLoad,  schema.frameLoadMnemonic()},
-        {&OpcodeHandles::frameStore, schema.frameStoreMnemonic()},
+    std::array<Entry, 10> const table{{
+        {&OpcodeHandles::mov,        "mov",        false},
+        {&OpcodeHandles::add,        "add",        false},
+        {&OpcodeHandles::sub,        "sub",        false},
+        {&OpcodeHandles::load,       "load",       false},
+        {&OpcodeHandles::store,      "store",      false},
+        {&OpcodeHandles::frameLoad,  schema.frameLoadMnemonic(),  false},
+        {&OpcodeHandles::frameStore, schema.frameStoreMnemonic(), false},
         // ML7 cycle 2: arg + call materialized inside this pass.
-        {&OpcodeHandles::arg,        "arg"},
-        {&OpcodeHandles::call,       "call"},
+        {&OpcodeHandles::arg,        "arg",        false},
+        {&OpcodeHandles::call,       "call",       false},
+        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
+        // optional — a target without dynamic-import support legitimately
+        // omits this opcode. MIR→LIR's separate per-call extern check at
+        // `lowerCall` fails loud upstream if a call to a missing-opcode
+        // extern is lowered, so the absence here is safe.
+        {&OpcodeHandles::callIndirectViaExtern,
+         "call_indirect_via_extern", true},
     }};
-    for (auto const& [field, mnem] : table) {
+    for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
         if (!op.has_value()) {
+            if (optional) {
+                // Leave field at 0 (invalid sentinel — never matches
+                // a real input opcode).
+                continue;
+            }
             report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                    DiagnosticSeverity::Error,
                    std::format("target schema missing '{}' opcode required for "
@@ -354,7 +488,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     LirReg const sp = makePhysicalReg(cc.stackPointer->ordinal, LirRegClass::GPR);
 
     std::vector<LirReg> usedSaved = collectUsedCalleeSaved(src, fn, schema, cc);
-    auto layoutOpt = computeFrameLayout(alloc, schema, cc, std::move(usedSaved), reporter);
+    bool const hasCalls = functionHasCalls(src, fn, schema);
+    auto layoutOpt = computeFrameLayout(alloc, schema, cc,
+                                        std::move(usedSaved),
+                                        hasCalls, reporter);
     if (!layoutOpt.has_value()) return false;
     outLayout = std::move(*layoutOpt);
 
@@ -451,7 +588,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // `mov rdi, rsi; mov rsi, rdi`, where the second read sees
             // the clobbered rdi) trip `L_MoveCycleUnsupported` loud.
             // Proper parallel-copy resolution is anchored at D-ML7-2.3.
-            if (op == h.call) {
+            // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold: arg-setup
+            // + return-value handling are identical across every call-
+            // shaped opcode (direct `call`, `call_indirect_via_extern`,
+            // and any future variant a target schema adds with
+            // `isCall: true`). Gate on the SAME `TargetOpcodeInfo::isCall`
+            // flag that `functionHasCalls` uses + the `hasCalls`
+            // detection scan uses — single source of truth.
+            // Mnemonic-equality match (`op == h.call || op ==
+            // h.callIndirectViaExtern`) was the prior shape; it would
+            // silently miss a 3rd call-shaped opcode (e.g. a future
+            // `call_indirect_reg` for function-pointer support
+            // anchored at D-ML7-2.4) — the silent-failure audit pin.
+            if (info != nullptr && info->isCall) {
                 if (ops.empty()) {
                     report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
                            DiagnosticSeverity::Error,
@@ -564,10 +713,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 for (auto const& m : argMoves) {
                     maybeMov(b, h.mov, m.dest, m.src);
                 }
-                // Emit `call <callee_symbol>` — single-symbol operand
-                // form (matches the schema's variant guard).
+                // Emit the call instruction. Pass through the input
+                // opcode (h.call OR h.callIndirectViaExtern) so the
+                // assembler picks the right encoding. Single-symbol
+                // operand form for both (matches each schema variant
+                // guard `["symbol"]`).
                 std::array<LirOperand, 1> callOps{calleeOp};
-                b.addInst(h.call, InvalidLirReg, callOps,
+                b.addInst(op, InvalidLirReg, callOps,
                           payload, src.instFlags(inst));
                 // Move return register into result (only if non-void).
                 if (result.valid()) {

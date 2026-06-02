@@ -939,7 +939,13 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                               // `< stackAlignment` check below
                               // (type-design C1 at the standing
                               // audit). Include it in the trigger.
-                              || cc.entryStackPointerBias != 0;
+                              || cc.entryStackPointerBias != 0
+                              // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY:
+                              // same protection for the new
+                              // callPushBytes field (a cc declaring
+                              // only callPushBytes would bypass the
+                              // multiple-of-alignment check below).
+                              || cc.callPushBytes != 0;
         if (hasAbiInfo) {
             if (!isPow2Nonzero(cc.stackAlignment)) {
                 fail(std::format("/callingConventions/{}/stackAlignment", i),
@@ -969,6 +975,22 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                              "({}) must be < stackAlignment ({}) — bias "
                              "is an offset INTO the alignment quantum",
                              cc.name, cc.entryStackPointerBias,
+                             cc.stackAlignment));
+                }
+                // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: callPushBytes is
+                // ALSO an offset INTO the alignment quantum (the
+                // CALL instruction's RSP delta is bounded by the
+                // architecture's pointer width, which divides
+                // stackAlignment). Strict-less-than matches
+                // entryStackPointerBias's invariant.
+                if (cc.callPushBytes >= cc.stackAlignment) {
+                    fail(std::format(
+                             "/callingConventions/{}/callPushBytes", i),
+                         std::format(
+                             "callingConvention '{}': callPushBytes "
+                             "({}) must be < stackAlignment ({}) — bias "
+                             "is an offset INTO the alignment quantum",
+                             cc.name, cc.callPushBytes,
                              cc.stackAlignment));
                 }
             }

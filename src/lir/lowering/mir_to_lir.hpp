@@ -88,10 +88,14 @@ lowerToLir(Mir const&          mir,
            DiagnosticReporter& reporter,
            // Extern symbols extracted by HIR→MIR lowering
            // (`HirToMirResult.externImports`). Propagated verbatim
-           // through the returned `MirToLirResult.externImports`;
-           // the LIR lowerer itself does not consume them
-           // structurally. Defaults to empty for static modules
-           // (LK6 cycle 2d — D-LK6-6 closure).
+           // through the returned `MirToLirResult.externImports`.
+           // **Also CONSUMED structurally** by `lowerCall` (post-fold
+           // 2026-06-02, D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY closure):
+           // a call whose GlobalAddr target's SymbolId is in this
+           // list lowers to `call_indirect_via_extern` (FF 15 disp32
+           // — dereferences the IAT/GOT slot); a call whose target
+           // is module-internal lowers to `call` (E8 disp32 — direct
+           // rel32). Defaults to empty for static modules.
            std::vector<ExternImport> externImports = {});
 
 } // namespace dss

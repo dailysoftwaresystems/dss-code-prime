@@ -7,7 +7,9 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -100,6 +102,15 @@ enum class MnemonicSlot : std::uint8_t {
     MovqXClass,
     // cycle 3e: Call + IntrinsicCall (GlobalAddr reuses Mov via SymbolRef)
     Call, IntrinsicCall,
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): indirect
+    // call through an extern-import IAT/GOT slot. x86_64 PE = `FF 15
+    // disp32` (CALL [RIP+disp32]); the linker patches disp32 to the IAT
+    // slot RVA. Direct `call` (E8 disp32) would execute the IAT slot's
+    // BYTES as code rather than dereferencing it for the callee's
+    // address — the 0xC0000005 puts SEGV had two layers: missing
+    // shadow space AND wrong call opcode. Same schema opcode the
+    // trampoline emitter uses for ExitProcess.
+    CallIndirectViaExtern,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -156,6 +167,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::MovqXClass,    "movq_xclass"},
     {MnemonicSlot::Call,           "call"},
     {MnemonicSlot::IntrinsicCall,  "intrinsic_call"},
+    {MnemonicSlot::CallIndirectViaExtern, "call_indirect_via_extern"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -202,6 +214,16 @@ struct Lowerer {
     // parallel-copy moves).
     MirInstId                       currentMir{};
 
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): set
+    // of SymbolIds that name extern imports (populated from the
+    // caller-supplied `externImports` vector at construction time).
+    // `lowerCall` consults this set when the callee is a GlobalAddr
+    // — an extern-targeting call must lower to
+    // `CallIndirectViaExtern` (FF 15 disp32 — dereferences the IAT
+    // slot) rather than `Call` (E8 disp32 — interprets the IAT slot
+    // bytes as code).
+    std::unordered_set<std::uint32_t> externSymbols;
+
     // Whether the running lowering pass added any error-severity
     // diagnostics. Mirrors ML2's delta-on-errorCount; reset by the ctor.
     std::uint32_t baselineErrors = 0;
@@ -210,10 +232,15 @@ struct Lowerer {
     }
 
     Lowerer(Mir const& m, TargetSchema const& t, TypeInterner const& i,
-            DiagnosticReporter& r)
+            DiagnosticReporter& r,
+            std::span<ExternImport const> externImports)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()) {
         baselineErrors = reporter.errorCount();
+        externSymbols.reserve(externImports.size());
+        for (auto const& e : externImports) {
+            externSymbols.insert(e.symbol.v);
+        }
         // Mnemonics in MnemonicSlot enum-declaration order. The
         // `static_assert` below closes the silent-drift hazard 4
         // review agents converged on: if a developer adds a slot to
@@ -720,6 +747,23 @@ struct Lowerer {
             reportUnsupported(MirOpcode::Call, id);
             return;
         }
+
+        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02):
+        // pick the right call opcode based on whether the callee is
+        // an extern import. Two distinct x86_64 encodings:
+        //   * `call` (E8 disp32): direct call; the linker patches
+        //     disp32 to the callee's RVA. Correct for module-internal
+        //     functions whose bodies live in the same image.
+        //   * `call_indirect_via_extern` (FF 15 disp32): indirect
+        //     call via [RIP+disp32]; the linker patches disp32 to
+        //     the IAT slot RVA. The CPU dereferences the slot to
+        //     reach the loader-fixed-up callee address. Correct for
+        //     extern imports (puts via msvcrt.dll, ExitProcess via
+        //     kernel32.dll, etc.).
+        // Using `call` for an extern target would execute the IAT
+        // slot's bytes as code — guaranteed SEGV. Detected via the
+        // `externSymbols` set populated at Lowerer construction from
+        // the caller-supplied `externImports` vector.
         // Cycle 3e fix-up: HOIST all regForValue checks BEFORE any
         // state mutation. The cycle-3e first cut built the operand
         // vector inline; a mid-loop arg-not-mapped bail-out would
@@ -743,6 +787,28 @@ struct Lowerer {
         bool const calleeIsGlobalAddr =
             mir.instOpcode(calleeMir) == MirOpcode::GlobalAddr;
 
+        // Determine extern-vs-internal based on the GlobalAddr's
+        // SymbolId. Indirect-without-GlobalAddr (function-pointer
+        // call) is anchored at D-ML7-2.4 — surfaces loud at
+        // materialization for now.
+        bool calleeIsExtern = false;
+        SymbolId calleeSym{};
+        if (calleeIsGlobalAddr) {
+            calleeSym = mir.globalAddrSymbol(calleeMir);
+            calleeIsExtern = externSymbols.contains(calleeSym.v);
+        }
+
+        MnemonicSlot const callSlot = calleeIsExtern
+            ? MnemonicSlot::CallIndirectViaExtern
+            : MnemonicSlot::Call;
+        if (!opcode(callSlot).has_value()) {
+            reportMissingOpcode(callSlot,
+                calleeIsExtern
+                    ? "MIR Call (extern-import target)"
+                    : "MIR Call");
+            return;
+        }
+
         std::vector<LirReg> argRegs;
         argRegs.reserve(operands.size());
         // Skip operand[0] (callee) when we fold it; otherwise include it.
@@ -755,13 +821,16 @@ struct Lowerer {
 
         // Build the LIR operand list.
         // Direct: [SymbolRef(sym), arg0, arg1, ...]
-        // Indirect: [callee_reg, arg0, arg1, ...] (legacy shape; ML7
-        //           cycle 2 surfaces this loud at materialization time)
+        // Indirect-via-extern: [SymbolRef(sym), arg0, arg1, ...] —
+        //     same shape; the SymbolRef tags an extern (resolved to
+        //     IAT slot RVA at link time; the opcode encoding
+        //     dereferences it).
+        // Indirect (fn-pointer): [callee_reg, arg0, arg1, ...]
+        //     (anchored D-ML7-2.4; trips loud at materialization).
         std::vector<LirOperand> ops;
         ops.reserve(argRegs.size() + 1);
         if (calleeIsGlobalAddr) {
-            SymbolId const sym = mir.globalAddrSymbol(calleeMir);
-            ops.push_back(LirOperand::makeSymbolRef(sym.v));
+            ops.push_back(LirOperand::makeSymbolRef(calleeSym.v));
         }
         for (auto const r : argRegs) ops.push_back(LirOperand::makeReg(r));
 
@@ -771,11 +840,11 @@ struct Lowerer {
         bool const isVoid = !resultTy.valid()
                          || interner.kind(resultTy) == TypeKind::Void;
         if (isVoid) {
-            emitInst(*opcode(MnemonicSlot::Call), InvalidLirReg, ops);
+            emitInst(*opcode(callSlot), InvalidLirReg, ops);
             return;
         }
         LirReg const result = lir.newVReg(regClassFor(id));
-        emitInst(*opcode(MnemonicSlot::Call), result, ops);
+        emitInst(*opcode(callSlot), result, ops);
         defineValue(id, result);
     }
 
@@ -1534,7 +1603,11 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           TypeInterner const& interner,
                           DiagnosticReporter& reporter,
                           std::vector<ExternImport> externImports) {
-    Lowerer L{mir, target, interner, reporter};
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
+    // the externImports vector to the Lowerer so it can distinguish
+    // extern-targeting calls (CallIndirectViaExtern — FF 15) from
+    // module-internal direct calls (Call — E8).
+    Lowerer L{mir, target, interner, reporter, externImports};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

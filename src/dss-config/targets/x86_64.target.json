@@ -205,9 +205,9 @@
       }
     },
     {
-      "$comment": "D-LK10-ENTRY Slice A: indirect call through an extern-import IAT slot (Windows kernel32!ExitProcess, future macOS libSystem imports). x86_64 encoding `FF 15 disp32` (call qword ptr [RIP + disp32]) — the same 4-byte disp32 + REL32 reloc shape as the existing direct `call` opcode (E8 disp32), just with a 2-byte opcode literal `[255, 21]` (FF + ModR/M byte 15h = mod=00 reg=/2 rm=101 → [RIP+disp32]). NOT a terminator (general-case indirect call; the trampoline emitter appends `unreachable` after when the callee is noreturn like ExitProcess). 1 operand = ExternImport SymbolRef. The `rel32` reloc-kind row (in this file's `relocations[]` array) computes `S - P - 4` which is exactly what `[RIP+disp32]` resolution needs at load time (S = IAT slot VA, P = the disp32 patch site, RIP at execution = patch + 4).",
+      "$comment": "D-LK10-ENTRY Slice A: indirect call through an extern-import IAT slot (Windows kernel32!ExitProcess, future macOS libSystem imports). x86_64 encoding `FF 15 disp32` (call qword ptr [RIP + disp32]) — the same 4-byte disp32 + REL32 reloc shape as the existing direct `call` opcode (E8 disp32), just with a 2-byte opcode literal `[255, 21]` (FF + ModR/M byte 15h = mod=00 reg=/2 rm=101 → [RIP+disp32]). NOT a terminator (general-case indirect call; the trampoline emitter appends `unreachable` after when the callee is noreturn like ExitProcess). 1 operand = ExternImport SymbolRef. The `rel32` reloc-kind row (in this file's `relocations[]` array) computes `S - P - 4` which is exactly what `[RIP+disp32]` resolution needs at load time (S = IAT slot VA, P = the disp32 patch site, RIP at execution = patch + 4). D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): result widened from `none` to `optional` — same shape as `call` — so MIR→LIR's `lowerCall` can emit `call_indirect_via_extern` for an extern returning a non-void value (puts returns int). The materialize pass moves the return register into the result vreg uniformly for both `call` and `call_indirect_via_extern`; the schema's result-rule must permit both void and non-void targets.",
       "mnemonic":      "call_indirect_via_extern",
-      "result":        "none",
+      "result":        "optional",
       "hasSideEffects": true,
       "isCall":        true,
       "minOperands":   1,
@@ -638,7 +638,9 @@
       "shadowSpaceBytes": 0,
       "redZoneBytes":     128,
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: at SysV process entry the kernel maps the image and JUMPS to `_start` with RSP 16-byte-aligned and NO return address pushed — so RSP bias mod stackAlignment is 0. The trampoline emitter computes its prologue `sub rsp, N` via `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0` — no prologue emitted, which is correct for SysV (no shadow space + already aligned).",
-      "entryStackPointerBias": 0
+      "entryStackPointerBias": 0,
+      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address. ML7 `computeFrameLayout` consumes this as the bias for non-leaf functions so their prologue `sub rsp, N` produces RSP ≡ 0 mod 16 at the next call site. SysV's entry bias is 0 (kernel JMP) but this in-program call-push is 8 — the two distinct facts coincide on Win64 (both 8) and diverge here. Without this wired, the user-fn → extern-call shadow-space + alignment violation reappears one stack frame below the trampoline (the same 0xC0000005 class as D-LK10-ENTRY-TRAMP-PROLOGUE, now recurring at the user-fn boundary).",
+      "callPushBytes": 8
     },
     {
       "name": "ms_x64",
@@ -657,7 +659,9 @@
       "shadowSpaceBytes": 32,
       "redZoneBytes":     0,
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: at Windows process entry, `RtlUserThreadStart` does a CALL into the entry point, so RSP at the first trampoline instruction is ≡8 mod 16. The trampoline emitter computes its prologue `sub rsp, N` via `alignedSizeWithBias(shadowSpaceBytes=32, stackAlignment=16, bias=8)`: smallest N >= 32 with N ≡ 8 mod 16 = 40. That single `sub rsp, 0x28` (a) reserves 32 bytes of caller-side shadow space for ExitProcess + (b) realigns RSP from ≡8 to ≡0 mod 16 so both `call user_entry` and `call [iat_ExitProcess]` enter their callees at the ABI-mandated RSP ≡8 mod 16. Without this field wired, ExitProcess's aligned-SSE stores produced STATUS_ACCESS_VIOLATION on CLI-emitted binaries (smoke test `mov eax,42; ret` hid it because the test fn never touched the stack and the specific ExitProcess code path didn't hit movaps with misaligned RSP).",
-      "entryStackPointerBias": 8
+      "entryStackPointerBias": 8,
+      "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address (same as SysV — ISA-level fact). ML7 `computeFrameLayout` for any non-leaf Win64 function emits `sub rsp, N` where N satisfies BOTH N >= max(savedRegs+spill, shadowSpaceBytes=32) AND N ≡ callPushBytes=8 (mod stackAlignment=16) — same `alignedSizeWithBias` helper the trampoline emitter uses. For a hello_puts-shape main (no callee-saved, no spills, calls puts): raw = max(0, 32) = 32; N = alignedSizeWithBias(32, 16, 8) = 40. Main's prologue becomes `sub rsp, 0x28`; main calls puts at RSP ≡ 0 mod 16 (Win64 ABI requirement) with 32 bytes of shadow space available for puts's register-arg home area. This closes the actual cause of the 2026-06-02 hello_puts SEGV — NOT a CRT-init gap (msvcrt's DllMain self-inits stdio at DLL load).",
+      "callPushBytes": 8
     }
   ],
   "$relocationsComment": "Relocation taxonomy (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker reads via TargetSchema::relocationInfo(kind). `formula` is a CLOSED-ENUM DISCRIMINATOR (load-bearing — see RelocFormulaKind in target_schema.hpp): 'linear' (S + A + (pcRel ? -P : 0) + addendBias; widthBytes LE), or one of the bit-shift variants ('aarch64_call26' / 'aarch64_adr_prel_pg_hi21' / 'aarch64_add_abs_lo12'). For 'linear', the structured fields (pcRelative + addendBias + widthBytes) parameterize the formula. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference.",
