@@ -679,7 +679,22 @@ enum class DiagnosticCode : std::uint16_t {
     // closure. Companion D-LK6-14-INTEGRATION-GOT-SLOTS is open but
     // its failure surfaces at dyld load, not at the walker — outside
     // K_* scope.)
-    // K-NEXT-SLOT: 0x800D — grep this marker before adding a K_* code.
+    // K_EntryPointResolvesToExtern: format.entryPoint resolved to an
+    //   ExternImport rather than an AssembledFunction. Semantically
+    //   invalid — an extern is a SYMBOL REFERENCE to code that lives
+    //   in another module; it cannot SERVE AS the user entry point.
+    //   Closes D-LK10-ENTRY-EXTERN-ENTRY-DIAG — split from the
+    //   generic K_SymbolUndefined so triage tooling can distinguish
+    //   "entry point name doesn't exist anywhere" from "entry point
+    //   resolved to an extern (the user almost certainly named the
+    //   wrong symbol in the format JSON)". Both fire at trampoline-
+    //   injection time, but the user-visible remediation differs:
+    //   K_SymbolUndefined → check that the user's source declares
+    //   the named entry function; K_EntryPointResolvesToExtern →
+    //   check that the format JSON's `entryPoint` field names a
+    //   declared function rather than an imported symbol.
+    K_EntryPointResolvesToExtern   = 0x800D,
+    // K-NEXT-SLOT: 0x800E — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

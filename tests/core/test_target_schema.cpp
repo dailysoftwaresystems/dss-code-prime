@@ -305,8 +305,8 @@ TEST(TargetSchema, EntryStackPointerBiasGreaterThanOrEqualAlignmentRejected) {
     EXPECT_FALSE(r.has_value());
     if (!r.has_value()) {
         bool sawBiasMsg = false;
-        for (auto const& d : r.error().diags) {
-            if (d.actual.find("entryStackPointerBias") != std::string::npos) {
+        for (auto const& d : r.error()) {
+            if (d.message.find("entryStackPointerBias") != std::string::npos) {
                 sawBiasMsg = true;
                 break;
             }

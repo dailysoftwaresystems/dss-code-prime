@@ -1656,6 +1656,62 @@ TEST(GrammarSchema, SemanticsUnknownDeclKindReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// ── D-LK10-ENTRY-MAIN-IMPLICIT-RETURN loader negative tests ───────
+//
+// `implicitReturnZeroForFunctionNames` on `DeclarationRule` accepts
+// an array of non-empty strings. Each malformed shape must emit
+// `C_InvalidSemantics` so a typo in a language config can't silently
+// produce an empty list (which would make the implicit-return-0
+// rule never fire for that language).
+
+TEST(GrammarSchema, SemanticsImplicitReturnZeroNonArrayReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames": "main" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsImplicitReturnZeroNonStringElementReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames": ["main", 42] } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsImplicitReturnZeroEmptyStringElementReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                            "implicitReturnZeroForFunctionNames": ["main", ""] } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
 // `literalTypes[i].literal` that names no declared token → C_UnknownToken.
 TEST(GrammarSchema, SemanticsLiteralUnknownTokenReportsUnknownToken) {
     constexpr std::string_view kCfg = R"JSON({

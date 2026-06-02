@@ -17,6 +17,7 @@
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cerrno>
@@ -25,6 +26,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -2349,7 +2351,7 @@ struct Lowerer {
             discNode = descend(node, decl.kindByChild->childPath);
             if (discNode.valid() && tree().kind(discNode) == NodeKind::Internal
                 && tree().rule(discNode).v == decl.kindByChild->whenRule.v) {
-                return lowerFunction(node, sym, type, *decl.kindByChild, discNode);
+                return lowerFunction(node, sym, type, decl, *decl.kindByChild, discNode);
             }
         }
         // Global.
@@ -2379,6 +2381,91 @@ struct Lowerer {
     // to c-subset's dual-purpose `topLevelDecl`+kindByChild. Reads the params/body
     // subtrees from the semantic DeclarationRule's `paramsChild`/`bodyChild`
     // visible-child indices.
+    // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN (source-agnostic): if the
+    // language's semantic config declares this function's name in
+    // `implicitReturnZeroForFunctionNames` AND the return type is
+    // non-void AND `body` is a Block AND the body doesn't
+    // structurally terminate, return a new Block that wraps the
+    // original children + a synthetic `return <zero>`. Otherwise
+    // return `body` unchanged. Shared between `lowerFunctionDecl`
+    // (dedicated-rule front-ends like toy) and `lowerFunction`
+    // (kindByChild dispatch like c-subset's `topLevelDecl`) — both
+    // call this AFTER lowering the body and BEFORE handing it to
+    // `builder.makeFunction`.
+    // Integer-typed return-value predicate for the implicit-
+    // return-0 insertion. C99 §5.1.2.2.3 specifies `int main`;
+    // restricting to integer cores prevents a non-conformant
+    // `float main()` or `struct S main()` from silently getting a
+    // float / struct-typed synthetic return that the trampoline's
+    // `mov status, returnGprs[0]` would mis-read (the user-fn's
+    // return value would land in xmm0 or split GPR slots, not the
+    // integer return register). Non-int main fns fall through to
+    // the verifier's loud-fail — which is the correct outcome
+    // (non-int main is non-conformant C).
+    [[nodiscard]] static bool isIntegerReturnCore(TypeKind k) noexcept {
+        switch (k) {
+            case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32:
+            case TypeKind::I64: case TypeKind::I128:
+            case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
+            case TypeKind::U64: case TypeKind::U128:
+            case TypeKind::Bool: case TypeKind::Char: case TypeKind::Byte:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    [[nodiscard]] HirNodeId
+    maybeAppendImplicitReturnZero(NodeId node,
+                                  HirNodeId body,
+                                  SymbolId sym,
+                                  TypeId retType,
+                                  DeclarationRule const& decl) {
+        // Fast-path: most declaration forms declare no implicit-
+        // return-0 names — short-circuits before any type / model
+        // lookup.
+        if (decl.implicitReturnZeroForFunctionNames.empty()) return body;
+        // `retType.valid()` subsumes `sig.valid()` (caller computes
+        // retType as `sig.valid() ? interner.fnResult(sig) : InvalidType`).
+        if (!retType.valid()) return body;
+        // Integer-only — silent-failure F3 fold (audit on 3-stream
+        // parallel work). Excludes void, float, struct, ptr, etc.
+        if (!isIntegerReturnCore(interner.kind(retType))) return body;
+        if (builder.kind(body) != HirKind::Block) return body;
+        // `recordFor(sym) == nullptr` means upstream semantic
+        // analysis failed to mint a record for this declaration —
+        // a substrate-shape violation (every reached function decl
+        // must have a SymbolRecord). The earlier `retType.valid()`
+        // gate already implies `sig.valid()` which is set from
+        // `rec->type` at the call site, so this branch is in
+        // practice unreachable through the shipped grammars.
+        // Defensive `nullptr` skip preserved as belt-and-suspenders
+        // — silent-failure F2 fold.
+        auto const* rec = model.recordFor(sym);
+        if (rec == nullptr) return body;
+        if (std::ranges::find(
+                decl.implicitReturnZeroForFunctionNames, rec->name)
+            == decl.implicitReturnZeroForFunctionNames.end())
+            return body;
+        if (pathTerminates(builder, body)) return body;
+
+        // Build the synthetic return — a zero literal of retType
+        // wrapped in a ReturnStmt, both flagged Synthetic. Then
+        // wrap the original body's children + the new return in a
+        // fresh outer Block (also Synthetic). The original Block
+        // node remains in the arena but is orphaned — HIR is built
+        // bottom-up immutable; node mutation is not supported.
+        HirNodeId const zero = synthZeroOrError(node, retType);
+        HirNodeId const ret  = track(
+            builder.makeReturn(zero, HirFlags::Synthetic), node);
+        auto const oldKids = builder.children(body);
+        std::vector<HirNodeId> newKids(
+            oldKids.begin(), oldKids.end());
+        newKids.push_back(ret);
+        return track(
+            builder.makeBlock(newKids, HirFlags::Synthetic), node);
+    }
+
     HirNodeId lowerFunctionDecl(NodeId node) {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "function decl has no semantics rule");
@@ -2398,11 +2485,15 @@ struct Lowerer {
         // around the call to handle nested functions if a future frontend
         // emits them (today's grammars don't).
         TypeId const savedReturn = currentReturnType_;
-        currentReturnType_ = sig.valid() ? interner.fnResult(sig) : InvalidType;
+        TypeId const retType =
+            sig.valid() ? interner.fnResult(sig) : InvalidType;
+        currentReturnType_ = retType;
         HirNodeId body = (decl.bodyChild && *decl.bodyChild < vis.size())
                        ? lowerStmt(vis[*decl.bodyChild])
                        : track(builder.makeBlock({}), node);
         currentReturnType_ = savedReturn;
+        body = maybeAppendImplicitReturnZero(
+            node, body, sym, retType, decl);
         return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 
@@ -2500,15 +2591,20 @@ struct Lowerer {
     }
 
     HirNodeId lowerFunction(NodeId node, SymbolId sym, TypeId sig,
+                            DeclarationRule const& decl,
                             KindDiscriminator const& disc, NodeId discNode) {
         std::vector<HirNodeId> params;
         NodeId paramsNode = descend(discNode, disc.paramsPath);
         if (paramsNode.valid()) collectParams(paramsNode, params);
         NodeId bodyNode = descend(discNode, disc.bodyPath);
         TypeId const savedReturn = currentReturnType_;
-        currentReturnType_ = sig.valid() ? interner.fnResult(sig) : InvalidType;
+        TypeId const retType =
+            sig.valid() ? interner.fnResult(sig) : InvalidType;
+        currentReturnType_ = retType;
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
         currentReturnType_ = savedReturn;
+        body = maybeAppendImplicitReturnZero(
+            node, body, sym, retType, decl);
         return track(builder.makeFunction(sig, sym.v, params, body), node);
     }
 

@@ -9,7 +9,7 @@
     "kind": "pe"
   },
 
-  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention — same as LK1 ELF ET_EXEC). Real-name resolution closes with D-LK1-1 (HIR→LIR symbol-name thread). When D-LK10-ENTRY Slice C lands, the linker prepends a synthetic `_start` trampoline as module.functions[0] and the schema's entryPoint names the USER fn (the trampoline's call target) — see plan 14 §2.13.",
+  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention — same as LK1 ELF ET_EXEC). Real-name resolution closes with D-LK1-1 (HIR→LIR symbol-name thread). D-LK10-ENTRY Slice C (CLOSED 2026-06-02, commit 1a0b414): the linker prepends a synthetic `_start` trampoline as module.functions[0]; the schema's empty entryPoint resolves to functions[0] = the trampoline, which then calls the USER fn (the post-prepend functions[1+]). See plan 14 §2.13 — Stage 1 closed.",
   "entryPoint": "",
 
   "$processExitComment": "D-LK10-ENTRY Slice B (plan 14 §2.13): the Windows runnable-binary spine. Trampoline emitter issues `call qword ptr [iat_ExitProcess]` to kernel32.dll's ExitProcess — no CRT needed. The linker injects a synthetic `ExternImport{kernel32.dll, ExitProcess}` into module.externImports; the existing IAT writer (LK6 cycle 2a) emits the IAT slot; the new `call_indirect_via_extern` LIR opcode (Slice A) emits FF 15 disp32 with a REL32 reloc on the disp32 patch site targeting the synthetic import's SymbolId.",

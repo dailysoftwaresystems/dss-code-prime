@@ -38,13 +38,35 @@ namespace {
 // entry-resolution path). MUST be called BEFORE the trampoline is
 // prepended; reading `functions[0]` AFTER prepend would
 // self-reference the trampoline.
-[[nodiscard]] std::optional<SymbolId> resolveUserEntrySymbol(
+//
+// D-LK10-ENTRY-EXTERN-ENTRY-DIAG: the two failure modes (no match
+// at all vs. match resolves to an ExternImport) are semantically
+// distinct and the user-visible remediation differs — split into a
+// tagged result so the caller emits the precise diagnostic. The
+// previous shape (`std::optional<SymbolId>` returning nullopt for
+// both cases) hid the distinction and forced a generic combined
+// message at the call site.
+enum class EntryResolutionStatus : std::uint8_t {
+    Found,             // entry resolved to a defined AssembledFunction
+    NotFound,          // entryName matched neither a function nor an extern
+    ResolvedToExtern,  // entryName matched an ExternImport (invalid)
+};
+
+struct EntryResolution {
+    EntryResolutionStatus status   = EntryResolutionStatus::NotFound;
+    SymbolId              symbol{};  // valid iff status == Found
+};
+
+[[nodiscard]] EntryResolution resolveUserEntrySymbol(
         AssembledModule const&    module,
         ObjectFormatSchema const& format) {
-    if (module.functions.empty()) return std::nullopt;
+    if (module.functions.empty()) {
+        return {EntryResolutionStatus::NotFound, SymbolId{}};
+    }
     auto const entryName = std::string{format.entryPoint()};
     if (entryName.empty()) {
-        return module.functions[0].symbol;
+        return {EntryResolutionStatus::Found,
+                module.functions[0].symbol};
     }
     // Walker-side synthesized name convention: `sym_<id>` on
     // ELF/PE; `_sym_<id>` on Mach-O. Match either form (real-name
@@ -61,24 +83,26 @@ namespace {
         std::string const machoName =
             "_sym_" + std::to_string(fn.symbol.v);
         if (entryName == elfPeName || entryName == machoName) {
-            return fn.symbol;
+            return {EntryResolutionStatus::Found, fn.symbol};
         }
     }
-    // Reject if entryName matches an ExternImport (cannot use an
-    // extern as the user entry — silent-failure FN-4 fold at the
-    // d642655 audit pinned this diagnostic distinction).
+    // entryName matches an ExternImport's synthesized name — the
+    // schema authored a format that names an imported symbol as
+    // the entry point. Semantically invalid: an extern is a
+    // SYMBOL REFERENCE; it has no body to call into. Distinct
+    // from the not-found case because the schema author named a
+    // KNOWN symbol that's just on the wrong table.
     for (auto const& ext : module.externImports) {
         std::string const elfPeName =
             "sym_"  + std::to_string(ext.symbol.v);
         std::string const machoName =
             "_sym_" + std::to_string(ext.symbol.v);
         if (entryName == elfPeName || entryName == machoName) {
-            // Signal extern-resolved-as-entry via nullopt; caller
-            // emits a distinct diagnostic message.
-            return std::nullopt;
+            return {EntryResolutionStatus::ResolvedToExtern,
+                    SymbolId{}};
         }
     }
-    return std::nullopt;
+    return {EntryResolutionStatus::NotFound, SymbolId{}};
 }
 
 void emit(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
@@ -170,20 +194,47 @@ bool injectEntryTrampoline(AssembledModule&          module,
 
     // Resolve user-entry BEFORE prepend (silent-failure H1 from
     // d642655 audit — reading after prepend would self-reference).
-    auto const userEntry = resolveUserEntrySymbol(module, format);
-    if (!userEntry.has_value()) {
-        emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             std::format("entry-trampoline: format '{}' declared "
-                         "entryPoint '{}' but no AssembledFunction "
-                         "has the matching synthesized symbol name "
-                         "(`sym_<id>` for ELF/PE; `_sym_<id>` for "
-                         "Mach-O), OR the name resolved to an "
-                         "ExternImport (cannot use an extern as the "
-                         "user entry).",
-                         std::string{format.name()},
-                         std::string{format.entryPoint()}));
-        return false;
+    // D-LK10-ENTRY-EXTERN-ENTRY-DIAG: distinct diagnostics per
+    // failure mode — NotFound emits K_SymbolUndefined (the named
+    // symbol doesn't exist anywhere in the module);
+    // ResolvedToExtern emits K_EntryPointResolvesToExtern (the
+    // name resolved to an ExternImport, which is semantically
+    // invalid as an entry point — the user almost certainly named
+    // the wrong symbol in the format JSON).
+    auto const entryRes = resolveUserEntrySymbol(module, format);
+    switch (entryRes.status) {
+        case EntryResolutionStatus::Found: break;
+        case EntryResolutionStatus::ResolvedToExtern:
+            emit(reporter,
+                 DiagnosticCode::K_EntryPointResolvesToExtern,
+                 std::format("entry-trampoline: format '{}' declared "
+                             "entryPoint '{}' but that name resolves "
+                             "to an ExternImport in the module's "
+                             "import table — an extern is a symbol "
+                             "REFERENCE to code in another module, "
+                             "not a callable definition, so it cannot "
+                             "serve as the user entry point. Check "
+                             "the format JSON's `entryPoint` field: "
+                             "name a declared AssembledFunction, not "
+                             "an imported symbol.",
+                             std::string{format.name()},
+                             std::string{format.entryPoint()}));
+            return false;
+        case EntryResolutionStatus::NotFound:
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::format("entry-trampoline: format '{}' declared "
+                             "entryPoint '{}' but no AssembledFunction "
+                             "has the matching synthesized symbol "
+                             "name (`sym_<id>` for ELF/PE; "
+                             "`_sym_<id>` for Mach-O). Check that the "
+                             "user's source declares the named entry "
+                             "function and that the SymbolId encoded "
+                             "in entryPoint matches.",
+                             std::string{format.name()},
+                             std::string{format.entryPoint()}));
+            return false;
     }
+    SymbolId const userEntrySym = entryRes.symbol;
 
     // Resolve register names from the active cc.
     auto const argRegName    = std::string{cc->argGprs[0]};
@@ -306,7 +357,7 @@ bool injectEntryTrampoline(AssembledModule&          module,
 
     // 1. call user_entry — produces REL32 reloc on the disp32.
     LirOperand const callOps[] = {
-        LirOperand::makeSymbolRef(userEntry->v)
+        LirOperand::makeSymbolRef(userEntrySym.v)
     };
     (void)b.addInst(*callOp, InvalidLirReg, callOps);
 

@@ -148,6 +148,177 @@ TEST(Program_CompileFiles, MultiTargetWiresDistinctArtifactDirs) {
         scratch.path() / "target" / "pe64-x86_64-windows"));
 }
 
+// ── D-LK10-OUTPUT-PIPELINE-E2E ─────────────────────────────────────
+//
+// `--output <dir>` routes emitted artifacts away from the default
+// `<cwd>/target/<formatName>/<binary>` layout. The path-construction
+// branch at `src/program/program.cpp::compileOneTarget` is a
+// ternary on `multiTargetBuild`:
+//   single-target  → `<outputDir>/<binary>`
+//   multi-target   → `<outputDir>/<formatName>/<binary>`
+// A regression flipping the ternary's arms would either silently
+// route multi-target outputs to a flat dir (collision risk) or
+// single-target outputs through a phantom `<formatName>/` subdir
+// (path drift). These tests pin the disk-side layout end-to-end.
+
+TEST(Program_CompileFiles, OutputFlagSingleTargetPlacesArtifactFlat) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "forty_two.c",
+        "int forty_two() { return 42; }\n");
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+
+    Program prog;
+    prog.setOutputDir(outDir);
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:elf64-x86_64-linux"});
+    ASSERT_EQ(rc, 0);
+    // Single-target with --output: artifact lands DIRECTLY under
+    // the user-specified directory, with NO format subdir
+    // interposed. A regression to multi-target-style routing would
+    // place the file at `<outDir>/elf64-x86_64-linux/forty_two.o`
+    // instead — the absent-path assertion catches that drift.
+    EXPECT_TRUE(fs::exists(outDir / "forty_two.o"))
+        << "single-target --output must place artifact flat: "
+           "<outDir>/<binary>";
+    EXPECT_FALSE(fs::exists(
+        outDir / "elf64-x86_64-linux" / "forty_two.o"))
+        << "single-target must NOT interpose a <formatName>/ subdir "
+           "— that's the multi-target arm; regression would silently "
+           "drift artifact paths for downstream build scripts";
+}
+
+// ── D-LK10-ENTRY-MAIN-IMPLICIT-RETURN ──────────────────────────────
+//
+// C99 §5.1.2.2.3: a `main` function that reaches the closing `}`
+// without an explicit `return` has the semantics of an implicit
+// `return 0`. Source-agnostically expressed via the c-subset's
+// semantic config (`declarations[topLevelDecl].
+// implicitReturnZeroForFunctionNames: ["main"]`); the HIR lowering
+// at `cst_to_hir.cpp::lowerFunctionDecl` reads the list and
+// appends a synthetic `return 0` to a body that doesn't
+// structurally terminate. Other languages declare their own
+// entry-fn names in their own `.lang.json` — shared HIR substrate
+// has zero language hardcodes.
+//
+// Before this fix: the verifier's `checkReturnCompleteness`
+// loud-failed `int main() { }` with H_VerifierFailure ("non-void
+// function may fall through"). After: the synthetic return makes
+// the verifier pass, and downstream MIR/LIR see a defined exit
+// value (0) so the trampoline's `mov status, rax` reads
+// deterministic 0 rather than register-uninitialized garbage.
+
+TEST(Program_CompileFiles, MainWithoutExplicitReturnGetsImplicitReturnZero) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // `int main() { }` — no explicit return. Pre-fix this would
+    // have failed verification; post-fix it lowers cleanly.
+    auto const src = writeCSubsetSource(
+        scratch.path(), "implicit_main.c",
+        "int main() { }\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:elf64-x86_64-linux"});
+    EXPECT_EQ(rc, 0)
+        << "main without explicit return must compile cleanly — "
+           "the HIR lowering inserts synthetic `return 0` per C99 "
+           "§5.1.2.2.3 via c-subset's "
+           "implicitReturnZeroForFunctionNames config";
+    auto const outDir =
+        scratch.path() / "target" / "elf64-x86_64-linux";
+    EXPECT_TRUE(fs::exists(outDir / "implicit_main.o"))
+        << "successful compile must produce the .o artifact";
+}
+
+TEST(Program_CompileFiles, MainWithExplicitReturnCompilesCleanly) {
+    // Anti-double-insert pin: when `main` already path-terminates
+    // via its own explicit `return`, the `pathTerminates` guard in
+    // `maybeAppendImplicitReturnZero` SHORT-CIRCUITS — the
+    // synthetic return is NOT appended (avoiding unreachable-code
+    // diagnostics from `checkBlockTermination`). A regression
+    // dropping that guard would cause every main to land with two
+    // returns, the second one unreachable → loud verifier error
+    // → rc != 0. This test pins rc==0 for the explicit-return path.
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "explicit_return.c",
+        "int main() { return 42; }\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:elf64-x86_64-linux"});
+    EXPECT_EQ(rc, 0)
+        << "main with explicit return must compile cleanly — the "
+           "pathTerminates guard must short-circuit BEFORE appending "
+           "a synthetic return (otherwise we'd get an unreachable-"
+           "code diagnostic on the second return)";
+}
+
+TEST(Program_CompileFiles, NonMainWithoutExplicitReturnStillFailsLoud) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // A non-main function lacking a return must STILL be rejected.
+    // The implicit-return-0 rule is scoped to names in the
+    // language config's `implicitReturnZeroForFunctionNames` list
+    // (c-subset declares only `main`); every other non-void
+    // unreturning fn falls through to verifier's loud-fail.
+    auto const src = writeCSubsetSource(
+        scratch.path(), "bad_helper.c",
+        "int helper() { }\n"
+        "int main() { return helper(); }\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:elf64-x86_64-linux"});
+    EXPECT_NE(rc, 0)
+        << "non-main non-void function without explicit return "
+           "must STILL fail the verifier — the implicit-return "
+           "rule is scoped to the names the language declares "
+           "(only `main` for c-subset)";
+}
+
+TEST(Program_CompileFiles, OutputFlagMultiTargetPlacesArtifactsInFormatSubdirs) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "small.c",
+        "int small() { return 7; }\n");
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+
+    Program prog;
+    prog.setOutputDir(outDir);
+    prog.compileFiles({src.generic_string()},
+                       "c-subset",
+                       {"x86_64:elf64-x86_64-linux",
+                        "x86_64:pe64-x86_64-windows"});
+    // Multi-target with --output: each target gets its own
+    // `<formatName>/` subdir under outDir to prevent same-named
+    // artifacts (small.o on ELF, small.obj on PE happen to differ
+    // by extension here, but the discipline applies universally
+    // when extensions collide).
+    EXPECT_TRUE(fs::is_directory(outDir / "elf64-x86_64-linux"))
+        << "multi-target --output must create <outDir>/<formatName>/ "
+           "subdirs to prevent artifact collisions";
+    EXPECT_TRUE(fs::is_directory(outDir / "pe64-x86_64-windows"));
+    // Regression assertion (anti-flatten): a future change that
+    // routes multi-target to a flat dir would leave the per-format
+    // subdirs absent.
+    EXPECT_FALSE(fs::exists(outDir / "small.o"))
+        << "multi-target must NOT flatten — artifacts must live "
+           "under their <formatName>/ subdir";
+}
+
 // ── compileFiles: fail-loud surfaces ──────────────────────────
 
 TEST(Program_CompileFiles, EmptySourceListReturnsNonZero) {

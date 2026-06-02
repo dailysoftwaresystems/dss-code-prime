@@ -3251,6 +3251,53 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: optional
+                        // `implicitReturnZeroForFunctionNames` string-
+                        // array. Function declarations whose declared
+                        // symbol name appears in this list get a
+                        // synthetic `return <zero>` appended to their
+                        // body when the body fails to structurally
+                        // terminate (C99 §5.1.2.2.3 for `main`).
+                        // Source-agnostic: each language declares its
+                        // own entry-fn names. Absent / empty → no
+                        // implicit insertion for this declaration form.
+                        if (entry.contains(
+                                "implicitReturnZeroForFunctionNames")) {
+                            auto const& arr = entry.at(
+                                "implicitReturnZeroForFunctionNames");
+                            if (!arr.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/implicitReturnZeroForFunctionNames",
+                                          "'implicitReturnZeroForFunctionNames' "
+                                          "must be an array of strings");
+                            } else {
+                                rule.implicitReturnZeroForFunctionNames
+                                    .reserve(arr.size());
+                                for (std::size_t ni = 0; ni < arr.size(); ++ni) {
+                                    if (!arr[ni].is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  std::format(
+                                                      "{}/implicitReturnZeroForFunctionNames/{}",
+                                                      path, ni),
+                                                  "each entry must be a string");
+                                        continue;
+                                    }
+                                    auto const s =
+                                        arr[ni].get<std::string>();
+                                    if (s.empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  std::format(
+                                                      "{}/implicitReturnZeroForFunctionNames/{}",
+                                                      path, ni),
+                                                  "function name must be non-empty");
+                                        continue;
+                                    }
+                                    rule.implicitReturnZeroForFunctionNames
+                                        .push_back(s);
+                                }
+                            }
+                        }
+
                         if (entry.contains("kind")) {
                             if (!entry.at("kind").is_string()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,

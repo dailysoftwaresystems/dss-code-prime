@@ -34,7 +34,10 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <vector>
 
 using namespace dss;
@@ -66,6 +69,62 @@ namespace {
     fn.bytes  = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};
     mod.functions.push_back(std::move(fn));
     return mod;
+}
+
+// Build a PE-Exec ObjectFormatSchema by loading the shipped
+// pe64-x86_64-windows-exec format JSON and patching its
+// `entryPoint` field. Used by the D-LK10-ENTRY-EXTERN-ENTRY-DIAG
+// test path to exercise the case where the format names a
+// synthesized symbol that lives in `externImports[]` rather than
+// `functions[]`. Riding on the shipped JSON (rather than inlining
+// a 60-line literal) keeps the test aligned with whatever fields
+// the format schema validator requires today — no test-side
+// staleness as the format substrate evolves.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadPeExecWithEntryPoint(std::string const& entryName) {
+    // Walk up from cwd looking for the shipped JSON file — mirrors
+    // the ancestor-walk in `findShippedConfig` so this test works
+    // whether ctest invokes from build/ or the repo root.
+    namespace fs = std::filesystem;
+    fs::path shipped;
+    fs::path here = fs::current_path();
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        fs::path const candidate = here / "src" / "dss-config"
+            / "object-formats" / "pe64-x86_64-windows-exec.format.json";
+        if (fs::exists(candidate)) {
+            shipped = candidate;
+            break;
+        }
+        fs::path const parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+    if (shipped.empty()) return nullptr;
+    std::ifstream f{shipped};
+    std::stringstream buf;
+    buf << f.rdbuf();
+    std::string jsonStr = buf.str();
+    // The shipped file declares `"entryPoint": ""`. Replace the
+    // empty value with the parameterized name. A single literal
+    // unique to the field anchors the substitution.
+    std::string const needle    = R"("entryPoint": "")";
+    std::string const replaced  = R"("entryPoint": ")" + entryName + R"(")";
+    auto const pos = jsonStr.find(needle);
+    if (pos == std::string::npos) return nullptr;
+    // Silent-failure F1 pin (3-stream audit fold): if the shipped
+    // JSON ever grows a second `"entryPoint": ""` substring (e.g.
+    // a comment reproduces the literal verbatim), `find` would
+    // silently match the wrong site. Require uniqueness so a future
+    // config drift fails loud at the test helper rather than
+    // silently producing a malformed format.
+    if (jsonStr.find(needle, pos + needle.size())
+            != std::string::npos) {
+        return nullptr;
+    }
+    jsonStr.replace(pos, needle.size(), replaced);
+    auto result = ObjectFormatSchema::loadFromText(jsonStr);
+    if (!result.has_value()) return nullptr;
+    return std::move(result).value();
 }
 
 }  // namespace
@@ -359,6 +418,78 @@ TEST(LK10EntrySliceC, SysvElfTrampolineEmitsNoPrologue) {
     EXPECT_EQ(trampBytes[0], 0xE8u)
         << "SysV trampoline's first instruction is `call user_entry` "
            "directly (no prologue).";
+}
+
+// ── D-LK10-ENTRY-EXTERN-ENTRY-DIAG distinct diagnostic ─────────────
+//
+// `resolveUserEntrySymbol` returns one of three statuses:
+//   * Found            — entry name matches an AssembledFunction
+//   * NotFound         — entry name matches NOTHING in the module
+//   * ResolvedToExtern — entry name matches an ExternImport (invalid)
+//
+// The two failure modes need DISTINCT diagnostic codes because the
+// user-visible remediation differs. The previous shape returned
+// `optional<SymbolId>` with nullopt for both cases — the caller
+// emitted a single combined message. Closure pins both arms with
+// their own diagnostic codes:
+//   K_SymbolUndefined            for NotFound
+//   K_EntryPointResolvesToExtern for ResolvedToExtern
+
+TEST(LK10EntrySliceC, ExternAsEntryFiresDistinctDiagnostic) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    // Custom PE-exec format whose entryPoint names the synthesized
+    // symbol "sym_42" — same prefix the trampoline emitter uses for
+    // ELF/PE.
+    auto format = loadPeExecWithEntryPoint("sym_42");
+    ASSERT_NE(format, nullptr)
+        << "loadPeExecWithEntryPoint returned null — either the "
+           "shipped pe64-x86_64-windows-exec.format.json's `\"entryPoint\": "
+           "\"\"` literal was changed (string-replace pattern broke), "
+           "or the patched JSON failed schema validation. Check the "
+           "shipped file's entryPoint field.";
+    // Module with ONE function (SymbolId{1}; entryName 'sym_42'
+    // won't match it) + ONE extern (SymbolId{42}; entryName WILL
+    // match its synthesized name 'sym_42').
+    auto mod = makeReturn42Module();
+    ExternImport extern_;
+    extern_.symbol      = SymbolId{42};
+    extern_.mangledName = "SomeImportedFn";
+    extern_.libraryPath = "some.dll";
+    mod.externImports.push_back(std::move(extern_));
+
+    DiagnosticReporter rep;
+    bool const ok = linker::injectEntryTrampoline(
+        mod, **target, *format, rep);
+    EXPECT_FALSE(ok)
+        << "extern-as-entry must reject the trampoline injection";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_EntryPointResolvesToExtern), 1u)
+        << "must fire the EXTERN-specific code, NOT generic "
+           "K_SymbolUndefined — closes D-LK10-ENTRY-EXTERN-ENTRY-DIAG";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "K_SymbolUndefined must NOT fire here — that's the "
+           "NotFound arm, distinct from this case";
+}
+
+TEST(LK10EntrySliceC, NoMatchingEntryFiresGenericUndefined) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    // Custom format with entryPoint = "sym_999" which matches
+    // NEITHER any function NOR any extern in the module → the
+    // NotFound arm fires K_SymbolUndefined (NOT the new extern code).
+    auto format = loadPeExecWithEntryPoint("sym_999");
+    ASSERT_NE(format, nullptr);
+    auto mod = makeReturn42Module();  // only SymbolId{1} declared
+
+    DiagnosticReporter rep;
+    bool const ok = linker::injectEntryTrampoline(
+        mod, **target, *format, rep);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << "NotFound arm must fire K_SymbolUndefined";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_EntryPointResolvesToExtern), 0u)
+        << "K_EntryPointResolvesToExtern is reserved for the extern "
+           "case — must NOT fire when the name matches nothing";
 }
 
 // ── Stage-1 runnable smoke (Windows host only) ─────────────────────

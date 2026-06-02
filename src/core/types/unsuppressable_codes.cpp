@@ -21,7 +21,7 @@ namespace {
 // D-LK6-8.2 SIGILL surface (D_TargetMachineCodeMismatch /
 // D_TargetAbiModelMismatch) and the LK10 image-write contract
 // (K_ImageWrite* + K_ImageEmpty).
-constexpr std::array<DiagnosticCode, 53> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 54> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -106,6 +106,12 @@ constexpr std::array<DiagnosticCode, 53> kUnsuppressableCodes{{
     DiagnosticCode::K_FormatLacksImportSupport,
     DiagnosticCode::K_RelocationKindMismatch,
     DiagnosticCode::K_WalkerInputContractViolation,
+    // K_EntryPointResolvesToExtern — extern-named-as-entry is a
+    // schema misconfiguration that produces a runnable binary
+    // pointing at a stub IAT slot. Suppressing → the loader jumps
+    // to unrelocated import-stub bytes at process entry → SEGV with
+    // no diagnostic trail.
+    DiagnosticCode::K_EntryPointResolvesToExtern,
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating

@@ -153,6 +153,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_ImageWriteShort:              return "K_ImageWriteShort";
         case DiagnosticCode::K_ImageWriteCloseFailed:        return "K_ImageWriteCloseFailed";
         case DiagnosticCode::K_ImageEmpty:                   return "K_ImageEmpty";
+        case DiagnosticCode::K_EntryPointResolvesToExtern:   return "K_EntryPointResolvesToExtern";
 
         case DiagnosticCode::D_TargetFormatMismatch:         return "D_TargetFormatMismatch";
         case DiagnosticCode::D_TargetMachineCodeMismatch:    return "D_TargetMachineCodeMismatch";

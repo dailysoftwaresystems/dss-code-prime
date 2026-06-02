@@ -37,6 +37,62 @@ class TypeInterner;
 // no semantic phase, has no interner to consult). The real pipeline always
 // supplies the interner the semantic phase produced, so these rules always run
 // in production.
+// Structural-termination predicate. Returns true iff control leaves
+// `id` on EVERY structural path by returning or diverging
+// (`ReturnStmt`, `Unreachable`, or a nested Block/If/Switch whose
+// every reachable arm terminates). Conservative — a loop's body is
+// NOT counted as terminating (lowering appends `Unreachable` after a
+// provably-infinite loop to make the structural answer match the
+// dynamic one).
+//
+// Exposed at the verifier-substrate header so other HIR-tier
+// transformations (CST-to-HIR's main-implicit-return-0 insertion
+// for D-LK10-ENTRY-MAIN-IMPLICIT-RETURN; future const-eval +
+// reachability passes) can share the SINGLE source of truth for
+// "this construct terminates control" — duplicating the recursion
+// elsewhere would silently drift if a new HIR kind extends the
+// terminator set (e.g. ThrowStmt for a hypothetical exception
+// model).
+//
+// Templated over the source so it works against EITHER a frozen
+// `Hir` (the verifier's consumer) or a mid-build `HirBuilder` (the
+// CST-to-HIR lowering's consumer). Required source interface:
+// `kind(id) -> HirKind`, `children(id) -> span`, `ifThen(id)`,
+// `ifElse(id) -> optional`, `switchArms(id) -> span`,
+// `caseArmBody(id) -> span`, `caseArmIsDefault(id) -> bool`. Both
+// `Hir` and `HirBuilder` satisfy this interface.
+template <typename Source>
+[[nodiscard]] bool pathTerminates(Source const& src, HirNodeId id) {
+    switch (src.kind(id)) {
+        case HirKind::ReturnStmt:
+        case HirKind::Unreachable:
+            return true;
+        case HirKind::Block: {
+            auto kids = src.children(id);
+            return !kids.empty() && pathTerminates(src, kids.back());
+        }
+        case HirKind::IfStmt: {
+            auto elseB = src.ifElse(id);
+            return elseB.has_value()
+                && pathTerminates(src, src.ifThen(id))
+                && pathTerminates(src, *elseB);
+        }
+        case HirKind::SwitchStmt: {
+            bool hasDefault = false;
+            for (HirNodeId arm : src.switchArms(id)) {
+                if (src.kind(arm) != HirKind::CaseArm) return false;
+                auto body = src.caseArmBody(arm);
+                if (body.empty() || !pathTerminates(src, body.back()))
+                    return false;
+                if (src.caseArmIsDefault(arm)) hasDefault = true;
+            }
+            return hasDefault;
+        }
+        default:
+            return false;
+    }
+}
+
 class DSS_EXPORT HirVerifier {
 public:
     explicit HirVerifier(Hir const& hir, HirSourceMap const* sourceMap = nullptr,

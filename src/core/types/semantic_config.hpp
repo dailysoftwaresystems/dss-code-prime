@@ -169,6 +169,38 @@ struct DSS_EXPORT DeclarationRule {
     // params are intentional) or globals/columns. Default false ⇒ no
     // unused check for this declaration form.
     bool            warnIfUnused = false;
+    // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
+    // insertion rule (source-agnostic). When this declaration is a
+    // FUNCTION declaration AND the declared symbol's name appears
+    // in this list AND the function's return type is non-void AND
+    // the function's body does not structurally terminate on every
+    // path, the HIR lowering appends a synthetic `return <zero>`
+    // (a synthetic literal of the function's return type) as the
+    // last statement of the body's outermost Block. Per C99
+    // §5.1.2.2.3 for `main`; configurable per language so other
+    // source languages can declare their own entry-fn conventions
+    // (Pascal's `program`, Rust's `fn main`, etc.) WITHOUT touching
+    // shared HIR substrate. Empty ⇒ no implicit insertion for any
+    // function of this declaration form (every non-terminating non-
+    // void function then falls through to the verifier's
+    // checkReturnCompleteness loud-fail, which is the language-
+    // strict default).
+    //
+    // Both the synthetic ReturnStmt AND a fresh wrapping Block are
+    // appended (both flagged `HirFlags::Synthetic`); the original
+    // body's children are copied into the new block verbatim with
+    // the synthetic return appended at the tail. The original Block
+    // node is left detached (no in-place node mutation — HIR is
+    // built bottom-up immutable). Restricted to integer return
+    // types (Bool / I8..I128 / U8..U128 / Char / Byte) so a non-
+    // conformant `float main()` or `struct S main()` doesn't get a
+    // silently wrong-typed synthetic return — those fall through
+    // to the verifier's loud-fail. The verifier then sees a
+    // terminating body and downstream MIR/LIR see a defined return
+    // value at the function's exit register — preventing the
+    // "garbage-rax-at-exit" downstream of the runnable-binary
+    // trampoline (D-LK10-ENTRY).
+    std::vector<std::string> implicitReturnZeroForFunctionNames;
     // Optional kind-discriminator. When set, the engine evaluates it at
     // pass 1 and uses the resulting effective kind / params / body
     // instead of the static fields above.

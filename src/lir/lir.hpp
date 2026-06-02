@@ -140,7 +140,14 @@ public:
     LirBuilder(LirBuilder const&)            = delete;
     LirBuilder& operator=(LirBuilder const&) = delete;
     LirBuilder(LirBuilder&&) noexcept        = default;
-    LirBuilder& operator=(LirBuilder&&) noexcept = default;
+    // Move-assignment must be deleted explicitly: `target_` is a
+    // reference member that cannot be re-bound. The default move-
+    // assign would be implicitly deleted by the compiler and clang's
+    // `-Wdefaulted-function-deleted` flags the `= default` as
+    // misleading. The single move-ctor + deleted assignment matches
+    // the "single-use builder consumed by `finish() &&`" contract:
+    // a moved-from builder is destructed, never re-assigned.
+    LirBuilder& operator=(LirBuilder&&) noexcept = delete;
 
     [[nodiscard]] LirModuleId         id()       const noexcept { return moduleId_; }
     [[nodiscard]] TargetSchemaId      targetId() const noexcept { return target_.id(); }
