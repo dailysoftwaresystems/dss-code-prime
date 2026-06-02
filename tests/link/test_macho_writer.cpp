@@ -24,6 +24,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/format/macho.hpp"
+#include "link/format/macho_chained_fixups.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
@@ -1395,7 +1396,7 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
     // 2u * page_count` with page_count > 1.
     EXPECT_EQ(readU32LE(bytes, segStructOff + 0),
               static_cast<std::uint32_t>(
-                  dss::macho::detail::kDyldChainedStartsInSegmentHdrSz
+                  ::dss::macho::detail::kDyldChainedStartsInSegmentHdrSz
                   + 2u * 1u))
         << "dyld_chained_starts_in_segment.size must be header (22) "
            "+ 2*page_count (2) = 24 for the v1 single-page case";
