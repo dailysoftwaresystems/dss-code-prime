@@ -1219,6 +1219,15 @@ encodeExecDynamic(AssembledModule const&    module,
     // DYLD_CHAINED_PTR_64 bitfields + drops LC_DYSYMTAB.
     bool const useChainedFixups = im.useChainedFixups;
     std::vector<std::uint8_t> dyldBindBlob;
+    // `chainedImports` is built in section (i) for the chained path
+    // and consumed AFTER layout (section k below) when `segmentOffset`
+    // = `gotVa - textSegVmaddr` is known. The payload contains a
+    // `dyld_chained_starts_in_segment` struct whose `segment_offset`
+    // u64 must reference the actual __DATA_CONST VM offset — that
+    // value depends on `sizeofcmds → textFileOff → gotFileOff → gotVa`
+    // computed in section (j). Hoisting the imports here keeps the
+    // pre-check loud while deferring payload bytes.
+    std::vector<dss::macho::detail::ChainedFixupImport> chainedImports;
     if (useChainedFixups) {
         // D-LK6-14-NAME-OFFSET-OVERFLOW close: pre-check the
         // cumulative symbols-pool size before payload construction
@@ -1250,8 +1259,6 @@ encodeExecDynamic(AssembledModule const&    module,
                              kDyldChainedImportNameOffsetMax)));
             return {};
         }
-        std::vector<dss::macho::detail::ChainedFixupImport>
-            chainedImports;
         chainedImports.reserve(numExterns);
         for (auto const& ext : module.externImports) {
             std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
@@ -1279,11 +1286,8 @@ encodeExecDynamic(AssembledModule const&    module,
                 false  // weakImport — D-LK6-14-MACHO-WEAK-DEF
             });
         }
-        dyldBindBlob =
-            dss::macho::detail::buildChainedFixupsPayload(chainedImports);
-        // Pad to 8-byte load-command alignment per Apple convention.
-        while (dyldBindBlob.size() % kLoadCmdAlign != 0)
-            dyldBindBlob.push_back(0);
+        // Payload bytes deferred to section (k) below — segment_offset
+        // resolution requires gotVa.
     } else {
         // Legacy LC_DYLD_INFO_ONLY bind opcode stream.
         //
@@ -1349,11 +1353,17 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint32_t const numDefs =
         static_cast<std::uint32_t>(module.functions.size());
     std::vector<std::uint32_t> indirectSyms;
-    indirectSyms.reserve(numExterns * 2);
-    for (std::size_t i = 0; i < numExterns; ++i)
-        indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
-    for (std::size_t i = 0; i < numExterns; ++i)
-        indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
+    if (!useChainedFixups) {
+        // D-LK6-14-INTEGRATION-GOT-SLOTS: chained pointers in __got
+        // encode the import ordinal directly, so the indirect symbol
+        // table is redundant. Skip construction (and the matching
+        // LC_DYSYMTAB + __LINKEDIT emission below) on chained path.
+        indirectSyms.reserve(numExterns * 2);
+        for (std::size_t i = 0; i < numExterns; ++i)
+            indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
+        for (std::size_t i = 0; i < numExterns; ++i)
+            indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
+    }
 
     // ── (k) Build nlist_64 + string table: defined externs first,
     //       undefined externs next.
@@ -1409,10 +1419,14 @@ encodeExecDynamic(AssembledModule const&    module,
     bool const emitCodeSig = im.codeSignatureSize != 0;
     // ncmds = 4 segments + LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
     //       + LC_LOAD_DYLINKER + LC_MAIN + N × LC_LOAD_DYLIB
-    //       + LC_SYMTAB + LC_DYSYMTAB (+ LC_CODE_SIGNATURE when
-    //       emitCodeSig). Either dyld-binding LC counts as one.
+    //       + LC_SYMTAB + (LC_DYSYMTAB when !useChainedFixups —
+    //       D-LK6-14-INTEGRATION-GOT-SLOTS drops it because chained
+    //       pointers in __got encode the import ordinal directly, so
+    //       the indirect symbol table is redundant) + LC_CODE_SIGNATURE
+    //       when emitCodeSig.
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
-        4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u + 1u
+        4u + 1u + 1u + 1u + im.loadDylibs.size() + 1u
+        + (useChainedFixups ? 0u : 1u)
         + (emitCodeSig ? 1u : 0u));
     // sizeofcmds: LC_DYLD_CHAINED_FIXUPS is 16 bytes (linkedit_data_
     // command shape — same as LC_CODE_SIGNATURE); LC_DYLD_INFO_ONLY
@@ -1424,7 +1438,7 @@ encodeExecDynamic(AssembledModule const&    module,
         kSegCmdPageZeroSize + kSegCmdTextSize + kSegCmdDataConstSize +
         kSegCmdLinkeditSize + dyldBindCmdSize + dylinkerCmdSize +
         kLcMainSize + totalDylibCmdSize + kSymtabCommandSize +
-        kDysymtabCommandSize +
+        (useChainedFixups ? 0u : kDysymtabCommandSize) +
         (emitCodeSig ? kCodeSigCommandSize : 0u);
     std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
 
@@ -1488,8 +1502,76 @@ encodeExecDynamic(AssembledModule const&    module,
         stubsBody.push_back(static_cast<std::uint8_t>((d32 >> 24) & 0xFF));
     }
 
-    // __got body: numExterns × 8 zero bytes (dyld fills at load).
+    // Section (k) — D-LK6-14-INTEGRATION-GOT-SLOTS: now that gotVa
+    // is known, build the chained-fixups payload with
+    // `dyld_chained_starts_in_segment.segment_offset` resolved.
+    // (Legacy path's dyldBindBlob was already built in section (i).)
+    if (useChainedFixups) {
+        // Single-page __DATA_CONST guard. v1 supports at most one
+        // page of __got (kPageSize / kGotSlotSize = 512 externs at
+        // 8 bytes each on a 4 KiB page). Multi-page support requires
+        // computing page_starts[i] for each page — anchored
+        // D-LK6-14-MULTI-PAGE-GOT (trigger: first module with > 512
+        // extern imports OR first 16 KiB-page target).
+        if (gotFileSize > kPageSize) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encodeExecDynamic: chained-fixups "
+                             "__got spans {} bytes > kPageSize {} — "
+                             "v1 supports single-page chains only. "
+                             "Reduce extern count or fall back to "
+                             "LC_DYLD_INFO_ONLY. Anchored "
+                             "D-LK6-14-MULTI-PAGE-GOT.",
+                             gotFileSize, kPageSize));
+            return {};
+        }
+        dss::macho::detail::ChainedSegInfo segInfo;
+        // segment_offset is the VM offset from __TEXT to __DATA_CONST.
+        // __TEXT.vmaddr = im.pageZeroSize (by convention);
+        // __DATA_CONST.vmaddr = gotVa (since __got is the only
+        // section in __DATA_CONST, at the segment start).
+        segInfo.segmentOffset = gotVa - im.pageZeroSize;
+        segInfo.pageSize      = static_cast<std::uint16_t>(kPageSize);
+        segInfo.pointerFormat = dss::macho::detail::kDyldChainedPtrFormat64;
+        // Single page; first chained pointer at byte 0 of __got
+        // (which is at byte 0 of __DATA_CONST). page_starts[0] = 0.
+        segInfo.pageStarts.push_back(0u);
+        dyldBindBlob = dss::macho::detail::buildChainedFixupsPayload(
+            chainedImports, &segInfo);
+        // Pad to 8-byte load-command alignment per Apple convention.
+        while (dyldBindBlob.size() % kLoadCmdAlign != 0)
+            dyldBindBlob.push_back(0);
+    }
+
+    // __got body: numExterns × 8 zero bytes on legacy path (dyld
+    // fills via bind opcodes at load); DYLD_CHAINED_PTR_64 bitfields
+    // on chained path so dyld walks the chain at load.
     std::vector<std::uint8_t> gotBody(gotFileSize, 0u);
+    if (useChainedFixups) {
+        // dyld_chained_ptr_64_bind bitfield (Apple fixup-chains.h):
+        //   bits [ 0..23]  ordinal  (24-bit; DYLD_CHAINED_IMPORT row index)
+        //   bits [24..31]  addend   (8-bit; 0 for our straightforward binds)
+        //   bits [32..50]  reserved (19-bit; must be 0)
+        //   bits [51..62]  next     (12-bit; 8-byte-unit offset to next
+        //                            chained pointer on same page; 0=end)
+        //   bit  [63]      bind     (1=bind, 0=rebase; always 1 here)
+        for (std::size_t i = 0; i < numExterns; ++i) {
+            std::uint64_t bits = 0;
+            bits |= static_cast<std::uint64_t>(i) & 0xFFFFFFull;  // ordinal
+            // addend = 0; reserved = 0.
+            bool const isLast = (i + 1 == numExterns);
+            // next is in 4-byte units per Apple's spec for
+            // DYLD_CHAINED_PTR_64. Adjacent 8-byte slots are 2 units
+            // apart. 0 = end of chain.
+            std::uint64_t const next = isLast ? 0ull : 2ull;
+            bits |= next << 51;
+            bits |= 1ull << 63;  // bind = 1
+            std::size_t const slotOff = i * kGotSlotSize;
+            for (int b = 0; b < 8; ++b) {
+                gotBody[slotOff + b] = static_cast<std::uint8_t>(
+                    (bits >> (b * 8)) & 0xFFu);
+            }
+        }
+    }
 
     // __LINKEDIT contents.
     std::uint64_t const linkeditFileOff =
@@ -1557,10 +1639,14 @@ encodeExecDynamic(AssembledModule const&    module,
         alignUp(linkeditFileSize, kPageSize);
 
     // Indirect-symtab reserved1 indices: __stubs uses [0..numExterns),
-    // __got uses [numExterns..2*numExterns).
+    // __got uses [numExterns..2*numExterns). On the chained-fixups
+    // path the indirect symbol table is absent; reserved1 = 0 for
+    // both sections (D-LK6-14-INTEGRATION-GOT-SLOTS — chained
+    // pointers in __got encode the ordinal directly).
     constexpr std::uint32_t kStubsReserved1 = 0;
-    std::uint32_t const kGotReserved1 =
-        static_cast<std::uint32_t>(numExterns);
+    std::uint32_t const kGotReserved1 = useChainedFixups
+        ? 0u
+        : static_cast<std::uint32_t>(numExterns);
 
     // ── (m) Emit bytes ───────────────────────────────────────────
     std::vector<std::uint8_t> bytes;
@@ -1738,32 +1824,34 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, static_cast<std::uint32_t>(strtabOff));
     appendU32LE(bytes, static_cast<std::uint32_t>(strtabSize));
 
-    // LC_DYSYMTAB (indirect symbol table for __stubs/__got).
-    // D-LK6-14-INTEGRATION-GOT-SLOTS anchor: chained fixups make
-    // this LC redundant — the chained pointers in __got encode the
-    // import ordinal directly, so the indirect symbol table is no
-    // longer needed. When D-LK6-14-INTEGRATION-GOT-SLOTS lands,
-    // this entire block is dropped AND __got slot population
-    // switches from zero-init (filled by dyld via bind-opcodes)
-    // to direct DYLD_CHAINED_PTR_64 bitfield writes.
-    appendU32LE(bytes, LC_DYSYMTAB);
-    appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
-    appendU32LE(bytes, 0);                    // ilocalsym
-    appendU32LE(bytes, 0);                    // nlocalsym
-    appendU32LE(bytes, 0);                    // iextdefsym
-    appendU32LE(bytes, numDefs);              // nextdefsym
-    appendU32LE(bytes, numDefs);              // iundefsym
-    appendU32LE(bytes,
-                static_cast<std::uint32_t>(numExterns));  // nundefsym
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // toc
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // modtab
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrefsym
-    appendU32LE(bytes,
-                static_cast<std::uint32_t>(indirectSymtabOff));
-    appendU32LE(bytes,
-                static_cast<std::uint32_t>(indirectSyms.size()));
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrel
-    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // locrel
+    if (!useChainedFixups) {
+        // LC_DYSYMTAB (indirect symbol table for __stubs/__got).
+        // D-LK6-14-INTEGRATION-GOT-SLOTS CLOSED: chained fixups make
+        // this LC redundant — the chained pointers in __got encode
+        // the import ordinal directly via DYLD_CHAINED_PTR_64 row
+        // bits[0..23]. The entire block is skipped on chained path
+        // (the ncmds/sizeofcmds arithmetic above accounts for the
+        // absence). Indirect-symtab byte emission below is similarly
+        // skipped.
+        appendU32LE(bytes, LC_DYSYMTAB);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
+        appendU32LE(bytes, 0);                    // ilocalsym
+        appendU32LE(bytes, 0);                    // nlocalsym
+        appendU32LE(bytes, 0);                    // iextdefsym
+        appendU32LE(bytes, numDefs);              // nextdefsym
+        appendU32LE(bytes, numDefs);              // iundefsym
+        appendU32LE(bytes,
+                    static_cast<std::uint32_t>(numExterns));  // nundefsym
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // toc
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // modtab
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrefsym
+        appendU32LE(bytes,
+                    static_cast<std::uint32_t>(indirectSymtabOff));
+        appendU32LE(bytes,
+                    static_cast<std::uint32_t>(indirectSyms.size()));
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrel
+        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // locrel
+    }
 
     // LK7: LC_CODE_SIGNATURE placeholder. linkedit_data_command =
     // cmd(4) cmdsize(4) dataoff(4) datasize(4). Plan 16 fills the

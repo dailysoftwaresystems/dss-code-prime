@@ -5,18 +5,28 @@
 namespace dss::macho::detail {
 
 std::vector<std::uint8_t>
-buildChainedFixupsPayload(std::vector<ChainedFixupImport> const& imports) {
+buildChainedFixupsPayload(std::vector<ChainedFixupImport> const& imports,
+                          ChainedSegInfo const*                  segInfo) {
     using namespace dss::link::format::detail;
     std::vector<std::uint8_t> out;
 
-    // Layout offsets. v1 substrate emits ONE segment slot with
-    // `seg_info_offset[0] = 0` (no chains in this segment).
-    // D-LK6-14-INTEGRATION-GOT-SLOTS populates per-segment
-    // page_starts when __DATA_CONST chained pointers are emitted.
+    // Layout offsets. The dyld_chained_starts_in_image region holds
+    // a seg_count + one seg_info_offset[0] entry. When `segInfo` is
+    // provided (the D-LK6-14-INTEGRATION-GOT-SLOTS path), region 1
+    // ALSO contains the `dyld_chained_starts_in_segment` struct
+    // directly after the seg_info_offset table — pointed at by
+    // seg_info_offset[0] = 8. When `segInfo` is null (substrate
+    // path), seg_info_offset[0] = 0 ("no chains in segment") and
+    // dyld processes no fixups.
     constexpr std::uint32_t kSegCount = 1u;
-    std::size_t const startsOff   = kDyldChainedFixupsHeaderSz;
-    // starts_in_image = 4 (seg_count) + 4 * seg_count (offsets)
-    std::size_t const startsSize  = 4u + 4u * kSegCount;
+    std::size_t const startsOff      = kDyldChainedFixupsHeaderSz;
+    // starts_in_image header = seg_count (u32) + seg_info_offset[0] (u32).
+    constexpr std::size_t kStartsInImageHdrSz = 4u + 4u * kSegCount;
+    std::size_t const startsInSegmentSize = segInfo
+        ? kDyldChainedStartsInSegmentHdrSz
+            + 2u * segInfo->pageStarts.size()
+        : 0u;
+    std::size_t const startsSize  = kStartsInImageHdrSz + startsInSegmentSize;
     std::size_t const importsOff  = startsOff + startsSize;
     std::size_t const importsSize = kDyldChainedImportSz * imports.size();
     std::size_t const symbolsOff  = importsOff + importsSize;
@@ -30,9 +40,32 @@ buildChainedFixupsPayload(std::vector<ChainedFixupImport> const& imports) {
     appendU16LE(out, kDyldChainedImportsFormat);
     appendU16LE(out, kDyldChainedSymbolsFormat);
 
-    // Region 1: dyld_chained_starts_in_image (8 bytes for kSegCount=1).
+    // Region 1a: dyld_chained_starts_in_image (8 bytes for kSegCount=1).
     appendU32LE(out, kSegCount);
-    appendU32LE(out, 0u);  // seg_info_offset[0] — populated by INTEGRATION
+    if (segInfo) {
+        // seg_info_offset[0] = 8 — points at the
+        // dyld_chained_starts_in_segment struct that immediately
+        // follows the seg_info_offset table.
+        appendU32LE(out, static_cast<std::uint32_t>(kStartsInImageHdrSz));
+        // Region 1b: dyld_chained_starts_in_segment (22-byte header
+        // + page_starts array).
+        std::uint32_t const segStructSize = static_cast<std::uint32_t>(
+            startsInSegmentSize);
+        appendU32LE(out, segStructSize);
+        appendU16LE(out, segInfo->pageSize);
+        appendU16LE(out, segInfo->pointerFormat);
+        appendU64LE(out, segInfo->segmentOffset);
+        appendU32LE(out, 0u);  // max_valid_pointer (0 for 64-bit)
+        appendU16LE(out, static_cast<std::uint16_t>(
+                             segInfo->pageStarts.size()));
+        for (std::uint16_t pageStart : segInfo->pageStarts) {
+            appendU16LE(out, pageStart);
+        }
+    } else {
+        // Substrate path: seg_info_offset[0] = 0 → dyld sees "no
+        // chains in segment". No starts_in_segment emitted.
+        appendU32LE(out, 0u);
+    }
 
     // Build the symbols pool first so we know each import's
     // name_offset. The pool starts with a NUL sentinel (offset 0
@@ -63,13 +96,10 @@ buildChainedFixupsPayload(std::vector<ChainedFixupImport> const& imports) {
         if (imp.weakImport) packed |= 0x100u;
         // Silent-truncation guard (D-LK6-14-NAME-OFFSET-OVERFLOW):
         // the 23-bit name_offset field cannot represent symbol-pool
-        // offsets > 8MiB-1. Caller-side enforcement is currently
-        // UNENFORCED (anchored; the integration fold ships the
-        // reporter-aware diagnostic). The mask below is defense-in-
-        // depth only — a contract violation cannot write nonsense
-        // bits 24..31, but the resulting truncation IS silent. The
-        // boundary value `kDyldChainedImportNameOffsetMax` is
-        // exported in the header so callers can do the precheck.
+        // offsets > 8MiB-1. Caller-side enforcement at the walker
+        // (encodeExecDynamic pre-check) fires loud K_SymbolUndefined.
+        // The mask below is defense-in-depth — a contract violation
+        // cannot write nonsense bits 24..31.
         packed |= (nameOffsets[i] & 0x7FFFFFu) << 9;
         appendU32LE(out, packed);
     }

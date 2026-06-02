@@ -57,9 +57,38 @@ constexpr std::uint16_t kDyldChainedImportsFormat = 1u;  // DYLD_CHAINED_IMPORT
 constexpr std::uint16_t kDyldChainedSymbolsFormat = 0u;  // uncompressed
 constexpr std::size_t   kDyldChainedFixupsHeaderSz = 24u;
 constexpr std::size_t   kDyldChainedImportSz       = 4u;
+// dyld_chained_starts_in_segment fixed header size (before page_starts):
+//   size u32 + page_size u16 + pointer_format u16 + segment_offset u64
+//   + max_valid_pointer u32 + page_count u16 = 22 bytes.
+constexpr std::size_t   kDyldChainedStartsInSegmentHdrSz = 22u;
+// DYLD_CHAINED_PTR_64 (non-authenticated 64-bit chained pointers).
+constexpr std::uint16_t kDyldChainedPtrFormat64 = 6u;
+// DYLD_CHAINED_PTR_START_NONE — page has no chained pointers.
+constexpr std::uint16_t kDyldChainedPtrStartNone = 0xFFFFu;
 
 // Max name_offset that fits the 23-bit field. 8 MiB - 1.
 constexpr std::uint32_t kDyldChainedImportNameOffsetMax = (1u << 23) - 1u;
+
+// Per-segment chain layout. When passed to buildChainedFixupsPayload,
+// the helper emits a `dyld_chained_starts_in_segment` struct inside
+// Region 1 and points `seg_info_offset[0]` at it. When omitted, the
+// payload retains the substrate behavior (seg_info_offset[0] = 0 —
+// "no chains in segment").
+//
+// Apple `dyld_chained_starts_in_segment` (22-byte header + page_starts):
+//   [ 0.. 3] size              (this struct + page_starts array)
+//   [ 4.. 5] page_size         (0x1000 x86_64; 0x4000 arm64)
+//   [ 6.. 7] pointer_format    (6 = DYLD_CHAINED_PTR_64)
+//   [ 8..15] segment_offset    (VM offset of segment from __TEXT base)
+//   [16..19] max_valid_pointer (0 for 64-bit)
+//   [20..21] page_count        (length of page_starts)
+//   [22..]   page_starts[N]    (u16 each; 0xFFFF = no chain on page)
+struct ChainedSegInfo {
+    std::uint64_t              segmentOffset = 0;
+    std::uint16_t              pageSize      = 0x1000;
+    std::uint16_t              pointerFormat = kDyldChainedPtrFormat64;
+    std::vector<std::uint16_t> pageStarts;  // size = page_count
+};
 
 // One row supplied by the caller. `libOrdinal` is the signed 8-bit
 // library reference: -2 = MAIN_EXECUTABLE, -1 = SELF, 1..N = the
@@ -83,6 +112,7 @@ struct ChainedFixupImport {
 // pre-check the cumulative byte count of `imp.name + 1` (NUL)
 // across all imports.
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
-buildChainedFixupsPayload(std::vector<ChainedFixupImport> const& imports);
+buildChainedFixupsPayload(std::vector<ChainedFixupImport> const& imports,
+                          ChainedSegInfo const* segInfo = nullptr);
 
 } // namespace dss::macho::detail

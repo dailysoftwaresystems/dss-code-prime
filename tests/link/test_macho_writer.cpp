@@ -32,6 +32,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
@@ -49,7 +50,7 @@ namespace {
 // convergence: code-reviewer HIGH-1 + type-design Q5 + simplifier
 // S1 + comment-analyzer) drops them.
 using dss::link_format::test::readU16LE;
-using readU32LE;
+using dss::link_format::test::readU32LE;
 using dss::link_format::test::readU64LE;
 
 struct Loaded {
@@ -1219,10 +1220,12 @@ TEST(MachOExecWriter, ChainedFixupsSymbolsPoolContainsExternName) {
 // slot bitfield population — a premature regression that drops
 // LC_DYSYMTAB here would produce structurally broken chained
 // binaries with no failing test.
-// FLIP-MARKER: when D-LK6-14-INTEGRATION-GOT-SLOTS lands, this
-// test MUST invert (assert LC_DYSYMTAB is ABSENT). Until then it
-// pins presence to catch a premature regression.
-TEST(MachOExecWriter, ChainedFixupsKeepsLcDysymtab) {
+// D-LK6-14-INTEGRATION-GOT-SLOTS closed: LC_DYSYMTAB is DROPPED on
+// the chained-fixups path (chained pointers in __got encode the
+// import ordinal directly via DYLD_CHAINED_PTR_64 bits [0..23], so
+// the indirect symbol table is redundant). The prior pin (which
+// pinned PRESENCE during the substrate window) is now inverted.
+TEST(MachOExecWriter, ChainedFixupsDropsLcDysymtab) {
     constexpr std::uint32_t kLcDysymtab = 0x0Bu;
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
@@ -1232,27 +1235,200 @@ TEST(MachOExecWriter, ChainedFixupsKeepsLcDysymtab) {
     DiagnosticReporter rep;
     auto bytes = macho::encode(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
+    EXPECT_FALSE(
+        dss::macho::test::findLoadCommand(bytes, kLcDysymtab).has_value())
+        << "LC_DYSYMTAB MUST be absent on the chained-fixups path — "
+           "D-LK6-14-INTEGRATION-GOT-SLOTS closed: chained pointers "
+           "in __got encode the import ordinal directly so the "
+           "indirect symbol table is redundant. A regression that "
+           "re-emits LC_DYSYMTAB here would produce dyld-rejected "
+           "binaries because ncmds/sizeofcmds arithmetic accounts "
+           "for the absence.";
+}
+
+// D-LK6-14-INTEGRATION-GOT-SLOTS pin: each __got slot must hold a
+// valid DYLD_CHAINED_PTR_64 bind bitfield (bit 63 set, ordinal in
+// bits [0..23] matching the import index, next field forming a
+// valid chain). Without this, dyld cannot resolve extern imports.
+TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmt, nullptr);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_a",
+                     "/usr/lib/libSystem.B.dylib"});
+    mod.externImports.push_back(
+        ExternImport{SymbolId{100}, "_b",
+                     "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Locate __got via the __DATA_CONST segment. The segment's
+    // fileoff is at section_64.__got's offset in load commands;
+    // easier path: read LC_SEGMENT_64 for __DATA_CONST and follow.
+    // For this byte-level pin we read __got via the LC_DYLD_CHAINED_
+    // FIXUPS payload's segment_offset to derive __DATA_CONST file
+    // offset via header values — but a simpler check: parse all
+    // LC_SEGMENT_64s, find __DATA_CONST, read fileoff (offset 32 in
+    // segment_command_64), then read 8-byte slots.
+    constexpr std::uint32_t kLcSegment64 = 0x19u;
+    std::optional<std::size_t> dataConstFileOff;
+    std::size_t lcOff = 32;  // past mach_header_64
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t const cmd = readU32LE(bytes, lcOff);
+        std::uint32_t const cmdsize = readU32LE(bytes, lcOff + 4);
+        if (cmd == kLcSegment64) {
+            // segname at lcOff+8 (16 bytes); fileoff at lcOff+8+16+16 = lcOff+40
+            char name[17] = {};
+            std::memcpy(name, &bytes[lcOff + 8], 16);
+            if (std::string{name} == "__DATA_CONST") {
+                dataConstFileOff = static_cast<std::size_t>(
+                    readU64LE(bytes, lcOff + 8 + 16 + 16));
+                break;
+            }
+        }
+        lcOff += cmdsize;
+    }
+    ASSERT_TRUE(dataConstFileOff.has_value())
+        << "__DATA_CONST LC_SEGMENT_64 must be present";
+    // Read slot[0] and slot[1] (8 bytes each).
+    std::uint64_t const slot0 = readU64LE(bytes, *dataConstFileOff);
+    std::uint64_t const slot1 = readU64LE(bytes, *dataConstFileOff + 8);
+    // bit 63 = bind (must be 1 on both slots — they're binds, not rebases).
+    EXPECT_NE(slot0 & (1ull << 63), 0u)
+        << "slot[0] bind bit (63) must be set";
+    EXPECT_NE(slot1 & (1ull << 63), 0u)
+        << "slot[1] bind bit (63) must be set";
+    // bits [0..23] = ordinal: slot[i] → import row i.
+    EXPECT_EQ(slot0 & 0xFFFFFFull, 0u)
+        << "slot[0] ordinal must be 0 (first import)";
+    EXPECT_EQ(slot1 & 0xFFFFFFull, 1u)
+        << "slot[1] ordinal must be 1 (second import)";
+    // bits [51..62] = next (12 bits, 4-byte units to next chain entry).
+    // Slot[0] points at slot[1] (8 bytes away = 2 four-byte units).
+    // Slot[1] is the last → next = 0.
+    std::uint64_t const next0 = (slot0 >> 51) & 0xFFFu;
+    std::uint64_t const next1 = (slot1 >> 51) & 0xFFFu;
+    EXPECT_EQ(next0, 2u)
+        << "slot[0] next field must be 2 (4-byte units to slot[1])";
+    EXPECT_EQ(next1, 0u)
+        << "slot[1] next field must be 0 (end of chain)";
+}
+
+// D-LK6-14-INTEGRATION-GOT-SLOTS pin: the chained-fixups payload's
+// seg_info_offset[0] must be non-zero (= 8) and point at a
+// dyld_chained_starts_in_segment struct with pointer_format=6 and
+// non-zero segment_offset. A regression dropping the segInfo arg
+// would leave seg_info_offset[0] = 0 (substrate behavior) and dyld
+// would see "no chains in segment".
+TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmt, nullptr);
+    auto mod = chainedFixupsTestModule();
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
     auto const lcOff =
-        dss::macho::test::findLoadCommand(bytes, kLcDysymtab);
-    ASSERT_TRUE(lcOff.has_value())
-        << "LC_DYSYMTAB must STAY emitted on the chained path until "
-           "D-LK6-14-INTEGRATION-GOT-SLOTS drops it; premature drop "
-           "would leave binaries structurally broken silently.";
-    // 5ac97ae audit fold (test-analyzer + test-analyzer-dim-2):
-    // pin LC_DYSYMTAB CONTENT (not just presence). cmdsize=80
-    // (Apple's dysymtab_command shape). nundefsym must equal the
-    // module's externImports count (1 in the fixture).
-    EXPECT_EQ(readU32LE(bytes, *lcOff + 4), 80u)
-        << "LC_DYSYMTAB cmdsize must be 80 (Apple dysymtab_command)";
-    // dysymtab_command layout (bytes after cmd+cmdsize):
-    //   [ 0.. 3] ilocalsym  [ 4.. 7] nlocalsym
-    //   [ 8..11] iextdefsym [12..15] nextdefsym
-    //   [16..19] iundefsym  [20..23] nundefsym
-    EXPECT_EQ(readU32LE(bytes, *lcOff + 8 + 20),
-              mod.externImports.size())
-        << "nundefsym must match externImports.size() — catches "
-           "off-by-one or garbage-field regressions on the dysymtab "
-           "emission path";
+        dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
+    ASSERT_TRUE(lcOff.has_value());
+    std::uint32_t const dataoff =
+        readU32LE(bytes, *lcOff + 8);
+    // starts_offset is at payload+4 (header field).
+    std::uint32_t const startsOff = readU32LE(bytes, dataoff + 4);
+    // starts_in_image: seg_count (u32) at startsOff, seg_info_offset[0]
+    // (u32) at startsOff+4.
+    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff), 1u)
+        << "seg_count must be 1 (single __DATA_CONST segment)";
+    std::uint32_t const segInfoOffset =
+        readU32LE(bytes, dataoff + startsOff + 4);
+    EXPECT_EQ(segInfoOffset, 8u)
+        << "seg_info_offset[0] must be 8 (immediately after the "
+           "starts_in_image header); a regression dropping segInfo "
+           "would leave this 0 (substrate behavior) and dyld would "
+           "see 'no chains in segment'";
+    // dyld_chained_starts_in_segment at startsOff + 8:
+    //   [ 0.. 3] size           [ 4.. 5] page_size
+    //   [ 6.. 7] pointer_format [ 8..15] segment_offset
+    //   [16..19] max_valid_ptr  [20..21] page_count
+    std::size_t const segStructOff =
+        dataoff + startsOff + segInfoOffset;
+    EXPECT_EQ(readU16LE(bytes, segStructOff + 6),
+              6u)
+        << "pointer_format must be 6 (DYLD_CHAINED_PTR_64)";
+    EXPECT_NE(readU64LE(bytes, segStructOff + 8), 0u)
+        << "segment_offset must be non-zero (= gotVa - "
+           "__TEXT.vmaddr); a regression that leaves it 0 means dyld "
+           "would resolve the chain at the wrong VM address";
+    EXPECT_EQ(readU16LE(bytes, segStructOff + 20), 1u)
+        << "page_count must be 1 (single-page __DATA_CONST)";
+    // page_starts[0] at segStructOff + 22.
+    EXPECT_EQ(readU16LE(bytes, segStructOff + 22), 0u)
+        << "page_starts[0] must be 0 (first chained pointer at byte "
+           "0 of the page — __got starts at __DATA_CONST start)";
+}
+
+// D-LK6-14-SIZEOFCMDS-DELTA-PIN: chained path's sizeofcmds must be
+// exactly `kDysymtabCommandSize` (80) less than legacy path's (since
+// LC_DYSYMTAB is dropped on chained). Pins the ncmds/sizeofcmds
+// arithmetic against subtle drift.
+TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    // Legacy fixture (useChainedFixups absent → defaults to false).
+    auto fmtLegacy = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": {"name":"macho-legacy-for-delta","kind":"macho"},
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    ASSERT_TRUE(fmtLegacy.has_value());
+    auto mod = chainedFixupsTestModule();
+    DiagnosticReporter rep;
+    auto bytesLegacy = macho::encode(mod, **target, **fmtLegacy, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto fmtChained = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmtChained, nullptr);
+    auto bytesChained = macho::encode(mod, **target, *fmtChained, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // sizeofcmds field is at mach_header_64 offset 20 (u32).
+    std::uint32_t const sizeofcmdsLegacy =
+        readU32LE(bytesLegacy, 20);
+    std::uint32_t const sizeofcmdsChained =
+        readU32LE(bytesChained, 20);
+    // Delta = LC_DYLD_INFO_ONLY (48) - LC_DYLD_CHAINED_FIXUPS (16)
+    //       + LC_DYSYMTAB (80, dropped on chained) = 112.
+    EXPECT_EQ(sizeofcmdsLegacy - sizeofcmdsChained, 112u)
+        << "sizeofcmds delta: legacy emits LC_DYLD_INFO_ONLY (48) + "
+           "LC_DYSYMTAB (80) = 128; chained emits LC_DYLD_CHAINED_"
+           "FIXUPS (16) only = 16; delta = 112. Regression in any "
+           "arm of the ternary or in the LC sizes would shift this.";
 }
 
 // 8aabc04 audit fold (test-analyzer-dim-2 HIGH): multi-import name
