@@ -133,15 +133,28 @@ TEST(AsmSubstrate, AssembledModuleCarriesDataItemsField) {
         << "C-string nul terminator must round-trip verbatim";
 }
 
-// FLIP-MARKER (silent-failure F2 fold): no shipped exec format
-// declares a `rodata` section row YET. When the first per-format
-// walker arm closes (D-LK2-RODATA / D-LK1-RODATA / D-LK3-RODATA),
-// the corresponding `EXPECT_EQ(... nullptr)` flips to `EXPECT_NE`.
-// Acts as a tripwire: a JSON edit that adds the row WITHOUT also
-// closing the walker arm surfaces here.
-TEST(AsmSubstrate, ShippedExecFormatsLackRodataSectionUntilWalkerLands) {
+// D-LK2-RODATA CLOSED 2026-06-02: PE walker emits `.rdata`. The
+// FLIP-MARKER for PE is now NE(nullptr) — the format JSON declares
+// the row. ELF (D-LK1-RODATA) and Mach-O (D-LK3-RODATA) remain
+// anchored; their assertions stay EQ(nullptr) until the matching
+// walker arm closes.
+TEST(AsmSubstrate, ShippedExecFormatsRodataSectionPerWalkerArm) {
+    // PE: walker arm CLOSED — must declare the row.
+    {
+        auto fmt = ObjectFormatSchema::loadShipped(
+            "pe64-x86_64-windows-exec");
+        ASSERT_TRUE(fmt.has_value());
+        EXPECT_NE((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
+            << "pe64-x86_64-windows-exec: D-LK2-RODATA closed — the "
+               "format JSON must declare a `.rdata` (Rodata) section "
+               "row that the walker reads at emit time. If this fails, "
+               "the JSON row was removed without re-anchoring the "
+               "walker arm.";
+    }
+    // ELF + Mach-O: walker arms still anchored (D-LK1-RODATA /
+    // D-LK3-RODATA) — must NOT yet declare the row. When the walker
+    // arm closes, flip the corresponding EQ to NE.
     for (auto const* formatName : {
-             "pe64-x86_64-windows-exec",
              "elf64-x86_64-linux-exec",
              "macho64-x86_64-darwin-exec"}) {
         auto fmt = ObjectFormatSchema::loadShipped(formatName);
@@ -149,8 +162,8 @@ TEST(AsmSubstrate, ShippedExecFormatsLackRodataSectionUntilWalkerLands) {
         EXPECT_EQ((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
             << formatName
             << " declares a rodata section row — the matching walker "
-               "arm (D-LK2-RODATA / D-LK1-RODATA / D-LK3-RODATA) must "
-               "land in the SAME slice; flip this assertion from "
+               "arm (D-LK1-RODATA for ELF / D-LK3-RODATA for Mach-O) "
+               "must land in the SAME slice; flip this assertion from "
                "EQ(nullptr) to NE(nullptr) when that closes.";
     }
 }

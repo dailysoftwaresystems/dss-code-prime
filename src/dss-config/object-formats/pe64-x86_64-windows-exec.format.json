@@ -57,6 +57,16 @@
       "addrAlign": 0,
       "entrySize": 0,
       "virtualAddress": 4096
+    },
+    {
+      "$comment": "Read-only data section (D-LK2-RODATA closure). Emitted by the PE walker between .text and .idata when `AssembledModule.dataItems` carries any item with `section==Rodata`. virtualAddress=0 here is a placeholder — the walker computes the actual RVA at emit time as (textVirtualAddress + textVirtualSize) since sections must be contiguous in VA space. Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x00000040) | IMAGE_SCN_MEM_READ (0x40000000) = 0x40000040 — initialized data, read-only (no write, no execute). The walker reads the section name + characteristics from this row; the VA is computed dynamically from layout.",
+      "kind": "rodata",
+      "name": ".rdata",
+      "type": 1073741888,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
     }
   ],
 

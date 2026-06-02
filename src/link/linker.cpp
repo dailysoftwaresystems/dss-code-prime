@@ -9,6 +9,7 @@
 #include "link/format/wasm.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <format>
 #include <string>
 #include <unordered_set>
 #include <utility>
