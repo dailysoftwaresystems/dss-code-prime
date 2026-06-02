@@ -815,6 +815,25 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "(D-LK10-ENTRY §2.13). Either declare both or "
              "neither.");
     }
+    // silent-failure H1 (7425905 audit fold): `processExit` +
+    // `entryCallingConvention` are meaningful ONLY on exec-flavored
+    // formats — the trampoline emitter never runs on relocatables
+    // (.o / Obj / Object). Declaring them on a relocatable format
+    // is dead data that would silently confuse anyone diffing
+    // format schemas. Gate them on `isExecFlavor` (computed above).
+    if (processExit.has_value() && !isExecFlavor) {
+        fail("/processExit",
+             "processExit is only legal on exec-flavored formats "
+             "(ELF ET_EXEC / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
+             "Relocatable artifacts (.o / Obj / Object) cannot have "
+             "an entry trampoline. (D-LK10-ENTRY §2.13.)");
+    }
+    if (!entryCallingConvention.empty() && !isExecFlavor) {
+        fail("/entryCallingConvention",
+             "entryCallingConvention is only legal on exec-flavored "
+             "formats — relocatable artifacts have no entry "
+             "trampoline to resolve a cc against. (D-LK10-ENTRY §2.13.)");
+    }
 
     return problems;
 }

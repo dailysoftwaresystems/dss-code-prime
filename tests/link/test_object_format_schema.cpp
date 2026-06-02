@@ -248,6 +248,18 @@ TEST(ShippedArm64ElfReloc, MachineCodeIsEmAarch64) {
 // `processExit` block + `entryCallingConvention` field, plus the
 // JSON loader's per-arm coverage + cross-field validate() rules.
 
+namespace {
+// simplifier FOLD-NOW #2 (7425905 audit fold): the rejection-case
+// tests all follow `loadFromText(json) + EXPECT_FALSE` shape. One
+// helper collapses ~6 sites; the JSON literal stays inline (it IS
+// the test fixture).
+inline void expectRejected(std::string_view jsonText,
+                            std::string_view why) {
+    auto r = ObjectFormatSchema::loadFromText(jsonText);
+    EXPECT_FALSE(r.has_value()) << why;
+}
+}  // namespace
+
 TEST(LK10EntrySliceB, ShippedPeExecHasByNameImportProcessExit) {
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
     ASSERT_TRUE(r.has_value());
@@ -387,6 +399,135 @@ TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
     })");
     EXPECT_FALSE(r.has_value())
         << "syscallOpcodeBytes entries must fit in u8 (0..255)";
+}
+
+// test-analyzer H1 (7425905 audit fold): pin the `ExitMechanism::
+// None` sentinel rejection path explicitly — `UnknownMechanismRejected`
+// only drives the `!m.has_value()` arm via "bogus"; the `*m == None`
+// branch at object_format_schema_json.cpp's mechanism-resolve was
+// dead-coverage.
+TEST(LK10EntrySliceB, MechanismNoneStringRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": { "mechanism": "none" }
+    })", "mechanism=\"none\" is the sentinel; loader rejects "
+         "explicitly to prevent the sentinel from leaking through");
+}
+
+// dim-2 HIGH #1 (7425905 audit fold): pin the missing-key path
+// distinct from the wrong-value path.
+TEST(LK10EntrySliceB, MechanismKeyOmittedRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": { "syscallNumber": 231 }
+    })", "processExit object missing the `mechanism` key entirely "
+         "must reject (different path from `mechanism=\"bogus\"`)");
+}
+
+// test-analyzer H2 (7425905 audit fold): pin the syscallNumGpr-
+// missing arm explicitly.
+TEST(LK10EntrySliceB, SyscallArmMissingNumGprRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallOpcodeBytes": [15, 5]
+      }
+    })", "syscall arm without syscallNumGpr must reject");
+}
+
+// dim-2 #4 (7425905 audit fold): pin the empty-array
+// syscallOpcodeBytes branch explicitly (separate from omitted).
+TEST(LK10EntrySliceB, SyscallOpcodeBytesEmptyArrayRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": []
+      }
+    })", "syscallOpcodeBytes empty array must reject");
+}
+
+// test-analyzer M1 (7425905 audit fold): pin the ByNameImport
+// missing-mangled-name arm.
+TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth", "version": "0.1", "kind": "pe" },
+      "pe": { "machine": 34404, "characteristics": 34 },
+      "entryCallingConvention": "ms_x64",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importLibraryPath": "kernel32.dll"
+      }
+    })", "by-name-import arm without importMangledName must reject");
+}
+
+// silent-failure H1 (7425905 audit fold): pin the isExecFlavor gate.
+// Relocatable formats (.o / Obj / Object) cannot have entry
+// trampolines; declaring processExit/entryCallingConvention on a
+// relocatable schema is meaningless dead data.
+TEST(LK10EntrySliceB, ProcessExitOnRelocatableFormatRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62,
+               "type": "rel" },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      }
+    })", "processExit on ET_REL must reject — only exec-flavored "
+         "formats have an entry trampoline");
+}
+
+// dim-2 HIGH #2 (7425905 audit fold): entryCallingConvention with
+// whitespace silently passed schema-load before the audit;
+// loader now rejects.
+TEST(LK10EntrySliceB, EntryCcLeadingWhitespaceRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": " sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      }
+    })", "leading whitespace in entryCallingConvention must reject "
+         "— would silently fail at Slice C callingConventionByName");
+}
+
+// dim-2 HIGH #3 (7425905 audit fold): Wasm/SPIR-V format kinds
+// have no trampoline emitter; processExit/entryCallingConvention
+// are meaningless on those formats. Defense-in-depth.
+TEST(LK10EntrySliceB, WasmFormatRejectsProcessExit) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
+      "processExit": { "mechanism": "syscall" }
+    })", "WASM format must reject `processExit` — no trampoline "
+         "emitter applies on operand-stack ABIs");
 }
 
 TEST(LK10EntrySliceB, RelocatableFormatOmitsProcessExitOk) {

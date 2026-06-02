@@ -7,6 +7,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -165,6 +167,12 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
      || data.kind == ObjectFormatKind::Spirv) {
         char const* const universalFields[] = {
             "sections", "relocations", "entryPoint",
+            // dim-2 HIGH #3 (7425905 audit fold): D-LK10-ENTRY
+            // Slice B fields are meaningless on Wasm/SPIR-V
+            // (no trampoline emitter; their exit semantics are
+            // format-native). Defense-in-depth: reject loudly
+            // rather than silently accept dead data.
+            "processExit", "entryCallingConvention",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -210,8 +218,26 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                       "/entryCallingConvention",
                       "'entryCallingConvention' must be a string");
         } else {
-            data.entryCallingConvention =
+            auto const cc =
                 doc.at("entryCallingConvention").get<std::string>();
+            // dim-2 HIGH #2 (7425905 audit fold): non-whitespace
+            // check. Without this, leading/trailing whitespace in a
+            // hand-edited JSON would silently pass schema-load and
+            // fail only at Slice C trampoline-build time via
+            // `callingConventionByName()` returning nullptr.
+            // Symmetric to the format.name discipline.
+            bool const hasWs = std::any_of(cc.begin(), cc.end(),
+                [](unsigned char c) { return std::isspace(c); });
+            if (cc.empty() || hasWs) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/entryCallingConvention",
+                          "'entryCallingConvention' must be a "
+                          "non-empty string with no whitespace "
+                          "(must resolve via `target."
+                          "callingConventionByName(...)`).");
+            } else {
+                data.entryCallingConvention = cc;
+            }
         }
     }
 
@@ -252,6 +278,27 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     armOk = false;
                 } else {
                     out.mechanism = *m;
+                    // simplifier FOLD-NOW #1 (7425905 audit fold):
+                    // collapse the 3 repeated `!contains || !is_string
+                    // || .empty()` patterns into one lambda. Behavior
+                    // unchanged; diagnostic text preserved.
+                    auto requireNonEmptyString =
+                        [&](char const* field, std::string& out) -> bool {
+                            std::string const path =
+                                std::string{"/processExit/"} + field;
+                            if (!pe.contains(field)
+                             || !pe.at(field).is_string()
+                             || pe.at(field).get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          path,
+                                          std::format(
+                                              "requires non-empty '{}' "
+                                              "(string)", field));
+                                return false;
+                            }
+                            out = pe.at(field).get<std::string>();
+                            return true;
+                        };
                     if (out.mechanism == ExitMechanism::Syscall) {
                         if (!pe.contains("syscallNumber")
                          || !pe.at("syscallNumber").is_number_unsigned()) {
@@ -264,17 +311,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             out.syscallNumber =
                                 pe.at("syscallNumber").get<std::uint32_t>();
                         }
-                        if (!pe.contains("syscallNumGpr")
-                         || !pe.at("syscallNumGpr").is_string()
-                         || pe.at("syscallNumGpr").get<std::string>().empty()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/processExit/syscallNumGpr",
-                                      "syscall arm requires non-empty "
-                                      "'syscallNumGpr' (string)");
+                        if (!requireNonEmptyString("syscallNumGpr",
+                                                    out.syscallNumGpr)) {
                             armOk = false;
-                        } else {
-                            out.syscallNumGpr =
-                                pe.at("syscallNumGpr").get<std::string>();
                         }
                         if (!pe.contains("syscallOpcodeBytes")
                          || !pe.at("syscallOpcodeBytes").is_array()
@@ -301,31 +340,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             }
                         }
                     } else {  // ByNameImport
-                        if (!pe.contains("importLibraryPath")
-                         || !pe.at("importLibraryPath").is_string()
-                         || pe.at("importLibraryPath").get<std::string>().empty()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/processExit/importLibraryPath",
-                                      "by-name-import arm requires "
-                                      "non-empty 'importLibraryPath' "
-                                      "(string)");
+                        if (!requireNonEmptyString("importLibraryPath",
+                                                    out.importLibraryPath)) {
                             armOk = false;
-                        } else {
-                            out.importLibraryPath =
-                                pe.at("importLibraryPath").get<std::string>();
                         }
-                        if (!pe.contains("importMangledName")
-                         || !pe.at("importMangledName").is_string()
-                         || pe.at("importMangledName").get<std::string>().empty()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/processExit/importMangledName",
-                                      "by-name-import arm requires "
-                                      "non-empty 'importMangledName' "
-                                      "(string)");
+                        if (!requireNonEmptyString("importMangledName",
+                                                    out.importMangledName)) {
                             armOk = false;
-                        } else {
-                            out.importMangledName =
-                                pe.at("importMangledName").get<std::string>();
                         }
                     }
                 }

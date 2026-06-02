@@ -792,13 +792,16 @@ inline constexpr EnumNameTable<RelocFormulaKind, 4> kRelocFormulaTable{{{
 //                        (Windows `kernel32!ExitProcess`, future
 //                        macOS libSystem). Per-OS data: library
 //                        path, mangled name.
-//   * `None`           — sentinel; format declared no exit
-//                        mechanism. The trampoline emitter fails
-//                        loud `K_NoMatchingObjectFormat` on this
-//                        (silent OS-defaulting would break runnable
-//                        binaries).
+//   * `None`           — default-constructed sentinel. "No
+//                        mechanism" is encoded by the field type
+//                        itself (`optional<ProcessExit>` empty),
+//                        NOT by `None` appearing in a validated
+//                        ProcessExit. The JSON loader explicitly
+//                        rejects `mechanism="none"` so the
+//                        sentinel cannot leak into a validated
+//                        schema.
 enum class ExitMechanism : std::uint8_t {
-    None         = 0,  // sentinel — format declared no exit mechanism
+    None         = 0,  // default-constructed zero; loader rejects "none"
     Syscall      = 1,  // raw syscall (Linux exit_group / Mach-O BSD exit)
     ByNameImport = 2,  // call qword ptr [iat] (Windows ExitProcess)
 };
@@ -819,7 +822,7 @@ exitMechanismFromName(std::string_view s) noexcept {
 
 // Per-OS process-exit descriptor. Lives on `ObjectFormatData`
 // (loaded from format JSON's `processExit` block). The trampoline
-// emitter reads the active arm based on `mechanism`:
+// emitter (Slice C) reads the active arm based on `mechanism`:
 //
 // For Syscall (Linux / macOS-BSD-syscall):
 //   * `syscallNumber`      — syscall-table index (Linux x86_64
@@ -828,17 +831,24 @@ exitMechanismFromName(std::string_view s) noexcept {
 //   * `syscallNumGpr`      — register that holds the syscall number
 //                            at the syscall transition ("rax" on
 //                            x86_64; "x8" on ARM64).
-//   * `syscallOpcodeBytes` — instruction bytes the emitter writes
-//                            verbatim to invoke the kernel
-//                            ("0F 05" SYSCALL on x86_64; "D4 00 00
-//                            01" SVC #0 on ARM64). NOT used by
-//                            Slice B's LIR-driven emitter (which
-//                            emits the `syscall` opcode through
-//                            the assembler) — kept on the
-//                            substrate for Slice C if the syscall
-//                            instruction differs per kernel (e.g.
-//                            BSD `int 0x80` legacy path) without
-//                            requiring a new LIR opcode.
+//   * `syscallOpcodeBytes` — instruction bytes in STORED ORDER
+//                            (memory-layout order, NOT disassembler
+//                            display order). x86_64 SYSCALL byte
+//                            stream = [0x0F, 0x05]. ARM64 SVC #0
+//                            instruction word = 0xD4000001; in
+//                            ARM64's little-endian memory layout
+//                            this stores as [0x01, 0x00, 0x00, 0xD4]
+//                            — that's what the JSON declares + what
+//                            the emitter writes verbatim. NOT used
+//                            by Slice C's LIR-driven emitter today
+//                            (the Slice A `syscall` LIR opcode emits
+//                            these bytes through the assembler) —
+//                            retained on the substrate as an escape
+//                            hatch for future kernels whose syscall
+//                            instruction differs from the LIR
+//                            opcode's lowering (e.g. legacy BSD
+//                            `int 0x80`) without requiring a new
+//                            LIR opcode.
 //
 // For ByNameImport (Windows / macOS-libSystem):
 //   * `importLibraryPath`  — DLL/dylib path ("kernel32.dll" on
