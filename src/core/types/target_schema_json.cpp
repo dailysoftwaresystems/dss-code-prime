@@ -836,6 +836,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
                 readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);
                 readBoundedInt(c, coll, ccPath, "redZoneBytes",     cc.redZoneBytes);
+                // D-LK10-ENTRY-TRAMP-PROLOGUE: process-entry RSP bias
+                // when this cc is the entry cc. See target_schema.hpp
+                // for the per-cc concrete values. Validated below
+                // (must be < stackAlignment when set).
+                readBoundedInt(c, coll, ccPath, "entryStackPointerBias",
+                               cc.entryStackPointerBias);
                 if (c.contains("linkRegister")) {
                     if (!c.at("linkRegister").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,

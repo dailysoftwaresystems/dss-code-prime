@@ -3,6 +3,7 @@
 #include "core/types/extern_import.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir.hpp"
+#include "lir/lir_callconv.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
 
@@ -143,7 +144,10 @@ bool injectEntryTrampoline(AssembledModule&          module,
 
     // Look up all needed opcodes from the target schema (Slice A
     // ships `syscall`, `call_indirect_via_extern`, and the existing
-    // `call` / `mov` / `unreachable` opcodes).
+    // `call` / `mov` / `unreachable` opcodes). `sub` is required
+    // ONLY when the format declares a non-zero
+    // `processExit.preCallStackAdjustBytes` (the ABI-prologue arm
+    // closing D-LK10-ENTRY-TRAMP-PROLOGUE).
     auto const callOp     = target.opcodeByMnemonic("call");
     auto const movOp      = target.opcodeByMnemonic("mov");
     auto const unreachOp  = target.opcodeByMnemonic("unreachable");
@@ -237,6 +241,58 @@ bool injectEntryTrampoline(AssembledModule&          module,
     (void)b.addFunction(trampSym);
     auto blk = b.createBlock();
     b.beginBlock(blk);
+
+    // 0. ABI prologue (D-LK10-ENTRY-TRAMP-PROLOGUE). Compute the
+    //    smallest frame-size adjust satisfying BOTH (a) the cc's
+    //    shadow-space requirement and (b) the cc's stack-alignment
+    //    at the call sites about to follow, given the process-entry
+    //    RSP bias the kernel/loader provides. Algorithm lives ONCE
+    //    in `alignedSizeWithBias()` (lir_callconv.hpp) so ML7 and
+    //    the trampoline share one source of truth — see header
+    //    docblock for the consumers + reasoning.
+    //
+    //    Result is non-zero only when shadowSpaceBytes != 0 OR the
+    //    process-entry RSP is misaligned for the cc (Windows PE:
+    //    32+8=40; SysV ELF / Mach-O / ARM64: 0).
+    //
+    //    No restoration is emitted — the exit mechanism never
+    //    returns (the trampoline ends in `unreachable` / `ud2`).
+    std::uint32_t const adjustBytes = alignedSizeWithBias(
+        static_cast<std::uint32_t>(cc->shadowSpaceBytes),
+        static_cast<std::uint32_t>(cc->stackAlignment),
+        static_cast<std::uint32_t>(cc->entryStackPointerBias));
+    if (adjustBytes > 0) {
+        if (!cc->stackPointer.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: cc '{}' has no "
+                             "`stackPointer` declared but the computed "
+                             "ABI-prologue adjust is {} bytes "
+                             "(D-LK10-ENTRY-TRAMP-PROLOGUE). The cc "
+                             "must declare its stack-pointer register "
+                             "for the trampoline to emit the prologue.",
+                             ccName, adjustBytes));
+            return false;
+        }
+        auto const subOp = target.opcodeByMnemonic("sub");
+        if (!subOp.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: target '{}' lacks the "
+                             "`sub` opcode required by the trampoline "
+                             "ABI prologue (D-LK10-ENTRY-TRAMP-PROLOGUE; "
+                             "fires when the cc declares shadow space "
+                             "OR a non-zero process-entry RSP bias).",
+                             std::string{target.name()}));
+            return false;
+        }
+        auto const spReg = makePhysicalReg(cc->stackPointer->ordinal,
+                                           LirRegClass::GPR);
+        LirOperand const subOps[] = {
+            LirOperand::makeReg(spReg),
+            LirOperand::makeImmInt32(
+                static_cast<std::int32_t>(adjustBytes))
+        };
+        (void)b.addInst(*subOp, spReg, subOps);
+    }
 
     // 1. call user_entry — produces REL32 reloc on the disp32.
     LirOperand const callOps[] = {

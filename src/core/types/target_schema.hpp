@@ -260,6 +260,47 @@ struct DSS_EXPORT TargetCallingConvention {
     std::uint16_t shadowSpaceBytes = 0;   // MS x64: 32 bytes of home space; SysV: 0
     std::uint16_t redZoneBytes     = 0;   // SysV leaf-fn red zone (128); MS x64: 0
 
+    // RSP-bias mod `stackAlignment` at the START of a function that
+    // serves as the PROCESS ENTRY POINT (D-LK10-ENTRY-TRAMP-PROLOGUE).
+    // This is the single new piece of vocabulary that closes the
+    // trampoline ABI-prologue without storing a derived constant:
+    // the bias, together with `stackAlignment` and `shadowSpaceBytes`
+    // already on this struct, determines the smallest `sub sp, N`
+    // the trampoline must emit. Algorithm lives in `lir_callconv.hpp`'s
+    // `alignedSizeWithBias()` so ML7 and the trampoline call ONE
+    // formula.
+    //
+    // Concrete values (encode the OS-loader convention for the entry
+    // cc):
+    //   * `ms_x64`     (Windows PE):   8  — `RtlUserThreadStart` does
+    //                                       a CALL into the entry
+    //                                       point, so the first
+    //                                       instruction sees RSP ≡ 8
+    //                                       mod 16.
+    //   * `sysv_x64`   (Linux ELF /    0  — kernel maps the image and
+    //                  macOS Mach-O):       JUMPS to `_start`/`main`
+    //                                       with RSP 16-byte-aligned
+    //                                       and NO return address
+    //                                       pushed.
+    //   * `aapcs64`    (Linux/Win/Mac  0  — ARM64 BL doesn't push,
+    //                  ARM64):              and the kernel sets SP
+    //                                       aligned at process entry.
+    //
+    // This field is consumed ONLY by the trampoline emitter (the
+    // entry-cc-of-the-program scenario). Normal-function frames
+    // computed by ML7 use the function-entry bias (= the cc's
+    // post-CALL RSP offset, typically equal to `callInstructionPush
+    // Bytes mod stackAlignment` = 8 for x86_64 / 0 for ARM64) — that
+    // bias is NOT this field. Wiring ML7 onto this field is anchored
+    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY for when normal-function call-
+    // site shadow-space lands (separately tracked; not the
+    // trampoline's concern).
+    //
+    // Validators (target_schema.cpp::validate): MUST be 0 if the cc
+    // has all other stack fields at 0; otherwise MUST be <
+    // `stackAlignment`.
+    std::uint16_t entryStackPointerBias = 0;
+
     // Named register reference. Used for distinguished-role registers
     // (link register, stack pointer, frame pointer in future cycles).
     // The struct shape co-locates the JSON-side `name` (kept for

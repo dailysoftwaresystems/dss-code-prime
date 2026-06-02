@@ -950,6 +950,19 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                          std::format("callingConvention '{}': redZoneBytes ({}) must be a multiple of stackAlignment ({})",
                                      cc.name, cc.redZoneBytes, cc.stackAlignment));
                 }
+                // D-LK10-ENTRY-TRAMP-PROLOGUE: entryStackPointerBias
+                // is an offset INTO the alignment quantum, NOT a
+                // multiple of it — must be strictly < stackAlignment.
+                if (cc.entryStackPointerBias >= cc.stackAlignment) {
+                    fail(std::format(
+                             "/callingConventions/{}/entryStackPointerBias", i),
+                         std::format(
+                             "callingConvention '{}': entryStackPointerBias "
+                             "({}) must be < stackAlignment ({}) — bias "
+                             "is an offset INTO the alignment quantum",
+                             cc.name, cc.entryStackPointerBias,
+                             cc.stackAlignment));
+                }
             }
             // ML7 callconv lowering requires a stack-pointer register
             // for any register-machine cc carrying ABI info. Surface
