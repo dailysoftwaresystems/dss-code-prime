@@ -21,6 +21,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "diagnostic_count.hpp"  // dss::test_support::countCode
 #include "lir/lir.hpp"
 
 #include <gtest/gtest.h>
@@ -347,25 +348,35 @@ TEST(LK10EntrySliceA, SyscallWithStrayOperandFailsLoud) {
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();
     b.beginBlock(blk);
-    // A stray imm operand on a zero-operand opcode should NOT match
-    // the empty-list variant guard. LirBuilder's per-opcode operand-
-    // count guard (minOperands/maxOperands = 0) rejects this at
-    // addInst time; if that gate is ever relaxed, the encoder's
-    // guard must still reject. This test pins the contract.
+    // A stray imm operand on a zero-operand opcode does NOT match
+    // the empty-list variant guard. ff7b76d 3rd-order audit:
+    // silent-failure verified `LirBuilder::addInst` (lir.cpp:210-227)
+    // checks only `opcode != 0` and `opcodeInfo(opcode) != nullptr`
+    // — it does NOT enforce min/max-operands (see
+    // `x86_64.target.json:8` $reservedFields: "minOperands/
+    // maxOperands fields are NOT yet fully enforced"). The encoder's
+    // variant-guard match in `walker_util.hpp::operandsMatchGuard`
+    // is the SOLE gate today. Anchor D-LIR-BUILDER-OPERAND-COUNT-GATE
+    // — if a future LirBuilder operand-count gate is added, the test
+    // would start to fail at addInst (different code path); that
+    // signals an intentional substrate change the test author
+    // updates for.
     LirOperand const strayOps[] = { LirOperand::makeImmInt32(42) };
-    // Note: this may fail at addInst (LirBuilder gate) OR at
-    // assemble (encoder guard) — either is acceptable; what's NOT
-    // acceptable is silent emission. We don't assert which gate
-    // catches it, only that errorCount > 0 OR the build aborts.
     (void)b.addInst(*syscallOp, InvalidLirReg, strayOps);
     (void)b.addUnreachable(*unreachOp);
     Lir lir = std::move(b).finish();
     std::vector<MirInstId> lirToMir(lir.instCount());
     DiagnosticReporter rep;
     (void)assemble(lir, **schema, lirToMir, rep);
-    EXPECT_GT(rep.errorCount(), 0u)
-        << "syscall with stray operand must fail loud — empty-list "
-           "variant guard cannot match a 1-operand inst.";
+    // silent-failure FOLD-NOW (3rd-order audit): pin the SPECIFIC
+    // diagnostic code, not just `errorCount > 0` — a regression
+    // firing the wrong diagnostic (e.g. an unrelated infra error)
+    // would silently satisfy a permissive `EXPECT_GT(errorCount, 0)`.
+    EXPECT_GT(::dss::test_support::countCode(
+                  rep, DiagnosticCode::A_NoMatchingEncodingVariant), 0u)
+        << "syscall with stray operand must fire "
+           "A_NoMatchingEncodingVariant from the encoder's variant "
+           "guard — the empty-list guard cannot match a 1-operand inst.";
 }
 
 TEST(LK10EntrySliceA, CallIndirectViaExternWithRegOperandFailsLoud) {
@@ -394,7 +405,13 @@ TEST(LK10EntrySliceA, CallIndirectViaExternWithRegOperandFailsLoud) {
     std::vector<MirInstId> lirToMir(lir.instCount());
     DiagnosticReporter rep;
     (void)assemble(lir, **schema, lirToMir, rep);
-    EXPECT_GT(rep.errorCount(), 0u)
-        << "call_indirect_via_extern with Reg operand must fail loud "
-           "— the guard {operandKinds: [\"symbol\"]} requires SymbolRef.";
+    // Pin specific diagnostic code (silent-failure ff7b76d 3rd-order
+    // audit FOLD-NOW) — the encoder's variant-guard mismatch fires
+    // A_NoMatchingEncodingVariant. A regression that fires a
+    // different code would silently pass a loose errorCount > 0.
+    EXPECT_GT(::dss::test_support::countCode(
+                  rep, DiagnosticCode::A_NoMatchingEncodingVariant), 0u)
+        << "call_indirect_via_extern with Reg operand must fire "
+           "A_NoMatchingEncodingVariant — the variant guard "
+           "{operandKinds: [\"symbol\"]} requires SymbolRef.";
 }
