@@ -21,6 +21,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "diagnostic_count.hpp"
 #include "link/entry_trampoline.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
@@ -183,8 +184,12 @@ TEST(LK10EntrySliceC, ImageEntryOverrideOutOfRangeFailsLoud) {
     auto image = linker::link(mod, **target, **format, rep);
     EXPECT_TRUE(image.bytes.empty())
         << "out-of-range imageEntryOverride must reject (no bytes)";
-    EXPECT_GT(rep.errorCount(), 0u)
-        << "must emit K_SymbolUndefined";
+    // silent-failure HIGH (7f8b843 audit fold): pin SPECIFIC code,
+    // not just errorCount>0 — a regression firing the wrong
+    // diagnostic would silently satisfy a loose check.
+    EXPECT_GT(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "out-of-range must fire K_SymbolUndefined specifically";
 }
 
 TEST(LK10EntrySliceC, SymbolIdSpaceExhaustionFailsLoud) {
@@ -206,7 +211,51 @@ TEST(LK10EntrySliceC, SymbolIdSpaceExhaustionFailsLoud) {
     ASSERT_FALSE(linker::injectEntryTrampoline(
         mod, **target, **format, rep))
         << "trampoline injection must fail loud at UINT32_MAX wrap";
-    EXPECT_GT(rep.errorCount(), 0u);
+    EXPECT_GT(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "UINT32_MAX wrap must fire K_SymbolUndefined specifically";
+}
+
+// code-architect FOLD-NOW (7f8b843 audit fold): all prior Slice C
+// tests exercise the PE/ByNameImport arm of the trampoline. The
+// ELF/Syscall arm (Linux exit_group=231 via SYSCALL) is structurally
+// covered by the same emitter but has no dedicated pin. Bytes-only
+// pin via injectEntryTrampoline on `elf64-x86_64-linux-exec` format
+// — avoids the POSIX-RUN-HARNESS wait (anchored D-LK10-ENTRY-POSIX-
+// RUN-HARNESS) while still catching Syscall-arm regressions.
+TEST(LK10EntrySliceC, SyscallArmInjectsCleanlyOnElfExec) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42Module();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep))
+        << "Syscall-arm trampoline injection must succeed on "
+           "elf64-x86_64-linux-exec";
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // Module post-injection: 2 functions (trampoline at [0], user
+    // at [1]) + ZERO synthetic externImports (Syscall arm doesn't
+    // need an IAT slot — distinguishes Syscall from ByNameImport).
+    ASSERT_EQ(mod.functions.size(), 2u);
+    EXPECT_TRUE(mod.externImports.empty())
+        << "Syscall arm must NOT inject a synthetic ExternImport "
+           "— that's only the ByNameImport arm's behavior.";
+    // Trampoline at functions[0] has the relocation to user_entry
+    // (REL32 for the direct `call`). No ExitProcess reloc.
+    ASSERT_GE(mod.functions[0].relocations.size(), 1u);
+    bool userCallFound = false;
+    for (auto const& r : mod.functions[0].relocations) {
+        if (r.target == SymbolId{1}) {
+            userCallFound = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(userCallFound)
+        << "trampoline must call the user fn (SymbolId{1}) via REL32";
+    EXPECT_TRUE(mod.imageEntryOverride.has_value());
+    EXPECT_EQ(*mod.imageEntryOverride, 0u);
 }
 
 TEST(LK10EntrySliceC, LinkerSkipsInjectionWhenOverrideAlreadyPresent) {

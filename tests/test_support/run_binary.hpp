@@ -17,8 +17,8 @@
 //
 // Caller writes the bytes to disk first via
 // `dss::linker::writeImage`. Caller-side responsibility for
-// permissions on POSIX + .exe extension on Windows
-// (writer.hpp:27-30 documents this contract).
+// permissions on POSIX + .exe extension on Windows (the parent-
+// directory contract is documented at `writer.hpp:30-34`).
 
 #include <chrono>
 #include <cstdint>

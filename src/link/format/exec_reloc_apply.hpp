@@ -16,10 +16,25 @@
 #include <unordered_map>
 #include <vector>
 
-// Shared in-place relocation applier — plan 14 LK6 cycle 1 closure
-// hoisted across the 3 image-side walkers (ELF ET_EXEC, PE PE32+,
-// Mach-O MH_EXECUTE). Closes simplifier #1 + #2 + architect O5
-// 3-agent convergence from the LK2+LK3 cycle 2 review.
+// Shared walker substrate for the 3 image-side walkers (ELF
+// ET_EXEC, PE PE32+, Mach-O MH_EXECUTE). Two concerns now live
+// here:
+//
+//   1. `applyExecRelocations` — in-place relocation applier (plan
+//      14 LK6 cycle 1 closure; hoisted at the LK2+LK3 cycle 2
+//      review via simplifier #1+#2 + architect O5 3-agent
+//      convergence).
+//
+//   2. `resolveEntryFnIdx` — shared image-entry function-index
+//      resolver (D-LK10-ENTRY Slice C audit fold 2026-06-02;
+//      3-agent FOLD-NOW convergence from type-design + simplifier
+//      + code-architect). Honors `module.imageEntryOverride`
+//      first, falls back to `format.entryPoint()` synthesized-
+//      name resolution, defaults to functions[0]. 5 walker sites
+//      collapsed via this helper.
+//
+// The two functions share the `dss::link::format` namespace and
+// rely on the `detail::emit` reporter helper from `byte_emit.hpp`.
 //
 // LK6 cycle 2a generalisation: the caller now passes an
 // **absolute symbol-VA map** (`symbolVa: SymbolId → uint64_t`)
