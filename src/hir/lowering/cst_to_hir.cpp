@@ -176,11 +176,45 @@ struct Lowerer {
     [[nodiscard]] E coerce(E child, TypeId target) {
         if (!target.valid() || !child.type.valid()) return child;
         if (child.type == target) return child;
+        TypeKind const ck = interner.kind(child.type);
+        TypeKind const tk = interner.kind(target);
+        // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-
+        // STRING closure, 2026-06-02): `Array<T,N>` rvalue in a
+        // `Ptr<T>` context decays to the address of the first
+        // element. Emitted as a `Cast` HIR node (the universal
+        // type-conversion marker); HIR→MIR's `mapCast` recognizes
+        // the Array→Ptr pair and routes to the appropriate
+        // materialization (for string literals: synthesize the
+        // MirGlobal + emit GlobalAddr; for local arrays: anchored
+        // D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY).
+        //
+        // Pin the same-element-type rule isAssignable already
+        // checked: only matching `Array<T,N>`/`Ptr<T>` qualifies
+        // for the decay. The HIR verifier expects the Cast's
+        // result type matches `target` here.
+        //
+        // Anchor: D-LANG-STRUCTURAL-DECAY-OPT-OUT (per-language
+        // opt-out when a non-C-family schema wants strict-no-
+        // implicit-decay semantics).
+        if (ck == TypeKind::Array && tk == TypeKind::Ptr) {
+            auto const arrElem = interner.operands(child.type);
+            auto const ptrElem = interner.operands(target);
+            if (!arrElem.empty() && !ptrElem.empty()
+                && arrElem[0] == ptrElem[0]) {
+                HirNodeId const decay = builder.makeCast(
+                    child.id, target, HirFlags::Synthetic);
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({decay, it->second});
+                        break;
+                    }
+                }
+                return {decay, target};
+            }
+        }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds) is the implicit-conversion surface.
-        TypeKind const ck = interner.kind(child.type);
-        TypeKind const tk = interner.kind(target);
         auto isArithmetic = [](TypeKind k) noexcept {
             return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
                 || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32

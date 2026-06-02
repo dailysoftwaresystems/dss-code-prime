@@ -391,6 +391,21 @@ lowerMirGlobalsToDataItems(Mir const&          mir,
         // here (raw bytes + 1 NUL byte) so the on-disk layout
         // matches what C-style consumers expect when dereferencing
         // through the array.
+        //
+        // DISPATCH-ORDER INVARIANT (code-architect audit fold,
+        // 2026-06-02 — D-LK4-RODATA-PRODUCER-STRING coupling):
+        // this `std::string` variant check MUST fire BEFORE the
+        // TypeKind-keyed `primitiveByteSize` gate below. String-
+        // literal-promoted MirGlobals carry `TypeKind::Array` (the
+        // HIR string-literal's `Array<Char,N+1>` type), which
+        // `primitiveByteSize` does NOT handle (returns nullopt →
+        // K_NoMatchingObjectFormat with a misleading "non-primitive
+        // global types are anchored under D-LK4-RODATA-PRODUCER-
+        // AGGREGATE-GLOBAL" message). The dispatch on the LITERAL-
+        // POOL VARIANT (not the TypeKind) is the correct
+        // discriminator for the string case. A future refactor
+        // that reorders to "TypeKind check first" would silently
+        // break the D-LK4-RODATA-PRODUCER-STRING closure path.
         if (std::holds_alternative<std::string>(v.value)) {
             auto const& s = std::get<std::string>(v.value);
             d.bytes.assign(s.begin(), s.end());

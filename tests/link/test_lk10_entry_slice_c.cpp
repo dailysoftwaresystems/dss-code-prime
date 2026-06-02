@@ -226,6 +226,51 @@ TEST(LK10EntrySliceC, SyntheticExitProcessExternThreadsThroughIat) {
     EXPECT_EQ(*mod.imageEntryOverride, 0u);
 }
 
+TEST(LK10EntrySliceC, MaxExistingSymbolIdScansDataItems) {
+    // D-LK4-RODATA-PRODUCER-STRING audit-fold pin (2026-06-02):
+    // `entry_trampoline.cpp::maxExistingSymbolIdV` was extended to
+    // scan `module.dataItems` so the trampoline's synthetic _start
+    // and ExitProcess SymbolId mints can't collide with a string-
+    // literal-promoted rodata global. Without this scan, the
+    // collision would surface as `K_DuplicateDataSymbol` in the PE
+    // walker's symbolVa loop (loud but root-cause-distant). This
+    // test pins the defense: a module with a high-SymbolId rodata
+    // item must produce trampoline mints STRICTLY greater than the
+    // rodata symbol — regardless of how many user functions exist.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(format.has_value());
+    AssembledModule mod = makeReturn42Module();  // 1 user fn at SymbolId{1}
+    AssembledData rodata;
+    rodata.symbol  = SymbolId{100};  // high; would collide if scan misses
+    rodata.section = DataSectionKind::Rodata;
+    rodata.bytes   = {'X', 0};
+    rodata.alignment = Alignment::of<1>();
+    mod.dataItems.push_back(std::move(rodata));
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // Trampoline injection adds a synthetic _start at functions[0]
+    // and a synthetic ExitProcess extern. Both SymbolIds must be
+    // strictly greater than 100 (the rodata item's SymbolId).
+    ASSERT_GE(mod.functions.size(), 2u);
+    EXPECT_GT(mod.functions[0].symbol.v, 100u)
+        << "trampoline SymbolId must exceed rodata item's "
+           "SymbolId — the audit-fold dataItems scan is the load-"
+           "bearing defense against K_DuplicateDataSymbol";
+    ASSERT_GE(mod.externImports.size(), 1u);
+    EXPECT_GT(mod.externImports[0].symbol.v, 100u)
+        << "synthetic ExitProcess SymbolId must also exceed "
+           "rodata item's SymbolId";
+    // Cross-check: the rodata symbol itself must remain in dataItems
+    // with its original ID (the audit-fold extension is a SCAN, not
+    // a rewrite).
+    ASSERT_EQ(mod.dataItems.size(), 1u);
+    EXPECT_EQ(mod.dataItems[0].symbol.v, 100u);
+}
+
 // ── Fail-loud pins added at Slice C audit fold (3-agent convergence) ──
 
 TEST(LK10EntrySliceC, ImageEntryOverrideOutOfRangeFailsLoud) {

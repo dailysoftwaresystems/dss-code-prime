@@ -6,6 +6,7 @@
 
 #include <array>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -104,6 +105,73 @@ struct Lowerer {
         bool       continueReferenced = false;
     };
     std::vector<BranchFrame> branchStack;
+
+    // D-LK4-RODATA-PRODUCER-STRING (2026-06-02): synthetic-symbol
+    // counter for string-literal-promoted globals. Initialized to
+    // 1 + max(existing function/extern/global SymbolId.v) on first
+    // use so synthetic symbols can't collide with user-declared
+    // ones. Mirrors the `entry_trampoline.cpp::maxExistingSymbolIdV`
+    // pattern used by D-LK10-ENTRY Slice C. Lazy seeding lets the
+    // pre-passes (`collectFunctions` / `collectGlobals` /
+    // `collectExterns`) populate the symbol sets BEFORE the first
+    // expression lowering reaches a string literal.
+    //
+    // Encoded as `optional<uint32_t>` (type-design audit fold,
+    // 2026-06-02): a `(bool seeded, uint32_t value)` two-field
+    // pair admits the contradictory state `(false, 17)` that no
+    // invariant pinned. `optional<uint32_t>` encodes "unseeded +
+    // value" in one type-enforced state; `if (!opt.has_value())`
+    // is the lazy-seed gate.
+    std::optional<std::uint32_t> nextSyntheticGlobalSym_;
+    // Returns a fresh SymbolId, OR an invalid `SymbolId{}` if the
+    // mint would wrap around UINT32_MAX. The caller is expected to
+    // fail loud on the invalid sentinel — silent-failure HIGH-1
+    // audit fold (2026-06-02): mirrors the D-LK10-ENTRY Slice C
+    // discipline `SymbolId{} == 0` sentinel + caller-checked
+    // wraparound, anchored by the prior `3541177` audit fold's
+    // `SymbolIdSpaceExhaustionFailsLoud` precedent. Without this
+    // guard, a 2^32-occurrence string-literal corpus would silently
+    // wrap and collide with SymbolId{0} / user symbols.
+    [[nodiscard]] SymbolId mintSyntheticGlobalSymbol() {
+        if (!nextSyntheticGlobalSym_.has_value()) {
+            std::uint32_t maxV = 0;
+            for (auto v : functionSymbols) {
+                if (v > maxV) maxV = v;
+            }
+            for (auto v : globalSymbols) {
+                if (v > maxV) maxV = v;
+            }
+            // Cross-tier collision protection (code-architect audit
+            // fold, 2026-06-02): `collectExterns` (search by name
+            // — line numbers drift) inserts every extern's
+            // `SymbolId.v` into `functionSymbols`. The scan above
+            // therefore covers functions + externs + globals — the
+            // three user-symbol categories MIR sees. The HIR builder's
+            // `freshSymbol()` runs past `model.symbols().size()`
+            // for HIR-synthesized symbols; those SymbolIds are
+            // ALREADY in `functionSymbols`/`globalSymbols` by the
+            // time `mintSyntheticGlobalSymbol()` first runs, so
+            // the lazy seed naturally clears them too.
+            //
+            // UINT32_MAX seed: refuse to seed at the saturated
+            // edge so the immediate `*nextSyntheticGlobalSym_`
+            // read below never wraps. The caller fail-louds.
+            if (maxV == std::numeric_limits<std::uint32_t>::max()) {
+                return SymbolId{};
+            }
+            nextSyntheticGlobalSym_ = maxV + 1u;
+        }
+        std::uint32_t const minted = *nextSyntheticGlobalSym_;
+        // Wrap detection (silent-failure HIGH-1 audit fold): if
+        // `minted == UINT32_MAX`, advancing would wrap to 0
+        // (collide with the invalid sentinel). Refuse and let the
+        // caller fail loud.
+        if (minted == std::numeric_limits<std::uint32_t>::max()) {
+            return SymbolId{};
+        }
+        nextSyntheticGlobalSym_ = minted + 1u;
+        return SymbolId{minted};
+    }
 
     // Emit an unsupported-construct diagnostic anchored at the HIR node's
     // source span (via the optional source map). The buffer/span both
@@ -541,13 +609,83 @@ struct Lowerer {
                     unsupported(node, "malformed Cast (expect 1 operand)");
                     return InvalidMirInst;
                 }
-                MirInstId const operand = lowerExpr(kids[0]);
-                if (!operand.valid()) return InvalidMirInst;
                 TypeId const fromTy = hir.typeId(kids[0]);
                 TypeKind const fromK = fromTy.valid()
                     ? interner.kind(fromTy) : TypeKind::Void;
                 TypeKind const toK   = t.valid()
                     ? interner.kind(t) : TypeKind::Void;
+                // D-LK4-RODATA-PRODUCER-STRING closure (2026-06-02):
+                // C-standard array-to-pointer decay. CST→HIR's coerce()
+                // emits a synthetic `Cast` HIR node when an Array<T,N>
+                // rvalue reaches a Ptr<T> context. Lower it BEFORE the
+                // general mapCast() path so the operand's array-typed
+                // SSA value never materializes (it would have no encoder
+                // path: an aggregate Const cannot land in a single
+                // register). Cycle scope: string literals only —
+                // synthesize a MirGlobal carrying the string bytes +
+                // emit GlobalAddr returning the Ptr. Local-array decay
+                // (`int arr[10]; foo(arr);`) is anchored as
+                // D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY (needs
+                // `AddressOf(Alloca) + Gep(0)` lowering); non-string
+                // module-scope arrays anchored as
+                // D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY.
+                // Both fail loud here so a future producer can't slip
+                // a silent miscompile through this arm.
+                if (fromK == TypeKind::Array && toK == TypeKind::Ptr) {
+                    if (hir.kind(kids[0]) != HirKind::Literal) {
+                        unsupported(node,
+                            "Array→Pointer decay supported only on "
+                            "string-literal operands today (local + "
+                            "non-string-global arrays anchored "
+                            "D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY "
+                            "/ D-LK4-RODATA-PRODUCER-NONSTRING-GLOBAL-"
+                            "ARRAY-DECAY)");
+                        return InvalidMirInst;
+                    }
+                    std::uint32_t const litIdx0 = hir.payload(kids[0]);
+                    HirLiteralValue const& src = literals.at(litIdx0);
+                    if (!std::holds_alternative<std::string>(src.value)) {
+                        unsupported(node,
+                            "Array→Pointer decay operand is a Literal "
+                            "but its pool entry is not a string arm "
+                            "(non-string array literals anchored "
+                            "D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-"
+                            "LITERAL-DECAY)");
+                        return InvalidMirInst;
+                    }
+                    // Mint a fresh synthetic global for the literal,
+                    // register it in the MIR globals arena with the
+                    // string bytes as its constant-init, and emit a
+                    // `GlobalAddr` that returns the Ptr<T> the Cast
+                    // expression yields. The lowerMirGlobalsToDataItems
+                    // pass (asm/asm.cpp) materializes the rodata bytes
+                    // from this MirGlobal at assembly time.
+                    //
+                    // SymbolId-space-exhaustion guard (silent-failure
+                    // HIGH-1 audit fold, 2026-06-02): the minter
+                    // returns invalid SymbolId{} when the next mint
+                    // would wrap UINT32_MAX. Fail loud rather than
+                    // silently collide with SymbolId{0} (the
+                    // invalid sentinel) or user-declared symbols.
+                    SymbolId const sym = mintSyntheticGlobalSymbol();
+                    if (!sym.valid()) {
+                        unsupported(node,
+                            "string-literal promotion failed: "
+                            "synthetic SymbolId space exhausted "
+                            "(UINT32_MAX wraparound). Source has "
+                            "too many string literals OR the user "
+                            "SymbolId range already saturates the "
+                            "u32 space. Anchor: D-LK4-RODATA-"
+                            "PRODUCER-STRING space-exhaustion pin.");
+                        return InvalidMirInst;
+                    }
+                    std::uint32_t const mirLitIdx =
+                        mir.literalPoolAdd(toMirLiteral(src));
+                    (void)mir.addGlobal(fromTy, sym, mirLitIdx);
+                    return mir.addGlobalAddr(sym, t);
+                }
+                MirInstId const operand = lowerExpr(kids[0]);
+                if (!operand.valid()) return InvalidMirInst;
                 MirOpcode const mop = mapCast(fromK, toK);
                 if (mop == MirOpcode::Invalid) {
                     unsupported(node, std::format(

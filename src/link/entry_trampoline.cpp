@@ -29,6 +29,16 @@ namespace {
     for (auto const& ext : mod.externImports) {
         if (ext.symbol.v > maxV) maxV = ext.symbol.v;
     }
+    // D-LK4-RODATA-PRODUCER-STRING audit-fold (2026-06-02): include
+    // rodata items so the trampoline's mint can't collide with a
+    // string-literal-promoted MirGlobal that landed in dataItems.
+    // The collision would surface as `K_DuplicateDataSymbol` in the
+    // PE walker's symbolVa loop, NOT here — silent at this site,
+    // loud downstream — but the diagnostic would point at the PE
+    // walker, away from the actual root cause (the missing scan).
+    for (auto const& d : mod.dataItems) {
+        if (d.symbol.v > maxV) maxV = d.symbol.v;
+    }
     return maxV;
 }
 
