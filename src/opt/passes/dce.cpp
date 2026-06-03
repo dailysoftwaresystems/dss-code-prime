@@ -48,6 +48,12 @@ namespace {
 [[nodiscard]] std::unordered_set<std::uint32_t>
 computeLiveInsts(Mir const& mir,
                  std::vector<MirBlockId> const& reachable) {
+    // Reachable-block set as a flat hash for O(1) predecessor lookup
+    // (used to filter phi incomings — see below).
+    std::unordered_set<std::uint32_t> reachableSet;
+    reachableSet.reserve(reachable.size());
+    for (MirBlockId const b : reachable) reachableSet.insert(b.v);
+
     std::unordered_set<std::uint32_t> live;
     std::deque<MirInstId> worklist;
 
@@ -65,12 +71,18 @@ computeLiveInsts(Mir const& mir,
     }
 
     // BFS backward over operands (or phi incomings for Phi nodes).
+    // For phi: intersect incomings with the reachable predecessor
+    // set — Phase-3 rebuild also drops unreachable-pred incomings,
+    // so marking their value live would over-approximate the live
+    // set (latent risk if anything other than the rebuild ever
+    // consumes `liveInsts`).
     while (!worklist.empty()) {
         MirInstId const id = worklist.front();
         worklist.pop_front();
         MirOpcode const op = mir.instOpcode(id);
         if (op == MirOpcode::Phi) {
             for (auto const& inc : mir.phiIncomings(id)) {
+                if (!reachableSet.count(inc.pred.v)) continue;
                 if (live.insert(inc.value.v).second) {
                     worklist.push_back(inc.value);
                 }
@@ -111,12 +123,42 @@ struct SymbolScanResult {
     SymbolScanResult out;
     std::deque<MirFuncId> funcWorklist;
 
-    // SymbolId.v → MirFuncId map for BFS expansion.
+    // SymbolId.v → MirFuncId map for BFS expansion. MirBuilder
+    // admits multiple functions with the same SymbolId (weak
+    // aliases, COMDAT, hand-built test fixtures) AND admits
+    // symbol.v == 0 (anonymous / synthetic thunks). Both shapes
+    // would silently miscompile here: `emplace` drops the second
+    // entry → only the first is dispatched by the BFS → subsequent
+    // functions with the same symbol enter `liveSymbols` (via the
+    // shared symbol) but never get a `perFunc` entry → step 3's
+    // fail-loud fires with a misleading "scanLiveSymbols invariant"
+    // message. Fail loud HERE so the user/test author sees the
+    // actual root cause (input MIR has aliasing symbols).
     std::unordered_map<std::uint32_t, MirFuncId> symToFunc;
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        symToFunc.emplace(mir.funcSymbol(f).v, f);
+        std::uint32_t const sv = mir.funcSymbol(f).v;
+        if (sv == 0) {
+            std::fprintf(stderr,
+                "dss::opt::passes::scanLiveSymbols fatal: function "
+                "funcId v=%u has SymbolId v=0 (anonymous / synthetic) — "
+                "DCE's symbol-keyed BFS cannot disambiguate. Caller "
+                "must assign a unique non-zero SymbolId before invoking "
+                "the optimizer (D-OPT3-DCE-ANONYMOUS-SYMBOL).\n", f.v);
+            std::abort();
+        }
+        auto const [it, inserted] = symToFunc.emplace(sv, f);
+        if (!inserted) {
+            std::fprintf(stderr,
+                "dss::opt::passes::scanLiveSymbols fatal: SymbolId v=%u "
+                "appears on multiple functions (funcId v=%u and v=%u) — "
+                "DCE's inter-procedural BFS requires unique SymbolIds. "
+                "Weak/COMDAT-style aliasing is not supported in this cycle "
+                "(D-OPT3-DCE-DUPLICATE-SYMBOL).\n",
+                sv, it->second.v, f.v);
+            std::abort();
+        }
     }
 
     // Phase 1: seed with externally-visible roots.
@@ -429,19 +471,32 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
         if (!liveSymbols.count(mir.funcSymbol(f).v)) {
+            // Whole-function elimination: count this function AND
+            // every one of its blocks so `blocksEliminated` reflects
+            // the total elision (not only blocks dropped from
+            // surviving functions). Pre-fold the counter undercounted
+            // — a consumer ratioing block-elimination against total
+            // blocks would have seen misleading data on modules where
+            // DCE drops entire functions.
             ++result.functionsEliminated;
+            result.blocksEliminated += mir.funcBlockCount(f);
             continue;
         }
         auto const it = symScan.perFunc.find(f.v);
         if (it == symScan.perFunc.end()) {
-            // A live function with no per-function live-set entry is a
-            // substrate-contract violation: scanLiveSymbols populates
-            // perFunc[f.v] for every function it BFS'd, and the BFS
-            // visits every function whose symbol enters liveSymbols.
+            // A live function with no per-function live-set entry —
+            // scanLiveSymbols was supposed to populate perFunc[f.v]
+            // for every function whose symbol entered liveSymbols.
+            // Anonymous (symbol.v=0) and duplicate-symbol cases now
+            // fail loud INSIDE scanLiveSymbols (see D-OPT3-DCE-
+            // ANONYMOUS-SYMBOL + D-OPT3-DCE-DUPLICATE-SYMBOL), so
+            // reaching this site means scanLiveSymbols dropped a
+            // function on a path other than those two.
             std::fprintf(stderr,
                 "dss::opt::passes::runDce fatal: liveSymbols includes "
                 "fn symbol %u but perFunc has no entry for funcId v=%u — "
-                "scanLiveSymbols invariant violation.\n",
+                "scanLiveSymbols BFS invariant violation (every live "
+                "function-symbol must be visited).\n",
                 mir.funcSymbol(f).v, f.v);
             std::abort();
         }
