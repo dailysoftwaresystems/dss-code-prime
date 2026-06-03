@@ -13,13 +13,17 @@
 #include <vector>
 
 // Plan 11 FF2 — C header parser ("header mode"). Reads a pre-reduced
-// C header (per plan 11 §4 Q1: hermetic, hand-curated under
-// `src/dss-config/ffi-headers/<library>/`) and returns the symbol
-// surface as `ImportSurface` rows — uniform with FF1's binary
-// readers. Thin orchestration over the c-subset frontend (tokenize +
-// parse + semantic-analyze + lower-to-HIR); typedefs are absorbed
-// into the type system, everything else either yields a row or
-// fails loud.
+// C header from disk OR in-memory text + returns the symbol surface
+// as `ImportSurface` rows — uniform with FF1's binary readers. Thin
+// orchestration over the c-subset frontend (tokenize + parse +
+// semantic-analyze + lower-to-HIR); typedefs are absorbed into the
+// type system, everything else either yields a row or fails loud.
+//
+// FF-latent (no live production caller as of 2026-06-03). The
+// shipped-headers consumer (`readCHeaderShipped`) + the
+// `src/dss-config/ffi-headers/` tree were removed as dead code; this
+// substrate remains compiled and tested as anchored future
+// capability (D-FF2 in plan 11).
 
 namespace dss::ffi {
 
@@ -38,7 +42,6 @@ enum class HeaderReadErrorKind : std::uint8_t {
     GrammarLoadFailed            = 5,  // shipped c-subset grammar JSON could not load
     HeaderHasUnsupportedTopLevel = 6,  // ImportGroup (#include), future HirKind, etc.
     InternalInvariant            = 7,  // compiler-bug surface — file a bug
-    InvalidShippedPath           = 8,  // readCHeaderShipped relative-path validation reject
 };
 
 // D-FF2-2: source location of the offending construct, set by per-decl
@@ -46,7 +49,7 @@ enum class HeaderReadErrorKind : std::uint8_t {
 // HeaderHasUnsupportedTopLevel / InternalInvariant) and by HeaderParseFailed
 // when a downstream lowering emitted a span-bearing diagnostic. Entry-point
 // errors that have no node-level locus (FileOpenFailed / EmptyImportLibrary /
-// GrammarLoadFailed / InvalidShippedPath) leave this default-constructed —
+// GrammarLoadFailed) leave this default-constructed —
 // `at.isAbsent() == true`, the canonical "no source location" value per
 // `hir/attributes/source_span.hpp:30-60`. No `std::optional` wrapper —
 // `HirSourceLoc{}` is already the documented absent sentinel (post-fold #7
@@ -95,20 +98,5 @@ readCHeaderFromText(std::string_view    text,
                     std::string_view    headerPathLabel,
                     std::string_view    importLibrary,
                     DiagnosticReporter& reporter);
-
-// Convenience: resolve `headerRelPath` (e.g. `"libc/stdio.h"`) under
-// the shipped `src/dss-config/ffi-headers/` tree via the standard
-// `findShippedFfiHeader` cwd-walk-up, then dispatch to `readCHeader`.
-//
-// Returns `InvalidShippedPath` if `headerRelPath` is empty, absolute
-// (leading `/`/`\`, drive letter), starts with `.`, or contains a
-// `..` path component (rejected per-component, not via substring
-// match). Returns `FileOpenFailed` if the path validates but no
-// shipped file matches in the cwd ancestry.
-[[nodiscard]] DSS_EXPORT
-std::expected<std::vector<ImportSurface>, HeaderReadError>
-readCHeaderShipped(std::string_view    headerRelPath,
-                   std::string_view    importLibrary,
-                   DiagnosticReporter& reporter);
 
 } // namespace dss::ffi

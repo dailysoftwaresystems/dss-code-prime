@@ -144,9 +144,10 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
             headers.push_back(entry.path());
         }
     }
-    // Deterministic order: alphabetical by filename — round-trips
-    // with the shipped `src/dss-config/ffi-headers/<lib>/*.h` layout
-    // and makes test assertions stable across platforms.
+    // Deterministic order: alphabetical by filename — makes test
+    // assertions stable across platforms when a directory-based
+    // header library is fed to FF5 (no live production caller as of
+    // 2026-06-03; FF-latent substrate).
     std::sort(headers.begin(), headers.end());
 
     std::vector<ImportSurface> aggregated;

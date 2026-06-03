@@ -330,7 +330,7 @@ TEST(FfiCHeaderParser, ErrorStructLocationAbsentEvenWithPriorCallError) {
 
 TEST(FfiCHeaderParser, ErrorStructLocationAbsentForEntryPointFailures) {
     // D-FF2-2 negative: entry-point errors (EmptyImportLibrary /
-    // FileOpenFailed / GrammarLoadFailed / InvalidShippedPath) have
+    // FileOpenFailed / GrammarLoadFailed) have
     // no single decl locus — `at` stays default-constructed
     // (buffer.valid() == false). Programmatic consumers must check
     // before reading; this pins the contract.
@@ -397,109 +397,6 @@ TEST(FfiCHeaderParser, HeaderReadErrorKindNameRoundTrip) {
               "HeaderHasUnsupportedTopLevel");
     EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::InternalInvariant),
               "InternalInvariant");
-    EXPECT_EQ(headerReadErrorKindName(HeaderReadErrorKind::InvalidShippedPath),
-              "InvalidShippedPath");
-}
-
-// ── Shipped headers via readCHeaderShipped ───────────────────
-
-TEST(FfiCHeaderParser, ShippedLibcStdioRoundTrips) {
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped("libc/stdio.h", "libc.so.6", rep);
-    if (!rowsOrErr.has_value()
-        && rowsOrErr.error().kind == HeaderReadErrorKind::FileOpenFailed) {
-        GTEST_SKIP() << "shipped libc/stdio.h not located from cwd; "
-                     << "build configs without an upward-reachable repo root "
-                     << "can't run this test (not a regression).";
-    }
-    ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
-    ASSERT_EQ(rowsOrErr->size(), 2u);
-    EXPECT_EQ((*rowsOrErr)[0].mangledName, "puts");
-    EXPECT_EQ((*rowsOrErr)[1].mangledName, "putchar");
-    for (auto const& row : *rowsOrErr) {
-        EXPECT_EQ(row.libraryPath, "libc.so.6");
-        EXPECT_EQ(row.kind, SymbolKind::Function);
-    }
-    EXPECT_EQ(rep.errorCount(), 0u);
-}
-
-TEST(FfiCHeaderParser, ShippedLibcStdlibRoundTrips) {
-    // pr-test-analyzer P9 fold: stdlib.h exercises `void*` return,
-    // `void*` parameter, and `void` return — distinct shapes from
-    // stdio.h. A c-subset grammar regression dropping `void*` for
-    // return types would trip ONLY this test.
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped("libc/stdlib.h", "libc.so.6", rep);
-    if (!rowsOrErr.has_value()
-        && rowsOrErr.error().kind == HeaderReadErrorKind::FileOpenFailed) {
-        GTEST_SKIP() << "shipped libc/stdlib.h not located from cwd.";
-    }
-    ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
-    ASSERT_EQ(rowsOrErr->size(), 3u);
-    EXPECT_EQ((*rowsOrErr)[0].mangledName, "malloc");
-    EXPECT_EQ((*rowsOrErr)[1].mangledName, "free");
-    EXPECT_EQ((*rowsOrErr)[2].mangledName, "exit");
-    for (auto const& row : *rowsOrErr) {
-        EXPECT_EQ(row.libraryPath, "libc.so.6");
-        EXPECT_EQ(row.kind, SymbolKind::Function);
-    }
-    EXPECT_EQ(rep.errorCount(), 0u);
-}
-
-TEST(FfiCHeaderParser, ShippedHeaderPathTraversalRejected) {
-    // Post-FF2-#2 H2 fold: path-traversal is now a distinct kind
-    // (InvalidShippedPath) + code (F_HeaderInvalidShippedPath),
-    // separating caller-API bugs from file-not-found.
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped("../etc/passwd", "libc.so.6", rep);
-    ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
-    EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderInvalidShippedPath), 1u);
-}
-
-TEST(FfiCHeaderParser, ShippedHeaderEmptyPathRejected) {
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped("", "libc.so.6", rep);
-    ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
-}
-
-TEST(FfiCHeaderParser, ShippedHeaderLeadingSlashRejected) {
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped("/etc/passwd", "libc.so.6", rep);
-    ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
-}
-
-#if defined(_WIN32)
-TEST(FfiCHeaderParser, ShippedHeaderWindowsAbsoluteRejected) {
-    // CRITICAL-1 fold: Windows absolute paths (drive letter) must
-    // be rejected — the pre-fold leading-char check would have
-    // accepted `C:\Windows\...` and composed it as an absolute
-    // path via `fs::path::operator/`.
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped("C:/Windows/System32/drivers/etc/hosts",
-                                        "libc.so.6", rep);
-    ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
-}
-#endif
-
-TEST(FfiCHeaderParser, ShippedHeaderLeadingDotRejected) {
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped(".config/secrets", "libc.so.6", rep);
-    ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
-}
-
-TEST(FfiCHeaderParser, ShippedHeaderEmbeddedTraversalRejectedByComponent) {
-    // Per-component check: a `..` in the middle of the path is also
-    // rejected (the pre-fold substring check matched but so did
-    // `foo..bar`; this test pins the cleaner component check).
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped("libc/../etc/passwd", "libc.so.6", rep);
-    ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::InvalidShippedPath);
 }
 
 TEST(FfiCHeaderParser, NonExternGlobalRejectionCarriesSourceSpan) {
@@ -524,15 +421,7 @@ TEST(FfiCHeaderParser, NonExternGlobalRejectionCarriesSourceSpan) {
     EXPECT_TRUE(foundWithSpan);
 }
 
-TEST(FfiCHeaderParser, ShippedPathRejectionInlinesCauseInWrapMessage) {
-    // Post-FF2-#2 silent-failure C2 fold: the wrap diagnostic must
-    // include the underlying cause text so that even with
-    // `--suppress=C_*` the operator sees what went wrong.
-    DiagnosticReporter rep;
-    auto rowsOrErr = readCHeaderShipped("libc/../etc/passwd", "libc.so.6", rep);
-    ASSERT_FALSE(rowsOrErr.has_value());
-    // Cause was "shipped-ffi-header path must not contain a '..' component".
-    EXPECT_NE(rowsOrErr.error().detail.find("'..'"), std::string::npos)
-        << "wrap must inline the underlying ConfigDiagnostic cause; got: "
-        << rowsOrErr.error().detail;
-}
+// (`ShippedPathRejectionInlinesCauseInWrapMessage` test removed
+// 2026-06-03: shipped-headers tree + `readCHeaderShipped` /
+// `findShippedFfiHeader` deleted as dead code, no production
+// consumer ever called them.)

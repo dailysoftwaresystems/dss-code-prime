@@ -151,14 +151,17 @@ enum class DiagnosticCode : std::uint16_t {
     // construction — the schema loader in `core` cannot see the `hir`-layer
     // enums — and reported as H_UnsupportedLoweringForKind.)
     C_InvalidHirLowering          = 0xC033,
-    // C_InvalidShippedFfiHeaderPath: `findShippedFfiHeader` was called
-    // with a relative path that is empty / absolute / starts with `.`
-    // / contains a `..` component. Distinct from C_InvalidLanguageName
-    // because the remediation prose is path-shaped, not name-shaped:
-    // the caller passes something like `"libc/stdio.h"`, NOT a logical
-    // language identifier. Post-FF2-#2 fold (silent-failure HIGH-2 +
-    // code-reviewer HIGH).
-    C_InvalidShippedFfiHeaderPath = 0xC034,
+    // C_InvalidShippedFfiHeaderPath: RETIRED 2026-06-03. The shipped
+    // FFI-headers tree (`src/dss-config/ffi-headers/`) + the
+    // `findShippedFfiHeader` resolver + `readCHeaderShipped` consumer
+    // were removed in the OPT2 cycle 1 commit — the only caller path
+    // was tests of the shipped headers themselves, with no production
+    // consumer (production routes through `synthesizeFfiFromSourceDecls`).
+    // The number is kept reserved (NOT renumbered) so historical
+    // diagnostics remain decodeable. The FF1/FF2/FF5 in-memory +
+    // arbitrary-path header substrate (readCHeader / readCHeaderFromText)
+    // stays as unused-feature substrate awaiting its trigger.
+    C_InvalidShippedFfiHeaderPath = 0xC034,  // RETIRED — see comment
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
@@ -605,6 +608,30 @@ enum class DiagnosticCode : std::uint16_t {
     //   the silent-fallback gap code-reviewer C2 flagged in OPT1
     //   cycle 1. D-OPT1-PASS-ID-STABILITY's enforcement surface.
     X_UnknownPassId                = 0x2001,
+    // X_PipelineVersionMismatch: a `*.pipeline.json` file is missing
+    //   `dssPipelineVersion` or carries a version this build doesn't
+    //   speak. Same shape as C_VersionMismatch for target/format
+    //   schemas — fail-loud at load time so a config-tier mismatch
+    //   never silently maps to the wrong pipeline.
+    X_PipelineVersionMismatch      = 0x2002,
+    // X_UnknownPassName: a `*.pipeline.json` `passes[]` entry names a
+    //   string that `optPassIdFromName` does not recognize. The
+    //   config-load-time analog of X_UnknownPassId (which fires at
+    //   runtime dispatch). Catches typos + drift between JSON and
+    //   the PassId enum.
+    X_UnknownPassName              = 0x2003,
+    // X_PipelineMalformed: `*.pipeline.json` has a structural issue
+    //   the loader can't recover from — missing required field,
+    //   wrong type, unknown sub-key in a closed-key object (per
+    //   D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD).
+    X_PipelineMalformed            = 0x2004,
+    // X_PipelineNameResolutionFailed: compile_pipeline asked for a
+    //   pipeline by name (e.g. "release") but `loadShipped(name)`
+    //   couldn't locate a matching `*.pipeline.json` under
+    //   `src/dss-config/pipelines/`. Distinguished from
+    //   X_PipelineMalformed (which means the file was found but
+    //   broken).
+    X_PipelineNameResolutionFailed = 0x2005,
 
     // ── Linker (renders as `K`) ───────────────────────────────────────
     //
@@ -816,12 +843,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   numeric kind embedded in the diagnostic detail). Remediation:
     //   remove the construct from the curated header OR extend FF2 to
     //   accept it.
-    // F_HeaderInvalidShippedPath: `readCHeaderShipped` was called with
-    //   a relative path that is empty / absolute / contains a `..`
-    //   component / starts with `.` — caller-API bug separate from
-    //   genuine "file not found in any ancestor dir" (F_FileOpenFailed).
-    //   Remediation: caller passes a valid relative path like
-    //   `"libc/stdio.h"`.
+    // F_HeaderInvalidShippedPath: RETIRED 2026-06-03. The shipped-
+    //   header consumer (`readCHeaderShipped`) was deleted alongside
+    //   `findShippedFfiHeader` + `src/dss-config/ffi-headers/` — no
+    //   production caller. Number kept reserved to preserve the band
+    //   layout. (FF1/FF2 substrate stays — `readCHeader` /
+    //   `readCHeaderFromText` are unused-feature substrate awaiting
+    //   their trigger; only the shipped-path-loading variant retired.)
     // F_HeaderInternalInvariant: an internal-invariant violation
     //   reached the header walker — a compiler bug, not a user-fixable
     //   issue. Remediation: file a bug.
@@ -836,7 +864,7 @@ enum class DiagnosticCode : std::uint16_t {
     F_HeaderGrammarLoadFailed      = 0x500C,
     F_HeaderHasUnsupportedTopLevel = 0x500D,
     F_HeaderInternalInvariant      = 0x500E,
-    F_HeaderInvalidShippedPath     = 0x500F,
+    F_HeaderInvalidShippedPath     = 0x500F,  // RETIRED — see comment
     // ── FF3 ABI catalog (plan 11 §2.4) ──
     // F_AbiUnknownTuple: the (target.name, format.kind) pair has no
     //   row in FF3's catalog. Remediation: ship the format.json for

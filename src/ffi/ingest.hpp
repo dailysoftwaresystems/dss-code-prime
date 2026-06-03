@@ -201,8 +201,9 @@ ingest(std::span<IngestionSource const> sources,
 // `importLibrary` identity (the directory is taken to be a single
 // library's curated header set).
 //
-// Alphabetical-order is deterministic — round-trips with the
-// shipped `src/dss-config/ffi-headers/<lib>/*.h` layout.
+// Alphabetical-order is deterministic — makes test assertions
+// stable across platforms (FF-latent substrate; no live production
+// caller as of 2026-06-03).
 //
 // Failure modes (post-fold #5 H1): per-file failures are collected.
 // The directory read returns a partial surface with rows from every

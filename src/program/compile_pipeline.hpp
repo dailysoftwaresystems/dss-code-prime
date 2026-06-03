@@ -5,6 +5,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
+#include "opt/optimizer.hpp"
 
 #include <filesystem>
 #include <string>
@@ -78,6 +79,14 @@ DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
 // every compile silently used index 0 — a real miscompile on
 // non-default-cc targets (PE64 + x86_64 silently emitted SysV
 // register assignments instead of MS_x64).
+// `pipelineOverride` (D-OPT1-DIFFERENTIAL-VERIFY-RUNNER): when
+// non-null, this pipeline is used at the MIR-optimizer step (3.5)
+// instead of the JSON-loaded default. Used by the examples_runner's
+// differential-verify arm so a manifest can ship explicit per-test
+// pipelines without touching the shipped pipeline registry, AND by
+// MIR unit tests. When null, the pipeline is resolved from the
+// CompileConfig (Debug→"debug", Release→"release") via
+// `loadShippedPipeline(name)`.
 [[nodiscard]] DSS_EXPORT bool
 compileSingleUnit(CompilationUnit const&         cu,
                   GrammarSchema const&           grammar,
@@ -85,6 +94,7 @@ compileSingleUnit(CompilationUnit const&         cu,
                   ObjectFormatSchema const&      format,
                   std::uint16_t                  callingConventionIndex,
                   std::filesystem::path const&   outPath,
-                  DiagnosticReporter&            reporter);
+                  DiagnosticReporter&            reporter,
+                  ::dss::opt::OptPipeline const* pipelineOverride = nullptr);
 
 } // namespace dss

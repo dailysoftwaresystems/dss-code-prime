@@ -9,5 +9,8 @@
       "artifact": "main.exe",
       "runOn": ["windows"]
     }
+  ],
+  "optimizedPipelines": [
+    {"label": "constfold-only", "passes": ["ConstFold"]}
   ]
 }

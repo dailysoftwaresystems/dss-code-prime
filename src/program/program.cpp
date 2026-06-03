@@ -166,7 +166,8 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                     std::string const&     targetSpecStr,
                                     DiagnosticReporter&    reporter,
                                     std::optional<std::filesystem::path> const& outputDir,
-                                    bool                   multiTargetBuild) {
+                                    bool                   multiTargetBuild,
+                                    ::dss::opt::OptPipeline const* pipelineOverride) {
     auto parsed = TargetSpec::parse(targetSpecStr);
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,
@@ -282,7 +283,8 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
 
     return compileSingleUnit(cu, grammar, **targetR, **formatR,
-                             ccIndex, outPath, reporter);
+                             ccIndex, outPath, reporter,
+                             pipelineOverride);
 }
 
 } // namespace
@@ -526,10 +528,13 @@ int Program::compileFiles(
         scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
         scratchCfg.dedupWindow    = 0;
         DiagnosticReporter scratch{scratchCfg};
-        bool const ok = compileOneTarget(cu, *grammar, sourceStem,
-                                          spec, scratch,
-                                          outputDir_,
-                                          /*multiTargetBuild*/ targets.size() > 1u);
+        bool const ok = compileOneTarget(
+            cu, *grammar, sourceStem,
+            spec, scratch,
+            outputDir_,
+            /*multiTargetBuild*/ targets.size() > 1u,
+            optimizerPipelineOverride_.has_value()
+                ? &*optimizerPipelineOverride_ : nullptr);
         mergeWithTargetContext(scratch, spec, rep);
         if (!ok || scratch.hasErrors()) exitCode = 1;
     }

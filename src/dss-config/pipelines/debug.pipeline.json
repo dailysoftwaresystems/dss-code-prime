@@ -1,0 +1,7 @@
+{
+    "dssPipelineVersion": 1,
+    "pipeline": {
+        "name": "debug",
+        "passes": ["Identity"]
+    }
+}

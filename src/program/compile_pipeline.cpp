@@ -55,7 +55,8 @@ bool compileSingleUnit(CompilationUnit const&        cu,
                        ObjectFormatSchema const&     format,
                        std::uint16_t                 callingConventionIndex,
                        std::filesystem::path const&  outPath,
-                       DiagnosticReporter&           reporter) {
+                       DiagnosticReporter&           reporter,
+                       ::dss::opt::OptPipeline const* pipelineOverride) {
     // Take a CU pointer matching `analyze()`'s shared_ptr signature.
     // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
     // with a null deleter so `analyze`'s ref-counting contract is
@@ -169,18 +170,33 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         return false;
     }
 
-    // 3.5. MIR optimizer (plan 22 OPT1; default = {Identity} — the
-    // no-op pass exercises the engine each compile. OPT2 lands real
-    // passes here; the pipeline gets resolved from artifact-profile
-    // config — D-OPT1-PIPELINE-FROM-CONFIG).
+    // 3.5. MIR optimizer (plan 22 OPT1+OPT2). Pipeline resolution:
+    //   (a) explicit `pipelineOverride` (examples_runner's differential-
+    //       verify arm, unit tests) — bypasses the JSON registry.
+    //   (b) shipped JSON: today everyone gets "debug" (=[Identity]).
+    //       When CompileConfig threads through the kernel a future
+    //       cycle, Release will map to "release" (=[Identity,ConstFold,...])
+    //       — D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG.
     auto const optEntry = reporter.errorCount();
-    ::dss::opt::OptPipeline pipeline{
-        "default",
-        { ::dss::opt::PassId::Identity }};
-    if (!::dss::opt::optimize(mir.mir, target, pipeline, reporter)) {
-        return false;
+    ::dss::opt::OptPipeline loadedPipeline;
+    ::dss::opt::OptPipeline const* effectivePipeline = pipelineOverride;
+    if (effectivePipeline == nullptr) {
+        auto loaded = ::dss::opt::loadShippedPipeline("debug");
+        if (!loaded.has_value()) {
+            // The pipeline file ships with the repo; a load failure
+            // here is a deploy/install bug. Drain config diagnostics
+            // via the shared helper so the user sees the JSON-path
+            // context.
+            forwardConfigDiagnostics(loaded.error(), reporter);
+            return false;
+        }
+        loadedPipeline = std::move(loaded).value();
+        effectivePipeline = &loadedPipeline;
     }
-    if (!tierClean(reporter, optEntry)) {
+    auto const optResult = ::dss::opt::optimize(
+        mir.mir, target, model.lattice().interner(),
+        *effectivePipeline, reporter);
+    if (!optResult.ok || !tierClean(reporter, optEntry)) {
         return false;
     }
 

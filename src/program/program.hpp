@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "opt/optimizer.hpp"
 #include "program/input_resolver.hpp"
 
 #include <filesystem>
@@ -95,8 +96,23 @@ public:
     [[nodiscard]] std::optional<std::filesystem::path> const&
     outputDir() const noexcept { return outputDir_; }
 
+    /// D-OPT1-DIFFERENTIAL-VERIFY-RUNNER (OPT2 cycle 1): override the
+    /// MIR-optimizer pipeline for the next compileFiles/Directory call.
+    /// When set, replaces the JSON-loaded default at compile_pipeline
+    /// step 3.5. Used by the examples_runner's differential-verify arm
+    /// + MIR unit tests; production callers leave it unset (the JSON
+    /// registry resolves the pipeline by name from CompileConfig).
+    void setOptimizerPipelineOverride(std::optional<::dss::opt::OptPipeline> p) {
+        optimizerPipelineOverride_ = std::move(p);
+    }
+    [[nodiscard]] std::optional<::dss::opt::OptPipeline> const&
+    optimizerPipelineOverride() const noexcept {
+        return optimizerPipelineOverride_;
+    }
+
 private:
     std::optional<std::filesystem::path> outputDir_;
+    std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
 };
 
 } // namespace dss
