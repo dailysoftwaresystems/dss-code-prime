@@ -45,6 +45,7 @@ enum class PassId : std::uint8_t {
     Dce       = 2,
     Mem2Reg   = 3,
     CopyProp  = 4,
+    Cse       = 5,
 };
 
 // Single source-of-truth for the {ordinal, name} pairing.
@@ -52,15 +53,16 @@ enum class PassId : std::uint8_t {
 // `kPassIdCount` static_assert all derive from this — adding a
 // new enumerator without extending the table fails the static_assert
 // at compile time (D-OPT1-PASS-ID-STABILITY enforcement).
-inline constexpr std::size_t kPassIdCount = 5;
+inline constexpr std::size_t kPassIdCount = 6;
 inline constexpr std::pair<PassId, std::string_view> kPassNameTable[kPassIdCount] = {
     {PassId::Identity,  "Identity"},
     {PassId::ConstFold, "ConstFold"},
     {PassId::Dce,       "Dce"},
     {PassId::Mem2Reg,   "Mem2Reg"},
     {PassId::CopyProp,  "CopyProp"},
+    {PassId::Cse,       "Cse"},
 };
-static_assert(kPassIdCount == static_cast<std::size_t>(PassId::CopyProp) + 1,
+static_assert(kPassIdCount == static_cast<std::size_t>(PassId::Cse) + 1,
               "PassId enum / kPassIdCount drift — add a row to "
               "kPassNameTable + the runPass arm in optimizer.cpp's "
               "switch when you append a new PassId enumerator "

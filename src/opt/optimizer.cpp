@@ -4,6 +4,7 @@
 #include "mir/mir_verifier.hpp"
 #include "opt/passes/const_fold.hpp"
 #include "opt/passes/copy_prop.hpp"
+#include "opt/passes/cse.hpp"
 #include "opt/passes/dce.hpp"
 #include "opt/passes/mem2reg.hpp"
 
@@ -50,6 +51,10 @@ struct PassRunResult {
         case PassId::CopyProp: {
             auto const r = passes::runCopyProp(mir, interner, reporter);
             return {r.ok, r.phisCollapsed > 0};
+        }
+        case PassId::Cse: {
+            auto const r = passes::runCse(mir, interner, reporter);
+            return {r.ok, r.instructionsCsed > 0};
         }
     }
     // Enum-drift fallback. A future PassId enumerator added without

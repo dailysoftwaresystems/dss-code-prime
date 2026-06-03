@@ -36,20 +36,22 @@ TEST(PipelineLoader, ShippedDebugLoadsIdentity) {
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
 }
 
-// Shipped `release.pipeline.json` declares [Identity, ConstFold, Mem2Reg, CopyProp, Dce].
-// CopyProp sits between Mem2Reg and Dce so trivial Phis surfaced by
-// Mem2Reg's promotion collapse to their canonical value, leaving the
-// dead Phi for DCE to sweep.
+// Shipped `release.pipeline.json` declares
+// [Identity, ConstFold, Mem2Reg, CopyProp, Cse, Dce]. Cse sits
+// AFTER CopyProp so trivial Phi-collapse has already simplified the
+// SSA graph, then Cse merges remaining duplicates, then Dce sweeps
+// the dead originals (CopyProp's dead Phis + Cse's dead duplicates).
 TEST(PipelineLoader, ShippedReleaseLoadsAllPasses) {
     auto r = opt::loadShippedPipeline("release");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->name, "release");
-    ASSERT_EQ(r->passes.size(), 5u);
+    ASSERT_EQ(r->passes.size(), 6u);
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
     EXPECT_EQ(r->passes[1], opt::PassId::ConstFold);
     EXPECT_EQ(r->passes[2], opt::PassId::Mem2Reg);
     EXPECT_EQ(r->passes[3], opt::PassId::CopyProp);
-    EXPECT_EQ(r->passes[4], opt::PassId::Dce);
+    EXPECT_EQ(r->passes[4], opt::PassId::Cse);
+    EXPECT_EQ(r->passes[5], opt::PassId::Dce);
 }
 
 // Missing version → X_PipelineVersionMismatch. The version gate is the

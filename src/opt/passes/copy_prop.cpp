@@ -5,6 +5,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
+#include "opt/passes/path_compress.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -50,24 +51,6 @@ public:
     }
 
 private:
-    [[nodiscard]] MirInstId resolveTransitive(MirInstId v) const {
-        // Walk the collapse chain v → collapsed[v] → ... bounded by
-        // the map size (a cycle would mean we collapsed a Phi to
-        // itself, which is filtered upstream). Fail loud on overrun.
-        std::uint32_t cap = static_cast<std::uint32_t>(collapsed_.size()) + 1;
-        while (cap-- > 0) {
-            auto it = collapsed_.find(v);
-            if (it == collapsed_.end()) return v;
-            v = it->second;
-        }
-        std::fprintf(stderr,
-            "dss::opt::passes::CopyProp fatal: resolveTransitive "
-            "exceeded chain length walking from v=%u — collapse map "
-            "contains a cycle (self-reference filter upstream broke).\n",
-            v.v);
-        std::abort();
-    }
-
     Mir const& src_;
     // Old-id → old-id collapse map. Path-compressed after analysis
     // so a lookup is O(1). Cleared between functions; counters live.
@@ -115,7 +98,7 @@ void CopyPropPolicy::analyze(MirFuncId fn) {
 
         std::unordered_set<MirInstId> distinct;
         for (auto const& inc : src_.phiIncomings(P)) {
-            MirInstId const v = resolveTransitive(inc.value);
+            MirInstId const v = resolveTransitive(collapsed_, inc.value, "CopyProp");
             if (v.v == P.v) continue;  // SSA self-reference (back-edge)
             distinct.insert(v);
             if (distinct.size() > 1) break;  // early exit — not collapsible
@@ -137,28 +120,7 @@ void CopyPropPolicy::analyze(MirFuncId fn) {
         }
     }
 
-    // Step 3: path-compress so every collapse-target is a
-    // non-collapsed value. After compression, no target may itself
-    // be a collapse-map key — the compression terminates at a
-    // non-collapsed value. Verify the invariant: if any target
-    // still appears as a key, the substitution chain at rebuild
-    // time would yield the wrong NEW id (rewriteOperand would
-    // succeed on the intermediate Phi's new id rather than the
-    // final value). Fail loud rather than silently miscompile.
-    for (auto& [p, t] : collapsed_) {
-        t = resolveTransitive(t);
-    }
-    for (auto const& [p, t] : collapsed_) {
-        if (collapsed_.count(t)) {
-            std::fprintf(stderr,
-                "dss::opt::passes::CopyProp fatal: post-compression "
-                "invariant broken — target v=%u of Phi v=%u is itself "
-                "a collapse-map key. resolveTransitive should have "
-                "terminated at a non-collapsed value.\n", t.v, p.v);
-            std::abort();
-        }
-    }
-
+    pathCompressAndVerify(collapsed_, "CopyProp");
     phisCollapsed_ += collapsed_.size();
 }
 

@@ -3,6 +3,7 @@ add_library(opt OBJECT
     optimizer_json.cpp
     passes/const_fold.cpp
     passes/copy_prop.cpp
+    passes/cse.cpp
     passes/dce.cpp
     passes/mem2reg.cpp
     passes/mir_rebuild_helper.cpp
