@@ -1,12 +1,47 @@
 #include "opt/passes/mir_rebuild_helper.hpp"
 
+#include "core/types/parse_diagnostic.hpp"
 #include "mir/mir_opcode.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <utility>
 
 namespace dss::opt::passes {
+
+GlobalClonePrelude
+cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
+                       DiagnosticReporter& reporter,
+                       std::string_view passName) {
+    std::size_t const ng = mir.moduleGlobalCount();
+    for (std::uint32_t i = 0; i < ng; ++i) {
+        if (mir.globalInitFunc(mir.globalAt(i)).valid()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::X_OptPassSkipped;
+            d.severity = DiagnosticSeverity::Info;
+            d.actual   = std::format(
+                "opt::{}: skipped — module has >= 1 runtime-init "
+                "global; func-id remap not yet implemented "
+                "(D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS).", passName);
+            reporter.report(std::move(d));
+            return GlobalClonePrelude::CarvedOut;
+        }
+    }
+    for (std::uint32_t i = 0; i < ng; ++i) {
+        MirGlobalId const g = mir.globalAt(i);
+        std::uint32_t const initIdx = mir.globalInitLiteralIndex(g);
+        std::uint32_t newInitIdx = UINT32_MAX;
+        if (initIdx != UINT32_MAX) {
+            newInitIdx = builder.literalPoolAdd(mir.literalValue(initIdx));
+        }
+        builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
+                          newInitIdx, MirFuncId{},
+                          mir.globalBinding(g), mir.globalVisibility(g));
+    }
+    return GlobalClonePrelude::Cloned;
+}
 
 void MirRebuildPolicy::onZeroPhiIncomings(MirInstId oldPhi, MirBlockId oldBlock,
                                          MirFuncId oldFn, MirInstId newPhi) {
@@ -96,7 +131,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
             auto const predIt = blockMap_.find(inc.pred.v);
             if (predIt == blockMap_.end()) continue;  // safety belt
             MirInstId const newVal = policy_.substituteOperand(
-                rewriteOperand(inc.value));
+                rewriteOperand(policy_.substituteOldOperand(inc.value)));
             dst_.addPhiIncoming(dp.newPhi,
                                 MirPhiIncoming{newVal, predIt->second});
             ++kept;
@@ -129,8 +164,9 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         return;
     }
 
-    // Try the per-pass rewrite hook (ConstFold's fold, future copy-
-    // prop's full-inst-replacement). Returns nullopt → verbatim copy.
+    // Per-pass full-inst-replacement hook. Returns nullopt → verbatim
+    // copy. ConstFold emits a Const for foldable expressions; CopyProp
+    // uses substituteOldOperand instead so the dead Phi stays for DCE.
     if (auto rewritten = policy_.tryRewrite(op, oldId, dst_, rewrite_);
         rewritten.has_value()) {
         rewrite_.emplace(oldId.v, *rewritten);
@@ -142,7 +178,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
     std::vector<MirInstId> newOps;
     newOps.reserve(oldOps.size());
     for (auto o : oldOps) {
-        newOps.push_back(policy_.substituteOperand(rewriteOperand(o)));
+        newOps.push_back(policy_.substituteOperand(rewriteOperand(policy_.substituteOldOperand(o))));
     }
     MirInstId const newId = dst_.addInst(op, newOps, src_.instType(oldId),
                                          src_.instPayload(oldId),
@@ -166,7 +202,7 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
         }
         case MirOpcode::CondBr: {
             MirInstId const cond = policy_.substituteOperand(
-                rewriteOperand(oldOps[0]));
+                rewriteOperand(policy_.substituteOldOperand(oldOps[0])));
             MirInstId const newId = dst_.addCondBr(
                 cond, blockMap_.at(oldSucc[0].v), blockMap_.at(oldSucc[1].v));
             remember(newId);
@@ -174,13 +210,13 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
         }
         case MirOpcode::Switch: {
             MirInstId const disc = policy_.substituteOperand(
-                rewriteOperand(oldOps[0]));
+                rewriteOperand(policy_.substituteOldOperand(oldOps[0])));
             std::vector<std::pair<MirInstId, MirBlockId>> cases;
             std::size_t const ncases = oldSucc.size() - 1;
             cases.reserve(ncases);
             for (std::size_t i = 0; i < ncases; ++i) {
                 cases.emplace_back(
-                    policy_.substituteOperand(rewriteOperand(oldOps[1 + i])),
+                    policy_.substituteOperand(rewriteOperand(policy_.substituteOldOperand(oldOps[1 + i]))),
                     blockMap_.at(oldSucc[i].v));
             }
             MirInstId const newId = dst_.addSwitch(
@@ -191,7 +227,7 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
         case MirOpcode::Return: {
             std::optional<MirInstId> retVal;
             if (!oldOps.empty()) {
-                retVal = policy_.substituteOperand(rewriteOperand(oldOps[0]));
+                retVal = policy_.substituteOperand(rewriteOperand(policy_.substituteOldOperand(oldOps[0])));
             }
             MirInstId const newId = dst_.addReturn(retVal);
             remember(newId);

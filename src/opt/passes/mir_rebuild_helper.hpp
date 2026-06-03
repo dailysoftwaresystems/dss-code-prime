@@ -18,15 +18,31 @@
 //   Phase 2 — fill blocks with instructions; Phi incomings deferred.
 //   Phase 3 — flush Phi incomings via the now-complete rewrite map.
 
+#include "core/types/diagnostic_reporter.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 
 #include <cstdint>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace dss::opt::passes {
+
+// Shared "clone globals OR carve out on runtime-init" prelude used
+// by every MIR-tier rebuild pass (ConstFold, Dce, Mem2Reg, CopyProp).
+// A module with any `globalInitFunc.valid()` global requires a two-
+// pass func-id remap not yet implemented; carve-out emits Info
+// `X_OptPassSkipped` so callers / diff-verify can observe the
+// deliberate skip. The carve-out anchor is shared:
+// D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS.
+enum class GlobalClonePrelude : std::uint8_t { Cloned, CarvedOut };
+
+[[nodiscard]] GlobalClonePrelude
+cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
+                       DiagnosticReporter& reporter,
+                       std::string_view passName);
 
 // Per-pass policy driving the rebuild. Pass-specific state lives on
 // the concrete subclass; the rebuilder owns only the rewrite map +
@@ -80,11 +96,31 @@ public:
         return std::nullopt;
     }
 
-    // Phase 2: per-operand substitution hook applied during the
-    // verbatim-copy arm AFTER rewriteOperand resolves old→new.
-    // Default returns the operand unchanged (identity).
-    // Copy-prop will override this to redirect uses to a dominating
-    // definition. ConstFold + DCE + Mem2Reg use identity.
+    // Pre-rewrite operand substitution hook (applied BEFORE
+    // `rewriteOperand` maps old→new). Default = identity. CopyProp
+    // overrides this for SSA Phi-collapse: a Phi whose non-self
+    // incomings all resolve to the same value `V` redirects every
+    // use of the Phi to `V` directly. The hook works in OLD-id space
+    // so the resolution chain (P1 → P2 → V) is transitively
+    // path-compressed during analysis on the immutable source MIR;
+    // `rewriteOperand` then maps the resolved old target to its NEW
+    // id (which has already been emitted in phase 2 by SSA's
+    // def-dominates-use invariant + RPO block order). This shape is
+    // what allows the Phi-collapse pass to leave the dead Phi
+    // instruction in the rebuilt module — a subsequent DCE pass
+    // sweeps it because it has zero uses.
+    [[nodiscard]] virtual MirInstId
+    substituteOldOperand(MirInstId oldOp) {
+        return oldOp;
+    }
+
+    // Post-rewrite operand substitution hook (applied AFTER
+    // `rewriteOperand` resolves old→new). Default = identity.
+    // Reserved for a future general copy-prop variant where the
+    // dominating definition is determined per-use (requires a
+    // block cursor — D-OPT-COPYPROP-BLOCK-CURSOR — not yet needed
+    // by the Phi-collapse pass since Phi semantics already encode
+    // dominance).
     [[nodiscard]] virtual MirInstId
     substituteOperand(MirInstId operand) {
         return operand;

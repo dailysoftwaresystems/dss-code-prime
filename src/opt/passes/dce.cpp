@@ -258,13 +258,10 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
     DceResult result{};
     MirBuilder builder;
 
-    // Runtime-init globals carve-out: a global with `initFunc.valid()`
-    // requires a two-pass func-id remap across the rebuild — not yet
-    // implemented. Caller keeps the unoptimized MIR. Emit Info
-    // X_OptPassSkipped so the user / tooling can observe that DCE
-    // deliberately declined to run on this module (mirroring
-    // ConstFold's parallel carve-out — without the diagnostic, this
-    // silently re-opens the failure pattern a prior cycle closed).
+    // DCE has the same runtime-init carve-out as the other passes but
+    // CANNOT use the shared `cloneGlobalsOrCarveOut` helper: DCE elides
+    // dead globals based on the live-symbol BFS result, so its global-
+    // clone loop is filtered. The carve-out itself remains shared.
     std::size_t const ng = mir.moduleGlobalCount();
     for (std::uint32_t i = 0; i < ng; ++i) {
         if (mir.globalInitFunc(mir.globalAt(i)).valid()) {
@@ -273,8 +270,7 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
             d.severity = DiagnosticSeverity::Info;
             d.actual   = "opt::Dce: skipped — module has >= 1 runtime-init "
                          "global; func-id remap not yet implemented "
-                         "(D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS — DCE "
-                         "shares the same carve-out).";
+                         "(D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS).";
             reporter.report(std::move(d));
             result.ok = true;
             return result;

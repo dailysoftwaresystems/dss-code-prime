@@ -565,35 +565,10 @@ Mem2RegResult runMem2Reg(Mir& mir, TypeInterner const& interner,
     Mem2RegResult result{};
     MirBuilder builder;
 
-    // Runtime-init globals carve-out (D-OPT2-CONST-FOLD-RUNTIME-INIT-
-    // GLOBALS shared anchor). Same shape as ConstFold + DCE.
-    std::size_t const ng = mir.moduleGlobalCount();
-    for (std::uint32_t i = 0; i < ng; ++i) {
-        if (mir.globalInitFunc(mir.globalAt(i)).valid()) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::X_OptPassSkipped;
-            d.severity = DiagnosticSeverity::Info;
-            d.actual   = "opt::Mem2Reg: skipped — module has >= 1 "
-                         "runtime-init global; func-id remap not yet "
-                         "implemented (D-OPT2-CONST-FOLD-RUNTIME-INIT-"
-                         "GLOBALS — Mem2Reg shares the same carve-out).";
-            reporter.report(std::move(d));
-            result.ok = true;
-            return result;
-        }
-    }
-
-    // Clone globals before any function (same discipline as ConstFold).
-    for (std::uint32_t i = 0; i < ng; ++i) {
-        MirGlobalId const g = mir.globalAt(i);
-        std::uint32_t const initIdx = mir.globalInitLiteralIndex(g);
-        std::uint32_t newInitIdx = UINT32_MAX;
-        if (initIdx != UINT32_MAX) {
-            newInitIdx = builder.literalPoolAdd(mir.literalValue(initIdx));
-        }
-        builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
-                          newInitIdx, MirFuncId{},
-                          mir.globalBinding(g), mir.globalVisibility(g));
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "Mem2Reg")
+        == GlobalClonePrelude::CarvedOut) {
+        result.ok = true;
+        return result;
     }
 
     // Per-function: analyze → rebuild → finalize phi incomings.

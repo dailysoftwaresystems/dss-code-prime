@@ -257,39 +257,10 @@ ConstFoldResult runConstFold(Mir& mir, TypeInterner const& interner,
     ConstFoldResult result{};
     MirBuilder builder;
 
-    // Runtime-init globals carve-out (D-OPT2-CONST-FOLD-RUNTIME-INIT-
-    // GLOBALS): MirFuncId in initFunc references the OLD arena;
-    // cloning would need a two-pass func-id remap not yet implemented.
-    // Emit Info X_OptPassSkipped so the user / tooling can observe
-    // that ConstFold deliberately declined to run on this module.
-    std::size_t const ng = mir.moduleGlobalCount();
-    for (std::uint32_t i = 0; i < ng; ++i) {
-        if (mir.globalInitFunc(mir.globalAt(i)).valid()) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::X_OptPassSkipped;
-            d.severity = DiagnosticSeverity::Info;
-            d.actual   = "opt::ConstFold: skipped — module has >= 1 "
-                         "runtime-init global; func-id remap not yet "
-                         "implemented (D-OPT2-CONST-FOLD-RUNTIME-INIT-"
-                         "GLOBALS).";
-            reporter.report(std::move(d));
-            result.ok = true;
-            return result;
-        }
-    }
-
-    // Clone globals before any function — GlobalAddr value-origins
-    // require the global to exist when a function references it.
-    for (std::uint32_t i = 0; i < ng; ++i) {
-        MirGlobalId const g = mir.globalAt(i);
-        std::uint32_t const initIdx = mir.globalInitLiteralIndex(g);
-        std::uint32_t newInitIdx = UINT32_MAX;
-        if (initIdx != UINT32_MAX) {
-            newInitIdx = builder.literalPoolAdd(mir.literalValue(initIdx));
-        }
-        builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
-                          newInitIdx, MirFuncId{},
-                          mir.globalBinding(g), mir.globalVisibility(g));
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "ConstFold")
+        == GlobalClonePrelude::CarvedOut) {
+        result.ok = true;
+        return result;
     }
 
     // Drive the shared rebuilder with the ConstFold policy.

@@ -1,7 +1,7 @@
 {
   "language": "c-subset",
   "source": "main.c",
-  "exitCode": 10,
+  "exitCode": 42,
   "expectedStdout": "",
   "targets": [
     {
@@ -11,7 +11,7 @@
     }
   ],
   "optimizedPipelines": [
-    {"label": "mem2reg-only", "passes": ["Mem2Reg"]},
-    {"label": "copyprop-after-mem2reg", "passes": ["Mem2Reg", "CopyProp"]}
+    {"label": "mem2reg-then-copyprop", "passes": ["Mem2Reg", "CopyProp"]},
+    {"label": "constfold-mem2reg-copyprop", "passes": ["ConstFold", "Mem2Reg", "CopyProp"]}
   ]
 }
