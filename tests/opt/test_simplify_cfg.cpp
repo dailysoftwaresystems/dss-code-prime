@@ -26,7 +26,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 using namespace dss;
 

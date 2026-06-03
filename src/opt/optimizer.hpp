@@ -184,6 +184,13 @@ struct OptResult {
     std::size_t passesMutated     = 0;
     bool        fixedPointReached = false;
     std::array<std::size_t, kPassIdCount> passMutationCount = {};
+
+    // Typed accessor — preferred over raw `passMutationCount[
+    // static_cast<size_t>(PassId::X)]` at call sites; the cast is
+    // hidden behind a single bounds-checked-by-type entry point.
+    [[nodiscard]] std::size_t mutationCount(PassId id) const noexcept {
+        return passMutationCount[static_cast<std::size_t>(id)];
+    }
 };
 
 // Run the configured pipeline over every function in `mir`. Returns

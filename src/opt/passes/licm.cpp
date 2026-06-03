@@ -220,6 +220,17 @@ void LicmPolicy::analyze(MirFuncId fn) {
                     }
                 }
                 if (!allOutside) continue;
+                // Nested-loop dedup (CRITICAL fix): an inst that's
+                // invariant in BOTH an inner and an outer enclosing
+                // loop (e.g. operands all in function entry) would
+                // appear as a candidate in BOTH loops. The first
+                // record wins; subsequent visits skip — this prevents
+                // `recordHoist`'s duplicate-guard from firing on
+                // legitimate nested-loop input. The loop iteration
+                // order (sorted by header.v) typically hits the
+                // outer loop first, hoisting to the OUTERMOST valid
+                // preheader (deepest hoist).
+                if (hoistedInsts_.count(id)) continue;
                 recordHoist(id, preheader);
             }
         }

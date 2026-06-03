@@ -351,6 +351,65 @@ TEST(Licm, MultiplePreheaderPredsSkipsLoop) {
            "c1 conservatively skips (D-OPT6-LICM-PREHEADER-INSERTION)";
 }
 
+// Nested-loop invariant — surfaced by the OPT6 2nd-look review as
+// CRITICAL #1. An inst (e.g. Add of two entry-block Consts) is
+// invariant in BOTH the outer and inner loops. Pre-fold, both loop-
+// iterations of `analyze()` would try to `recordHoist` the same
+// id, triggering the `!inserted` substrate-violation abort. Post-
+// fold, the second visit short-circuits via the
+// `hoistedInsts_.count(id) != 0` gate. The candidate is hoisted to
+// the OUTERMOST valid preheader (deepest hoist). This test would
+// have aborted the test process pre-fold.
+TEST(Licm, NestedLoopInvariantHoistedToOuterPreheader) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // entry → outerH → outerBody=innerH → innerBody → innerH (back)
+    // outerBody → outerH (back); outerH → exitB
+    MirBlockId const entry      = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const outerH     = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const innerH     = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const innerBody  = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const outerLatch = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB      = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const b = mb.addConst(v4, i32);
+    mb.addBr(outerH);
+    mb.beginBlock(outerH);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cOuter = mb.addConst(tru, boolT);
+    mb.addCondBr(cOuter, innerH, exitB);
+    mb.beginBlock(innerH);
+    MirInstId const cInner = mb.addConst(tru, boolT);
+    mb.addCondBr(cInner, innerBody, outerLatch);
+    mb.beginBlock(innerBody);
+    // The hoist candidate: Add(a, b). Operands defined in entry.
+    // Invariant in BOTH the inner loop (body = {innerH, innerBody})
+    // AND the outer loop (body = {outerH, innerH, innerBody, outerLatch}).
+    MirInstId const ops[] = {a, b};
+    (void)mb.addInst(MirOpcode::Add, ops, i32);
+    mb.addBr(innerH);
+    mb.beginBlock(outerLatch);
+    mb.addBr(outerH);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 1u)
+        << "the entry-Const-operand Add is invariant in BOTH loops; "
+           "the recordHoist dedup must register it exactly once";
+}
+
 // Multi-function: counter accumulates across functions. Each
 // function has an independently-hoistable invariant.
 TEST(Licm, MultiFunctionCounterAccumulates) {

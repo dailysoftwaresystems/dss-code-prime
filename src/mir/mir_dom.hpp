@@ -291,6 +291,17 @@ mirNaturalLoops(Mir const& mir,
             if (n.v == headerSlot) continue;
             if (n.v >= preds.size()) continue;
             for (MirBlockId const p : preds[n.v]) {
+                // SSA-soundness gate: a `gaveUp` block has
+                // unresolved dominance — admitting it into the loop
+                // body could let LICM hoist through it, producing a
+                // def in the preheader that no longer dominates its
+                // use in the gaveUp block. Filter at the worklist
+                // step so the body computation stays sound; the
+                // verifier should have flagged the gaveUp block
+                // upstream, but this is a defense-in-depth measure
+                // against a verifier-gating regression
+                // (D-OPT6-LICM-GAVEUP-BODY-FILTER).
+                if (p.v < dom.gaveUp.size() && dom.gaveUp[p.v]) continue;
                 if (inBody.insert(p.v).second) {
                     worklist.push_back(p);
                 }
@@ -306,6 +317,22 @@ mirNaturalLoops(Mir const& mir,
                 "missing from body set — natural-loop construction "
                 "invariant violation.\n", headerSlot);
             std::abort();
+        }
+        // INVARIANT: no `gaveUp` block is in the body set. The
+        // worklist filter above gates predecessor admission; this
+        // post-condition catches the case where a back-edge SOURCE
+        // is itself in the seed set despite being gaveUp (e.g. a
+        // future seed-expansion that bypasses the back-edge
+        // dominance check). LICM's SSA-soundness depends on this.
+        for (std::uint32_t const slot : inBody) {
+            if (slot < dom.gaveUp.size() && dom.gaveUp[slot]) {
+                std::fprintf(stderr,
+                    "dss::mirNaturalLoops fatal: body slot v=%u is "
+                    "gaveUp — dominance is unsound; LICM hoisting "
+                    "through this block would violate def-dominates-"
+                    "use (D-OPT6-LICM-GAVEUP-BODY-FILTER).\n", slot);
+                std::abort();
+            }
         }
         loop.body.reserve(inBody.size());
         for (std::uint32_t const slot : inBody) {

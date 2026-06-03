@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <numeric>
 
 using namespace dss;
 
@@ -235,19 +236,32 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
         ASSERT_TRUE(result.ok);
         EXPECT_TRUE(result.fixedPointReached);
 
-        std::size_t const constFoldCount =
-            result.passMutationCount[
-                static_cast<std::size_t>(opt::PassId::ConstFold)];
-        EXPECT_GE(constFoldCount, 2u)
+        EXPECT_GE(result.mutationCount(opt::PassId::ConstFold), 2u)
             << "ConstFold must mutate in at least TWO iterations — once "
                "on the source-emitted 5+3, then again on 8*2 (and "
                "16+26) AFTER Mem2Reg promoted the alloca. A regression "
                "that drops maxIterations OR reorders passes flips this "
                "(D-OPT-CONSTFOLD-RERUN-POST-MEM2REG).";
+        EXPECT_GE(result.mutationCount(opt::PassId::Mem2Reg), 1u)
+            << "Mem2Reg must fire at least once on `x` and `a` (both "
+               "promotable scalar allocas). Without Mem2Reg, the 8*2 "
+               "fold opportunity never surfaces.";
         EXPECT_EQ(countMulInModule(mir), 0u)
             << "the Mul on `x * 2` must be eliminated — folded by the "
                "re-run ConstFold + DCE-swept. Surviving Mul means the "
                "post-Mem2Reg fold never fired.";
+
+        // Engine-invariant cross-check: `passesMutated` should equal
+        // the sum of `passMutationCount` over all PassIds (every
+        // increment of one happens alongside the other, at the same
+        // call site in the engine loop). Catches a future
+        // refactor that decouples the two counters.
+        std::size_t const sum = std::accumulate(
+            result.passMutationCount.begin(),
+            result.passMutationCount.end(), std::size_t{0});
+        EXPECT_EQ(sum, result.passesMutated)
+            << "passesMutated (cumulative total) must equal the sum "
+               "of per-pass passMutationCount entries";
     }
 
     // ARM 2 — regression: maxIterations=1. ConstFold can only fold
@@ -266,16 +280,40 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
         auto const result = opt::optimize(mir, target, interner, singleIter, rep);
         ASSERT_TRUE(result.ok);
 
-        std::size_t const constFoldCount =
-            result.passMutationCount[
-                static_cast<std::size_t>(opt::PassId::ConstFold)];
-        EXPECT_EQ(constFoldCount, 1u)
+        EXPECT_EQ(result.mutationCount(opt::PassId::ConstFold), 1u)
             << "with maxIterations=1, ConstFold runs exactly once and "
                "cannot re-fold post-Mem2Reg — this is the regression "
                "shape ARM 1 guards against";
         EXPECT_GE(countMulInModule(mir), 1u)
             << "the Mul survives the single-iter pipeline — the post-"
                "Mem2Reg fold opportunity was never reached";
+    }
+
+    // ARM 3 — SHIPPED pipeline integration: the test-analyzer's
+    // load-bearing gap. ARMs 1+2 use an INLINE pipeline literal that
+    // mirrors the shipped `release.pipeline.json`; if someone edits
+    // the JSON to drop Mem2Reg or reorder passes without touching
+    // the test, the inline ARM stays green while the SHIPPED
+    // configuration regresses. This arm loads the actual shipped
+    // pipeline and asserts the SAME witness — closes the loop
+    // between behavioral effectiveness and shipped config.
+    {
+        auto pipelineR = opt::loadShippedPipeline("release");
+        ASSERT_TRUE(pipelineR.has_value())
+            << "shipped release.pipeline.json must load";
+
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildConstFoldInsideExprMir(interner);
+        DiagnosticReporter rep;
+        auto const result = opt::optimize(mir, target, interner, *pipelineR, rep);
+        ASSERT_TRUE(result.ok);
+        EXPECT_TRUE(result.fixedPointReached);
+        EXPECT_GE(result.mutationCount(opt::PassId::ConstFold), 2u)
+            << "the SHIPPED release pipeline must achieve the same "
+               "re-fold effectiveness — a JSON edit that drops "
+               "Mem2Reg or reorders ConstFold-then-Mem2Reg would "
+               "regress without an inline-literal test catching it";
+        EXPECT_EQ(countMulInModule(mir), 0u);
     }
 }
 
