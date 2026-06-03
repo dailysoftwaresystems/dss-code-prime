@@ -103,41 +103,94 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
         // ONBLOCKBEGIN-HOOK). Default no-op for every other pass.
         policy_.onBlockBegin(oldB, newB, dst_, rewrite_, blockMap_);
 
-        std::uint32_t const ninst = src_.blockInstCount(oldB);
-        for (std::uint32_t i = 0; i < ninst; ++i) {
-            MirInstId const oldId = src_.blockInstAt(oldB, i);
-            MirOpcode const op    = src_.instOpcode(oldId);
+        // Walk source-block insts. If a block-merge policy chooses to
+        // absorb a successor, the loop continues with the absorbed
+        // block's insts AFTER `oldB`'s non-terminator insts — the
+        // merged block's terminator is the LAST absorbed block's
+        // terminator (D-OPT5-BLOCK-MERGE).
+        MirBlockId currentSource = oldB;
+        std::uint32_t absorbDepth = 0;
+        std::uint32_t const absorbCap =
+            static_cast<std::uint32_t>(src_.blockCount()) + 1;
+        while (true) {
+            std::uint32_t const ninst = src_.blockInstCount(currentSource);
+            std::optional<MirBlockId> absorbed;
+            for (std::uint32_t i = 0; i < ninst; ++i) {
+                MirInstId const oldId = src_.blockInstAt(currentSource, i);
+                MirOpcode const op    = src_.instOpcode(oldId);
 
-            if (opcodeInfo(op).isTerminator) {
-                // Hoist-into-preheader hook for LICM
-                // (D-OPT-MIR-REBUILDER-ONBLOCKBEFORETERMINATOR-HOOK).
-                // Fires once per block, immediately before the
-                // terminator clone. Default no-op for every other pass.
-                policy_.onBlockBeforeTerminator(oldB, newB, dst_,
-                                                rewrite_, blockMap_);
-                emitTerminator(op, oldId);
-                continue;
+                if (opcodeInfo(op).isTerminator) {
+                    // The terminator is the LAST inst of the block.
+                    // Before emitting it, check whether the policy
+                    // wants to absorb a successor — if so, skip the
+                    // terminator and continue with that successor's
+                    // insts in the next outer-loop iteration.
+                    absorbed = policy_.absorbSuccessor(currentSource);
+                    if (absorbed.has_value()) break;
+                    // No absorb — fire the LICM hoist hook + emit the
+                    // terminator. This is the merged-block's actual
+                    // terminator (which may be the head's original
+                    // terminator OR the tail of an absorb chain's).
+                    policy_.onBlockBeforeTerminator(oldB, newB, dst_,
+                                                    rewrite_, blockMap_);
+                    emitTerminator(op, oldId);
+                    break;
+                }
+                if (!policy_.shouldEmit(oldId)) continue;
+                if (op == MirOpcode::Phi) {
+                    MirInstId const newPhi = dst_.addPhi(src_.instType(oldId));
+                    rewrite_.emplace(oldId.v, newPhi);
+                    deferredPhis.push_back({oldId, newPhi, oldB});
+                    continue;
+                }
+                emitValue(op, oldId);
             }
-            if (!policy_.shouldEmit(oldId)) continue;
-            if (op == MirOpcode::Phi) {
-                MirInstId const newPhi = dst_.addPhi(src_.instType(oldId));
-                rewrite_.emplace(oldId.v, newPhi);
-                deferredPhis.push_back({oldId, newPhi, oldB});
-                continue;
+            if (!absorbed.has_value()) break;
+            currentSource = *absorbed;
+            if (++absorbDepth > absorbCap) {
+                std::fprintf(stderr,
+                    "dss::opt::passes::MirFunctionRebuilder fatal: "
+                    "absorbSuccessor chain exceeded block count "
+                    "walking from oldB v=%u — cycle in absorb chain "
+                    "(substrate-contract violation).\n", oldB.v);
+                std::abort();
             }
-            emitValue(op, oldId);
         }
     }
 
     // Phase 3: flush phi incomings via the now-complete rewrite map.
+    // Phi-incoming preds also route through `redirectBlockTarget` —
+    // an incoming-from-absorbed-block must redirect to the absorb
+    // head (the surviving block that flows into the phi's owner).
     for (auto const& dp : deferredPhis) {
         std::size_t kept = 0;
         for (auto const& inc : src_.phiIncomings(dp.oldPhi)) {
             if (!policy_.acceptPhiIncoming(inc, blockMap_)) continue;
-            auto const predIt = blockMap_.find(inc.pred.v);
-            if (predIt == blockMap_.end()) continue;  // safety belt
-            MirInstId const newVal = policy_.substituteOperand(
-                rewriteOperand(policy_.substituteOldOperand(inc.value)));
+            MirBlockId const redirectedPred =
+                policy_.redirectBlockTarget(inc.pred);
+            auto const predIt = blockMap_.find(redirectedPred.v);
+            if (predIt == blockMap_.end()) {
+                // After `acceptPhiIncoming` admitted this incoming AND
+                // `redirectBlockTarget` resolved its pred, the result
+                // must be in the surviving blockMap. Reaching here
+                // means a policy that accepts a phi incoming but
+                // doesn't keep its redirected pred reachable —
+                // substrate-contract violation. Fail loud rather than
+                // silently drop one SSA edge (the `kept == 0`
+                // fail-loud only fires when EVERY incoming is dropped;
+                // a single-edge silent drop turns the phi value-wrong
+                // without diagnostic).
+                std::fprintf(stderr,
+                    "dss::opt::passes::MirFunctionRebuilder fatal: phi "
+                    "incoming pred old v=%u (redirected to v=%u) not in "
+                    "blockMap_ after acceptPhiIncoming admitted it. "
+                    "OLD phi v=%u, OLD block v=%u, OLD fn v=%u. Policy "
+                    "must keep redirected preds in the surviving set.\n",
+                    inc.pred.v, redirectedPred.v, dp.oldPhi.v,
+                    dp.oldBlock.v, oldFn.v);
+                std::abort();
+            }
+            MirInstId const newVal = mapOperand(inc.value);
             dst_.addPhiIncoming(dp.newPhi,
                                 MirPhiIncoming{newVal, predIt->second});
             ++kept;
@@ -184,7 +237,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
     std::vector<MirInstId> newOps;
     newOps.reserve(oldOps.size());
     for (auto o : oldOps) {
-        newOps.push_back(policy_.substituteOperand(rewriteOperand(policy_.substituteOldOperand(o))));
+        newOps.push_back(mapOperand(o));
     }
     MirInstId const newId = dst_.addInst(op, newOps, src_.instType(oldId),
                                          src_.instPayload(oldId),
@@ -229,22 +282,20 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             return;
         }
         case MirOpcode::CondBr: {
-            MirInstId const cond = policy_.substituteOperand(
-                rewriteOperand(policy_.substituteOldOperand(oldOps[0])));
+            MirInstId const cond = mapOperand(oldOps[0]);
             MirInstId const newId = dst_.addCondBr(
                 cond, mapSucc(oldSucc[0]), mapSucc(oldSucc[1]));
             remember(newId);
             return;
         }
         case MirOpcode::Switch: {
-            MirInstId const disc = policy_.substituteOperand(
-                rewriteOperand(policy_.substituteOldOperand(oldOps[0])));
+            MirInstId const disc = mapOperand(oldOps[0]);
             std::vector<std::pair<MirInstId, MirBlockId>> cases;
             std::size_t const ncases = oldSucc.size() - 1;
             cases.reserve(ncases);
             for (std::size_t i = 0; i < ncases; ++i) {
                 cases.emplace_back(
-                    policy_.substituteOperand(rewriteOperand(policy_.substituteOldOperand(oldOps[1 + i]))),
+                    mapOperand(oldOps[1 + i]),
                     mapSucc(oldSucc[i]));
             }
             MirInstId const newId = dst_.addSwitch(
@@ -255,7 +306,7 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
         case MirOpcode::Return: {
             std::optional<MirInstId> retVal;
             if (!oldOps.empty()) {
-                retVal = policy_.substituteOperand(rewriteOperand(policy_.substituteOldOperand(oldOps[0])));
+                retVal = mapOperand(oldOps[0]);
             }
             MirInstId const newId = dst_.addReturn(retVal);
             remember(newId);

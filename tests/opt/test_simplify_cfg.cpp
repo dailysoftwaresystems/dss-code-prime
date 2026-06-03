@@ -293,6 +293,435 @@ TEST(SimplifyCfg, MultiFunctionEachFoldedIndependently) {
         << "each function's CondBr-on-const must fold — counter accumulates";
 }
 
+// D-OPT5-BLOCK-MERGE — linear chain (P, B) where both are Linear:
+// P+B merge into one block; B's terminator becomes the merged block's
+// terminator; B is dropped.
+TEST(SimplifyCfg, LinearChainBlockMerged) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const mid   = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const b = mb.addConst(v4, i32);
+    // Entry has real content (Add(a,b)) AND terminator Br(mid).
+    MirInstId const addOps[] = {a, b};
+    (void)mb.addInst(MirOpcode::Add, addOps, i32);
+    mb.addBr(mid);
+    mb.beginBlock(mid);
+    // Mid has real content (Const + Return).
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
+    Mir mir = std::move(mb).finish();
+
+    auto const blocksBefore = totalBlockCount(mir);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksMerged, 1u)
+        << "linear chain (entry,mid) merges into one block";
+    EXPECT_LT(totalBlockCount(mir), blocksBefore);
+}
+
+// Non-Linear marker on BOTH sides → block-merge skipped (conservative
+// scope; full marker re-derivation is anchored as
+// D-OPT4-1-NON-LINEAR-MARKER-MERGE for a future cycle).
+TEST(SimplifyCfg, BothNonLinearMarkersNotMerged) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // entry → tArm → join, both non-Linear; tArm.terminator = Br(join);
+    // join has 1 pred (tArm). Would be a merge candidate EXCEPT both
+    // markers are non-Linear → conservative gate refuses.
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+    mb.beginBlock(entry); mb.addBr(tArm);
+    mb.beginBlock(tArm);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const addOps[] = {a, a};
+    (void)mb.addInst(MirOpcode::Add, addOps, i32);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    // tArm IS trampoline-shaped? No — it has real content (Add).
+    // Block-merge gate would fire EXCEPT both markers non-Linear.
+    EXPECT_EQ(r.blocksMerged, 0u)
+        << "IfThen + IfJoin both non-Linear — conservative c3 gate "
+           "refuses (D-OPT4-1-NON-LINEAR-MARKER-MERGE).";
+    EXPECT_EQ(r.blocksJumpThreaded, 0u);
+}
+
+// Marker re-derivation: P=Linear, B=LoopExit → merged block becomes
+// LoopExit (the surviving non-Linear marker). Pin the survivor's
+// marker post-merge. The fixture uses entry → CondBr split → only
+// the false-arm reaches the merge chain; this prevents the entry's
+// own merge from collapsing the chain into entry (which would
+// inherit EntryBlock and shadow the marker-re-derivation test).
+TEST(SimplifyCfg, MergeSurvivorInheritsNonLinearMarker) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // entry → CondBr(cond, tArm, mid).  mid(Linear) → exit(LoopExit).
+    // (mid, exit) is the merge candidate we're testing. The entry
+    // can't merge with anyone (its terminator is CondBr, not Br).
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const mid   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const exitB = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    mb.addCondBr(cond, tArm, mid);
+    mb.beginBlock(tArm);
+    MirLiteralValue v9; v9.value = std::int64_t{9}; v9.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v9, i32));
+    mb.beginBlock(mid);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const addOps[] = {a, a};
+    (void)mb.addInst(MirOpcode::Add, addOps, i32);
+    mb.addBr(exitB);
+    mb.beginBlock(exitB);
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksMerged, 1u)
+        << "exactly one merge fires — (mid, exit). Entry's terminator "
+           "is CondBr, so it can't merge with anyone.";
+    bool foundLoopExitMarker = false;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const blk = mir.funcBlockAt(f, bi);
+            if (mir.blockMarker(blk) == StructCfMarker::LoopExit) {
+                foundLoopExitMarker = true;
+            }
+        }
+    }
+    EXPECT_TRUE(foundLoopExitMarker)
+        << "after merge, LoopExit marker must survive (non-Linear "
+           "marker wins over Linear head marker — D-OPT4-1)";
+}
+
+// Block-merge skipped: B has a Phi node (degenerate single-incoming
+// phi, but defensive — block-merge defers to CopyProp's Phi-collapse).
+TEST(SimplifyCfg, TargetWithPhiNotMerged) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const mid   = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirInstId const c = mb.addConst(v3, i32);
+    mb.addBr(mid);
+    mb.beginBlock(mid);
+    MirPhiIncoming const incs[] = {{c, entry}};
+    MirInstId const phi = mb.addPhi(i32, incs);
+    mb.addReturn(phi);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksMerged, 0u)
+        << "B has a Phi — block-merge defers; CopyProp's Phi-collapse "
+           "handles the degenerate single-incoming case";
+}
+
+// Block-merge skipped: B has multiple predecessors. The merge requires
+// exactly 1 pred (= P) so the surviving block has no fan-in to handle.
+TEST(SimplifyCfg, TargetWithMultiplePredsNotMerged) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const fArm  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    mb.addCondBr(cond, tArm, fArm);
+    mb.beginBlock(tArm);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    MirInstId const aops[] = {c1, c1};
+    (void)mb.addInst(MirOpcode::Add, aops, i32);
+    mb.addBr(join);
+    mb.beginBlock(fArm);
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    MirInstId const c2 = mb.addConst(v2, i32);
+    MirInstId const aops2[] = {c2, c2};
+    (void)mb.addInst(MirOpcode::Sub, aops2, i32);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksMerged, 0u)
+        << "join has 2 preds (tArm, fArm) — merging into one would "
+           "require Phi-incoming fan-out (deferred via single-pred gate)";
+}
+
+// Multi-step chain: P → B → C, all Linear, all with real content,
+// each gate fires → all three merge into one block.
+TEST(SimplifyCfg, MultiStepChainMerged) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const mid1  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const mid2  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const dst   = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const aops[] = {a, a};
+    (void)mb.addInst(MirOpcode::Add, aops, i32);
+    mb.addBr(mid1);
+    mb.beginBlock(mid1);
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirInstId const b = mb.addConst(v4, i32);
+    MirInstId const bops[] = {b, b};
+    (void)mb.addInst(MirOpcode::Sub, bops, i32);
+    mb.addBr(mid2);
+    mb.beginBlock(mid2);
+    MirLiteralValue v5; v5.value = std::int64_t{5}; v5.core = TypeKind::I32;
+    MirInstId const c = mb.addConst(v5, i32);
+    MirInstId const cops[] = {c, c};
+    (void)mb.addInst(MirOpcode::Mul, cops, i32);
+    mb.addBr(dst);
+    mb.beginBlock(dst);
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksMerged, 3u)
+        << "all three merge pairs fire — entry+mid1, mid1+mid2, "
+           "mid2+dst collapse into ONE block";
+    EXPECT_EQ(totalBlockCount(mir), 1u);
+}
+
+// Phi-incoming redirection across merge: downstream block has a Phi
+// with incoming-from-absorbed-B; that incoming must redirect to the
+// absorb head P. This pins the phase-3 phi-incoming redirect via
+// redirectBlockTarget.
+TEST(SimplifyCfg, PhiIncomingRedirectedAcrossMerge) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // entry → tHead(Linear) → tMerged(Linear) → join(Linear);
+    //  entry → fArm(Linear) → join.
+    // tHead+tMerged should merge (both Linear, single-pred chain).
+    // join has Phi with incomings (vT, tMerged) + (vF, fArm).
+    // Post-merge: phi's tMerged-incoming must redirect to tHead.
+    MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tHead    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const tMerged  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const fArm     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join     = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    MirInstId const vT = mb.addConst(v1, i32);
+    MirInstId const vF = mb.addConst(v2, i32);
+    mb.addCondBr(cond, tHead, fArm);
+    mb.beginBlock(tHead);
+    MirInstId const aops[] = {vT, vT};
+    (void)mb.addInst(MirOpcode::Add, aops, i32);
+    mb.addBr(tMerged);
+    mb.beginBlock(tMerged);
+    MirInstId const sops[] = {vT, vT};
+    (void)mb.addInst(MirOpcode::Sub, sops, i32);
+    mb.addBr(join);
+    mb.beginBlock(fArm);
+    MirInstId const mops[] = {vF, vF};
+    (void)mb.addInst(MirOpcode::Mul, mops, i32);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    MirPhiIncoming const incs[] = {{vT, tMerged}, {vF, fArm}};
+    MirInstId const phi = mb.addPhi(i32, incs);
+    mb.addReturn(phi);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksMerged, 1u)
+        << "tHead+tMerged merge (both Linear, single-pred chain)";
+    // Stronger pin per simplifier review #8: assert NOT just "phi
+    // has 2 incomings" but that one incoming's pred IS the absorb
+    // head's surviving block id. Track the function's blocks in
+    // creation order: entry, tHead, fArm, join (tMerged absorbed
+    // into tHead). The phi's incomings should be {(vT, tHead-new),
+    // (vF, fArm-new)} — not {(vT, fArm), (vF, fArm)} which would
+    // pass the count-only assertion but be semantically wrong.
+    bool phiIncomingsCorrectlyRedirected = false;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        // The tHead-new block is the SECOND block created in source
+        // order (after entry). tMerged was absorbed into tHead.
+        // Walk the funcBlockAt sequence; surviving blocks are
+        // entry, tHead-new, fArm-new, join-new (tMerged elided).
+        ASSERT_EQ(nb, 4u) << "tMerged should be elided; 4 blocks survive";
+        MirBlockId const newEntry  = mir.funcBlockAt(f, 0);
+        MirBlockId const newTHead  = mir.funcBlockAt(f, 1);
+        MirBlockId const newFArm   = mir.funcBlockAt(f, 2);
+        MirBlockId const newJoin   = mir.funcBlockAt(f, 3);
+        (void)newEntry;
+        std::uint32_t const ni = mir.blockInstCount(newJoin);
+        for (std::uint32_t i2 = 0; i2 < ni; ++i2) {
+            MirInstId const id = mir.blockInstAt(newJoin, i2);
+            if (mir.instOpcode(id) != MirOpcode::Phi) continue;
+            auto const phiIncs = mir.phiIncomings(id);
+            ASSERT_EQ(phiIncs.size(), 2u);
+            // Pin: one incoming pred == newTHead (absorb head),
+            // other == newFArm. Order may vary but the SET must match.
+            std::vector<std::uint32_t> predIds;
+            for (auto const& inc : phiIncs) predIds.push_back(inc.pred.v);
+            std::sort(predIds.begin(), predIds.end());
+            std::vector<std::uint32_t> expected = {newTHead.v, newFArm.v};
+            std::sort(expected.begin(), expected.end());
+            if (predIds == expected) phiIncomingsCorrectlyRedirected = true;
+        }
+    }
+    EXPECT_TRUE(phiIncomingsCorrectlyRedirected)
+        << "phi incoming preds must be exactly {newTHead, newFArm} — "
+           "tMerged's absorbed-pred slot redirected to its absorb "
+           "head tHead, NOT silently dropped or aliased to fArm";
+}
+
+// Chain non-Linear marker invariant: a chain like H(Linear) →
+// B1(IfThen) → B2(LoopExit) would violate the "≤1 non-Linear marker
+// per chain" rule that c3's marker re-derivation depends on.
+// analyze() rejects the second admission to keep the chain
+// single-non-Linear. Without this guard, the marker re-derivation
+// would silently pick one and drop the other.
+TEST(SimplifyCfg, ChainNonLinearMarkerRejectsSecondAdmission) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // entry → ifThen(IfThen) → linkage(Linear) → loopExit(LoopExit).
+    // (entry, ifThen): entry=EntryBlock non-Linear, ifThen=IfThen
+    //                  non-Linear → pair gate REJECTS (both non-Linear).
+    // Adjust: use entry → linkage1(Linear) → ifThen(IfThen) →
+    //          linkage2(Linear) → loopExit(LoopExit) to expose the
+    //          chain-multi-non-Linear case.
+    MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const linkage1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const ifThen   = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const linkage2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const loopExit = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry); mb.addBr(linkage1);
+    mb.beginBlock(linkage1);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const aops1[] = {a, a};
+    (void)mb.addInst(MirOpcode::Add, aops1, i32);
+    mb.addBr(ifThen);
+    mb.beginBlock(ifThen);
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirInstId const b = mb.addConst(v4, i32);
+    MirInstId const aops2[] = {b, b};
+    (void)mb.addInst(MirOpcode::Sub, aops2, i32);
+    mb.addBr(linkage2);
+    mb.beginBlock(linkage2);
+    MirLiteralValue v5; v5.value = std::int64_t{5}; v5.core = TypeKind::I32;
+    MirInstId const c = mb.addConst(v5, i32);
+    MirInstId const aops3[] = {c, c};
+    (void)mb.addInst(MirOpcode::Mul, aops3, i32);
+    mb.addBr(loopExit);
+    mb.beginBlock(loopExit);
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    // Pairs by-the-gate: (linkage1, ifThen) admits (head=linkage1,
+    // chain non-Linear=IfThen). (ifThen, linkage2) — head is still
+    // linkage1; chain has IfThen + linkage2 is Linear → admit.
+    // (linkage2, loopExit) — head is linkage1; chain has IfThen
+    // non-Linear AND loopExit is non-Linear → REJECT (would push to
+    // 2 non-Linear). So 2 admissions, not 3.
+    EXPECT_EQ(r.blocksMerged, 2u)
+        << "the third admission (linkage2 → loopExit) is rejected "
+           "to keep the chain at ≤1 non-Linear marker; loopExit "
+           "survives as its own block";
+    // Surviving non-Linear markers: EntryBlock (entry), IfThen
+    // (linkage1's chain inherits via override), LoopExit (loopExit
+    // standalone). The chain's surviving marker should be IfThen.
+    std::vector<int> survivors;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            survivors.push_back(static_cast<int>(
+                mir.blockMarker(mir.funcBlockAt(f, bi))));
+        }
+    }
+    std::sort(survivors.begin(), survivors.end());
+    std::vector<int> expected = {
+        static_cast<int>(StructCfMarker::EntryBlock),
+        static_cast<int>(StructCfMarker::IfThen),
+        static_cast<int>(StructCfMarker::LoopExit),
+    };
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(survivors, expected)
+        << "after chain-non-Linear rejection, surviving markers are "
+           "{EntryBlock, IfThen (from chain via override), LoopExit}";
+}
+
 // D-OPT4-1 marker preservation (RULE: c2's transforms — branch-fold +
 // empty-block elision — NEVER mutate a surviving block's structural
 // role). Build a multi-marker CFG with NO trampolines (so no blocks

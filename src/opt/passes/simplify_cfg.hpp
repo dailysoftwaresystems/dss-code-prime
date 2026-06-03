@@ -61,6 +61,7 @@ struct SimplifyCfgResult {
     bool        ok                 = false;
     std::size_t branchesFolded     = 0;
     std::size_t blocksJumpThreaded = 0;
+    std::size_t blocksMerged       = 0;
 };
 
 [[nodiscard]] DSS_EXPORT SimplifyCfgResult

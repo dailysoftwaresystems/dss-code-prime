@@ -60,7 +60,9 @@ struct PassRunResult {
         }
         case PassId::SimplifyCfg: {
             auto const r = passes::runSimplifyCfg(mir, interner, reporter);
-            return {r.ok, r.branchesFolded + r.blocksJumpThreaded > 0};
+            return {r.ok,
+                    r.branchesFolded + r.blocksJumpThreaded
+                  + r.blocksMerged > 0};
         }
         case PassId::Licm: {
             auto const r = passes::runLicm(mir, interner, reporter);

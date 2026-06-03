@@ -138,6 +138,28 @@ public:
         std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
         std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {}
 
+    // Block-merge / absorb hook. If a policy returns `next` for
+    // block `oldB`, the rebuilder treats `next`'s instructions as a
+    // continuation of `oldB`: after emitting `oldB`'s non-terminator
+    // insts, the rebuilder continues with `next`'s non-terminator
+    // insts (and chases further `absorbSuccessor(next)`...), then
+    // finally emits the LAST absorbed block's terminator as the
+    // merged block's terminator. `oldB`'s own terminator is
+    // dropped. Default = nullopt (no absorb). SimplifyCFG overrides
+    // this to merge `(P, B)` pairs where `P.terminator == Br(B)`,
+    // `preds[B] == {P}`, and B has no Phi nodes.
+    //
+    // The absorbed block (`next`) MUST be excluded from
+    // `selectBlocks` so the rebuilder doesn't pre-create it; the
+    // policy is responsible for that exclusion. Predecessors of
+    // `next` in phi-incomings flow through `redirectBlockTarget`
+    // (phase 3 calls it on `inc.pred`) so the surviving block id
+    // (the absorb chain head) is used in the rebuilt phi.
+    [[nodiscard]] virtual std::optional<MirBlockId>
+    absorbSuccessor(MirBlockId /*oldB*/) {
+        return std::nullopt;
+    }
+
     // Successor-block redirect hook applied during terminator
     // emission. Default = identity. SimplifyCFG overrides this for
     // empty-block jump-threading: a block B whose only inst is a
@@ -217,6 +239,16 @@ public:
 
 private:
     [[nodiscard]] MirInstId rewriteOperand(MirInstId oldOp) const;
+    // Operand mapping composition: `substituteOldOperand` (OLD-id
+    // pre-rewrite redirect — e.g. CopyProp Phi-collapse, CSE value
+    // numbering) → `rewriteOperand` (old→new arena translation) →
+    // `substituteOperand` (NEW-id post-rewrite redirect — reserved
+    // for future general copy-prop). Single helper at every operand-
+    // resolution site so the 3-step composition stays uniform.
+    [[nodiscard]] MirInstId mapOperand(MirInstId oldOp) const {
+        return policy_.substituteOperand(
+            rewriteOperand(policy_.substituteOldOperand(oldOp)));
+    }
     void emitValue(MirOpcode op, MirInstId oldId);
     void emitTerminator(MirOpcode op, MirInstId oldId);
 
