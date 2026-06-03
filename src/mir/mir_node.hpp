@@ -2,6 +2,7 @@
 
 #include "core/substrate/arena_tag.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_attrs.hpp"           // SymbolBinding / SymbolVisibility
 #include "core/types/type_lattice/type_id.hpp"   // TypeId
 #include "mir/mir_opcode.hpp"
 
@@ -156,7 +157,19 @@ struct MirFunc {
     std::uint32_t blockStart = 0;            // 4  — into the block arena
     std::uint32_t blockCount = 0;            // 4
     std::uint32_t symbol     = 0;            // 4  — declared SymbolId.v
-    std::uint32_t _pad       = 0;            // 4  — explicit padding
+    // D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD (step 13.6 OPT1 gate,
+    // 2026-06-03): linkage attributes for the optimizer's DCE pass.
+    // `isExternallyVisible(binding, visibility)` is the DCE-protect
+    // predicate; a function for which it returns true MUST NOT be
+    // deleted by DCE even when no intra-module use exists. C-style
+    // languages without `static` default both fields to (Global,
+    // Default) — every function externally visible by language
+    // convention. Front-ends with `static` / `inline` / `hidden`
+    // emit the matching binding/visibility at HIR→MIR lowering.
+    // Fits the existing 4-byte _pad slot — no struct-size growth.
+    SymbolBinding    binding    = SymbolBinding::Global;     // 1
+    SymbolVisibility visibility = SymbolVisibility::Default; // 1
+    std::uint16_t _pad          = 0;                         // 2  — explicit padding
 };
 static_assert(sizeof(MirFunc) <= 32, "detail::MirFunc grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirFunc>);
@@ -185,6 +198,14 @@ struct MirGlobal {
     std::uint32_t symbol           = 0;                 // 4  — declared SymbolId.v
     std::uint32_t initLiteralIndex = UINT32_MAX;        // 4  — into MirLiteralPool
     MirFuncId     initFunc{};                           // 8  — module-init function id (strong)
+    // D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD (step 13.6 OPT1 gate,
+    // 2026-06-03): same linkage discipline as MirFunc — DCE-protected
+    // when `isExternallyVisible(binding, visibility)` returns true.
+    // Externally-observable globals (a C-style file-scope `int g;`
+    // with no `static`) MUST survive DCE / unused-symbol elimination.
+    SymbolBinding    binding    = SymbolBinding::Global;     // 1
+    SymbolVisibility visibility = SymbolVisibility::Default; // 1
+    std::uint16_t _pad          = 0;                         // 2  — explicit padding
 };
 static_assert(sizeof(MirGlobal) <= 32, "detail::MirGlobal grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirGlobal>);
