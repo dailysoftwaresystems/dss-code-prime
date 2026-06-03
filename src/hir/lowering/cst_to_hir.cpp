@@ -283,21 +283,32 @@ struct Lowerer {
             }
         }
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): when
-        // the source expression is an integer-literal 0 and the target
-        // is a pointer type, materialize the null-pointer conversion
-        // as `Cast(IntLit(0), Ptr<T>)`. The MIR-tier Cast lowering
-        // routes integer→pointer as a zero-extending move into a
-        // pointer-width register (literal 0 → 8-byte zero on Win64
-        // ms_x64), which Windows ABI reads as NULL — synchronous
-        // mode for `lpOverlapped`, NULL handle for HANDLE-typed args.
+        // the source expression is an integer-literal in a pointer-
+        // typed context and the active language admits null-pointer-
+        // constant conversion, materialize the null-pointer conversion
+        // as `Cast(IntLit, Ptr<T>)`. The MIR-tier Cast lowering routes
+        // integer→pointer as a zero-extending move into a pointer-
+        // width register (literal 0 → 8-byte zero on Win64 ms_x64),
+        // which Windows ABI reads as NULL.
         //
-        // Sister rule in `semantic_analyzer.cpp::admitsNullPointerConstant`
-        // — the semantic phase has admitted this site BEFORE reaching
-        // here; this arm only materializes the Cast. The value check
-        // (`payload == 0` in the pool's int64/uint64 arm) duplicates
-        // the semantic-phase check intentionally — the lowering should
-        // not assume external admission state; an unadmitted call here
-        // would have already produced an S_TypeMismatch.
+        // **Trust the semantic admission**: the value check (literal
+        // == 0) lives in `semantic_analyzer.cpp::isLiteralIntegerZero`
+        // at the CST tier. By the time coerce() is called, the
+        // semantic analyzer has already verified value==0 AND admitted
+        // the conversion; a NON-zero literal would have produced
+        // S_TypeMismatch before HIR lowering. Duplicating the value
+        // check at HIR tier requires a literal-pool lookup
+        // (`builder.payload` + `literals.at` + variant arm dispatch
+        // via `asInt64`) which is sensitive to STL implementation
+        // differences (caught on macOS CI 2026-06-02 where the literal
+        // pool variant access disagreed between hosts, silently
+        // skipping Cast emission). Trusting the semantic gate makes
+        // the lowering single-source-of-truth at the right tier.
+        //
+        // Source-agnostic: gates on the per-language config flag.
+        // Languages without null-pointer-constant (Rust/Swift/Zig)
+        // never admit at the semantic tier and never reach this arm
+        // with int→Ptr.
         if (tk == TypeKind::Ptr
             && sem.pointerConversions.nullPointerConstantFromIntegerZero
             && builder.kind(child.id) == HirKind::Literal) {
@@ -310,25 +321,15 @@ struct Lowerer {
                 || ck2 == TypeKind::U32 || ck2 == TypeKind::U64
                 || ck2 == TypeKind::U128;
             if (isInt) {
-                auto const idx = builder.payload(child.id);
-                auto const& lv = literals.at(idx);
-                // Use `dss::detail::asInt64` (const_eval_arith.hpp) to
-                // bridge both int64 and uint64 variant arms uniformly
-                // — matches the existing const-eval convention and
-                // avoids duplicating the variant-dispatch logic.
-                auto const i64 = ::dss::detail::asInt64(lv);
-                bool const isZero = i64.has_value() && *i64 == 0;
-                if (isZero) {
-                    HirNodeId const cast = builder.makeCast(
-                        child.id, target, HirFlags::Synthetic);
-                    for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
-                        if (it->first == child.id) {
-                            spans.push_back({cast, it->second});
-                            break;
-                        }
+                HirNodeId const cast = builder.makeCast(
+                    child.id, target, HirFlags::Synthetic);
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({cast, it->second});
+                        break;
                     }
-                    return {cast, target};
                 }
+                return {cast, target};
             }
         }
         // Pointers, structs, FnSig are not coerced implicitly; let the

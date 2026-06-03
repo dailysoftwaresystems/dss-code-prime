@@ -217,17 +217,21 @@ struct DSS_EXPORT FrameLayout {
     // pre-13.3b shapes (corpus tests + globals-only examples).
     //
     // **Frame-zone ordering [outgoing | saved | spill | LOCALS]
-    // rationale** (7-agent fold A4): locals-on-top is correct for
-    // two compounding reasons. (1) Spills are touched on EVERY
-    // function call's reg-pressure-driven save/restore traffic;
-    // keeping them closer to SP enables smaller disp8 displacement
-    // encodings on x86_64 (1-byte vs 4-byte disp32) — measurable
-    // .text-size win on spill-heavy functions. (2) Saved-reg area
-    // must be adjacent to the prologue's push sequence for unwind-
-    // info correctness on Windows x64 (.pdata FrameRegister offset
-    // pins the saved-reg block at a known position relative to the
-    // post-prologue SP). Locals-above-spill is also LLVM's x86
-    // FrameLowering convention.
+    // rationale** (7-agent fold A4 + 2nd-order silent-failure HIGH-2
+    // correction): saved-reg area MUST sit contiguously above the
+    // prologue's push sequence for unwind-info correctness on
+    // Windows x64 — UWOP_PUSH_NONVOL codes in UNWIND_INFO record
+    // each saved-reg push relative to the prologue's SP-adjusting
+    // subq, so no other zone may interleave between the pushes and
+    // the saved-reg block. Locals-above-spill (vs spill-above-
+    // locals) is LLVM's x86 FrameLowering convention; the disp8
+    // encoding-density argument (smaller 1-byte vs 4-byte
+    // displacement for spill traffic) is anchored as a future win
+    // — the current x86_variable encoder emits only MemDisp32 mode
+    // (`x86_variable.cpp::ModMode::{RegDirect,MemDisp32,RipRel}`),
+    // so the displacement-size benefit doesn't materialize until
+    // a `MemDisp8` mode + selection lands (anchor: future
+    // `D-AS4-DISP8-ENCODING` cycle).
     [[nodiscard]] constexpr std::uint32_t
     localAreaOffset() const noexcept {
         return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize;

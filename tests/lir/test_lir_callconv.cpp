@@ -452,19 +452,24 @@ collectInstStats(Lir const& lir, TargetSchema const& schema) {
                 if (allocaOp.has_value() && op == *allocaOp) ++s.allocaOps;
                 if (leaOp.has_value() && op == *leaOp) {
                     ++s.leaOps;
-                    // Capture the disp32 of the 3-op LEA variant
-                    // (`lea result, [base + disp32]` — operand layout
-                    // [base_reg, MemBase, MemOffset]). Other variants
-                    // (4-op indexed; 1-op SymbolRef RipRel) are
-                    // captured as 0 since they're not the alloca-
-                    // materialize shape.
+                    // 2nd-order silent-failure fix: capture the disp32
+                    // ONLY for the 3-op LEA variant (`lea result,
+                    // [base + disp32]` — operand layout [base_reg,
+                    // MemBase, MemOffset]). Pushing `0` for the 4-op
+                    // indexed and 1-op SymbolRef-RipRel variants would
+                    // silently satisfy offset==0 membership checks
+                    // (the alloca-materialize shape can legitimately
+                    // emit offset 0 for leaf functions with no
+                    // outgoing/saved/spill area), causing the multi-
+                    // alloca off-by-one regression detector to pass
+                    // when it shouldn't. Skip non-3-op variants
+                    // entirely so `leaOffsets` only contains the
+                    // alloca-materialize shape's offsets.
                     auto const ops = lir.instOperands(inst);
-                    std::int32_t off = 0;
                     if (ops.size() == 3
                         && ops[2].kind == LirOperandKind::MemOffset) {
-                        off = ops[2].offset;
+                        s.leaOffsets.push_back(ops[2].offset);
                     }
-                    s.leaOffsets.push_back(off);
                 }
                 if (callOp.has_value() && op == *callOp) {
                     ++s.callOps;
