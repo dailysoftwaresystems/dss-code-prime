@@ -352,6 +352,31 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
     // count-by-blocks framing). Each absorbed block appears in
     // exactly one pair as the tail.
     blocksMerged_ += absorbedToHead_.size();
+    // Inversion invariant (type-design FOLD-NOW from 2nd-pass
+    // review): absorbMap_.values() must equal absorbedToHead_.keys()
+    // and the two maps must have the same size. A future maintainer
+    // who adds to one map but forgets the other would silently
+    // miscompile (selectBlocks would emit an "absorbed" block, or
+    // the rebuilder would chase an absorb chain into a dead key).
+    if (absorbMap_.size() != absorbedToHead_.size()) {
+        std::fprintf(stderr,
+            "dss::opt::passes::SimplifyCfg fatal: absorbMap_ size %zu "
+            "≠ absorbedToHead_ size %zu — inversion-invariant "
+            "violation (every absorbed block in one map must appear "
+            "in the other).\n",
+            absorbMap_.size(), absorbedToHead_.size());
+        std::abort();
+    }
+    for (auto const& [P, B] : absorbMap_) {
+        if (absorbedToHead_.count(B) != 1) {
+            std::fprintf(stderr,
+                "dss::opt::passes::SimplifyCfg fatal: absorbMap_ "
+                "entry P v=%u → B v=%u, but B is not in "
+                "absorbedToHead_ — inversion-invariant violation.\n",
+                P.v, B.v);
+            std::abort();
+        }
+    }
 
     // Step 2: identify branch-foldable terminators. A CondBr is
     // foldable iff its condition resolves (via the source MIR) to a

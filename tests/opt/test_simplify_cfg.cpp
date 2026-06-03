@@ -18,10 +18,12 @@
 //   * Runtime-init carve-out parity
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/optimizer.hpp"
 #include "opt/passes/simplify_cfg.hpp"
 
 #include <gtest/gtest.h>
@@ -361,8 +363,10 @@ TEST(SimplifyCfg, BothNonLinearMarkersNotMerged) {
     // tArm IS trampoline-shaped? No — it has real content (Add).
     // Block-merge gate would fire EXCEPT both markers non-Linear.
     EXPECT_EQ(r.blocksMerged, 0u)
-        << "IfThen + IfJoin both non-Linear — conservative c3 gate "
-           "refuses (D-OPT4-1-NON-LINEAR-MARKER-MERGE).";
+        << "BOTH candidate pairs in this fixture — (entry, tArm) and "
+           "(tArm, join) — share the both-non-Linear shape "
+           "(EntryBlock+IfThen, then IfThen+IfJoin). The c3 gate "
+           "rejects both pairs (D-OPT4-1-NON-LINEAR-MARKER-MERGE).";
     EXPECT_EQ(r.blocksJumpThreaded, 0u);
 }
 
@@ -410,21 +414,44 @@ TEST(SimplifyCfg, MergeSurvivorInheritsNonLinearMarker) {
     EXPECT_EQ(r.blocksMerged, 1u)
         << "exactly one merge fires — (mid, exit). Entry's terminator "
            "is CondBr, so it can't merge with anyone.";
-    bool foundLoopExitMarker = false;
+    // Tighter pin (test-analyzer rating 4): assert LoopExit marker
+    // lands on the MERGED block specifically, not "somewhere" — a
+    // regression that bled the marker to an unrelated block would
+    // pass the "found somewhere" check but fail this stricter pin.
+    // The merged block is identified by its instruction count: it's
+    // the only block whose instCount equals (mid.preMerge - 1 for
+    // the dropped Br + exitB.preMerge) = (3 + 2) - 1 = 4. The
+    // unmerged tArm has 2 insts. Entry has 3 (Arg + 2 Consts +
+    // CondBr — wait, MirBuilder stores Arg/Const as instructions;
+    // entry has Arg + CondBr cond + actual CondBr = 3 inst items).
+    // The marker should land on the 4-inst block specifically.
+    std::size_t loopExitCount = 0;
+    bool mergedBlockHasLoopExit = false;
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < nf; ++fi) {
         MirFuncId const f = mir.funcAt(fi);
         std::uint32_t const nb = mir.funcBlockCount(f);
+        ASSERT_EQ(nb, 3u) << "after one merge, 3 blocks survive";
         for (std::uint32_t bi = 0; bi < nb; ++bi) {
             MirBlockId const blk = mir.funcBlockAt(f, bi);
-            if (mir.blockMarker(blk) == StructCfMarker::LoopExit) {
-                foundLoopExitMarker = true;
+            StructCfMarker const m = mir.blockMarker(blk);
+            if (m == StructCfMarker::LoopExit) {
+                ++loopExitCount;
+                // The merged block has instCount > 2 (mid's 2 non-
+                // terminator insts + exitB's 2 insts including its
+                // Return terminator = 4). Unmerged tArm has only 2.
+                if (mir.blockInstCount(blk) > 2) {
+                    mergedBlockHasLoopExit = true;
+                }
             }
         }
     }
-    EXPECT_TRUE(foundLoopExitMarker)
-        << "after merge, LoopExit marker must survive (non-Linear "
-           "marker wins over Linear head marker — D-OPT4-1)";
+    EXPECT_EQ(loopExitCount, 1u)
+        << "exactly one block carries the LoopExit marker post-merge";
+    EXPECT_TRUE(mergedBlockHasLoopExit)
+        << "the LoopExit marker lands on the MERGED block (instCount > 2 "
+           "— contains both mid's and exitB's content), NOT on an "
+           "unrelated block (D-OPT4-1)";
 }
 
 // Block-merge skipped: B has a Phi node (degenerate single-incoming
@@ -720,6 +747,115 @@ TEST(SimplifyCfg, ChainNonLinearMarkerRejectsSecondAdmission) {
     EXPECT_EQ(survivors, expected)
         << "after chain-non-Linear rejection, surviving markers are "
            "{EntryBlock, IfThen (from chain via override), LoopExit}";
+}
+
+// Three-transform composition (test-analyzer rating 6): a SINGLE
+// `runSimplifyCfg` invocation should fire branch-fold + jump-thread
+// + block-merge if the CFG has each opportunity. Catches ordering
+// bugs (e.g. branch-fold creating a new merge opportunity that the
+// same analysis pass misses, or jump-thread invalidating a merge
+// candidate's pred-set without reseeding the analyzer).
+TEST(SimplifyCfg, ThreeTransformsComposeInOnePass) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // Combined CFG with all 3 shapes:
+    //   entry: CondBr(Const(true), tArm, fArm) → branch-fold fires.
+    //   tArm(Linear): real content, Br(tramp).
+    //   tramp(Linear): only Br(dst) → jump-thread fires (dst has no phis).
+    //   fArm(Linear): dead post-fold; DCE handles next iter.
+    //   dst(Linear): real content + Br(final).
+    //   final(Linear): Return.
+    //   (tArm, dst) is a block-merge candidate via the jump-threaded
+    //   target — but actually let's structure it more cleanly:
+    //   entry → CondBr(true, A, B) → A → tramp → C → final.
+    //   A and C are merge candidates (both Linear, single-pred chain).
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const A     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const B     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const tramp = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const C     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const final_ = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const condT = mb.addConst(tru, boolT);
+    mb.addCondBr(condT, A, B);  // CondBr(const(true)) → branch-fold
+    mb.beginBlock(A);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    MirInstId const aops[] = {c1, c1};
+    (void)mb.addInst(MirOpcode::Add, aops, i32);
+    mb.addBr(tramp);
+    mb.beginBlock(B);  // unreachable post-fold; ConstFold/DCE clears next iter
+    MirLiteralValue v9; v9.value = std::int64_t{9}; v9.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v9, i32));
+    mb.beginBlock(tramp); mb.addBr(C);  // trampoline → jump-thread fires
+    mb.beginBlock(C);
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    MirInstId const c2 = mb.addConst(v2, i32);
+    MirInstId const sops[] = {c2, c2};
+    (void)mb.addInst(MirOpcode::Sub, sops, i32);
+    mb.addBr(final_);
+    mb.beginBlock(final_);
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_GE(r.branchesFolded,    1u) << "CondBr(true) folds to Br(A)";
+    EXPECT_GE(r.blocksJumpThreaded, 1u) << "tramp(Br-only) jump-threaded";
+    EXPECT_GE(r.blocksMerged,      1u)
+        << "after jump-thread + branch-fold, C+final (or A+...) merge";
+}
+
+// Engine end-to-end (test-analyzer rating 7): block-merge must
+// produce a verifier-accepted MIR. Direct `runSimplifyCfg` tests
+// the pass; this test rounds through `optimize()` with
+// `verify-after-pass` active. A regression that produces malformed
+// SSA (dangling phi-incoming, broken pred-edge set, orphan
+// terminator) fails the verifier rather than passing this test.
+TEST(SimplifyCfg, BlockMergeProducesVerifierAcceptedMir) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const mid   = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const aops[] = {a, a};
+    (void)mb.addInst(MirOpcode::Add, aops, i32);
+    mb.addBr(mid);
+    mb.beginBlock(mid);
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v7, i32));
+    Mir mir = std::move(mb).finish();
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    DiagnosticReporter rep;
+    opt::OptPipeline const pipeline{
+        "simplify-cfg-only", {opt::PassId::SimplifyCfg}, /*maxIterations*/1};
+    auto const result =
+        opt::optimize(mir, **targetR, interner, pipeline, rep);
+    EXPECT_TRUE(result.ok)
+        << "block-merge'd MIR must round through verify-after-pass "
+           "cleanly — a malformed CFG would set ok=false";
+    // No verifier diagnostic codes should appear.
+    std::size_t verifierFailureCount = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::I_VerifierFailure) {
+            ++verifierFailureCount;
+        }
+    }
+    EXPECT_EQ(verifierFailureCount, 0u);
 }
 
 // D-OPT4-1 marker preservation (RULE: c2's transforms — branch-fold +
