@@ -191,7 +191,8 @@
         "variants": [
           {
             "guard":    { "operandKinds": [] },
-            "template": { "opcode": [15, 144], "condCodeFromPayload": true, "modrmRegExt": 0 },
+            "$templateComment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): `forceRexPrefix: true` forces a REX prefix even when no W/R/X/B bit is set. Required so the byte-register-bearing setcc accesses spl/bpl/sil/dil (low byte of r4..r7) instead of the legacy ah/ch/dh/bh high-byte aliases. Without this, regalloc picking rsp/rbp/rsi/rdi would silently write the setcc result into the HIGH byte of a DIFFERENT physical register.",
+            "template": { "opcode": [15, 144], "condCodeFromPayload": true, "modrmRegExt": 0, "forceRexPrefix": true },
             "resultSlot": "modrm.rm"
           }
         ]
@@ -494,14 +495,27 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Zero-extend integer (cycle 3c cast lowering for MIR ZExt). Operands: [src_reg]. AS1 emits movzx.",
+      "$comment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): zero-extend the low BYTE of a register to a full r64. Encoding `REX.W 0F B6 /r` — movzx r64, r/m8. ModR/M.reg = result (dest, 64-bit); ModR/M.rm = operand[0] (src, low-byte). REX.W=true serves double duty: (a) sets dest to r64, (b) forces REX prefix presence so the SRC low-byte access uses the spl/bpl/sil/dil aliasing (proper 8-bit access of r4..r7) instead of the legacy ah/ch/dh/bh high-byte alias. The natural consumer is the setcc → zext pair lowered by `lowerICmp`, but it is also reused by MIR ZExt for arbitrary boolean-typed → int widening.",
       "mnemonic":      "zext",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "rexW": true, "opcode": [15, 182] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Truncate integer (cycle 3c cast lowering for MIR Trunc). Operands: [src_reg]. AS1 emits mov of the low N bits (effectively a no-op on x86_64 since registers alias subregs).",

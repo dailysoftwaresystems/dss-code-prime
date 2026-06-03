@@ -563,7 +563,14 @@ bool encode(Lir const&                  lir,
     bool const rexX = st.rexX;  // reserved — SIB.index high bit (no
                                  // cycle-2 walker writes this).
     bool const rexB = st.rexB;
-    if (rexW || rexR || rexX || rexB) {
+    // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
+    // code-reviewer C2): a variant whose template declares
+    // `forceRexPrefix: true` (setcc) emits a REX prefix even with
+    // no W/R/X/B bit set, so the byte-register-bearing instruction
+    // accesses spl/bpl/sil/dil (low byte of r4..r7) instead of the
+    // legacy ah/ch/dh/bh high-byte aliases.
+    bool const forceRex = selected->tmpl.forceRexPrefix;
+    if (rexW || rexR || rexX || rexB || forceRex) {
         std::uint8_t const rex =
             static_cast<std::uint8_t>(0x40u
             | (rexW ? 0x08u : 0u)

@@ -1079,6 +1079,10 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Setcc, "MIR ICmp");
             return;
         }
+        if (!opcode(MnemonicSlot::ZExt).has_value()) {
+            reportMissingOpcode(MnemonicSlot::ZExt, "MIR ICmp");
+            return;
+        }
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) {
             reportUnsupported(mir.instOpcode(id), id);
@@ -1094,9 +1098,27 @@ struct Lowerer {
         std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
         emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
 
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
-        emitInst(*opcode(MnemonicSlot::Setcc), result, std::span<LirOperand const>{},
+        // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
+        // code-reviewer C2): emit setcc into a separate "byte" vreg,
+        // then movzx the low byte into the result vreg. This makes
+        // the substrate contract explicit: setcc writes the LOW
+        // BYTE of its r/m8 destination; the upper 56 bits are
+        // architecturally undefined per Intel SDM. The standalone
+        // zext makes the zero-extend a first-class LIR operation
+        // so the result is always a CLEAN 0/1 r64 — `cmp r64, 0`
+        // / `cmp r64, r64` consumers downstream cannot read garbage.
+        // The ICmp+CondBr fusion at `lowerCondBr` still elides the
+        // cmp-against-0 (the setcc + zext become "dead" via D-LIR-
+        // SETCC-DEAD-AFTER-FUSION DCE in 13.6), but non-adjacent
+        // ICmp uses (bool stored, bool returned, bool ternary) now
+        // get correct width semantics for free. Clean SSA: setcc
+        // defines `b8`; zext consumes `b8` AND defines `result`.
+        LirReg const b8 = lir.newVReg(LirRegClass::GPR);
+        emitInst(*opcode(MnemonicSlot::Setcc), b8, std::span<LirOperand const>{},
                     /*payload=*/static_cast<std::uint32_t>(cond));
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> zextOps{LirOperand::makeReg(b8)};
+        emitInst(*opcode(MnemonicSlot::ZExt), result, zextOps);
         defineValue(id, result);
     }
 
@@ -1463,18 +1485,32 @@ struct Lowerer {
             LirBlockId nextBlock;
             bool const isLastCase = (i + 1 == caseCount);
             LirBlockId const caseTarget = mirBlockToLirBlock.get(succs[i]);
+            // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1
+            // post-fold, code-reviewer C1): jcc now requires the
+            // 2 BlockRef operands as its operand list (matches the
+            // schema's `["blockref", "blockref"]` guard). Pre-fold
+            // the switch lowering passed empty operands — the
+            // encoder would have failed `A_NoMatchingEncodingVariant`
+            // on EVERY switch statement; the gap slipped because
+            // no runnable corpus example exercises switch yet.
             if (isLastCase) {
                 // Final compare: jcc-eq to case target, else jcc fallthrough
                 // to a tiny "jmp default" block.
                 LirBlockId const defaultJump = lir.createBlock();
-                emitCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
+                std::array<LirOperand, 2> jccOps{
+                    LirOperand::makeBlockRef(caseTarget.v),
+                    LirOperand::makeBlockRef(defaultJump.v)};
+                emitCondBr(*opcode(MnemonicSlot::Jcc), jccOps,
                               caseTarget, defaultJump, eqCond);
                 lir.beginBlock(defaultJump);
                 emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
                 return true;
             }
             nextBlock = lir.createBlock();
-            emitCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
+            std::array<LirOperand, 2> jccOps{
+                LirOperand::makeBlockRef(caseTarget.v),
+                LirOperand::makeBlockRef(nextBlock.v)};
+            emitCondBr(*opcode(MnemonicSlot::Jcc), jccOps,
                           caseTarget, nextBlock, eqCond);
             lir.beginBlock(nextBlock);
         }

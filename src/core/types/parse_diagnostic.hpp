@@ -581,6 +581,16 @@ enum class DiagnosticCode : std::uint16_t {
     A_LirToMirSizeMismatch         = 0x1003,
     A_NoMatchingEncodingVariant    = 0x1004,
     A_RoundTripMismatch            = 0x1005,
+    // D-ASM-ENCODE-FAILURE-FUNCTION-ROLLBACK (step 13.5 cycle 1
+    // post-fold, silent-failure CRITICAL #2): function-level
+    // summary emitted when one or more of its instructions failed
+    // to encode AND the function was dropped from the
+    // AssembledModule. A per-inst A_NoEncodingDeclared /
+    // A_NoMatchingEncodingVariant already reported the root cause;
+    // this code communicates the CONSEQUENCE (the whole function
+    // is missing) so the user/test isn't surprised by the bytes
+    // being absent without a function-tier diagnostic.
+    A_FunctionEncodeAborted        = 0x1006,
 
     // ── Linker (renders as `K`) ───────────────────────────────────────
     //

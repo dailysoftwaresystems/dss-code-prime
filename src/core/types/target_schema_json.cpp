@@ -176,6 +176,19 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             tmpl.condCodeFromPayload = t.at("condCodeFromPayload").get<bool>();
         }
     }
+    // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold): force a
+    // REX prefix even when no REX bit is set — required by x86 byte-
+    // register-bearing opcodes (setcc) to access the spl/bpl/sil/dil
+    // low-byte registers instead of the legacy ah/ch/dh/bh aliases.
+    if (t.contains("forceRexPrefix")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/forceRexPrefix", opIdx, vi);
+        if (!t.at("forceRexPrefix").is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'forceRexPrefix' must be a boolean");
+        } else {
+            tmpl.forceRexPrefix = t.at("forceRexPrefix").get<bool>();
+        }
+    }
     // `fixedWord` (plan 13 AS3 — `fixed32` shape) — 32-bit base bit
     // pattern. JSON accepts unsigned 32-bit integer values.
     if (t.contains("fixedWord")) {

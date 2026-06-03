@@ -161,6 +161,26 @@ appendPendingReloc(std::vector<Relocation>&   relocs,
     });
 }
 
+// D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03) +
+// architect FOLD-NOW (post-fold): per-patch shape discriminator so
+// the shared `asm.cpp` resolver dispatches via ISA arithmetic
+// instead of hardcoding x86 rel32-after-disp semantics in the
+// target-shared loop. ARM64 B / B.cc use different formulas
+// (PC-of-instruction, no +4 bias; 19- or 26-bit displacement scaled
+// by 4); adding the discriminator now (cost: 1 byte/patch) avoids
+// a multi-file signature refactor when ARM64 control-flow lands.
+enum class BlockRelPatchKind : std::uint8_t {
+    // x86 rel32-after-disp: `disp = target - (patch + 4)`, written
+    // as 4 LE bytes at `patch_offset`. Used by `E9 rel32` /
+    // `0F 8x rel32` (jmp / jcc family).
+    X86Rel32 = 0,
+    // ARM64 placeholders (D-AS3-BLOCK-REL-IMM19/26 — close when
+    // ARM64 control-flow lands). Mentioned to lock in the enum
+    // shape; resolver MUST fail-loud on these until implemented.
+    Arm64Imm19 = 1,  // B.cc — bits 23..5 of the 32-bit word, shift=2
+    Arm64Imm26 = 2,  // B    — bits 25..0 of the 32-bit word, shift=2
+};
+
 // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
 // pending intra-function block-relative branch patch. Distinct from
 // `PendingRelocSlot` because the target is an INTRA-FUNCTION basic
@@ -168,12 +188,12 @@ appendPendingReloc(std::vector<Relocation>&   relocs,
 // no `RelocationKind`, no entry in the function's relocation list.
 // The asm.cpp per-function loop builds the block-offset table while
 // emitting block-by-block, accumulates these patches as branches
-// emit, then resolves them after the function is fully assembled by
-// writing `target_offset - (patch_offset + 4)` as 4 LE bytes back
-// into the function's byte buffer.
+// emit, then dispatches via `kind` to the right resolution formula
+// (x86 / ARM64-19 / ARM64-26).
 struct BlockRelPatch {
-    std::uint32_t patchOffset;  // byte offset of the 4-byte placeholder in out
+    std::uint32_t patchOffset;  // byte offset of the placeholder in out
     std::uint32_t targetBlock;  // LirBlockId.v of the branch target block
+    BlockRelPatchKind kind = BlockRelPatchKind::X86Rel32;
 };
 
 } // namespace dss::walker_util

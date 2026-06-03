@@ -807,6 +807,19 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // zero would map every condition to `eq`.
     bool condCodeFromPayload = false;
 
+    // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
+    // code-reviewer C2): force a REX prefix even when no REX bit
+    // (W/R/X/B) is set. Required by x86 byte-register-bearing
+    // opcodes like setcc that target rsp/rbp/rsi/rdi (hwEncoding
+    // 4..7) — without a REX prefix, ModR/M.rm=4..7 references the
+    // legacy {ah, ch, dh, bh} high-byte aliases instead of the
+    // {spl, bpl, sil, dil} low-byte registers; setcc would silently
+    // write to the high byte of a different physical register.
+    // With ANY REX bit set (or this flag forcing one), the encoder
+    // uses the spl/bpl/sil/dil aliasing — correct low-byte access
+    // across all 16 GPRs.
+    bool forceRexPrefix = false;
+
     // Fixed-word template (plan 13 AS3 — `fixed32` shape). The 32-bit
     // base bit pattern of an AArch64 / RV32-style instruction; the
     // walker emits this word with each declared slot's `hwEncoding`

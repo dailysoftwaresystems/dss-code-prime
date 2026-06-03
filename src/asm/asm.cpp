@@ -1,5 +1,6 @@
 #include "asm/asm.hpp"
 
+#include "asm/format/byte_emit.hpp"
 #include "asm/format/fixed32.hpp"
 #include "asm/format/walker_util.hpp"
 #include "asm/format/x86_variable.hpp"
@@ -207,6 +208,19 @@ AssembledModule assemble(Lir const&                 lir,
         blockOffsets.reserve(blockCount);
         std::vector<walker_util::BlockRelPatch> blockPatches;
 
+        // D-ASM-ENCODE-FAILURE-FUNCTION-ROLLBACK (step 13.5 cycle 1
+        // post-fold, silent-failure-hunter CRITICAL #2): track
+        // per-inst encode failures. Continue past failures (so the
+        // user sees ALL per-inst diagnostics in one compile pass —
+        // the parallel-index-discipline invariant: every unencoded
+        // inst surfaces its own diagnostic) BUT truncate any
+        // partial bytes the failing encoder may have emitted, so
+        // subsequent block-offset captures and intra-function
+        // branch patches don't read partial-byte tails. After all
+        // insts are encoded, if ANY failed, drop the entire
+        // function's bytes from the AssembledModule — a function
+        // with one wrong byte cannot ship correctly.
+        bool funcEncodeOk = true;
         for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
             LirBlockId const blk = lir.funcBlockAt(fn, bi);
             blockOffsets[blk.v] =
@@ -214,18 +228,42 @@ AssembledModule assemble(Lir const&                 lir,
             std::uint32_t const instCount = lir.blockInstCount(blk);
             for (std::uint32_t ii = 0; ii < instCount; ++ii) {
                 LirInstId const inst = lir.blockInstAt(blk, ii);
-                // Each inst's encoder either appends bytes / relocs /
-                // source-map entries and returns true, or emits its
-                // own diagnostic and returns false. The parallel-
-                // index discipline requires we continue to the next
-                // inst either way — the function slot exists for
-                // every LIR function regardless of per-inst failure.
-                // The reporter is the success channel.
-                (void)encodeInst(lir, schema, inst,
+                std::size_t const preInstByteCount = outFn.bytes.size();
+                bool const ok = encodeInst(lir, schema, inst,
                                  outFn.bytes, outFn.relocations,
                                  outFn.sourceMap, blockPatches,
                                  lirToMir, reporter);
+                if (!ok) {
+                    outFn.bytes.resize(preInstByteCount);
+                    funcEncodeOk = false;
+                }
             }
+        }
+
+        if (!funcEncodeOk) {
+            // The per-inst diagnostic above already reported the
+            // root cause; emit a function-level summary so the
+            // user knows WHICH function got dropped. Uses the
+            // distinct `A_FunctionEncodeAborted` code so unit-test
+            // invariants counting per-inst-failure codes (e.g.
+            // EveryUnencodedInstFiresNoEncodingDiagnostic) don't
+            // double-count this function-level wrapper.
+            report(reporter, DiagnosticCode::A_FunctionEncodeAborted,
+                   DiagnosticSeverity::Error,
+                   std::format("function symbol id {} dropped from "
+                               "AssembledModule — at least one "
+                               "instruction failed to encode (see "
+                               "preceding diagnostic); D-ASM-ENCODE-"
+                               "FAILURE-FUNCTION-ROLLBACK preserves "
+                               "byte-offset integrity by aborting the "
+                               "function on first per-inst failure",
+                               outFn.symbol.v));
+            // Clear the function's bytes/relocs entirely so the
+            // partial output cannot leak past assemble().
+            outFn.bytes.clear();
+            outFn.relocations.clear();
+            outFn.sourceMap.clear();
+            continue;  // skip patch resolution for this function
         }
 
         // Resolve intra-function block-relative branch patches now
@@ -233,9 +271,23 @@ AssembledModule assemble(Lir const&                 lir,
         // 4 zero placeholder bytes; we overwrite them with the
         // signed 32-bit displacement `target_offset - (patch_offset
         // + 4)` (the x86 convention: rel32 is relative to the byte
-        // AFTER the displacement). A target block missing from the
-        // offset table is a malformed LIR (terminator points at a
-        // block that's not in this function) — fail loud.
+        // AFTER the displacement).
+        //
+        // D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD (post-fold, silent-
+        // failure-hunter HIGH #3): on ANY patch failure, abort the
+        // whole function's emission rather than partially patching.
+        // The previous shape `continue`-d past failures and shipped
+        // a partial-patched binary — a missing-target patch left 4
+        // zero bytes (rel32=0 → branch-to-self → infinite loop).
+        // Dispatch via patch.kind so the shared resolver does NOT
+        // bake in x86 rel32-after-disp arithmetic. Each ISA's
+        // walker tags its patches with the appropriate kind; the
+        // resolver dispatches accordingly. Architect FOLD-NOW post-
+        // fold: pre-fix the `target - (patch + 4)` formula and
+        // 4-byte LE write lived as raw arithmetic here — an
+        // agnosticism break per the project's standing rules
+        // (shared substrate, zero CPU-name branches).
+        bool patchOk = true;
         for (auto const& patch : blockPatches) {
             auto it = blockOffsets.find(patch.targetBlock);
             if (it == blockOffsets.end()) {
@@ -246,33 +298,52 @@ AssembledModule assemble(Lir const&                 lir,
                                    "the function's block list — malformed "
                                    "LIR (D-CSUBSET-WHILE-LOOP-SUBSTRATE)",
                                    outFn.symbol.v, patch.targetBlock));
-                continue;
+                patchOk = false;
+                break;
             }
-            std::int64_t const disp = static_cast<std::int64_t>(it->second)
-                                    - static_cast<std::int64_t>(patch.patchOffset + 4);
-            if (disp < std::numeric_limits<std::int32_t>::min()
-             || disp > std::numeric_limits<std::int32_t>::max()) {
-                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-                       DiagnosticSeverity::Error,
-                       std::format("intra-function branch in fn '{}' "
-                                   "needs displacement {} which exceeds "
-                                   "rel32 range — function body too large "
-                                   "for 32-bit branch reach (anchor "
-                                   "D-CSUBSET-LONG-BRANCH for thunks)",
-                                   outFn.symbol.v, disp));
-                continue;
+            switch (patch.kind) {
+                case walker_util::BlockRelPatchKind::X86Rel32: {
+                    std::int64_t const disp =
+                        static_cast<std::int64_t>(it->second)
+                      - static_cast<std::int64_t>(patch.patchOffset + 4);
+                    if (disp < std::numeric_limits<std::int32_t>::min()
+                     || disp > std::numeric_limits<std::int32_t>::max()) {
+                        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                               DiagnosticSeverity::Error,
+                               std::format("intra-function branch in fn '{}' "
+                                           "needs displacement {} which exceeds "
+                                           "rel32 range — function body too large "
+                                           "for 32-bit branch reach (anchor "
+                                           "D-CSUBSET-LONG-BRANCH for thunks)",
+                                           outFn.symbol.v, disp));
+                        patchOk = false;
+                        break;
+                    }
+                    asm_byte_emit::writeU32LEAt(outFn.bytes, patch.patchOffset,
+                        static_cast<std::uint32_t>(static_cast<std::int32_t>(disp)));
+                    break;
+                }
+                case walker_util::BlockRelPatchKind::Arm64Imm19:
+                case walker_util::BlockRelPatchKind::Arm64Imm26: {
+                    report(reporter, DiagnosticCode::A_NoEncodingShapeWalker,
+                           DiagnosticSeverity::Error,
+                           std::format("intra-function ARM64 branch patch in "
+                                       "fn '{}' targets shape {} — resolver "
+                                       "not yet implemented (anchored "
+                                       "D-AS3-BLOCK-REL-IMM19/26; lands when "
+                                       "ARM64 control-flow corpus lands)",
+                                       outFn.symbol.v,
+                                       static_cast<int>(patch.kind)));
+                    patchOk = false;
+                    break;
+                }
             }
-            // Write the 4 LE bytes back into the placeholder slot.
-            std::uint32_t const d = static_cast<std::uint32_t>(
-                static_cast<std::int32_t>(disp));
-            outFn.bytes[patch.patchOffset + 0] =
-                static_cast<std::uint8_t>(d        & 0xFFu);
-            outFn.bytes[patch.patchOffset + 1] =
-                static_cast<std::uint8_t>((d >>  8) & 0xFFu);
-            outFn.bytes[patch.patchOffset + 2] =
-                static_cast<std::uint8_t>((d >> 16) & 0xFFu);
-            outFn.bytes[patch.patchOffset + 3] =
-                static_cast<std::uint8_t>((d >> 24) & 0xFFu);
+            if (!patchOk) break;
+        }
+        if (!patchOk) {
+            outFn.bytes.clear();
+            outFn.relocations.clear();
+            outFn.sourceMap.clear();
         }
     }
 

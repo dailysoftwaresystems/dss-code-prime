@@ -34,4 +34,19 @@ inline void appendImm32LE(std::vector<std::uint8_t>& out, std::int32_t v) noexce
     appendU32LE(out, static_cast<std::uint32_t>(v));
 }
 
+// D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
+// in-place 4-byte LE write at a known offset. Used by asm.cpp's
+// per-function patch-resolve loop to overwrite BlockRel32 placeholder
+// zeros with the resolved displacement. The asm tier intentionally
+// owns this helper (mirroring `dss::byte_emit::writeU32LEAt` in
+// `link/format/byte_emit.hpp`) so the asm-tier patch code does not
+// take a depend-up on the link tier.
+inline void writeU32LEAt(std::vector<std::uint8_t>& buf,
+                         std::size_t off, std::uint32_t v) noexcept {
+    buf[off + 0] = static_cast<std::uint8_t>(v         & 0xFFu);
+    buf[off + 1] = static_cast<std::uint8_t>((v >>  8) & 0xFFu);
+    buf[off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);
+    buf[off + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
+}
+
 } // namespace dss::asm_byte_emit
