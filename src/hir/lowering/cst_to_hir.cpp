@@ -788,9 +788,19 @@ struct Lowerer {
         // If the callee's typeId is a FnSig, coerce each arg to its declared
         // param type. Variadic / unknown signatures pass through unchanged
         // (the verifier owns the arity-vs-FnSig rule).
-        std::span<TypeId const> paramTypes{};
+        //
+        // M2 silent-failure fix (3-agent root-cause analysis, 2026-06-02):
+        // copy `interner.fnParams()`'s span into a stable owned vector
+        // BEFORE the arg loop. The span points into the interner's
+        // `operandPool_` (a `std::vector<TypeId>`) which could be
+        // reallocated by ANY interner-growing call inside the loop
+        // (e.g., `interner.pointer()` / `interner.array()` during a
+        // nested arg lowering), silently dangling the span. Same
+        // pattern applied at lowerPostfix's call arm.
+        std::vector<TypeId> paramTypes;
         if (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig) {
-            paramTypes = interner.fnParams(calleeTy);
+            auto const paramSpan = interner.fnParams(calleeTy);
+            paramTypes.assign(paramSpan.begin(), paramSpan.end());
         }
         std::size_t argIdx = 0;
         if (cr.argsChild < vis.size()) {
@@ -1209,9 +1219,23 @@ struct Lowerer {
             // Coerce each arg to its FnSig param type (when the callee's
             // signature is known). Same discipline as the lowerFlatExpr's
             // call arm above — single source of truth for arg-coercion.
-            std::span<TypeId const> paramTypes{};
+            //
+            // M2 silent-failure fix (3-agent root-cause analysis,
+            // 2026-06-02): `interner.fnParams()` returns a span into
+            // `operandPool_` (a `std::vector<TypeId>`). If the arg-
+            // coerce loop below triggers an interner reallocation
+            // (e.g., a future arg shape that calls `interner.pointer()`
+            // / `interner.array()` mid-loop via lowerExpr or coerce),
+            // the span would dangle silently — wrong-type reads with
+            // no diagnostic. Copy to a stable owned vector BEFORE the
+            // loop so iterations are robust against ANY downstream
+            // interner growth. Cost: one small heap allocation per
+            // call site; rare alternative is a `std::array`-backed
+            // small-buffer for ≤8-param calls (most calls).
+            std::vector<TypeId> paramTypes;
             if (base.type.valid() && interner.kind(base.type) == TypeKind::FnSig) {
-                paramTypes = interner.fnParams(base.type);
+                auto const paramSpan = interner.fnParams(base.type);
+                paramTypes.assign(paramSpan.begin(), paramSpan.end());
             }
             std::size_t argIdx = 0;
             for (NodeId argN : argExpressions(rest)) {

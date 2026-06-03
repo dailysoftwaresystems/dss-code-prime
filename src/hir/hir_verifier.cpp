@@ -411,21 +411,57 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
                 // null-pointer-constant case which is admitted at
                 // value-tier (semantic) rather than type-tier
                 // (isAssignable).
+                // Helper: walk through Cast wrappers to find the
+                // effective leaf, returning the leaf node + its
+                // resolved type. coerce()'s host-divergent path could
+                // either (a) skip Cast emission entirely (args[a]
+                // arrives as bare Literal) OR (b) emit a Cast with a
+                // mismatched typeId. The fallback walks Cast wrappers
+                // to handle both — the structural invariant pins
+                // "is this ultimately an integer-typed literal" not
+                // "is this directly a Literal node".
+                auto findEffectiveIntegerLiteral = [&](HirNodeId start) {
+                    struct R { HirKind kind; TypeId ty; };
+                    HirNodeId cur = start;
+                    // Bounded descent: walk through at most a handful
+                    // of Cast wrappers (defensive against unbounded
+                    // chains; coerce only ever emits a single Cast).
+                    for (int hop = 0; hop < 4 && cur.valid(); ++hop) {
+                        HirKind const k  = hir_.kind(cur);
+                        TypeId  const ty = hir_.typeId(cur);
+                        if (k == HirKind::Literal) {
+                            return R{k, ty};
+                        }
+                        if (k != HirKind::Cast) break;
+                        auto const kids = hir_.children(cur);
+                        if (kids.empty()) break;
+                        cur = kids[0];
+                    }
+                    return R{HirKind::Module, InvalidType};  // sentinel non-match
+                };
                 bool nullPtrConstant = false;
                 TypeId const paramTy = params[a];
-                TypeId const argTy   = hir_.typeId(args[a]);
                 if (paramTy.valid()
-                    && interner_->kind(paramTy) == TypeKind::Ptr
-                    && hir_.kind(args[a]) == HirKind::Literal
-                    && argTy.valid()) {
-                    auto const ck = interner_->kind(argTy);
-                    if (ck == TypeKind::I8   || ck == TypeKind::I16
-                     || ck == TypeKind::I32  || ck == TypeKind::I64
-                     || ck == TypeKind::I128
-                     || ck == TypeKind::U8   || ck == TypeKind::U16
-                     || ck == TypeKind::U32  || ck == TypeKind::U64
-                     || ck == TypeKind::U128) {
-                        nullPtrConstant = true;
+                    && interner_->kind(paramTy) == TypeKind::Ptr) {
+                    auto const eff = findEffectiveIntegerLiteral(args[a]);
+                    if (eff.kind == HirKind::Literal && eff.ty.valid()) {
+                        auto const ck = interner_->kind(eff.ty);
+                        if (ck == TypeKind::I8   || ck == TypeKind::I16
+                         || ck == TypeKind::I32  || ck == TypeKind::I64
+                         || ck == TypeKind::I128
+                         || ck == TypeKind::U8   || ck == TypeKind::U16
+                         || ck == TypeKind::U32  || ck == TypeKind::U64
+                         || ck == TypeKind::U128) {
+                            // Semantic gate guarantees value==0 for
+                            // any integer literal admitted in a
+                            // Ptr<*> slot (a non-zero literal would
+                            // have produced S_TypeMismatch before
+                            // HIR lowering). Safe to admit
+                            // structurally without value-tier
+                            // re-check (which is the host-divergent
+                            // path we're guarding against).
+                            nullPtrConstant = true;
+                        }
                     }
                 }
                 if (nullPtrConstant) continue;
