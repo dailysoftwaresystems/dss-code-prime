@@ -1,5 +1,6 @@
 #include "opt/passes/const_fold.hpp"
 
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/const_eval_arith.hpp"
@@ -442,7 +443,7 @@ private:
 } // namespace
 
 ConstFoldResult runConstFold(Mir& mir, TypeInterner const& interner,
-                             DiagnosticReporter& /*reporter*/) {
+                             DiagnosticReporter& reporter) {
     ConstFoldResult result{};
     MirBuilder builder;
     FunctionRebuilder rb{mir, builder, interner};
@@ -450,20 +451,25 @@ ConstFoldResult runConstFold(Mir& mir, TypeInterner const& interner,
     // Pre-scan for runtime-init globals (D-OPT2-CONST-FOLD-RUNTIME-
     // INIT-GLOBALS). A runtime-init global's `initFunc` is a
     // MirFuncId in the ORIGINAL module's arena; cloning it would
-    // require a two-pass func-id remap (clone all functions FIRST,
-    // build old→new MirFuncId map, then clone globals using the
-    // remapped initFunc). Cycle 1 short-circuits cleanly when any
-    // exists — return `ok=true, instructionsFolded=0` so the caller
-    // keeps the unoptimized MIR without any spurious diagnostic.
-    // This is a "no-op for this module" path, NOT an error path —
-    // const-fold has no correctness concern on these modules; it
-    // just doesn't pay for the rebuild yet. Caller (compile_pipeline)
-    // sees `ok=true` + zero mutation and proceeds with the original
-    // mir. c-subset doesn't emit runtime-init globals today; if/when
-    // it does, this carve-out promotes to a real func-id-remap path.
+    // require a two-pass func-id remap. Cycle 1 short-circuits with
+    // `ok=true, instructionsFolded=0` so the caller keeps the
+    // unoptimized MIR. NOT an error path — const-fold has no
+    // correctness concern on these modules; just doesn't pay for
+    // the rebuild yet. Emit an Info diagnostic (X_OptPassSkipped) so
+    // the user / tooling can observe that ConstFold deliberately
+    // declined to run on this specific module, distinguishing it
+    // from "ran and produced 0 mutations because code was optimal."
     std::size_t const ng = mir.moduleGlobalCount();
     for (std::uint32_t i = 0; i < ng; ++i) {
         if (mir.globalInitFunc(mir.globalAt(i)).valid()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::X_OptPassSkipped;
+            d.severity = DiagnosticSeverity::Info;
+            d.actual   = "opt::ConstFold: skipped — module has >= 1 "
+                         "runtime-init global; func-id remap not yet "
+                         "implemented (D-OPT2-CONST-FOLD-RUNTIME-INIT-"
+                         "GLOBALS).";
+            reporter.report(std::move(d));
             result.ok = true;
             return result;
         }

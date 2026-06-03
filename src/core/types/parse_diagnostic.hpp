@@ -632,6 +632,22 @@ enum class DiagnosticCode : std::uint16_t {
     //   X_PipelineMalformed (which means the file was found but
     //   broken).
     X_PipelineNameResolutionFailed = 0x2005,
+    // X_OptReturnFalseWithoutDiagnostic: the optimize() engine's
+    //   belt-and-suspenders guard fired — a pass returned ok=false
+    //   WITHOUT reporting any new diagnostic. Distinct from
+    //   X_UnknownPassId (which means a fabricated PassId reached
+    //   the switch fallback). Pre-fold both shared X_UnknownPassId
+    //   making it impossible to distinguish enum-drift from contract-
+    //   violation in test pins.
+    X_OptReturnFalseWithoutDiagnostic = 0x2006,
+    // X_OptPassSkipped: emitted at Info severity when a pass declines
+    //   to run on a specific module because of a feature carve-out
+    //   (e.g. ConstFold skipping modules with runtime-init globals —
+    //   D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS). Lets the user / tooling
+    //   learn that the optimizer ran but produced no rewrite for THIS
+    //   module, distinct from "ran 0 mutations because the code was
+    //   already optimal."
+    X_OptPassSkipped                  = 0x2007,
 
     // ── Linker (renders as `K`) ───────────────────────────────────────
     //

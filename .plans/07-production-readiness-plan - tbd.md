@@ -301,9 +301,9 @@ This is the **largest single chunk of work** in v1.
 | G-807 | C name mangling (per-platform underscoring); Itanium + MSVC demangling reserved post-v1. | FF4. |
 | G-808 | `ingest()` entry point + `HirAttribute<FfiMetadata>` populated on extern decls. | FF5. |
 | G-809 | libc smoke: `extern printf(...)` end-to-end on all 6 (OS × arch). | FF6. |
-| G-810 | (post-v1) C preprocessor for header mode (`#include` + function-like macros). | Reserved. v1 uses pre-reduced headers in `src/dss-config/ffi-headers/`. |
+| G-810 | (post-v1) C preprocessor for header mode (`#include` + function-like macros). | Reserved. Pre-reduced headers under `src/dss-config/ffi-headers/` were removed OPT2 cycle 1 (2026-06-03, commit `8bae225`) as dead-code (no production caller); FF2 substrate `readCHeader` / `readCHeaderFromText` stays as latent capability. |
 | G-811 | (post-v1) Itanium + MSVC C++ demanglers. | FF7 / FF8. |
-| G-812 | Pre-reduced headers for {libc, libSystem, msvcrt, kernel32} on each platform. | Ships under `src/dss-config/ffi-headers/`. |
+| G-812 | Pre-reduced headers for {libc, libSystem, msvcrt, kernel32} on each platform. | Shipped under `src/dss-config/ffi-headers/` through FF2; tree + `findShippedFfiHeader` + `readCHeaderShipped` removed OPT2 cycle 1 (2026-06-03) — no production caller. Promotes when production-FFI-ingest trigger fires. |
 | G-813 | Symbol-existence pin: CI reads the actual platform libc binary and asserts every header-declared symbol is present. | Catches drift between pre-reduced headers and reality. |
 
 ---

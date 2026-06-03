@@ -276,13 +276,25 @@ compileAndRunArm(fs::path const& exampleDir,
     }
     // Use the no-throw overload — a non-existent path past the
     // EXPECT above would otherwise throw filesystem_error and abort
-    // the gtest process rather than poison the arm cleanly.
+    // the gtest process rather than poison the arm cleanly. Per
+    // [fs.op.file_size], on error sz is `static_cast<uintmax_t>(-1)`
+    // = UINT64_MAX, so an unguarded `EXPECT_GT(sz, 0u)` would
+    // spuriously PASS on file_size failure. Gate on sz_ec to make
+    // both checks honest.
     std::error_code sz_ec;
     auto const sz = fs::file_size(artifactPath, sz_ec);
-    EXPECT_FALSE(sz_ec) << "file_size failed: " << sz_ec.message()
-                        << " (arm=" << armLabel << ")";
-    EXPECT_GT(sz, 0u) << "artifact is empty: " << artifactPath.generic_string()
+    if (sz_ec) {
+        ADD_FAILURE() << "file_size failed: " << sz_ec.message()
                       << " (arm=" << armLabel << ")";
+        armResult.status = ArmStatus::Poisoned;
+        return armResult;
+    }
+    if (sz == 0u) {
+        ADD_FAILURE() << "artifact is empty: " << artifactPath.generic_string()
+                      << " (arm=" << armLabel << ")";
+        armResult.status = ArmStatus::Poisoned;
+        return armResult;
+    }
 
     auto const host = currentHostOs();
     bool const shouldRun = std::any_of(t.runOn.begin(), t.runOn.end(),
@@ -307,6 +319,16 @@ compileAndRunArm(fs::path const& exampleDir,
     EXPECT_FALSE(result.timedOut)
         << "spawn timed out for " << artifactPath.generic_string()
         << " (arm=" << armLabel << ") diag=" << result.diagnostic;
+    // Poison the arm if spawn failed or timed out — the binary never
+    // actually ran, so result.exitCode + result.capturedStdout are
+    // garbage. Without this, the differential-verify ASSERT_EQ would
+    // compare two arms' bogus exit codes and could spuriously pass
+    // when both arms time out (silent-bypass re-opens the very gap
+    // the ArmStatus tri-state was introduced to close).
+    if (!result.spawned || result.timedOut) {
+        armResult.status = ArmStatus::Poisoned;
+        return armResult;
+    }
     armResult.status         = ArmStatus::Ran;
     armResult.exitCode       = result.exitCode;
     armResult.capturedStdout = result.capturedStdout;

@@ -80,8 +80,15 @@ TEST(Optimizer, UnknownPassIdFiresXUnknownPassId) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::X_UnknownPassId), 1u)
         << "expected exactly one X_UnknownPassId — runPass's emit + the "
            "optimize() snapshot guard must NOT both fire on the same "
-           "false-return path (the guard's purpose is to catch a future "
-           "false-return without diagnostic, not double-emit here).";
+           "false-return path. The guard's purpose is to catch a future "
+           "false-return without diagnostic — and it now fires a DEDICATED "
+           "X_OptReturnFalseWithoutDiagnostic code, not X_UnknownPassId, "
+           "so a future test can pin the contract-violation path "
+           "independently of the enum-drift path.";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::X_OptReturnFalseWithoutDiagnostic), 0u)
+        << "the contract-violation guard fires ONLY when a pass returns "
+           "ok=false without emitting; here runPass's switch-fallback DID "
+           "emit X_UnknownPassId, so the guard correctly does not fire.";
 }
 
 // D-OPT1-OPT-RESULT-SHAPE: the new OptResult populates passesRun /

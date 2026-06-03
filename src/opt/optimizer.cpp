@@ -68,13 +68,31 @@ OptResult optimize(Mir& mir,
     // when consumed by a future caller.
     result.fixedPointReached = true;
 
+    // Symmetric defense: the JSON loader rejects empty `passes` at
+    // load time, but a caller constructing OptPipeline{} directly in
+    // code (test fixtures, future programmatic builders, the
+    // CompileConfig→pipeline mapping when it lands) could bypass that
+    // check and silently produce an "optimizer ran nothing" result
+    // observationally indistinguishable from a successful run. Reject
+    // at the engine entrypoint too — use [Identity] for explicit no-op.
+    if (pipeline.passes.empty()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::X_PipelineMalformed;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = "opt::optimize: pipeline has zero passes — substrate "
+                     "contract violation. Use [Identity] for an explicit "
+                     "no-op pipeline.";
+        reporter.report(std::move(d));
+        return result;
+    }
+
     for (PassId p : pipeline.passes) {
         auto const passResult = runPass(p, mir, target, interner, reporter);
         ++result.passesRun;
         if (!passResult.ok) {
             if (reporter.errorCount() <= entryErrorCount) {
                 ParseDiagnostic d;
-                d.code     = DiagnosticCode::X_UnknownPassId;
+                d.code     = DiagnosticCode::X_OptReturnFalseWithoutDiagnostic;
                 d.severity = DiagnosticSeverity::Error;
                 d.actual   = "opt::optimize: pass returned ok=false WITHOUT "
                              "emitting a diagnostic — substrate contract "
