@@ -454,6 +454,22 @@ struct DSS_EXPORT TargetCallingConvention {
     // memory addressing. Empty optional means a stack-pointer-less
     // target (operand-stack VMs).
     std::optional<NamedRegisterRef> stackPointer;
+
+    // D-LANG-VARIADIC (step 13.4, 2026-06-02): the register the caller
+    // MUST load with the count of vector (FPR) arguments passed in
+    // vector registers BEFORE the call instruction of any C-style
+    // variadic function. SysV AMD64 (§3.2.3): `al = number of XMM
+    // arguments used by varargs (0..8)`. Win64 ms_x64 has no
+    // equivalent (the loader-side ABI uses GPR-shadow + double-spill
+    // — anchored D-ML7-VARIADIC-WIN64-DOUBLE-SPILL — and this field
+    // is left empty). AAPCS64 (ARM64): no equivalent (variadic floats
+    // pass on the stack, no count register). Empty optional ⇒ this
+    // CC requires no caller-side vector-count register for variadic
+    // calls. When engaged, ML7 materialize for a Call with
+    // payload `isVariadic=true` counts FPR args in
+    // [fixedArgCount..N) and emits a `mov <reg>, <count>` before
+    // the call instruction.
+    std::optional<NamedRegisterRef> variadicVectorCountReg;
 };
 
 // Discriminates the byte-encoding shape an opcode commits to (plan 13

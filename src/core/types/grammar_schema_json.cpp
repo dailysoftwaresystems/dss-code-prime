@@ -3104,6 +3104,31 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D-LANG-VARIADIC (step 13.4, 2026-06-02): optional
+                        // C-style variadic-marker token. Same shape as
+                        // `constMarker` above: a bad token name is
+                        // C_UnknownToken; the declaration is still usable
+                        // (just never marked variadic). Source-language
+                        // agnostic — each language declares its own marker.
+                        if (entry.contains("variadicMarker")) {
+                            if (!entry.at("variadicMarker").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/variadicMarker",
+                                          "'variadicMarker' must be a string");
+                            } else {
+                                auto const vm = entry.at("variadicMarker").get<std::string>();
+                                if (!data.schemaTokens->contains(vm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              path + "/variadicMarker",
+                                              std::format("'declarations[{}].variadicMarker' "
+                                                          "references unknown token kind '{}'",
+                                                          i, vm));
+                                } else {
+                                    rule.variadicMarker = data.schemaTokens->find(vm);
+                                }
+                            }
+                        }
+
                         // SE-arrays (HR9): optional C-style declarator suffix.
                         //   "arraySuffix": { "rule": "arrayDeclSuffix",
                         //                    "lengthChild": 1 }

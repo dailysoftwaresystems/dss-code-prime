@@ -98,6 +98,7 @@
 
     ".":  [{ "kind": "DotOp"   }],
     "->": [{ "kind": "ArrowOp" }],
+    "...":[{ "kind": "EllipsisOp" }],
 
     "+=":  [{ "kind": "PlusAssignOp"   }],
     "-=":  [{ "kind": "MinusAssignOp"  }],
@@ -370,11 +371,19 @@
     "paramList": {
       "sequence": [
         "param",
-        { "repeat": { "sequence": [ "Comma", "param" ] } }
+        { "repeat": { "sequence": [ "Comma", "paramOrEllipsis" ] } }
       ]
     },
 
     "param": { "sequence": [ "typeRefAllowingStruct", "Identifier" ] },
+
+    "paramOrEllipsis": {
+      "alt": [
+        "param",
+        "ellipsisParam"
+      ]
+    },
+    "ellipsisParam": { "sequence": [ "EllipsisOp" ] },
 
     "block": {
       "sequence": [
@@ -599,6 +608,7 @@
           "whenKind": "function",
           "paramsPath": [1]
         },
+        "variadicMarker": "EllipsisOp",
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } }
     ],
     "references": [

@@ -161,6 +161,17 @@ struct DSS_EXPORT DeclarationRule {
     // `typeChild` is set), marks the minted symbol const. `nullopt` ⇒ the
     // language has no const marker for this declaration form.
     std::optional<SchemaTokenId> constMarker;
+    // D-LANG-VARIADIC (step 13.4, 2026-06-02): a token kind that, when
+    // found anywhere in this declaration's params subtree (the subtree
+    // rooted at the `paramsChild` visible child), marks the declared
+    // FnSig as C-style variadic. The semantic analyzer scans for this
+    // token at FnSig-build time and passes `isVariadic=true` to the
+    // 4-arg `TypeInterner::fnSig()` overload when present. Source-
+    // language agnostic: each language declares its own marker token
+    // (c-subset: `EllipsisOp`; future Rust would declare none; etc.).
+    // `nullopt` ⇒ the language has no variadic-marker for this
+    // declaration form (the FnSig is always non-variadic).
+    std::optional<SchemaTokenId> variadicMarker;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
     // D8 unused-variable warning: when true, a symbol minted by this

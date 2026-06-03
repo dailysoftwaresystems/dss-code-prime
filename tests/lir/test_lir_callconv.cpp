@@ -7,12 +7,14 @@
 //   * Per-function FrameLayout populated correctly
 //   * No frame_load/frame_store ops remain in the output module
 
+#include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
 #include "diagnostic_count.hpp"
 #include "lir/lir.hpp"
 
 #include <algorithm>
+#include <format>
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
@@ -547,6 +549,94 @@ TEST(LirCallconvAbi, SingleArgFunctionEmitsMovFromArgGpr0) {
     // happen to pick argGprs[0]. Don't pin an exact count — just
     // confirm movs were generated.
     EXPECT_GE(stats.movOps, 1u);
+}
+
+TEST(LirCallconvAbi, MsX64CcDoesNotDeclareVariadicVectorCountReg) {
+    // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-2: Win64 ms_x64
+    // has NO equivalent to SysV's AL-count register — the loader
+    // ABI uses vararg double-spill (anchored
+    // D-ML7-VARIADIC-WIN64-DOUBLE-SPILL). A regression that copy-
+    // pasted SysV's `variadicVectorCountReg: rax` into the ms_x64
+    // entry would silently emit a wrong-cc count-mov at every printf
+    // call from a Windows-targeted binary. Pin: the ms_x64 cc field
+    // MUST be empty.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* msX64 = (*target)->callingConventionByName("ms_x64");
+    ASSERT_NE(msX64, nullptr)
+        << "x86_64 target schema must declare 'ms_x64' cc";
+    EXPECT_FALSE(msX64->variadicVectorCountReg.has_value())
+        << "Win64 ms_x64 has NO caller-side variadic vector-count "
+           "register — the count-mov path is SysV-specific. A future "
+           "Win64 vararg-double-spill implementation goes through "
+           "D-ML7-VARIADIC-WIN64-DOUBLE-SPILL, NOT this field.";
+}
+
+TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
+    // D-LANG-VARIADIC (step 13.4) substrate pin: the SysV AMD64 cc
+    // on x86_64 MUST declare `variadicVectorCountReg` (rax / AL per
+    // §3.5.7). Without this field, ML7 materialize skips the
+    // pre-call `mov <countReg>, <fpCount>` and printf reads garbage
+    // from AL on hardened glibcs. The end-to-end emission + runtime
+    // behavior is pinned at the runnable-example tier
+    // (`examples/c-subset/hello_printf`); this test pins the
+    // SCHEMA tier so a CC-config regression surfaces as a target-
+    // schema fail-loud here, not as a runtime garbage in printf.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value()) << "loadShipped(x86_64) failed";
+    auto const* cc = (*target)->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->variadicVectorCountReg.has_value())
+        << "SysV AMD64 cc (cc index 0 on x86_64) MUST declare the "
+           "variadic vector-count register per SysV §3.5.7 / "
+           "D-LANG-VARIADIC step 13.4.";
+    // The register name must resolve in the target's register table
+    // — a typo'd or non-existent name would silently cause the
+    // ordinal to refer to the wrong physical reg. The loader sets
+    // both name + ordinal atomically; verifying both stay in sync
+    // pins the contract.
+    auto const ord = (*target)->registerByName(
+        cc->variadicVectorCountReg->name);
+    ASSERT_TRUE(ord.has_value())
+        << "variadicVectorCountReg name '"
+        << cc->variadicVectorCountReg->name
+        << "' must resolve in the target's register table.";
+    EXPECT_EQ(*ord, cc->variadicVectorCountReg->ordinal);
+}
+
+TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
+    // D-LANG-VARIADIC (step 13.4) substrate pin: the shared MIR/LIR
+    // Call payload encoding (bit 31 = isVariadic; bits 0..30 =
+    // fixedArgCount) round-trips for both the non-variadic and
+    // variadic cases. The ML7 materialize call arm reads these bits
+    // off every call inst; an off-by-one in the mask would either
+    // truncate fixedArgCount or silently flip the variadic bit, both
+    // of which would corrupt the count-mov emission for variadic
+    // calls (and falsely trigger it for non-variadic calls).
+    using namespace dss::call_payload;
+    // Non-variadic encoding is payload == 0 (preserves the addInst
+    // default for every pre-13.4 call site).
+    EXPECT_EQ(encode(false, 0u), 0u);
+    EXPECT_FALSE(isVariadic(encode(false, 0u)));
+    // The high bit alone flips isVariadic; fixedArgCount=0 round-
+    // trips (a hypothetical thunk-style vararg-only function).
+    EXPECT_TRUE(isVariadic(encode(true, 0u)));
+    EXPECT_EQ(fixedArgCount(encode(true, 0u)), 0u);
+    // Typical printf shape: 1 fixed param + vararg.
+    EXPECT_TRUE(isVariadic(encode(true, 1u)));
+    EXPECT_EQ(fixedArgCount(encode(true, 1u)), 1u);
+    // Round-trip at the high edge of the fixed-arg field. If the
+    // mask boundary regresses, fixedArgCount(kFixedArgMask) returns
+    // a different value here — pins the contract.
+    EXPECT_EQ(fixedArgCount(encode(true, kFixedArgMask)),
+              kFixedArgMask);
+    EXPECT_TRUE(isVariadic(encode(true, kFixedArgMask)));
+    // A non-variadic encoding with a fixed-arg count carries the
+    // fixedArgCount through but reports isVariadic=false — the
+    // accessor never spuriously reports variadic just because
+    // fixedArgCount is non-zero.
+    EXPECT_FALSE(isVariadic(encode(false, 42u)));
+    EXPECT_EQ(fixedArgCount(encode(false, 42u)), 42u);
 }
 
 TEST(LirCallconvAbi, CalleeArgReceivesFromArgGprAcrossSysVAndMsX64) {

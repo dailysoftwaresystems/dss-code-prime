@@ -775,6 +775,80 @@ TEST(HirVerifier, CallArgWideningIsAssignableClean) {
     EXPECT_EQ(reporter.errorCount(), 0u);
 }
 
+// ── D-LANG-VARIADIC (step 13.4) variadic-arity arm ────────────────────────
+//
+// The Call walker's arity check is a 3-way branch: variadic-too-few /
+// fixed-mismatch / clean. These three tests pin the matrix at the HIR
+// tier so a regression that inverts the ternary surfaces here, not
+// hours later in printf-output garbage.
+
+TEST(HirVerifier, VariadicFnSigAdmitsArgsBeyondFixedParamCount) {
+    // (Ptr<Char>, ...)->I32 — printf shape. A 3-arg call (1 fixed +
+    // 2 vararg) must verify clean: vararg-region args are NOT
+    // assignability-checked (default-arg-promotion + the platform
+    // vararg ABI handle their types at the call site).
+    TypeInterner ti = makeInterner();
+    TypeId const i32     = ti.primitive(TypeKind::I32);
+    TypeId const charTy  = ti.primitive(TypeKind::Char);
+    TypeId const ptrChar = ti.pointer(charTy);
+    TypeId const sig     = ti.fnSig(std::array{ptrChar}, i32,
+                                    dss::CallConv::CcSysV,
+                                    /*isVariadic=*/true);
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, /*symbol=*/1);
+    // 3 args: ptrChar (fixed), i32 (vararg), i32 (vararg).
+    HirNodeId const call = b.makeCall(callee,
+        std::array{b.makeLiteral(ptrChar), b.makeLiteral(i32),
+                   b.makeLiteral(i32)}, i32);
+    Hir h = std::move(b).finish(call);
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
+TEST(HirVerifier, VariadicFnSigRejectsFewerArgsThanFixedParams) {
+    // Same printf-shape FnSig, but the Call passes 0 args — fewer
+    // than the 1 declared fixed param. MUST fail with the verifier's
+    // arity diagnostic carrying the "fixed " word (the lexical
+    // distinguisher between variadic-too-few and exact-arity
+    // diagnostics — a std::format arg-order regression would fail
+    // here, not silently downstream).
+    TypeInterner ti = makeInterner();
+    TypeId const i32     = ti.primitive(TypeKind::I32);
+    TypeId const charTy  = ti.primitive(TypeKind::Char);
+    TypeId const ptrChar = ti.pointer(charTy);
+    TypeId const sig     = ti.fnSig(std::array{ptrChar}, i32,
+                                    dss::CallConv::CcSysV,
+                                    /*isVariadic=*/true);
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, 1);
+    HirNodeId const call   = b.makeCall(callee, {}, i32);  // 0 args, expects >=1
+    Hir h = std::move(b).finish(call);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+TEST(HirVerifier, NonVariadicFnSigStillRejectsExtraArgs) {
+    // Negative pin: a NON-variadic FnSig with one fixed param must
+    // still reject 2 args (no silent loosening of the existing
+    // CallArgCountMismatchFires contract). Distinguishes the 3-way
+    // arity matrix from a regression that flips fixed-arity to
+    // accept-extras.
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const sig = ti.fnSig(std::array{i32}, i32,
+                                dss::CallConv::CcSysV);
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, 1);
+    HirNodeId const call = b.makeCall(callee,
+        std::array{b.makeLiteral(i32), b.makeLiteral(i32)}, i32);
+    Hir h = std::move(b).finish(call);
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
 // ── intrinsic rule (HR6, H_UnknownIntrinsic) ──
 
 TEST(HirVerifier, UnregisteredIntrinsicFires) {

@@ -872,12 +872,18 @@ struct Lowerer {
         TypeId const resultTy = mir.instType(id);
         bool const isVoid = !resultTy.valid()
                          || interner.kind(resultTy) == TypeKind::Void;
+        // D-LANG-VARIADIC (step 13.4): forward the MIR Call's
+        // variadic-payload bits (isVariadic + fixedArgCount) to the
+        // LIR Call so the post-regalloc ML7 materialize pass can
+        // emit the platform's variadic-call setup (SysV `mov al,
+        // <xmm-arg-count>` etc.). Non-variadic calls keep payload=0.
+        std::uint32_t const payload = mir.instPayload(id);
         if (isVoid) {
-            emitInst(*opcode(callSlot), InvalidLirReg, ops);
+            emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
             return;
         }
         LirReg const result = lir.newVReg(regClassFor(id));
-        emitInst(*opcode(callSlot), result, ops);
+        emitInst(*opcode(callSlot), result, ops, payload);
         defineValue(id, result);
     }
 

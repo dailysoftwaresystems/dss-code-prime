@@ -1,5 +1,6 @@
 #include "lir/lir_callconv.hpp"
 
+#include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -1113,6 +1114,39 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // Cycle-free — emit register moves in order.
                 for (auto const& m : argMoves) {
                     maybeMov(b, h.mov, m.dest, m.src);
+                }
+                // D-LANG-VARIADIC (step 13.4): when the call is
+                // variadic AND the cc declares a vector-arg count
+                // register, emit `mov <countReg>, <count>` per
+                // SysV §3.5.7 (see `variadicVectorCountReg`
+                // docblock in target_schema.hpp). Emitted AFTER
+                // arg-passing moves + stack-arg stores: the cc's
+                // countReg (e.g. SysV `rax`) is NOT in the arg-
+                // passing GPR pool, but a future indirect-call
+                // shape or parallel-copy serializer could use it
+                // as a scratch — emitting last guarantees no later
+                // code reads or writes it before the call consumes it.
+                if (::dss::call_payload::isVariadic(payload)
+                    && cc.variadicVectorCountReg.has_value()) {
+                    std::uint32_t const fixedCount =
+                        ::dss::call_payload::fixedArgCount(payload);
+                    std::uint32_t vectorArgsInVararg = 0;
+                    for (std::size_t i = 1; i < ops.size(); ++i) {
+                        // ops[0] is the callee; ops[1..] are args.
+                        std::size_t const argIdx = i - 1;
+                        if (argIdx < fixedCount) continue;
+                        if (ops[i].kind != LirOperandKind::Reg) continue;
+                        if (ops[i].reg.regClass() == LirRegClass::FPR) {
+                            ++vectorArgsInVararg;
+                        }
+                    }
+                    LirReg const countReg = makePhysicalReg(
+                        cc.variadicVectorCountReg->ordinal,
+                        LirRegClass::GPR);
+                    std::array<LirOperand, 1> immOps{
+                        LirOperand::makeImmInt32(
+                            static_cast<std::int32_t>(vectorArgsInVararg))};
+                    b.addInst(h.mov, countReg, immOps);
                 }
                 // Emit the call instruction. Pass through the input
                 // opcode (h.call OR h.callIndirectViaExtern) so the

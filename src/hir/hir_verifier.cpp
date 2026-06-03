@@ -367,10 +367,24 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
 
         auto params = interner_->fnParams(sig);
         auto args   = kids.subspan(1);
-        if (args.size() != params.size()) {
+        // D-LANG-VARIADIC (step 13.4): a variadic FnSig admits args
+        // beyond `fnParams().size()` — the declared params are the
+        // FIXED prefix; positions [fixedCount, args.size()) are
+        // vararg-region positions whose types are not constrained
+        // by the FnSig (C's default-argument-promotion + the
+        // platform's vararg ABI handle them at the call site). The
+        // arity check rejects only when there are FEWER args than
+        // fixed params. For non-variadic FnSigs the check is
+        // unchanged (exact match).
+        bool const isVariadic = interner_->fnIsVariadic(sig);
+        bool const arityBad   = isVariadic
+            ? (args.size() < params.size())
+            : (args.size() != params.size());
+        if (arityBad) {
             reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
                      std::format("Call #{} passes {} argument(s) but the callee FnSig "
-                                 "declares {} parameter(s)", id.v, args.size(), params.size()),
+                                 "declares {} {}parameter(s)", id.v, args.size(),
+                                 params.size(), isVariadic ? "fixed " : ""),
                      sourceMap_);
             continue;  // positions no longer correspond
         }
@@ -388,7 +402,13 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
         // JIT path), add an audit test that constructs HIR with a
         // bare `Ptr<int>→Ptr<Void>` call arg WITHOUT a Cast and pins
         // `H_VerifierFailure` fires here.
-        for (std::size_t a = 0; a < args.size(); ++a) {
+        // D-LANG-VARIADIC (step 13.4): vararg-region args (positions
+        // >= params.size() on a variadic FnSig) have no type
+        // constraint from the FnSig — the per-arg assignability check
+        // bounds at `params.size()`, not `args.size()`. C's default
+        // argument promotion + the platform vararg ABI handle vararg
+        // typing at the call site, not at the verifier.
+        for (std::size_t a = 0; a < params.size(); ++a) {
             if (!isAssignable(*interner_, params[a], hir_.typeId(args[a]))) {
                 // D-LANG-NULL-POINTER-CONSTANT verifier fallback
                 // (step 13.3 macOS CI fix 2026-06-02): if `cst_to_hir.cpp`'s

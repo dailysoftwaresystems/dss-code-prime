@@ -69,8 +69,15 @@ public:
     // with the enum TypeId; the enum type itself is int-compatible).
     TypeId enumType(std::string_view name,
                     TypeKind underlying = TypeKind::I32);
-    // fnSig: operands=[result, params...], scalars=[(int)cc].
+    // fnSig: operands=[result, params...], scalars=[(int)cc, isVariadic].
+    // D-LANG-VARIADIC (step 13.4): variadic flips the second scalar slot;
+    // non-variadic encodings remain 1-slot for cache stability against
+    // every pre-13.4 TypeId. The declared params are the FIXED arg count
+    // (matches LLVM's `(i32 (i8*, ...))*` convention — `...` is a
+    // marker, not a typed param).
     TypeId fnSig(std::span<TypeId const> params, TypeId result, CallConv cc);
+    TypeId fnSig(std::span<TypeId const> params, TypeId result, CallConv cc,
+                 bool isVariadic);
     // extension: kind = TypeKind::Extension, extensionKind = `kind`, nominal name,
     // operands=[type args...], scalars=[integer args...].
     TypeId extension(TypeKindId kind, std::string_view name,
@@ -89,6 +96,12 @@ public:
     // `id` is not a FnSig.
     [[nodiscard]] TypeId                   fnResult(TypeId id) const;
     [[nodiscard]] std::span<TypeId const>  fnParams(TypeId id) const;
+    // D-LANG-VARIADIC (step 13.4): true iff this FnSig was built via
+    // the 4-arg `fnSig()` overload with `isVariadic=true`. Read from
+    // scalars[1]. Pre-13.4 FnSigs (built via the 3-arg overload)
+    // encode scalars=[(int)cc] only — `fnIsVariadic` returns false
+    // for them (scalar count < 2 → no variadic encoding present).
+    [[nodiscard]] bool                     fnIsVariadic(TypeId id) const;
 
     // ── promotion / coercion (C99 "usual arithmetic conversions") ──
     // The common arithmetic type two operands are coerced to before a binary

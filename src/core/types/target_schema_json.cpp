@@ -909,6 +909,29 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         }
                     }
                 }
+                // D-LANG-VARIADIC (step 13.4, 2026-06-02): optional
+                // caller-side vector-count register for variadic calls.
+                // SysV AMD64 sets it to "al"; Win64 / AAPCS64 omit it.
+                if (c.contains("variadicVectorCountReg")) {
+                    if (!c.at("variadicVectorCountReg").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/variadicVectorCountReg", ccPath),
+                                  "must be a register-name string");
+                    } else {
+                        auto const name = c.at("variadicVectorCountReg").get<std::string>();
+                        auto it = data.registerIndex.find(name);
+                        if (it != data.registerIndex.end()) {
+                            cc.variadicVectorCountReg = TargetCallingConvention::NamedRegisterRef{
+                                name, it->second
+                            };
+                        } else {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/variadicVectorCountReg", ccPath),
+                                      std::format("variadic vector-count register "
+                                                  "'{}' is not in the register table", name));
+                        }
+                    }
+                }
 
                 std::uint16_t const idx =
                     static_cast<std::uint16_t>(data.callingConventions.size());

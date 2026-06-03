@@ -106,11 +106,12 @@ rule:root
                     tok:"int"
                 tok:"a"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"b"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"b"
             tok:")"
           rule:block
             tok:"{"
@@ -143,17 +144,19 @@ rule:root
                     tok:"int"
                 tok:"a"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"b"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"b"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"c"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"c"
             tok:")"
           rule:block
             tok:"{"
@@ -251,11 +254,12 @@ rule:root
                     tok:"int"
                 tok:"arr"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"len"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"len"
             tok:")"
           rule:block
             tok:"{"
@@ -698,11 +702,12 @@ rule:root
                     tok:"int"
                 tok:"a"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"b"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"b"
             tok:")"
           rule:block
             tok:"{"
@@ -754,17 +759,19 @@ rule:root
                     tok:"int"
                 tok:"x"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"lo"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"lo"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"hi"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"hi"
             tok:")"
           rule:block
             tok:"{"
@@ -819,17 +826,19 @@ rule:root
                     tok:"int"
                 tok:"a"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"b"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"b"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"limit"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"limit"
             tok:")"
           rule:block
             tok:"{"
@@ -925,17 +934,19 @@ rule:root
                     tok:"int"
                 tok:"a"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"b"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"b"
               tok:","
-              rule:param
-                rule:typeRefAllowingStruct
-                  rule:typeBaseAllowingStruct
-                    tok:"int"
-                tok:"c"
+              rule:paramOrEllipsis
+                rule:param
+                  rule:typeRefAllowingStruct
+                    rule:typeBaseAllowingStruct
+                      tok:"int"
+                  tok:"c"
             tok:")"
           rule:block
             tok:"{"

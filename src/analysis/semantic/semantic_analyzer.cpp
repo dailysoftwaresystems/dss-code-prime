@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <limits>
 #include <optional>
 #include <span>
@@ -1010,6 +1011,19 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             collectParamTypes(s, cfg, tree, paramsNode, here,
                                               paramTypes);
                         }
+                        // D-LANG-VARIADIC (step 13.4): scan the params
+                        // subtree for the declaration's configured
+                        // variadic-marker token (e.g. `EllipsisOp` for
+                        // c-subset). When present, build a variadic
+                        // FnSig (scalars=[cc, 1]); otherwise build the
+                        // standard non-variadic FnSig (scalars=[cc]).
+                        // Reuses `subtreeContainsToken` (the same DFS
+                        // walker SE4 const-marker detection uses) —
+                        // one tree-walker semantics surface, not two.
+                        bool const isVariadic =
+                            paramsNode.valid() && decl.variadicMarker.has_value()
+                            && subtreeContainsToken(
+                                tree, paramsNode, *decl.variadicMarker);
                         // CcSysV is the canonical MIR-tier placeholder
                         // (mirrors `hir_to_mir.cpp:lowerModuleInit`'s
                         // moduleInit FnSig): the target's real
@@ -1021,7 +1035,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         // placeholder convention every interner
                         // `fnSig()` callsite uses pre-ML7.
                         TypeId const fnTy = s.lattice.interner().fnSig(
-                            paramTypes, returnTy, CallConv::CcSysV);
+                            paramTypes, returnTy, CallConv::CcSysV,
+                            isVariadic);
                         s.symbols.at(sym).type = fnTy;
                         s.nodeToType.set(resolved.node, fnTy);
                         // GAP A: record the function's RESULT type keyed on
@@ -1644,17 +1659,36 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
     auto params = s.lattice.interner().fnParams(fnTy);
 
-    bool const variadic = s.symbols.at(calleeSym).variadicBuiltin;
-    if (!variadic && argNodes.size() != params.size()) {
+    // D-LANG-VARIADIC (step 13.4): a C-style variadic FnSig
+    // (scalars[1] == 1) admits >= fixedParamCount args; a non-variadic
+    // FnSig admits exactly fixedParamCount. The pre-existing
+    // `variadicBuiltin` flag (e.g. tsql COALESCE) admits ANY arg count
+    // — those builtins have no fixed prefix to require.
+    bool const variadicBuiltin = s.symbols.at(calleeSym).variadicBuiltin;
+    bool const variadicFnSig   = s.lattice.interner().fnIsVariadic(fnTy);
+    bool const tooFewForVariadic =
+        variadicFnSig && argNodes.size() < params.size();
+    bool const wrongCountForFixed =
+        !variadicBuiltin && !variadicFnSig
+        && argNodes.size() != params.size();
+    if (tooFewForVariadic || wrongCountForFixed) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::S_ArgCountMismatch;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(node);
-        d.actual   = std::to_string(argNodes.size());
+        // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-1: mirror the
+        // HIR verifier's "fixed " word for variadic-too-few so users
+        // can distinguish "wrong fixed-arity" from "variadic prefix
+        // too short" without inspecting the FnSig.
+        d.actual   = tooFewForVariadic
+            ? std::format("{} (fewer than {} fixed parameter(s))",
+                          argNodes.size(), params.size())
+            : std::to_string(argNodes.size());
         s.reporter.report(std::move(d));
         return;
     }
+    bool const variadic = variadicBuiltin || variadicFnSig;
 
     // Per-arg assignability (only up to the declared arity for variadics).
     std::size_t const checkCount = variadic

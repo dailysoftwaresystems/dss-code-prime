@@ -193,12 +193,37 @@ TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
 }
 
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc) {
-    // operands = [result, params...] so the result is recoverable at a fixed
-    // position; scalars = [(int)cc].
+    // 3-arg backward-compat path: non-variadic. Delegates to the 4-arg
+    // overload with isVariadic=false. Pre-13.4 callers (30+ sites)
+    // continue to intern the EXISTING shape (scalars=[(int)cc] only —
+    // 1 slot) so legacy round-trip tests + cached TypeIds remain
+    // bit-identical.
+    return fnSig(params, result, cc, /*isVariadic=*/false);
+}
+
+TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc,
+                           bool isVariadic) {
+    // operands = [result, params...] so the result is recoverable at a
+    // fixed position. D-LANG-VARIADIC (step 13.4, 2026-06-02): scalars
+    // encoding depends on isVariadic:
+    //   non-variadic → scalars=[(int)cc]               (1 slot, legacy)
+    //   variadic     → scalars=[(int)cc, isVariadic=1] (2 slots)
+    // The 1-slot legacy form preserves bit-identical TypeIds for
+    // pre-13.4 callers (30+ sites in semantic / hir / mir / lir / ffi
+    // not yet ported to the 4-arg overload). The 2-slot form opts in
+    // to variadic encoding only at sites that explicitly declare it
+    // — c-subset's `...` paramList tail is the only declarer today.
+    // Decoder `fnIsVariadic` handles both forms (false for legacy).
     std::vector<TypeId> ops;
     ops.reserve(params.size() + 1);
     ops.push_back(result);
     ops.insert(ops.end(), params.begin(), params.end());
+    if (isVariadic) {
+        std::array<std::int64_t, 2> const sc{
+            static_cast<std::int64_t>(cc),
+            std::int64_t{1}};
+        return internContent(TypeKind::FnSig, {}, ops, sc, {});
+    }
     std::array<std::int64_t, 1> const sc{static_cast<std::int64_t>(cc)};
     return internContent(TypeKind::FnSig, {}, ops, sc, {});
 }
@@ -233,6 +258,19 @@ TypeId TypeInterner::fnResult(TypeId id) const {
 std::span<TypeId const> TypeInterner::fnParams(TypeId id) const {
     if (kind(id) != TypeKind::FnSig) latticeFatal("fnParams: TypeId is not a FnSig");
     return operands(id).subspan(1);
+}
+
+bool TypeInterner::fnIsVariadic(TypeId id) const {
+    if (kind(id) != TypeKind::FnSig) latticeFatal("fnIsVariadic: TypeId is not a FnSig");
+    auto const sc = scalars(id);
+    // D-LANG-VARIADIC (step 13.4): every FnSig MUST carry at least
+    // the cc scalar (post-13.4 audit-fold HIGH-1). Pre-13.4 FnSigs
+    // encode scalars=[(int)cc] (1 slot); variadic FnSigs encode
+    // scalars=[(int)cc, 1] (2 slots). A 0-slot FnSig has no cc —
+    // structurally impossible via the public builder, fatal here to
+    // pin the invariant against a future builder bypass.
+    if (sc.empty()) latticeFatal("fnIsVariadic: FnSig has no cc scalar");
+    return sc.size() >= 2 && sc[1] != 0;
 }
 
 namespace {
