@@ -204,19 +204,45 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
     TypeId lhsTy, NodeId rhsExpr,
     SemanticConfig::PointerConversionRules const& rules);
 
-// True iff a token of kind `kind` appears anywhere in `node`'s subtree.
-// Used by SE4 const-marker detection (walk the type subtree for the
-// language's const keyword).
+// True iff a token of kind `kind` appears anywhere in `node`'s subtree,
+// stopping descent at any NESTED declaration-rule node (other than the
+// root `node` itself). Used by SE4 const-marker detection (walk a decl's
+// `typeChild` for the language's const keyword) AND by D-LANG-VARIADIC
+// variadic-marker detection (walk a decl's `paramsChild` for the
+// language's `EllipsisOp` marker). Generic substrate — any future
+// "marker token within a decl subtree" scan (async/inline/noexcept
+// markers etc.) reuses this same walker with the same decl-rule stop.
+//
+// `declByRule` is the map from RuleId.v → declarations[] index that
+// EngineState builds at activate-time. Pass `&s.idx().declByRule` for
+// safe-bounded descent (the audit-fold default — closes silent-failure
+// HIGH-2 step 13.4: without it, a future grammar that nested a
+// default-value expression INSIDE a `param` could false-match a marker
+// in the inner expression and silently lower every fixed-arity callee
+// as variadic). Pass `nullptr` ONLY when the scan MUST cross nested
+// declaration-boundaries by design — a deliberate choice, not an
+// oversight or a copy-paste from the legacy unbounded shape.
 [[nodiscard]] bool
-subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind) {
+subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
+                     std::unordered_map<std::uint32_t, std::size_t> const*
+                         declByRule = nullptr) {
     if (!node.valid() || !kind.valid()) return false;
     std::vector<NodeId> stack{node};
+    bool firstPop = true;
     while (!stack.empty()) {
         NodeId cur = stack.back();
         stack.pop_back();
         if (tree.kind(cur) == NodeKind::Token && tree.tokenKind(cur) == kind) {
             return true;
         }
+        // Stop descent at any nested declaration-rule node (the root
+        // itself IS a decl subtree by contract and stays in scope).
+        if (!firstPop && declByRule != nullptr
+            && tree.kind(cur) == NodeKind::Internal
+            && declByRule->contains(tree.rule(cur).v)) {
+            continue;
+        }
+        firstPop = false;
         for (auto const& child : tree.children(cur)) {
             if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
         }
@@ -707,7 +733,8 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             scanRoot = kids[*decl.typeChild];
                         }
                         rec.isConst = subtreeContainsToken(
-                            tree, scanRoot, *decl.constMarker);
+                            tree, scanRoot, *decl.constMarker,
+                            &s.idx().declByRule);
                     }
 
                     SymbolId const newId = s.symbols.mint(rec);
@@ -1017,13 +1044,16 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         // c-subset). When present, build a variadic
                         // FnSig (scalars=[cc, 1]); otherwise build the
                         // standard non-variadic FnSig (scalars=[cc]).
-                        // Reuses `subtreeContainsToken` (the same DFS
-                        // walker SE4 const-marker detection uses) —
-                        // one tree-walker semantics surface, not two.
+                        // The walker stops descent at any nested decl-
+                        // rule node — a future grammar that nests a
+                        // default-value expression inside a `param`
+                        // cannot false-match the marker. Closes silent-
+                        // failure HIGH-2 (step 13.4 post-fold).
                         bool const isVariadic =
                             paramsNode.valid() && decl.variadicMarker.has_value()
                             && subtreeContainsToken(
-                                tree, paramsNode, *decl.variadicMarker);
+                                tree, paramsNode, *decl.variadicMarker,
+                                &s.idx().declByRule);
                         // CcSysV is the canonical MIR-tier placeholder
                         // (mirrors `hir_to_mir.cpp:lowerModuleInit`'s
                         // moduleInit FnSig): the target's real

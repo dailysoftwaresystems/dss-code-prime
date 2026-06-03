@@ -1140,9 +1140,32 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             ++vectorArgsInVararg;
                         }
                     }
+                    // D-LANG-VARIADIC (step 13.4) post-fold (type-design
+                    // analyzer rec): derive the countReg's class from
+                    // the SCHEMA's register-table entry, NOT a
+                    // hardcoded LirRegClass::GPR. SysV's rax is GPR;
+                    // a hypothetical future ABI that chose an XMM
+                    // register would have its class threaded through
+                    // automatically. Closes silent-failure surface
+                    // where a non-GPR cc.variadicVectorCountReg would
+                    // silently misclass the emitted vreg.
+                    auto const* regInfo = schema.registerInfo(
+                        cc.variadicVectorCountReg->ordinal);
+                    if (regInfo == nullptr) {
+                        report(reporter,
+                               DiagnosticCode::L_CcRegLookupFailed,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: cc '{}' "
+                                           "variadicVectorCountReg ordinal "
+                                           "{} is out of range",
+                                           cc.name,
+                                           cc.variadicVectorCountReg->ordinal));
+                        return false;
+                    }
                     LirReg const countReg = makePhysicalReg(
                         cc.variadicVectorCountReg->ordinal,
-                        LirRegClass::GPR);
+                        static_cast<LirRegClass>(
+                            static_cast<std::uint8_t>(regInfo->regClass)));
                     std::array<LirOperand, 1> immOps{
                         LirOperand::makeImmInt32(
                             static_cast<std::int32_t>(vectorArgsInVararg))};
