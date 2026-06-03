@@ -1010,6 +1010,16 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             collectParamTypes(s, cfg, tree, paramsNode, here,
                                               paramTypes);
                         }
+                        // CcSysV is the canonical MIR-tier placeholder
+                        // (mirrors `hir_to_mir.cpp:lowerModuleInit`'s
+                        // moduleInit FnSig): the target's real
+                        // convention is applied by ML7 (`lir_callconv`)
+                        // via `cc.name` lookup at materialize time.
+                        // Do NOT inspect this CallConv field at MIR
+                        // tier — it's a semantic placeholder, not the
+                        // load-bearing CC. Anchored as the same
+                        // placeholder convention every interner
+                        // `fnSig()` callsite uses pre-ML7.
                         TypeId const fnTy = s.lattice.interner().fnSig(
                             paramTypes, returnTy, CallConv::CcSysV);
                         s.symbols.at(sym).type = fnTy;
@@ -2023,6 +2033,13 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
             for (auto pc : bf.paramCores) {
                 paramTypes.push_back(s.lattice.interner().primitive(pc));
             }
+            // CcSysV is the canonical MIR-tier placeholder (mirrors
+            // the same convention as the user-function FnSig
+            // construction earlier in this TU + `hir_to_mir.cpp:
+            // lowerModuleInit`'s moduleInit FnSig): ML7's
+            // calling-convention pass maps to the target's real
+            // convention at materialize time via `cc.name` lookup.
+            // Do NOT inspect this CallConv field at MIR tier.
             TypeId const fnTy = s.lattice.interner().fnSig(
                 paramTypes, s.lattice.interner().primitive(bf.resultCore),
                 CallConv::CcSysV);
