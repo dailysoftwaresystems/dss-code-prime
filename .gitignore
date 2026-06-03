@@ -48,6 +48,11 @@ build/
 # a CI step that cd's wrong) — these are throwaway run artifacts.
 Testing/
 
+# Test-scratch directories created by examples_runner + integrated_tests
+# during per-example compile/run cycles. Throwaway working dirs that
+# happen to land at repo-root when ctest runs without a build-dir cwd.
+test-scratch/
+
 # Python bytecode cache (e.g. tools/refresh_landing_log.py)
 __pycache__/
 *.pyc
