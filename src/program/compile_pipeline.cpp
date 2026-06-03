@@ -169,30 +169,11 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         return false;
     }
 
-    // 3.5. MIR optimizer pipeline (plan 22 OPT1 — step 13.6 cycle 1
-    // 2026-06-03). Cycle 1 ships only the identity (no-op) pass and
-    // no shipped pipeline declares any passes — the optimizer
-    // function runs end-to-end as a verify-the-wiring tier, returning
-    // MIR unchanged. Future cycles land actual passes (OPT2 const-
-    // fold / DCE / copy-prop / peephole) inside this exact slot.
-    //
-    // Per plan 22 §2.5 (per-output-path policy), the active pipeline
-    // is resolved from the artifact-profile config — c-subset's
-    // default profile is the no-op pipeline today. The differential-
-    // verification corpus (14 positive + 5 negative pins, c8f913a +
-    // c-subset/dce_negative_pin/ + cse_noncommutative/ etc.) verifies
-    // each future pass landing as it does.
+    // 3.5. MIR optimizer (plan 22 OPT1; default = {Identity} — the
+    // no-op pass exercises the engine each compile. OPT2 lands real
+    // passes here; the pipeline gets resolved from artifact-profile
+    // config — D-OPT1-PIPELINE-FROM-CONFIG).
     auto const optEntry = reporter.errorCount();
-    // Silent-failure post-fold F2 (2026-06-03): default pipeline =
-    // [Identity], NOT empty. An empty `passes` array would skip the
-    // optimizer's per-pass loop entirely — leaving the future
-    // D-OPT1-VERIFY-AFTER-EVERY-PASS slot dead code and the engine's
-    // dispatch never exercised. The Identity pass is the substrate's
-    // self-test: it runs the loop, gets dispatched, returns clean,
-    // and (when OPT2 lands) triggers the verify-after-pass hook.
-    // Future cycles replace the literal `{Identity}` here with a
-    // pipeline-name lookup against the artifact-profile config
-    // (anchored D-OPT1-PIPELINE-FROM-CONFIG).
     ::dss::opt::OptPipeline pipeline{
         "default",
         { ::dss::opt::PassId::Identity }};

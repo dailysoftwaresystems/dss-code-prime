@@ -30,7 +30,9 @@ function Get-Anchors([string]$Path, [string[]]$Filters) {
     return $anchors.Keys | Sort-Object
 }
 
-$srcAnchors = Get-Anchors 'src' @('*.cpp', '*.hpp', '*.json')
+$srcAnchors = (Get-Anchors 'src'      @('*.cpp', '*.hpp', '*.json')) +
+              (Get-Anchors 'examples' @('*.c'))
+$srcAnchors = $srcAnchors | Sort-Object -Unique
 
 # Read every plan-file's raw content for substring matching. Substring
 # (vs equality vs extracted-anchor-set) handles two false-positive modes:

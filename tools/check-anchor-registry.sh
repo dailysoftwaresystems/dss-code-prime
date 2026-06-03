@@ -28,8 +28,8 @@ cd "${REPO_ROOT}"
 # treated as informal; the registry contract enforces ≥3 segments.
 ANCHOR_REGEX='\<D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
 
-SRC_ANCHORS="$(grep -rEoh "${ANCHOR_REGEX}" src/ \
-    --include='*.cpp' --include='*.hpp' --include='*.json' 2>/dev/null \
+SRC_ANCHORS="$(grep -rEoh "${ANCHOR_REGEX}" src/ examples/ \
+    --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' 2>/dev/null \
     | sort -u || true)"
 
 # For each src anchor, check substring presence in any .plans/*.md.
@@ -57,7 +57,8 @@ echo "have no matching row/citation in any .plans/*.md file:"
 echo ""
 for anchor in "${MISSING[@]}"; do
     echo "  ${anchor}"
-    grep -rln "${anchor}" src/ --include='*.cpp' --include='*.hpp' --include='*.json' \
+    grep -rln "${anchor}" src/ examples/ \
+        --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' \
         2>/dev/null | sed 's/^/    cited in: /'
 done
 echo ""

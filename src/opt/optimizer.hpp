@@ -52,6 +52,20 @@ enum class PassId : std::uint8_t {
     // Future cycles append: ConstFold, Dce, CopyProp, Peephole, ...
 };
 
+// Type-design post-fold (2026-06-03): compile-time enum-drift guard
+// matching the codebase's existing `kEncodingSlotKindCount` /
+// `kTargetCondCodeTable` pattern. When a new enumerator lands in
+// PassId WITHOUT a matching `runPass` arm + a bump of this constant,
+// the static_assert below trips loud at the next compile. Converts
+// the X_UnknownPassId runtime fail-loud (a useful belt-and-suspenders)
+// into a compile-time invariant — D-OPT1-PASS-ID-STABILITY enforced
+// by the type system, not just by reviewer discipline.
+inline constexpr std::size_t kPassIdCount = 1;
+static_assert(kPassIdCount == static_cast<std::size_t>(PassId::Identity) + 1,
+              "PassId enum / kPassIdCount drift — add a runPass arm in "
+              "optimizer.cpp's switch AND bump kPassIdCount when you "
+              "append a new PassId enumerator (D-OPT1-PASS-ID-STABILITY)");
+
 // A pipeline is an ordered list of passes to run on each MIR
 // function. Loaded from `src/dss-config/pipelines/*.pipeline.json`
 // at compile time; the same vocabulary will later be searched by
