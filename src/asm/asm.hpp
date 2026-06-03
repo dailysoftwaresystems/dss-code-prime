@@ -278,7 +278,32 @@ struct DSS_EXPORT AssembledModule {
     // as "unset" would collide with the valid-0 case — same
     // `Unknown=0-vs-valid-0` trap LK4 cycle-1 review already
     // caught.
-    std::optional<std::size_t>     imageEntryOverride;
+    std::optional<std::size_t>     imageEntryOverride;  // INDEX into functions[]
+
+    // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
+    // 2026-06-03): explicit USER entry-function symbol — set by the
+    // compile pipeline based on the source language's entry-function
+    // name config (e.g. c-subset's "main"). Distinct from
+    // `imageEntryOverride` which names the IMAGE entry (= the
+    // injected trampoline at functions[0]); this field names the
+    // FUNCTION the trampoline calls.
+    //
+    // Pre-fix, the trampoline injector resolved the user entry via
+    // `resolveUserEntrySymbol` which fell back to `functions[0]`
+    // when the format JSON's `entryPoint` was empty (default for
+    // every shipped format pending D-LK1-1's real-symbol-name
+    // thread). With multi-function modules where the entry isn't
+    // first in source order, this resolved to the WRONG function
+    // — e.g. `int helper(int x){return x;}; int main(){return
+    // helper(42);}` had main calling helper correctly, but the
+    // trampoline called HELPER instead of main, returning rcx
+    // (= the trampoline's RCX-on-entry, which is uninitialized).
+    // With this field set, `resolveUserEntrySymbol` looks it up
+    // directly — bypassing the functions[0] fallback.
+    //
+    // Empty optional ⇒ pre-13.5-cycle-2 fallback discipline
+    // (entryPoint or functions[0]). Set ⇒ load-bearing.
+    std::optional<SymbolId>        userEntrySymbol;     // SymbolId of user-written entry fn
 
     // Derived: true iff `assemble()` ran on a non-empty LIR module AND
     // every function received its parallel-index slot. The reporter
