@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 namespace dss {
@@ -212,6 +213,66 @@ mirDominanceFrontier(Mir const& mir,
         }
     }
     return df;
+}
+
+// Dominator-tree children: invert `idom` so consumers can walk the
+// tree top-down. Returns `children[b.v]` = list of blocks whose
+// immediate dominator is `b` (excluding the entry's self-loop).
+// O(V), one linear scan over `idom`. Mem2Reg's rename DFS walks the
+// dom tree in pre-order; LICM's hoist scan walks it bottom-up.
+//
+// Blocks with `gaveUp[i] != 0` or invalid `idom[i]` get no parent
+// entry — the verifier maps those to `I_VerifierFailure`; this helper
+// silently drops them from the tree (a conservative caller treats
+// "no parent" as "do not promote / hoist through this block").
+[[nodiscard]] inline std::vector<std::vector<MirBlockId>>
+mirDomTreeChildren(Mir const& mir, MirDomTree const& dom) {
+    std::vector<std::vector<MirBlockId>> children(mir.blockCount());
+    for (std::uint32_t i = 1; i < mir.blockCount(); ++i) {
+        if (i < dom.gaveUp.size() && dom.gaveUp[i]) continue;
+        if (i >= dom.idom.size()) continue;
+        MirBlockId const parent = dom.idom[i];
+        if (!parent.valid()) continue;
+        if (parent.v == i) continue;  // skip the entry's self-loop
+        MirBlockId const b{i, mir.id().v};
+        children[parent.v].push_back(b);
+    }
+    return children;
+}
+
+// Iterated dominance frontier (IDF) of a set of "def blocks". For
+// Cytron-Ferrante SSA construction (Mem2Reg): a Phi for variable V
+// must be inserted at every block in IDF(def-blocks-of(V)). The
+// classic worklist formulation: start with the def set, expand by
+// DF, repeat until no new blocks are added. Each block enters the
+// IDF at most once → terminates in O(|IDF| · |DF|).
+//
+// `df` is the output of `mirDominanceFrontier`. `defBlocks` is the
+// blocks containing a definition of the variable (e.g. a Store to
+// a promotable alloca for Mem2Reg). Returns the IDF in
+// insertion-order; the caller iterates linearly.
+[[nodiscard]] inline std::vector<MirBlockId>
+mirIteratedDominanceFrontier(
+    std::vector<MirBlockId> const& defBlocks,
+    std::vector<std::vector<MirBlockId>> const& df) {
+    std::vector<MirBlockId> worklist(defBlocks.begin(), defBlocks.end());
+    std::unordered_set<std::uint32_t> inIDF;
+    std::unordered_set<std::uint32_t> onWorklist;
+    for (MirBlockId const b : defBlocks) onWorklist.insert(b.v);
+    std::vector<MirBlockId> idf;
+    while (!worklist.empty()) {
+        MirBlockId const b = worklist.back();
+        worklist.pop_back();
+        if (b.v >= df.size()) continue;
+        for (MirBlockId const f : df[b.v]) {
+            if (!inIDF.insert(f.v).second) continue;
+            idf.push_back(f);
+            if (onWorklist.insert(f.v).second) {
+                worklist.push_back(f);
+            }
+        }
+    }
+    return idf;
 }
 
 } // namespace dss

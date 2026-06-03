@@ -1,17 +1,11 @@
 #pragma once
 
-// Shared MIR-tier function rebuilder substrate. Consumed by every
-// MIR pass that follows the "rebuild-via-MirBuilder" pattern
-// (ConstFold, DCE today; Mem2Reg + CopyProp + LICM + CSE tomorrow).
+// Shared MIR-tier function rebuilder substrate. Every MIR-tier pass
+// that rewrites a function via MirBuilder drives this rebuilder —
+// centralizing the rewrite-map / terminator-clone / phi-deferral
+// invariants prevents per-pass drift (D-OPT-MIR-REBUILDER-EXTRACT).
 //
-// Extracted when Mem2Reg arrived as the 3rd consumer — pre-extraction
-// ConstFold + DCE carried 70%-identical `FunctionRebuilder` classes
-// in anon namespace + drift had already occurred (DCE doesn't
-// `rewrite_.emplace` terminators; ConstFold does). Closes
-// D-OPT-MIR-REBUILDER-EXTRACT before the 3rd copy multiplies the
-// drift.
-//
-// **The contract** (D-OPT2-REWRITE-MAP-COMPLETENESS):
+// **REWRITE-MAP COMPLETENESS CONTRACT** (D-OPT2-REWRITE-MAP-COMPLETENESS):
 // every value-producing OLD-module inst must be in the rewrite map
 // by the time a downstream consumer reads it. Phi back-edges are the
 // one delayed case — handled in phase 3 only. A missing entry at
@@ -36,9 +30,9 @@ namespace dss::opt::passes {
 
 // Per-pass policy driving the rebuild. Pass-specific state lives on
 // the concrete subclass; the rebuilder owns only the rewrite map +
-// the per-function block map. The default-method implementations
-// here cover the "no special handling" path used by ConstFold's
-// default arms (a concrete policy overrides only the hooks it needs).
+// the per-function block map. Default-method implementations express
+// the "no special handling" path; a concrete policy overrides only
+// the hooks it needs.
 class MirRebuildPolicy {
 public:
     virtual ~MirRebuildPolicy() = default;
@@ -48,6 +42,21 @@ public:
     // subset. Mem2Reg: all blocks (it inserts Phis, doesn't elide blocks).
     [[nodiscard]] virtual std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) = 0;
+
+    // Phase 2: per-block prologue hook called after `dst.beginBlock(newB)`
+    // and before the block's instruction loop runs. Default = no-op.
+    // Mem2Reg overrides this to insert Phi placeholders at the head of
+    // each block in the iterated dominance frontier of a promotable
+    // alloca's def-blocks. The rewrite map is mutable so the hook can
+    // record any (oldId → newId) entries the same block's subsequent
+    // instructions will consume. `blockMap` is provided so the policy
+    // can resolve OLD-block-id refs (e.g. inserted-phi marker keys
+    // that the rename walk already mapped to OLD block ids).
+    virtual void onBlockBegin(
+        MirBlockId /*oldB*/, MirBlockId /*newB*/,
+        MirBuilder& /*dst*/,
+        std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
+        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {}
 
     // Phase 2: pre-emit filter for non-Phi, non-terminator value-producing
     // insts. Returns false → skip this inst entirely (caller's counter
@@ -121,6 +130,16 @@ public:
 
     // Run the 3-phase rebuild for a single old-module function.
     void rebuildFunction(MirFuncId oldFn);
+
+    // Post-rebuild accessors so a pass that inserts NEW SSA values
+    // (e.g. Mem2Reg's IDF phis — net-new defs that don't correspond
+    // to any old-module instruction) can resolve old→new ids when
+    // wiring up their own phi incomings. Read-only; the rebuilder
+    // remains the sole writer of these maps during rebuild.
+    [[nodiscard]] std::unordered_map<std::uint32_t, MirInstId> const&
+    rewriteMap() const noexcept { return rewrite_; }
+    [[nodiscard]] std::unordered_map<std::uint32_t, MirBlockId> const&
+    blockMap() const noexcept { return blockMap_; }
 
 private:
     [[nodiscard]] MirInstId rewriteOperand(MirInstId oldOp) const;

@@ -64,6 +64,9 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     for (MirBlockId const oldB : blocks) {
         MirBlockId const newB = blockMap_.at(oldB.v);
         dst_.beginBlock(newB);
+        // Mem2Reg's IDF-phi-insertion site (D-OPT-MIR-REBUILDER-
+        // ONBLOCKBEGIN-HOOK). Default no-op for every other pass.
+        policy_.onBlockBegin(oldB, newB, dst_, rewrite_, blockMap_);
 
         std::uint32_t const ninst = src_.blockInstCount(oldB);
         for (std::uint32_t i = 0; i < ninst; ++i) {

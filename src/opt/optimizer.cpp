@@ -4,6 +4,7 @@
 #include "mir/mir_verifier.hpp"
 #include "opt/passes/const_fold.hpp"
 #include "opt/passes/dce.hpp"
+#include "opt/passes/mem2reg.hpp"
 
 #include <format>
 
@@ -38,6 +39,12 @@ struct PassRunResult {
             return {r.ok,
                     r.instructionsEliminated + r.blocksEliminated
                   + r.functionsEliminated   + r.globalsEliminated > 0};
+        }
+        case PassId::Mem2Reg: {
+            auto const r = passes::runMem2Reg(mir, interner, reporter);
+            return {r.ok,
+                    r.allocasPromoted + r.phisInserted
+                  + r.loadsReplaced  + r.storesEliminated > 0};
         }
     }
     // Enum-drift fallback. A future PassId enumerator added without

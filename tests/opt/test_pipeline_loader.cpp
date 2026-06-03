@@ -36,15 +36,19 @@ TEST(PipelineLoader, ShippedDebugLoadsIdentity) {
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
 }
 
-// Shipped `release.pipeline.json` declares [Identity, ConstFold, Dce].
+// Shipped `release.pipeline.json` declares [Identity, ConstFold, Mem2Reg, Dce].
+// Mem2Reg sits BEFORE Dce so the SSA-form module is available to DCE's
+// live-symbol analysis (post-promotion, formerly memory-only references
+// become explicit SSA def-use edges).
 TEST(PipelineLoader, ShippedReleaseLoadsAllPasses) {
     auto r = opt::loadShippedPipeline("release");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->name, "release");
-    ASSERT_EQ(r->passes.size(), 3u);
+    ASSERT_EQ(r->passes.size(), 4u);
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
     EXPECT_EQ(r->passes[1], opt::PassId::ConstFold);
-    EXPECT_EQ(r->passes[2], opt::PassId::Dce);
+    EXPECT_EQ(r->passes[2], opt::PassId::Mem2Reg);
+    EXPECT_EQ(r->passes[3], opt::PassId::Dce);
 }
 
 // Missing version → X_PipelineVersionMismatch. The version gate is the
