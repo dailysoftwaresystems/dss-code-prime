@@ -36,14 +36,15 @@ TEST(PipelineLoader, ShippedDebugLoadsIdentity) {
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
 }
 
-// Shipped `release.pipeline.json` declares [Identity, ConstFold].
-TEST(PipelineLoader, ShippedReleaseLoadsConstFold) {
+// Shipped `release.pipeline.json` declares [Identity, ConstFold, Dce].
+TEST(PipelineLoader, ShippedReleaseLoadsAllPasses) {
     auto r = opt::loadShippedPipeline("release");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->name, "release");
-    ASSERT_EQ(r->passes.size(), 2u);
+    ASSERT_EQ(r->passes.size(), 3u);
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
     EXPECT_EQ(r->passes[1], opt::PassId::ConstFold);
+    EXPECT_EQ(r->passes[2], opt::PassId::Dce);
 }
 
 // Missing version → X_PipelineVersionMismatch. The version gate is the

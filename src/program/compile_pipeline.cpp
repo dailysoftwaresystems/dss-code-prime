@@ -56,7 +56,7 @@ bool compileSingleUnit(CompilationUnit const&        cu,
                        std::uint16_t                 callingConventionIndex,
                        std::filesystem::path const&  outPath,
                        DiagnosticReporter&           reporter,
-                       ::dss::opt::OptPipeline const* pipelineOverride) {
+                       CompileOptions const&         opts) {
     // Take a CU pointer matching `analyze()`'s shared_ptr signature.
     // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
     // with a null deleter so `analyze`'s ref-counting contract is
@@ -170,23 +170,37 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         return false;
     }
 
-    // 3.5. MIR optimizer (plan 22 OPT1+OPT2). Pipeline resolution:
-    //   (a) explicit `pipelineOverride` (examples_runner's differential-
-    //       verify arm, unit tests) — bypasses the JSON registry.
-    //   (b) shipped JSON: today everyone gets "debug" (=[Identity]).
-    //       When CompileConfig threads through the kernel a future
-    //       cycle, Release will map to "release" (=[Identity,ConstFold,...])
-    //       — D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG.
+    // 3.5. MIR optimizer (plan 22). Pipeline resolution:
+    //   (a) explicit `opts.pipelineOverride` (examples_runner's
+    //       differential-verify arm, unit tests) — bypasses the JSON
+    //       registry.
+    //   (b) shipped JSON via `resolvePipelineName(opts.config)`
+    //       (Debug → "debug" / Release → "release").
     auto const optEntry = reporter.errorCount();
     ::dss::opt::OptPipeline loadedPipeline;
-    ::dss::opt::OptPipeline const* effectivePipeline = pipelineOverride;
+    ::dss::opt::OptPipeline const* effectivePipeline = opts.pipelineOverride;
     if (effectivePipeline == nullptr) {
-        auto loaded = ::dss::opt::loadShippedPipeline("debug");
+        auto const name = resolvePipelineName(opts.config);
+        if (!name.has_value()) {
+            // Out-of-range CompileConfig ordinal — fail loud rather
+            // than silently degrade to "debug" (which would let a
+            // buggy CLI parser silently demote a release build).
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::X_PipelineNameResolutionFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "compile_pipeline: CompileConfig ordinal {} out of range "
+                "(kCompileConfigCount = {}) — substrate-shape violation "
+                "(D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG).",
+                static_cast<int>(opts.config), kCompileConfigCount);
+            reporter.report(std::move(d));
+            return false;
+        }
+        auto loaded = ::dss::opt::loadShippedPipeline(*name);
         if (!loaded.has_value()) {
             // The pipeline file ships with the repo; a load failure
             // here is a deploy/install bug. Drain config diagnostics
-            // via the shared helper so the user sees the JSON-path
-            // context.
+            // so the user sees the JSON-path context.
             forwardConfigDiagnostics(loaded.error(), reporter);
             return false;
         }

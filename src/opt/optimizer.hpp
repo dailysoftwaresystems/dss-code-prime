@@ -42,23 +42,21 @@ namespace dss::opt {
 enum class PassId : std::uint8_t {
     Identity  = 0,
     ConstFold = 1,
+    Dce       = 2,
 };
 
 // Single source-of-truth for the {ordinal, name} pairing.
 // `optPassIdFromName` + `optPassIdName` + the runPass switch + the
 // `kPassIdCount` static_assert all derive from this — adding a
 // new enumerator without extending the table fails the static_assert
-// at compile time (D-OPT1-PASS-ID-STABILITY enforcement). Pre-fold
-// the four sites were independently editable, leaving room for a
-// reviewer to bump `kPassIdCount` + add the runPass arm but forget
-// `optPassIdName` — silently corrupting every future serialized
-// pipeline diagnostic. With the table the drift is one site only.
-inline constexpr std::size_t kPassIdCount = 2;
+// at compile time (D-OPT1-PASS-ID-STABILITY enforcement).
+inline constexpr std::size_t kPassIdCount = 3;
 inline constexpr std::pair<PassId, std::string_view> kPassNameTable[kPassIdCount] = {
     {PassId::Identity,  "Identity"},
     {PassId::ConstFold, "ConstFold"},
+    {PassId::Dce,       "Dce"},
 };
-static_assert(kPassIdCount == static_cast<std::size_t>(PassId::ConstFold) + 1,
+static_assert(kPassIdCount == static_cast<std::size_t>(PassId::Dce) + 1,
               "PassId enum / kPassIdCount drift — add a row to "
               "kPassNameTable + the runPass arm in optimizer.cpp's "
               "switch when you append a new PassId enumerator "

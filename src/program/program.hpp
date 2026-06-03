@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "opt/optimizer.hpp"
+#include "program/cli_args.hpp"      // CompileConfig
 #include "program/input_resolver.hpp"
 
 #include <filesystem>
@@ -110,9 +111,18 @@ public:
         return optimizerPipelineOverride_;
     }
 
+    /// D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: the build configuration.
+    /// Debug → "debug" pipeline (no optimization); Release → "release"
+    /// pipeline (full optimizer). `Program::run` stamps this from
+    /// `CliArgs::config` before dispatching to `compileFiles`; tests
+    /// can override directly.
+    void setCompileConfig(CompileConfig c) noexcept { compileConfig_ = c; }
+    [[nodiscard]] CompileConfig compileConfig() const noexcept { return compileConfig_; }
+
 private:
-    std::optional<std::filesystem::path> outputDir_;
+    std::optional<std::filesystem::path>   outputDir_;
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
+    CompileConfig                          compileConfig_ = CompileConfig::Debug;
 };
 
 } // namespace dss

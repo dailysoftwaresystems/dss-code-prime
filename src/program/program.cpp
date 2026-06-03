@@ -167,7 +167,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                     DiagnosticReporter&    reporter,
                                     std::optional<std::filesystem::path> const& outputDir,
                                     bool                   multiTargetBuild,
-                                    ::dss::opt::OptPipeline const* pipelineOverride) {
+                                    CompileOptions const&  compileOpts) {
     auto parsed = TargetSpec::parse(targetSpecStr);
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,
@@ -283,8 +283,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
 
     return compileSingleUnit(cu, grammar, **targetR, **formatR,
-                             ccIndex, outPath, reporter,
-                             pipelineOverride);
+                             ccIndex, outPath, reporter, compileOpts);
 }
 
 } // namespace
@@ -316,6 +315,10 @@ int Program::run(int argc, char* argv[]) {
     auto const cfg = buildReporterConfig(args);
     // D-LK10-ENTRY Slice C companion: route emitted binaries.
     setOutputDir(args.outputDir);
+    // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: thread the CLI's
+    // `--config=<debug|release>` into the kernel so the right
+    // shipped pipeline gets loaded at compile_pipeline step 3.5.
+    setCompileConfig(args.config);
     if (args.projectPath.has_value()) {
         return compileProject(*args.projectPath, cfg);
     }
@@ -528,13 +531,17 @@ int Program::compileFiles(
         scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
         scratchCfg.dedupWindow    = 0;
         DiagnosticReporter scratch{scratchCfg};
+        CompileOptions compileOpts;
+        compileOpts.config = compileConfig_;
+        compileOpts.pipelineOverride =
+            optimizerPipelineOverride_.has_value()
+                ? &*optimizerPipelineOverride_ : nullptr;
         bool const ok = compileOneTarget(
             cu, *grammar, sourceStem,
             spec, scratch,
             outputDir_,
             /*multiTargetBuild*/ targets.size() > 1u,
-            optimizerPipelineOverride_.has_value()
-                ? &*optimizerPipelineOverride_ : nullptr);
+            compileOpts);
         mergeWithTargetContext(scratch, spec, rep);
         if (!ok || scratch.hasErrors()) exitCode = 1;
     }

@@ -3,6 +3,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "mir/mir_verifier.hpp"
 #include "opt/passes/const_fold.hpp"
+#include "opt/passes/dce.hpp"
 
 #include <format>
 
@@ -31,6 +32,12 @@ struct PassRunResult {
         case PassId::ConstFold: {
             auto const r = passes::runConstFold(mir, interner, reporter);
             return {r.ok, r.instructionsFolded > 0};
+        }
+        case PassId::Dce: {
+            auto const r = passes::runDce(mir, interner, reporter);
+            return {r.ok,
+                    r.instructionsEliminated + r.blocksEliminated
+                  + r.functionsEliminated   + r.globalsEliminated > 0};
         }
     }
     // Enum-drift fallback. A future PassId enumerator added without

@@ -123,5 +123,6 @@ TEST(Optimizer, OptResultIdentityShape) {
 TEST(Optimizer, OptPassIdFromNameResolvesAllEnumerators) {
     EXPECT_EQ(opt::optPassIdFromName("Identity"),  opt::PassId::Identity);
     EXPECT_EQ(opt::optPassIdFromName("ConstFold"), opt::PassId::ConstFold);
+    EXPECT_EQ(opt::optPassIdFromName("Dce"),       opt::PassId::Dce);
     EXPECT_FALSE(opt::optPassIdFromName("DoesNotExist").has_value());
 }

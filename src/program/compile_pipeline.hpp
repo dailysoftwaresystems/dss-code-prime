@@ -6,9 +6,14 @@
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
 #include "opt/optimizer.hpp"
+#include "program/cli_args.hpp"  // CompileConfig
 
+#include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 // Driver-tier "one CU → one (target, format) → one artifact"
@@ -79,14 +84,68 @@ DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
 // every compile silently used index 0 — a real miscompile on
 // non-default-cc targets (PE64 + x86_64 silently emitted SysV
 // register assignments instead of MS_x64).
-// `pipelineOverride` (D-OPT1-DIFFERENTIAL-VERIFY-RUNNER): when
-// non-null, this pipeline is used at the MIR-optimizer step (3.5)
-// instead of the JSON-loaded default. Used by the examples_runner's
-// differential-verify arm so a manifest can ship explicit per-test
-// pipelines without touching the shipped pipeline registry, AND by
-// MIR unit tests. When null, the pipeline is resolved from the
-// CompileConfig (Debug→"debug", Release→"release") via
-// `loadShippedPipeline(name)`.
+// D-OPT-COMPILE-OPTIONS-STRUCT: consolidates the trailing-nullable
+// parameters that were individually positional. Adding future knobs
+// (emitDebugInfo, ltoMode, inlineThreshold, ...) is a zero-signature-
+// churn struct-field addition.
+struct CompileOptions {
+    // Selects the default optimizer pipeline when `pipelineOverride`
+    // is null. Resolved via `resolvePipelineName` (a constexpr table
+    // indexed by ordinal — NO `if (config == Release)` branches per
+    // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG agnosticism contract).
+    CompileConfig config = CompileConfig::Debug;
+
+    // Non-null: bypasses the JSON registry; used by the examples_runner's
+    // differential-verify arm + MIR unit tests (D-OPT1-DIFFERENTIAL-
+    // VERIFY-RUNNER).
+    ::dss::opt::OptPipeline const* pipelineOverride = nullptr;
+};
+
+// Resolve `CompileConfig` to a shipped pipeline name. Uses a
+// constexpr table of {ordinal, name} pairs — adding a new
+// CompileConfig enumerator without extending the table fails the
+// static_assert below at compile time. Mirrors the kPassNameTable
+// precedent in optimizer.hpp INCLUDING the "in-order" check that
+// catches a row-swap (e.g. accidentally putting "release" first):
+// without the swap guard, a future edit could silently flip
+// Debug→release and Release→debug at zero compile cost.
+inline constexpr std::size_t kCompileConfigCount = 2;
+inline constexpr std::pair<CompileConfig, std::string_view>
+kPipelineNameTable[kCompileConfigCount] = {
+    {CompileConfig::Debug,   "debug"},
+    {CompileConfig::Release, "release"},
+};
+static_assert(kCompileConfigCount ==
+              static_cast<std::size_t>(CompileConfig::Release) + 1,
+              "CompileConfig / kPipelineNameTable drift — add a row to "
+              "kPipelineNameTable when a new CompileConfig enumerator "
+              "lands (D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG).");
+
+[[nodiscard]] constexpr bool kPipelineNameTableInOrder() noexcept {
+    for (std::size_t i = 0; i < kCompileConfigCount; ++i) {
+        if (static_cast<std::size_t>(kPipelineNameTable[i].first) != i) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(kPipelineNameTableInOrder(),
+              "kPipelineNameTable entries must appear in CompileConfig "
+              "ordinal order — a row-swap would silently flip the "
+              "Debug↔Release mapping.");
+
+// Returns nullopt on an out-of-range `CompileConfig` ordinal (e.g.
+// `static_cast<CompileConfig>(99)` produced by a buggy CLI parser
+// or a future enumerator added without a table row). Callers
+// fail loud — silent fallback to "debug" would let a release build
+// silently degrade to debug-pipeline.
+[[nodiscard]] constexpr std::optional<std::string_view>
+resolvePipelineName(CompileConfig config) noexcept {
+    auto const idx = static_cast<std::size_t>(config);
+    if (idx >= kCompileConfigCount) return std::nullopt;
+    return kPipelineNameTable[idx].second;
+}
+
 [[nodiscard]] DSS_EXPORT bool
 compileSingleUnit(CompilationUnit const&         cu,
                   GrammarSchema const&           grammar,
@@ -95,6 +154,6 @@ compileSingleUnit(CompilationUnit const&         cu,
                   std::uint16_t                  callingConventionIndex,
                   std::filesystem::path const&   outPath,
                   DiagnosticReporter&            reporter,
-                  ::dss::opt::OptPipeline const* pipelineOverride = nullptr);
+                  CompileOptions const&          opts = {});
 
 } // namespace dss

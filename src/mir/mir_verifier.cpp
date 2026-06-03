@@ -3,6 +3,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "mir/mir_cfg.hpp"   // shared mirReversePostOrder
 #include "mir/mir_opcode.hpp"
 
 #include <algorithm>
@@ -86,34 +87,6 @@ buildPredecessors(Mir const& mir, DiagnosticReporter& reporter) {
         }
     }
     return preds;
-}
-
-// Reverse post-order over the CFG starting at `entry`. Unreachable
-// blocks are excluded by construction.
-[[nodiscard]] std::vector<MirBlockId>
-reversePostOrder(Mir const& mir, MirBlockId entry) {
-    std::vector<MirBlockId> order;
-    if (!entry.valid()) return order;
-    std::unordered_set<std::uint32_t> visited;
-    struct Frame { MirBlockId block; std::size_t nextSucc; };
-    std::vector<Frame> stack;
-    auto push = [&](MirBlockId b) {
-        if (b.valid() && visited.insert(b.v).second) stack.push_back({b, 0});
-    };
-    push(entry);
-    while (!stack.empty()) {
-        Frame& top = stack.back();
-        auto succs = mir.blockSuccessors(top.block);
-        if (top.nextSucc < succs.size()) {
-            MirBlockId const s = succs[top.nextSucc++];
-            push(s);
-        } else {
-            order.push_back(top.block);
-            stack.pop_back();
-        }
-    }
-    std::reverse(order.begin(), order.end());
-    return order;
 }
 
 // Cooper-Harvey-Kennedy iterative dominators ("A Simple, Fast
@@ -468,7 +441,7 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                 "funcEntry() returned InvalidMirBlock; skipping dominance check");
             continue;
         }
-        auto rpo  = reversePostOrder(mir_, entry);
+        auto rpo  = mirReversePostOrder(mir_, entry);
         DomState const domState = computeIDoms(mir_, entry, rpo, preds);
         auto const& idom = domState.idom;
         // Emit `I_VerifierFailure` for every block whose idom couldn't

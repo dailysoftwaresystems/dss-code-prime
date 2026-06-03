@@ -2,6 +2,6 @@
     "dssPipelineVersion": 1,
     "pipeline": {
         "name": "release",
-        "passes": ["Identity", "ConstFold"]
+        "passes": ["Identity", "ConstFold", "Dce"]
     }
 }

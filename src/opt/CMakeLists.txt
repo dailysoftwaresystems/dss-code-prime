@@ -2,6 +2,7 @@ add_library(opt OBJECT
     optimizer.cpp
     optimizer_json.cpp
     passes/const_fold.cpp
+    passes/dce.cpp
 )
 
 target_include_directories(opt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

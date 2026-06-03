@@ -323,3 +323,77 @@ TEST(ConstFold, FoldsICmpEqProducesBool) {
     EXPECT_TRUE(ret.isConst);
     EXPECT_EQ(ret.constValue, 1) << "5 == 5 must fold to true (1)";
 }
+
+// D-OPT-CONST-FOLD-PHI-TEST: 3-phase Phi rebuild preservation. A
+// regression in deferredPhi handling, rewrite_.clear() ordering, or
+// oldPhi/newPhi confusion would silently miscompile any phi-using
+// function. This test constructs a 3-block CFG with a Phi at the
+// merge, runs ConstFold, and asserts every incoming (value, pred)
+// pair in the source's Phi appears verbatim (semantically) in the
+// rebuilt Phi.
+TEST(ConstFold, PreservesPhiIncomingsAtMergeBlock) {
+    TypeInterner interner{CompilationUnitId{1}};
+    BuildResult br;
+    br.i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    br.fnSig = interner.fnSig(params, br.i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(br.fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const fArm  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const merge = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    mb.addCondBr(cond, tArm, fArm);
+    mb.beginBlock(tArm);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, br.i32);
+    mb.addBr(merge);
+    mb.beginBlock(fArm);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, br.i32);
+    mb.addBr(merge);
+    mb.beginBlock(merge);
+    MirPhiIncoming const incomings[] = {{c1, tArm}, {c0, fArm}};
+    MirInstId const phi = mb.addPhi(br.i32, incomings);
+    mb.addReturn(phi);
+    br.mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runConstFold(br.mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+
+    // Find the rebuilt Phi + assert it has 2 incomings whose values
+    // are Consts (1 and 0) AND whose predecessors are valid distinct
+    // blocks. A bug in phase 3 (rewrite map missing back-edge values
+    // OR predecessor block-id remap drifting) would surface here.
+    MirFuncId const fn = br.mir.funcAt(0);
+    ASSERT_EQ(br.mir.funcBlockCount(fn), 4u)
+        << "All 4 blocks (entry/tArm/fArm/merge) reachable + preserved";
+
+    bool foundPhi = false;
+    for (std::uint32_t bi = 0; bi < 4u; ++bi) {
+        MirBlockId const b = br.mir.funcBlockAt(fn, bi);
+        std::uint32_t const ni = br.mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < ni; ++i) {
+            MirInstId const id = br.mir.blockInstAt(b, i);
+            if (br.mir.instOpcode(id) != MirOpcode::Phi) continue;
+            foundPhi = true;
+            auto const inc = br.mir.phiIncomings(id);
+            ASSERT_EQ(inc.size(), 2u);
+            // Each incoming.value MUST resolve to a Const inst in
+            // the rebuilt module.
+            for (auto const& edge : inc) {
+                EXPECT_EQ(br.mir.instOpcode(edge.value), MirOpcode::Const)
+                    << "phi incoming value must be the preserved Const";
+                EXPECT_TRUE(edge.pred.valid())
+                    << "phi predecessor block must be valid post-rebuild";
+            }
+            // Both predecessors must be distinct blocks.
+            EXPECT_NE(inc[0].pred.v, inc[1].pred.v);
+        }
+    }
+    EXPECT_TRUE(foundPhi) << "Phi inst missing from rebuilt module";
+}
