@@ -111,6 +111,50 @@ TEST(Optimizer, OptResultIdentityShape) {
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
+// D-OPT-FIXED-POINT-LOOP: a pipeline with `maxIterations > 1` actually
+// re-runs the pass list. With a foldable Add at iter 0, ConstFold
+// mutates on the first iteration; on iteration 2 nothing changes →
+// loop converges + breaks. `passesRun` == 2 × passes.size().
+TEST(Optimizer, MaxIterationsFixedPointLoop) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+
+    // Build a fn that returns Add(Const(1), Const(2)) — ConstFold
+    // folds on iter 1; iter 2 finds nothing to fold.
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder b;
+    b.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    MirInstId const c1 = b.addConst(v1, i32);
+    MirInstId const c2 = b.addConst(v2, i32);
+    MirInstId const ops[] = {c1, c2};
+    MirInstId const sum = b.addInst(MirOpcode::Add, ops, i32);
+    b.addReturn(sum);
+    Mir mir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"two-pass", {opt::PassId::ConstFold,
+                                            opt::PassId::Identity}};
+    pipeline.maxIterations = 4;
+    auto const result = opt::optimize(mir, target, interner, pipeline, rep);
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(result.fixedPointReached)
+        << "the cluster converges after iter 2; fixedPointReached must "
+           "be true (iter-2 produces zero mutations → break)";
+    // iter 1: ConstFold mutates + Identity no-ops → passesMutated == 1
+    // iter 2: ConstFold no-ops + Identity no-ops → passesMutated still 1, break
+    EXPECT_EQ(result.passesMutated, 1u);
+    EXPECT_EQ(result.passesRun, 4u)
+        << "passes×iters = 2×2 (the second iter detects convergence "
+           "AFTER running through the full pipeline list)";
+}
+
 // D-OPT1-PASS-ID-STABILITY: the kPassIdCount drift guard's compile-
 // time correctness is what matters; this test pins the RUNTIME side
 // — optPassIdFromName resolves every shipped enumerator + rejects an

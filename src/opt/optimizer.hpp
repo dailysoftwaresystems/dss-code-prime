@@ -40,12 +40,13 @@ namespace dss::opt {
 // reference passes by NAME at the JSON tier; ordinals here are
 // internal. Adding a pass appends to the end (never renumbers).
 enum class PassId : std::uint8_t {
-    Identity  = 0,
-    ConstFold = 1,
-    Dce       = 2,
-    Mem2Reg   = 3,
-    CopyProp  = 4,
-    Cse       = 5,
+    Identity     = 0,
+    ConstFold    = 1,
+    Dce          = 2,
+    Mem2Reg      = 3,
+    CopyProp     = 4,
+    Cse          = 5,
+    SimplifyCfg  = 6,
 };
 
 // Single source-of-truth for the {ordinal, name} pairing.
@@ -53,16 +54,17 @@ enum class PassId : std::uint8_t {
 // `kPassIdCount` static_assert all derive from this — adding a
 // new enumerator without extending the table fails the static_assert
 // at compile time (D-OPT1-PASS-ID-STABILITY enforcement).
-inline constexpr std::size_t kPassIdCount = 6;
+inline constexpr std::size_t kPassIdCount = 7;
 inline constexpr std::pair<PassId, std::string_view> kPassNameTable[kPassIdCount] = {
-    {PassId::Identity,  "Identity"},
-    {PassId::ConstFold, "ConstFold"},
-    {PassId::Dce,       "Dce"},
-    {PassId::Mem2Reg,   "Mem2Reg"},
-    {PassId::CopyProp,  "CopyProp"},
-    {PassId::Cse,       "Cse"},
+    {PassId::Identity,    "Identity"},
+    {PassId::ConstFold,   "ConstFold"},
+    {PassId::Dce,         "Dce"},
+    {PassId::Mem2Reg,     "Mem2Reg"},
+    {PassId::CopyProp,    "CopyProp"},
+    {PassId::Cse,         "Cse"},
+    {PassId::SimplifyCfg, "SimplifyCfg"},
 };
-static_assert(kPassIdCount == static_cast<std::size_t>(PassId::Cse) + 1,
+static_assert(kPassIdCount == static_cast<std::size_t>(PassId::SimplifyCfg) + 1,
               "PassId enum / kPassIdCount drift — add a row to "
               "kPassNameTable + the runPass arm in optimizer.cpp's "
               "switch when you append a new PassId enumerator "
@@ -102,12 +104,34 @@ optPassIdName(PassId id) noexcept {
 //
 // `name` is OWNED (std::string) — a view over a parsed-JSON
 // owned-string would dangle the moment the pipeline outlives the
-// source json::value. Owned at cycle 1 = zero lifetime-audit debt
-// when more callers come online.
+// source json::value. Owned (not view) — pipeline outlives its
+// source json::value without lifetime audit.
 struct OptPipeline {
     std::string         name;
     std::vector<PassId> passes;
+    // Pipeline-level fixed-point loop (D-OPT-FIXED-POINT-LOOP +
+    // D-OPT1-PASS-RUN-MAX-ITER): the engine reruns the entire
+    // `passes` sequence up to `maxIterations` times or until a full
+    // iteration produces zero `passesMutated`. Default = 1 (single
+    // pass, the historical behavior). Set higher in pipelines that
+    // include mutually-enabling passes (e.g. ConstFold + SimplifyCfg
+    // + Dce — ConstFold folds `if (5<3)` to `if (false)`, SimplifyCfg
+    // folds the CondBr, DCE drops the dead arm, potentially exposing
+    // more ConstFold opportunities). The loader rejects 0 (silent
+    // no-op trap) and caps at 32 (an upper bound large enough for
+    // any realistic mutually-enabling cluster — anything more is
+    // either a non-converging pass or a pathological input).
+    std::uint8_t        maxIterations = 1;
 };
+
+// Substrate bound on `OptPipeline::maxIterations` — the loader
+// rejects values outside [1, kMaxPipelineIterations]. 32 fits in
+// uint8_t comfortably and is large enough for any realistic
+// mutually-enabling cluster (ConstFold + SimplifyCfg + DCE converge
+// in O(log #blocks) in practice). Width chosen for invariant
+// expression: a u16 admits 0 and 33..65535 — silent traps the
+// loader's runtime check has to catch.
+inline constexpr std::uint8_t kMaxPipelineIterations = 32;
 
 // `LoadResult<T>` mirrors `TargetSchema::LoadResult` / `ObjectFormatSchema::LoadResult`.
 // Same 7-step loader shape across all config tiers.
@@ -133,17 +157,19 @@ loadShippedPipeline(std::string_view name);
 loadPipelineFromText(std::string_view jsonText,
                      std::string_view sourceLabel);
 
-// D-OPT1-OPT-RESULT-SHAPE: structured result. `ok` is the equivalent
-// of the old `bool` return; the rest become meaningful as more passes
-// land. `passesMutated > 0` is the signal the future differential-
-// verify-harness short-circuit will read. `fixedPointReached` is
-// true today (no fixed-point pass in cycle 1) — meaningful with
-// copy-prop later (D-OPT1-PASS-RUN-MAX-ITER).
+// Structured optimizer result. `ok` is the equivalent of the old
+// `bool` return. `passesRun` + `passesMutated` are CUMULATIVE across
+// all iterations of the pipeline-level fixed-point loop (a pipeline
+// with `maxIterations=4` and 7 passes that runs 3 iterations reports
+// `passesRun = 21`). `fixedPointReached` is true iff a full iteration
+// produced zero `passesMutated` (mutually-enabling cluster converged).
+// Default = `false` so an early-return path (verifier failure,
+// substrate-contract violation) doesn't masquerade as "converged."
 struct OptResult {
     bool        ok                = false;
     std::size_t passesRun         = 0;
     std::size_t passesMutated     = 0;
-    bool        fixedPointReached = true;
+    bool        fixedPointReached = false;
 };
 
 // Run the configured pipeline over every function in `mir`. Returns

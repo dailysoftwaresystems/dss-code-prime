@@ -7,6 +7,7 @@ add_library(opt OBJECT
     passes/dce.cpp
     passes/mem2reg.cpp
     passes/mir_rebuild_helper.cpp
+    passes/simplify_cfg.cpp
 )
 
 target_include_directories(opt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

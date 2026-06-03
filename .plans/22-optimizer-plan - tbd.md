@@ -26,9 +26,8 @@
 | OPT2  | Const-fold (MIR-tier)                      | ✅ **DONE**          | c1          | `8bae225` + `1a2bed5` |
 | OPT3  | DCE + CompileConfig threading              | ✅ **DONE**          | c1          | `52c1380` |
 | OPT4  | Pre-cond refactors (dom-tree + rebuilder) + Mem2Reg + SSA copy-prop | 🟩 **c1+c2+c3 DONE** | c3          | `256b970` + `2e89b83` + `f496aea` |
-| OPT5  | CSE / GVN + SimplifyCFG | 🟦 **c1 DONE** (SimplifyCFG / LICM next) | c1          | `pending push` |
-| OPT5  | CSE / GVN                                  | ⏳ **planned**        | —           | — |
-| OPT5+ | **SimplifyCFG**† — unreachable / block-merge / jump-thread / branch-fold (MIR; recurring) | ⏳ **planned** | — | — |
+| OPT5  | CSE / GVN + SimplifyCFG + pipeline fixed-point | 🟩 **c1+c2 DONE** (LICM / block-merge next) | c2          | `ec7220b` + `pending push` |
+| OPT5+ | **SimplifyCFG**† — branch-fold + empty-block jump-thread (MIR; recurring; block-merge deferred) | 🟦 **c2 DONE (branch-fold + jump-thread)** (block-merge + marker-repair next) | c2 | `pending push` |
 | OPT6  | LICM (loop-invariant code motion)          | ⏳ **planned**        | —           | — |
 | OPT7  | Inlining                                   | ⏳ **planned (v1.x)** | —           | — |
 | OPT8  | LIR peephole + register coalescing         | ⏳ **planned (v1.x)** | —           | — |

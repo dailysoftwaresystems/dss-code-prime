@@ -134,8 +134,33 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
         ++idx;
     }
 
+    // Pipeline-level fixed-point loop (D-OPT-FIXED-POINT-LOOP +
+    // D-OPT1-PASS-RUN-MAX-ITER). Optional. Default = 1 (single
+    // iteration — historical behavior). Rejected outside
+    // [1, kMaxPipelineIterations]: 0 is a silent-no-op trap, and
+    // values > 32 indicate non-convergence or pathological input
+    // (every realistic mutually-enabling cluster converges in
+    // < log(blockCount) iterations).
+    std::uint8_t maxIterations = 1;
+    if (pipe.contains("maxIterations")) {
+        if (!pipe.at("maxIterations").is_number_integer()) {
+            emitMalformed(coll, std::string{sourceLabel} + "/pipeline/maxIterations",
+                          "must be an integer");
+        } else {
+            auto const v = pipe.at("maxIterations").get<std::int64_t>();
+            if (v < 1 || v > kMaxPipelineIterations) {
+                emitMalformed(coll,
+                    std::string{sourceLabel} + "/pipeline/maxIterations",
+                    std::format("must be in [1, {}] (got {})",
+                                static_cast<int>(kMaxPipelineIterations), v));
+            } else {
+                maxIterations = static_cast<std::uint8_t>(v);
+            }
+        }
+    }
+
     rejectUnknownKeys(coll, pipe, std::string{sourceLabel} + "/pipeline",
-                      {"name", "passes"});
+                      {"name", "passes", "maxIterations"});
 
     // Empty pipeline = silent no-op at the optimizer engine. Reject
     // at load-time so a stray `"passes": []` doesn't ship a build
@@ -148,7 +173,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     if (coll.hasErrors()) {
         return std::unexpected(std::move(coll).release());
     }
-    return OptPipeline{std::move(name), std::move(passes)};
+    return OptPipeline{std::move(name), std::move(passes), maxIterations};
 }
 
 } // namespace

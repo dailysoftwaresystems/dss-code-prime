@@ -7,6 +7,7 @@
 #include "opt/passes/cse.hpp"
 #include "opt/passes/dce.hpp"
 #include "opt/passes/mem2reg.hpp"
+#include "opt/passes/simplify_cfg.hpp"
 
 #include <format>
 
@@ -56,6 +57,10 @@ struct PassRunResult {
             auto const r = passes::runCse(mir, interner, reporter);
             return {r.ok, r.instructionsCsed > 0};
         }
+        case PassId::SimplifyCfg: {
+            auto const r = passes::runSimplifyCfg(mir, interner, reporter);
+            return {r.ok, r.branchesFolded + r.blocksJumpThreaded > 0};
+        }
     }
     // Enum-drift fallback. A future PassId enumerator added without
     // a matching switch arm above would silently no-op without the
@@ -87,10 +92,6 @@ OptResult optimize(Mir& mir,
     auto const entryErrorCount = reporter.errorCount();
 
     OptResult result{};
-    // No fixed-point pass exists in this build; per-pass fixed-point
-    // lives on PassRun (D-OPT1-PASS-RUN-MAX-ITER) and will flip this
-    // when consumed by a future caller.
-    result.fixedPointReached = true;
 
     // Symmetric defense: the JSON loader rejects empty `passes` at
     // load time, but a caller constructing OptPipeline{} directly in
@@ -110,40 +111,62 @@ OptResult optimize(Mir& mir,
         return result;
     }
 
-    for (PassId p : pipeline.passes) {
-        auto const passResult = runPass(p, mir, target, interner, reporter);
-        ++result.passesRun;
-        if (!passResult.ok) {
-            if (reporter.errorCount() <= entryErrorCount) {
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::X_OptReturnFalseWithoutDiagnostic;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = "opt::optimize: pass returned ok=false WITHOUT "
-                             "emitting a diagnostic — substrate contract "
-                             "violation (D-OPT1-RETURN-FALSE-DIAGNOSTIC-"
-                             "CONTRACT).";
-                reporter.report(std::move(d));
+    // Pipeline-level fixed-point loop (D-OPT-FIXED-POINT-LOOP +
+    // D-OPT1-PASS-RUN-MAX-ITER). The whole `passes` sequence reruns
+    // up to `maxIterations` times, or stops early when a full
+    // iteration produces zero `passesMutated` (the fixed-point
+    // signal). Each pass remains internally idempotent; only the
+    // MUTUALLY-ENABLING cluster (ConstFold ↔ SimplifyCfg ↔ Dce)
+    // needs the outer loop. `maxIterations = 1` (the default)
+    // preserves single-pass semantics for every pipeline that
+    // doesn't opt in.
+    // Defense — loader rejects 0; clamp here too so a programmatic
+    // OptPipeline construction (test fixture, future builder API)
+    // bypassing the loader still gets at-least-one iteration.
+    std::uint8_t const maxIter = pipeline.maxIterations == 0
+        ? std::uint8_t{1}
+        : pipeline.maxIterations;
+    // Pessimistic default: stays `false` if we exit the loop without
+    // observing a mutation-free iteration. Set `true` on the first
+    // converged iteration.
+    result.fixedPointReached = false;
+    for (std::uint8_t iter = 0; iter < maxIter; ++iter) {
+        std::size_t const mutatedAtIterStart = result.passesMutated;
+        for (PassId p : pipeline.passes) {
+            auto const passResult = runPass(p, mir, target, interner, reporter);
+            ++result.passesRun;
+            if (!passResult.ok) {
+                if (reporter.errorCount() <= entryErrorCount) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::X_OptReturnFalseWithoutDiagnostic;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = "opt::optimize: pass returned ok=false WITHOUT "
+                                 "emitting a diagnostic — substrate contract "
+                                 "violation (D-OPT1-RETURN-FALSE-DIAGNOSTIC-"
+                                 "CONTRACT).";
+                    reporter.report(std::move(d));
+                }
+                return result;
             }
-            return result;
-        }
-        if (passResult.mutated) {
-            ++result.passesMutated;
-        }
+            if (passResult.mutated) {
+                ++result.passesMutated;
+            }
 
-        // D-OPT1-VERIFY-AFTER-EVERY-PASS (live as of OPT2 cycle 1).
-        // Unconditional verify after EVERY successful pass — not
-        // Debug-only per plan 22 §3 PR1 directive. A pass that
-        // produces an invalid MIR must be a build break, not a
-        // runtime miscompile cascading through LIR + asm + linker.
-        // The verifier's `errorCount` delta-discipline means prior
-        // errors don't taint a clean module's result.
-        MirVerifier verifier{mir, &interner};
-        if (!verifier.verify(reporter)) {
-            // Verifier already emitted the I_* diagnostic explaining
-            // which invariant was broken. We just exit the loop —
-            // a downstream pass running on a broken MIR would
-            // cascade more (often confusing) failures.
-            return result;
+            // D-OPT1-VERIFY-AFTER-EVERY-PASS — unconditional MIR
+            // verify after EVERY successful pass under all build
+            // modes (plan 22 §3 PR1 directive). A pass that produces
+            // an invalid MIR must be a build break, not a runtime
+            // miscompile cascading through LIR + asm + linker.
+            MirVerifier verifier{mir, &interner};
+            if (!verifier.verify(reporter)) {
+                return result;
+            }
+        }
+        // Fixed-point check: a full iteration with zero passes-mutated
+        // means no remaining transformation enables another.
+        if (result.passesMutated == mutatedAtIterStart) {
+            result.fixedPointReached = true;
+            break;
         }
     }
 

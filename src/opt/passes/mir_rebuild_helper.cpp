@@ -194,9 +194,31 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
     auto remember = [&](MirInstId newId) {
         if (record) rewrite_.emplace(oldId.v, newId);
     };
+    // Per-terminator full-replacement hook (branch-folding etc.).
+    // Returning a value short-circuits the standard emit arms.
+    if (auto const rewritten = policy_.tryRewriteTerminator(
+            op, oldId, dst_, rewrite_, blockMap_); rewritten.has_value()) {
+        remember(*rewritten);
+        return;
+    }
+    auto mapSucc = [&](MirBlockId oldS) -> MirBlockId {
+        MirBlockId const redirected = policy_.redirectBlockTarget(oldS);
+        auto const it = blockMap_.find(redirected.v);
+        if (it == blockMap_.end()) {
+            std::fprintf(stderr,
+                "dss::opt::passes::MirFunctionRebuilder fatal: emitTerminator "
+                "successor old v=%u (redirected to v=%u) not in blockMap_ — "
+                "either `selectBlocks` omitted a reachable block OR a policy's "
+                "`redirectBlockTarget` returned an elided block. Originating "
+                "terminator: old MirInstId v=%u.\n",
+                oldS.v, redirected.v, oldId.v);
+            std::abort();
+        }
+        return it->second;
+    };
     switch (op) {
         case MirOpcode::Br: {
-            MirInstId const newId = dst_.addBr(blockMap_.at(oldSucc[0].v));
+            MirInstId const newId = dst_.addBr(mapSucc(oldSucc[0]));
             remember(newId);
             return;
         }
@@ -204,7 +226,7 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             MirInstId const cond = policy_.substituteOperand(
                 rewriteOperand(policy_.substituteOldOperand(oldOps[0])));
             MirInstId const newId = dst_.addCondBr(
-                cond, blockMap_.at(oldSucc[0].v), blockMap_.at(oldSucc[1].v));
+                cond, mapSucc(oldSucc[0]), mapSucc(oldSucc[1]));
             remember(newId);
             return;
         }
@@ -217,10 +239,10 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             for (std::size_t i = 0; i < ncases; ++i) {
                 cases.emplace_back(
                     policy_.substituteOperand(rewriteOperand(policy_.substituteOldOperand(oldOps[1 + i]))),
-                    blockMap_.at(oldSucc[i].v));
+                    mapSucc(oldSucc[i]));
             }
             MirInstId const newId = dst_.addSwitch(
-                disc, cases, blockMap_.at(oldSucc[ncases].v));
+                disc, cases, mapSucc(oldSucc[ncases]));
             remember(newId);
             return;
         }

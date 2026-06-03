@@ -37,21 +37,62 @@ TEST(PipelineLoader, ShippedDebugLoadsIdentity) {
 }
 
 // Shipped `release.pipeline.json` declares
-// [Identity, ConstFold, Mem2Reg, CopyProp, Cse, Dce]. Cse sits
-// AFTER CopyProp so trivial Phi-collapse has already simplified the
-// SSA graph, then Cse merges remaining duplicates, then Dce sweeps
-// the dead originals (CopyProp's dead Phis + Cse's dead duplicates).
+// [Identity, ConstFold, Mem2Reg, CopyProp, Cse, SimplifyCfg, Dce]
+// with maxIterations=4. SimplifyCfg sits AFTER CSE so trivial
+// merges have already canonicalized; the mutually-enabling cluster
+// (ConstFold ↔ SimplifyCfg ↔ Dce) needs the outer loop.
 TEST(PipelineLoader, ShippedReleaseLoadsAllPasses) {
     auto r = opt::loadShippedPipeline("release");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->name, "release");
-    ASSERT_EQ(r->passes.size(), 6u);
+    ASSERT_EQ(r->passes.size(), 7u);
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
     EXPECT_EQ(r->passes[1], opt::PassId::ConstFold);
     EXPECT_EQ(r->passes[2], opt::PassId::Mem2Reg);
     EXPECT_EQ(r->passes[3], opt::PassId::CopyProp);
     EXPECT_EQ(r->passes[4], opt::PassId::Cse);
-    EXPECT_EQ(r->passes[5], opt::PassId::Dce);
+    EXPECT_EQ(r->passes[5], opt::PassId::SimplifyCfg);
+    EXPECT_EQ(r->passes[6], opt::PassId::Dce);
+    EXPECT_EQ(r->maxIterations, 4u);
+}
+
+// maxIterations bounds (D-OPT-FIXED-POINT-LOOP): rejected when 0
+// (silent-no-op trap) or > kMaxPipelineIterations (non-convergence
+// signal). Missing field defaults to 1.
+TEST(PipelineLoader, MaxIterationsZeroRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"], "maxIterations": 0}})",
+        "max-iter-zero.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, MaxIterationsOverflowRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"], "maxIterations": 999}})",
+        "max-iter-overflow.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, MaxIterationsNonIntegerRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"], "maxIterations": "many"}})",
+        "max-iter-string.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, MaxIterationsMissingDefaultsToOne) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"]}})",
+        "no-max-iter.json");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->maxIterations, 1u);
 }
 
 // Missing version → X_PipelineVersionMismatch. The version gate is the

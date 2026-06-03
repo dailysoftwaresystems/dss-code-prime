@@ -116,14 +116,38 @@ public:
 
     // Post-rewrite operand substitution hook (applied AFTER
     // `rewriteOperand` resolves old→new). Default = identity.
-    // Reserved for a future general copy-prop variant where the
-    // dominating definition is determined per-use (requires a
-    // block cursor — D-OPT-COPYPROP-BLOCK-CURSOR — not yet needed
-    // by the Phi-collapse pass since Phi semantics already encode
-    // dominance).
+    // Reserved for per-use dominating-definition substitution
+    // (D-OPT-COPYPROP-BLOCK-CURSOR — general operand-substitution
+    // variant beyond Phi-collapse).
     [[nodiscard]] virtual MirInstId
     substituteOperand(MirInstId operand) {
         return operand;
+    }
+
+    // Successor-block redirect hook applied during terminator
+    // emission. Default = identity. SimplifyCFG overrides this for
+    // empty-block jump-threading: a block B whose only inst is a
+    // `Br(S)` (no phi at S uses B as a pred) becomes a "trampoline" —
+    // any predecessor branching to B is redirected to S directly,
+    // B is elided from `selectBlocks`, and `blockMap_.at(redirected)`
+    // succeeds because S is in the surviving-blocks set.
+    [[nodiscard]] virtual MirBlockId
+    redirectBlockTarget(MirBlockId oldTarget) {
+        return oldTarget;
+    }
+
+    // Per-terminator-opcode full-replacement hook. Default = nullopt
+    // → standard `emitTerminator` arm. SimplifyCFG overrides for
+    // branch-folding: `CondBr(Const(true|false), T, F)` → `Br(T|F)`.
+    // The hook receives the SAME ids the standard path would consume;
+    // returning a new MirInstId records it in the rewrite map (per
+    // `recordTerminatorInRewrite`) and skips the standard emit arm.
+    [[nodiscard]] virtual std::optional<MirInstId>
+    tryRewriteTerminator(MirOpcode /*op*/, MirInstId /*oldId*/,
+                         MirBuilder& /*dst*/,
+                         std::unordered_map<std::uint32_t, MirInstId> const& /*rewrite*/,
+                         std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {
+        return std::nullopt;
     }
 
     // Phase 3: per-phi-incoming filter. Default = accept everything.
