@@ -6,6 +6,7 @@
 #include "opt/passes/copy_prop.hpp"
 #include "opt/passes/cse.hpp"
 #include "opt/passes/dce.hpp"
+#include "opt/passes/licm.hpp"
 #include "opt/passes/mem2reg.hpp"
 #include "opt/passes/simplify_cfg.hpp"
 
@@ -60,6 +61,10 @@ struct PassRunResult {
         case PassId::SimplifyCfg: {
             auto const r = passes::runSimplifyCfg(mir, interner, reporter);
             return {r.ok, r.branchesFolded + r.blocksJumpThreaded > 0};
+        }
+        case PassId::Licm: {
+            auto const r = passes::runLicm(mir, interner, reporter);
+            return {r.ok, r.instructionsHoisted > 0};
         }
     }
     // Enum-drift fallback. A future PassId enumerator added without

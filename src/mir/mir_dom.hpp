@@ -240,6 +240,94 @@ mirDomTreeChildren(Mir const& mir, MirDomTree const& dom) {
     return children;
 }
 
+// Natural-loop forest: every back-edge (u → v) where v dominates u
+// induces a natural loop with header `v`. The loop's body is `v`
+// itself plus every block from which `u` is reachable in the
+// predecessor graph (the standard Aho-Sethi-Ullman / Cooper-Harvey-
+// Kennedy natural-loop computation). Multiple back-edges to the
+// same header merge into one loop with multiple `backEdgeSources`.
+//
+// LICM consumes this to: (a) identify hoist candidates whose
+// operands are all defined OUTSIDE the loop body, (b) locate the
+// preheader (the unique non-back-edge predecessor of the header,
+// when one exists).
+struct MirNaturalLoop {
+    MirBlockId              header;
+    std::vector<MirBlockId> body;             // blocks IN the loop (header + all reachable-to-back-edge)
+    std::vector<MirBlockId> backEdgeSources;  // blocks with edges back to header
+};
+
+[[nodiscard]] inline std::vector<MirNaturalLoop>
+mirNaturalLoops(Mir const& mir,
+                MirDomTree const& dom,
+                std::vector<std::vector<MirBlockId>> const& preds) {
+    // Group back-edges by header.
+    std::unordered_map<std::uint32_t, std::vector<MirBlockId>> byHeader;
+    for (std::uint32_t i = 1; i < mir.blockCount(); ++i) {
+        if (i < dom.gaveUp.size() && dom.gaveUp[i]) continue;
+        MirBlockId const u{i, mir.id().v};
+        for (MirBlockId const s : mir.blockSuccessors(u)) {
+            if (!s.valid() || s.v >= mir.blockCount()) continue;
+            // Back-edge: successor dominates the source.
+            if (mirDominatesBlock(s, u, dom) == MirDomResult::Dominates) {
+                byHeader[s.v].push_back(u);
+            }
+        }
+    }
+    std::vector<MirNaturalLoop> loops;
+    loops.reserve(byHeader.size());
+    for (auto const& [headerSlot, backSources] : byHeader) {
+        MirNaturalLoop loop;
+        loop.header = MirBlockId{headerSlot, mir.id().v};
+        loop.backEdgeSources = backSources;
+        // Body = header + worklist over predecessors from each back-edge source.
+        std::unordered_set<std::uint32_t> inBody;
+        inBody.insert(headerSlot);
+        std::vector<MirBlockId> worklist = backSources;
+        for (MirBlockId const b : backSources) inBody.insert(b.v);
+        while (!worklist.empty()) {
+            MirBlockId const n = worklist.back();
+            worklist.pop_back();
+            if (n.v == headerSlot) continue;
+            if (n.v >= preds.size()) continue;
+            for (MirBlockId const p : preds[n.v]) {
+                if (inBody.insert(p.v).second) {
+                    worklist.push_back(p);
+                }
+            }
+        }
+        // INVARIANT: header is in the body set (seeded at line 1 of
+        // the body-construction worklist). Verifying here catches a
+        // future regression that forgets the seed (silent: LICM
+        // would then hoist out of the header itself).
+        if (inBody.count(headerSlot) == 0) {
+            std::fprintf(stderr,
+                "dss::mirNaturalLoops fatal: header block v=%u "
+                "missing from body set — natural-loop construction "
+                "invariant violation.\n", headerSlot);
+            std::abort();
+        }
+        loop.body.reserve(inBody.size());
+        for (std::uint32_t const slot : inBody) {
+            loop.body.push_back(MirBlockId{slot, mir.id().v});
+        }
+        // Determinism: `unordered_set` iteration order is
+        // implementation-defined. Sort by slot id so downstream
+        // consumers (LICM hoist plan, future loop-rotation passes)
+        // see a stable order regardless of stdlib version.
+        std::sort(loop.body.begin(), loop.body.end(),
+                  [](MirBlockId a, MirBlockId b) { return a.v < b.v; });
+        loops.push_back(std::move(loop));
+    }
+    // Determinism: the byHeader map is unordered too. Sort the loop
+    // list by header slot so iteration order is stable.
+    std::sort(loops.begin(), loops.end(),
+              [](MirNaturalLoop const& a, MirNaturalLoop const& b) {
+                  return a.header.v < b.header.v;
+              });
+    return loops;
+}
+
 // Iterated dominance frontier (IDF) of a set of "def blocks". For
 // Cytron-Ferrante SSA construction (Mem2Reg): a Phi for variable V
 // must be inserted at every block in IDF(def-blocks-of(V)). The

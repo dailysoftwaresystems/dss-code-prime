@@ -37,22 +37,24 @@ TEST(PipelineLoader, ShippedDebugLoadsIdentity) {
 }
 
 // Shipped `release.pipeline.json` declares
-// [Identity, ConstFold, Mem2Reg, CopyProp, Cse, SimplifyCfg, Dce]
-// with maxIterations=4. SimplifyCfg sits AFTER CSE so trivial
-// merges have already canonicalized; the mutually-enabling cluster
-// (ConstFold ↔ SimplifyCfg ↔ Dce) needs the outer loop.
+// [Identity, ConstFold, Mem2Reg, CopyProp, Cse, Licm, SimplifyCfg, Dce]
+// with maxIterations=4. LICM sits AFTER CSE (canonicalized SSA
+// graph) and BEFORE SimplifyCFG (hoisting unconditional defs into
+// the preheader may expose new constant-condition CondBrs the
+// SimplifyCFG pass can fold).
 TEST(PipelineLoader, ShippedReleaseLoadsAllPasses) {
     auto r = opt::loadShippedPipeline("release");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->name, "release");
-    ASSERT_EQ(r->passes.size(), 7u);
+    ASSERT_EQ(r->passes.size(), 8u);
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
     EXPECT_EQ(r->passes[1], opt::PassId::ConstFold);
     EXPECT_EQ(r->passes[2], opt::PassId::Mem2Reg);
     EXPECT_EQ(r->passes[3], opt::PassId::CopyProp);
     EXPECT_EQ(r->passes[4], opt::PassId::Cse);
-    EXPECT_EQ(r->passes[5], opt::PassId::SimplifyCfg);
-    EXPECT_EQ(r->passes[6], opt::PassId::Dce);
+    EXPECT_EQ(r->passes[5], opt::PassId::Licm);
+    EXPECT_EQ(r->passes[6], opt::PassId::SimplifyCfg);
+    EXPECT_EQ(r->passes[7], opt::PassId::Dce);
     EXPECT_EQ(r->maxIterations, 4u);
 }
 

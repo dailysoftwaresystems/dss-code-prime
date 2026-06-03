@@ -124,6 +124,20 @@ public:
         return operand;
     }
 
+    // Per-block "just before the terminator" hook called once per
+    // block in phase 2, immediately before the terminator's emit.
+    // Default = no-op. LICM overrides to inject hoisted-into-this-
+    // block instructions at the end of the block (where the
+    // terminator would have appeared in the source). The `rewrite`
+    // map is mutable so the hook can record (oldHoistedInstId →
+    // newHoistedInstId) entries the subsequent terminator emit (and
+    // any downstream consumer in later blocks) will resolve through.
+    virtual void onBlockBeforeTerminator(
+        MirBlockId /*oldB*/, MirBlockId /*newB*/,
+        MirBuilder& /*dst*/,
+        std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
+        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {}
+
     // Successor-block redirect hook applied during terminator
     // emission. Default = identity. SimplifyCFG overrides this for
     // empty-block jump-threading: a block B whose only inst is a

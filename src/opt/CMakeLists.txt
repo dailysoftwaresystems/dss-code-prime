@@ -5,6 +5,7 @@ add_library(opt OBJECT
     passes/copy_prop.cpp
     passes/cse.cpp
     passes/dce.cpp
+    passes/licm.cpp
     passes/mem2reg.cpp
     passes/mir_rebuild_helper.cpp
     passes/simplify_cfg.cpp

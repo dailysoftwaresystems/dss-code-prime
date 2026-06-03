@@ -109,6 +109,12 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
             MirOpcode const op    = src_.instOpcode(oldId);
 
             if (opcodeInfo(op).isTerminator) {
+                // Hoist-into-preheader hook for LICM
+                // (D-OPT-MIR-REBUILDER-ONBLOCKBEFORETERMINATOR-HOOK).
+                // Fires once per block, immediately before the
+                // terminator clone. Default no-op for every other pass.
+                policy_.onBlockBeforeTerminator(oldB, newB, dst_,
+                                                rewrite_, blockMap_);
                 emitTerminator(op, oldId);
                 continue;
             }

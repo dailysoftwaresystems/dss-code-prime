@@ -291,6 +291,142 @@ TEST(SimplifyCfg, MultiFunctionEachFoldedIndependently) {
         << "each function's CondBr-on-const must fold — counter accumulates";
 }
 
+// D-OPT4-1 marker preservation (RULE: c2's transforms — branch-fold +
+// empty-block elision — NEVER mutate a surviving block's structural
+// role). Build a multi-marker CFG with NO trampolines (so no blocks
+// elided) + NO constant-condition CondBrs (so no folding). Snapshot
+// markers pre-pass, run the pass, snapshot post-pass, byte-compare.
+// A regression where the rebuilder accidentally defaulted markers to
+// `Linear` (e.g. via a refactor of `createBlock`) would flip them
+// silently — WASM/SPIR-V lowering depends on the markers to detect
+// structured-CF regions without a Relooper recovery pass.
+TEST(SimplifyCfg, StructCfMarkersUnchangedWhenNoTransformsFire) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // Build a CFG with diverse markers + no eligible transforms.
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm   = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fArm   = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const join   = mb.createBlock(StructCfMarker::IfJoin);
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);  // non-const → not foldable
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    MirInstId const c2 = mb.addConst(v2, i32);
+    mb.addCondBr(cond, tArm, fArm);
+    mb.beginBlock(tArm);
+    // tArm has a real inst → not a trampoline.
+    MirInstId const aops[] = {c1, c1};
+    (void)mb.addInst(MirOpcode::Add, aops, i32);
+    mb.addBr(join);
+    mb.beginBlock(fArm);
+    // fArm has a real inst → not a trampoline.
+    MirInstId const sops[] = {c2, c2};
+    (void)mb.addInst(MirOpcode::Sub, sops, i32);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    MirPhiIncoming const incs[] = {{c1, tArm}, {c2, fArm}};
+    MirInstId const phi = mb.addPhi(i32, incs);
+    mb.addReturn(phi);
+    Mir mir = std::move(mb).finish();
+
+    // Snapshot markers before the pass. SimplifyCFG's `selectBlocks`
+    // returns RPO order — which reorders a diamond's tArm/fArm
+    // relative to source-creation order — so we compare the MULTISET
+    // of markers, not positional. The invariant is "every surviving
+    // block KEEPS its marker"; block-position-in-arena is an arena
+    // detail of the rebuild, not part of the marker contract.
+    auto collectMarkersSorted = [&](Mir const& m) {
+        std::vector<int> out;
+        std::size_t const nf = m.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            MirFuncId const f = m.funcAt(i);
+            std::uint32_t const nb = m.funcBlockCount(f);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                out.push_back(
+                    static_cast<int>(m.blockMarker(m.funcBlockAt(f, bi))));
+            }
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    auto const before = collectMarkersSorted(mir);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    // Pre-condition for the marker pin: no transform should fire.
+    ASSERT_EQ(r.branchesFolded, 0u);
+    ASSERT_EQ(r.blocksJumpThreaded, 0u);
+
+    auto const after = collectMarkersSorted(mir);
+    ASSERT_EQ(before, after)
+        << "SimplifyCFG with no transforms must preserve the marker "
+           "MULTISET — every surviving block KEEPS its structural role "
+           "(D-OPT4-1). Position-in-arena may differ due to RPO; the "
+           "load-bearing invariant is per-block marker preservation, "
+           "which a sorted-multiset compare pins.";
+}
+
+// Marker SURVIVAL under elision: when SimplifyCFG elides one or more
+// trampoline blocks, the surviving blocks must retain their original
+// markers. Build a CFG where exactly one trampoline gets elided;
+// assert the post-pass marker SEQUENCE for surviving blocks matches
+// the pre-pass marker sequence MINUS the elided block's slot.
+TEST(SimplifyCfg, StructCfMarkersPreservedAfterTrampolineElision) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    // entry (EntryBlock) → tramp (Linear, will elide) → dst (LoopExit).
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tramp = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const dst   = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry); mb.addBr(tramp);
+    mb.beginBlock(tramp); mb.addBr(dst);
+    mb.beginBlock(dst);
+    MirLiteralValue v; v.value = std::int64_t{42}; v.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    ASSERT_EQ(r.blocksJumpThreaded, 1u);
+
+    // Post-pass: tramp is gone. The surviving sequence in RPO order
+    // is [EntryBlock, LoopExit] — entry's marker preserved, dst's
+    // marker preserved, the Linear trampoline elided. A regression
+    // that re-marked dst as `Linear` (e.g. by collapsing markers
+    // during block-elision) would change the visible sequence.
+    std::vector<StructCfMarker> after;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            after.push_back(mir.blockMarker(mir.funcBlockAt(f, bi)));
+        }
+    }
+    ASSERT_EQ(after.size(), 2u);
+    EXPECT_EQ(static_cast<int>(after[0]),
+              static_cast<int>(StructCfMarker::EntryBlock))
+        << "entry's marker must survive trampoline elision";
+    EXPECT_EQ(static_cast<int>(after[1]),
+              static_cast<int>(StructCfMarker::LoopExit))
+        << "destination's marker must survive trampoline elision "
+           "unchanged (NOT re-marked to Linear)";
+}
+
 // Runtime-init carve-out parity.
 TEST(SimplifyCfg, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
     TypeInterner interner{CompilationUnitId{1}};
