@@ -3,6 +3,7 @@ add_library(opt OBJECT
     optimizer_json.cpp
     passes/const_fold.cpp
     passes/dce.cpp
+    passes/mir_rebuild_helper.cpp
 )
 
 target_include_directories(opt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

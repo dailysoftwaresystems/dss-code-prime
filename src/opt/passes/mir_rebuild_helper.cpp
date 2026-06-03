@@ -1,0 +1,212 @@
+#include "opt/passes/mir_rebuild_helper.hpp"
+
+#include "mir/mir_opcode.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <utility>
+
+namespace dss::opt::passes {
+
+void MirRebuildPolicy::onZeroPhiIncomings(MirInstId oldPhi, MirBlockId oldBlock,
+                                         MirFuncId oldFn, MirInstId newPhi) {
+    std::fprintf(stderr,
+        "dss::opt::passes::MirFunctionRebuilder fatal: phi at OLD funcId "
+        "v=%u, OLD block v=%u, OLD phi v=%u (new id v=%u) ended phase 3 "
+        "with zero accepted incomings — every predecessor was rejected by "
+        "policy.acceptPhiIncoming(). Typical cause: a reachable block with "
+        "all-unreachable predecessors (a structural violation the verifier "
+        "should have rejected at the source MIR).\n",
+        oldFn.v, oldBlock.v, oldPhi.v, newPhi.v);
+    std::abort();
+}
+
+MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
+    auto const it = rewrite_.find(oldOp.v);
+    if (it == rewrite_.end()) {
+        std::fprintf(stderr,
+            "dss::opt::passes::MirFunctionRebuilder fatal: rewriteOperand: "
+            "old MirInstId v=%u has no rewrite entry — scan-order violation "
+            "OR operand referenced a skipped instruction "
+            "(D-OPT2-REWRITE-MAP-COMPLETENESS).\n", oldOp.v);
+        std::abort();
+    }
+    return it->second;
+}
+
+void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
+    dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
+                     src_.funcBinding(oldFn), src_.funcVisibility(oldFn));
+
+    // Phase 1: select + pre-create blocks. The policy decides which
+    // blocks to walk (all blocks vs RPO-reachable subset etc.).
+    auto const blocks = policy_.selectBlocks(src_, oldFn);
+    blockMap_.clear();
+    blockMap_.reserve(blocks.size());
+    for (MirBlockId const oldB : blocks) {
+        MirBlockId const newB = dst_.createBlock(src_.blockMarker(oldB));
+        blockMap_.emplace(oldB.v, newB);
+    }
+
+    // Phase 2: fill blocks; defer Phi incomings to Phase 3. Capture
+    // each phi's OLD block so the zero-incomings fail-loud can name
+    // it in the diagnostic (a NEW arena id is not debuggable against
+    // the source MIR).
+    struct DeferredPhi {
+        MirInstId oldPhi;
+        MirInstId newPhi;
+        MirBlockId oldBlock;
+    };
+    std::vector<DeferredPhi> deferredPhis;
+    rewrite_.clear();
+    rewrite_.reserve(src_.instCount());
+
+    for (MirBlockId const oldB : blocks) {
+        MirBlockId const newB = blockMap_.at(oldB.v);
+        dst_.beginBlock(newB);
+
+        std::uint32_t const ninst = src_.blockInstCount(oldB);
+        for (std::uint32_t i = 0; i < ninst; ++i) {
+            MirInstId const oldId = src_.blockInstAt(oldB, i);
+            MirOpcode const op    = src_.instOpcode(oldId);
+
+            if (opcodeInfo(op).isTerminator) {
+                emitTerminator(op, oldId);
+                continue;
+            }
+            if (!policy_.shouldEmit(oldId)) continue;
+            if (op == MirOpcode::Phi) {
+                MirInstId const newPhi = dst_.addPhi(src_.instType(oldId));
+                rewrite_.emplace(oldId.v, newPhi);
+                deferredPhis.push_back({oldId, newPhi, oldB});
+                continue;
+            }
+            emitValue(op, oldId);
+        }
+    }
+
+    // Phase 3: flush phi incomings via the now-complete rewrite map.
+    for (auto const& dp : deferredPhis) {
+        std::size_t kept = 0;
+        for (auto const& inc : src_.phiIncomings(dp.oldPhi)) {
+            if (!policy_.acceptPhiIncoming(inc, blockMap_)) continue;
+            auto const predIt = blockMap_.find(inc.pred.v);
+            if (predIt == blockMap_.end()) continue;  // safety belt
+            MirInstId const newVal = policy_.substituteOperand(
+                rewriteOperand(inc.value));
+            dst_.addPhiIncoming(dp.newPhi,
+                                MirPhiIncoming{newVal, predIt->second});
+            ++kept;
+        }
+        if (kept == 0) {
+            policy_.onZeroPhiIncomings(dp.oldPhi, dp.oldBlock, oldFn, dp.newPhi);
+        }
+    }
+}
+
+void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
+    // Value origins: leaves are always copied verbatim.
+    if (op == MirOpcode::Const) {
+        MirInstId const newId = dst_.addConst(
+            src_.literalValue(src_.constLiteralIndex(oldId)),
+            src_.instType(oldId));
+        rewrite_.emplace(oldId.v, newId);
+        return;
+    }
+    if (op == MirOpcode::Arg) {
+        MirInstId const newId = dst_.addArg(src_.argIndex(oldId),
+                                            src_.instType(oldId));
+        rewrite_.emplace(oldId.v, newId);
+        return;
+    }
+    if (op == MirOpcode::GlobalAddr) {
+        MirInstId const newId = dst_.addGlobalAddr(
+            src_.globalAddrSymbol(oldId), src_.instType(oldId));
+        rewrite_.emplace(oldId.v, newId);
+        return;
+    }
+
+    // Try the per-pass rewrite hook (ConstFold's fold, future copy-
+    // prop's full-inst-replacement). Returns nullopt → verbatim copy.
+    if (auto rewritten = policy_.tryRewrite(op, oldId, dst_, rewrite_);
+        rewritten.has_value()) {
+        rewrite_.emplace(oldId.v, *rewritten);
+        return;
+    }
+
+    // Verbatim copy with operand-level substitution applied.
+    auto const oldOps = src_.instOperands(oldId);
+    std::vector<MirInstId> newOps;
+    newOps.reserve(oldOps.size());
+    for (auto o : oldOps) {
+        newOps.push_back(policy_.substituteOperand(rewriteOperand(o)));
+    }
+    MirInstId const newId = dst_.addInst(op, newOps, src_.instType(oldId),
+                                         src_.instPayload(oldId),
+                                         src_.instFlags(oldId));
+    rewrite_.emplace(oldId.v, newId);
+}
+
+void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
+    auto const oldOps  = src_.instOperands(oldId);
+    auto const oldBlk  = src_.instBlock(oldId);
+    auto const oldSucc = src_.blockSuccessors(oldBlk);
+    bool const record  = policy_.recordTerminatorInRewrite();
+    auto remember = [&](MirInstId newId) {
+        if (record) rewrite_.emplace(oldId.v, newId);
+    };
+    switch (op) {
+        case MirOpcode::Br: {
+            MirInstId const newId = dst_.addBr(blockMap_.at(oldSucc[0].v));
+            remember(newId);
+            return;
+        }
+        case MirOpcode::CondBr: {
+            MirInstId const cond = policy_.substituteOperand(
+                rewriteOperand(oldOps[0]));
+            MirInstId const newId = dst_.addCondBr(
+                cond, blockMap_.at(oldSucc[0].v), blockMap_.at(oldSucc[1].v));
+            remember(newId);
+            return;
+        }
+        case MirOpcode::Switch: {
+            MirInstId const disc = policy_.substituteOperand(
+                rewriteOperand(oldOps[0]));
+            std::vector<std::pair<MirInstId, MirBlockId>> cases;
+            std::size_t const ncases = oldSucc.size() - 1;
+            cases.reserve(ncases);
+            for (std::size_t i = 0; i < ncases; ++i) {
+                cases.emplace_back(
+                    policy_.substituteOperand(rewriteOperand(oldOps[1 + i])),
+                    blockMap_.at(oldSucc[i].v));
+            }
+            MirInstId const newId = dst_.addSwitch(
+                disc, cases, blockMap_.at(oldSucc[ncases].v));
+            remember(newId);
+            return;
+        }
+        case MirOpcode::Return: {
+            std::optional<MirInstId> retVal;
+            if (!oldOps.empty()) {
+                retVal = policy_.substituteOperand(rewriteOperand(oldOps[0]));
+            }
+            MirInstId const newId = dst_.addReturn(retVal);
+            remember(newId);
+            return;
+        }
+        case MirOpcode::Unreachable: {
+            MirInstId const newId = dst_.addUnreachable();
+            remember(newId);
+            return;
+        }
+        default:
+            std::fprintf(stderr,
+                "dss::opt::passes::MirFunctionRebuilder fatal: emitTerminator: "
+                "MirOpcode %d marked isTerminator but no clone arm — add an "
+                "arm here when introducing a new terminator opcode.\n",
+                static_cast<int>(op));
+            std::abort();
+    }
+}
+
+} // namespace dss::opt::passes

@@ -5,6 +5,7 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -207,210 +208,47 @@ struct SymbolScanResult {
     return out;
 }
 
-// Per-function rebuilder. Uses the precomputed liveInsts + reachable
-// block set + the rewrite map keyed on OLD-module inst-slot (.v) —
-// same shape as ConstFold.
-class FunctionRebuilder {
+// DCE rebuild policy: filters dead non-Phi value insts via the
+// shared MirFunctionRebuilder's `shouldEmit` hook + filters
+// unreachable-pred phi incomings via `acceptPhiIncoming`. Terminator
+// results are not recorded in the rewrite map (the original DCE
+// convention — terminator results are never read as operands so the
+// hashmap inserts are pure overhead).
+class DcePolicy : public MirRebuildPolicy {
 public:
-    FunctionRebuilder(Mir const& src, MirBuilder& dst,
-                      std::vector<MirBlockId> const& reachable,
-                      std::unordered_set<std::uint32_t> const& liveInsts)
-        : src_(src), dst_(dst), reachable_(reachable), liveInsts_(liveInsts) {}
+    DcePolicy(std::vector<MirBlockId> const& reachable,
+              std::unordered_set<std::uint32_t> const& liveInsts)
+        : reachable_(reachable), liveInsts_(liveInsts) {}
 
     [[nodiscard]] std::size_t instructionsEliminated() const noexcept {
-        return instructionsEliminated_;
+        return eliminated_;
     }
 
-    void rebuildFunction(MirFuncId oldFn) {
-        dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
-                         src_.funcBinding(oldFn), src_.funcVisibility(oldFn));
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& /*src*/, MirFuncId /*fn*/) override {
+        return reachable_;
+    }
 
-        // Phase 1: pre-create every CFG-reachable block. Forward
-        // branches (terminators targeting later blocks) need the
-        // target ids before phase 2's terminator emits.
-        std::unordered_map<std::uint32_t, MirBlockId> blockMap;
-        blockMap.reserve(reachable_.size());
-        for (MirBlockId const oldB : reachable_) {
-            MirBlockId const newB = dst_.createBlock(src_.blockMarker(oldB));
-            blockMap.emplace(oldB.v, newB);
-        }
+    [[nodiscard]] bool shouldEmit(MirInstId oldId) override {
+        if (liveInsts_.count(oldId.v) != 0) return true;
+        ++eliminated_;
+        return false;
+    }
 
-        // Phase 2: fill each block. Phi incomings deferred to phase 3.
-        struct DeferredPhi {
-            MirInstId oldPhi;
-            MirInstId newPhi;
-        };
-        std::vector<DeferredPhi> deferredPhis;
+    [[nodiscard]] bool acceptPhiIncoming(
+        MirPhiIncoming const& inc,
+        std::unordered_map<std::uint32_t, MirBlockId> const& blockMap) override {
+        return blockMap.count(inc.pred.v) != 0;
+    }
 
-        for (MirBlockId const oldB : reachable_) {
-            MirBlockId const newB = blockMap.at(oldB.v);
-            dst_.beginBlock(newB);
-
-            std::uint32_t const ninst = src_.blockInstCount(oldB);
-            for (std::uint32_t i = 0; i < ninst; ++i) {
-                MirInstId const oldId = src_.blockInstAt(oldB, i);
-                MirOpcode const op    = src_.instOpcode(oldId);
-
-                // Terminator: always preserved (a block with no
-                // terminator is malformed). Operands are remapped;
-                // unreachable successor edges (which mirReversePostOrder
-                // excluded by definition) cannot appear on a reachable
-                // block's terminator AT THE OLD MODULE — the OLD CFG
-                // is whatever lowerToMir built, fully reachable by
-                // construction.
-                if (opcodeInfo(op).isTerminator) {
-                    emitTerminator(op, oldId, blockMap);
-                    continue;
-                }
-
-                // Skip non-side-effect instruction whose result is
-                // unused — operand-graph reachability missed it.
-                if (!liveInsts_.count(oldId.v)) {
-                    ++instructionsEliminated_;
-                    continue;
-                }
-
-                if (op == MirOpcode::Phi) {
-                    MirInstId const newPhi = dst_.addPhi(src_.instType(oldId));
-                    rewrite_.emplace(oldId.v, newPhi);
-                    deferredPhis.push_back({oldId, newPhi});
-                    continue;
-                }
-                emitValue(op, oldId);
-            }
-        }
-
-        // Phase 3: flush phi incomings. The rewrite map is now
-        // complete (every reachable + live inst has an entry); back-
-        // edge values resolve here. A phi at a reachable block CAN
-        // legitimately have an incoming from an UNREACHABLE predecessor
-        // (the verifier admits this — `mir_verifier.cpp` tolerates
-        // rpoIndex==sentinel). Such incomings have no remapped block
-        // (they were excluded from blockMap by RPO) — skip them. A
-        // phi left with ZERO incomings is a structural violation;
-        // fail loud.
-        for (auto const& dp : deferredPhis) {
-            std::size_t kept = 0;
-            for (auto const& inc : src_.phiIncomings(dp.oldPhi)) {
-                auto const predIt = blockMap.find(inc.pred.v);
-                if (predIt == blockMap.end()) continue;  // unreachable pred
-                MirInstId const newVal = rewriteOperand(inc.value);
-                dst_.addPhiIncoming(dp.newPhi,
-                                    MirPhiIncoming{newVal, predIt->second});
-                ++kept;
-            }
-            if (kept == 0) {
-                std::fprintf(stderr,
-                    "dss::opt::passes::dce::FunctionRebuilder fatal: phi at "
-                    "reachable block ended with zero incomings post-rebuild "
-                    "(every predecessor was unreachable AND eliminated) — "
-                    "this is a structural violation the verifier would "
-                    "have rejected at the source MIR.\n");
-                std::abort();
-            }
-        }
+    [[nodiscard]] bool recordTerminatorInRewrite() const noexcept override {
+        return false;
     }
 
 private:
-    [[nodiscard]] MirInstId rewriteOperand(MirInstId oldOp) const {
-        auto const it = rewrite_.find(oldOp.v);
-        if (it == rewrite_.end()) {
-            std::fprintf(stderr,
-                "dss::opt::passes::dce::FunctionRebuilder fatal: "
-                "rewriteOperand: old MirInstId v=%u has no rewrite entry — "
-                "scan-order violation OR operand referenced a "
-                "DCE-eliminated instruction (D-OPT2-REWRITE-MAP-COMPLETENESS).\n",
-                oldOp.v);
-            std::abort();
-        }
-        return it->second;
-    }
-
-    void emitValue(MirOpcode op, MirInstId oldId) {
-        if (op == MirOpcode::Const) {
-            MirInstId const newId = dst_.addConst(
-                src_.literalValue(src_.constLiteralIndex(oldId)),
-                src_.instType(oldId));
-            rewrite_.emplace(oldId.v, newId);
-            return;
-        }
-        if (op == MirOpcode::Arg) {
-            MirInstId const newId = dst_.addArg(src_.argIndex(oldId),
-                                                src_.instType(oldId));
-            rewrite_.emplace(oldId.v, newId);
-            return;
-        }
-        if (op == MirOpcode::GlobalAddr) {
-            MirInstId const newId = dst_.addGlobalAddr(
-                src_.globalAddrSymbol(oldId), src_.instType(oldId));
-            rewrite_.emplace(oldId.v, newId);
-            return;
-        }
-        // Generic computation: remap operands, copy verbatim.
-        auto const oldOps = src_.instOperands(oldId);
-        std::vector<MirInstId> newOps;
-        newOps.reserve(oldOps.size());
-        for (auto o : oldOps) newOps.push_back(rewriteOperand(o));
-        MirInstId const newId = dst_.addInst(op, newOps, src_.instType(oldId),
-                                             src_.instPayload(oldId),
-                                             src_.instFlags(oldId));
-        rewrite_.emplace(oldId.v, newId);
-    }
-
-    void emitTerminator(MirOpcode op, MirInstId oldId,
-                        std::unordered_map<std::uint32_t, MirBlockId> const& blockMap) {
-        auto const oldOps  = src_.instOperands(oldId);
-        auto const oldBlk  = src_.instBlock(oldId);
-        auto const oldSucc = src_.blockSuccessors(oldBlk);
-        switch (op) {
-            case MirOpcode::Br: {
-                dst_.addBr(blockMap.at(oldSucc[0].v));
-                return;
-            }
-            case MirOpcode::CondBr: {
-                MirInstId const cond = rewriteOperand(oldOps[0]);
-                dst_.addCondBr(cond, blockMap.at(oldSucc[0].v),
-                                     blockMap.at(oldSucc[1].v));
-                return;
-            }
-            case MirOpcode::Switch: {
-                MirInstId const disc = rewriteOperand(oldOps[0]);
-                std::vector<std::pair<MirInstId, MirBlockId>> cases;
-                std::size_t const ncases = oldSucc.size() - 1;
-                cases.reserve(ncases);
-                for (std::size_t i = 0; i < ncases; ++i) {
-                    cases.emplace_back(rewriteOperand(oldOps[1 + i]),
-                                       blockMap.at(oldSucc[i].v));
-                }
-                dst_.addSwitch(disc, cases, blockMap.at(oldSucc[ncases].v));
-                return;
-            }
-            case MirOpcode::Return: {
-                std::optional<MirInstId> retVal;
-                if (!oldOps.empty()) retVal = rewriteOperand(oldOps[0]);
-                dst_.addReturn(retVal);
-                return;
-            }
-            case MirOpcode::Unreachable: {
-                dst_.addUnreachable();
-                return;
-            }
-            default:
-                std::fprintf(stderr,
-                    "dss::opt::passes::dce::FunctionRebuilder fatal: "
-                    "emitTerminator: MirOpcode %d marked isTerminator but "
-                    "no clone arm — add an arm here when introducing a new "
-                    "terminator opcode.\n", static_cast<int>(op));
-                std::abort();
-        }
-    }
-
-    Mir const& src_;
-    MirBuilder& dst_;
-    std::vector<MirBlockId> const& reachable_;
+    std::vector<MirBlockId> const&           reachable_;
     std::unordered_set<std::uint32_t> const& liveInsts_;
-    std::unordered_map<std::uint32_t, MirInstId> rewrite_;
-    std::size_t instructionsEliminated_ = 0;
+    std::size_t                              eliminated_ = 0;
 };
 
 } // namespace
@@ -507,9 +345,10 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
         if (lset.reachable.size() < oldBlockCount) {
             result.blocksEliminated += (oldBlockCount - lset.reachable.size());
         }
-        FunctionRebuilder rb{mir, builder, lset.reachable, lset.liveInsts};
+        DcePolicy policy{lset.reachable, lset.liveInsts};
+        MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(f);
-        result.instructionsEliminated += rb.instructionsEliminated();
+        result.instructionsEliminated += policy.instructionsEliminated();
     }
 
     mir = std::move(builder).finish();

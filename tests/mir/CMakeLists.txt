@@ -6,6 +6,7 @@ dss_add_test(NAME mir/test_mir_node         SOURCES test_mir_node.cpp)
 dss_add_test(NAME mir/test_mir_literal_pool SOURCES test_mir_literal_pool.cpp)
 dss_add_test(NAME mir/test_mir              SOURCES test_mir.cpp)
 dss_add_test(NAME mir/test_mir_verifier     SOURCES test_mir_verifier.cpp)
+dss_add_test(NAME mir/test_mir_dom          SOURCES test_mir_dom.cpp)
 dss_add_test(NAME mir/test_mir_text         SOURCES test_mir_text.cpp)
 
 # ML2 lowering tests.
