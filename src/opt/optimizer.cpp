@@ -155,6 +155,37 @@ OptResult optimize(Mir& mir,
             }
             if (passResult.mutated) {
                 ++result.passesMutated;
+                // Per-pass effectiveness signal (D-OPT-PASS-METRICS):
+                // record each iteration where this PassId mutated.
+                // Consumed by effectiveness tests asserting that a
+                // pass fired enough times to prove the
+                // mutually-enabling cluster converged (e.g.
+                // `passMutationCount[ConstFold] >= 2` proves the
+                // re-fold post-Mem2Reg happened).
+                //
+                // The `kPassIdCount` static_assert at the enum
+                // declaration site keeps this index in range; an
+                // out-of-range `p` getting past `runPass` would also
+                // have already routed through the `X_UnknownPassId`
+                // fail-loud arm + early-returned. Reaching here with
+                // an OOR ordinal is a substrate-contract violation —
+                // fail loud rather than silently drop the count.
+                auto const idx = static_cast<std::size_t>(p);
+                if (idx >= kPassIdCount) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::X_UnknownPassId;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "opt::optimize: PassId ordinal {} bypassed the "
+                        "runPass enum-drift guard AND reached the "
+                        "passMutationCount increment with mutated=true "
+                        "— substrate-shape violation "
+                        "(D-OPT1-PASS-ID-STABILITY).",
+                        static_cast<int>(p));
+                    reporter.report(std::move(d));
+                    return result;
+                }
+                ++result.passMutationCount[idx];
             }
 
             // D-OPT1-VERIFY-AFTER-EVERY-PASS — unconditional MIR

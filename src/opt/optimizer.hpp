@@ -24,6 +24,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -167,11 +168,22 @@ loadPipelineFromText(std::string_view jsonText,
 // produced zero `passesMutated` (mutually-enabling cluster converged).
 // Default = `false` so an early-return path (verifier failure,
 // substrate-contract violation) doesn't masquerade as "converged."
+//
+// `passMutationCount[PassId]` is per-pass cumulative mutation count
+// (D-OPT-PASS-METRICS). Each entry records how many iterations of
+// the pipeline-level loop where that PassId returned mutated=true.
+// This is the EFFECTIVENESS-signal substrate: a test asserting
+// `passMutationCount[ConstFold] >= 2` proves the mutually-enabling
+// cluster fired (ConstFold ran at least twice — once originally,
+// once post-Mem2Reg via the fixed-point loop). Sized by the closed
+// PassId enum's count so the `static_assert(kPassIdCount == ...)`
+// drift guard keeps this array honest against future PassId growth.
 struct OptResult {
     bool        ok                = false;
     std::size_t passesRun         = 0;
     std::size_t passesMutated     = 0;
     bool        fixedPointReached = false;
+    std::array<std::size_t, kPassIdCount> passMutationCount = {};
 };
 
 // Run the configured pipeline over every function in `mir`. Returns
