@@ -98,6 +98,7 @@ filterToLirKind(OperandKindFilter f) noexcept {
         case OperandKindFilter::SymbolRef: return LirOperandKind::SymbolRef;
         case OperandKindFilter::MemBase:   return LirOperandKind::MemBase;
         case OperandKindFilter::MemOffset: return LirOperandKind::MemOffset;
+        case OperandKindFilter::BlockRef:  return LirOperandKind::BlockRef;
     }
     return std::nullopt;
 }
@@ -159,5 +160,20 @@ appendPendingReloc(std::vector<Relocation>&   relocs,
         /*addend=*/0,
     });
 }
+
+// D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
+// pending intra-function block-relative branch patch. Distinct from
+// `PendingRelocSlot` because the target is an INTRA-FUNCTION basic
+// block resolved at ASSEMBLE time (not link time) — no `SymbolId`,
+// no `RelocationKind`, no entry in the function's relocation list.
+// The asm.cpp per-function loop builds the block-offset table while
+// emitting block-by-block, accumulates these patches as branches
+// emit, then resolves them after the function is fully assembled by
+// writing `target_offset - (patch_offset + 4)` as 4 LE bytes back
+// into the function's byte buffer.
+struct BlockRelPatch {
+    std::uint32_t patchOffset;  // byte offset of the 4-byte placeholder in out
+    std::uint32_t targetBlock;  // LirBlockId.v of the branch target block
+};
 
 } // namespace dss::walker_util

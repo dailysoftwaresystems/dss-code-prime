@@ -538,14 +538,23 @@ enum class OperandKindFilter : std::uint8_t {
                     // signed 32-bit displacement for [base+disp]
                     // addressing. Wired to `Disp32Mem` to emit 4 LE
                     // bytes after the ModR/M (and SIB when present).
+    BlockRef  = 5,  // `LirOperand{kind == BlockRef}` — D-CSUBSET-
+                    // WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): refers
+                    // to an INTRA-FUNCTION basic block. Wired to the
+                    // `BlockRel32` slot on x86 (4-byte trailing PC-
+                    // relative displacement, resolved at assemble time
+                    // via `walker_util::BlockRelPatch`). ARM64 will
+                    // use Imm19/Imm26 with different patch arithmetic
+                    // (anchored D-AS3-BLOCK-REL-IMM19/26).
 };
 
-inline constexpr EnumNameTable<OperandKindFilter, 5> kOperandKindFilterTable{{{
+inline constexpr EnumNameTable<OperandKindFilter, 6> kOperandKindFilterTable{{{
     { OperandKindFilter::Reg,       "reg"      },
     { OperandKindFilter::ImmInt,    "imm32"    },  // JSON-side width label
     { OperandKindFilter::SymbolRef, "symbol"   },
     { OperandKindFilter::MemBase,   "membase"  },
     { OperandKindFilter::MemOffset, "memoffset"},
+    { OperandKindFilter::BlockRef,  "blockref" },
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -650,12 +659,39 @@ enum class EncodingSlotKind : std::uint8_t {
     // the trailing byte position (same byte-emit pattern as
     // `Disp32`); the only difference is the forced ModR/M state.
     RipRelDisp32  = 12,
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
+    // OR the target's condition-code numeric encoding (looked up from
+    // the inst's payload, which carries a `TargetCondCode` value) into
+    // the LAST opcode byte's low 4 bits. Used by x86 setcc (`0F 90+cc`)
+    // and jcc (`0F 80+cc`). Wire has `index: 0` by convention (the
+    // payload is implicit; the wire just declares "the cond goes in
+    // the opcode byte"). The encoder fail-loud (A_NoCondCodeEncoding)
+    // if the target hasn't loaded `condCodeEncoding[]` — a missing
+    // table would silently OR zero (= TargetCondCode::Eq's nibble) and
+    // every conditional branch would resolve as `je`.
+    CondCodeNibble = 13,
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE: 32-bit PC-relative displacement
+    // to an INTRA-FUNCTION basic block (resolved at assemble time, no
+    // linker relocation emitted). The walker emits 4 LE bytes of zero
+    // + records a (patch-byte-offset, target-LirBlockId) entry in the
+    // per-function patch list. After all blocks/insts of the function
+    // are encoded, `asm.cpp` resolves each patch by computing
+    // `block_offsets[target] - (patch_offset + 4)` and writing back
+    // the 4 LE bytes. Wire reads the BlockRef from operands[index]
+    // (jmp's operand[0]) — for opcodes whose block target lives in
+    // the block's successor pool rather than operands, the lowering
+    // pass MUST duplicate the BlockRef as an operand (jcc lowering
+    // passes both successors as BlockRef operands AS WELL AS via the
+    // `recordSuccessors_` API). Symmetric with the `addBr` precedent
+    // which already encodes the target both as operand[0] and via
+    // successors[0].
+    BlockRel32     = 14,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
     //   ImmShift / Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 13> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 15> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -669,6 +705,8 @@ inline constexpr EnumNameTable<EncodingSlotKind, 13> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Disp32Mem,    "disp32.mem"    },
     { EncodingSlotKind::SibIndex,     "sib.index"     },
     { EncodingSlotKind::RipRelDisp32, "riprel.disp32" },
+    { EncodingSlotKind::CondCodeNibble, "condcode.nibble" },
+    { EncodingSlotKind::BlockRel32,    "block.rel32"    },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -687,7 +725,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 13,
+static_assert(kEncodingSlotKindCount == 15,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -711,6 +749,8 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Disp32Mem:
         case EncodingSlotKind::SibIndex:
         case EncodingSlotKind::RipRelDisp32:
+        case EncodingSlotKind::CondCodeNibble:
+        case EncodingSlotKind::BlockRel32:
             return TargetEncodingShape::X86Variable;
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
@@ -757,6 +797,16 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // `x86-variable` shape.
     std::optional<std::uint8_t> modrmRegExt;
 
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): when true,
+    // the encoder reads the inst's `payload` field as a
+    // `TargetCondCode`, looks up the schema's `condCodeEncoding[]`
+    // nibble for that condition, and OR's it into the LAST opcode
+    // byte of `opcodeBytes`. Used by x86 setcc (`0F 90+cc`) and jcc
+    // (`0F 80+cc`). Fail-loud when the target hasn't loaded
+    // `condCodeEncoding[]` (A_NoCondCodeEncoding) — silently OR'ing
+    // zero would map every condition to `eq`.
+    bool condCodeFromPayload = false;
+
     // Fixed-word template (plan 13 AS3 — `fixed32` shape). The 32-bit
     // base bit pattern of an AArch64 / RV32-style instruction; the
     // walker emits this word with each declared slot's `hwEncoding`
@@ -801,13 +851,19 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
         case EncodingSlotKind::SibIndex:
+        case EncodingSlotKind::CondCodeNibble:
+        case EncodingSlotKind::BlockRel32:
             // D-AS4-1 / D-AS4-5 memory-addressing slots write immediate
             // displacements / register encodings (not symbol-relative).
             // The companion symbol-bearing slot for RIP-relative `lea`
             // is `RipRelDisp32` above; it's distinct because it forces
             // the ModR/M state (mod=00 rm=101) in addition to the
             // disp32 patch site, where Disp32 alone (e.g. `call rel32`)
-            // has no associated ModR/M byte.
+            // has no associated ModR/M byte. CondCodeNibble (D-CSUBSET-
+            // WHILE-LOOP-SUBSTRATE) writes into the opcode byte from
+            // the inst payload — no symbol. BlockRel32 patches a 4-byte
+            // intra-function displacement at assemble time — also no
+            // symbol-tier relocation.
             return false;
     }
     return false;
@@ -829,6 +885,15 @@ struct DSS_EXPORT TargetEncodingWire {
     std::uint8_t     index           = 0;
     EncodingSlotKind slotKind        = EncodingSlotKind::ModRmReg;
     std::optional<RelocationKind> relocationKind;
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): bytes
+    // emitted IMMEDIATELY BEFORE this wire's slot bytes (between
+    // the previous wire's emission and this one). Used by jcc's
+    // compound encoding: the second BlockRel32 wire (fallthrough
+    // target) declares `prefixOpcodeBytes: [0xE9]` so the encoder
+    // emits `E9 rel32` (the unconditional jmp to fallthrough)
+    // after the cond branch's `0F 8x rel32`. Empty for every
+    // other wire (no extra bytes between slots).
+    std::vector<std::uint8_t> prefixOpcodeBytes;
 };
 
 // One encoding variant — guard + template + slot-wiring. The walker
@@ -1286,6 +1351,27 @@ struct DSS_EXPORT TargetSchemaData {
     std::vector<TargetCallingConvention> callingConventions;
     substrate::TransparentStringMap<std::uint16_t> callingConventionIndex;
 
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
+    // per-target mapping from abstract `TargetCondCode` (substrate-tier
+    // 10-arm enum: Eq/Ne/Slt/Sle/Sgt/Sge/Ult/Ule/Ugt/Uge) to a numeric
+    // encoding used by the ISA's conditional opcodes. x86_64 uses the
+    // low 4 bits of the setcc/jcc opcode byte: Eq=4, Ne=5, Slt=12,
+    // Sle=14, Sgt=15, Sge=13, Ult=2, Ule=6, Ugt=7, Uge=3. ARM64 uses
+    // the same low-4-bits position but a different numeric mapping in
+    // bits 0..3 of the 32-bit B.cc instruction word. Empty means the
+    // target has no cond-code-bearing opcodes (declarative-only
+    // targets). When populated, MUST contain exactly 10 entries
+    // indexed by `(uint8_t)TargetCondCode` — validate() enforces.
+    std::array<std::uint8_t, 10> condCodeEncoding{};
+    // Companion bit: `true` once `condCodeEncoding` has been populated
+    // from the JSON (any value, including all-zero, is legal — the
+    // distinction is "is this table loaded vs. default-initialized").
+    // Consumers gate the `EncodingSlotKind::CondCodeNibble` walker on
+    // this flag — emitting a cond-code wire against an un-populated
+    // table fails loud at the per-inst encoder rather than silently
+    // OR'ing zero into the opcode byte.
+    bool condCodeEncodingLoaded = false;
+
     // Relocation taxonomy (plan 13 AS1 §2.6 — the bucket-1 reloc
     // facet). Each row declares one relocation kind: a canonical text
     // name (for the linker's `*.format.json` cross-reference per plan
@@ -1437,6 +1523,22 @@ public:
         auto it = d_.callingConventionIndex.find(name);
         if (it == d_.callingConventionIndex.end()) return nullptr;
         return &d_.callingConventions[it->second];
+    }
+
+    // ── Cond-code encoding (D-CSUBSET-WHILE-LOOP-SUBSTRATE) ──────
+    // Returns the target's numeric encoding for `cond`, or `nullopt`
+    // when this target hasn't declared a `condCodeEncoding` table.
+    // The encoder for cond-code-bearing opcodes (setcc / jcc on x86;
+    // B.cc on ARM64) gates on this — a missing table fails loud
+    // (A_NoCondCodeEncoding) rather than silently OR'ing zero into
+    // the opcode byte (which would map every condition to `eq`).
+    [[nodiscard]] std::optional<std::uint8_t> condCodeEncoding(
+            TargetCondCode cond) const noexcept {
+        if (!d_.condCodeEncodingLoaded) return std::nullopt;
+        return d_.condCodeEncoding[static_cast<std::uint8_t>(cond)];
+    }
+    [[nodiscard]] bool condCodeEncodingLoaded() const noexcept {
+        return d_.condCodeEncodingLoaded;
     }
 
     // ── Relocations (AS1) ────────────────────────────────────────

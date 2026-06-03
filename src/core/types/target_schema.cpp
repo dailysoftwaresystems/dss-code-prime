@@ -344,7 +344,16 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // are equally single-writer — extend the same rule there.
             {
                 auto const isMultiWriterSlot = [](EncodingSlotKind s) noexcept {
-                    return s == EncodingSlotKind::Imm32;
+                    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
+                    // BlockRel32 admits multiple wires per variant (jcc
+                    // emits TWO trailing rel32 placeholders — taken
+                    // target + fallthrough target — separated by the
+                    // wire-1's `prefixOpcodeBytes: [0xE9]` bridge). Each
+                    // wire targets a distinct LIR operand, so there's
+                    // no "silently overwrite" risk; the encoder appends
+                    // them in declaration order to the output stream.
+                    return s == EncodingSlotKind::Imm32
+                        || s == EncodingSlotKind::BlockRel32;
                 };
                 // Track each non-multi-writer slot's first writer.
                 // Sized from the shared `kEncodingSlotKindCount` so

@@ -147,23 +147,55 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): integer compare (writes FLAGS, no GPR result). Two variants: reg-reg (REX.W 0x39 /r — cmp r/m64, r64) + reg-imm32 (REX.W 0x81 /7 imm32 — cmp r/m64, imm32 with sign-extended imm32). modrmRegExt=7 fills ModR/M.reg with the /7 opcode-extension digit. ML5 lowerICmp + lowerCondBr both emit `cmp` against an immediate-0 or against another reg.",
       "mnemonic":      "cmp",
       "result":        "none",
       "hasSideEffects": false,
       "minOperands":   2,
       "maxOperands":   2,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "rexW": true, "opcode": [57] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Materialize a 0/1 boolean from FLAGS. Payload carries the TargetCondCode (eq/ne/slt/.../uge); the LIR substrate is condition-blind. ML6 regalloc treats FLAGS as an implicit predecessor; AS1 emits the real x86_64 setcc-byte + movzx zero-extend sequence.",
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): materialize 0/1 byte from FLAGS by cond-code. Encoding `0F 90+cc /0 r8` — the LOW 4 BITS of the SECOND opcode byte carry the condition (resolved via the target's `condCodeEncoding` table from the inst's payload). Result is r8 (low byte of a GPR); upper bits left undefined per Intel SDM. The LIR substrate treats setcc's result as a GPR vreg — callers either compare against 0 immediately (cmp r64, imm32 with sign-extend; safe for boolean compare since AL=0/1) or zero-extend via a follow-up movzx. Cycle scope keeps the substrate minimal; D-LIR-SETCC-MOVZX-COMPOUND anchors the zero-extend pairing when a boolean must escape into a fully-extended 64-bit slot.",
       "mnemonic":      "setcc",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   0,
       "maxOperands":   0,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [15, 144], "condCodeFromPayload": true, "modrmRegExt": 0 },
+            "resultSlot": "modrm.rm"
+          }
+        ]
+      }
     },
     {
       "$comment": "Hard-trap / 'this code path is unreachable'. AS1 maps to x86_64 ud2 (encoding `0F 0B`). Encoding added at D-LK10-ENTRY Slice A (2026-06-02) so the trampoline emitter can append `unreachable` after noreturn syscall / call_indirect_via_extern call sites — reaches `assemble()` and must emit bytes (the `TargetEncodingShape::None` arm in `asm.cpp` fails loud `A_NoEncodingDeclared`). Shape mirrors the `ret` opcode (zero-operand variant, no ModR/M, opcode bytes literal).",
@@ -228,6 +260,7 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): unconditional intra-function jump. Encoding `E9 rel32` (5 bytes). The 4-byte trailing rel32 is resolved at assemble-time via the BlockRel32 slot + per-function patch list (NOT a linker relocation — intra-function only). Operand[0] is a BlockRef naming the target basic block.",
       "mnemonic":      "jmp",
       "result":        "none",
       "terminatorKind": "br",
@@ -235,17 +268,43 @@
       "minOperands":   1,
       "maxOperands":   1,
       "minSuccessors": 1,
-      "maxSuccessors": 1
+      "maxSuccessors": 1,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["blockref"] },
+            "template": { "opcode": [233] },
+            "wires":    [
+              { "index": 0, "slotKind": "block.rel32" }
+            ]
+          }
+        ]
+      }
     },
     {
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): conditional intra-function jump with mandatory fallthrough. Compound encoding `0F 8x rel32; E9 rel32` (11 bytes total). The cond nibble in 0x80's low 4 bits comes from the inst's payload (TargetCondCode) via the schema's condCodeEncoding table. Both target blocks pass as BlockRef operands: operand[0] = ifTrue (taken when cond holds — encoded as the first rel32); operand[1] = ifFalse (the fallthrough — encoded as the trailing `E9 rel32`). The wire-1's `prefixOpcodeBytes: [0xE9]` bridges the two displacements. A future optimizer pass elides the trailing jmp when ifFalse is the next-laid-out block (anchored D-OPT-JCC-FALLTHROUGH).",
       "mnemonic":      "jcc",
       "result":        "none",
       "terminatorKind": "cond-br",
       "hasSideEffects": true,
-      "minOperands":   0,
-      "maxOperands":   255,
+      "minOperands":   2,
+      "maxOperands":   2,
       "minSuccessors": 2,
-      "maxSuccessors": 2
+      "maxSuccessors": 2,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["blockref", "blockref"] },
+            "template": { "opcode": [15, 128], "condCodeFromPayload": true },
+            "wires":    [
+              { "index": 0, "slotKind": "block.rel32" },
+              { "index": 1, "slotKind": "block.rel32", "prefixOpcodeBytes": [233] }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "call sym — direct near call to a symbol. Encoding: 0xE8 + 4-byte signed PC-relative displacement to the call target (filled with 0 by the assembler; the linker patches via the rel32 relocation). The schema's maxOperands=255 admits a call ABI where extra operands carry arg-register hints; cycle-4 wires the single-SymbolRef variant (the direct-call form). An indirect-call form (call rax, encoding REX 0xFF /2) is anchored as a future variant.",
@@ -681,6 +740,19 @@
       "slotAligned": true
     }
   ],
+  "$condCodeEncodingComment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): per-cond-code nibble mapping for x86 setcc / jcc opcodes. The encoder OR's this nibble into the LOW 4 BITS of the LAST opcode byte: setcc emits `0F 9x` (where x = cc nibble); jcc emits `0F 8x rel32`. Numeric values from Intel SDM Vol. 1 Appendix B (condition code encoding table). 10-arm coverage matches the substrate's `TargetCondCode` enum exactly. ARM64 will declare its own table mapping into bits 0..3 of the B.cc instruction word — different numeric values, same field-position abstraction (D-AS3-COND-CODE-ARM64 anchor).",
+  "condCodeEncoding": {
+    "eq":  4,
+    "ne":  5,
+    "slt": 12,
+    "sle": 14,
+    "sgt": 15,
+    "sge": 13,
+    "ult": 2,
+    "ule": 6,
+    "ugt": 7,
+    "uge": 3
+  },
   "$relocationsComment": "Relocation taxonomy (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker reads via TargetSchema::relocationInfo(kind). `formula` is a CLOSED-ENUM DISCRIMINATOR (load-bearing — see RelocFormulaKind in target_schema.hpp): 'linear' (S + A + (pcRel ? -P : 0) + addendBias; widthBytes LE), or one of the bit-shift variants ('aarch64_call26' / 'aarch64_adr_prel_pg_hi21' / 'aarch64_add_abs_lo12'). For 'linear', the structured fields (pcRelative + addendBias + widthBytes) parameterize the formula. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference.",
   "relocations": [
     { "name": "rel32", "kind": 1, "formula": "linear", "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },

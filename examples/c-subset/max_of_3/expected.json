@@ -1,0 +1,13 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 13,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    }
+  ]
+}

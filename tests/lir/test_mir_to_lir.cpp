@@ -429,13 +429,18 @@ TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
     }
 }
 
-TEST(MirToLir, CondBrJccPayloadIsNe) {
-    // The cycle-3b review surfaced that the jcc condition was silently
-    // defaulting to payload 0 (= TargetCondCode::Eq) instead of the
-    // intended Ne (since CondBr lowers as cmp val,0 + jcc(ne)). The
-    // fix extended `addCondBr` to take a payload; this test pins the
-    // emitted jcc carries `Ne` so a regression would surface here, not
-    // in AS1's encoded bytes.
+TEST(MirToLir, CondBrFusesIcmpConditionIntoJccPayload) {
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
+    // when CondBr's operand is produced by an ICmp, the lowering
+    // FUSES the pair into a single `cmp lhs, rhs; jcc-cond` shape
+    // — the jcc's payload carries the ICmp's TargetCondCode
+    // directly (Sgt here for `x > 0`), NOT the default cmp-against-
+    // zero + Ne pattern (which would read setcc's garbage upper
+    // bits and trip the branch wrong-direction).
+    //
+    // The non-fusable arm (cond from a non-ICmp source) keeps the
+    // existing cmp-against-0 + jcc-Ne path; covered by the
+    // CondBrJccPayloadIsNeForNonIcmpCond test below.
     auto L = lowerCSubsetToLir(
         "int sign(int x) { if (x > 0) return 1; return 0; }");
     assertUpstreamClean(L);
@@ -446,9 +451,10 @@ TEST(MirToLir, CondBrJccPayloadIsNe) {
     LirInstId const term = lir.blockTerminator(entry);
     ASSERT_EQ(lir.instOpcode(term), *sch.opcodeByMnemonic("jcc"));
     EXPECT_EQ(lir.instPayload(term),
-              static_cast<std::uint32_t>(::dss::TargetCondCode::Ne))
-        << "CondBr jcc payload must be Ne (jump-when-condition-is-true), "
-           "not the default 0 (Eq, which would invert the branch)";
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Sgt))
+        << "CondBr-fused jcc payload must be Sgt (the ICmpSgt's "
+           "cond code), NOT the legacy default Ne — D-CSUBSET-"
+           "WHILE-LOOP-SUBSTRATE fusion pin";
 }
 
 TEST(MirToLir, TernaryProducesPhiResolutionMoves) {

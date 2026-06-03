@@ -1,12 +1,14 @@
 #include "asm/asm.hpp"
 
 #include "asm/format/fixed32.hpp"
+#include "asm/format/walker_util.hpp"
 #include "asm/format/x86_variable.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <cstring>
 #include <format>
+#include <limits>
 #include <optional>
 #include <unordered_map>
 
@@ -35,6 +37,7 @@ using dss::report;
                               std::vector<std::uint8_t>& out,
                               std::vector<Relocation>&   relocs,
                               std::vector<SourceMapEntry>& srcMap,
+                              std::vector<walker_util::BlockRelPatch>& blockPatches,
                               std::span<MirInstId const> lirToMir,
                               DiagnosticReporter&     reporter) {
     auto const opcode = lir.instOpcode(inst);
@@ -77,11 +80,12 @@ using dss::report;
         case TargetEncodingShape::X86Variable:
             return x86_variable::encode(lir, schema, inst, info,
                                          lirToMir, out, relocs, srcMap,
-                                         reporter);
+                                         blockPatches, reporter);
 
         case TargetEncodingShape::Fixed32:
             return fixed32::encode(lir, schema, inst, info, lirToMir,
-                                    out, relocs, srcMap, reporter);
+                                    out, relocs, srcMap, blockPatches,
+                                    reporter);
         }
 
         // Enum-drift fallback. A new `TargetEncodingShape` value
@@ -191,8 +195,22 @@ AssembledModule assemble(Lir const&                 lir,
         outFn.symbol = lir.funcSymbol(fn);
 
         std::uint32_t const blockCount = lir.funcBlockCount(fn);
+
+        // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
+        // intra-function block-relative branch patching. Build the
+        // block-offset table while emitting block-by-block, then
+        // resolve patches after the function is fully assembled.
+        // Distinct from the symbol-relative `outFn.relocations` —
+        // those go to the linker; these resolve at assemble time
+        // and never leak past this function.
+        std::unordered_map<std::uint32_t, std::uint32_t> blockOffsets;
+        blockOffsets.reserve(blockCount);
+        std::vector<walker_util::BlockRelPatch> blockPatches;
+
         for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
             LirBlockId const blk = lir.funcBlockAt(fn, bi);
+            blockOffsets[blk.v] =
+                static_cast<std::uint32_t>(outFn.bytes.size());
             std::uint32_t const instCount = lir.blockInstCount(blk);
             for (std::uint32_t ii = 0; ii < instCount; ++ii) {
                 LirInstId const inst = lir.blockInstAt(blk, ii);
@@ -205,8 +223,56 @@ AssembledModule assemble(Lir const&                 lir,
                 // The reporter is the success channel.
                 (void)encodeInst(lir, schema, inst,
                                  outFn.bytes, outFn.relocations,
-                                 outFn.sourceMap, lirToMir, reporter);
+                                 outFn.sourceMap, blockPatches,
+                                 lirToMir, reporter);
             }
+        }
+
+        // Resolve intra-function block-relative branch patches now
+        // that every block's byte offset is known. Each patch wrote
+        // 4 zero placeholder bytes; we overwrite them with the
+        // signed 32-bit displacement `target_offset - (patch_offset
+        // + 4)` (the x86 convention: rel32 is relative to the byte
+        // AFTER the displacement). A target block missing from the
+        // offset table is a malformed LIR (terminator points at a
+        // block that's not in this function) — fail loud.
+        for (auto const& patch : blockPatches) {
+            auto it = blockOffsets.find(patch.targetBlock);
+            if (it == blockOffsets.end()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("intra-function branch patch in fn '{}' "
+                                   "targets block id {} which is not in "
+                                   "the function's block list — malformed "
+                                   "LIR (D-CSUBSET-WHILE-LOOP-SUBSTRATE)",
+                                   outFn.symbol.v, patch.targetBlock));
+                continue;
+            }
+            std::int64_t const disp = static_cast<std::int64_t>(it->second)
+                                    - static_cast<std::int64_t>(patch.patchOffset + 4);
+            if (disp < std::numeric_limits<std::int32_t>::min()
+             || disp > std::numeric_limits<std::int32_t>::max()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("intra-function branch in fn '{}' "
+                                   "needs displacement {} which exceeds "
+                                   "rel32 range — function body too large "
+                                   "for 32-bit branch reach (anchor "
+                                   "D-CSUBSET-LONG-BRANCH for thunks)",
+                                   outFn.symbol.v, disp));
+                continue;
+            }
+            // Write the 4 LE bytes back into the placeholder slot.
+            std::uint32_t const d = static_cast<std::uint32_t>(
+                static_cast<std::int32_t>(disp));
+            outFn.bytes[patch.patchOffset + 0] =
+                static_cast<std::uint8_t>(d        & 0xFFu);
+            outFn.bytes[patch.patchOffset + 1] =
+                static_cast<std::uint8_t>((d >>  8) & 0xFFu);
+            outFn.bytes[patch.patchOffset + 2] =
+                static_cast<std::uint8_t>((d >> 16) & 0xFFu);
+            outFn.bytes[patch.patchOffset + 3] =
+                static_cast<std::uint8_t>((d >> 24) & 0xFFu);
         }
     }
 

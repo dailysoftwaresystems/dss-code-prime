@@ -162,6 +162,20 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             }
         }
     }
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): cond-code-
+    // from-payload flag. When true, the encoder reads the inst's
+    // payload as `TargetCondCode`, looks up the schema's
+    // `condCodeEncoding[idx]` nibble, and OR's it into the LAST
+    // opcode byte before emission. Used by x86 setcc + jcc.
+    if (t.contains("condCodeFromPayload")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/condCodeFromPayload", opIdx, vi);
+        if (!t.at("condCodeFromPayload").is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'condCodeFromPayload' must be a boolean");
+        } else {
+            tmpl.condCodeFromPayload = t.at("condCodeFromPayload").get<bool>();
+        }
+    }
     // `fixedWord` (plan 13 AS3 — `fixed32` shape) — 32-bit base bit
     // pattern. JSON accepts unsigned 32-bit integer values.
     if (t.contains("fixedWord")) {
@@ -278,6 +292,40 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
                                           name));
                 } else {
                     wire.relocationKind = data.relocations[it->second].kind;
+                }
+            }
+        }
+        // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
+        // optional `prefixOpcodeBytes` — bytes emitted IMMEDIATELY
+        // BEFORE this wire's slot bytes (between the previous
+        // wire's emission and this one). Used by jcc's compound
+        // `0F 8x rel32; E9 rel32` encoding: wire 0 is the cond
+        // branch, wire 1 declares `[0xE9]` to bridge to the
+        // trailing uncond jmp's rel32 placeholder.
+        if (o2.contains("prefixOpcodeBytes")) {
+            auto const& pb = o2.at("prefixOpcodeBytes");
+            auto const pbPath = std::format("{}/prefixOpcodeBytes", wirePath);
+            if (!pb.is_array()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, pbPath,
+                          "'prefixOpcodeBytes' must be an array of "
+                          "byte integers");
+            } else {
+                for (auto const& bn : pb) {
+                    if (!bn.is_number_integer()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, pbPath,
+                                  "every prefixOpcodeBytes entry must be "
+                                  "an integer in [0, 255]");
+                        continue;
+                    }
+                    auto const bv = bn.get<std::int64_t>();
+                    if (bv < 0 || bv > 255) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, pbPath,
+                                  std::format("prefixOpcodeBytes entry {} "
+                                              "out of range [0, 255]", bv));
+                        continue;
+                    }
+                    wire.prefixOpcodeBytes.push_back(
+                        static_cast<std::uint8_t>(bv));
                 }
             }
         }
@@ -559,6 +607,91 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             }
             return true;
         });
+
+    // ── condCodeEncoding (D-CSUBSET-WHILE-LOOP-SUBSTRATE step 13.5
+    // cycle 1, 2026-06-03 — optional) ───────────────────────────────
+    // Per-target mapping from abstract `TargetCondCode` (substrate-tier
+    // 10-arm enum: eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge) to a numeric
+    // encoding used by the ISA's conditional opcodes. x86_64 writes
+    // the value into the low 4 bits of the setcc/jcc opcode byte;
+    // ARM64 writes it into bits 0..3 of the 32-bit B.cc instruction
+    // word (same low-nibble position; different numeric mapping per
+    // the AArch64 condition table). JSON shape: object with all 10
+    // string keys present, each mapping to an integer in [0, 15].
+    // Missing keys / extra keys / out-of-range values fail-loud.
+    //
+    // A target with no cond-code-bearing opcodes (a declarative-only
+    // target, future SPIR-V variant) omits the section entirely —
+    // `condCodeEncoding()` then returns nullopt and the per-opcode
+    // encoder fails loud `A_NoCondCodeEncoding` on any wire that
+    // references `CondCodeNibble`. The wire never silently OR's a
+    // zero nibble (which would map every condition to `eq`).
+    if (doc.contains("condCodeEncoding")) {
+        auto const& cc = doc.at("condCodeEncoding");
+        if (!cc.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/condCodeEncoding",
+                      "must be an object mapping cond-code name → "
+                      "integer encoding");
+        } else {
+            constexpr std::array<std::string_view, 10> kCondNames{
+                "eq", "ne", "slt", "sle", "sgt", "sge",
+                "ult", "ule", "ugt", "uge"};
+            std::array<bool, 10> seen{};
+            for (auto it = cc.begin(); it != cc.end(); ++it) {
+                auto const& key = it.key();
+                std::size_t idx = kCondNames.size();
+                for (std::size_t i = 0; i < kCondNames.size(); ++i) {
+                    if (kCondNames[i] == key) { idx = i; break; }
+                }
+                if (idx >= kCondNames.size()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/condCodeEncoding/{}", key),
+                              std::format("unknown cond-code key '{}' "
+                                          "(expected one of eq/ne/slt/sle/"
+                                          "sgt/sge/ult/ule/ugt/uge)", key));
+                    continue;
+                }
+                if (!it.value().is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/condCodeEncoding/{}", key),
+                              "value must be a non-negative integer");
+                    continue;
+                }
+                auto const v = it.value().get<std::int64_t>();
+                if (v < 0 || v > 15) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/condCodeEncoding/{}", key),
+                              std::format("value {} out of range — must "
+                                          "fit in 4 bits [0..15] to OR "
+                                          "into the opcode byte's low "
+                                          "nibble", v));
+                    continue;
+                }
+                data.condCodeEncoding[idx] = static_cast<std::uint8_t>(v);
+                seen[idx] = true;
+            }
+            std::vector<std::string_view> missing;
+            for (std::size_t i = 0; i < kCondNames.size(); ++i) {
+                if (!seen[i]) missing.push_back(kCondNames[i]);
+            }
+            if (!missing.empty()) {
+                std::string list;
+                for (std::size_t i = 0; i < missing.size(); ++i) {
+                    if (i) list += ", ";
+                    list += missing[i];
+                }
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/condCodeEncoding",
+                          std::format("missing cond-code(s) {} — when "
+                                      "the table is declared, ALL 10 "
+                                      "entries must be present so the "
+                                      "encoder cannot silently default "
+                                      "to 0 for an absent code", list));
+            } else {
+                data.condCodeEncodingLoaded = true;
+            }
+        }
+    }
 
     // ── opcodes ──
     if (!doc.contains("opcodes") || !doc.at("opcodes").is_array()) {
