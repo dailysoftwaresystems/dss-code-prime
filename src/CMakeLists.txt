@@ -7,6 +7,7 @@ add_subdirectory(hir)
 add_subdirectory(hir/lowering)
 add_subdirectory(mir)
 add_subdirectory(mir/lowering)
+add_subdirectory(opt)
 add_subdirectory(lir)
 add_subdirectory(asm)
 add_subdirectory(link)
@@ -26,6 +27,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:hir_lowering>
     $<TARGET_OBJECTS:mir>
     $<TARGET_OBJECTS:mir_lowering>
+    $<TARGET_OBJECTS:opt>
     $<TARGET_OBJECTS:lir>
     $<TARGET_OBJECTS:lir_lowering>
     $<TARGET_OBJECTS:asm>

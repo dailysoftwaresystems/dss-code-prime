@@ -592,6 +592,20 @@ enum class DiagnosticCode : std::uint16_t {
     // being absent without a function-tier diagnostic.
     A_FunctionEncodeAborted        = 0x1006,
 
+    // ── Optimizer (renders as `X`) ────────────────────────────────────
+    //
+    // X_* family at 0x2xxx per plan 22 PR1. The optimizer (OPT1+ — the
+    // `src/opt/` tier) emits these for pass-engine + pass-internal
+    // failures. Stable across optimizer versions.
+    //
+    // X_UnknownPassId: the `optimize()` engine dispatched a `PassId`
+    //   value with no matching arm in `runPass`'s switch. This is a
+    //   substrate-shape violation (a new PassId enumerator was added
+    //   without a handler) — fires before any MIR mutation. Closes
+    //   the silent-fallback gap code-reviewer C2 flagged in OPT1
+    //   cycle 1. D-OPT1-PASS-ID-STABILITY's enforcement surface.
+    X_UnknownPassId                = 0x2001,
+
     // ── Linker (renders as `K`) ───────────────────────────────────────
     //
     // The link pass (plan 14 LK4 substrate) emits these when an

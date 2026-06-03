@@ -17,6 +17,7 @@
 #include "lir/lir_rewrite.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "opt/optimizer.hpp"
 
 #include <algorithm>
 #include <format>
@@ -165,6 +166,40 @@ bool compileSingleUnit(CompilationUnit const&        cu,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap);
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
+        return false;
+    }
+
+    // 3.5. MIR optimizer pipeline (plan 22 OPT1 — step 13.6 cycle 1
+    // 2026-06-03). Cycle 1 ships only the identity (no-op) pass and
+    // no shipped pipeline declares any passes — the optimizer
+    // function runs end-to-end as a verify-the-wiring tier, returning
+    // MIR unchanged. Future cycles land actual passes (OPT2 const-
+    // fold / DCE / copy-prop / peephole) inside this exact slot.
+    //
+    // Per plan 22 §2.5 (per-output-path policy), the active pipeline
+    // is resolved from the artifact-profile config — c-subset's
+    // default profile is the no-op pipeline today. The differential-
+    // verification corpus (14 positive + 5 negative pins, c8f913a +
+    // c-subset/dce_negative_pin/ + cse_noncommutative/ etc.) verifies
+    // each future pass landing as it does.
+    auto const optEntry = reporter.errorCount();
+    // Silent-failure post-fold F2 (2026-06-03): default pipeline =
+    // [Identity], NOT empty. An empty `passes` array would skip the
+    // optimizer's per-pass loop entirely — leaving the future
+    // D-OPT1-VERIFY-AFTER-EVERY-PASS slot dead code and the engine's
+    // dispatch never exercised. The Identity pass is the substrate's
+    // self-test: it runs the loop, gets dispatched, returns clean,
+    // and (when OPT2 lands) triggers the verify-after-pass hook.
+    // Future cycles replace the literal `{Identity}` here with a
+    // pipeline-name lookup against the artifact-profile config
+    // (anchored D-OPT1-PIPELINE-FROM-CONFIG).
+    ::dss::opt::OptPipeline pipeline{
+        "default",
+        { ::dss::opt::PassId::Identity }};
+    if (!::dss::opt::optimize(mir.mir, target, pipeline, reporter)) {
+        return false;
+    }
+    if (!tierClean(reporter, optEntry)) {
         return false;
     }
 
