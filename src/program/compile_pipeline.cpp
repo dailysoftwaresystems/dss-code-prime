@@ -18,7 +18,12 @@
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 
+#include <algorithm>
+#include <format>
 #include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 
 // Plan 14 LK10 cycle 2 — driver pipeline kernel.
 
@@ -258,8 +263,8 @@ bool compileSingleUnit(CompilationUnit const&        cu,
             std::vector<std::string_view> matchNames;
             for (auto const& rec : model.symbols()) {
                 if (rec.kind != DeclarationKind::Function) continue;
-                bool const isEntry = std::ranges::any_of(
-                    entryNames,
+                bool const isEntry = std::any_of(
+                    entryNames.begin(), entryNames.end(),
                     [&](std::string_view n){ return n == rec.name; });
                 if (isEntry) {
                     SymbolId const sym{static_cast<std::uint32_t>(
