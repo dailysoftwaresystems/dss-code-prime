@@ -872,12 +872,18 @@ struct Lowerer {
         TypeId const resultTy = mir.instType(id);
         bool const isVoid = !resultTy.valid()
                          || interner.kind(resultTy) == TypeKind::Void;
+        // D-LANG-VARIADIC (step 13.4): forward the MIR Call's
+        // variadic-payload bits (isVariadic + fixedArgCount) to the
+        // LIR Call so the post-regalloc ML7 materialize pass can
+        // emit the platform's variadic-call setup (SysV `mov al,
+        // <xmm-arg-count>` etc.). Non-variadic calls keep payload=0.
+        std::uint32_t const payload = mir.instPayload(id);
         if (isVoid) {
-            emitInst(*opcode(callSlot), InvalidLirReg, ops);
+            emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
             return;
         }
         LirReg const result = lir.newVReg(regClassFor(id));
-        emitInst(*opcode(callSlot), result, ops);
+        emitInst(*opcode(callSlot), result, ops, payload);
         defineValue(id, result);
     }
 
@@ -1073,6 +1079,10 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Setcc, "MIR ICmp");
             return;
         }
+        if (!opcode(MnemonicSlot::ZExt).has_value()) {
+            reportMissingOpcode(MnemonicSlot::ZExt, "MIR ICmp");
+            return;
+        }
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) {
             reportUnsupported(mir.instOpcode(id), id);
@@ -1088,9 +1098,27 @@ struct Lowerer {
         std::array<LirOperand, 2> cmpOps{LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
         emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
 
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
-        emitInst(*opcode(MnemonicSlot::Setcc), result, std::span<LirOperand const>{},
+        // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
+        // code-reviewer C2): emit setcc into a separate "byte" vreg,
+        // then movzx the low byte into the result vreg. This makes
+        // the substrate contract explicit: setcc writes the LOW
+        // BYTE of its r/m8 destination; the upper 56 bits are
+        // architecturally undefined per Intel SDM. The standalone
+        // zext makes the zero-extend a first-class LIR operation
+        // so the result is always a CLEAN 0/1 r64 — `cmp r64, 0`
+        // / `cmp r64, r64` consumers downstream cannot read garbage.
+        // The ICmp+CondBr fusion at `lowerCondBr` still elides the
+        // cmp-against-0 (the setcc + zext become "dead" via D-LIR-
+        // SETCC-DEAD-AFTER-FUSION DCE in 13.6), but non-adjacent
+        // ICmp uses (bool stored, bool returned, bool ternary) now
+        // get correct width semantics for free. Clean SSA: setcc
+        // defines `b8`; zext consumes `b8` AND defines `result`.
+        LirReg const b8 = lir.newVReg(LirRegClass::GPR);
+        emitInst(*opcode(MnemonicSlot::Setcc), b8, std::span<LirOperand const>{},
                     /*payload=*/static_cast<std::uint32_t>(cond));
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> zextOps{LirOperand::makeReg(b8)};
+        emitInst(*opcode(MnemonicSlot::ZExt), result, zextOps);
         defineValue(id, result);
     }
 
@@ -1290,8 +1318,6 @@ struct Lowerer {
             reportUnsupported(MirOpcode::CondBr, id);
             return false;
         }
-        std::optional<LirReg> const cond = regForValue(operands[0]);
-        if (!cond.has_value()) return false;
         if (!mirBlockToLirBlock.has(succs[0]) || !mirBlockToLirBlock.has(succs[1])) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
@@ -1300,19 +1326,68 @@ struct Lowerer {
             reporter.report(std::move(d));
             return false;
         }
-        // Naive: compare the Bool value against 0, jcc-Ne taken when true.
-        // Optimizer fuses adjacent ICmp + CondBr to a single cmp/jcc-cond.
-        // The jcc condition is written into the inst's `payload` field via
-        // the cycle-3b-extended `addCondBr(payload=...)` overload — closes
-        // the cycle-3b-review HIGH finding where the payload silently
-        // defaulted to 0 (= TargetCondCode::Eq) and inverted the branch.
-        std::array<LirOperand, 2> cmpOps{
-            LirOperand::makeReg(*cond), LirOperand::makeImmInt32(0)};
-        emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
-        emitCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
-                      mirBlockToLirBlock.get(succs[0]),
-                      mirBlockToLirBlock.get(succs[1]),
-                      static_cast<std::uint32_t>(TargetCondCode::Ne));
+        LirBlockId const lirIfTrue  = mirBlockToLirBlock.get(succs[0]);
+        LirBlockId const lirIfFalse = mirBlockToLirBlock.get(succs[1]);
+        // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
+        // ICmp+CondBr FUSION. When the cond operand was produced by
+        // an ICmp instruction, replace the naive
+        // `cmp result_b8, 0; jcc-NE` sequence (which would read the
+        // garbage upper 56 bits of setcc's r8 result and trip the
+        // branch the wrong way) with a single fused `cmp lhs, rhs;
+        // jcc-cond` using the ICmp's args and condition directly.
+        // The setcc emitted by lowerICmp becomes dead code (its
+        // result has no LIR consumer in this fused path); a future
+        // dead-LIR-instruction-elimination pass anchored
+        // D-LIR-SETCC-DEAD-AFTER-FUSION removes the wasted bytes.
+        // This pre-empts the optimizer fusion (planned at 13.6)
+        // because the substrate would otherwise be load-bearing
+        // broken for every `if/while` until then.
+        //
+        // The non-fusable arm (cond from a non-ICmp source — bool
+        // param, bool load, etc.) keeps the existing cmp-against-0
+        // path. Those producers ARE responsible for zero-extending
+        // their bool result; they hit the cmp-r64-against-0 path
+        // correctly.
+        MirInstId const condInst = operands[0];
+        MirOpcode const condOp   = mir.instOpcode(condInst);
+        auto const fusedCc       = condCodeForICmp(condOp);
+        TargetCondCode jccCond;
+        if (fusedCc.has_value()) {
+            auto const icmpOperands = mir.instOperands(condInst);
+            if (icmpOperands.size() != 2) {
+                reportUnsupported(condOp, condInst);
+                return false;
+            }
+            std::optional<LirReg> const a = regForValue(icmpOperands[0]);
+            std::optional<LirReg> const b = regForValue(icmpOperands[1]);
+            if (!a.has_value() || !b.has_value()) return false;
+            std::array<LirOperand, 2> cmpOps{
+                LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
+            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+            jccCond = *fusedCc;
+        } else {
+            std::optional<LirReg> const cond = regForValue(operands[0]);
+            if (!cond.has_value()) return false;
+            std::array<LirOperand, 2> cmpOps{
+                LirOperand::makeReg(*cond), LirOperand::makeImmInt32(0)};
+            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);
+            jccCond = TargetCondCode::Ne;
+        }
+        // Pass both successors as BlockRef operands. jcc remains
+        // the block's terminator (schema's `cond-br` shape, 2
+        // successors); the encoder reads operand[0] (taken target)
+        // for the BlockRel32 displacement AND emits a trailing
+        // unconditional `jmp` to operand[1] (fallthrough) so the
+        // LIR block layout doesn't need to guarantee fallthrough
+        // order. A future optimizer pass elides the redundant
+        // trailing jmp when ifFalse IS the next-laid-out block
+        // (anchored D-OPT-JCC-FALLTHROUGH).
+        std::array<LirOperand, 2> jccOps{
+            LirOperand::makeBlockRef(lirIfTrue.v),
+            LirOperand::makeBlockRef(lirIfFalse.v)};
+        emitCondBr(*opcode(MnemonicSlot::Jcc), jccOps,
+                      lirIfTrue, lirIfFalse,
+                      static_cast<std::uint32_t>(jccCond));
         return true;
     }
 
@@ -1410,18 +1485,32 @@ struct Lowerer {
             LirBlockId nextBlock;
             bool const isLastCase = (i + 1 == caseCount);
             LirBlockId const caseTarget = mirBlockToLirBlock.get(succs[i]);
+            // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1
+            // post-fold, code-reviewer C1): jcc now requires the
+            // 2 BlockRef operands as its operand list (matches the
+            // schema's `["blockref", "blockref"]` guard). Pre-fold
+            // the switch lowering passed empty operands — the
+            // encoder would have failed `A_NoMatchingEncodingVariant`
+            // on EVERY switch statement; the gap slipped because
+            // no runnable corpus example exercises switch yet.
             if (isLastCase) {
                 // Final compare: jcc-eq to case target, else jcc fallthrough
                 // to a tiny "jmp default" block.
                 LirBlockId const defaultJump = lir.createBlock();
-                emitCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
+                std::array<LirOperand, 2> jccOps{
+                    LirOperand::makeBlockRef(caseTarget.v),
+                    LirOperand::makeBlockRef(defaultJump.v)};
+                emitCondBr(*opcode(MnemonicSlot::Jcc), jccOps,
                               caseTarget, defaultJump, eqCond);
                 lir.beginBlock(defaultJump);
                 emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
                 return true;
             }
             nextBlock = lir.createBlock();
-            emitCondBr(*opcode(MnemonicSlot::Jcc), std::span<LirOperand const>{},
+            std::array<LirOperand, 2> jccOps{
+                LirOperand::makeBlockRef(caseTarget.v),
+                LirOperand::makeBlockRef(nextBlock.v)};
+            emitCondBr(*opcode(MnemonicSlot::Jcc), jccOps,
                           caseTarget, nextBlock, eqCond);
             lir.beginBlock(nextBlock);
         }

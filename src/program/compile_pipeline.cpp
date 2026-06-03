@@ -18,7 +18,12 @@
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 
+#include <algorithm>
+#include <format>
 #include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 
 // Plan 14 LK10 cycle 2 — driver pipeline kernel.
 
@@ -133,7 +138,11 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         std::vector<ffi::ExternDeclRef> refs;
         refs.reserve(hir->externDecls.size());
         for (auto const& r : hir->externDecls) {
-            refs.push_back({r.node, r.canonicalName});
+            // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3):
+            // propagate the per-symbol library override decoded by
+            // the lowerer from the optional trailing string literal.
+            // Empty = use format-level default (existing behavior).
+            refs.push_back({r.node, r.canonicalName, r.libraryOverride});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -215,6 +224,79 @@ bool compileSingleUnit(CompilationUnit const&        cu,
                               lir.externImports);
     if (!assembled.ok() || !tierClean(reporter, asmEntry)) {
         return false;
+    }
+
+    // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
+    // 2026-06-03): plumb the source-language entry-function symbol
+    // into AssembledModule.userEntrySymbol. The language config's
+    // declaration rules carry an `implicitReturnZeroForFunctionNames`
+    // list — c-subset names "main" there; toy / future languages
+    // name their own entry. Scan the semantic model's symbol records
+    // for a function symbol whose name appears in ANY decl rule's
+    // entry-name list, and stamp it on the AssembledModule so the
+    // trampoline injector's `resolveUserEntrySymbol` doesn't fall
+    // through to the `functions[0]` default (which silently picked
+    // the FIRST-declared function — wrong when the entry isn't
+    // declared first in source order).
+    //
+    // Source-agnostic: the trigger comes from grammar config, not
+    // a hardcoded "main" string. Multiple symbols matching the
+    // entry-name list fail-loud (silent-failure post-fold HIGH #1
+    // 2026-06-03 — never pick silently between candidates).
+    if (!assembled.userEntrySymbol.has_value()) {
+        std::vector<std::string_view> entryNames;
+        for (auto const& decl : grammar.semantics().declarations) {
+            for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+                entryNames.push_back(n);
+            }
+        }
+        if (!entryNames.empty()) {
+            // Silent-failure HIGH #1 post-fold (2026-06-03): walk
+            // EVERY function symbol matching the entry-name list;
+            // fail-loud on multiple matches rather than silently
+            // first-match-wins. A future language declaring
+            // `["main", "_start"]` (both defined in the source)
+            // OR a duplicate-name config (same name across two
+            // decl rules) would otherwise re-introduce the silent
+            // wrong-entry bug class this fix is supposed to close.
+            std::vector<SymbolId> matches;
+            std::vector<std::string_view> matchNames;
+            for (auto const& rec : model.symbols()) {
+                if (rec.kind != DeclarationKind::Function) continue;
+                bool const isEntry = std::any_of(
+                    entryNames.begin(), entryNames.end(),
+                    [&](std::string_view n){ return n == rec.name; });
+                if (isEntry) {
+                    SymbolId const sym{static_cast<std::uint32_t>(
+                        &rec - model.symbols().data())};
+                    matches.push_back(sym);
+                    matchNames.push_back(rec.name);
+                }
+            }
+            if (matches.size() > 1) {
+                std::string list;
+                for (std::size_t i = 0; i < matchNames.size(); ++i) {
+                    if (i) list += ", ";
+                    list += matchNames[i];
+                }
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_SymbolUndefined;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "compile_pipeline: ambiguous user-entry — {} "
+                    "function symbol(s) match the language's entry-"
+                    "name list (matched: {}). The trampoline injector "
+                    "cannot silently pick one. Declare distinct entry "
+                    "names per decl rule OR restrict the source to "
+                    "exactly one of these (D-CSUBSET-MULTI-FN-WIN64-CC "
+                    "ambiguity gate).", matches.size(), list);
+                reporter.report(std::move(d));
+                return false;
+            }
+            if (matches.size() == 1) {
+                assembled.userEntrySymbol = matches[0];
+            }
+        }
     }
 
     // D-LK4-RODATA-PRODUCER (2026-06-02): materialize MIR globals

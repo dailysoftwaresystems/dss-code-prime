@@ -1,5 +1,6 @@
 #include "mir/lowering/hir_to_mir.hpp"
 
+#include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_op.hpp"
@@ -427,7 +428,56 @@ struct Lowerer {
                     if (!arg.valid()) return InvalidMirInst;
                     operands.push_back(arg);
                 }
-                return mir.addInst(MirOpcode::Call, operands, t);
+                // D-LANG-VARIADIC (step 13.4): stamp the MIR Call's
+                // payload with the callee's variadic-shape bits. The
+                // callee HIR node's TypeId is its FnSig (for direct
+                // calls — `Ref` to a function symbol carries the
+                // symbol's FnSig type) OR a pointer-to-FnSig (for
+                // indirect calls). We read it through one optional
+                // pointer-deref to support both. A non-FnSig callee
+                // (lowering bug, or fn-pointer-to-non-fn — already
+                // caught at semantic) emits payload=0 (non-variadic).
+                // Post-13.4 audit-fold (HIGH-5): a Ptr with empty
+                // operands is structurally malformed (Ptr<*> always
+                // carries the pointee at operands[0]) — fail-loud
+                // rather than silently leave calleeTy pointing at
+                // the Ptr wrapper which would silently degrade the
+                // call to non-variadic.
+                std::uint32_t callPayload = 0;
+                TypeId calleeTy = hir.typeId(kids[0]);
+                if (calleeTy.valid()
+                    && interner.kind(calleeTy) == TypeKind::Ptr) {
+                    auto const operands_ = interner.operands(calleeTy);
+                    if (operands_.empty()) {
+                        unsupported(node,
+                            "Call callee has Ptr-typed FnSig with empty "
+                            "operands — interner invariant violated");
+                        return InvalidMirInst;
+                    }
+                    calleeTy = operands_[0];
+                }
+                if (calleeTy.valid()
+                    && interner.kind(calleeTy) == TypeKind::FnSig
+                    && interner.fnIsVariadic(calleeTy)) {
+                    auto const fixedSz = interner.fnParams(calleeTy).size();
+                    // Post-13.4 audit-fold (HIGH-3): the call_payload
+                    // u32 encodes fixedArgCount in bits 0..30 (mask
+                    // 0x7FFF_FFFF). A FnSig with >= 2^31 params
+                    // would silently truncate AND collide with the
+                    // isVariadic bit. Practically unreachable (no
+                    // function has 2-billion fixed params) but pin
+                    // the contract so a future builder bypass can't
+                    // silently corrupt the payload.
+                    if (fixedSz > ::dss::call_payload::kFixedArgMask) {
+                        unsupported(node,
+                            "Call payload: fixed-arg count exceeds 31-bit "
+                            "encoding limit");
+                        return InvalidMirInst;
+                    }
+                    callPayload = ::dss::call_payload::encode(
+                        true, static_cast<std::uint32_t>(fixedSz));
+                }
+                return mir.addInst(MirOpcode::Call, operands, t, callPayload);
             }
             case HirKind::IntrinsicCall: {
                 // children: [args...]; the intrinsic id lives in payload.

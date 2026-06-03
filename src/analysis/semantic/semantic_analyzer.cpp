@@ -8,6 +8,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/number_decode.hpp"
+#include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/string_style.hpp"
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <limits>
 #include <optional>
 #include <span>
@@ -195,20 +197,52 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                  NodeId node, ScopeId scope, ReturnRule const& ret);
 void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
+[[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
+                                 NodeId node);
+[[nodiscard]] bool admitsNullPointerConstant(
+    EngineState const& s, Tree const& tree,
+    TypeId lhsTy, NodeId rhsExpr,
+    SemanticConfig::PointerConversionRules const& rules);
 
-// True iff a token of kind `kind` appears anywhere in `node`'s subtree.
-// Used by SE4 const-marker detection (walk the type subtree for the
-// language's const keyword).
+// True iff a token of kind `kind` appears anywhere in `node`'s subtree,
+// stopping descent at any NESTED declaration-rule node (other than the
+// root `node` itself). Used by SE4 const-marker detection (walk a decl's
+// `typeChild` for the language's const keyword) AND by D-LANG-VARIADIC
+// variadic-marker detection (walk a decl's `paramsChild` for the
+// language's `EllipsisOp` marker). Generic substrate — any future
+// "marker token within a decl subtree" scan (async/inline/noexcept
+// markers etc.) reuses this same walker with the same decl-rule stop.
+//
+// `declByRule` is the map from RuleId.v → declarations[] index that
+// EngineState builds at activate-time. Pass `&s.idx().declByRule` for
+// safe-bounded descent (the audit-fold default — closes silent-failure
+// HIGH-2 step 13.4: without it, a future grammar that nested a
+// default-value expression INSIDE a `param` could false-match a marker
+// in the inner expression and silently lower every fixed-arity callee
+// as variadic). Pass `nullptr` ONLY when the scan MUST cross nested
+// declaration-boundaries by design — a deliberate choice, not an
+// oversight or a copy-paste from the legacy unbounded shape.
 [[nodiscard]] bool
-subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind) {
+subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
+                     std::unordered_map<std::uint32_t, std::size_t> const*
+                         declByRule = nullptr) {
     if (!node.valid() || !kind.valid()) return false;
     std::vector<NodeId> stack{node};
+    bool firstPop = true;
     while (!stack.empty()) {
         NodeId cur = stack.back();
         stack.pop_back();
         if (tree.kind(cur) == NodeKind::Token && tree.tokenKind(cur) == kind) {
             return true;
         }
+        // Stop descent at any nested declaration-rule node (the root
+        // itself IS a decl subtree by contract and stays in scope).
+        if (!firstPop && declByRule != nullptr
+            && tree.kind(cur) == NodeKind::Internal
+            && declByRule->contains(tree.rule(cur).v)) {
+            continue;
+        }
+        firstPop = false;
         for (auto const& child : tree.children(cur)) {
             if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
         }
@@ -699,7 +733,8 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             scanRoot = kids[*decl.typeChild];
                         }
                         rec.isConst = subtreeContainsToken(
-                            tree, scanRoot, *decl.constMarker);
+                            tree, scanRoot, *decl.constMarker,
+                            &s.idx().declByRule);
                     }
 
                     SymbolId const newId = s.symbols.mint(rec);
@@ -1003,8 +1038,35 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             collectParamTypes(s, cfg, tree, paramsNode, here,
                                               paramTypes);
                         }
+                        // D-LANG-VARIADIC (step 13.4): scan the params
+                        // subtree for the declaration's configured
+                        // variadic-marker token (e.g. `EllipsisOp` for
+                        // c-subset). When present, build a variadic
+                        // FnSig (scalars=[cc, 1]); otherwise build the
+                        // standard non-variadic FnSig (scalars=[cc]).
+                        // The walker stops descent at any nested decl-
+                        // rule node — a future grammar that nests a
+                        // default-value expression inside a `param`
+                        // cannot false-match the marker. Closes silent-
+                        // failure HIGH-2 (step 13.4 post-fold).
+                        bool const isVariadic =
+                            paramsNode.valid() && decl.variadicMarker.has_value()
+                            && subtreeContainsToken(
+                                tree, paramsNode, *decl.variadicMarker,
+                                &s.idx().declByRule);
+                        // CcSysV is the canonical MIR-tier placeholder
+                        // (mirrors `hir_to_mir.cpp:lowerModuleInit`'s
+                        // moduleInit FnSig): the target's real
+                        // convention is applied by ML7 (`lir_callconv`)
+                        // via `cc.name` lookup at materialize time.
+                        // Do NOT inspect this CallConv field at MIR
+                        // tier — it's a semantic placeholder, not the
+                        // load-bearing CC. Anchored as the same
+                        // placeholder convention every interner
+                        // `fnSig()` callsite uses pre-ML7.
                         TypeId const fnTy = s.lattice.interner().fnSig(
-                            paramTypes, returnTy, CallConv::CcSysV);
+                            paramTypes, returnTy, CallConv::CcSysV,
+                            isVariadic);
                         s.symbols.at(sym).type = fnTy;
                         s.nodeToType.set(resolved.node, fnTy);
                         // GAP A: record the function's RESULT type keyed on
@@ -1203,7 +1265,21 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             if (ma->lhsChild < kids.size() && ma->nameChild < kids.size()) {
                 NodeId const lhsNode  = kids[ma->lhsChild];
                 NodeId const nameNode = kids[ma->nameChild];
-                TypeId lhsType = s.typeAt(lhsNode);
+                // subtreeType (not raw typeAt) — the LHS of `p->x` /
+                // `s.x` is the expression-wrapper node, not the leaf;
+                // pass 2 sets the type on the inner identifier-leaf
+                // for bare references and on the leaf literal for
+                // immediates. typeAt() against the wrapper returns
+                // InvalidType for both, silently bypassing
+                // S_NotAPointer / S_NotAComposite / field-type
+                // write-back. The DFS-descent helper handles both
+                // cases. Mirrors the same fix applied to checkCall
+                // (D-LANG-POINTER-VOID-CONVERT closure, step 13.2 —
+                // the void-pointer negative pin surfaced the
+                // checkCall variant of this gap; the silent-failure
+                // hunt review surfaced the parallel sites here +
+                // initNode below).
+                TypeId lhsType = subtreeType(s, tree, lhsNode);
                 if (lhsType.valid()) {
                     TypeId effectiveType = lhsType;
                     bool   typeOk = true;
@@ -1337,7 +1413,17 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             if (decl.initChild.has_value() && *decl.initChild < kids.size()
                 && decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 NodeId initNode = kids[*decl.initChild];
-                TypeId initTy = s.typeAt(initNode);
+                // subtreeType — bare identifier initializers like
+                // `int *p = q;` carry their type on the leaf, not on
+                // the expression wrapper. typeAt(initNode) returns
+                // InvalidType for the wrapper, the inference branch
+                // silently skips (rec.type stays Invalid), AND the
+                // brand-new pointerConversions-gated isAssignable
+                // check below is bypassed. The DFS-descent helper
+                // closes both. Mirrors the checkCall + member-access
+                // fix (D-LANG-POINTER-VOID-CONVERT closure +
+                // silent-failure hunt fold).
+                TypeId initTy = subtreeType(s, tree, initNode);
                 auto resolved = extractNameNode(
                     tree, kids[*decl.nameChild], decl.nameMatch, cfg.identifierToken);
                 if (resolved.node.valid()) {
@@ -1351,7 +1437,16 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             }
                         } else if (initTy.valid()
                                    && !isAssignable(s.lattice.interner(),
-                                                    rec.type, initTy)) {
+                                                    rec.type, initTy,
+                                                    tree.schema().semantics()
+                                                        .pointerConversions)
+                                   // D-LANG-NULL-POINTER-CONSTANT (step
+                                   // 13.3): admit `T* p = 0;` initializer
+                                   // per C §6.3.2.3.3.
+                                   && !admitsNullPointerConstant(
+                                          s, tree, rec.type, initNode,
+                                          tree.schema().semantics()
+                                              .pointerConversions)) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::S_TypeMismatch;
                             d.severity = DiagnosticSeverity::Error;
@@ -1594,26 +1689,63 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
     auto params = s.lattice.interner().fnParams(fnTy);
 
-    bool const variadic = s.symbols.at(calleeSym).variadicBuiltin;
-    if (!variadic && argNodes.size() != params.size()) {
+    // D-LANG-VARIADIC (step 13.4): a C-style variadic FnSig
+    // (scalars[1] == 1) admits >= fixedParamCount args; a non-variadic
+    // FnSig admits exactly fixedParamCount. The pre-existing
+    // `variadicBuiltin` flag (e.g. tsql COALESCE) admits ANY arg count
+    // — those builtins have no fixed prefix to require.
+    bool const variadicBuiltin = s.symbols.at(calleeSym).variadicBuiltin;
+    bool const variadicFnSig   = s.lattice.interner().fnIsVariadic(fnTy);
+    bool const tooFewForVariadic =
+        variadicFnSig && argNodes.size() < params.size();
+    bool const wrongCountForFixed =
+        !variadicBuiltin && !variadicFnSig
+        && argNodes.size() != params.size();
+    if (tooFewForVariadic || wrongCountForFixed) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::S_ArgCountMismatch;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(node);
-        d.actual   = std::to_string(argNodes.size());
+        // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-1: mirror the
+        // HIR verifier's "fixed " word for variadic-too-few so users
+        // can distinguish "wrong fixed-arity" from "variadic prefix
+        // too short" without inspecting the FnSig.
+        d.actual   = tooFewForVariadic
+            ? std::format("{} (fewer than {} fixed parameter(s))",
+                          argNodes.size(), params.size())
+            : std::to_string(argNodes.size());
         s.reporter.report(std::move(d));
         return;
     }
+    bool const variadic = variadicBuiltin || variadicFnSig;
 
     // Per-arg assignability (only up to the declared arity for variadics).
     std::size_t const checkCount = variadic
         ? std::min(argNodes.size(), params.size())
         : params.size();
+    // Use subtreeType (not raw typeAt) so the check sees the type of a
+    // bare identifier reference or literal whose type sits on a leaf
+    // descendant of the expression wrapper. Pre-fix, `typeAt(argNodes[i])`
+    // returned InvalidType for bare `x` references (the wrapper isn't in
+    // the type side-table) and the `if (!argTy.valid()) continue;`
+    // silently suppressed the diagnostic — a real silent-failure surface
+    // that step-13.2 surfaced via DistinctTypedPointersRemainMismatch.
+    // The same descent helper already powers checkReturn (`subtreeType`
+    // is defined directly below).
+    auto const& ptrRules = tree.schema().semantics().pointerConversions;
     for (std::size_t i = 0; i < checkCount && i < argNodes.size(); ++i) {
-        TypeId argTy = s.typeAt(argNodes[i]);
+        TypeId argTy = subtreeType(s, tree, argNodes[i]);
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
-        if (!isAssignable(s.lattice.interner(), params[i], argTy)) {
+        if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules)) {
+            // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
+            // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
+            // check lives here (NOT in isAssignable) because it is
+            // value-aware (looks at the literal's decoded value).
+            if (admitsNullPointerConstant(s, tree, params[i],
+                                          argNodes[i], ptrRules)) {
+                continue;
+            }
             ParseDiagnostic d;
             d.code     = DiagnosticCode::S_TypeMismatch;
             d.severity = DiagnosticSeverity::Error;
@@ -1625,20 +1757,221 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     }
 }
 
+// D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C §6.3.2.3.3,
+// an integer constant expression with value 0 is a null pointer constant
+// — convertible WITHOUT cast to any object-pointer or function-pointer
+// type. This helper admits ONLY the bare integer-literal `0` form (not
+// `+0` / `-0` / `0+0` / `(int)0`). Audit fold (6-agent 2nd-order F3,
+// 2026-06-02): the wider unary/cast/const-eval admission was DROPPED to
+// avoid a HIR/semantic divergence — the HIR `coerce()` arm matches on
+// `HirKind::Literal` of the child node, and a `-0` source expression
+// lowers to `UnaryOp(Neg, Literal(0))` whose top-level HIR kind is
+// `UnaryOp`. Semantic admission of `-0` without HIR materialization
+// would leak an un-Cast `I32` into a `Ptr<*>` slot at the verifier. The
+// wider admission lives at D-LANG-NULL-PTR-CONST-EVAL, which adds a
+// const-eval pre-pass producing a typed integer-zero result that both
+// tiers can recognize uniformly.
+//
+// **Honest behavior note** (2nd-order audit comment-analyzer #3,
+// 2026-06-02): the helper itself rejects `-0` (returns false on the
+// MinusOp non-literal token). But callers thread through
+// `subtreeType` first to compute `argTy`; with `-0` the operator-stop
+// in subtreeType returns InvalidType, and the caller's
+// `if (!argTy.valid()) continue;` cascade-suppression silently
+// skips the assignability check — `f(-0)` neither admits nor fires
+// a diagnostic. Closing this cascade-suppression false-negative
+// requires pass-2 expression typing on unary wrappers (anchored at
+// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS full closure).
+//
+// Implementation: walks the subtree, rejecting on any non-literal
+// token (operator / delimiter / etc.) and requiring exactly one
+// typed integer-literal Token leaf with decoded value 0.
+[[nodiscard]] bool
+isLiteralIntegerZero(EngineState const& s, Tree const& tree, NodeId node) {
+    if (!node.valid()) return false;
+    NodeId onlyLeaf;
+    int    typedCount = 0;
+    std::vector<NodeId> stack{node};
+    while (!stack.empty()) {
+        NodeId cur = stack.back();
+        stack.pop_back();
+        if (tree.kind(cur) == NodeKind::Token) {
+            if (isEmptySpace(tree.flags(cur))) continue;
+            auto const tk = tree.tokenKind(cur);
+            auto litIt = s.idx().literalTypeIds.find(tk.v);
+            if (litIt == s.idx().literalTypeIds.end()) {
+                // Non-literal token (operator / delimiter / etc.) —
+                // reject. This is the single gate that rules out
+                // `-0` (MinusOp present), `(0)` (ParenOpen present),
+                // `0 + 0` (PlusOp present), etc. — matching HIR
+                // coerce()'s `HirKind::Literal`-only admit shape.
+                return false;
+            }
+            if (!s.typeAt(cur).valid()) continue;
+            if (++typedCount > 1) return false;
+            onlyLeaf = cur;
+            continue;
+        }
+        for (auto child : tree.children(cur)) {
+            if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
+        }
+    }
+    if (typedCount != 1 || !onlyLeaf.valid()) return false;
+    auto const tk = tree.tokenKind(onlyLeaf);
+    auto litIt = s.idx().literalTypeIds.find(tk.v);
+    if (litIt == s.idx().literalTypeIds.end()) return false;
+    // Integer kind only (signed or unsigned). Floats / bools / chars
+    // can never be a NULL pointer constant.
+    auto const kind = s.lattice.interner().kind(litIt->second);
+    using namespace detail::type_rules;
+    if (signedIntRank(kind) == 0 && unsignedIntRank(kind) == 0) return false;
+    auto const decoded =
+        decodeInteger(tree.text(onlyLeaf), s.idx().numberStyle);
+    return decoded.has_value() && *decoded == 0;
+}
+
+// D-LANG-NULL-POINTER-CONSTANT helper (step 13.3): returns true when
+// the conversion `rhsExpr → lhsTy` should be admitted as a null-pointer
+// conversion. The shape is shared between checkCall arg-check,
+// checkReturn, and pass-2 decl-init — all three must read it identically
+// so a NULL passed as call-arg, return-value, or initializer behaves
+// the same. Source-agnostic: the rule fires only when the active
+// language declares `pointerConversions.nullPointerConstantFromIntegerZero:
+// true` (default false — Rust/Swift-friendly). The flag check lives
+// here; `isLiteralIntegerZero` is a structural-only helper that
+// makes no config check.
+[[nodiscard]] bool
+admitsNullPointerConstant(EngineState const& s, Tree const& tree,
+                          TypeId lhsTy, NodeId rhsExpr,
+                          SemanticConfig::PointerConversionRules const& rules) {
+    if (!rules.nullPointerConstantFromIntegerZero) return false;
+    if (!lhsTy.valid()) return false;
+    if (s.lattice.interner().kind(lhsTy) != TypeKind::Ptr) return false;
+    return isLiteralIntegerZero(s, tree, rhsExpr);
+}
+
 // GAP A: the type carried by an expression subtree. Pass 2 types literal
 // leaves and propagates resolved-symbol types to reference wrapper nodes,
 // but a literal's type lives on the leaf, not the enclosing expression
 // wrapper. So check `node` first, then DFS for the first typed descendant.
 // Generic — no rule names, just the side-table.
+//
+// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS (anchor, audit fold 2026-06-02,
+// silent-failure 2nd-order H1): the DFS descent is correct ONLY when every
+// wrapper rule between `node` and the first typed descendant is
+// TYPE-TRANSPARENT (passes its inner expression's type through unchanged).
+// Today's c-subset has exactly one such wrapper class (paren-expression),
+// which is type-transparent by construction. When c-subset gains
+// TYPE-CHANGING wrappers (cast-expression `(int*)q`, sizeof-expression,
+// future address-of/dereference rules that re-type the result), pass 2
+// MUST type the wrapper node itself with the EVALUATED expression type —
+// otherwise `subtreeType` would descend past the cast and return the
+// inner's pre-cast type. Example failure mode: `int *p = (int*)voidPtr;`
+// with `voidPtr` typed `Ptr<Void>` and pass 2 forgetting to type the
+// castExpr wrapper — subtreeType returns `Ptr<Void>`, the init-arm fires
+// `implicitFromVoidPtr` (admits), and the verifier sees a Ptr<Void> at
+// the slot expecting Ptr<I32>. Latent today (no castExpr in c-subset);
+// closure: when castExpr lands (likely co-cycle with D-CSUBSET-CONST-PTR-DECAY
+// or D-LK10-CRT-INIT-INVOKE's CRT helper imports), promote `subtreeType`
+// to take a wrapper-rule allowlist from `SemanticConfig` declaring which
+// rules are type-transparent — or assert at pass-2-completion that every
+// declared type-changing rule has set its wrapper-node type. Trigger:
+// first c-subset construct whose wrapper-rule semantically re-types its
+// inner expression.
 [[nodiscard]] TypeId
 subtreeType(EngineState const& s, Tree const& tree, NodeId node) {
     if (!node.valid()) return InvalidType;
     if (TypeId t = s.typeAt(node); t.valid()) return t;
+    // D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS partial closure
+    // (step 13.3, 2026-06-02): when descending the subtree, STOP at
+    // any internal node that holds an operator-token child (any
+    // arity — prefix `&x` / `*p`, infix `a + b`, postfix `i++`,
+    // ternary `c ? a : b`, grouped postfix `f(args)` / `a[i]`). Such
+    // wrappers RE-TYPE their inner expression and pass 2 hasn't
+    // computed the wrapper's type yet (no semantic-tier expression
+    // typing today). Returning the inner-leaf type would be wrong
+    // — `&x` on an `int x` would return I32 instead of Ptr<I32>.
+    // Returning InvalidType triggers cascade-suppression at the
+    // caller, matching the pre-13.2 false-negative shape for these
+    // wrappers (the bare-identifier / literal / call-result paths
+    // remain correctly typed). Source-agnostic via the schema's
+    // OperatorTable — any language declaring an operator in its
+    // JSON gets the right behavior.
+    //
+    // Full closure (anchor still open): pass 2 needs explicit
+    // expression-typing arms for unary/binary/ternary so the wrapper
+    // node carries the evaluated type — eliminates this descent
+    // stop entirely. Trigger: first c-subset feature that needs
+    // S_TypeMismatch on a unary/binary call-arg, init, or return.
+    auto const& opTable = tree.schema().operatorTable();
+    // 2nd-order audit fix (silent-failure + code-reviewer Critical,
+    // step 13.3a): the previous arity-based check was BROKEN. C-style
+    // operators like `-`, `+`, `*`, `&` are registered for BOTH
+    // Prefix AND Infix arities at the same `SchemaTokenId`. So
+    // `lookup(PlusOp, Prefix)` returns Some EVEN when the token is
+    // appearing in an INFIX position — which silently cascade-
+    // suppressed mismatches on every binary-arithmetic call-arg
+    // (`f(a+b)` where `f` takes a pointer would no-op the strict
+    // mismatch check). The fix is POSITION-BASED:
+    //   * Prefix detection = FIRST non-empty visible child IS a
+    //     prefix-capable token. The first-position discipline
+    //     distinguishes Prefix-USE from Infix-USE of the same
+    //     SchemaTokenId at the CST tier.
+    //   * Ternary detection = ANY visible Token child with Ternary
+    //     arity (the `?` of `c ? a : b` sits in middle position,
+    //     not first; its presence in the wrapper is sufficient).
+    //
+    // EXCLUDED dispatchers (deliberate — no stop):
+    //   * Postfix-grouped CALL wrappers (`f(args)`): typed by pass 2
+    //     at the call-typing arm (`s.nodeToType.set(node, fnTy.result)`),
+    //     so `typeAt(node)` returns the call's result type before
+    //     descent. Subscript wrappers (`a[i]`) are NOT typed by
+    //     pass 2 today — c-subset has no subscript surface, so
+    //     reverting to descend-through is no regression. Pass-2
+    //     subscript typing anchored at the D-SEMANTIC-SUBTREETYPE-
+    //     TRANSPARENT-WRAPPERS full closure trigger.
+    //   * Infix (`a + b`): first-position child is the LHS (an
+    //     Internal), so the prefix check naturally won't fire.
+    //     Type-preserving for integer arithmetic; inner leaf type
+    //     matches the wrapper's evaluated type.
+    //   * Postfix `i++` / `i--`: first-position child is the
+    //     operand (Internal), prefix check won't fire. Value-
+    //     modifying but type-preserving.
+    //
+    // Stops on type-preserving Prefix (`-x`/`+x`/`!x`/`~x`) are
+    // false-positives but match the pre-13.2 cascade-suppression
+    // shape — preferable to the false-NEGATIVE class the operator-
+    // table heuristic was added to prevent. Full closure (pass-2
+    // expression typing) anchored.
+    auto holdsOperator = [&](NodeId internal) {
+        bool first = true;
+        for (auto child : tree.children(internal)) {
+            if (isEmptySpace(tree.flags(child))) continue;
+            if (tree.kind(child) != NodeKind::Token) {
+                first = false;
+                continue;
+            }
+            auto const tk = tree.tokenKind(child);
+            if (first
+                && opTable.lookup(tk, OperatorArity::Prefix).has_value()) {
+                return true;
+            }
+            if (opTable.lookup(tk, OperatorArity::Ternary).has_value()) {
+                return true;
+            }
+            first = false;
+        }
+        return false;
+    };
     std::vector<NodeId> stack{node};
     while (!stack.empty()) {
         NodeId cur = stack.back();
         stack.pop_back();
         if (TypeId t = s.typeAt(cur); t.valid()) return t;
+        // Stop descent on a type-changing wrapper.
+        if (tree.kind(cur) == NodeKind::Internal && holdsOperator(cur)) {
+            continue;
+        }
         for (auto child : tree.children(cur)) {
             if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
         }
@@ -1709,7 +2042,14 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // An unknown result OR unknown expr type → skip (cascade suppression).
     TypeId const exprTy = subtreeType(s, tree, valueNode);
     if (!fnResult.valid() || !exprTy.valid()) return;
-    if (!isAssignable(s.lattice.interner(), fnResult, exprTy)) {
+    auto const& ptrRules = tree.schema().semantics().pointerConversions;
+    if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules)) {
+        // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
+        // from a Ptr<*>-returning function per C §6.3.2.3.3.
+        if (admitsNullPointerConstant(s, tree, fnResult,
+                                      valueNode, ptrRules)) {
+            return;
+        }
         emitMismatch(valueNode);
     }
 }
@@ -1757,6 +2097,13 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
             for (auto pc : bf.paramCores) {
                 paramTypes.push_back(s.lattice.interner().primitive(pc));
             }
+            // CcSysV is the canonical MIR-tier placeholder (mirrors
+            // the same convention as the user-function FnSig
+            // construction earlier in this TU + `hir_to_mir.cpp:
+            // lowerModuleInit`'s moduleInit FnSig): ML7's
+            // calling-convention pass maps to the target's real
+            // convention at materialize time via `cc.name` lookup.
+            // Do NOT inspect this CallConv field at MIR tier.
             TypeId const fnTy = s.lattice.interner().fnSig(
                 paramTypes, s.lattice.interner().primitive(bf.resultCore),
                 CallConv::CcSysV);

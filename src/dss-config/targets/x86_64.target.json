@@ -147,23 +147,56 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): integer compare (writes FLAGS, no GPR result). Two variants: reg-reg (REX.W 0x39 /r — cmp r/m64, r64) + reg-imm32 (REX.W 0x81 /7 imm32 — cmp r/m64, imm32 with sign-extended imm32). modrmRegExt=7 fills ModR/M.reg with the /7 opcode-extension digit. ML5 lowerICmp + lowerCondBr both emit `cmp` against an immediate-0 or against another reg.",
       "mnemonic":      "cmp",
       "result":        "none",
       "hasSideEffects": false,
       "minOperands":   2,
       "maxOperands":   2,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"] },
+            "template": { "rexW": true, "opcode": [57] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"] },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Materialize a 0/1 boolean from FLAGS. Payload carries the TargetCondCode (eq/ne/slt/.../uge); the LIR substrate is condition-blind. ML6 regalloc treats FLAGS as an implicit predecessor; AS1 emits the real x86_64 setcc-byte + movzx zero-extend sequence.",
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): materialize 0/1 byte from FLAGS by cond-code. Encoding `0F 90+cc /0 r8` — the LOW 4 BITS of the SECOND opcode byte carry the condition (resolved via the target's `condCodeEncoding` table from the inst's payload). Result is r8 (low byte of a GPR); upper bits left undefined per Intel SDM. The LIR substrate treats setcc's result as a GPR vreg — callers either compare against 0 immediately (cmp r64, imm32 with sign-extend; safe for boolean compare since AL=0/1) or zero-extend via a follow-up movzx. Cycle scope keeps the substrate minimal; D-LIR-SETCC-MOVZX-COMPOUND anchors the zero-extend pairing when a boolean must escape into a fully-extended 64-bit slot.",
       "mnemonic":      "setcc",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   0,
       "maxOperands":   0,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "$templateComment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): `forceRexPrefix: true` forces a REX prefix even when no W/R/X/B bit is set. Required so the byte-register-bearing setcc accesses spl/bpl/sil/dil (low byte of r4..r7) instead of the legacy ah/ch/dh/bh high-byte aliases. Without this, regalloc picking rsp/rbp/rsi/rdi would silently write the setcc result into the HIGH byte of a DIFFERENT physical register.",
+            "template": { "opcode": [15, 144], "condCodeFromPayload": true, "modrmRegExt": 0, "forceRexPrefix": true },
+            "resultSlot": "modrm.rm"
+          }
+        ]
+      }
     },
     {
       "$comment": "Hard-trap / 'this code path is unreachable'. AS1 maps to x86_64 ud2 (encoding `0F 0B`). Encoding added at D-LK10-ENTRY Slice A (2026-06-02) so the trampoline emitter can append `unreachable` after noreturn syscall / call_indirect_via_extern call sites — reaches `assemble()` and must emit bytes (the `TargetEncodingShape::None` arm in `asm.cpp` fails loud `A_NoEncodingDeclared`). Shape mirrors the `ret` opcode (zero-operand variant, no ModR/M, opcode bytes literal).",
@@ -228,6 +261,7 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): unconditional intra-function jump. Encoding `E9 rel32` (5 bytes). The 4-byte trailing rel32 is resolved at assemble-time via the BlockRel32 slot + per-function patch list (NOT a linker relocation — intra-function only). Operand[0] is a BlockRef naming the target basic block.",
       "mnemonic":      "jmp",
       "result":        "none",
       "terminatorKind": "br",
@@ -235,17 +269,43 @@
       "minOperands":   1,
       "maxOperands":   1,
       "minSuccessors": 1,
-      "maxSuccessors": 1
+      "maxSuccessors": 1,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["blockref"] },
+            "template": { "opcode": [233] },
+            "wires":    [
+              { "index": 0, "slotKind": "block.rel32" }
+            ]
+          }
+        ]
+      }
     },
     {
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): conditional intra-function jump with mandatory fallthrough. Compound encoding `0F 8x rel32; E9 rel32` (11 bytes total). The cond nibble in 0x80's low 4 bits comes from the inst's payload (TargetCondCode) via the schema's condCodeEncoding table. Both target blocks pass as BlockRef operands: operand[0] = ifTrue (taken when cond holds — encoded as the first rel32); operand[1] = ifFalse (the fallthrough — encoded as the trailing `E9 rel32`). The wire-1's `prefixOpcodeBytes: [0xE9]` bridges the two displacements. A future optimizer pass elides the trailing jmp when ifFalse is the next-laid-out block (anchored D-OPT-JCC-FALLTHROUGH).",
       "mnemonic":      "jcc",
       "result":        "none",
       "terminatorKind": "cond-br",
       "hasSideEffects": true,
-      "minOperands":   0,
-      "maxOperands":   255,
+      "minOperands":   2,
+      "maxOperands":   2,
       "minSuccessors": 2,
-      "maxSuccessors": 2
+      "maxSuccessors": 2,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["blockref", "blockref"] },
+            "template": { "opcode": [15, 128], "condCodeFromPayload": true },
+            "wires":    [
+              { "index": 0, "slotKind": "block.rel32" },
+              { "index": 1, "slotKind": "block.rel32", "prefixOpcodeBytes": [233] }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "call sym — direct near call to a symbol. Encoding: 0xE8 + 4-byte signed PC-relative displacement to the call target (filled with 0 by the assembler; the linker patches via the rel32 relocation). The schema's maxOperands=255 admits a call ABI where extra operands carry arg-register hints; cycle-4 wires the single-SymbolRef variant (the direct-call form). An indirect-call form (call rax, encoding REX 0xFF /2) is anchored as a future variant.",
@@ -435,14 +495,27 @@
       "maxSuccessors": 0
     },
     {
-      "$comment": "Zero-extend integer (cycle 3c cast lowering for MIR ZExt). Operands: [src_reg]. AS1 emits movzx.",
+      "$comment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): zero-extend the low BYTE of a register to a full r64. Encoding `REX.W 0F B6 /r` — movzx r64, r/m8. ModR/M.reg = result (dest, 64-bit); ModR/M.rm = operand[0] (src, low-byte). REX.W=true serves double duty: (a) sets dest to r64, (b) forces REX prefix presence so the SRC low-byte access uses the spl/bpl/sil/dil aliasing (proper 8-bit access of r4..r7) instead of the legacy ah/ch/dh/bh high-byte alias. The natural consumer is the setcc → zext pair lowered by `lowerICmp`, but it is also reused by MIR ZExt for arbitrary boolean-typed → int widening.",
       "mnemonic":      "zext",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "rexW": true, "opcode": [15, 182] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Truncate integer (cycle 3c cast lowering for MIR Trunc). Operands: [src_reg]. AS1 emits mov of the low N bits (effectively a no-op on x86_64 since registers alias subregs).",
@@ -495,10 +568,23 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
-      "$comment": "Integer two's-complement negate. AS1 emits x86_64 `neg`.",
+      "$comment": "Integer two's-complement negate — REX.W 0xF7 /3 (NEG r/m64). D-CSUBSET-LOCAL-INT-CODEGEN closure (step 13.3b, 2026-06-02): encoding row added so c-subset's unary minus (`-x`) lowers through the assembler. requires2Address mirrors the sub/mul shape — the operand IS the destination, the 2-addr legalize pass guarantees this invariant before encoding (insert a mov when result != operand[0] at MIR→LIR time). modrmRegExt=3 fills ModR/M.reg with the /3 opcode-extension digit.",
       "mnemonic": "neg", "result": "value",
+      "requires2Address": true,
       "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Float arithmetic (cycle 3d FPR wave). FAdd → `addsd`/`addss` per width; cycle 3d emits the abstract opcode and lets AS1 pick the right scalar variant from the operand width.",
@@ -640,7 +726,9 @@
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: at SysV process entry the kernel maps the image and JUMPS to `_start` with RSP 16-byte-aligned and NO return address pushed — so RSP bias mod stackAlignment is 0. The trampoline emitter computes its prologue `sub rsp, N` via `alignedSizeWithBias(shadowSpaceBytes=0, stackAlignment=16, bias=0) = 0` — no prologue emitted, which is correct for SysV (no shadow space + already aligned).",
       "entryStackPointerBias": 0,
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address. ML7 `computeFrameLayout` consumes this as the bias for non-leaf functions so their prologue `sub rsp, N` produces RSP ≡ 0 mod 16 at the next call site. SysV's entry bias is 0 (kernel JMP) but this in-program call-push is 8 — the two distinct facts coincide on Win64 (both 8) and diverge here. Without this wired, the user-fn → extern-call shadow-space + alignment violation reappears one stack frame below the trampoline (the same 0xC0000005 class as D-LK10-ENTRY-TRAMP-PROLOGUE, now recurring at the user-fn boundary).",
-      "callPushBytes": 8
+      "callPushBytes": 8,
+      "$variadicVectorCountRegComment": "D-LANG-VARIADIC (step 13.4, 2026-06-02): SysV AMD64 §3.5.7 — the caller MUST set AL to the number of vector (XMM) registers used to pass variadic arguments before any call to a function with `...`. printf reads %al to know whether to consult the XMM save area in its va_list walk; passing AL uninitialized yields garbage formatting and (on hardened glibcs) an abort. C-subset has no float type today, so every variadic call from c-subset stamps the count as 0; the count-of-FPRs logic in ML7 materialize is data-driven via this field — future float support (in c-subset or any other source language) lights up the same code path with zero substrate change. The field names `rax` (the register table's canonical full-width name) rather than `al` (the ABI document's low-byte alias) because the register table does NOT yet model the x86 subregister aliases (al / ax / eax for the low-byte / low-word / low-dword of rax); anchored D-TARGET-SUBREGISTER-ALIASES. Writing rax = count is ABI-equivalent: a `mov rax, <count<=8>` sets AL to the same byte and the upper bits are irrelevant to printf's ABI contract.",
+      "variadicVectorCountReg": "rax"
     },
     {
       "name": "ms_x64",
@@ -661,9 +749,24 @@
       "$entryStackPointerBiasComment": "D-LK10-ENTRY-TRAMP-PROLOGUE: at Windows process entry, `RtlUserThreadStart` does a CALL into the entry point, so RSP at the first trampoline instruction is ≡8 mod 16. The trampoline emitter computes its prologue `sub rsp, N` via `alignedSizeWithBias(shadowSpaceBytes=32, stackAlignment=16, bias=8)`: smallest N >= 32 with N ≡ 8 mod 16 = 40. That single `sub rsp, 0x28` (a) reserves 32 bytes of caller-side shadow space for ExitProcess + (b) realigns RSP from ≡8 to ≡0 mod 16 so both `call user_entry` and `call [iat_ExitProcess]` enter their callees at the ABI-mandated RSP ≡8 mod 16. Without this field wired, ExitProcess's aligned-SSE stores produced STATUS_ACCESS_VIOLATION on CLI-emitted binaries (smoke test `mov eax,42; ret` hid it because the test fn never touched the stack and the specific ExitProcess code path didn't hit movaps with misaligned RSP).",
       "entryStackPointerBias": 8,
       "$callPushBytesComment": "D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: x86_64 `call` instruction pushes the 8-byte return address (same as SysV — ISA-level fact). ML7 `computeFrameLayout` for any non-leaf Win64 function emits `sub rsp, N` where N satisfies BOTH N >= max(savedRegs+spill, shadowSpaceBytes=32) AND N ≡ callPushBytes=8 (mod stackAlignment=16) — same `alignedSizeWithBias` helper the trampoline emitter uses. For a hello_puts-shape main (no callee-saved, no spills, calls puts): raw = max(0, 32) = 32; N = alignedSizeWithBias(32, 16, 8) = 40. Main's prologue becomes `sub rsp, 0x28`; main calls puts at RSP ≡ 0 mod 16 (Win64 ABI requirement) with 32 bytes of shadow space available for puts's register-arg home area. This closes the actual cause of the 2026-06-02 hello_puts SEGV — NOT a CRT-init gap (msvcrt's DllMain self-inits stdio at DLL load).",
-      "callPushBytes": 8
+      "callPushBytes": 8,
+      "$slotAlignedComment": "D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64 uses SLOT-ALIGNED arg passing — each arg consumes one shared slot index regardless of register class. Slot N reserves BOTH argGprs[N] AND argFprs[N]. `f(int, double, int, double, int)` consumes slots 0..4 → (rcx OR xmm0, rdx OR xmm1, r8 OR xmm2, r9 OR xmm3, [rsp+0x20]). Pure-GPR calls (WriteFile, GetStdHandle, etc.) happen to give the same overflow count as independent counters; mixed-class calls require the slot-aligned counting to land arg-5 on the stack correctly. ML7 `computeMaxOutgoingStackArgs` + `materializeOneFunc` consult this flag.",
+      "slotAligned": true
     }
   ],
+  "$condCodeEncodingComment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): per-cond-code nibble mapping for x86 setcc / jcc opcodes. The encoder OR's this nibble into the LOW 4 BITS of the LAST opcode byte: setcc emits `0F 9x` (where x = cc nibble); jcc emits `0F 8x rel32`. Numeric values from Intel SDM Vol. 1 Appendix B (condition code encoding table). 10-arm coverage matches the substrate's `TargetCondCode` enum exactly. ARM64 will declare its own table mapping into bits 0..3 of the B.cc instruction word — different numeric values, same field-position abstraction (D-AS3-COND-CODE-ARM64 anchor).",
+  "condCodeEncoding": {
+    "eq":  4,
+    "ne":  5,
+    "slt": 12,
+    "sle": 14,
+    "sgt": 15,
+    "sge": 13,
+    "ult": 2,
+    "ule": 6,
+    "ugt": 7,
+    "uge": 3
+  },
   "$relocationsComment": "Relocation taxonomy (plan 13 AS4 + plan 14 LK6 cycle 1 + D-LK6-1 closure 2026-06-01). Opaque uint32 `kind` tags the assembler stamps onto each emitted Relocation; the linker reads via TargetSchema::relocationInfo(kind). `formula` is a CLOSED-ENUM DISCRIMINATOR (load-bearing — see RelocFormulaKind in target_schema.hpp): 'linear' (S + A + (pcRel ? -P : 0) + addendBias; widthBytes LE), or one of the bit-shift variants ('aarch64_call26' / 'aarch64_adr_prel_pg_hi21' / 'aarch64_add_abs_lo12'). For 'linear', the structured fields (pcRelative + addendBias + widthBytes) parameterize the formula. Tag values are arbitrary per-target — only the NAME round-trips with format.json cross-reference.",
   "relocations": [
     { "name": "rel32", "kind": 1, "formula": "linear", "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },

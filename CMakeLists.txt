@@ -87,4 +87,30 @@ if(DSS_BUILD_TESTS)
     # IS the fix; no separate anchor is tracked.
     add_subdirectory(integrated_tests)
     add_subdirectory(tests)
+
+    # Anchor-registry CI guard (2026-06-03 — per the cross-plan
+    # staleness sweep + the standing discipline that "make the
+    # system enforce it" is the right move for recurring leaks).
+    # Every `D-*` anchor cited in src/ must resolve to a row /
+    # citation in any .plans/*.md file. Same shape as the
+    # agnosticism veto + the CallConv static_assert — system-
+    # enforced rather than convention-enforced.
+    #
+    # Dispatches to the platform-appropriate script. The bash
+    # variant runs on Linux/macOS CI; the PowerShell variant runs
+    # on Windows CI. Both share the same contract + registry file.
+    if(WIN32)
+        find_program(POWERSHELL_EXE NAMES pwsh powershell REQUIRED)
+        add_test(
+            NAME anchor_registry_guard
+            COMMAND ${POWERSHELL_EXE}
+                    -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.ps1"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    else()
+        add_test(
+            NAME anchor_registry_guard
+            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.sh"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    endif()
 endif()

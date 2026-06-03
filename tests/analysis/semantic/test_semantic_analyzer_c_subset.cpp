@@ -145,6 +145,371 @@ TEST(SemanticAnalyzerCSubset, PointerDeclaratorTypedAsPtr) {
     EXPECT_EQ(ti.kind(ti.operands(ti.operands(pp->type)[0])[0]), TypeKind::I32);
 }
 
+// D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): `void *p` types
+// as `Ptr<Void>` — the existing pointer-declarator machinery handles
+// the Void element type without special-casing (the grammar parses
+// `void` + StarOp; resolveTypeNode wraps the Void TypeId in
+// interner.pointer()).
+TEST(SemanticAnalyzerCSubset, VoidStarDeclaratorTypedAsPtrVoid) {
+    auto cu = buildShippedUnit("c-subset", { "void f() { void *p; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* p = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "p") p = &model.symbols()[i];
+    }
+    ASSERT_NE(p, nullptr);
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(p->type)[0]), TypeKind::Void)
+        << "void* must intern as Ptr<Void> (the untyped-memory case "
+           "of Void's dual semantics — distinct from void-return)";
+}
+
+// D-LANG-POINTER-VOID-CONVERT: an extern function taking `void*`
+// argument types correctly + the call site passing a `char*` arg
+// must accept without diagnostic (C-standard §6.3.2.3 — c-subset
+// declares both directions implicit in pointerConversions).
+TEST(SemanticAnalyzerCSubset, CharStarToVoidStarArgImplicit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int handler(void* p);\n"
+        "int main() {\n"
+        "    char* s;\n"
+        "    return handler(s);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // Strict countCode pin (replaces an earlier any-bool sawMismatch
+    // loop that would have silently passed a wrong-code regression
+    // — e.g., an S_ReturnTypeMismatch firing in place of S_TypeMismatch
+    // would have masked the assertion).
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "char* → void* must be implicit in c-subset "
+           "(implicitToVoidPtr: true)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+}
+
+// D-LANG-POINTER-VOID-CONVERT: the reverse direction (`void*` →
+// `char*`) is also implicit under C semantics (c-subset declares
+// `implicitFromVoidPtr: true`) — C++ would forbid this without
+// an explicit cast.
+TEST(SemanticAnalyzerCSubset, VoidStarToCharStarArgImplicit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int handler(const char* s);\n"
+        "extern void* alloc(int n);\n"
+        "int main() {\n"
+        "    return handler(alloc(16));\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "void* → const char* must be implicit in c-subset "
+           "(implicitFromVoidPtr: true). When C++ frontend lands, "
+           "it would declare implicitFromVoidPtr: false and this "
+           "direction would require an explicit cast.";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+}
+
+// D-LANG-POINTER-VOID-CONVERT negative pin: distinct typed pointers
+// remain mismatch under c-subset (only `void*` ↔ `T*` is implicit;
+// `int*` → `char*` requires an explicit cast even in C).
+TEST(SemanticAnalyzerCSubset, DistinctTypedPointersRemainMismatch) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int handler(int* p);\n"
+        "int main() {\n"
+        "    char* s;\n"
+        "    return handler(s);\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // Pin EXACTLY ONE S_TypeMismatch (not duplicate cascade) AND
+    // zero adjacent mismatch codes — replaces the loose any-bool
+    // sawMismatch loop that would have admitted unrelated mismatch
+    // codes (S_ReturnTypeMismatch / S_ArgCountMismatch) as satisfying
+    // the assertion.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "char* → int* must NOT be implicit even in c-subset — "
+           "void* is the only universal-pointer special case; "
+           "ordinary typed pointers require an explicit cast";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArgCountMismatch), 0u);
+}
+
+// D-LANG-POINTER-VOID-CONVERT (step 13.2 audit fold): the
+// `pointerConversions`-gated `isAssignable` now reaches THREE
+// check sites in semantic_analyzer.cpp — `checkCall`'s call-arg
+// loop, `checkReturn`'s return-type check, and pass-2's
+// declaration-init arm. The original 13.2 tests exercised only
+// the call-arg site; these tests add return-direction + init-
+// direction pins (and a negative-pin via the return path).
+TEST(SemanticAnalyzerCSubset, VoidStarReturnFromTypedPtrImplicit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "void* f(int* p) { return p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u)
+        << "int* → void* via return must be implicit in c-subset "
+           "(implicitToVoidPtr: true)";
+}
+
+TEST(SemanticAnalyzerCSubset, TypedPtrReturnFromVoidStarImplicit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int* f(void* p) { return p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u)
+        << "void* → int* via return must be implicit in c-subset "
+           "(implicitFromVoidPtr: true). C++ would forbid.";
+}
+
+TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int* f(char* p) { return p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 1u)
+        << "char* → int* via return must NOT be implicit even in "
+           "c-subset (only void* gets the universal-pointer pass).";
+}
+
+// D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C §6.3.2.3.3,
+// the integer literal `0` is a null pointer constant — convertible to
+// ANY pointer type without a cast. c-subset declares
+// `nullPointerConstantFromIntegerZero: true` in its `pointerConversions`
+// block. These tests pin all three `isAssignable` call sites
+// (call-arg, return, init) AND a strict-reject case for non-zero
+// integer literals.
+TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsVoidStarArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(void* p);\n"
+        "int main() { f(0); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // F5 audit fix (6-agent 2nd-order, step 13.3a): pair the
+    // countCode(target) pin with `!hasErrors()` so a future
+    // wrong-code regression (e.g. a new S_NullPointerInvalid) can't
+    // silently satisfy the 0-count assertion.
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
+}
+
+TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsTypedPointerArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(int* p);\n"
+        "int main() { f(0); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // C §6.3.2.3.3: NULL pointer constant converts to ANY pointer type
+    // (not just void*) without a cast. F5 audit fix: pair countCode
+    // with !hasErrors so wrong-code regressions can't silently pass.
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "literal 0 must convert to int* without an explicit cast";
+}
+
+TEST(SemanticAnalyzerCSubset, NonZeroIntegerLiteralRejectsAsPointerArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(void* p);\n"
+        "int main() { f(1); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // Negative pin: ONLY the literal `0` admits as null pointer
+    // constant — `1` (or any non-zero int) must NOT silently convert.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "non-zero int literal must NOT be admitted as a null "
+           "pointer constant — only value-0 qualifies per C "
+           "§6.3.2.3.3";
+}
+
+TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsReturn) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int* f() { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());  // F5 audit fix
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u)
+        << "`return 0;` from an int*-returning function is a null "
+           "pointer conversion per C §6.3.2.3.3";
+}
+
+TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsInit) {
+    auto cu = buildShippedUnit("c-subset", {
+        "void f() { int* p = 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());  // F5 audit fix
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u)
+        << "`int* p = 0;` initializer is a null pointer constant";
+}
+
+// 2nd-order audit pin (code-reviewer Critical, step 13.3a): the
+// initial F1 fix used arity-based `OperatorTable.lookup(tk, Prefix)`,
+// which would have incorrectly matched binary-arithmetic operator
+// tokens (MinusOp/PlusOp/StarOp/BitAndOp are registered for BOTH
+// Prefix and Infix arities at the SAME SchemaTokenId in
+// c-subset.lang.json:128). The position-based fix only fires when
+// the FIRST visible child is a prefix-capable token — distinguishing
+// `-x` (first-position) from `a-b` (first-position is `a`). This
+// pin asserts S_TypeMismatch STILL fires on `f(1+1)` where `f`
+// takes a pointer; pre-position-fix it would have silently
+// cascade-suppressed.
+TEST(SemanticAnalyzerCSubset, InfixArithmeticStillFiresMismatchAtCallArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(char* p);\n"
+        "int main() { f(1+1); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "int (from `1+1`) → char* must fire mismatch — the "
+           "subtreeType operator-stop must NOT match PlusOp on its "
+           "INFIX usage at this wrapper (first-position child is "
+           "the integer literal, not the operator)";
+}
+
+// 2nd-order audit pin (silent-failure B-1, step 13.3a): document
+// the CURRENT cascade-suppression behavior on `f(-0)` so a future
+// tightening of subtreeType (pass-2 expression typing closure)
+// EXPLICITLY surfaces this case. Today the operator-stop returns
+// InvalidType for the `-0` wrapper (MinusOp at first position is
+// a registered Prefix operator); the call-arg check then
+// silently suppresses via `if (!argTy.valid()) continue;`. NO
+// diagnostic fires. This is the documented trade-off: false-
+// negative on Prefix-`-` rather than false-positive on `a-b`. The
+// fix is pass-2 expression typing of unary wrappers (anchored at
+// D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS full closure). If a
+// future tightening EITHER emits a diagnostic for `f(-0)` OR
+// admits `-0` as a null-pointer constant, this test will fail and
+// the maintainer will need to consciously update the pin.
+TEST(SemanticAnalyzerCSubset, NegativeZeroSilentlySuppressedAtCallArg) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern void f(void* p);\n"
+        "int main() { f(-0); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // CURRENT documented behavior: zero diagnostics. Pre-13.3a
+    // (with the original looser arity-check) and post-13.3a (with
+    // the position-based stop) BOTH produce zero diagnostics here
+    // — silent-suppression via cascade. Pin so future closures
+    // surface the change.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// F1 audit-fix pin (6-agent 2nd-order, step 13.3a): paren-wrapped
+// distinct-typed pointers must STILL fire S_TypeMismatch. Pre-fix,
+// subtreeType's operator-stop heuristic matched ParenOpen (shared
+// SchemaTokenId with the postfix call operator), which would have
+// suppressed the diagnostic. The narrowed operator-stop (Prefix +
+// Ternary only) excludes ParenOpen.
+TEST(SemanticAnalyzerCSubset, ParenWrappedDistinctTypedPointersStillMismatch) {
+    auto cu = buildShippedUnit("c-subset", {
+        "extern int handler(int* p);\n"
+        "int main() {\n"
+        "    char* s;\n"
+        "    return handler((s));\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 1u)
+        << "paren-wrapped char* → int* must still fire mismatch — "
+           "operator-stop must NOT match ParenOpen (which shares "
+           "the postfix-call SchemaTokenId with paren-wrapping)";
+}
+
+// D-LANG-POINTER-VOID-CONVERT audit fold (silent-failure 2nd-order H2):
+// the `subtreeType()` swap in `checkMemberAccess` (semantic_analyzer.cpp
+// lhsType lookup) had zero existing test coverage — pre-fix the
+// `typeAt(lhsNode)` returning InvalidType for bare-identifier wrappers
+// silently bypassed S_NotAPointer / S_NotAComposite / field-type
+// write-back. These 3 tests pin both the positive arrow-access path
+// AND the negative non-pointer-deref reject — without them, a future
+// regression in the swap (e.g. reverting to typeAt) would silently
+// pass.
+TEST(SemanticAnalyzerCSubset, StructMemberAccessViaArrowOnBareRefIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "void f(struct S *p) { p->x = 1; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAPointer), 0u)
+        << "p->x where p is Ptr<Struct> must NOT fire S_NotAPointer";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAComposite), 0u)
+        << "p->x where Struct has field x must NOT fire S_NotAComposite";
+}
+
+TEST(SemanticAnalyzerCSubset, ArrowAccessOnNonPointerFiresLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "void f(int n) { n->x = 1; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAPointer), 1u)
+        << "n->x where n is int must fire EXACTLY ONE S_NotAPointer "
+           "— pre-subtreeType swap the bare-ref wrapper's InvalidType "
+           "silently suppressed this diagnostic class entirely";
+}
+
+TEST(SemanticAnalyzerCSubset, StructDotMemberAccessOnBareRefIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "void f() { struct S s; s.x = 1; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAPointer), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAComposite), 0u)
+        << "Direct `s.x` access on bare Struct ref must be clean — "
+           "the swap admits both arrow-arm and dot-arm equally";
+}
+
 // SE-pointers (G5): a pointer parameter types as Ptr in the FnSig.
 TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
     auto cu = buildShippedUnit("c-subset", { "void f(int *p) {}\n" });

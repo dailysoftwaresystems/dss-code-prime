@@ -146,6 +146,17 @@ public:
     // The entry block (the function's first block). Aborts on a blockless function.
     [[nodiscard]] MirBlockId funcEntry(MirFuncId id) const;
 
+    // D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD (step 13.6 OPT1 gate):
+    // linkage attributes consumed by the optimizer's DCE pass and the
+    // downstream link-tier emitter. `isExternallyVisible(binding,
+    // visibility)` is the DCE-protect predicate.
+    [[nodiscard]] SymbolBinding funcBinding(MirFuncId id) const {
+        return funcArena_.at(id).binding;
+    }
+    [[nodiscard]] SymbolVisibility funcVisibility(MirFuncId id) const {
+        return funcArena_.at(id).visibility;
+    }
+
     // ── global accessors ──
     [[nodiscard]] TypeId   globalType(MirGlobalId id) const {
         return globalArena_.at(id).type;
@@ -162,6 +173,16 @@ public:
     // or `InvalidMirFunc` for constant-init or zero-init globals.
     [[nodiscard]] MirFuncId globalInitFunc(MirGlobalId id) const {
         return globalArena_.at(id).initFunc;
+    }
+    // D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD: same DCE-protect
+    // discipline as `funcBinding` / `funcVisibility`. A global
+    // with `isExternallyVisible(binding, visibility) == true` MUST
+    // survive DCE / unused-symbol elimination.
+    [[nodiscard]] SymbolBinding globalBinding(MirGlobalId id) const {
+        return globalArena_.at(id).binding;
+    }
+    [[nodiscard]] SymbolVisibility globalVisibility(MirGlobalId id) const {
+        return globalArena_.at(id).visibility;
     }
 
     // ── module-level iteration ──
@@ -244,7 +265,9 @@ public:
     // Open a function. Closes any open function first (which requires its current
     // block be terminated and the function have ≥1 block). `signature` is the
     // FnSig TypeId; `symbol` the declared SymbolId.
-    MirFuncId addFunction(TypeId signature, SymbolId symbol);
+    MirFuncId addFunction(TypeId signature, SymbolId symbol,
+                          SymbolBinding    binding    = SymbolBinding::Global,
+                          SymbolVisibility visibility = SymbolVisibility::Default);
 
     // ── literal pool ──
     // Append `value` to the module's literal pool and return the index.
@@ -264,7 +287,9 @@ public:
     // Aborts on a no-symbol or no-type call; aborts on the both-set combination.
     MirGlobalId addGlobal(TypeId type, SymbolId symbol,
                           std::uint32_t initLiteralIndex = UINT32_MAX,
-                          MirFuncId     initFunc         = {});
+                          MirFuncId     initFunc         = {},
+                          SymbolBinding    binding       = SymbolBinding::Global,
+                          SymbolVisibility visibility    = SymbolVisibility::Default);
 
     // Reserve a basic block in the current function WITHOUT opening it, returning
     // its id so terminators can target it before it is filled (forward branches).

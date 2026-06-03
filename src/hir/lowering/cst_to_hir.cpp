@@ -13,6 +13,7 @@
 #include "core/types/tree_node.hpp"             // isEmptySpace
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "hir/const_eval_arith.hpp"
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
@@ -217,6 +218,118 @@ struct Lowerer {
                     }
                 }
                 return {decay, target};
+            }
+        }
+        // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): when
+        // the active language's `pointerConversions` rules admit the
+        // direction-specific `Ptr<Void>` ↔ `Ptr<T>` conversion, emit
+        // a synthetic `Cast` HIR node. MIR-tier `mapCast` already
+        // routes Ptr→Ptr as `Bitcast` (no representation change at
+        // runtime) — every tier below MIR sees Ptr as pointer-width
+        // uniformly regardless of element type.
+        //
+        // The two arms are independent because the C++ self-host
+        // target distinguishes them: `T* → void*` (lhs is void*, rhs
+        // is T*, this is the `tk == Void` arm) is safe widening,
+        // permitted by C and C++; `void* → T*` (lhs is T*, rhs is
+        // void*, this is the `ck == Void` arm) is unsafe narrowing,
+        // permitted by C but FORBIDDEN by C++ (requires explicit
+        // cast). c-subset declares both true in
+        // `c-subset.lang.json`; default-constructed
+        // `PointerConversionRules` has both false (strict typing).
+        //
+        // Sister rule in `type_rules.hpp::isAssignable` — the
+        // semantic phase has already vetoed unsupported directions
+        // before reaching here, so this arm fires only when the
+        // active language admits the conversion. The `sem` field
+        // (Lowerer member, defined near the top of this TU) is
+        // bound by reference to the active schema's `SemanticConfig`
+        // at Lowerer construction (via `sch.semantics()`); there is
+        // no default-constructed fallback path. A schema whose
+        // `pointerConversions` block is absent loads as both flags
+        // `false` (strict typing) via the optional-field path in
+        // `grammar_schema_json.cpp`'s `pointerConversions` loader
+        // (search for the `if (sem.contains("pointerConversions"))`
+        // block — file-line citation deliberately omitted to remain
+        // stable under future reformatting of the loader TU).
+        if (ck == TypeKind::Ptr && tk == TypeKind::Ptr) {
+            auto const fromElem = interner.operands(child.type);
+            auto const toElem   = interner.operands(target);
+            if (!fromElem.empty() && !toElem.empty()) {
+                bool const fromIsVoid =
+                    interner.kind(fromElem[0]) == TypeKind::Void;
+                bool const toIsVoid =
+                    interner.kind(toElem[0]) == TypeKind::Void;
+                bool admit = false;
+                // T* → void* (toIsVoid && !fromIsVoid)
+                if (toIsVoid && !fromIsVoid) {
+                    admit = sem.pointerConversions.implicitToVoidPtr;
+                }
+                // void* → T* (fromIsVoid && !toIsVoid)
+                else if (fromIsVoid && !toIsVoid) {
+                    admit = sem.pointerConversions.implicitFromVoidPtr;
+                }
+                if (admit) {
+                    HirNodeId const cast = builder.makeCast(
+                        child.id, target, HirFlags::Synthetic);
+                    for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                        if (it->first == child.id) {
+                            spans.push_back({cast, it->second});
+                            break;
+                        }
+                    }
+                    return {cast, target};
+                }
+            }
+        }
+        // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): when
+        // the source expression is an integer-literal in a pointer-
+        // typed context and the active language admits null-pointer-
+        // constant conversion, materialize the null-pointer conversion
+        // as `Cast(IntLit, Ptr<T>)`. The MIR-tier Cast lowering routes
+        // integer→pointer as a zero-extending move into a pointer-
+        // width register (literal 0 → 8-byte zero on Win64 ms_x64),
+        // which Windows ABI reads as NULL.
+        //
+        // **Trust the semantic admission**: the value check (literal
+        // == 0) lives in `semantic_analyzer.cpp::isLiteralIntegerZero`
+        // at the CST tier. By the time coerce() is called, the
+        // semantic analyzer has already verified value==0 AND admitted
+        // the conversion; a NON-zero literal would have produced
+        // S_TypeMismatch before HIR lowering. Duplicating the value
+        // check at HIR tier requires a literal-pool lookup
+        // (`builder.payload` + `literals.at` + variant arm dispatch
+        // via `asInt64`) which is sensitive to STL implementation
+        // differences (caught on macOS CI 2026-06-02 where the literal
+        // pool variant access disagreed between hosts, silently
+        // skipping Cast emission). Trusting the semantic gate makes
+        // the lowering single-source-of-truth at the right tier.
+        //
+        // Source-agnostic: gates on the per-language config flag.
+        // Languages without null-pointer-constant (Rust/Swift/Zig)
+        // never admit at the semantic tier and never reach this arm
+        // with int→Ptr.
+        if (tk == TypeKind::Ptr
+            && sem.pointerConversions.nullPointerConstantFromIntegerZero
+            && builder.kind(child.id) == HirKind::Literal) {
+            auto const ck2 = interner.kind(child.type);
+            bool const isInt =
+                   ck2 == TypeKind::I8  || ck2 == TypeKind::I16
+                || ck2 == TypeKind::I32 || ck2 == TypeKind::I64
+                || ck2 == TypeKind::I128
+                || ck2 == TypeKind::U8  || ck2 == TypeKind::U16
+                || ck2 == TypeKind::U32 || ck2 == TypeKind::U64
+                || ck2 == TypeKind::U128;
+            if (isInt) {
+                HirNodeId const cast = builder.makeCast(
+                    child.id, target, HirFlags::Synthetic);
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({cast, it->second});
+                        break;
+                    }
+                }
+                return {cast, target};
             }
         }
         // Pointers, structs, FnSig are not coerced implicitly; let the
@@ -675,9 +788,19 @@ struct Lowerer {
         // If the callee's typeId is a FnSig, coerce each arg to its declared
         // param type. Variadic / unknown signatures pass through unchanged
         // (the verifier owns the arity-vs-FnSig rule).
-        std::span<TypeId const> paramTypes{};
+        //
+        // M2 silent-failure fix (3-agent root-cause analysis, 2026-06-02):
+        // copy `interner.fnParams()`'s span into a stable owned vector
+        // BEFORE the arg loop. The span points into the interner's
+        // `operandPool_` (a `std::vector<TypeId>`) which could be
+        // reallocated by ANY interner-growing call inside the loop
+        // (e.g., `interner.pointer()` / `interner.array()` during a
+        // nested arg lowering), silently dangling the span. Same
+        // pattern applied at lowerPostfix's call arm.
+        std::vector<TypeId> paramTypes;
         if (calleeTy.valid() && interner.kind(calleeTy) == TypeKind::FnSig) {
-            paramTypes = interner.fnParams(calleeTy);
+            auto const paramSpan = interner.fnParams(calleeTy);
+            paramTypes.assign(paramSpan.begin(), paramSpan.end());
         }
         std::size_t argIdx = 0;
         if (cr.argsChild < vis.size()) {
@@ -1096,9 +1219,23 @@ struct Lowerer {
             // Coerce each arg to its FnSig param type (when the callee's
             // signature is known). Same discipline as the lowerFlatExpr's
             // call arm above — single source of truth for arg-coercion.
-            std::span<TypeId const> paramTypes{};
+            //
+            // M2 silent-failure fix (3-agent root-cause analysis,
+            // 2026-06-02): `interner.fnParams()` returns a span into
+            // `operandPool_` (a `std::vector<TypeId>`). If the arg-
+            // coerce loop below triggers an interner reallocation
+            // (e.g., a future arg shape that calls `interner.pointer()`
+            // / `interner.array()` mid-loop via lowerExpr or coerce),
+            // the span would dangle silently — wrong-type reads with
+            // no diagnostic. Copy to a stable owned vector BEFORE the
+            // loop so iterations are robust against ANY downstream
+            // interner growth. Cost: one small heap allocation per
+            // call site; rare alternative is a `std::array`-backed
+            // small-buffer for ≤8-param calls (most calls).
+            std::vector<TypeId> paramTypes;
             if (base.type.valid() && interner.kind(base.type) == TypeKind::FnSig) {
-                paramTypes = interner.fnParams(base.type);
+                auto const paramSpan = interner.fnParams(base.type);
+                paramTypes.assign(paramSpan.begin(), paramSpan.end());
             }
             std::size_t argIdx = 0;
             for (NodeId argN : argExpressions(rest)) {
@@ -2554,6 +2691,64 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl.nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3,
+        // 2026-06-02): scan the tail subtree (varDeclTail or
+        // externFuncTail) for an optional trailing `stringLiteralExpr`
+        // node — when present, decode its body as the per-symbol
+        // import-library override. Source-language agnostic by rule
+        // name (any grammar that produces a child rule named
+        // `stringLiteralExpr` populates the override the same way).
+        // The decoder uses `decodeStringLiteralBody` (the same path
+        // string-literal-arg uses), so all C-family escapes work in
+        // the override string body.
+        auto extractLibraryOverride = [&]() -> std::string {
+            if (!decl.kindByChild) return {};
+            NodeId disc = descend(node, decl.kindByChild->childPath);
+            if (!disc.valid() || tree().kind(disc) != NodeKind::Internal) {
+                return {};
+            }
+            // Match by rule-name to stay source-agnostic. Any language
+            // whose grammar wraps the override in a rule named
+            // `stringLiteralExpr` (StringStart + StringLiteral body)
+            // gets per-symbol library routing for free.
+            RuleId const stringLitRule =
+                tree().schema().rules().find("stringLiteralExpr");
+            if (!stringLitRule.valid()) return {};
+            SchemaTokenId const stringLitTok =
+                tree().schema().schemaTokens().find("StringLiteral");
+            if (!stringLitTok.valid()) return {};
+            for (auto const& c : tree().children(disc)) {
+                if (tree().kind(c) != NodeKind::Internal) continue;
+                if (isEmptySpace(tree().flags(c))) continue;
+                if (tree().rule(c).v != stringLitRule.v) continue;
+                // The body is the inner StringLiteral token.
+                for (auto const& gc : tree().children(c)) {
+                    if (tree().kind(gc) != NodeKind::Token) continue;
+                    if (tree().tokenKind(gc).v != stringLitTok.v) continue;
+                    auto decoded =
+                        decodeStringLiteralBody(tree().text(gc));
+                    if (decoded.has_value()) return std::move(*decoded);
+                    // F4 audit fix (6-agent 2nd-order, step 13.3a):
+                    // fail-loud on malformed escape rather than
+                    // silently falling back to the format-level
+                    // default — pre-fix a user-typed `extern void f()
+                    // "k\xZZ.dll";` would silently link against
+                    // msvcrt.dll with no breadcrumb pointing at the
+                    // malformed override. H_ExternDeclMalformed is
+                    // already used for malformed extern declarations.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::H_ExternDeclMalformed;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree().source().id();
+                    d.span     = tree().span(gc);
+                    d.actual   = std::string{tree().text(gc)};
+                    reporter.report(std::move(d));
+                    return {};
+                }
+            }
+            return {};
+        };
+
         // FF6 Slice 2 (2026-06-02 + post-fold #1 simplifier): record
         // the extern for FFI synthesis. The canonical name comes
         // from the SymbolRecord (unmangled identifier as declared
@@ -2566,7 +2761,9 @@ struct Lowerer {
         // Both surfaces are unsuppressable + upstream-of-link.
         auto recordExtern = [&](HirNodeId h) {
             auto const* rec = model.recordFor(sym);
-            externDecls.push_back({h, rec ? rec->name : std::string{}});
+            externDecls.push_back({h,
+                                   rec ? rec->name : std::string{},
+                                   extractLibraryOverride()});
         };
         if (decl.kindByChild) {
             NodeId disc = descend(node, decl.kindByChild->childPath);

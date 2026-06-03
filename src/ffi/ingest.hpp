@@ -83,6 +83,14 @@ using IngestionSource = std::variant<BinaryLibrarySource,
 struct DSS_EXPORT ExternDeclRef {
     HirNodeId        node;
     std::string_view canonicalName;
+    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3, 2026-06-02):
+    // empty = the FFI synthesize stage uses the caller-supplied
+    // format-level default `importLibrary`; non-empty = per-symbol
+    // override (e.g. "kernel32.dll" for GetStdHandle/WriteFile when
+    // the language default is "msvcrt.dll"). Source-language
+    // agnostic — any language whose lowerer populates this field
+    // gets per-symbol routing.
+    std::string_view libraryOverride{};
 };
 
 // ── HirIngestResult ─────────────────────────────────────────────

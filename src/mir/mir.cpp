@@ -359,7 +359,9 @@ void MirBuilder::closeFunction_() {
     openFunc_ = MirFuncId{};
 }
 
-MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol) {
+MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
+                                  SymbolBinding    binding,
+                                  SymbolVisibility visibility) {
     // `symbol` MAY be invalid (0): synthetic/anonymous functions (thunks the
     // backend generates) have no source symbol. The signature, however, is always
     // required — codegen sizes the ABI from it.
@@ -374,6 +376,8 @@ MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol) {
     f.symbol     = symbol.v;
     f.blockStart = static_cast<std::uint32_t>(blockArena_.size());  // next block slot
     f.blockCount = 0;
+    f.binding    = binding;
+    f.visibility = visibility;
     MirFuncId const id = funcArena_.addNode(f);
     openFunc_ = id;
     return id;
@@ -385,7 +389,9 @@ std::uint32_t MirBuilder::literalPoolAdd(MirLiteralValue value) {
 
 MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
                                   std::uint32_t initLiteralIndex,
-                                  MirFuncId initFunc) {
+                                  MirFuncId initFunc,
+                                  SymbolBinding    binding,
+                                  SymbolVisibility visibility) {
     if (!type.valid()) {
         std::fputs("dss::MirBuilder fatal: addGlobal: type TypeId must be valid\n",
                    stderr);
@@ -411,6 +417,8 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
     g.symbol           = symbol.v;
     g.initLiteralIndex = initLiteralIndex;
     g.initFunc         = initFunc;
+    g.binding          = binding;
+    g.visibility       = visibility;
     return globalArena_.addNode(g);
 }
 

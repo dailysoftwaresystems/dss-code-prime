@@ -430,7 +430,15 @@ synthesizeFfiFromSourceDecls(
                                             format.kind());
         meta.linkage       = FfiLinkage::Strong;
         meta.visibility    = FfiVisibility::Default;
-        meta.importLibrary = libCopy;
+        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3): a
+        // per-symbol library override on the ExternDeclRef wins over
+        // the format-level default. Empty override = use the
+        // format-level fallback. Source-language agnostic — any
+        // language whose lowerer populates the override gets
+        // per-symbol routing without further substrate change.
+        meta.importLibrary = ext.libraryOverride.empty()
+                                 ? libCopy
+                                 : std::string{ext.libraryOverride};
         // `soname` left empty — same convention as `ingest()`.
 
         ffiMap.set(ext.node, std::move(meta));

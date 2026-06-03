@@ -110,6 +110,64 @@ targetAbiModelFromName(std::string_view s) noexcept {
     return kTargetAbiModelTable.fromName(s);
 }
 
+// Calling-convention name table. The `CallConv` enum itself lives in
+// `core/types/type_lattice/core_type.hpp` (TypeRecord's scalar pool
+// stores it as the underlying integer for FnSig). The name↔enum
+// mapping lives here alongside the 5 other `EnumNameTable` instances
+// so the cross-tier text emit/parse (HIR `.dsshir`, MIR `.dssir`)
+// reads a single source of truth. Adding a row here is the only edit
+// needed when a `CallConv` lands; the round-trip parsers + emitters
+// pick it up automatically. Audit-promoted from per-TU hand-rolled
+// if-chains in `hir_text.cpp` + `mir_text.cpp` (2026-06-02 cycle).
+inline constexpr EnumNameTable<CallConv, 9> kCallConvTable{{{
+    { CallConv::CcSysV,       "sysv"       },
+    { CallConv::CcMS64,       "ms64"       },
+    { CallConv::CcAAPCS64,    "aapcs64"    },
+    { CallConv::CcApple,      "apple"      },
+    { CallConv::CcFastcall,   "fastcall"   },
+    { CallConv::CcThiscall,   "thiscall"   },
+    { CallConv::CcVectorcall, "vectorcall" },
+    { CallConv::CcWasm,       "wasm"       },
+    { CallConv::CcSpirv,      "spirv"      },
+}}};
+
+[[nodiscard]] constexpr std::string_view callConvName(CallConv cc) noexcept {
+    return kCallConvTable.name(cc);
+}
+[[nodiscard]] constexpr std::optional<CallConv>
+callConvFromName(std::string_view s) noexcept {
+    return kCallConvTable.fromName(s);
+}
+
+// Compile-time silent-failure closure (silent-failure 2nd-order
+// audit, 2026-06-02): `EnumNameTable::name(e)` returns `rows[0].second`
+// on miss — `"sysv"` here. A future `CallConv` value added without
+// a matching `kCallConvTable` row would silently mint `"sysv"`-
+// labeled functions into `.dsshir` / `.dssir` text, corrupting
+// round-trip with no diagnostic. Pin: table size MUST cover every
+// enum value, AND each row MUST sit at the index matching its
+// enum's underlying value (also makes the lookup O(1) on a dense
+// enum). Pattern mirrors `c_mangle.cpp:42`. Anchored
+// D-ENUM-NAME-TABLE-STATIC-ASSERTS for retrofit to the 5 sibling
+// tables (TargetAbiModel / TargetCondCode / TargetResultRule /
+// TargetRegClass / TargetEncodingShape) — same silent-fallback
+// shape applies to each.
+static_assert(kCallConvTable.rows.size()
+              == static_cast<std::size_t>(CallConv::CcSpirv) + 1u,
+    "kCallConvTable must cover every CallConv — add the new row "
+    "when extending the enum or HIR/MIR text will silently emit "
+    "row-0 ('sysv') for the missing value.");
+static_assert([]{
+    for (std::size_t i = 0; i < kCallConvTable.rows.size(); ++i) {
+        if (static_cast<std::size_t>(kCallConvTable.rows[i].first) != i) {
+            return false;
+        }
+    }
+    return true;
+}(), "kCallConvTable rows must be ordered by CallConv underlying "
+     "value (enables O(1) name lookup AND surfaces a row-vs-enum "
+     "misorder at constexpr time).");
+
 // Universal integer-comparison condition codes (target-blind). Used by
 // LIR `jcc` (conditional branch) and `setcc` (materialize 0/1 from
 // FLAGS) opcodes via the LIR instruction's `payload` field. Every
@@ -343,6 +401,34 @@ struct DSS_EXPORT TargetCallingConvention {
     // implementation detail.
     std::uint16_t callPushBytes = 0;
 
+    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): when true,
+    // the cc uses SLOT-ALIGNED arg passing — each arg consumes ONE
+    // shared slot index regardless of its register class, AND both
+    // argGprs[N] AND argFprs[N] are reserved by slot N (matters for
+    // mixed int/float arg sequences). When false, the cc uses
+    // INDEPENDENT counters — gprIdx and fprIdx advance separately.
+    //
+    // Concrete shipped values:
+    //   * `ms_x64`     (Windows PE):           true  — `f(int, double,
+    //                                                   int, double,
+    //                                                   int)` consumes
+    //                                                   slots 0..4; slot 4
+    //                                                   overflows to stack.
+    //   * `sysv_amd64` (Linux ELF / Mach-O):   false — independent
+    //                                                   counters; ints fill
+    //                                                   rdi..r9, floats fill
+    //                                                   xmm0..xmm7 separately.
+    //   * `aapcs64`    (ARM64):                false — independent counters.
+    //
+    // Consumed by ML7 `materializeOneFunc`'s `arg` + `call` arms +
+    // `computeMaxOutgoingStackArgs` pre-scan. Under slot-aligned the
+    // outgoing-arg-area overflow count is `max(0, total_args -
+    // max(argGprs.size(), argFprs.size()))`; under independent it's
+    // `max(0, gprArgs - argGprs.size()) + max(0, fprArgs - argFprs.size())`.
+    // Pure-GPR calls (WriteFile, GetStdHandle, etc.) coincide between
+    // the two shapes; only mixed-class 5+ arg calls diverge.
+    bool slotAligned = false;
+
     // Named register reference. Used for distinguished-role registers
     // (link register, stack pointer, frame pointer in future cycles).
     // The struct shape co-locates the JSON-side `name` (kept for
@@ -368,6 +454,22 @@ struct DSS_EXPORT TargetCallingConvention {
     // memory addressing. Empty optional means a stack-pointer-less
     // target (operand-stack VMs).
     std::optional<NamedRegisterRef> stackPointer;
+
+    // D-LANG-VARIADIC (step 13.4, 2026-06-02): the register the caller
+    // MUST load with the count of vector (FPR) arguments passed in
+    // vector registers BEFORE the call instruction of any C-style
+    // variadic function. SysV AMD64 (§3.2.3): `al = number of XMM
+    // arguments used by varargs (0..8)`. Win64 ms_x64 has no
+    // equivalent (the loader-side ABI uses GPR-shadow + double-spill
+    // — anchored D-ML7-VARIADIC-WIN64-DOUBLE-SPILL — and this field
+    // is left empty). AAPCS64 (ARM64): no equivalent (variadic floats
+    // pass on the stack, no count register). Empty optional ⇒ this
+    // CC requires no caller-side vector-count register for variadic
+    // calls. When engaged, ML7 materialize for a Call with
+    // payload `isVariadic=true` counts FPR args in
+    // [fixedArgCount..N) and emits a `mov <reg>, <count>` before
+    // the call instruction.
+    std::optional<NamedRegisterRef> variadicVectorCountReg;
 };
 
 // Discriminates the byte-encoding shape an opcode commits to (plan 13
@@ -436,14 +538,23 @@ enum class OperandKindFilter : std::uint8_t {
                     // signed 32-bit displacement for [base+disp]
                     // addressing. Wired to `Disp32Mem` to emit 4 LE
                     // bytes after the ModR/M (and SIB when present).
+    BlockRef  = 5,  // `LirOperand{kind == BlockRef}` — D-CSUBSET-
+                    // WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): refers
+                    // to an INTRA-FUNCTION basic block. Wired to the
+                    // `BlockRel32` slot on x86 (4-byte trailing PC-
+                    // relative displacement, resolved at assemble time
+                    // via `walker_util::BlockRelPatch`). ARM64 will
+                    // use Imm19/Imm26 with different patch arithmetic
+                    // (anchored D-AS3-BLOCK-REL-IMM19/26).
 };
 
-inline constexpr EnumNameTable<OperandKindFilter, 5> kOperandKindFilterTable{{{
+inline constexpr EnumNameTable<OperandKindFilter, 6> kOperandKindFilterTable{{{
     { OperandKindFilter::Reg,       "reg"      },
     { OperandKindFilter::ImmInt,    "imm32"    },  // JSON-side width label
     { OperandKindFilter::SymbolRef, "symbol"   },
     { OperandKindFilter::MemBase,   "membase"  },
     { OperandKindFilter::MemOffset, "memoffset"},
+    { OperandKindFilter::BlockRef,  "blockref" },
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -548,12 +659,39 @@ enum class EncodingSlotKind : std::uint8_t {
     // the trailing byte position (same byte-emit pattern as
     // `Disp32`); the only difference is the forced ModR/M state.
     RipRelDisp32  = 12,
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
+    // OR the target's condition-code numeric encoding (looked up from
+    // the inst's payload, which carries a `TargetCondCode` value) into
+    // the LAST opcode byte's low 4 bits. Used by x86 setcc (`0F 90+cc`)
+    // and jcc (`0F 80+cc`). Wire has `index: 0` by convention (the
+    // payload is implicit; the wire just declares "the cond goes in
+    // the opcode byte"). The encoder fail-loud (A_NoCondCodeEncoding)
+    // if the target hasn't loaded `condCodeEncoding[]` — a missing
+    // table would silently OR zero (= TargetCondCode::Eq's nibble) and
+    // every conditional branch would resolve as `je`.
+    CondCodeNibble = 13,
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE: 32-bit PC-relative displacement
+    // to an INTRA-FUNCTION basic block (resolved at assemble time, no
+    // linker relocation emitted). The walker emits 4 LE bytes of zero
+    // + records a (patch-byte-offset, target-LirBlockId) entry in the
+    // per-function patch list. After all blocks/insts of the function
+    // are encoded, `asm.cpp` resolves each patch by computing
+    // `block_offsets[target] - (patch_offset + 4)` and writing back
+    // the 4 LE bytes. Wire reads the BlockRef from operands[index]
+    // (jmp's operand[0]) — for opcodes whose block target lives in
+    // the block's successor pool rather than operands, the lowering
+    // pass MUST duplicate the BlockRef as an operand (jcc lowering
+    // passes both successors as BlockRef operands AS WELL AS via the
+    // `recordSuccessors_` API). Symmetric with the `addBr` precedent
+    // which already encodes the target both as operand[0] and via
+    // successors[0].
+    BlockRel32     = 14,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
     //   ImmShift / Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 13> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 15> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -567,6 +705,8 @@ inline constexpr EnumNameTable<EncodingSlotKind, 13> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Disp32Mem,    "disp32.mem"    },
     { EncodingSlotKind::SibIndex,     "sib.index"     },
     { EncodingSlotKind::RipRelDisp32, "riprel.disp32" },
+    { EncodingSlotKind::CondCodeNibble, "condcode.nibble" },
+    { EncodingSlotKind::BlockRel32,    "block.rel32"    },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -585,7 +725,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 13,
+static_assert(kEncodingSlotKindCount == 15,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -609,6 +749,8 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Disp32Mem:
         case EncodingSlotKind::SibIndex:
         case EncodingSlotKind::RipRelDisp32:
+        case EncodingSlotKind::CondCodeNibble:
+        case EncodingSlotKind::BlockRel32:
             return TargetEncodingShape::X86Variable;
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
@@ -655,6 +797,29 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // `x86-variable` shape.
     std::optional<std::uint8_t> modrmRegExt;
 
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): when true,
+    // the encoder reads the inst's `payload` field as a
+    // `TargetCondCode`, looks up the schema's `condCodeEncoding[]`
+    // nibble for that condition, and OR's it into the LAST opcode
+    // byte of `opcodeBytes`. Used by x86 setcc (`0F 90+cc`) and jcc
+    // (`0F 80+cc`). Fail-loud when the target hasn't loaded
+    // `condCodeEncoding[]` (A_NoCondCodeEncoding) — silently OR'ing
+    // zero would map every condition to `eq`.
+    bool condCodeFromPayload = false;
+
+    // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
+    // code-reviewer C2): force a REX prefix even when no REX bit
+    // (W/R/X/B) is set. Required by x86 byte-register-bearing
+    // opcodes like setcc that target rsp/rbp/rsi/rdi (hwEncoding
+    // 4..7) — without a REX prefix, ModR/M.rm=4..7 references the
+    // legacy {ah, ch, dh, bh} high-byte aliases instead of the
+    // {spl, bpl, sil, dil} low-byte registers; setcc would silently
+    // write to the high byte of a different physical register.
+    // With ANY REX bit set (or this flag forcing one), the encoder
+    // uses the spl/bpl/sil/dil aliasing — correct low-byte access
+    // across all 16 GPRs.
+    bool forceRexPrefix = false;
+
     // Fixed-word template (plan 13 AS3 — `fixed32` shape). The 32-bit
     // base bit pattern of an AArch64 / RV32-style instruction; the
     // walker emits this word with each declared slot's `hwEncoding`
@@ -699,13 +864,19 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
         case EncodingSlotKind::SibIndex:
+        case EncodingSlotKind::CondCodeNibble:
+        case EncodingSlotKind::BlockRel32:
             // D-AS4-1 / D-AS4-5 memory-addressing slots write immediate
             // displacements / register encodings (not symbol-relative).
             // The companion symbol-bearing slot for RIP-relative `lea`
             // is `RipRelDisp32` above; it's distinct because it forces
             // the ModR/M state (mod=00 rm=101) in addition to the
             // disp32 patch site, where Disp32 alone (e.g. `call rel32`)
-            // has no associated ModR/M byte.
+            // has no associated ModR/M byte. CondCodeNibble (D-CSUBSET-
+            // WHILE-LOOP-SUBSTRATE) writes into the opcode byte from
+            // the inst payload — no symbol. BlockRel32 patches a 4-byte
+            // intra-function displacement at assemble time — also no
+            // symbol-tier relocation.
             return false;
     }
     return false;
@@ -727,6 +898,15 @@ struct DSS_EXPORT TargetEncodingWire {
     std::uint8_t     index           = 0;
     EncodingSlotKind slotKind        = EncodingSlotKind::ModRmReg;
     std::optional<RelocationKind> relocationKind;
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): bytes
+    // emitted IMMEDIATELY BEFORE this wire's slot bytes (between
+    // the previous wire's emission and this one). Used by jcc's
+    // compound encoding: the second BlockRel32 wire (fallthrough
+    // target) declares `prefixOpcodeBytes: [0xE9]` so the encoder
+    // emits `E9 rel32` (the unconditional jmp to fallthrough)
+    // after the cond branch's `0F 8x rel32`. Empty for every
+    // other wire (no extra bytes between slots).
+    std::vector<std::uint8_t> prefixOpcodeBytes;
 };
 
 // One encoding variant — guard + template + slot-wiring. The walker
@@ -1184,6 +1364,27 @@ struct DSS_EXPORT TargetSchemaData {
     std::vector<TargetCallingConvention> callingConventions;
     substrate::TransparentStringMap<std::uint16_t> callingConventionIndex;
 
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
+    // per-target mapping from abstract `TargetCondCode` (substrate-tier
+    // 10-arm enum: Eq/Ne/Slt/Sle/Sgt/Sge/Ult/Ule/Ugt/Uge) to a numeric
+    // encoding used by the ISA's conditional opcodes. x86_64 uses the
+    // low 4 bits of the setcc/jcc opcode byte: Eq=4, Ne=5, Slt=12,
+    // Sle=14, Sgt=15, Sge=13, Ult=2, Ule=6, Ugt=7, Uge=3. ARM64 uses
+    // the same low-4-bits position but a different numeric mapping in
+    // bits 0..3 of the 32-bit B.cc instruction word. Empty means the
+    // target has no cond-code-bearing opcodes (declarative-only
+    // targets). When populated, MUST contain exactly 10 entries
+    // indexed by `(uint8_t)TargetCondCode` — validate() enforces.
+    std::array<std::uint8_t, 10> condCodeEncoding{};
+    // Companion bit: `true` once `condCodeEncoding` has been populated
+    // from the JSON (any value, including all-zero, is legal — the
+    // distinction is "is this table loaded vs. default-initialized").
+    // Consumers gate the `EncodingSlotKind::CondCodeNibble` walker on
+    // this flag — emitting a cond-code wire against an un-populated
+    // table fails loud at the per-inst encoder rather than silently
+    // OR'ing zero into the opcode byte.
+    bool condCodeEncodingLoaded = false;
+
     // Relocation taxonomy (plan 13 AS1 §2.6 — the bucket-1 reloc
     // facet). Each row declares one relocation kind: a canonical text
     // name (for the linker's `*.format.json` cross-reference per plan
@@ -1335,6 +1536,22 @@ public:
         auto it = d_.callingConventionIndex.find(name);
         if (it == d_.callingConventionIndex.end()) return nullptr;
         return &d_.callingConventions[it->second];
+    }
+
+    // ── Cond-code encoding (D-CSUBSET-WHILE-LOOP-SUBSTRATE) ──────
+    // Returns the target's numeric encoding for `cond`, or `nullopt`
+    // when this target hasn't declared a `condCodeEncoding` table.
+    // The encoder for cond-code-bearing opcodes (setcc / jcc on x86;
+    // B.cc on ARM64) gates on this — a missing table fails loud
+    // (A_NoCondCodeEncoding) rather than silently OR'ing zero into
+    // the opcode byte (which would map every condition to `eq`).
+    [[nodiscard]] std::optional<std::uint8_t> condCodeEncoding(
+            TargetCondCode cond) const noexcept {
+        if (!d_.condCodeEncodingLoaded) return std::nullopt;
+        return d_.condCodeEncoding[static_cast<std::uint8_t>(cond)];
+    }
+    [[nodiscard]] bool condCodeEncodingLoaded() const noexcept {
+        return d_.condCodeEncodingLoaded;
     }
 
     // ── Relocations (AS1) ────────────────────────────────────────

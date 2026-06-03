@@ -7,9 +7,14 @@
 //   * Per-function FrameLayout populated correctly
 //   * No frame_load/frame_store ops remain in the output module
 
+#include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "diagnostic_count.hpp"
 #include "lir/lir.hpp"
+
+#include <algorithm>
+#include <format>
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
@@ -288,24 +293,39 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     ASSERT_NE(cc, nullptr);
     for (std::size_t i = 0; i < result.perFunc.size(); ++i) {
         auto const& layout = result.perFunc[i];
-        EXPECT_EQ(layout.spillAreaOffset(), layout.savedRegAreaSize);
+        // D-ML7-2.2 (2026-06-02): spillAreaOffset is now
+        // outgoingArgAreaSize + savedRegAreaSize (outgoing area is
+        // the new SP+0 zone; saved regs sit above it).
+        EXPECT_EQ(layout.spillAreaOffset(),
+                  layout.outgoingArgAreaSize + layout.savedRegAreaSize);
+        EXPECT_EQ(layout.savedRegAreaOffset(), layout.outgoingArgAreaSize);
         EXPECT_EQ(layout.savedRegAreaSize,
                   static_cast<std::uint32_t>(layout.savedRegs.size()) * layout.slotSize);
         EXPECT_EQ(layout.spillAreaSize,
                   bundle.alloc.perFunc[i].numSpillSlots * layout.slotSize);
-        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02): expected
-        // formula now branches on `hasCalls`. Non-leaf functions
-        // reserve at least `cc.shadowSpaceBytes` AND satisfy the
-        // `callPushBytes` alignment-bias congruence (so post-prologue
-        // RSP lands at 0 mod stackAlignment for the next call). Leaf
-        // functions use the pre-fix `alignUp(raw, alignment)` rule.
-        std::uint32_t const raw = layout.savedRegAreaSize + layout.spillAreaSize;
+        // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+        // localAreaSize == numLocalAllocas * slotSize. Each body-
+        // local declaration (`int a1; int r; ...`) emits one
+        // `alloca` LIR op which the materialize pass rewrites to a
+        // `lea`-of-frame-slot above the spill area.
+        EXPECT_EQ(layout.localAreaSize,
+                  layout.numLocalAllocas * layout.slotSize);
+        EXPECT_EQ(layout.localAreaOffset(),
+                  layout.outgoingArgAreaSize + layout.savedRegAreaSize
+                      + layout.spillAreaSize);
+        // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02) + D-ML7-2.2
+        // (2026-06-02) + D-CSUBSET-LOCAL-INT-CODEGEN (2026-06-02):
+        // expected formula incorporates outgoingArgAreaSize directly
+        // (already includes the callee's shadow-space when hasCalls)
+        // AND the new localAreaSize above the spill area.
+        std::uint32_t const raw = layout.outgoingArgAreaSize
+                                + layout.savedRegAreaSize
+                                + layout.spillAreaSize
+                                + layout.localAreaSize;
         std::uint32_t expected;
         if (layout.hasCalls) {
-            std::uint32_t const rawWithShadow = std::max(
-                raw, static_cast<std::uint32_t>(cc->shadowSpaceBytes));
             expected = dss::alignedSizeWithBias(
-                rawWithShadow,
+                raw,
                 static_cast<std::uint32_t>(cc->stackAlignment),
                 static_cast<std::uint32_t>(cc->callPushBytes));
         } else {
@@ -402,14 +422,26 @@ struct InstStats {
     // [SymbolRef] (the post-ML7-cycle-2 shape) or carries extra Reg
     // operands (the pre-cycle-2 shape — would fail at the assembler).
     std::uint32_t callsWithOnlySymbol = 0;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+    // post-materialize, EVERY `alloca` LIR op must be rewritten to
+    // a `lea result, [sp + offset]`. Survival of an `alloca` would
+    // trip A_NoEncodingDeclared at the assembler. The 7-agent F3
+    // audit added these counters + the per-lea-offset capture so
+    // the materialize-loop's offset arithmetic is unit-pinned, not
+    // just the layout-arithmetic invariant.
+    std::uint32_t                 allocaOps  = 0;
+    std::uint32_t                 leaOps     = 0;
+    std::vector<std::int32_t>     leaOffsets;  // per-lea MemOffset value
 };
 
 [[nodiscard]] InstStats
 collectInstStats(Lir const& lir, TargetSchema const& schema) {
     InstStats s;
-    auto const argOp  = schema.opcodeByMnemonic("arg");
-    auto const callOp = schema.opcodeByMnemonic("call");
-    auto const movOp  = schema.opcodeByMnemonic("mov");
+    auto const argOp    = schema.opcodeByMnemonic("arg");
+    auto const callOp   = schema.opcodeByMnemonic("call");
+    auto const movOp    = schema.opcodeByMnemonic("mov");
+    auto const allocaOp = schema.opcodeByMnemonic("alloca");
+    auto const leaOp    = schema.opcodeByMnemonic("lea");
     for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
         LirFuncId const fn = lir.funcAt(fi);
         for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
@@ -419,6 +451,28 @@ collectInstStats(Lir const& lir, TargetSchema const& schema) {
                 std::uint16_t const op = lir.instOpcode(inst);
                 if (argOp.has_value()  && op == *argOp)  ++s.argOps;
                 if (movOp.has_value()  && op == *movOp)  ++s.movOps;
+                if (allocaOp.has_value() && op == *allocaOp) ++s.allocaOps;
+                if (leaOp.has_value() && op == *leaOp) {
+                    ++s.leaOps;
+                    // 2nd-order silent-failure fix: capture the disp32
+                    // ONLY for the 3-op LEA variant (`lea result,
+                    // [base + disp32]` — operand layout [base_reg,
+                    // MemBase, MemOffset]). Pushing `0` for the 4-op
+                    // indexed and 1-op SymbolRef-RipRel variants would
+                    // silently satisfy offset==0 membership checks
+                    // (the alloca-materialize shape can legitimately
+                    // emit offset 0 for leaf functions with no
+                    // outgoing/saved/spill area), causing the multi-
+                    // alloca off-by-one regression detector to pass
+                    // when it shouldn't. Skip non-3-op variants
+                    // entirely so `leaOffsets` only contains the
+                    // alloca-materialize shape's offsets.
+                    auto const ops = lir.instOperands(inst);
+                    if (ops.size() == 3
+                        && ops[2].kind == LirOperandKind::MemOffset) {
+                        s.leaOffsets.push_back(ops[2].offset);
+                    }
+                }
                 if (callOp.has_value() && op == *callOp) {
                     ++s.callOps;
                     auto const ops = lir.instOperands(inst);
@@ -495,6 +549,94 @@ TEST(LirCallconvAbi, SingleArgFunctionEmitsMovFromArgGpr0) {
     // happen to pick argGprs[0]. Don't pin an exact count — just
     // confirm movs were generated.
     EXPECT_GE(stats.movOps, 1u);
+}
+
+TEST(LirCallconvAbi, MsX64CcDoesNotDeclareVariadicVectorCountReg) {
+    // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-2: Win64 ms_x64
+    // has NO equivalent to SysV's AL-count register — the loader
+    // ABI uses vararg double-spill (anchored
+    // D-ML7-VARIADIC-WIN64-DOUBLE-SPILL). A regression that copy-
+    // pasted SysV's `variadicVectorCountReg: rax` into the ms_x64
+    // entry would silently emit a wrong-cc count-mov at every printf
+    // call from a Windows-targeted binary. Pin: the ms_x64 cc field
+    // MUST be empty.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* msX64 = (*target)->callingConventionByName("ms_x64");
+    ASSERT_NE(msX64, nullptr)
+        << "x86_64 target schema must declare 'ms_x64' cc";
+    EXPECT_FALSE(msX64->variadicVectorCountReg.has_value())
+        << "Win64 ms_x64 has NO caller-side variadic vector-count "
+           "register — the count-mov path is SysV-specific. A future "
+           "Win64 vararg-double-spill implementation goes through "
+           "D-ML7-VARIADIC-WIN64-DOUBLE-SPILL, NOT this field.";
+}
+
+TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
+    // D-LANG-VARIADIC (step 13.4) substrate pin: the SysV AMD64 cc
+    // on x86_64 MUST declare `variadicVectorCountReg` (rax / AL per
+    // §3.5.7). Without this field, ML7 materialize skips the
+    // pre-call `mov <countReg>, <fpCount>` and printf reads garbage
+    // from AL on hardened glibcs. The end-to-end emission + runtime
+    // behavior is pinned at the runnable-example tier
+    // (`examples/c-subset/hello_printf`); this test pins the
+    // SCHEMA tier so a CC-config regression surfaces as a target-
+    // schema fail-loud here, not as a runtime garbage in printf.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value()) << "loadShipped(x86_64) failed";
+    auto const* cc = (*target)->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->variadicVectorCountReg.has_value())
+        << "SysV AMD64 cc (cc index 0 on x86_64) MUST declare the "
+           "variadic vector-count register per SysV §3.5.7 / "
+           "D-LANG-VARIADIC step 13.4.";
+    // The register name must resolve in the target's register table
+    // — a typo'd or non-existent name would silently cause the
+    // ordinal to refer to the wrong physical reg. The loader sets
+    // both name + ordinal atomically; verifying both stay in sync
+    // pins the contract.
+    auto const ord = (*target)->registerByName(
+        cc->variadicVectorCountReg->name);
+    ASSERT_TRUE(ord.has_value())
+        << "variadicVectorCountReg name '"
+        << cc->variadicVectorCountReg->name
+        << "' must resolve in the target's register table.";
+    EXPECT_EQ(*ord, cc->variadicVectorCountReg->ordinal);
+}
+
+TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
+    // D-LANG-VARIADIC (step 13.4) substrate pin: the shared MIR/LIR
+    // Call payload encoding (bit 31 = isVariadic; bits 0..30 =
+    // fixedArgCount) round-trips for both the non-variadic and
+    // variadic cases. The ML7 materialize call arm reads these bits
+    // off every call inst; an off-by-one in the mask would either
+    // truncate fixedArgCount or silently flip the variadic bit, both
+    // of which would corrupt the count-mov emission for variadic
+    // calls (and falsely trigger it for non-variadic calls).
+    using namespace dss::call_payload;
+    // Non-variadic encoding is payload == 0 (preserves the addInst
+    // default for every pre-13.4 call site).
+    EXPECT_EQ(encode(false, 0u), 0u);
+    EXPECT_FALSE(isVariadic(encode(false, 0u)));
+    // The high bit alone flips isVariadic; fixedArgCount=0 round-
+    // trips (a hypothetical thunk-style vararg-only function).
+    EXPECT_TRUE(isVariadic(encode(true, 0u)));
+    EXPECT_EQ(fixedArgCount(encode(true, 0u)), 0u);
+    // Typical printf shape: 1 fixed param + vararg.
+    EXPECT_TRUE(isVariadic(encode(true, 1u)));
+    EXPECT_EQ(fixedArgCount(encode(true, 1u)), 1u);
+    // Round-trip at the high edge of the fixed-arg field. If the
+    // mask boundary regresses, fixedArgCount(kFixedArgMask) returns
+    // a different value here — pins the contract.
+    EXPECT_EQ(fixedArgCount(encode(true, kFixedArgMask)),
+              kFixedArgMask);
+    EXPECT_TRUE(isVariadic(encode(true, kFixedArgMask)));
+    // A non-variadic encoding with a fixed-arg count carries the
+    // fixedArgCount through but reports isVariadic=false — the
+    // accessor never spuriously reports variadic just because
+    // fixedArgCount is non-zero.
+    EXPECT_FALSE(isVariadic(encode(false, 42u)));
+    EXPECT_EQ(fixedArgCount(encode(false, 42u)), 42u);
 }
 
 TEST(LirCallconvAbi, CalleeArgReceivesFromArgGprAcrossSysVAndMsX64) {
@@ -814,15 +956,24 @@ TEST(LirCallconvAbi, MultiArgFunctionMaterializesEveryArgGpr) {
 
 // ── Fail-loud surfaces ────────────────────────────────────────────────
 
-TEST(LirCallconvAbi, RejectsStackPassedGprArgLoud) {
-    // SysV AMD64 has 6 GPR arg registers (rdi/rsi/rdx/rcx/r8/r9). A
-    // 7-arg int function trips `arg 6` which exceeds the pool; the
-    // materialization must fail loud with `L_StackPassedArgUnsupported`
-    // citing D-ML7-2.2 — not silently miscompile by reading past the
-    // argGprs vector.
+TEST(LirCallconvAbi, SysVSevenArgFunctionStackPassesOverflowArg) {
+    // D-ML7-2.2 (closed 2026-06-02): SysV AMD64 has 6 GPR arg
+    // registers (rdi/rsi/rdx/rcx/r8/r9). A 7-arg int function
+    // overflows arg 6 onto the stack; the materialization must
+    // succeed cleanly + emit a `frame_load` (the schema's `load`
+    // opcode) at the callee side reading from
+    // `[sp + totalFrameSize + callPushBytes + shadowSpaceBytes +
+    // overflowIdx * slotSize]`. For SysV: shadowSpaceBytes=0,
+    // callPushBytes=8, overflowIdx=0, slotSize=8 → offset =
+    // totalFrameSize + 8. The fixture also CALLS f7 to exercise
+    // the caller-side `frame_store` arm (offset 0 within outgoing
+    // area = [sp+0] under SysV).
     auto bundle = lowerThroughRewrite(
         "int f7(int a, int b, int c, int d, int e, int f, int g) {\n"
         "    return g;\n"
+        "}\n"
+        "int caller_of_f7() {\n"
+        "    return f7(1, 2, 3, 4, 5, 6, 7);\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
@@ -830,22 +981,159 @@ TEST(LirCallconvAbi, RejectsStackPassedGprArgLoud) {
     auto result = materializeCallingConvention(bundle.rewritten.lir,
                                                *bundle.lowered.target,
                                                bundle.alloc, ccRep);
-    EXPECT_FALSE(result.ok())
-        << "7-arg function must trip the stack-passed guard";
-    bool sawCode = false;
-    bool sawAnchor = false;
-    for (auto const& d : ccRep.all()) {
-        if (d.code == DiagnosticCode::L_StackPassedArgUnsupported) {
-            sawCode = true;
-            if (d.actual.find("D-ML7-2.2") != std::string::npos) {
-                sawAnchor = true;
+    ASSERT_TRUE(result.ok())
+        << "D-ML7-2.2 closure: 7-arg SysV fn + call must lower cleanly";
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+    // L_StackPassedArgUnsupported must NOT fire — the substrate
+    // now handles the overflow via stack-spill rather than rejecting.
+    EXPECT_EQ(::dss::test_support::countCode(
+                  ccRep, DiagnosticCode::L_StackPassedArgUnsupported),
+              0u)
+        << "stack-passed guard must NOT fire on D-ML7-2.2-closed substrate";
+
+    // f7's frame must reserve outgoing-args area sized for the
+    // function's CALLS (none — f7 is leaf), but its non-leaf flag
+    // is false. caller_of_f7 makes ONE call passing 7 args; its
+    // outgoingArgAreaSize = shadowSpaceBytes (SysV=0) + 1 slot * 8 = 8.
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->callPushBytes, 8u);
+    EXPECT_EQ(cc->shadowSpaceBytes, 0u);
+    EXPECT_FALSE(cc->slotAligned);
+
+    // Find caller_of_f7 in the result (it makes the 7-arg call).
+    FrameLayout const* callerLayout = nullptr;
+    for (std::uint32_t i = 0; i < result.lir.moduleFuncCount(); ++i) {
+        auto const* layout = result.forFuncByIndex(i);
+        ASSERT_NE(layout, nullptr);
+        if (layout->hasCalls) {
+            EXPECT_EQ(callerLayout, nullptr)
+                << "fixture should have exactly one call-making fn";
+            callerLayout = layout;
+        }
+    }
+    ASSERT_NE(callerLayout, nullptr);
+    // SysV: shadow=0, 1 overflow slot → outgoingArgAreaSize = 8.
+    EXPECT_EQ(callerLayout->outgoingArgAreaSize, 8u)
+        << "SysV 7-arg call → 1 stack-spilled slot × 8 bytes "
+           "(shadowSpaceBytes=0 contributes nothing under SysV)";
+    // Frame congruence: totalFrameSize ≡ callPushBytes mod stackAlignment.
+    EXPECT_EQ(callerLayout->totalFrameSize % cc->stackAlignment,
+              static_cast<std::uint32_t>(cc->callPushBytes));
+    // pr-test-analyzer L3 audit fold: pin the EXACT byte offset of
+    // the emitted `frame_store` for the overflow arg. Under SysV
+    // (shadow=0, overflowIdx=0), the spill goes to [sp+0]. A
+    // regression to an off-by-one offset (e.g. [sp+8]) would
+    // silently read garbage on the callee side; the frame-size
+    // count alone wouldn't catch it.
+    auto const storeOpId = bundle.lowered.target->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOpId.has_value());
+    std::uint16_t const storeOp = *storeOpId;
+    bool foundStackArgStore = false;
+    LirFuncId const callerFn = result.lir.funcAt(1);
+    std::uint32_t const blkN = result.lir.funcBlockCount(callerFn);
+    for (std::uint32_t bi = 0; bi < blkN && !foundStackArgStore; ++bi) {
+        LirBlockId const blk = result.lir.funcBlockAt(callerFn, bi);
+        std::uint32_t const n = result.lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = result.lir.blockInstAt(blk, i);
+            if (result.lir.instOpcode(inst) != storeOp) continue;
+            auto const ops = result.lir.instOperands(inst);
+            // store layout: [value_reg, base_reg, MemBase, MemOffset]
+            if (ops.size() != 4) continue;
+            if (ops[3].kind != LirOperandKind::MemOffset) continue;
+            // The overflow arg lands at [sp + 0] under SysV (shadow=0,
+            // overflowIdx=0). Other stores in this fn would be at
+            // higher offsets (saved-reg prologue if any).
+            if (ops[3].offset == 0) {
+                foundStackArgStore = true;
+                break;
             }
         }
     }
-    EXPECT_TRUE(sawCode)
-        << "the 7-arg overflow must surface L_StackPassedArgUnsupported";
-    EXPECT_TRUE(sawAnchor)
-        << "the diagnostic must cite the D-ML7-2.2 anchor for triage";
+    EXPECT_TRUE(foundStackArgStore)
+        << "expected a `store` inst at [sp+0] for the 7th-arg overflow";
+}
+
+TEST(LirCallconvAbi, Win64FiveArgFunctionStackPassesViaSlotAligned) {
+    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64
+    // has 4 GPR arg registers (rcx/rdx/r8/r9). A 5-arg int function
+    // overflows arg 4 onto the stack. Under slot-aligned semantics,
+    // arg-4 lands at [rsp + shadowSpaceBytes + 0 * slotSize] =
+    // [rsp + 0x20] (the canonical Win64 5th-arg location).
+    // Outgoing-area total = shadowSpaceBytes (32) + 1 slot × 8 = 40.
+    auto bundle = lowerThroughRewrite(
+        "int f5(int a, int b, int c, int d, int e) { return e; }\n"
+        "int caller_of_f5() { return f5(1, 2, 3, 4, 5); }\n",
+        /*ccIndex=*/1);  // ms_x64
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "D-ML7-2.6 closure: 5-arg Win64 fn + call must lower cleanly";
+    EXPECT_EQ(ccRep.errorCount(), 0u);
+
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_STREQ(cc->name.c_str(), "ms_x64");
+    EXPECT_TRUE(cc->slotAligned)
+        << "ms_x64 MUST declare slotAligned=true (D-ML7-2.6 closure)";
+    EXPECT_EQ(cc->shadowSpaceBytes, 32u);
+    EXPECT_EQ(cc->callPushBytes, 8u);
+
+    // Find caller_of_f5.
+    FrameLayout const* callerLayout = nullptr;
+    for (std::uint32_t i = 0; i < result.lir.moduleFuncCount(); ++i) {
+        auto const* layout = result.forFuncByIndex(i);
+        ASSERT_NE(layout, nullptr);
+        if (layout->hasCalls) {
+            EXPECT_EQ(callerLayout, nullptr);
+            callerLayout = layout;
+        }
+    }
+    ASSERT_NE(callerLayout, nullptr);
+    // Win64 5-arg call: shadow=32, 1 overflow slot × 8 → outgoingArgAreaSize = 40.
+    // Pinning outgoingArgAreaSize directly (not totalFrameSize, which
+    // varies with regalloc-chosen callee-saved spills under ms_x64's
+    // many callee-saved regs).
+    EXPECT_EQ(callerLayout->outgoingArgAreaSize, 40u)
+        << "Win64 5-arg call → shadowSpaceBytes (32) + 1 overflow × 8 = 40";
+    // Frame congruence holds regardless of saved-reg count:
+    // alignedSizeWithBias result must always satisfy N ≡ 8 mod 16
+    // under Win64 (callPushBytes=8, stackAlignment=16).
+    EXPECT_GE(callerLayout->totalFrameSize, 40u);
+    EXPECT_EQ(callerLayout->totalFrameSize % 16u, 8u);
+    // pr-test-analyzer L3 audit fold: pin the EXACT byte offset of
+    // the emitted `frame_store` for the 5th-arg overflow. Under
+    // Win64 (shadow=32, overflowIdx=0), the spill goes to
+    // [sp+0x20] = [sp+32]. The canonical Win64 5th-arg location.
+    auto const storeOpId = bundle.lowered.target->opcodeByMnemonic("store");
+    ASSERT_TRUE(storeOpId.has_value());
+    std::uint16_t const storeOp = *storeOpId;
+    bool foundStackArgStoreAt0x20 = false;
+    LirFuncId const callerFn = result.lir.funcAt(1);
+    std::uint32_t const blkN = result.lir.funcBlockCount(callerFn);
+    for (std::uint32_t bi = 0; bi < blkN && !foundStackArgStoreAt0x20; ++bi) {
+        LirBlockId const blk = result.lir.funcBlockAt(callerFn, bi);
+        std::uint32_t const n = result.lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = result.lir.blockInstAt(blk, i);
+            if (result.lir.instOpcode(inst) != storeOp) continue;
+            auto const ops = result.lir.instOperands(inst);
+            if (ops.size() != 4) continue;
+            if (ops[3].kind != LirOperandKind::MemOffset) continue;
+            if (ops[3].offset == 0x20) {
+                foundStackArgStoreAt0x20 = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(foundStackArgStoreAt0x20)
+        << "Win64 5th-arg overflow MUST emit a `store` at [sp+0x20] "
+           "(the canonical Win64 stack-arg location AFTER shadow space)";
 }
 
 TEST(LirCallconvAbi, RejectsIndirectCallLoud) {
@@ -1211,13 +1499,16 @@ TEST(LirCallconv, NonLeafFunctionReservesShadowSpaceAndAlignmentBias) {
         << "g is leaf; FrameLayout.hasCalls must reflect that";
 
     // f (non-leaf): totalFrameSize >= shadowSpaceBytes AND
-    // satisfies the callPushBytes congruence. Same formula the
-    // implementation uses — pinning the mechanism.
-    std::uint32_t const fRaw =
-        fLayout->savedRegAreaSize + fLayout->spillAreaSize;
+    // satisfies the callPushBytes congruence. D-ML7-2.2 (2026-06-02):
+    // outgoingArgAreaSize already incorporates the shadow-space
+    // requirement (when hasCalls; for SysV it adds 0), so the
+    // expected formula folds shadow into raw via outgoingArgAreaSize
+    // rather than via a separate max().
+    std::uint32_t const fRaw = fLayout->outgoingArgAreaSize
+                             + fLayout->savedRegAreaSize
+                             + fLayout->spillAreaSize;
     std::uint32_t const fExpected = ::dss::alignedSizeWithBias(
-        std::max(fRaw, static_cast<std::uint32_t>(cc->shadowSpaceBytes)),
-        cc->stackAlignment, cc->callPushBytes);
+        fRaw, cc->stackAlignment, cc->callPushBytes);
     EXPECT_EQ(fLayout->totalFrameSize, fExpected);
     EXPECT_GE(fLayout->totalFrameSize, cc->shadowSpaceBytes)
         << "non-leaf must reserve at least shadowSpaceBytes";
@@ -1309,4 +1600,112 @@ TEST(LirCallconv, NonLeafFunctionOnWin64CcReservesFullShadowSpaceFrame) {
            "lands ≡ 0 mod 16 at the call site (the rule that makes "
            "puts's internal SSE movaps NOT fault)";
     EXPECT_TRUE(fLayout->hasCalls);
+}
+
+// D-CSUBSET-LOCAL-INT-CODEGEN substrate-tier tests (7-agent fold F3,
+// 2026-06-02): the FrameLayoutInvariantsHoldPerFunction test pins
+// the layout-arithmetic invariant (localAreaSize == numLocalAllocas
+// * slotSize). It does NOT pin the materialize-loop's behavior:
+// (a) every `alloca` rewrites to a `lea`; (b) the i-th alloca's
+// MemOffset is exactly localAreaOffset() + i*slotSize; (c) two
+// allocas get distinct, monotonically-increasing offsets (an
+// off-by-one in localAllocaIndex would silently alias slot 0 for
+// every alloca, miscompiling a function with multiple locals). The
+// hello_writefile E2E pin only exercises ONE local (`int written;`)
+// so its passing exit code does NOT pin the multi-local case.
+TEST(LirCallconvAbi, AllocaMaterializesToLeaInScanOrder) {
+    // Two body-local int declarations → two `alloca` LIR ops →
+    // two `lea` insts post-materialize, with distinct MemOffsets
+    // that are consecutive `slotSize`-strided from `localAreaOffset`.
+    auto bundle = lowerThroughRewrite(
+        "int f() { int a; int b; return 0; }\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const stats = collectInstStats(result.lir, *bundle.lowered.target);
+    EXPECT_EQ(stats.allocaOps, 0u)
+        << "every `alloca` virtual op must be rewritten by the "
+           "materialize pass — survival trips A_NoEncodingDeclared "
+           "at the assembler";
+    EXPECT_GE(stats.leaOps, 2u)
+        << "two body-local declarations should produce at least two "
+           "`lea` instructions (one per alloca)";
+    // f is the only function (no g), so its layout is at index 0.
+    ASSERT_GE(result.perFunc.size(), 1u);
+    auto const& layout = result.perFunc[0];
+    EXPECT_EQ(layout.numLocalAllocas, 2u);
+    // The first two leas (in scan order) must carry offsets
+    // localAreaOffset() and localAreaOffset() + slotSize. There may
+    // be additional `lea`s from other lowering paths in the LIR
+    // (e.g. global addresses) — pin that AT LEAST the two expected
+    // offsets appear among the captured set.
+    bool const firstFound = std::find(
+        stats.leaOffsets.begin(), stats.leaOffsets.end(),
+        static_cast<std::int32_t>(layout.localAreaOffset()))
+        != stats.leaOffsets.end();
+    bool const secondFound = std::find(
+        stats.leaOffsets.begin(), stats.leaOffsets.end(),
+        static_cast<std::int32_t>(layout.localAreaOffset()
+                                  + layout.slotSize))
+        != stats.leaOffsets.end();
+    EXPECT_TRUE(firstFound)
+        << "expected a `lea` with MemOffset = localAreaOffset() "
+           "for the first body-local (`int a;`)";
+    EXPECT_TRUE(secondFound)
+        << "expected a `lea` with MemOffset = localAreaOffset() + "
+           "slotSize for the second body-local (`int b;`) — an "
+           "off-by-one in localAllocaIndex would alias both to slot 0";
+}
+
+// 7-agent fold F3 negative pin: an `alloca` instruction whose
+// `result` reg is virtual (post-regalloc would have made it
+// physical) fails loud with `L_VirtualRegInPostRegalloc`. The
+// scenario is structurally impossible through the normal pipeline
+// (regalloc always runs before materialize) but matters for
+// hand-built LIR fixtures (synthesizers, JIT paths, future
+// linker-tier helpers per D-LIR-ALLOCA-LOWERING-EXTRACTION).
+TEST(LirCallconvAbi, AllocaWithVirtualResultFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    auto const allocaOp = sch.opcodeByMnemonic("alloca");
+    auto const retOp    = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(allocaOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    // alloca with a VIRTUAL result vreg (not physical). The
+    // materialize pass MUST reject this with the post-regalloc
+    // invariant diagnostic — letting it through would emit a
+    // `lea <virtual>, [sp + offset]` that the encoder can't handle.
+    LirReg const vresult = b.newVReg(LirRegClass::GPR);
+    b.addInst(*allocaOp, vresult, std::span<LirOperand const>{});
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    EXPECT_FALSE(result.ok())
+        << "materialize must reject a hand-built LIR with a virtual "
+           "alloca result — the post-regalloc invariant requires "
+           "all result vregs to be physical";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  ccRep,
+                  DiagnosticCode::L_VirtualRegInPostRegalloc), 1u)
+        << "the diagnostic code must be the post-regalloc invariant "
+           "code specifically, not any other error";
 }

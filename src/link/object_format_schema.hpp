@@ -6,6 +6,7 @@
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind + kObjectFormatKindTable
 #include "core/types/section_kind.hpp"        // SectionKind + kSectionKindTable
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_attrs.hpp"        // SymbolBinding / SymbolVisibility (lifted to core/types for MIR-tier producers)
 #include "core/types/target_schema.hpp"       // EnumNameTable<E,N>
 
 #include <array>
@@ -61,54 +62,18 @@ namespace dss {
 // here via the include above — every existing consumer continues to
 // work without touching its `#include`s.
 
-// Symbol binding — visibility within the linker's symbol-resolution
-// algorithm. Local symbols never resolve across translation units;
-// Weak symbols defer to Global symbols of the same name.
-enum class SymbolBinding : std::uint8_t {
-    Local  = 0,
-    Global = 1,
-    Weak   = 2,
-};
-
-inline constexpr EnumNameTable<SymbolBinding, 3> kSymbolBindingTable{{{
-    { SymbolBinding::Local,  "local"  },
-    { SymbolBinding::Global, "global" },
-    { SymbolBinding::Weak,   "weak"   },
-}}};
-
-[[nodiscard]] constexpr std::string_view
-symbolBindingName(SymbolBinding b) noexcept {
-    return kSymbolBindingTable.name(b);
-}
-[[nodiscard]] constexpr std::optional<SymbolBinding>
-symbolBindingFromName(std::string_view s) noexcept {
-    return kSymbolBindingTable.fromName(s);
-}
-
-// Symbol visibility — affects whether a symbol is exported to other
-// images at runtime. Default = exported (subject to binding).
-enum class SymbolVisibility : std::uint8_t {
-    Default   = 0,
-    Hidden    = 1,
-    Protected = 2,
-    Internal  = 3,
-};
-
-inline constexpr EnumNameTable<SymbolVisibility, 4> kSymbolVisibilityTable{{{
-    { SymbolVisibility::Default,   "default"   },
-    { SymbolVisibility::Hidden,    "hidden"    },
-    { SymbolVisibility::Protected, "protected" },
-    { SymbolVisibility::Internal,  "internal"  },
-}}};
-
-[[nodiscard]] constexpr std::string_view
-symbolVisibilityName(SymbolVisibility v) noexcept {
-    return kSymbolVisibilityTable.name(v);
-}
-[[nodiscard]] constexpr std::optional<SymbolVisibility>
-symbolVisibilityFromName(std::string_view s) noexcept {
-    return kSymbolVisibilityTable.fromName(s);
-}
+// SymbolBinding + SymbolVisibility lifted to `core/types/symbol_attrs.hpp`
+// so MIR-tier producers (the optimizer's DCE pass — D-OPT1-SYMBOL-
+// BINDING-VISIBILITY-THREAD) can consume the vocabulary without a
+// layer inversion through the link header. The canonical definitions
+// + name-tables live there; the file-top `#include` re-exports them
+// into the `dss` namespace for every existing link-side consumer. No
+// source-compatibility break.
+//
+// (Include is at file-top — see line 9 area — because symbol_attrs.hpp
+// declares its own `namespace dss { ... }` block, so it cannot be
+// nested inside the surrounding `namespace dss` here without creating
+// a `dss::dss::*` mis-qualification.)
 
 // ── Per-relocation row (format-side half of plan 13 §2.6) ──
 //

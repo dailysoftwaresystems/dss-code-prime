@@ -73,8 +73,49 @@ struct EntryResolution {
     if (module.functions.empty()) {
         return {EntryResolutionStatus::NotFound, SymbolId{}};
     }
+    // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
+    // 2026-06-03): when the compile pipeline plumbed an explicit
+    // user-entry symbol from the source language's entry-function
+    // name config (c-subset's `implicitReturnZeroForFunctionNames`),
+    // verify it resolves to a defined function in the module and
+    // use it. Pre-fix, multi-function modules whose entry wasn't
+    // declared first in source order silently called the wrong
+    // function (the first-declared one was picked as `functions[0]`
+    // via the empty-entryPoint fallback below).
+    if (module.userEntrySymbol.has_value()) {
+        SymbolId const want = *module.userEntrySymbol;
+        for (auto const& fn : module.functions) {
+            if (fn.symbol.v == want.v) {
+                return {EntryResolutionStatus::Found, fn.symbol};
+            }
+        }
+        for (auto const& ext : module.externImports) {
+            if (ext.symbol.v == want.v) {
+                return {EntryResolutionStatus::ResolvedToExtern,
+                        SymbolId{}};
+            }
+        }
+        return {EntryResolutionStatus::NotFound, SymbolId{}};
+    }
     auto const entryName = std::string{format.entryPoint()};
     if (entryName.empty()) {
+        // Silent-failure HIGH #3 + code-architect Q5 post-fold
+        // (2026-06-03): the `functions[0]` fallback is silently
+        // wrong-direction for multi-function modules whose entry
+        // isn't declared first in source order. The corpus expansion
+        // surfaced this via `int helper(int x){return x;}; int
+        // main(){return helper(42);}` returning 0 (the trampoline
+        // called helper). Single-function modules are unambiguous
+        // — keep the silent fallback there (the lone function IS
+        // the entry by construction). Multi-function modules
+        // without an explicit userEntrySymbol or format.entryPoint
+        // are a SUBSTRATE BUG: the compile pipeline failed to
+        // stamp userEntrySymbol, OR the language config didn't
+        // declare its entry-function name. Fail-loud rather than
+        // silently invoke the first-declared function.
+        if (module.functions.size() > 1) {
+            return {EntryResolutionStatus::NotFound, SymbolId{}};
+        }
         return {EntryResolutionStatus::Found,
                 module.functions[0].symbol};
     }

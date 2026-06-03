@@ -104,6 +104,19 @@ struct EncodingState {
     std::optional<std::uint8_t> sibScaleExp;
     std::vector<std::int32_t>     imm32s;        // immediate values to append (LE 4B each)
     std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
+    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): pending
+    // intra-function block-relative branch targets. Each entry
+    // emits its `prefixBytes` then 4 zero placeholder bytes,
+    // recording `{ patch_offset, target_block }` into the per-
+    // function `blockPatches` vector. Multiple entries support
+    // jcc's compound `0F 8x rel32; E9 rel32` shape — wire[0]
+    // emits the cond-branch rel32; wire[1] declares
+    // `prefixOpcodeBytes=[0xE9]` for the trailing uncond jmp.
+    struct PendingBlockRel {
+        std::vector<std::uint8_t> prefixBytes;
+        std::uint32_t             targetBlock;
+    };
+    std::vector<PendingBlockRel> blockRels;
 };
 
 // Reject a duplicate write to the same slot. Returns true if the
@@ -356,6 +369,7 @@ bool encode(Lir const&                  lir,
             std::vector<std::uint8_t>&  out,
             std::vector<Relocation>&    relocs,
             std::vector<SourceMapEntry>& /*srcMap*/,
+            std::vector<walker_util::BlockRelPatch>& blockPatches,
             DiagnosticReporter&         reporter) {
     // Substrate contract — `asm.cpp`'s dispatch screens
     // `opcodeInfo(opcode) != nullptr` BEFORE routing to a format
@@ -444,6 +458,25 @@ bool encode(Lir const&                  lir,
                                 info->mnemonic, reporter)) {
                 return false;
             }
+        } else if (srcOp.kind == LirOperandKind::BlockRef) {
+            // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
+            // intra-function block-relative branch target. The slot
+            // MUST be `BlockRel32`. Queue one PendingBlockRel per
+            // wire — supports both the simple jmp shape (one entry)
+            // and jcc's compound shape (two entries; the second
+            // declares `prefixOpcodeBytes=[0xE9]` for the trailing
+            // unconditional jmp to the fallthrough target).
+            if (wire.slotKind != EncodingSlotKind::BlockRel32) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': BlockRef operand wired "
+                                   "to non-BlockRel32 slot '{}'",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            st.blockRels.push_back(EncodingState::PendingBlockRel{
+                wire.prefixOpcodeBytes, srcOp.blockSlot});
         } else if (srcOp.kind == LirOperandKind::SymbolRef) {
             // Plan 13 AS4 — symbol-bearing wire emits a Relocation.
             // Two symbol-bearing slots today:
@@ -530,7 +563,14 @@ bool encode(Lir const&                  lir,
     bool const rexX = st.rexX;  // reserved — SIB.index high bit (no
                                  // cycle-2 walker writes this).
     bool const rexB = st.rexB;
-    if (rexW || rexR || rexX || rexB) {
+    // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold,
+    // code-reviewer C2): a variant whose template declares
+    // `forceRexPrefix: true` (setcc) emits a REX prefix even with
+    // no W/R/X/B bit set, so the byte-register-bearing instruction
+    // accesses spl/bpl/sil/dil (low byte of r4..r7) instead of the
+    // legacy ah/ch/dh/bh high-byte aliases.
+    bool const forceRex = selected->tmpl.forceRexPrefix;
+    if (rexW || rexR || rexX || rexB || forceRex) {
         std::uint8_t const rex =
             static_cast<std::uint8_t>(0x40u
             | (rexW ? 0x08u : 0u)
@@ -540,9 +580,49 @@ bool encode(Lir const&                  lir,
         out.push_back(rex);
     }
 
-    // 3) Opcode bytes (declared by the variant template).
-    for (auto b : selected->tmpl.opcodeBytes) {
-        out.push_back(b);
+    // 3) Opcode bytes (declared by the variant template). When the
+    //    variant's template declares `condCodeFromPayload`, OR the
+    //    schema's `condCodeEncoding[payload]` nibble into the LAST
+    //    opcode byte (D-CSUBSET-WHILE-LOOP-SUBSTRATE step 13.5
+    //    cycle 1 — used by setcc `0F 90+cc` / jcc `0F 80+cc`).
+    if (selected->tmpl.opcodeBytes.empty()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': variant has empty opcodeBytes",
+                           info->mnemonic));
+        return false;
+    }
+    if (selected->tmpl.condCodeFromPayload) {
+        auto const condValue = lir.instPayload(inst);
+        if (condValue > 9u) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': cond-code payload {} is "
+                               "out of range [0..9] for TargetCondCode "
+                               "(eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge)",
+                               info->mnemonic, condValue));
+            return false;
+        }
+        auto const condNibble = schema.condCodeEncoding(
+            static_cast<TargetCondCode>(condValue));
+        if (!condNibble.has_value()) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': variant declares "
+                               "condCodeFromPayload but target schema "
+                               "'{}' has no `condCodeEncoding` table",
+                               info->mnemonic, schema.name()));
+            return false;
+        }
+        for (std::size_t i = 0; i + 1 < selected->tmpl.opcodeBytes.size(); ++i) {
+            out.push_back(selected->tmpl.opcodeBytes[i]);
+        }
+        out.push_back(static_cast<std::uint8_t>(
+            selected->tmpl.opcodeBytes.back() | (*condNibble & 0x0Fu)));
+    } else {
+        for (auto b : selected->tmpl.opcodeBytes) {
+            out.push_back(b);
+        }
     }
 
     // 4) ModR/M byte. Emit iff any slot wired into ModR/M, OR the
@@ -683,6 +763,23 @@ bool encode(Lir const&                  lir,
     if (st.disp32.has_value()) {
         walker_util::appendPendingReloc(relocs, out, *st.disp32);
         // 4 placeholder bytes (linker patches these).
+        asm_byte_emit::appendU32LE(out, 0u);
+    }
+
+    // 9) D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
+    //    BlockRel32 trailing placeholder(s). Each pending entry
+    //    emits its prefix bytes (for compound shapes like jcc's
+    //    `0F 8x rel32; E9 rel32`), then 4 zero placeholder bytes
+    //    at the patch offset. asm.cpp resolves all patches once
+    //    every block in the function has been encoded.
+    for (auto const& br : st.blockRels) {
+        for (auto b : br.prefixBytes) {
+            out.push_back(b);
+        }
+        blockPatches.push_back(walker_util::BlockRelPatch{
+            static_cast<std::uint32_t>(out.size()),
+            br.targetBlock,
+        });
         asm_byte_emit::appendU32LE(out, 0u);
     }
 

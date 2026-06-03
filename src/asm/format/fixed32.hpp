@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asm/asm.hpp"
+#include "asm/format/walker_util.hpp"
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/strong_ids.hpp"
@@ -53,6 +54,7 @@ encode(Lir const&                  lir,
        std::vector<std::uint8_t>&  out,
        std::vector<Relocation>&    relocs,
        std::vector<SourceMapEntry>& srcMap,
+       std::vector<walker_util::BlockRelPatch>& blockPatches,
        DiagnosticReporter&         reporter);
 
 } // namespace dss::fixed32

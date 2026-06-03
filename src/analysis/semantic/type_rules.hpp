@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -83,8 +84,32 @@ namespace detail::type_rules {
 //   are deliberately NOT assignable; languages requiring them widen
 //   their config (typeShapes / numeric-promotion table) rather than
 //   getting silent C-style implicit conversions.
-[[nodiscard]] inline bool isAssignable(TypeInterner const& interner,
-                                       TypeId lhs, TypeId rhs) noexcept {
+//
+// D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): when the
+// caller supplies a `PointerConversionRules` block from the active
+// language's `SemanticConfig`, this function admits the direction-
+// specific `Ptr<Void>` ↔ `Ptr<T>` conversions per the flags. The
+// default-constructed rules (both false) preserve strict semantics
+// for callers that don't yet thread the schema (e.g., the HIR
+// verifier — post-coerce, implicit conversions are already
+// materialized as explicit `Cast` HIR nodes; see anchor
+// `D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT` in `hir_verifier.cpp`
+// at the `isAssignable` call site for the post-coerce invariant).
+//
+// Note: `TypeKind::Void` carries DUAL semantics across the type
+// lattice: (a) "no value" as a function-return type, and (b)
+// "untyped memory" as the element of a `Ptr<>`. The conflation is
+// contained at the type-rules tier — every tier below MIR (LIR,
+// regalloc, asm) sees `Ptr<>` uniformly as pointer-width and never
+// inspects the element type. Future readers checking `kind ==
+// Void`: it might be the no-value case OR the untyped-memory case
+// depending on context (look at whether it's the result kind or a
+// `Ptr<>` operand element).
+[[nodiscard]] inline bool isAssignable(
+    TypeInterner const&                                interner,
+    TypeId                                             lhs,
+    TypeId                                             rhs,
+    SemanticConfig::PointerConversionRules const&      ptrRules = {}) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
@@ -120,6 +145,45 @@ namespace detail::type_rules {
         if (!lhsElem.empty() && !rhsElem.empty()
             && lhsElem[0] == rhsElem[0]) {
             return true;
+        }
+    }
+    // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): the two
+    // directions of `void*` ↔ `T*` conversion are configured
+    // INDEPENDENTLY — they carry different safety characteristics:
+    //
+    //   * `Ptr<T> → Ptr<Void>` (T* → void*; lhs is void*, rhs is T*)
+    //     — typed→untyped, information-erasing, ALWAYS safe.
+    //     C / C++ / Obj-C: implicit. Rust / Swift: explicit cast.
+    //   * `Ptr<Void> → Ptr<T>` (void* → T*; lhs is T*, rhs is void*)
+    //     — untyped→typed, information-asserting, UNSAFE.
+    //     C / Obj-C: implicit. C++ / Rust / Swift: explicit cast.
+    //
+    // The arms below are written with `lk`/`rk` standing for
+    // lhs-kind / rhs-kind throughout, matching the rest of the
+    // function. Same-element-type is the trivial sameType() case
+    // already covered above; here we admit the conversion ONLY when
+    // exactly one side's pointer element is Void (the directional
+    // void-conversion case).
+    if (lk == TypeKind::Ptr && rk == TypeKind::Ptr) {
+        auto const lhsElem = interner.operands(lhs);
+        auto const rhsElem = interner.operands(rhs);
+        if (!lhsElem.empty() && !rhsElem.empty()) {
+            bool const lhsIsVoidPtr =
+                interner.kind(lhsElem[0]) == TypeKind::Void;
+            bool const rhsIsVoidPtr =
+                interner.kind(rhsElem[0]) == TypeKind::Void;
+            // T* → void* direction: lhs is void*, rhs is T* (T != void).
+            if (lhsIsVoidPtr && !rhsIsVoidPtr) {
+                return ptrRules.implicitToVoidPtr;
+            }
+            // void* → T* direction: lhs is T* (T != void), rhs is void*.
+            if (!lhsIsVoidPtr && rhsIsVoidPtr) {
+                return ptrRules.implicitFromVoidPtr;
+            }
+            // BOTH void: caught by sameType() above (Ptr<Void> ==
+            // Ptr<Void> via interning). NEITHER void: distinct typed
+            // pointers; fall through to the strict-reject default
+            // below (Ptr<int> → Ptr<float> is NOT implicit).
         }
     }
     return false;

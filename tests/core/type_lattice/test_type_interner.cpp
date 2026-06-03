@@ -87,6 +87,45 @@ TEST(TypeInterner, FnSigEncodesResultParamsAndCc) {
     EXPECT_NE(thunk.v, sig.v);
     EXPECT_EQ(ti.fnResult(thunk).v, i32.v);
     EXPECT_TRUE(ti.fnParams(thunk).empty());
+
+    // D-LANG-VARIADIC (step 13.4): the 3-arg overload encodes non-
+    // variadic (scalars=[cc], length 1) — backward-compat default
+    // for every pre-13.4 call site.
+    EXPECT_FALSE(ti.fnIsVariadic(sig));
+}
+
+TEST(TypeInterner, FnSigVariadicEncodingDistinctFromNonVariadic) {
+    // D-LANG-VARIADIC (step 13.4): the 4-arg `fnSig(...isVariadic)`
+    // overload encodes scalars=[cc, isVariadic]. A variadic and a
+    // non-variadic signature over the same param / result / cc
+    // INTERN AS DISTINCT TypeIds (scalar count + value differ), and
+    // `fnIsVariadic` decodes correctly for both.
+    auto ti = makeInterner(1);
+    const TypeId i32     = ti.primitive(TypeKind::I32);
+    const TypeId charTy  = ti.primitive(TypeKind::Char);
+    const TypeId ptrChar = ti.pointer(charTy);
+    std::array<TypeId, 1> const fixedParams{ptrChar};
+
+    const TypeId nonVar = ti.fnSig(fixedParams, i32, CallConv::CcSysV);
+    const TypeId varSig = ti.fnSig(fixedParams, i32, CallConv::CcSysV,
+                                   /*isVariadic=*/true);
+    EXPECT_NE(nonVar.v, varSig.v);
+    EXPECT_FALSE(ti.fnIsVariadic(nonVar));
+    EXPECT_TRUE (ti.fnIsVariadic(varSig));
+    // Fixed-param accessor sees only the declared params (no
+    // synthetic "vararg" entry).
+    EXPECT_EQ(ti.fnParams(varSig).size(), 1u);
+    // Re-interning with the same (params, result, cc, isVariadic)
+    // tuple is canonical.
+    EXPECT_EQ(varSig.v,
+              ti.fnSig(fixedParams, i32, CallConv::CcSysV, true).v);
+    // Scalar encoding: 1 slot for non-variadic (cc only), 2 for
+    // variadic (cc + isVariadic=1).
+    EXPECT_EQ(ti.scalars(nonVar).size(), 1u);
+    EXPECT_EQ(ti.scalars(varSig).size(), 2u);
+    EXPECT_EQ(ti.scalars(varSig)[0],
+              static_cast<std::int64_t>(CallConv::CcSysV));
+    EXPECT_EQ(ti.scalars(varSig)[1], std::int64_t{1});
 }
 
 TEST(TypeInterner, ExtensionRecordsCarryKindAndArgs) {

@@ -83,6 +83,13 @@ bool encode(Lir const&                  lir,
             std::vector<std::uint8_t>&  out,
             std::vector<Relocation>&    relocs,
             std::vector<SourceMapEntry>& /*srcMap*/,
+            // D-CSUBSET-WHILE-LOOP-SUBSTRATE: BlockRel32 (x86-style
+            // 32-bit intra-function branch displacement) is not used
+            // by fixed32 — ARM64 uses Imm26/Imm19 with different
+            // patch arithmetic. Anchored as D-AS3-BLOCK-REL-IMM19/26
+            // when ARM64 control-flow lands. Parameter unused here
+            // for signature parity with x86_variable::encode.
+            std::vector<walker_util::BlockRelPatch>& /*blockPatches*/,
             DiagnosticReporter&         reporter) {
     assert(info != nullptr && "fixed32::encode requires non-null info");
 

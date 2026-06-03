@@ -1,5 +1,6 @@
 #include "lir/lir_callconv.hpp"
 
+#include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -152,6 +153,8 @@ computeFrameLayout(LirFuncAllocation const& alloc,
                    TargetCallingConvention const& cc,
                    std::vector<LirReg> savedRegs,
                    bool hasCalls,
+                   std::uint32_t outgoingArgSlots,
+                   std::uint32_t numLocalAllocas,
                    DiagnosticReporter& reporter) {
     std::uint32_t const slotWidth = std::max(widthForClass(schema, LirRegClass::GPR),
                                              widthForClass(schema, LirRegClass::FPR));
@@ -165,29 +168,73 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     FrameLayout layout;
     layout.savedRegs        = std::move(savedRegs);
     layout.slotSize         = slotWidth;
-    layout.savedRegAreaSize = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
-    layout.spillAreaSize    = alloc.numSpillSlots * slotWidth;
-    layout.hasCalls         = hasCalls;
+    // D-ML7-2.2 + D-ML7-2.6 (co-closed 2026-06-02): outgoingArgAreaSize
+    // is THIS function's reserved space for ITS calls. Encompasses
+    // BOTH the callee's shadow space (Win64=32, SysV=0; reserved
+    // unconditionally when hasCalls) AND any explicit stack-arg
+    // overflow (`outgoingArgSlots * outgoingSlotSize`).
+    //
+    // **Critical: outgoing slots are POINTER-width** (GPR width =
+    // 8 bytes on x86_64 / ARM64), NOT the larger of GPR/FPR. Per
+    // Win64 + SysV + AAPCS64 ABIs each stack-passed arg occupies
+    // exactly one pointer-width slot regardless of its register
+    // class (a stack-passed `double` is still 8 bytes; FPR width
+    // = 16 bytes is the XMM-register saved-reg width, irrelevant
+    // for stack-arg passing). Using the larger slotSize here would
+    // double-count outgoing-args and silently inflate every
+    // non-leaf frame on x86_64. Exposed on FrameLayout so the
+    // materialize call/arg arms use the SAME stride consistently.
+    layout.outgoingSlotSize    = widthForClass(schema, LirRegClass::GPR);
+    layout.outgoingArgAreaSize = hasCalls
+        ? (static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+            + outgoingArgSlots * layout.outgoingSlotSize)
+        : 0u;
+    layout.savedRegAreaSize    = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
+    layout.spillAreaSize       = alloc.numSpillSlots * slotWidth;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): local
+    // allocas sit ABOVE the spill area in the layout (positive RSP
+    // offset post-prologue). Each alloca consumes one slotSize-byte
+    // slot; ordering is by LIR scan order (the same order
+    // `computeNumLocalAllocas` discovers them, so materializeOneFunc
+    // assigns the same indices). slotSize matches the spill stride
+    // (max(GPR, FPR) = 16 on x86_64) for uniformity — locals are
+    // never wider than slotSize today; an aggregate-local cycle
+    // would extend this with per-alloca size encoded in the LIR
+    // alloca instruction's payload.
+    layout.numLocalAllocas     = numLocalAllocas;
+    layout.localAreaSize       = numLocalAllocas * slotWidth;
+    layout.hasCalls            = hasCalls;
+    // Frame zones stack from SP+0 upward: outgoing-args, saved regs,
+    // spill slots, then local-alloca slots. Caller-side `frame_store
+    // srcReg, [sp + outgoingOffset]` writes into this function's
+    // outgoing area at offset `cc.shadowSpaceBytes + overflowIndex *
+    // slotWidth` (the shadow space occupies the first
+    // cc.shadowSpaceBytes bytes; explicit overflow args begin AFTER
+    // it). Callee reads at `[sp + totalFrameSize + cc.callPushBytes +
+    // cc.shadowSpaceBytes + overflowIndex * slotWidth]` from its own
+    // post-prologue RSP — the caller's outgoing area sits above the
+    // callee's full frame + the post-CALL return-address push. Local
+    // allocas at `[sp + localAreaOffset() + i*slotWidth]` post-
+    // prologue (D-CSUBSET-LOCAL-INT-CODEGEN); the materialize pass
+    // emits `lea result, [sp + offset]` for each `alloca` opcode.
     std::uint32_t const rawPreShadow =
-        layout.savedRegAreaSize + layout.spillAreaSize;
+        layout.outgoingArgAreaSize + layout.savedRegAreaSize
+        + layout.spillAreaSize    + layout.localAreaSize;
     std::uint32_t const align = (cc.stackAlignment > 0) ? cc.stackAlignment : 1u;
     if (hasCalls) {
-        // Non-leaf: reserve at least shadow-space + re-align for
-        // post-CALL RSP delta. Same `alignedSizeWithBias` formula
-        // the trampoline emitter uses, with the cc's `callPushBytes`
-        // as the bias (the in-program CALL instruction's RSP push;
-        // distinct from `entryStackPointerBias` which is the kernel→
-        // trampoline transition bias — see `target_schema.hpp`).
-        std::uint32_t const rawWithShadow =
-            std::max(rawPreShadow,
-                     static_cast<std::uint32_t>(cc.shadowSpaceBytes));
+        // Non-leaf: alignedSizeWithBias with callPushBytes as the
+        // bias so post-prologue RSP lands at ≡ 0 mod alignment at
+        // the next call site. The shadow-space requirement is
+        // already incorporated into rawPreShadow via
+        // outgoingArgAreaSize, so no separate max() is needed.
         layout.totalFrameSize = alignedSizeWithBias(
-            rawWithShadow, align,
+            rawPreShadow, align,
             static_cast<std::uint32_t>(cc.callPushBytes));
     } else {
         // Leaf: existing rule (no callee to home args for, no call
-        // site to re-align). Shadow space requirement does not
-        // apply — there is no callee that could read it.
+        // site to re-align). outgoingArgSlots == 0 by construction
+        // for leaf fns (computeMaxOutgoingStackArgs returns 0 when
+        // hasCalls is false).
         layout.totalFrameSize = alignUp(rawPreShadow, align);
     }
     return layout;
@@ -220,6 +267,142 @@ functionHasCalls(Lir const& src, LirFuncId fn,
         }
     }
     return false;
+}
+
+// D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): count the
+// `alloca` virtual ops in `fn`. Each becomes one local-area frame
+// slot of `slotSize` bytes; the materialize pass rewrites it to
+// `lea result, [sp + localAreaOffset() + i * slotSize]` using the
+// 3-op no-index `lea` form.
+//
+// Source-language and target agnostic: the predicate is mnemonic-
+// match on the (per-target) `alloca` opcode handle. A target that
+// declares no `alloca` opcode passes `allocaOp == 0` (invalid
+// sentinel, never matches a real input opcode) and the count is
+// zero for any function — the frame layout collapses to its
+// pre-13.3b shape, preserving backward compatibility with all
+// shader / WASM / operand-stack targets that don't have body-local
+// allocas.
+//
+// Pre-scan happens at materializeOneFunc time (parallel to the
+// `functionHasCalls` + `computeMaxOutgoingStackArgs` pre-scans),
+// not at MIR→LIR time, so the count includes any post-regalloc
+// inserts (none today, but defensive against future passes that
+// could synthesize local slots).
+//
+// D-CSUBSET-ALLOCA-COUNT-CACHE (anchor, 7-agent fold F2): the count
+// IS knowable at MIR→LIR time — each MIR Alloca maps 1:1 to an LIR
+// alloca op. Caching it on `LirFuncAllocation` (one uint32_t per
+// function) would eliminate this O(blocks × insts) re-scan for the
+// common case of "target has alloca, function has 0 allocas". The
+// re-scan is 1 of 4 existing per-function pre-scans (callee-saved
+// collection + `functionHasCalls` + `computeMaxOutgoingStackArgs`)
+// so the incremental cost is marginal today; closure waits for
+// profile evidence. Trigger: profiling shows > 0.5% of compile
+// time in this helper on multi-function modules.
+[[nodiscard]] std::uint32_t
+functionLocalAllocaCount(Lir const& src, LirFuncId fn,
+                         std::uint16_t allocaOp) noexcept {
+    if (allocaOp == 0) return 0u;
+    std::uint32_t count = 0;
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const instN = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < instN; ++i) {
+            LirInstId const inst = src.blockInstAt(blk, i);
+            if (src.instOpcode(inst) == allocaOp) ++count;
+        }
+    }
+    return count;
+}
+
+// D-ML7-2.2 (closed co-with-D-ML7-2.6, 2026-06-02): compute the
+// maximum number of stack-passed-arg slots ACROSS all call sites in
+// `fn`. The function's prologue must reserve enough outgoing-args
+// area to accommodate the WIDEST call (any call with more args than
+// the cc's register pool). Per-call site overflow rules:
+//
+//   * Slot-aligned cc (`cc.slotAligned == true` — Win64 ms_x64):
+//     each arg consumes one shared slot regardless of class. Total
+//     slots = args.size(). Pool size = max(argGprs, argFprs).
+//     Overflow = max(0, total_slots - pool_size).
+//   * Independent-counters cc (`cc.slotAligned == false` —
+//     SysV / AAPCS64): gpr and fpr counters advance separately.
+//     Overflow = max(0, gprArgs - argGprs.size()) +
+//                max(0, fprArgs - argFprs.size()).
+//
+// Args are identified by their LirReg's class (GPR vs FPR). Callee
+// is operand[0] (a SymbolRef post-isel), so args are operands[1..N].
+//
+// Same `TargetOpcodeInfo::isCall` flag the prologue allocator + the
+// regalloc cross-call-live exclusion use — single source of truth.
+[[nodiscard]] std::uint32_t
+computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
+                            TargetSchema const& schema,
+                            TargetCallingConvention const& cc) noexcept {
+    std::uint32_t const gprPoolSize =
+        static_cast<std::uint32_t>(cc.argGprs.size());
+    std::uint32_t const fprPoolSize =
+        static_cast<std::uint32_t>(cc.argFprs.size());
+    std::uint32_t const slotAlignedPoolSize =
+        std::max(gprPoolSize, fprPoolSize);
+
+    std::uint32_t maxOverflow = 0;
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const instN = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < instN; ++i) {
+            LirInstId const inst = src.blockInstAt(blk, i);
+            std::uint16_t const op = src.instOpcode(inst);
+            auto const* info = schema.opcodeInfo(op);
+            if (info == nullptr || !info->isCall) continue;
+
+            auto const ops = src.instOperands(inst);
+            if (ops.empty()) continue;  // malformed; the materialize
+                                         // pass will report loud.
+            // Operand[0] is the callee SymbolRef (post-isel peephole);
+            // args are operands[1..].
+            std::uint32_t const argCount =
+                static_cast<std::uint32_t>(ops.size() - 1);
+
+            std::uint32_t overflow = 0;
+            if (cc.slotAligned) {
+                // Each arg consumes one shared slot regardless of class.
+                if (argCount > slotAlignedPoolSize) {
+                    overflow = argCount - slotAlignedPoolSize;
+                }
+            } else {
+                // Independent counters per class. Gate on Reg-kind
+                // operands only (silent-failure H1 audit fold,
+                // 2026-06-02): the materialize call arm reports
+                // `L_VirtualRegInPostRegalloc` for non-Reg arg
+                // operands, but THIS pre-scan runs BEFORE the
+                // materialize gate. A future isel arm that puts an
+                // Imm or SymbolRef in operand[1..] would otherwise
+                // silently inflate this fn's frame by counting the
+                // non-Reg as a GPR arg.
+                std::uint32_t gprArgs = 0, fprArgs = 0;
+                for (std::size_t k = 1; k < ops.size(); ++k) {
+                    LirOperand const& argOp = ops[k];
+                    if (argOp.kind != LirOperandKind::Reg) continue;
+                    if (argOp.reg.regClass() == LirRegClass::FPR) {
+                        ++fprArgs;
+                    } else {
+                        ++gprArgs;
+                    }
+                }
+                std::uint32_t const gprOverflow =
+                    (gprArgs > gprPoolSize) ? (gprArgs - gprPoolSize) : 0u;
+                std::uint32_t const fprOverflow =
+                    (fprArgs > fprPoolSize) ? (fprArgs - fprPoolSize) : 0u;
+                overflow = gprOverflow + fprOverflow;
+            }
+            if (overflow > maxOverflow) maxOverflow = overflow;
+        }
+    }
+    return maxOverflow;
 }
 
 // Emit `<op> SP, bytes` — destructive 2-operand form. Caller supplies
@@ -264,25 +447,55 @@ void emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
     b.addInst(loadOp, result, ops);
 }
 
+// D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): emit
+// `result = lea [SP + offset]` — the address of a frame-local slot
+// in a register. `lea` operand layout per x86_64.target.json 3-op
+// no-index variant: [base_reg, MemBase(scale), MemOffset(disp)] —
+// 3 ops + result. Same operand shape as `load`/`store`; the
+// distinction is the opcode (`lea` produces an EFFECTIVE ADDRESS,
+// not a memory access). Used by the materialize pass to rewrite
+// `alloca` instructions into `lea`-of-frame-slot — assigning each
+// alloca a fixed offset above the spill area.
+void emitFrameAddr(LirBuilder& b, std::uint16_t leaOp, LirReg result,
+                   LirReg sp, std::int32_t offset) {
+    std::array<LirOperand, 3> ops{
+        LirOperand::makeReg(sp),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(offset)
+    };
+    b.addInst(leaOp, result, ops);
+}
+
 void emitPrologue(LirBuilder& b, FrameLayout const& layout,
                   LirReg sp, std::uint16_t subOp, std::uint16_t storeOp) {
     emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
+    // D-ML7-2.2 audit-fold (2026-06-02 silent-failure CRITICAL C1):
+    // saved regs sit at [SP + savedRegAreaOffset() + i*slotSize),
+    // NOT [SP + i*slotSize). The new outgoing-args area pushes saved
+    // regs upward by `outgoingArgAreaSize` bytes. Pre-fold the
+    // emitter wrote saved regs into the outgoing-area memory,
+    // silently corrupting outgoing stack args (and reading garbage
+    // back at the epilogue).
+    std::uint32_t const base = layout.savedRegAreaOffset();
     for (std::size_t i = 0; i < layout.savedRegs.size(); ++i) {
         // saved reg carries its own class (set by collectUsedCalleeSaved
         // via schema.registerInfo) — FPR callee-saves (MS-x64 xmm6..15)
         // store with FPR-class encoding rather than being silently
         // mis-classified as GPR.
         emitFrameStore(b, storeOp, layout.savedRegs[i], sp,
-                       static_cast<std::int32_t>(i * layout.slotSize));
+                       static_cast<std::int32_t>(base + i * layout.slotSize));
     }
 }
 
 void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
                   LirReg sp, std::uint16_t addOp, std::uint16_t loadOp) {
     // Reverse the prologue: load saved regs FIRST, then restore SP.
+    // Same savedRegAreaOffset() bias as the prologue (mirrored
+    // reads — silent miscompile if these diverge).
+    std::uint32_t const base = layout.savedRegAreaOffset();
     for (std::size_t i = 0; i < layout.savedRegs.size(); ++i) {
         emitFrameLoad(b, loadOp, layout.savedRegs[i], sp,
-                      static_cast<std::int32_t>(i * layout.slotSize));
+                      static_cast<std::int32_t>(base + i * layout.slotSize));
     }
     emitSpAdjust(b, addOp, sp, layout.totalFrameSize);
 }
@@ -305,6 +518,15 @@ struct OpcodeHandles {
     // how the linker patches disp32 (IAT slot RVA vs callee RVA).
     // The materialize pass treats both identically for arg setup.
     std::uint16_t callIndirectViaExtern;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): the
+    // `alloca` virtual op is materialized by the callconv pass into
+    // `lea result, [sp + localAreaOffset() + i*slotSize]` using the
+    // 3-op no-index `lea` form. The opcode handle pair must both
+    // resolve — a target without `lea` would naturally lack `alloca`
+    // too (both anchored on register-machine ABIs); the loader
+    // rejects loud if either is missing AND `alloca` is exercised.
+    std::uint16_t alloca_;
+    std::uint16_t lea;
 };
 
 // Resolve a cc register-name reference to a typed `LirReg`. Returns
@@ -428,7 +650,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 10> const table{{
+    std::array<Entry, 12> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -446,6 +668,17 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // extern is lowered, so the absence here is safe.
         {&OpcodeHandles::callIndirectViaExtern,
          "call_indirect_via_extern", true},
+        // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+        // optional — a target without body-local allocas (e.g., a
+        // shader / WASM target where locals are operand-stack
+        // values, not stack slots) legitimately omits both. When
+        // present they MUST both resolve: a target declaring
+        // `alloca` without `lea` (or vice versa) is a schema
+        // misconfiguration. The materialize pass fails loud if it
+        // encounters an `alloca` instruction without the `lea`
+        // handle resolved.
+        {&OpcodeHandles::alloca_,    "alloca",     true},
+        {&OpcodeHandles::lea,        "lea",        true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -489,9 +722,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
     std::vector<LirReg> usedSaved = collectUsedCalleeSaved(src, fn, schema, cc);
     bool const hasCalls = functionHasCalls(src, fn, schema);
+    // D-ML7-2.2: pre-scan call sites for the maximum stack-arg
+    // overflow across all calls. The prologue reserves enough
+    // outgoing-arg-area bytes for the widest call.
+    std::uint32_t const outgoingArgSlots = hasCalls
+        ? computeMaxOutgoingStackArgs(src, fn, schema, cc)
+        : 0u;
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): pre-
+    // scan `alloca` opcodes; the prologue reserves one slotSize-byte
+    // slot per body-local declaration. Order-by-scan = order-by-
+    // materialize-arm — the materialize loop assigns the same index
+    // i to the same alloca as the count pre-scan visited.
+    std::uint32_t const numLocalAllocas =
+        functionLocalAllocaCount(src, fn, h.alloca_);
     auto layoutOpt = computeFrameLayout(alloc, schema, cc,
                                         std::move(usedSaved),
-                                        hasCalls, reporter);
+                                        hasCalls, outgoingArgSlots,
+                                        numLocalAllocas,
+                                        reporter);
     if (!layoutOpt.has_value()) return false;
     outLayout = std::move(*layoutOpt);
 
@@ -507,6 +755,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     }
 
     std::uint32_t const slotSize = outLayout.slotSize;
+
+    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): counter
+    // advanced once per `alloca` instruction in scan order. Matches
+    // the order `functionLocalAllocaCount` visited at frame-layout
+    // time, so each alloca's offset is stable + reproducible.
+    std::uint32_t localAllocaIndex = 0;
 
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
@@ -538,11 +792,31 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // param into the regalloc-chosen home — or skip when
             // regalloc happened to pick the source reg itself (no-op).
             //
-            // Out-of-range arg indices fall into D-ML7-2.2 (stack-
-            // passed). A future regalloc pre-coloring hint
-            // (D-ML7-2.5) would eliminate most of these movs by
-            // pre-pinning the param vreg to its cc arg reg; for v1
-            // correctness, the unconditional mov is the right shape.
+            // D-ML7-2.2 + D-ML7-2.6 closure (2026-06-02): when the
+            // arg index overflows the register pool, the arg lives in
+            // the caller's outgoing-args area on the stack. The
+            // callee reads it via `frame_load result, [sp +
+            // totalFrameSize + callPushBytes + shadowSpaceBytes +
+            // overflowIndex * outgoingSlotSize]` — the caller's
+            // outgoing area sits above this fn's full frame + the
+            // post-CALL return-address push, and stack args start
+            // AFTER the shadow space at offset `shadowSpaceBytes`
+            // within the outgoing area. `outgoingSlotSize` (= GPR
+            // width = pointer width = 8 on x86_64/ARM64), NOT the
+            // larger `slotSize` (= max(GPR, FPR) = 16 on x86_64 due
+            // to XMM 128-bit registers).
+            //
+            // Slot-aligned cc (Win64 ms_x64): payload is the flat
+            // slot index; pool size = max(argGprs, argFprs); register
+            // resident when slot < poolSize, else stack-resident.
+            // Independent counters (SysV/AAPCS64): payload IS the
+            // per-class index (existing semantics — see D-ML7-2.10
+            // anchor for the mixed-class latent gap).
+            //
+            // A future regalloc pre-coloring hint (D-ML7-2.5) would
+            // eliminate most register-resident movs by pre-pinning
+            // the param vreg to its cc arg reg; for v1 correctness,
+            // the unconditional mov is the right shape.
             if (op == h.arg) {
                 if (!result.valid() || result.isPhysical == 0) {
                     report(reporter, DiagnosticCode::L_VirtualRegInPostRegalloc,
@@ -552,11 +826,82 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        inst.v));
                     return false;
                 }
-                auto const argSrc =
-                    argPassingReg(schema, cc, payload, result.regClass(),
-                                  "materializeOneFunc: arg", reporter);
-                if (!argSrc.has_value()) return false;
-                maybeMov(b, h.mov, result, *argSrc);
+                LirRegClass const cls = result.regClass();
+                std::uint32_t const slotAlignedPoolSize = std::max(
+                    static_cast<std::uint32_t>(cc.argGprs.size()),
+                    static_cast<std::uint32_t>(cc.argFprs.size()));
+                std::uint32_t const classPoolSize = static_cast<std::uint32_t>(
+                    (cls == LirRegClass::FPR) ? cc.argFprs.size() : cc.argGprs.size());
+                std::uint32_t const poolSize = cc.slotAligned
+                    ? slotAlignedPoolSize : classPoolSize;
+                if (payload < poolSize) {
+                    // Register-resident: existing path.
+                    auto const argSrc =
+                        argPassingReg(schema, cc, payload, cls,
+                                      "materializeOneFunc: arg", reporter);
+                    if (!argSrc.has_value()) return false;
+                    maybeMov(b, h.mov, result, *argSrc);
+                } else {
+                    // Stack-resident: read from caller's outgoing area.
+                    // Offset within outgoing area = shadowSpaceBytes +
+                    // (overflow_index * outgoingSlotSize). Callee reads
+                    // it at totalFrameSize + callPushBytes above its
+                    // own SP. outgoingSlotSize (= GPR width, 8 on
+                    // x86_64) is the per-stack-arg stride — NOT
+                    // slotSize (max of GPR/FPR = 16 on x86_64) which
+                    // is the spill-slot stride.
+                    std::uint32_t const overflowIdx = payload - poolSize;
+                    std::int32_t const offset = static_cast<std::int32_t>(
+                        outLayout.totalFrameSize
+                        + static_cast<std::uint32_t>(cc.callPushBytes)
+                        + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+                        + overflowIdx * outLayout.outgoingSlotSize);
+                    emitFrameLoad(b, h.load, result, sp, offset);
+                }
+                continue;
+            }
+
+            // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+            // materialize `alloca` virtual op into `lea result,
+            // [sp + localAreaOffset() + i * slotSize]`. Placed next
+            // to the `arg` arm because both produce a frame-resident
+            // value into a physreg result (vs. the call arm which is
+            // an explicit ABI-shaped emission sequence). `h.alloca_`
+            // is the (optional) opcode handle; the loader leaves it
+            // 0 for targets that don't declare alloca (shaders, WASM
+            // — operand-stack ABIs have no body-local stack slots),
+            // and `op == 0` never matches a real input opcode.
+            // `h.lea` MUST resolve when h.alloca_ does — a schema
+            // declaring one without the other is a misconfiguration
+            // that we fail loud on at the per-instruction site.
+            if (h.alloca_ != 0 && op == h.alloca_) {
+                if (h.lea == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: target schema declares "
+                                       "'alloca' opcode but no 'lea' opcode "
+                                       "— required to materialize alloca as "
+                                       "`lea result, [sp + offset]` per "
+                                       "D-CSUBSET-LOCAL-INT-CODEGEN"));
+                    return false;
+                }
+                if (!result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_VirtualRegInPostRegalloc,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: alloca inst {} has no "
+                                       "physical-reg result after regalloc",
+                                       inst.v));
+                    return false;
+                }
+                // Assign this alloca a local index by scan order
+                // (matches functionLocalAllocaCount's traversal —
+                // shared loop nesting + identical instruction visit
+                // order guarantee the two counters stay in sync).
+                std::int32_t const offset = static_cast<std::int32_t>(
+                    outLayout.localAreaOffset()
+                    + localAllocaIndex * outLayout.slotSize);
+                ++localAllocaIndex;
+                emitFrameAddr(b, h.lea, result, sp, offset);
                 continue;
             }
 
@@ -620,18 +965,34 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        inst.v));
                     return false;
                 }
-                // Plan the move-to-arg-register sequence up front so a
-                // move-cycle check can run BEFORE any mov is emitted.
-                // Each entry is (destination arg-passing physreg,
-                // source physreg holding the value).
+                // Plan the move-to-arg-register sequence (and any
+                // stack-arg spills) up front so a move-cycle check
+                // can run BEFORE any mov is emitted AND stack stores
+                // happen BEFORE register moves (so the stack-store
+                // reads its src reg before any register move could
+                // clobber it).
                 struct ArgMove {
                     LirReg dest;
                     LirReg src;
                 };
+                struct StackArgStore {
+                    LirReg       src;
+                    std::int32_t offset;  // from THIS fn's SP-post-prologue
+                };
                 std::vector<ArgMove> argMoves;
+                std::vector<StackArgStore> stackStores;
                 argMoves.reserve(ops.size());
+                // D-ML7-2.6: under slot-aligned cc (Win64 ms_x64),
+                // each arg consumes one shared slot index regardless
+                // of class. Under independent counters (SysV/AAPCS64),
+                // gpr/fpr counters advance separately.
+                std::uint32_t const slotAlignedPoolSize = std::max(
+                    static_cast<std::uint32_t>(cc.argGprs.size()),
+                    static_cast<std::uint32_t>(cc.argFprs.size()));
                 std::uint32_t gprIdx = 0;
                 std::uint32_t fprIdx = 0;
+                std::uint32_t slotIdx = 0;
+                std::uint32_t overflowIdx = 0;  // count of stack-args so far
                 for (std::size_t i = 1; i < ops.size(); ++i) {
                     LirOperand const& argOp = ops[i];
                     if (argOp.kind != LirOperandKind::Reg
@@ -646,13 +1007,41 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     }
                     LirReg const srcReg = argOp.reg;
                     LirRegClass const cls = srcReg.regClass();
-                    std::uint32_t const argIndex =
-                        (cls == LirRegClass::FPR) ? fprIdx++ : gprIdx++;
-                    auto const destReg =
-                        argPassingReg(schema, cc, argIndex, cls,
-                                      "materializeOneFunc: call", reporter);
-                    if (!destReg.has_value()) return false;
-                    argMoves.push_back({*destReg, srcReg});
+                    std::uint32_t argIndex;
+                    std::uint32_t poolSize;
+                    if (cc.slotAligned) {
+                        argIndex  = slotIdx++;
+                        poolSize  = slotAlignedPoolSize;
+                    } else {
+                        if (cls == LirRegClass::FPR) {
+                            argIndex = fprIdx++;
+                            poolSize = static_cast<std::uint32_t>(cc.argFprs.size());
+                        } else {
+                            argIndex = gprIdx++;
+                            poolSize = static_cast<std::uint32_t>(cc.argGprs.size());
+                        }
+                    }
+                    if (argIndex < poolSize) {
+                        // Register-resident arg: existing path.
+                        auto const destReg =
+                            argPassingReg(schema, cc, argIndex, cls,
+                                          "materializeOneFunc: call", reporter);
+                        if (!destReg.has_value()) return false;
+                        argMoves.push_back({*destReg, srcReg});
+                    } else {
+                        // D-ML7-2.2 stack-arg overflow: spill srcReg
+                        // into THIS fn's outgoing-args area at
+                        // [sp + shadowSpaceBytes + overflowIdx * slotSize].
+                        // Stack stores are emitted BEFORE register
+                        // moves below so the src reg is read before
+                        // any later register move could clobber it.
+                        std::int32_t const offset =
+                            static_cast<std::int32_t>(
+                                static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+                                + overflowIdx * outLayout.outgoingSlotSize);
+                        stackStores.push_back({srcReg, offset});
+                        ++overflowIdx;
+                    }
                 }
                 // Move-ordering hazard detection (silent-failure-hunter
                 // CRITICAL F1 fold + post-fold inversion fix). The
@@ -709,9 +1098,78 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         }
                     }
                 }
-                // Cycle-free — emit in order.
+                // D-ML7-2.2 (closed 2026-06-02): emit stack-arg
+                // stores FIRST, before any register move. The
+                // stack-store reads its src reg; if a later register
+                // move would have written to that reg, the store
+                // would see the clobbered value. Stack stores never
+                // write to a register, so they can't participate in
+                // the register-move-cycle hazard — they're safe to
+                // emit first unconditionally. Offset is from THIS
+                // fn's SP-post-prologue (the outgoing-args area sits
+                // at [SP+0..outgoingArgAreaSize)).
+                for (auto const& s : stackStores) {
+                    emitFrameStore(b, h.store, s.src, sp, s.offset);
+                }
+                // Cycle-free — emit register moves in order.
                 for (auto const& m : argMoves) {
                     maybeMov(b, h.mov, m.dest, m.src);
+                }
+                // D-LANG-VARIADIC (step 13.4): when the call is
+                // variadic AND the cc declares a vector-arg count
+                // register, emit `mov <countReg>, <count>` per
+                // SysV §3.5.7 (see `variadicVectorCountReg`
+                // docblock in target_schema.hpp). Emitted AFTER
+                // arg-passing moves + stack-arg stores: the cc's
+                // countReg (e.g. SysV `rax`) is NOT in the arg-
+                // passing GPR pool, but a future indirect-call
+                // shape or parallel-copy serializer could use it
+                // as a scratch — emitting last guarantees no later
+                // code reads or writes it before the call consumes it.
+                if (::dss::call_payload::isVariadic(payload)
+                    && cc.variadicVectorCountReg.has_value()) {
+                    std::uint32_t const fixedCount =
+                        ::dss::call_payload::fixedArgCount(payload);
+                    std::uint32_t vectorArgsInVararg = 0;
+                    for (std::size_t i = 1; i < ops.size(); ++i) {
+                        // ops[0] is the callee; ops[1..] are args.
+                        std::size_t const argIdx = i - 1;
+                        if (argIdx < fixedCount) continue;
+                        if (ops[i].kind != LirOperandKind::Reg) continue;
+                        if (ops[i].reg.regClass() == LirRegClass::FPR) {
+                            ++vectorArgsInVararg;
+                        }
+                    }
+                    // D-LANG-VARIADIC (step 13.4) post-fold (type-design
+                    // analyzer rec): derive the countReg's class from
+                    // the SCHEMA's register-table entry, NOT a
+                    // hardcoded LirRegClass::GPR. SysV's rax is GPR;
+                    // a hypothetical future ABI that chose an XMM
+                    // register would have its class threaded through
+                    // automatically. Closes silent-failure surface
+                    // where a non-GPR cc.variadicVectorCountReg would
+                    // silently misclass the emitted vreg.
+                    auto const* regInfo = schema.registerInfo(
+                        cc.variadicVectorCountReg->ordinal);
+                    if (regInfo == nullptr) {
+                        report(reporter,
+                               DiagnosticCode::L_CcRegLookupFailed,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: cc '{}' "
+                                           "variadicVectorCountReg ordinal "
+                                           "{} is out of range",
+                                           cc.name,
+                                           cc.variadicVectorCountReg->ordinal));
+                        return false;
+                    }
+                    LirReg const countReg = makePhysicalReg(
+                        cc.variadicVectorCountReg->ordinal,
+                        static_cast<LirRegClass>(
+                            static_cast<std::uint8_t>(regInfo->regClass)));
+                    std::array<LirOperand, 1> immOps{
+                        LirOperand::makeImmInt32(
+                            static_cast<std::int32_t>(vectorArgsInVararg))};
+                    b.addInst(h.mov, countReg, immOps);
                 }
                 // Emit the call instruction. Pass through the input
                 // opcode (h.call OR h.callIndirectViaExtern) so the

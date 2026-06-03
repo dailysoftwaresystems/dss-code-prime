@@ -2,6 +2,7 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"  // callConvName / callConvFromName
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_literal_pool.hpp"
@@ -134,33 +135,11 @@ constexpr int kVersion = 1;
     return std::nullopt;
 }
 
-[[nodiscard]] std::string_view ccName(CallConv cc) noexcept {
-    switch (cc) {
-        case CallConv::CcSysV:       return "sysv";
-        case CallConv::CcMS64:       return "ms64";
-        case CallConv::CcAAPCS64:    return "aapcs64";
-        case CallConv::CcApple:      return "apple";
-        case CallConv::CcFastcall:   return "fastcall";
-        case CallConv::CcThiscall:   return "thiscall";
-        case CallConv::CcVectorcall: return "vectorcall";
-        case CallConv::CcWasm:       return "wasm";
-        case CallConv::CcSpirv:      return "spirv";
-    }
-    return "sysv";
-}
-
-[[nodiscard]] std::optional<CallConv> ccFromName(std::string_view s) noexcept {
-    if (s == "sysv")       return CallConv::CcSysV;
-    if (s == "ms64")       return CallConv::CcMS64;
-    if (s == "aapcs64")    return CallConv::CcAAPCS64;
-    if (s == "apple")      return CallConv::CcApple;
-    if (s == "fastcall")   return CallConv::CcFastcall;
-    if (s == "thiscall")   return CallConv::CcThiscall;
-    if (s == "vectorcall") return CallConv::CcVectorcall;
-    if (s == "wasm")       return CallConv::CcWasm;
-    if (s == "spirv")      return CallConv::CcSpirv;
-    return std::nullopt;
-}
+// CallConv name mapping previously hand-rolled here (and in
+// hir_text.cpp) — duplication caught in the 2026-06-02 cross-
+// codebase audit. Call sites now use `callConvName(cc)` /
+// `callConvFromName(s)` directly from the single source of truth
+// (`kCallConvTable` in target_schema.hpp).
 
 // ── Emitter ──────────────────────────────────────────────────────────
 
@@ -295,7 +274,7 @@ private:
                 if (!sc.empty()) {
                     auto const cc = static_cast<CallConv>(sc[0]);
                     if (cc != CallConv::CcSysV) {
-                        out_ += " cc "; out_ += ccName(cc);
+                        out_ += " cc "; out_ += callConvName(cc);
                     }
                 }
                 return;
@@ -989,7 +968,7 @@ private:
             if (peekIdent("cc")) {
                 lex_.take();
                 Tok n = lex_.take();
-                if (auto c = ccFromName(n.text); c.has_value()) cc = *c;
+                if (auto c = callConvFromName(n.text); c.has_value()) cc = *c;
             }
             return interner_.fnSig(params, ret, cc);
         }
