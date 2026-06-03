@@ -25,3 +25,21 @@ target_compile_definitions(opt PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # guarantee, no link-tier dependency. Future LIR-tier passes (OPT5+)
 # will add lir.
 target_link_libraries(opt PRIVATE core mir hir nlohmann_json::nlohmann_json)
+
+# D-OPT-RUNPASS-EXHAUSTIVE-WARN closure: enforce exhaustive PassId
+# dispatch at compile time, scoped to optimizer.cpp ONLY. The runPass
+# switch has no default arm, so the "no-default + missing case = error"
+# flavor (GCC/Clang `-Werror=switch`; MSVC `/we4062`) catches a future
+# PassId enumerator added without a dispatch arm at build time — closing
+# the runtime-only `X_UnknownPassId` gap the static_assert on
+# kPassIdCount can't reach.
+# Per-file scope is load-bearing: pass implementations legitimately use
+# subset-switches WITH defaults, which the with-default flavor (/we4061
+# / -Wswitch-enum) would noisily flag without catching real drift.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    set_source_files_properties(optimizer.cpp PROPERTIES
+        COMPILE_OPTIONS "-Werror=switch")
+elseif(MSVC)
+    set_source_files_properties(optimizer.cpp PROPERTIES
+        COMPILE_OPTIONS "/we4062")
+endif()
