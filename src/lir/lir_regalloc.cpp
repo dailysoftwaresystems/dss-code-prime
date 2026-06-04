@@ -148,6 +148,88 @@ rangeCrossesCall(LirLiveRange const& r,
     return *lo + 1u < r.end;
 }
 
+// Per-opcode implicit-clobber consumer (cycle 10q closure of the
+// 10p substrate). Some opcodes (x86 idiv/div, future x86 shift-by-CL,
+// future mul-1-op-for-128-bit-result) destroy specific physical
+// registers as part of their semantic contract — distinct from
+// caller-saved (which is target-wide, applies to all calls) and
+// distinct from requires2Address (which forces ops[0]==result).
+// The 10p substrate declared the constraint per-opcode JSON-side;
+// 10q wires the regalloc to read + respect it.
+//
+// Mechanism mirrors callPositions: scan the LIR once, collect a
+// (position, clobbered-ordinals) entry per opcode-with-clobbers.
+// Per-range allocation then checks crossings + adds the union of
+// crossed clobbers to the exclusion set passed to tryAllocate
+// Excluding. Universal across CPUs: the constraint is per-opcode-
+// JSON-declared; no `if (opcode == idiv)` ever.
+struct ImplicitClobberAt {
+    std::uint32_t              position;
+    std::vector<std::uint16_t> clobberedOrdinals;
+};
+
+[[nodiscard]] std::vector<ImplicitClobberAt>
+collectImplicitClobberPositions(Lir const& lir, TargetSchema const& schema,
+                                LirFuncLiveness const& flow) {
+    std::vector<ImplicitClobberAt> out;
+    std::uint32_t pos = 0;
+    for (auto const& b : flow.blockOrder) {
+        std::uint32_t const n = lir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = lir.blockInstAt(b, i);
+            auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
+            if (info != nullptr
+             && info->implicitRegisters.has_value()
+             && !info->implicitRegisters->clobberedOrdinals.empty()) {
+                out.push_back({pos,
+                               info->implicitRegisters->clobberedOrdinals});
+            }
+            pos += 2u;
+        }
+    }
+    return out;
+}
+
+// Returns the union of clobbered-register ordinals across every
+// implicit-clobber opcode the range crosses (range.start <= pos+1 <
+// range.end — same "strictly past" semantics as rangeCrossesCall).
+// The result is written into `out` and the size returned via
+// reference so callers can chain into the existing fixed-size
+// exclusion array without heap allocation per range.
+template <std::size_t N>
+[[nodiscard]] std::size_t
+implicitClobbersCrossedBy(LirLiveRange const& r,
+                          std::vector<ImplicitClobberAt> const& clobbers,
+                          std::array<std::uint16_t, N>& out,
+                          std::size_t outAlreadyFilled) {
+    std::size_t filled = outAlreadyFilled;
+    for (auto const& c : clobbers) {
+        if (c.position < r.start) continue;
+        if (c.position + 1u >= r.end) continue;
+        for (std::uint16_t const ord : c.clobberedOrdinals) {
+            // Dedup against what's already in `out` (the
+            // requires2Address pass populated the leading slice;
+            // multiple implicit-clobber positions may repeat the
+            // same ordinal).
+            bool already = false;
+            for (std::size_t k = 0; k < filled; ++k) {
+                if (out[k] == ord) { already = true; break; }
+            }
+            if (already) continue;
+            if (filled >= out.size()) {
+                regallocFatal(
+                    "implicit-clobber + 2-addr exclusion union "
+                    "exceeds fixed exclusion buffer size — extend "
+                    "excludedStorage in lir_regalloc.cpp OR re-shape "
+                    "the schema so the high-pressure case lands "
+                    "differently (D-OPT-REGALLOC-EXCLUSION-BUFFER)");
+            }
+            out[filled++] = ord;
+        }
+    }
+    return filled;
+}
+
 struct ActiveEntry {
     LirLiveRange  range;
     LirRegClass   cls;
@@ -407,6 +489,11 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     FreeListsByClass free = buildFreeLists(schema, *cc);
     std::vector<std::uint32_t> const callPositions =
         collectCallPositions(lir, schema, flow);
+    // Cycle 10q closure of 10p substrate: per-opcode implicit
+    // clobbers (e.g., x86 idiv/div clobber RDX). One scan, consumed
+    // by every range that crosses an implicit-clobber position.
+    std::vector<ImplicitClobberAt> const implicitClobbers =
+        collectImplicitClobberPositions(lir, schema, flow);
 
     std::uint32_t maxVRegId = 0;
     for (auto const& r : flow.ranges) {
@@ -463,7 +550,17 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         // Universal across commutativity: the bug fires for both
         // commutative and non-commutative 2-addr ops; both want
         // the same exclusion.
-        std::array<std::uint16_t, 4> excludedStorage{};
+        // Exclusion buffer holds the union of (a) requires2Address
+        // operand[1..N] clobber-prevention + (b) cycle-10q implicit-
+        // register clobbers from crossed opcodes (e.g., x86 idiv's
+        // RDX). Size 8 = 4 (existing 2-addr headroom) + 4 (current
+        // max implicit-clobber set on any one op; idiv/div clobber 1
+        // each, future mul-1-op clobbers 1, future shift-by-CL
+        // clobbers 0). A schema row that pushes the union past 8
+        // fails loud via `regallocFatal` in
+        // `implicitClobbersCrossedBy` (D-OPT-REGALLOC-EXCLUSION-
+        // BUFFER anchored there).
+        std::array<std::uint16_t, 8> excludedStorage{};
         std::size_t excludedCount = 0;
         if (LirInstId const producingInst =
                 (r.start < flow.positionToInst.size())
@@ -538,6 +635,13 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 }
             }
         }
+        // Augment exclusion with implicit-register clobbers from any
+        // opcode this range crosses (cycle 10q substrate consumer).
+        // Universal across CPUs — driven entirely by the per-opcode
+        // schema declaration; no `if (opcode == idiv)` branch.
+        excludedCount = implicitClobbersCrossedBy(
+            r, implicitClobbers, excludedStorage, excludedCount);
+
         std::span<std::uint16_t const> const excluded{
             excludedStorage.data(), excludedCount};
 

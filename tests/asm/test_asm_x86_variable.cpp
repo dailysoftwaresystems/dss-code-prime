@@ -359,6 +359,72 @@ TEST(X86VariableEncoder, ZextRaxRaxEmits48_0F_B6_C0) {
     EXPECT_EQ(bytes[4], 0xC3);
 }
 
+// ── D-CSUBSET-DIVISION-OP-CODEGEN byte-pins (cycle 10q, 2026-06-04) ──
+//
+// Compound divide opcodes pack a pre-divide register-setup byte
+// sequence with the actual divide. Each opcode emits 5 bytes total:
+// 4 from template.opcode + 1 ModR/M derived from operand 0 (divisor)
+// + modrmRegExt. The byte sequences MUST differ — they encode
+// signed vs unsigned divide. FLAG 1 (silent-miscompile guard):
+// confusing the two routes any high-bit-set dividend through the
+// wrong sign interpretation — silent miscompile. The shared helper
+// + two parameterized tests fail loud at the assembler tier if the
+// JSON contract drifts. Post-fold helper extraction (10q FOLD-NOW)
+// eliminates ~25 LOC of duplication + collapses the drift surface
+// for future div-variant rows (e.g., 32-bit i32 div / SMod / UMod).
+
+namespace {
+void expectCompoundDivBytes(char const* mnemonic,
+                            std::array<std::uint8_t, 5> const& expected) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const compoundOp = (*schema)->opcodeByMnemonic(mnemonic);
+    ASSERT_TRUE(compoundOp.has_value()) << "missing opcode: " << mnemonic;
+    auto const raxOrd = (*schema)->registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+
+    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
+                     /*isPhysical=*/1,
+                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(rax) };
+        (void)b.addInst(*compoundOp, InvalidLirReg, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(bytes.size(), 6u);  // 5 compound bytes + ret
+    for (std::size_t i = 0; i < 5; ++i) {
+        EXPECT_EQ(bytes[i], expected[i])
+            << mnemonic << " byte " << i << " mismatch";
+    }
+    EXPECT_EQ(bytes[5], 0xC3);  // ret
+}
+} // namespace
+
+TEST(X86VariableEncoder, SdivCompoundRaxEmits48_99_48_F7_F8) {
+    // sdiv_compound rax = REX.W 0x99 CQO (sign-extend RAX→RDX:RAX)
+    // + REX.W 0xF7 /7 IDIV r/m64 (divides RDX:RAX by rax).
+    // ModR/M byte 0xF8 = mod=11 /7 rm=rax(0).
+    expectCompoundDivBytes("sdiv_compound",
+        {0x48, 0x99, 0x48, 0xF7, 0xF8});
+}
+
+TEST(X86VariableEncoder, UdivCompoundRaxEmits31_D2_48_F7_F0) {
+    // udiv_compound rax = 0x31 0xD2 XOR EDX, EDX (zeroes RDX —
+    // 32-bit op zero-extends to RDX) + REX.W 0xF7 /6 DIV r/m64.
+    // ModR/M byte 0xF0 = mod=11 /6 rm=rax(0).
+    //
+    // FLAG 1 discrimination: udiv's bytes[0..1] = 31 D2 are
+    // STRUCTURALLY DIFFERENT from sdiv's 48 99. A schema swap
+    // would fail at byte 0 BEFORE any high-bit dividend test
+    // could silently pass with wrong sign interpretation.
+    expectCompoundDivBytes("udiv_compound",
+        {0x31, 0xD2, 0x48, 0xF7, 0xF0});
+}
+
 // ── Variant-guard mismatch — A_NoMatchingEncodingVariant ─────────────
 
 TEST(X86VariableEncoder, NoMatchingVariantFiresLoudDiagnostic_KindMismatch) {

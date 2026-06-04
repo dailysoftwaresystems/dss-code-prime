@@ -230,6 +230,115 @@ TEST(MirToLir, MulReturnLowersThreeInstructions) {
               *L.target->opcodeByMnemonic("mul"));
 }
 
+// D-CSUBSET-DIVISION-OP-CODEGEN (cycle 10q, 2026-06-04): signed
+// divide. c-subset has only signed int/long → `/` lowers via
+// HirOpKind::Div → MirOpcode::SDiv → LIR MnemonicSlot::SDivCore →
+// the x86 `sdiv_compound` opcode (REX.W 0x99 CQO + REX.W 0xF7 /7
+// IDIV, byte-pinned in test_asm_x86_variable.cpp). The Div lowering
+// emits 3 LIR ops: (1) `mov rax_phys, dividend_vreg` to pin
+// dividend into RAX; (2) the compound div (no SSA result; outputs
+// live implicit in RAX/RDX); (3) `mov result_vreg, rax_phys` to
+// capture quotient.
+TEST(MirToLir, SignedDivisionLowersToSDivCompound) {
+    auto L = lowerCSubsetToLir("int q(int a, int b) { return a / b; }");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+
+    Lir const& lir = L.lir.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    // Expected sequence (instructions in the entry block):
+    //   0: arg a
+    //   1: arg b
+    //   2: mov rax_phys, a_vreg        (pin dividend)
+    //   3: sdiv_compound b_vreg        (no result)
+    //   4: mov result_vreg, rax_phys   (capture quotient)
+    //   5: mov ret_phys, result_vreg   (return convention)
+    //   6: ret
+    auto const sdivOp = L.target->opcodeByMnemonic("sdiv_compound");
+    auto const movOp  = L.target->opcodeByMnemonic("mov");
+    ASSERT_TRUE(sdivOp.has_value());
+    ASSERT_TRUE(movOp.has_value());
+    // Locate the sdiv_compound inst by opcode scan (position-
+    // resilient to upstream lowering changes that add/remove ops).
+    std::uint32_t sdivIdx = lir.blockInstCount(bb);
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *sdivOp) {
+            sdivIdx = i;
+            break;
+        }
+    }
+    ASSERT_LT(sdivIdx, lir.blockInstCount(bb))
+        << "MIR SDiv must lower to LIR sdiv_compound — present "
+           "verification via opcode scan in the function's entry "
+           "block";
+    // The sdiv_compound MUST be preceded by a mov-to-RAX (the
+    // dividend pin) and followed by a mov-from-RAX (the capture).
+    // Both are `mov`-mnemonic ops.
+    ASSERT_GT(sdivIdx, 0u);
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, sdivIdx - 1)), *movOp)
+        << "sdiv_compound must be preceded by `mov rax, dividend`";
+    ASSERT_LT(sdivIdx + 1, lir.blockInstCount(bb));
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, sdivIdx + 1)), *movOp)
+        << "sdiv_compound must be followed by `mov result, rax`";
+}
+
+// FLAG 1 discrimination test (10q, 2026-06-04): a hand-built MIR
+// with a UDiv inst MUST lower to the udiv_compound LIR opcode
+// (different byte sequence: XOR-zero-RDX + DIV /6) and NOT to
+// sdiv_compound (CQO-sign-extend + IDIV /7). c-subset itself has
+// no unsigned source today, so this test uses a hand-built MIR
+// fixture to exercise the UDiv arm directly. A regression that
+// routes UDiv through SDivCore would pass any high-bit-set
+// dividend test with the wrong sign interpretation (silent
+// miscompile) — this test catches it at the opcode level before
+// the bytes are even assembled.
+TEST(MirToLir, UnsignedDivisionLowersToUDivCompoundNotSDiv) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+    TypeId const params[] = {i32, i32};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const a = mb.addArg(0, i32);
+    MirInstId const b = mb.addArg(1, i32);
+    MirInstId const divOps[] = {a, b};
+    MirInstId const q = mb.addInst(MirOpcode::UDiv, divOps, i32);
+    mb.addReturn(q);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+
+    auto const udivOp = (*target)->opcodeByMnemonic("udiv_compound");
+    auto const sdivOp = (*target)->opcodeByMnemonic("sdiv_compound");
+    ASSERT_TRUE(udivOp.has_value());
+    ASSERT_TRUE(sdivOp.has_value());
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool foundUdiv = false;
+    bool foundSdiv = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const op = lir.instOpcode(lir.blockInstAt(bb, i));
+        if (op == *udivOp) foundUdiv = true;
+        if (op == *sdivOp) foundSdiv = true;
+    }
+    EXPECT_TRUE(foundUdiv)
+        << "MIR UDiv must lower to LIR udiv_compound (REX.W XOR + "
+           "DIV /6). Routing UDiv through sdiv_compound would mis-"
+           "sign-interpret dividends >= INT_MAX — silent miscompile.";
+    EXPECT_FALSE(foundSdiv)
+        << "MIR UDiv MUST NOT lower to sdiv_compound — the test "
+           "would pass with a small dividend but silently miscompile "
+           "any high-bit-set dividend (CRITICAL discriminator for "
+           "FLAG 1 of cycle 10q's silent-miscompile guard).";
+}
+
 // Cycle 3a wide-literal coverage (>INT32_MAX) is deferred to cycle 3b's
 // synthetic-MIR helper — the c-subset semantic phase rejects out-of-range
 // literals before they reach the LIR lowerer, so we can't exercise the

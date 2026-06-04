@@ -517,29 +517,60 @@ TEST(TargetSchema, ImplicitRegistersOmissionLeavesNullopt) {
            "nullopt — not auto-default to an empty constraint";
 }
 
-TEST(TargetSchema, ShippedX86_64NoOpcodeDeclaresImplicitRegisters) {
-    // Pre-cycle-10q invariant: NO shipped x86_64 opcode declares
-    // implicit-register constraints yet. The substrate ships
-    // unconsumed in 10p. When 10q adds idiv/cdq/cqo with declarations,
-    // this test will need an update — it's an attribution pin so
-    // that update is intentional, not silent (a future regression
-    // that accidentally re-defaults to nullopt during the loader's
-    // pre-10q absence would otherwise read green here).
+TEST(TargetSchema, ShippedX86_64ImplicitRegistersConsumerCount) {
+    // Cycle 10p landed the substrate UNCONSUMED. Cycle 10q opened
+    // consumption by adding sdiv_compound + udiv_compound (the
+    // two compound divide opcodes). This test pins the consumer
+    // count + names so:
+    //   * future cycles adding new implicit-register-bearing
+    //     opcodes (mul-1-op for 128-bit results / shift-by-CL /
+    //     ARM64 fixed-operand ops) update this list intentionally,
+    //     not silently;
+    //   * a regression that accidentally drops the implicit-
+    //     register declaration during a JSON edit fails loud with
+    //     attribution-clear "expected 2, got 1" diagnostic.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
     auto const& sch = **r;
-    std::size_t withConstraint = 0;
+    std::vector<std::string> mnemonicsWithConstraint;
     for (std::uint16_t op = 0; op < sch.opcodeCount(); ++op) {
         auto const* info = sch.opcodeInfo(op);
         if (info && info->implicitRegisters.has_value()) {
-            ++withConstraint;
+            mnemonicsWithConstraint.push_back(info->mnemonic);
         }
     }
-    EXPECT_EQ(withConstraint, 0u)
-        << "pre-cycle-10q: no shipped x86_64 opcode should declare "
-           "implicitRegisters yet. The substrate (cycle 10p) lands "
-           "unconsumed. Update this count when idiv/cdq/cqo land in "
-           "cycle 10q.";
+    ASSERT_EQ(mnemonicsWithConstraint.size(), 2u)
+        << "expected exactly 2 implicit-register-bearing opcodes "
+           "(sdiv_compound + udiv_compound from cycle 10q); update "
+           "this count when a new consumer lands.";
+    EXPECT_EQ(mnemonicsWithConstraint[0], "sdiv_compound");
+    EXPECT_EQ(mnemonicsWithConstraint[1], "udiv_compound");
+    // FLAG 1 discrimination: both ops carry the same implicit-
+    // register profile (RAX in, RAX/RDX out, RDX clobbered), but
+    // their BYTE sequences must differ (sdiv starts with CQO; udiv
+    // with XOR-RDX-RDX). The byte-pin tests in test_asm_x86_variable
+    // assert the difference at the assembler tier; this test
+    // attests the schema-tier shape.
+    auto const sdivOp = sch.opcodeByMnemonic("sdiv_compound");
+    auto const udivOp = sch.opcodeByMnemonic("udiv_compound");
+    ASSERT_TRUE(sdivOp.has_value());
+    ASSERT_TRUE(udivOp.has_value());
+    auto const* sdivInfo = sch.opcodeInfo(*sdivOp);
+    auto const* udivInfo = sch.opcodeInfo(*udivOp);
+    ASSERT_TRUE(sdivInfo->implicitRegisters.has_value());
+    ASSERT_TRUE(udivInfo->implicitRegisters.has_value());
+    EXPECT_EQ(sdivInfo->implicitRegisters->inputNames,
+              (std::vector<std::string>{"rax"}));
+    EXPECT_EQ(sdivInfo->implicitRegisters->outputNames,
+              (std::vector<std::string>{"rax", "rdx"}));
+    EXPECT_EQ(sdivInfo->implicitRegisters->clobberedNames,
+              (std::vector<std::string>{"rdx"}));
+    EXPECT_EQ(udivInfo->implicitRegisters->inputNames,
+              sdivInfo->implicitRegisters->inputNames)
+        << "udiv must declare the SAME implicit-register profile as "
+           "sdiv — both consume RAX, produce RAX/RDX, clobber RDX. "
+           "Distinction is byte-level (CQO vs XOR-zero), not regalloc-"
+           "level. A divergence here would indicate a profile typo.";
 }
 
 // ─── cycle 2b — calling conventions ──────────────────────────────────────

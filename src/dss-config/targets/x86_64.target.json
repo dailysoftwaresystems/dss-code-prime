@@ -147,6 +147,60 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — signed-divide compound op (cycle 10q, 2026-06-04). One LIR op packs CQO+IDIV (5 bytes total): REX.W 0x99 sign-extends RAX into RDX:RAX; then REX.W 0xF7 /7 IDIV r/m64 divides RDX:RAX by the divisor (operand 0), placing quotient in RAX + remainder in RDX. The MIR→LIR Div arm emits this op followed by `mov result_vreg, rax` to capture the quotient (SMod/UMod would capture RDX instead — anchored D-CSUBSET-MOD-OP-CODEGEN). `result: none` is intentional — the SSA result is created by the follow-up mov, not this op. `hasSideEffects: true` because the implicit RAX/RDX writes are not modeled as a wire-slot result. **implicitRegisters consumes 10p's substrate**: inputs=[rax] (dividend) — CQO derives RDX from RAX so RDX is NOT a true input; outputs=[rax,rdx] (quotient + remainder); clobbered=[rdx] (any prior live value in RDX is destroyed). ARM64's future direct SDIV opcode would land as a separate row with `result: value` + no implicitRegisters — the MIR→LIR Div arm's per-target divergence (compound + follow-up mov on x86 vs single SSA-result op on ARM64) is anchored D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC for closure when the 2nd target lands.",
+      "mnemonic":      "sdiv_compound",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":    ["rax"],
+        "outputs":   ["rax", "rdx"],
+        "clobbered": ["rdx"]
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "opcode": [72, 153, 72, 247], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — unsigned-divide compound op (cycle 10q, 2026-06-04). Sibling to sdiv_compound; same shape, different bytes. 5 bytes total: 0x31 0xD2 (XOR EDX, EDX — 32-bit XOR with destination=EDX, source=EDX zero-extends to clear all 64 bits of RDX); then REX.W 0xF7 /6 DIV r/m64 divides the zero-extended RDX:RAX by operand 0. **FLAG 1 of cycle 10q (silent-miscompile guard)**: routing MIR UDiv through `sdiv_compound` (idiv) would mis-sign-interpret any dividend ≥ INT_MAX as negative — producing a wrong quotient with no diagnostic. The tests pin discrimination by inspecting the actual emitted bytes (sdiv_compound starts with 0x48 0x99; udiv_compound starts with 0x31 0xD2). implicitRegisters: inputs=[rax] only (XOR zeroes RDX so it's not an input); outputs=[rax,rdx]; clobbered=[rdx].",
+      "mnemonic":      "udiv_compound",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":    ["rax"],
+        "outputs":   ["rax", "rdx"],
+        "clobbered": ["rdx"]
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"] },
+            "template": { "opcode": [49, 210, 72, 247], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): integer compare (writes FLAGS, no GPR result). Two variants: reg-reg (REX.W 0x39 /r — cmp r/m64, r64) + reg-imm32 (REX.W 0x81 /7 imm32 — cmp r/m64, imm32 with sign-extended imm32). modrmRegExt=7 fills ModR/M.reg with the /7 opcode-extension digit. ML5 lowerICmp + lowerCondBr both emit `cmp` against an immediate-0 or against another reg.",
       "mnemonic":      "cmp",
       "result":        "none",
