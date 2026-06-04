@@ -4,8 +4,9 @@ description: >
   Advance the DSS Code Prime compiler by exactly ONE development cycle: pick the next
   priority from the plan-00 §0.1 stepper, clear its blockers first, plan it with
   /feature-dev:feature-dev, design-audit the plan against the bar before locking it,
-  implement the best long-term solution, run /pr-review-toolkit:review-pr, pin every
-  deferral with a priority, cross-plan update, commit and push. One cycle per invocation — meant to be driven by /loop for continuous
+  implement the best long-term solution, run /pr-review-toolkit:review-pr (and re-review the
+  fold if it changed logic), pin every deferral with a priority, cross-plan update, self-audit
+  the cycle against the bar before locking, then commit and push. One cycle per invocation — meant to be driven by /loop for continuous
   autonomous progress. PAUSES and asks the user on any pending definition, architectural
   fork, gated anchor, or hard-stop boundary; never guesses, never workarounds, never
   breaks source (language) / target (processor) / linker (object-format) agnosticism.
@@ -95,7 +96,7 @@ The loop resumes only after the user answers. While paused, do not start a diffe
 
 ---
 
-## C. The cycle — ten steps (+ the plan-lock design gate at Step 3.5)
+## C. The cycle — ten steps (+ design-review gate at 3.5 · self-audit gate at 8.5)
 
 ### Step 0 — Orient
 - Check `git status` + current branch + the last commit subject. A `… WIP` cycle in flight
@@ -185,6 +186,11 @@ cheaper than after the diff lands. (This is the gate run on the linkage P1+P2 pl
   GCC-vs-MSVC portability (gtest `ASSERT_*` in non-void helpers; PCH-masked missing
   includes; UTF-8 / string-literal portability). Local green ≠ CI green.
 - Fold every FOLD-NOW finding. Then rebuild + re-run the full ctest.
+- **Re-review the fold.** If folding *changed logic* (anything beyond comments / renames /
+  formatting), run a **second `/pr-review-toolkit:review-pr` pass scoped to the fold's diff** — a
+  fold can introduce its own bugs (the 2nd-order-fold discipline). Fold-and-re-review until a
+  pass yields **no logic-changing FOLD-NOW** (a fixed point). If passes keep surfacing logic
+  FOLD-NOWs without converging, that is a **§B signal** — stop and report, do not grind.
 
 ### Step 6 — Fail-loud gate
 This is the canonical gate checklist (§A.6 is its one-line statement). Verify every item:
@@ -213,6 +219,32 @@ Keep the plans honest in the **same commit** as the code:
   **never delete a row** (the audit trail is load-bearing); add new anchors.
 - Record the cycle in the running cycle-log (memory entry per the established convention).
 - Update the `dss-code-prime` skill if a convention changed.
+
+### Step 8.5 — Self-audit before lock (the pre-commit audit gate)
+Before committing (Step 9), run the **`dss-audit` pass on the complete, gate-passed,
+cross-plan-updated cycle** — the rule-lens (`dss-audit` §E) + guardrail enforcement (§F) + the
+silent-gap hunt that the mechanical Step 6 gate **cannot** see. (The cycle-12 enum-init miss was
+exactly this: 193/193 green + review-passed, yet a real latent rule-break — caught only by an
+independent audit.) Running it here catches such a thing **before** anything is pushed.
+
+- **Independence is the point.** Run it as an **independent subagent** applying the `dss-audit`
+  bar — fresh context, no stake in having authored the diff, so it cannot rubber-stamp its own
+  work. Step 6 already ran the mechanical battery; the value-add here is the *subtle* checks —
+  agnosticism's conservative-default forms, prove-don't-assert / red-on-disable **completeness**
+  (every site/form of a multi-site contract, not a subset), over-claimed-close, effectiveness-
+  masking, and the §D guardrails.
+- **On findings → back to Step 4.** Treat the findings as the next work items: return to **Step 4
+  (Implement)**, fix them, then re-flow Step 5 (review + re-review) → 6 (gate) → 7 → 8 → 8.5
+  (re-audit). Loop until the self-audit is **clean**, then proceed to Step 9 with a cycle that is
+  already self-audited. A finding that implies a *design choice* (not a mechanical fix) is a **§B
+  gate** — escalate, do not loop on it. Passes that keep finding issues without converging are
+  themselves a §B signal.
+- **Pre-commit, by design.** Auditing *before* the commit keeps a rule-breaking change off the
+  branch entirely — no fix-forward churn, no pushed §F violation — and preserves "one cycle = one
+  clean push". **CI legs** are the one thing this gate cannot check (nothing is pushed yet); they
+  verify post-push (next cycle's Step 0 baseline, the separate human-run `dss-audit`, or
+  `gh run watch`). This in-loop self-audit does **not** replace that external `dss-audit` — that
+  stays the independent post-push backstop.
 
 ### Step 9 — Commit & push
 - Commit using the repo cycle convention: subject `Cycle <id>: <concise summary>` (use
@@ -253,7 +285,7 @@ fresh context.
 ## E. Stop-command handling
 
 If the user issues a stop while a cycle is running: **finish the current cycle's full flow
-through Step 9 (review → gate → cross-plan update → commit → push)**, then halt. Do not begin
+through Step 9 (review → gate → cross-plan update → self-audit → commit → push)**, then halt. Do not begin
 a new cycle. Two situations the stop does **not** override:
 - **Cannot reach a clean gate** (red build/test the cycle can't self-repair): stop at the gate
   and report — do not push broken.
@@ -295,7 +327,8 @@ Every deferral is explicit, located, and prioritized — never silent.
 | Deferral registry | `.plans/_deferred-anchor-registry.md` |
 | Per-cycle plan | `/feature-dev:feature-dev` (Step 3) |
 | Plan-lock design audit | independent `dss-audit` lens on the plan, pre-build (Step 3.5) |
-| Per-cycle review | `/pr-review-toolkit:review-pr` (Step 5) |
+| Per-cycle review (+ re-review the fold) | `/pr-review-toolkit:review-pr` ×N to a fixed point (Step 5) |
+| Pre-commit self-audit | independent `dss-audit` lens on the built cycle (Step 8.5) — findings loop back to Step 4 |
 | Conventions + strict tests | the `dss-code-prime` skill (§7, §9, §13) |
 
 **The loop's own creed:** it holds itself to the same fail-loud, no-workaround, agnostic
