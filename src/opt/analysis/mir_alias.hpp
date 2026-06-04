@@ -19,11 +19,15 @@
 #include "core/types/type_lattice/type_id.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_cfg.hpp"
 #include "mir/mir_opcode.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <span>
+#include <unordered_set>
+#include <vector>
 
 namespace dss::opt::analysis {
 
@@ -158,6 +162,174 @@ namespace detail {
     }
 
     return MirAliasResult::Maybe;                                      // Rule 6
+}
+
+// ── Region + loop clobber walkers ────────────────────────────────────
+//
+// CSE/LICM Load admission needs to answer "is there a may-aliasing
+// Store between two program points?" The MVP implementation walks a
+// bounded BLOCK SET (NOT path enumeration — exponential in the worst
+// case): for each block reachable from `from` AND from which `to` is
+// reachable, scan its Stores and call `mirMayAlias` on each store's
+// pointer operand vs the load's pointer.
+//
+// This is O(loads × region × stores) worst-case — fine for the v1
+// corpus but the classic place that doesn't scale. The standard upgrade
+// is MemorySSA — compute each load's clobbering def once at function
+// scope, then CSE/LICM/DSE query in ~O(1). Anchored at
+// `D-OPT-MEMORYSSA-CLOBBER-WALK`; built when the region-walk step-cap
+// fires on real input OR a third memory-clobber consumer (DSE) lands.
+
+// Compute the STRICTLY-BETWEEN region: blocks forward-reachable from
+// `loadBlock` AND backward-reachable from `useBlock`, EXCLUDING both
+// endpoints (caller owns the in-block walks for `loadBlock`'s tail
+// and `useBlock`'s head — they have the inst-index context needed to
+// scope those scans). Returns block ids deterministic-sorted by slot.
+//
+// Naming: `loadBlock` is where the dominator Load lives (the "from"
+// end of the path); `useBlock` is where the use being CSE'd-against
+// lives (the "to" end). The names lock direction so a caller can't
+// silently swap arguments — see the docblock on `mirMayAlias` for
+// the same StrictTbaa rationale.
+//
+// Bounded by step-cap = block-count * 4 + 4; fail-loud on overflow
+// (signals a malformed CFG the verifier should have caught).
+[[nodiscard]] inline std::vector<MirBlockId>
+mirRegionBetween(
+    Mir const&        mir,
+    MirBlockId        loadBlock,
+    MirBlockId        useBlock)
+{
+    std::vector<MirBlockId> result;
+    if (!loadBlock.valid() || !useBlock.valid()) return result;
+
+    std::uint32_t const blockCount = static_cast<std::uint32_t>(mir.blockCount());
+    if (blockCount == 0) return result;
+    std::uint32_t const stepCap = blockCount * 4u + 4u;
+
+    // Forward-reachable from `loadBlock`.
+    std::unordered_set<std::uint32_t> fwd;
+    {
+        std::vector<MirBlockId> work;
+        work.push_back(loadBlock);
+        fwd.insert(loadBlock.v);
+        std::uint32_t steps = 0;
+        while (!work.empty()) {
+            if (++steps > stepCap) {
+                std::fprintf(stderr,
+                    "dss::opt::analysis::mirRegionBetween fatal: "
+                    "step-cap exceeded in forward walk from #%u — "
+                    "malformed CFG (the verifier should have caught "
+                    "this; D-OPT-MEMORYSSA-CLOBBER-WALK trigger).\n",
+                    loadBlock.v);
+                std::abort();
+            }
+            MirBlockId const b = work.back();
+            work.pop_back();
+            for (MirBlockId const s : mir.blockSuccessors(b)) {
+                if (!s.valid() || s.v >= blockCount) continue;
+                if (fwd.insert(s.v).second) work.push_back(s);
+            }
+        }
+    }
+
+    // Backward-reachable from `useBlock` (via predecessors).
+    auto const preds = mirBuildPredecessors(mir);
+    std::unordered_set<std::uint32_t> bwd;
+    {
+        std::vector<MirBlockId> work;
+        work.push_back(useBlock);
+        bwd.insert(useBlock.v);
+        std::uint32_t steps = 0;
+        while (!work.empty()) {
+            if (++steps > stepCap) {
+                std::fprintf(stderr,
+                    "dss::opt::analysis::mirRegionBetween fatal: "
+                    "step-cap exceeded in backward walk to #%u — "
+                    "malformed CFG.\n", useBlock.v);
+                std::abort();
+            }
+            MirBlockId const b = work.back();
+            work.pop_back();
+            if (b.v >= preds.size()) continue;
+            for (MirBlockId const p : preds[b.v]) {
+                if (!p.valid() || p.v >= blockCount) continue;
+                if (bwd.insert(p.v).second) work.push_back(p);
+            }
+        }
+    }
+
+    // Intersection minus BOTH endpoints — caller's in-block walks own
+    // loadBlock's tail (after canonical Load) + useBlock's head (before
+    // current use). This keeps the region walker symmetric (excludes
+    // both) and prevents the dead-code-masking-bug class where a
+    // useBlock-included region + a redundant head-of-useBlock scan
+    // could disagree on which scanner found a clobber.
+    for (std::uint32_t v = 1; v < blockCount; ++v) {
+        if (v == loadBlock.v) continue;
+        if (v == useBlock.v) continue;
+        if (fwd.count(v) && bwd.count(v)) {
+            result.push_back(MirBlockId{v, mir.id().v});
+        }
+    }
+    // result is already sorted by `v` because the loop emits in order.
+    return result;
+}
+
+// True iff any Store instruction in the named region's blocks may
+// alias the given Load pointer. Walks each block's Stores in scan
+// order; for each, calls `mirMayAlias(loadPtr, storePtrOperand)`. The
+// Store's pointer operand convention is `operands[1]` (operand 0 is
+// the stored value); this matches Mem2Reg's `Store[op1]` gate.
+//
+// Returns true on the first may-aliasing Store found (short-circuit).
+// `strictTBAA` threaded from `Mir::aliasingMode()` (cycle 10c wiring)
+// or fixed by the caller in the meantime.
+[[nodiscard]] inline bool
+mirAnyMayAliasingStoreInRegion(
+    Mir const&                       mir,
+    TypeInterner const&              interner,
+    MirInstId                        loadPtr,
+    std::span<MirBlockId const>      region,
+    StrictTbaa                       strictTBAA = StrictTbaa::No)
+{
+    for (MirBlockId const b : region) {
+        std::uint32_t const ninst = mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < ninst; ++i) {
+            MirInstId const id = mir.blockInstAt(b, i);
+            if (mir.instOpcode(id) != MirOpcode::Store) continue;
+            auto const ops = mir.instOperands(id);
+            if (ops.size() < 2) {
+                std::fprintf(stderr,
+                    "dss::opt::analysis::mirAnyMayAliasingStoreInRegion "
+                    "fatal: Store inst v=%u has fewer than 2 operands "
+                    "— verifier-contract violation.\n", id.v);
+                std::abort();
+            }
+            MirInstId const storePtr = ops[1];
+            if (mirMayAlias(mir, interner, loadPtr, storePtr, strictTBAA)
+                != MirAliasResult::No) {
+                return true;  // could clobber
+            }
+        }
+    }
+    return false;
+}
+
+// True iff any Store in the loop body may alias the given Load
+// pointer. Convenience wrapper over `mirAnyMayAliasingStoreInRegion`
+// for LICM's hoist-admission gate. Loop body comes from
+// `mirNaturalLoops` (dom-tree natural-loop analysis).
+[[nodiscard]] inline bool
+mirAnyMayAliasingStoreInLoop(
+    Mir const&                       mir,
+    TypeInterner const&              interner,
+    MirInstId                        loadPtr,
+    std::span<MirBlockId const>      loopBody,
+    StrictTbaa                       strictTBAA = StrictTbaa::No)
+{
+    return mirAnyMayAliasingStoreInRegion(mir, interner, loadPtr,
+                                          loopBody, strictTBAA);
 }
 
 } // namespace dss::opt::analysis

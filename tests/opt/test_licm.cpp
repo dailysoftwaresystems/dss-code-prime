@@ -153,8 +153,10 @@ TEST(Licm, TrapEligibleSDivNotHoisted) {
            "would change observable behavior (D-OPT6-LICM-TRAP-SAFE-HOIST)";
 }
 
-// Load NOT hoisted (alias-unsafe defer).
-TEST(Licm, LoadNotHoisted) {
+// Cycle 10b: Load IS a hoist candidate now. A loop-invariant Load
+// (pointer defined outside loop AND no may-aliasing Store in body)
+// hoists to the preheader.
+TEST(Licm, InvariantLoadHoisted) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const ptr   = interner.pointer(i32);
@@ -189,8 +191,55 @@ TEST(Licm, LoadNotHoisted) {
     DiagnosticReporter rep;
     auto const r = opt::passes::runLicm(mir, interner, rep);
     EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 1u)
+        << "alias-clean Load must hoist now that alias substrate is wired";
+}
+
+// Negative pin: a may-aliasing Store inside the loop body blocks
+// Load hoist. The Store writes through the same Alloca the Load
+// reads → Rule 1 (Yes) in body → admission refuses.
+TEST(Licm, LoadNotHoistedAcrossAliasingStoreInLoop) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v42; v42.value = std::int64_t{42}; v42.core = TypeKind::I32;
+    MirInstId const c = mb.addConst(v42, i32);
+    MirInstId const s[] = {c, slot};
+    (void)mb.addInst(MirOpcode::Store, s, InvalidType);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    MirInstId const lops[] = {slot};
+    (void)mb.addInst(MirOpcode::Load, lops, i32);
+    // Aliasing Store inside the body — clobbers the Load every iteration.
+    MirLiteralValue v99; v99.value = std::int64_t{99}; v99.core = TypeKind::I32;
+    MirInstId const c99 = mb.addConst(v99, i32);
+    MirInstId const sBody[] = {c99, slot};
+    (void)mb.addInst(MirOpcode::Store, sBody, InvalidType);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.instructionsHoisted, 0u)
-        << "Load is alias-unsafe (no alias analysis substrate) — not hoisted";
+        << "aliasing Store in loop body must block Load hoist";
 }
 
 // Volatile-flagged inst NOT hoisted even if otherwise invariant.

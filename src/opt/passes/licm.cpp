@@ -4,6 +4,7 @@
 #include "mir/mir_dom.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/analysis/mir_alias.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstdint>
@@ -16,6 +17,9 @@
 namespace dss::opt::passes {
 
 namespace {
+
+using dss::opt::analysis::StrictTbaa;
+using dss::opt::analysis::mirAnyMayAliasingStoreInLoop;
 
 // Trap-eligible opcodes: divisions and modulo may raise at runtime
 // (#DE on x86 for IDIV with divisor=0 / quotient overflow; similar
@@ -38,7 +42,10 @@ namespace {
     if (isTerminator(op)) return false;
     if (isPhi(op)) return false;
     if (opcodeInfo(op).hasSideEffects) return false;
-    if (op == MirOpcode::Load) return false;  // alias-unsafe defer
+    // Load admission (cycle 10b): Load IS a hoist candidate now. The
+    // analyze() loop additionally gates each Load via
+    // `mirAnyMayAliasingStoreInLoop` — if no may-aliasing Store sits
+    // in the loop body, the Load is loop-invariant in the alias sense.
     if (isTrapEligible(op)) return false;     // D-OPT6-LICM-TRAP-SAFE-HOIST
     // Leaf opcodes (zero-operand value origins) have dedicated
     // builders on MirBuilder + carry no runtime computation worth
@@ -54,7 +61,8 @@ namespace {
 
 class LicmPolicy final : public MirRebuildPolicy {
 public:
-    explicit LicmPolicy(Mir const& src) : src_(src) {}
+    LicmPolicy(Mir const& src, TypeInterner const& interner) noexcept
+        : src_(src), interner_(interner) {}
 
     [[nodiscard]] std::size_t instructionsHoisted() const noexcept {
         return instructionsHoisted_;
@@ -148,7 +156,8 @@ private:
         hoistPlan_[preheader].push_back(id);
     }
 
-    Mir const& src_;
+    Mir const&          src_;
+    TypeInterner const& interner_;
 
     // Per-function analysis state. Counters live across functions.
     std::unordered_set<MirInstId> hoistedInsts_;                          // body-side: skip via shouldEmit
@@ -220,6 +229,28 @@ void LicmPolicy::analyze(MirFuncId fn) {
                     }
                 }
                 if (!allOutside) continue;
+                // Load admission gate: a Load is hoist-eligible only
+                // when no Store in the loop body may alias its pointer.
+                // The pointer-operand-defined-outside check above is a
+                // necessary but not sufficient condition; a Store
+                // whose target may alias the loaded location would
+                // make the Load's value loop-variant.
+                if (op == MirOpcode::Load) {
+                    auto const lops = src_.instOperands(id);
+                    if (lops.empty()) {
+                        std::fprintf(stderr,
+                            "dss::opt::passes::Licm fatal: Load inst "
+                            "v=%u has zero operands — verifier-contract "
+                            "violation.\n", id.v);
+                        std::abort();
+                    }
+                    if (mirAnyMayAliasingStoreInLoop(
+                            src_, interner_, lops[0], loop.body,
+                            // TODO(D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING)
+                            StrictTbaa::No)) {
+                        continue;  // clobbered in body
+                    }
+                }
                 // Nested-loop dedup (CRITICAL fix): an inst that's
                 // invariant in BOTH an inner and an outer enclosing
                 // loop (e.g. operands all in function entry) would
@@ -239,7 +270,7 @@ void LicmPolicy::analyze(MirFuncId fn) {
 
 } // namespace
 
-LicmResult runLicm(Mir& mir, TypeInterner const& /*interner*/,
+LicmResult runLicm(Mir& mir, TypeInterner const& interner,
                    DiagnosticReporter& reporter) {
     LicmResult result{};
     MirBuilder builder;
@@ -250,7 +281,7 @@ LicmResult runLicm(Mir& mir, TypeInterner const& /*interner*/,
         return result;
     }
 
-    LicmPolicy policy{mir};
+    LicmPolicy policy{mir, interner};
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);

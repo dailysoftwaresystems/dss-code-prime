@@ -10,8 +10,10 @@
 //     NOT merge — D-OPT1-CSE-NONCOMMUTATIVE-PIN.
 //   * SIDE-EFFECT EXCLUSION: two identical Stores (same value, same
 //     addr) do NOT merge — both must execute (Store is side-effecting).
-//   * LOAD EXCLUSION: two Loads from same address do NOT merge
-//     (alias-unsafe defer).
+//   * LOAD ADMISSION (cycle 10b): two Loads from the same Alloca with
+//     no may-aliasing Store between them DO merge. An intervening
+//     aliasing Store (same Alloca) blocks; a non-aliasing Store
+//     (distinct Alloca) does not.
 //   * VOLATILE EXCLUSION: a Volatile-flagged binary op does NOT
 //     merge with a non-volatile equivalent.
 //   * DOMINANCE SCOPING: an expression defined only in one arm of
@@ -178,9 +180,9 @@ TEST(Cse, SideEffectingStoreNotCsed) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Store), 2u);
 }
 
-// Load exclusion: two Loads from same address NOT merged (alias-
-// unsafe defer until alias analysis lands).
-TEST(Cse, LoadNotCsed) {
+// Load admission positive pin: two identical Loads with no may-aliasing
+// Store between them collapse (D-OPT-LOAD-ALIAS-ANALYSIS).
+TEST(Cse, LoadCsedAcrossNoStore) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const ptr   = interner.pointer(i32);
@@ -206,8 +208,84 @@ TEST(Cse, LoadNotCsed) {
     DiagnosticReporter rep;
     auto const res = opt::passes::runCse(mir, interner, rep);
     EXPECT_TRUE(res.ok);
-    EXPECT_EQ(res.instructionsCsed, 0u);
+    // CSE marks ld2 → ld1; the dead duplicate stays in the rebuild
+    // (DCE sweeps next). instructionsCsed is the load-bearing signal.
+    EXPECT_EQ(res.instructionsCsed, 1u);
+}
+
+// Negative pin: a may-aliasing Store between two identical Loads
+// blocks CSE. The Store writes through the SAME Alloca pointer the
+// Loads read — Rule 1 (same SSA) says Yes, so admission MUST refuse.
+TEST(Cse, LoadNotCsedAcrossAliasingStore) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const s0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, s0, InvalidType);
+    MirInstId const lops[] = {slot};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    MirInstId const s1[] = {c1, slot};
+    (void)mb.addInst(MirOpcode::Store, s1, InvalidType);
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);
+    MirInstId const sum[] = {ld1, ld2};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 0u)
+        << "intervening aliasing Store must block Load CSE";
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 2u);
+}
+
+// Positive pin (SSA-derivable Rule 2): an intervening Store to a
+// DISTINCT Alloca does NOT alias the Loaded pointer, so CSE proceeds.
+TEST(Cse, LoadCsedAcrossDistinctAllocaStore) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slotA = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirInstId const slotB = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const sA0[] = {c0, slotA}; (void)mb.addInst(MirOpcode::Store, sA0, InvalidType);
+    MirInstId const sB0[] = {c0, slotB}; (void)mb.addInst(MirOpcode::Store, sB0, InvalidType);
+    MirInstId const lopsA[] = {slotA};
+    MirInstId const ldA1 = mb.addInst(MirOpcode::Load, lopsA, i32);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    MirInstId const sB1[] = {c1, slotB};
+    (void)mb.addInst(MirOpcode::Store, sB1, InvalidType);
+    MirInstId const ldA2 = mb.addInst(MirOpcode::Load, lopsA, i32);
+    MirInstId const sum[] = {ldA1, ldA2};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 1u)
+        << "Store to distinct Alloca must not block Load CSE on a different Alloca";
 }
 
 // Volatile exclusion: a Volatile-flagged binary op participates in

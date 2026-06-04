@@ -4,6 +4,7 @@
 #include "mir/mir_dom.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/analysis/mir_alias.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 #include "opt/passes/path_compress.hpp"
 
@@ -18,6 +19,12 @@
 namespace dss::opt::passes {
 
 namespace {
+
+using dss::opt::analysis::MirAliasResult;
+using dss::opt::analysis::StrictTbaa;
+using dss::opt::analysis::mirMayAlias;
+using dss::opt::analysis::mirRegionBetween;
+using dss::opt::analysis::mirAnyMayAliasingStoreInRegion;
 
 // Hash-key for a CSE-candidate instruction. Operands are stored in
 // canonical order (sorted for commutative 2-operand ops) so the two
@@ -61,14 +68,19 @@ struct CseKeyHash {
 };
 
 // Whether an opcode is a CSE candidate. Side-effecting + terminator +
-// Phi + Load + Volatile are excluded by the caller; this predicate is
-// the OPCODE-level filter only (per-instruction Volatile flag is
-// consulted at the use site).
+// Phi + Volatile are excluded by the caller; this predicate is the
+// OPCODE-level filter only (per-instruction Volatile flag + per-Load
+// alias-clobber check are consulted at the use site).
+//
+// Load admission (cycle 10b): Load IS a CSE candidate now. The use
+// site additionally walks `mirAnyMayAliasingStoreInRegion` between
+// the canonical Load's block and the current Load's block before
+// admitting the CSE — this is the alias-safety gate that replaces
+// the prior blanket exclusion.
 [[nodiscard]] bool isCseCandidateOpcode(MirOpcode op) noexcept {
     if (isTerminator(op)) return false;
     if (isPhi(op)) return false;
     if (opcodeInfo(op).hasSideEffects) return false;
-    if (op == MirOpcode::Load) return false;  // alias-unsafe
     // Defensive guard: each Alloca is a distinct memory address even
     // at the same type — merging two Allocas would alias two stack
     // slots into one. Today Alloca is `hasSideEffects=true` so the
@@ -80,7 +92,8 @@ struct CseKeyHash {
 
 class CsePolicy final : public MirRebuildPolicy {
 public:
-    explicit CsePolicy(Mir const& src) : src_(src) {}
+    CsePolicy(Mir const& src, TypeInterner const& interner) noexcept
+        : src_(src), interner_(interner) {}
 
     [[nodiscard]] std::size_t instructionsCsed() const noexcept {
         return instructionsCsed_;
@@ -123,7 +136,8 @@ private:
         return k;
     }
 
-    Mir const& src_;
+    Mir const&          src_;
+    TypeInterner const& interner_;
     // Old-id → canonical-old-id. Built by analyze() via dom-tree DFS
     // with a scoped value-numbering table; path-compressed after.
     std::unordered_map<MirInstId, MirInstId> cseMap_;
@@ -190,9 +204,138 @@ void CsePolicy::analyze(MirFuncId fn) {
             CseKey k = buildKey(id);
             auto it = scope.find(k);
             if (it != scope.end()) {
-                cseMap_[id] = it->second;
-                ++instructionsCsed_;
-                continue;
+                // Load admission gate: a Load CSE'd against a dominating
+                // canonical Load is sound only if no may-aliasing Store
+                // sits anywhere between them. We scan three slices
+                // owned by the caller (this site) plus the strictly-
+                // between region owned by `mirRegionBetween`:
+                //   — canonical's block tail (after canonical, to end)
+                //   — strictly-between blocks (region walker)
+                //   — useBlock's head (start, up to current)
+                // The region walker EXCLUDES both endpoints to keep the
+                // two responsibilities disjoint and prevent the dead-
+                // code-masking-bug class where overlapping scans hide
+                // each other's correctness gaps. For non-Load opcodes
+                // the gate is a no-op (only Load reads memory in the
+                // v1 opcode set; if a future memory-reading opcode
+                // lands — AtomicLoad, VolatileLoad — it MUST be added
+                // to this gate explicitly, since the alias substrate
+                // doesn't know about it).
+                bool admit = true;
+                if (op == MirOpcode::Load) {
+                    MirInstId const canonical = it->second;
+                    auto const ops = src_.instOperands(id);
+                    if (ops.empty()) {
+                        std::fprintf(stderr,
+                            "dss::opt::passes::Cse fatal: Load inst v=%u "
+                            "has zero operands — verifier-contract "
+                            "violation (Load's pointer operand at "
+                            "operands[0] is required).\n",
+                            id.v);
+                        std::abort();
+                    }
+                    MirInstId const loadPtr = ops[0];
+                    MirBlockId const canonicalBlock = src_.instBlock(canonical);
+
+                    // Locate canonical in its block. Substrate-contract
+                    // invariant: `instBlock(canonical) ⟹ canonical is
+                    // in blockInstAt(canonicalBlock, *)`. A miss
+                    // signals a substrate breach (instBlock and
+                    // blockInstAt disagree) — fail loud rather than
+                    // silently admit/refuse and hide the corruption.
+                    std::uint32_t const cn = src_.blockInstCount(canonicalBlock);
+                    std::uint32_t canonicalIdx = cn;
+                    for (std::uint32_t j = 0; j < cn; ++j) {
+                        if (src_.blockInstAt(canonicalBlock, j).v == canonical.v) {
+                            canonicalIdx = j;
+                            break;
+                        }
+                    }
+                    if (canonicalIdx == cn) {
+                        std::fprintf(stderr,
+                            "dss::opt::passes::Cse fatal: canonical "
+                            "Load v=%u not in canonicalBlock v=%u "
+                            "inst list — instBlock/blockInstAt "
+                            "substrate-contract violation.\n",
+                            canonical.v, canonicalBlock.v);
+                        std::abort();
+                    }
+
+                    auto storesClobber = [&](MirBlockId blk,
+                                             std::uint32_t lo,
+                                             std::uint32_t hi) -> bool {
+                        for (std::uint32_t j = lo; j < hi; ++j) {
+                            MirInstId const sid = src_.blockInstAt(blk, j);
+                            if (src_.instOpcode(sid) != MirOpcode::Store) continue;
+                            auto const sops = src_.instOperands(sid);
+                            if (sops.size() < 2) {
+                                std::fprintf(stderr,
+                                    "dss::opt::passes::Cse fatal: "
+                                    "Store inst v=%u has fewer than "
+                                    "2 operands — verifier-contract "
+                                    "violation.\n", sid.v);
+                                std::abort();
+                            }
+                            if (mirMayAlias(src_, interner_,
+                                            loadPtr, sops[1],
+                                            // TODO(D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING)
+                                            StrictTbaa::No)
+                                != MirAliasResult::No) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+
+                    if (canonicalBlock.v == B.v) {
+                        // Same-block case: scan strictly between
+                        // canonical (at canonicalIdx) and current
+                        // (at i). Dom-tree DFS scope guarantees
+                        // canonicalIdx < i; assert it so a future
+                        // reorder doesn't silently corrupt scope.
+                        if (canonicalIdx >= i) {
+                            std::fprintf(stderr,
+                                "dss::opt::passes::Cse fatal: "
+                                "canonical idx=%u >= current idx=%u "
+                                "in same block v=%u — dom-tree DFS "
+                                "scope invariant violation.\n",
+                                canonicalIdx, i, B.v);
+                            std::abort();
+                        }
+                        if (storesClobber(B, canonicalIdx + 1, i)) {
+                            admit = false;
+                        }
+                    } else {
+                        // Different-block: scan
+                        //   (a) canonical's block tail (after canonical)
+                        //   (b) strictly-between region
+                        //   (c) useBlock's head (before current)
+                        if (storesClobber(canonicalBlock, canonicalIdx + 1, cn)) {
+                            admit = false;
+                        }
+                        if (admit) {
+                            auto const region = mirRegionBetween(
+                                src_, canonicalBlock, B);
+                            if (mirAnyMayAliasingStoreInRegion(
+                                    src_, interner_, loadPtr, region,
+                                    // TODO(D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING)
+                                    StrictTbaa::No)) {
+                                admit = false;
+                            }
+                        }
+                        if (admit && storesClobber(B, 0, i)) {
+                            admit = false;
+                        }
+                    }
+                }
+                if (admit) {
+                    cseMap_[id] = it->second;
+                    ++instructionsCsed_;
+                    continue;
+                }
+                // Fall through to insert this Load as a new canonical
+                // — a later identical Load may still CSE against it
+                // if no aliasing Store separates THEM.
             }
             log.push_back(k);
             scope.emplace(std::move(k), id);
@@ -213,7 +356,7 @@ void CsePolicy::analyze(MirFuncId fn) {
 
 } // namespace
 
-CseResult runCse(Mir& mir, TypeInterner const& /*interner*/,
+CseResult runCse(Mir& mir, TypeInterner const& interner,
                  DiagnosticReporter& reporter) {
     CseResult result{};
     MirBuilder builder;
@@ -224,7 +367,7 @@ CseResult runCse(Mir& mir, TypeInterner const& /*interner*/,
         return result;
     }
 
-    CsePolicy policy{mir};
+    CsePolicy policy{mir, interner};
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
