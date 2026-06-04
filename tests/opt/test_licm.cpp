@@ -343,6 +343,109 @@ TEST(Licm, LoadNotHoistedAcrossDistinctPrimitiveStoreInLoopUnderPermissive) {
         << "Permissive: distinct primitive pointees stay Maybe; LICM refuses";
 }
 
+// D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE end-to-end pin (LICM side):
+// proves the LicmPolicy ctor reads Mir.charTypesAliasAll() and threads
+// it to mirAnyMayAliasingStoreInLoop. Fixture: Load through Ptr<Char>
+// in loop body + Store through Ptr<I32> in same body. Under default
+// (char-aliases-all=true) strict-TBAA: Rule 5 fires → Maybe → LICM
+// refuses. Under char-aliases-all=false strict-TBAA: Rule 6
+// distinguishes Char vs I32 → No → LICM hoists.
+TEST(Licm, LoadHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAANoCharException) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const charT  = interner.primitive(TypeKind::Char);
+    TypeId const boolT  = interner.primitive(TypeKind::Bool);
+    TypeId const ptrCh  = interner.pointer(charT);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const params[] = {ptrCh, ptrI32};
+    TypeId const fnSig = interner.fnSig(params, charT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.setCharTypesAliasAll(false);  // Rust-like / strict-typed DSL
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirInstId const pCh  = mb.addArg(0, ptrCh);
+    MirInstId const pI32 = mb.addArg(1, ptrI32);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    MirInstId const lops[] = {pCh};
+    (void)mb.addInst(MirOpcode::Load, lops, charT);
+    // Store through Ptr<I32> in loop body — under strict + char-
+    // exception-disabled, cannot alias the Char Load.
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const sOps[] = {c0, pI32};
+    (void)mb.addInst(MirOpcode::Store, sOps, InvalidType);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0r; v0r.value = std::int64_t{0}; v0r.core = TypeKind::Char;
+    mb.addReturn(mb.addConst(v0r, charT));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 1u)
+        << "strict + char-exception-disabled: Store<I32> cannot alias "
+           "Load<Char>; LICM must hoist";
+}
+
+// Negative polarity: same fixture under default charTypesAliasAll=true.
+TEST(Licm, LoadNotHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAAWithCharException) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const charT  = interner.primitive(TypeKind::Char);
+    TypeId const boolT  = interner.primitive(TypeKind::Bool);
+    TypeId const ptrCh  = interner.pointer(charT);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const params[] = {ptrCh, ptrI32};
+    TypeId const fnSig = interner.fnSig(params, charT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.setCharTypesAliasAll(true);  // C/C++/ObjC default — explicit
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirInstId const pCh  = mb.addArg(0, ptrCh);
+    MirInstId const pI32 = mb.addArg(1, ptrI32);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    MirInstId const lops[] = {pCh};
+    (void)mb.addInst(MirOpcode::Load, lops, charT);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const sOps[] = {c0, pI32};
+    (void)mb.addInst(MirOpcode::Store, sOps, InvalidType);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0r; v0r.value = std::int64_t{0}; v0r.core = TypeKind::Char;
+    mb.addReturn(mb.addConst(v0r, charT));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 0u)
+        << "strict + char-exception-enabled: char* may alias int*; LICM refuses";
+}
+
 // Volatile-flagged inst NOT hoisted even if otherwise invariant.
 TEST(Licm, VolatileBinaryOpNotHoisted) {
     TypeInterner interner{CompilationUnitId{1}};

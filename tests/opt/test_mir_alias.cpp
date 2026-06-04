@@ -226,6 +226,39 @@ TEST(MirAlias, Rule5_CharExceptionDisabledLetsStrictTBAAReturnNo) {
               MirAliasResult::No);
 }
 
+// Rule 7 catch-all pin under the strict + char-exception-disabled
+// combination. Same-kind char-vs-char must STILL be Maybe (the strict-
+// TBAA Rule 6 only fires on DISTINCT primitive kinds — same kind
+// falls through). Without this pin, a future regression to
+// isDistinctPrimitivePair that drops the `kA != kB` guard would
+// silently make same-type char* CSE-mergeable.
+//
+// Asymmetric coverage: the `charTypesAliasAll=false` arm is what
+// guards `isDistinctPrimitivePair`'s `kA != kB` invariant (it routes
+// to Rule 6 directly). The `=true` arm only proves Rule 5's same-kind
+// short-circuit — that arm becomes dead weight if a future cleanup
+// removes Rule 5's pre-position. Both polarities asserted so any
+// future review-of-this-test can see the dual purpose explicitly.
+TEST(MirAlias, Rule7_SameCharPointeesUnderStrictNoCharExceptionReturnMaybe) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const charT  = interner.primitive(TypeKind::Char);
+    TypeId const ptrCh  = interner.pointer(charT);
+    std::array<TypeId, 2> const params{ptrCh, ptrCh};
+    auto m = buildArgModule(interner, params);
+
+    // Both pointees Char. Even with strict + char-exception disabled,
+    // Rule 7's catch-all → Maybe (Rule 6 strict-TBAA requires distinct
+    // kinds; same kind doesn't qualify).
+    EXPECT_EQ(mirMayAlias(m.mir, interner, m.args[0], m.args[1],
+                          StrictTbaa::Yes, /*charTypesAliasAll=*/false),
+              MirAliasResult::Maybe);
+    // With char-exception enabled, Rule 5 fires → Maybe (the same
+    // verdict, different rule).
+    EXPECT_EQ(mirMayAlias(m.mir, interner, m.args[0], m.args[1],
+                          StrictTbaa::Yes, /*charTypesAliasAll=*/true),
+              MirAliasResult::Maybe);
+}
+
 TEST(MirAlias, Rule5_BytePointeeAliasesAllUnderStrict) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32    = interner.primitive(TypeKind::I32);

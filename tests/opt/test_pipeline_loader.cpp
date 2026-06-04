@@ -97,6 +97,28 @@ TEST(PipelineLoader, MaxIterationsMissingDefaultsToOne) {
     EXPECT_EQ(r->maxIterations, 1u);
 }
 
+// D-OPT1-PASS-DUP-POLICY: a pipeline declaring the SAME pass twice
+// (e.g. `[ConstFold, ConstFold]`) is structurally legal. The pipeline-
+// level fixed-point loop already lets a pass re-run; declaring the
+// duplicate explicitly is the OPT2b "transpile-readable" use case
+// where const-fold runs first, peephole rewrites land between, then
+// const-fold runs again to fold the rewrites' constants. The loader
+// MUST accept this without complaint. (Future opt-time rejection of
+// pathological pipelines is a separate concern — the loader's job is
+// schema-conformance, not optimality.)
+TEST(PipelineLoader, DuplicatePassesInPipelineAreLegal) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "double-const-fold",
+             "passes": ["ConstFold", "ConstFold"]}})",
+        "dup-passes.json");
+    ASSERT_TRUE(r.has_value()) << "duplicate PassIds in a pipeline must load";
+    EXPECT_EQ(r->name, "double-const-fold");
+    ASSERT_EQ(r->passes.size(), 2u);
+    EXPECT_EQ(r->passes[0], opt::PassId::ConstFold);
+    EXPECT_EQ(r->passes[1], opt::PassId::ConstFold);
+}
+
 // Missing version → X_PipelineVersionMismatch. The version gate is the
 // load-bearing fence between this build and a future incompatible
 // pipeline format.

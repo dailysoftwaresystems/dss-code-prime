@@ -361,6 +361,51 @@ TEST(Optimizer, MaxIterationsFixedPointLoop) {
            "AFTER running through the full pipeline list)";
 }
 
+// D-OPT1-PASS-DUP-POLICY engine-arm pin: a pipeline declaring
+// `{ConstFold, ConstFold}` doesn't get silently de-duped by the engine.
+// The loader admits the shape (test_pipeline_loader); the engine must
+// actually dispatch both. Catches a future regression where the
+// dispatch loop adds "skip if PassId already visited" optimization.
+TEST(Optimizer, DuplicatePassesInPipelineBothDispatch) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+
+    // Fixture: a foldable Add. ConstFold mutates on first run, then
+    // on the SECOND run finds nothing left to fold. With the engine
+    // dispatching both entries, passMutationCount[ConstFold] must be
+    // at least 1 from the first run; both dispatches contribute to
+    // passesRun.
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder b;
+    b.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    MirInstId const c1 = b.addConst(v1, i32);
+    MirInstId const c2 = b.addConst(v2, i32);
+    MirInstId const ops[] = {c1, c2};
+    MirInstId const sum = b.addInst(MirOpcode::Add, ops, i32);
+    b.addReturn(sum);
+    Mir mir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    // `maxIterations = 1` keeps the outer loop from re-running the
+    // pipeline (which would dispatch ConstFold even more times) so
+    // `passesRun == 2` cleanly attributes to BOTH pipeline entries
+    // being honored.
+    opt::OptPipeline pipeline{"dup-const-fold",
+                              {opt::PassId::ConstFold, opt::PassId::ConstFold}};
+    pipeline.maxIterations = 1;
+    auto const result = opt::optimize(mir, target, interner, pipeline, rep);
+    EXPECT_TRUE(result.ok);
+    EXPECT_EQ(result.passesRun, 2u)
+        << "engine must dispatch BOTH ConstFold entries (no silent dedup)";
+}
+
 // D-OPT1-PASS-ID-STABILITY: the kPassIdCount drift guard's compile-
 // time correctness is what matters; this test pins the RUNTIME side
 // — optPassIdFromName resolves every shipped enumerator + rejects an

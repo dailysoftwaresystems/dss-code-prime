@@ -373,6 +373,91 @@ TEST(Cse, LoadNotCsedAcrossDistinctPrimitiveStoreUnderPermissive) {
         << "Permissive: distinct primitive pointees stay Maybe; CSE refuses";
 }
 
+// D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE end-to-end pin (consumer side):
+// proves the CsePolicy ctor reads Mir.charTypesAliasAll() and threads
+// it to mirMayAlias. Without this, a regression dropping the
+// charTypesAliasAll_ cache member or passing the wrong field value
+// would leave the predicate-level test green but the consumer broken.
+//
+// Fixture: Load through Ptr<Char>, Store through Ptr<I32>, second
+// Load through Ptr<Char>. Under default (charTypesAliasAll=true)
+// strict-TBAA — Rule 5 char-exception fires → Maybe → CSE refuses.
+// Under charTypesAliasAll=false strict-TBAA — Rule 5 is bypassed,
+// Rule 6 distinguishes Char vs I32 → No → CSE admits.
+TEST(Cse, LoadCsedAcrossDistinctPrimitiveStoreUnderStrictTBAANoCharException) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const charT  = interner.primitive(TypeKind::Char);
+    TypeId const ptrCh  = interner.pointer(charT);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const params[] = {ptrCh, ptrI32};
+    TypeId const fnSig = interner.fnSig(params, charT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.setCharTypesAliasAll(false);  // Rust-like / strict-typed DSL
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const pCh  = mb.addArg(0, ptrCh);
+    MirInstId const pI32 = mb.addArg(1, ptrI32);
+    MirInstId const lops[] = {pCh};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, charT);
+    // Intervening Store through Ptr<I32> — under StrictTBAA + char-
+    // exception-disabled, cannot alias the Char Load.
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const sOps[] = {c0, pI32};
+    (void)mb.addInst(MirOpcode::Store, sOps, InvalidType);
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, charT);
+    mb.addReturn(ld2);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 1u)
+        << "strict + char-exception-disabled: Store<I32> cannot alias "
+           "Load<Char>; CSE must admit";
+}
+
+// Negative polarity: same fixture under default charTypesAliasAll=true.
+// Rule 5 char-exception fires → Maybe → CSE refuses. The pair (positive
+// above + this negative) proves the CsePolicy reads + threads the flag.
+TEST(Cse, LoadNotCsedAcrossDistinctPrimitiveStoreUnderStrictTBAAWithCharException) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const charT  = interner.primitive(TypeKind::Char);
+    TypeId const ptrCh  = interner.pointer(charT);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const params[] = {ptrCh, ptrI32};
+    TypeId const fnSig = interner.fnSig(params, charT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.setCharTypesAliasAll(true);  // C/C++/ObjC default — explicit
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const pCh  = mb.addArg(0, ptrCh);
+    MirInstId const pI32 = mb.addArg(1, ptrI32);
+    MirInstId const lops[] = {pCh};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, charT);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const sOps[] = {c0, pI32};
+    (void)mb.addInst(MirOpcode::Store, sOps, InvalidType);
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, charT);
+    mb.addReturn(ld2);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 0u)
+        << "strict + char-exception-enabled: char* may alias int*; CSE refuses";
+}
+
 // Volatile exclusion: a Volatile-flagged binary op participates in
 // neither side of a CSE merge.
 TEST(Cse, VolatileBinaryOpNotCsed) {
