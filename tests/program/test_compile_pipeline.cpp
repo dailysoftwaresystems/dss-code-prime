@@ -543,12 +543,12 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
     // Three-sided assertion (d312c1c audit fold, test-analyzer #2):
     // pin marker count + total size + cap shape. With maxDiagnostics=1,
     // target A's FIRST diagnostic (the format-schema JSON load fires
-    // forwardConfigDiagnostics → C_InvalidLanguageName) lands in
-    // scratch, gets merged into rep, fills the cap → marker fires.
-    // Every subsequent diagnostic from both targets is silently
-    // dropped at rep's hitCap_ gate. Final state: exactly 2 entries
-    // in rep.all() — one C_InvalidLanguageName + one
-    // P_TooManyDiagnostics marker.
+    // forwardConfigDiagnostics → C_InvalidFormatName, per cycle 10m's
+    // per-kind diag-code split) lands in scratch, gets merged into
+    // rep, fills the cap → marker fires. Every subsequent diagnostic
+    // from both targets is silently dropped at rep's hitCap_ gate.
+    // Final state: exactly 2 entries in rep.all() — one
+    // C_InvalidFormatName + one P_TooManyDiagnostics marker.
     EXPECT_EQ(dss::test_support::countCode(
                   rep, DiagnosticCode::P_TooManyDiagnostics),
               1u)
@@ -563,7 +563,7 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
     // code-architect Q5 + test-analyzer-dim-2 #6): pin the IDENTITY
     // of the cap-filling diagnostic. A regression in
     // forwardConfigDiagnostics that swaps the first emitted code
-    // (e.g. renamed C_InvalidLanguageName or rerouted to a different
+    // (e.g. renamed C_InvalidFormatName or rerouted to a different
     // C_*/D_*) would leave size==2 + marker==1 green while silently
     // shifting cap-fill semantics. The comment above already claimed
     // this identity; the test now enforces it.
