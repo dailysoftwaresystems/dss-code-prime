@@ -7,10 +7,12 @@
 #include "link/format/pe.hpp"
 #include "link/format/spirv.hpp"
 #include "link/format/wasm.hpp"
+#include "link/symbol_kind.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <format>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -20,14 +22,83 @@ namespace {
 
 using dss::report;
 
+// D-LK4-3 — build the collision-proof compound-key symbol index for one module.
+// Every function / data item / extern import is keyed by `(module.cuId, SymbolId)`
+// so two CUs minting the same bare SymbolId stay distinct. A duplicate COMPOUND
+// key — the same SymbolId declared twice in THIS CU (across functions, data, or
+// externs) — is an ambiguous-resolution error: the `emplace`-failure detects it,
+// unifying the former cross-table + within-table duplicate checks into one gate.
+void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
+                        AssembledModule const& m,
+                        DiagnosticReporter& reporter) {
+    auto declare = [&](SymbolId sym, SymbolKind kind, char const* what) {
+        if (!index.emplace(LinkedSymbolKey{m.cuId, sym}, kind).second) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "symbol #" + std::to_string(sym.v) + " (CU #" +
+                   std::to_string(m.cuId.v) + ") is declared more than once — this " +
+                   what + " collides with a prior function / data item / extern import "
+                   "of the same SymbolId in this CompilationUnit (ambiguous resolution).");
+        }
+    };
+    for (auto const& fn : m.functions) declare(fn.symbol, SymbolKind::Defined, "function");
+    for (auto const& di : m.dataItems) declare(di.symbol, SymbolKind::Data, "data item");
+    for (std::size_t i = 0; i < m.externImports.size(); ++i) {
+        auto const& ext = m.externImports[i];
+        // Empty mangledName / libraryPath silently produce broken imports
+        // (GetProcAddress("") → null IAT slot; empty DT_SONAME / LC_LOAD_DYLIB).
+        // Fail loud so the toolchain owns the diagnostic.
+        if (ext.mangledName.empty()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "ExternImport[" + std::to_string(i) + "] (symbol #" +
+                   std::to_string(ext.symbol.v) + ") has empty mangledName — "
+                   "import-table entries require a non-empty symbol name.");
+        }
+        if (ext.libraryPath.empty()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "ExternImport[" + std::to_string(i) + "] (symbol #" +
+                   std::to_string(ext.symbol.v) + ") has empty libraryPath — "
+                   "import-table entries require a non-empty DLL / SO / dylib name.");
+        }
+        declare(ext.symbol, SymbolKind::Extern, "extern import");
+    }
+}
+
 } // namespace
 
-LinkedImage link(AssembledModule const&    inputModule,
+LinkedImage link(std::span<AssembledModule const> modules,
                  TargetSchema const&       targetSchema,
                  ObjectFormatSchema const& objectFormatSchema,
                  DiagnosticReporter&       reporter) {
     LinkedImage image;
     image.format = objectFormatSchema.kind();
+
+    // D-LK4-3 — N==0 is a caller error; N>1 (cross-CU) builds the collision-proof
+    // compound-key index + validates each CU, then fail-louds: the multi-CU image
+    // MERGE (cross-CU name resolution + weak-vs-strong) is LK11. N==1 is the
+    // single-CU path below (full image emission, behavior unchanged).
+    if (modules.empty()) {
+        report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported,
+               DiagnosticSeverity::Error,
+               "linker::link received no modules to link.");
+        return image;
+    }
+    if (modules.size() > 1) {
+        std::unordered_map<LinkedSymbolKey, SymbolKind> crossCuIndex;
+        for (auto const& m : modules) buildCompoundIndex(crossCuIndex, m, reporter);
+        image.symbolCount = crossCuIndex.size();
+        report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported,
+               DiagnosticSeverity::Error,
+               "multi-CU image merge (" + std::to_string(modules.size()) +
+               " CompilationUnits) is LK11 — D-LK4-3 ships the collision-proof "
+               "compound-key index + the multi-module entry; the cross-CU symbol "
+               "merge + name resolution + weak-vs-strong is not yet implemented.");
+        return image;
+    }
+
+    AssembledModule const& inputModule = modules[0];
     image.expectedFuncCount = inputModule.expectedFuncCount;
 
     // D-LK10-ENTRY Slice C (plan 14 §2.13): when the format declares
@@ -75,82 +146,16 @@ LinkedImage link(AssembledModule const&    inputModule,
     // only when the first passed.
     std::size_t const errorsAtEntry = reporter.errorCount();
 
-    // Index every function symbol the assembler declared (defined
-    // intra-module) PLUS every extern import the assembler stamped
-    // for FFI resolution. Single-CU resolution; cross-CU symbol-
-    // table merge is LK11 (D-LK4-3). Externs are resolved against
-    // import-table emission in the per-format walker (LK6 cycle 2
-    // — PE IAT lands at cycle 2a; ELF GOT/PLT at 2b; Mach-O
-    // chained-fixups at 2c).
-    std::unordered_set<SymbolId> declaredSymbols;
-    declaredSymbols.reserve(module.functions.size());
-    for (auto const& fn : module.functions) {
-        declaredSymbols.insert(fn.symbol);
-    }
-    // D-LK4-RODATA-PRODUCER (2026-06-02): rodata `AssembledData`
-    // items are also valid reloc targets. The format walker
-    // (pe.cpp::encodeExec for PE) merges them into its symbolVa
-    // map at `rdata->rva + section-offset`. The linker's
-    // pre-walker cross-reference check must accept them here so
-    // a .text → rodata REL32 doesn't fire K_SymbolUndefined.
-    std::unordered_set<SymbolId> dataSymbols;
-    dataSymbols.reserve(module.dataItems.size());
-    for (auto const& di : module.dataItems) {
-        dataSymbols.insert(di.symbol);
-    }
-    std::unordered_set<SymbolId> externSymbols;
-    externSymbols.reserve(module.externImports.size());
-    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
-        auto const& ext = module.externImports[i];
-        // Empty mangledName / libraryPath silently produce broken
-        // imports (Windows: GetProcAddress("") → null IAT slot;
-        // ELF: empty DT_SONAME; Mach-O: empty LC_LOAD_DYLIB path).
-        // The loaders accept the binary at link time and crash at
-        // first call. Fail loud here so the toolchain owns the
-        // diagnostic. (3-agent convergence: silent-failure C2 +
-        // type-design O1 + architect O4.)
-        if (ext.mangledName.empty()) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "ExternImport[" + std::to_string(i) +
-                   "] (symbol #" + std::to_string(ext.symbol.v) +
-                   ") has empty mangledName — import-table entries "
-                   "require a non-empty symbol name.");
-        }
-        if (ext.libraryPath.empty()) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "ExternImport[" + std::to_string(i) +
-                   "] (symbol #" + std::to_string(ext.symbol.v) +
-                   ") has empty libraryPath — import-table entries "
-                   "require a non-empty DLL / SO / dylib name.");
-        }
-        // Cross-table SymbolId uniqueness: a SymbolId cannot appear
-        // in BOTH `functions` and `externImports` — the resolution
-        // would silently pick whichever the walker's map-emplace
-        // saw first (silent-failure C1 + type-design O2 2-agent
-        // convergence).
-        if (declaredSymbols.contains(ext.symbol)) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "symbol #" + std::to_string(ext.symbol.v) +
-                   " is BOTH a defined AssembledFunction AND an "
-                   "ExternImport — ambiguous resolution; the same "
-                   "SymbolId cannot reference both an intra-module "
-                   "function and an external library symbol.");
-        }
-        // Within-table duplicate ExternImport: two ExternImports
-        // with the same SymbolId silently overwrite each other in
-        // the walker's emplace.
-        if (!externSymbols.insert(ext.symbol).second) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "ExternImport symbol #" +
-                   std::to_string(ext.symbol.v) +
-                   " is declared more than once in "
-                   "AssembledModule.externImports.");
-        }
-    }
+    // D-LK4-3: index every symbol this CU declares — functions, rodata data items,
+    // and FFI extern imports — into the collision-proof compound-key map (keyed by
+    // (cuId, SymbolId)). `buildCompoundIndex` fails loud on a duplicate compound key
+    // (the same SymbolId declared twice in this CU, across any kind) and on empty
+    // extern mangledName / libraryPath. Single-CU resolution here; cross-CU symbol-
+    // table merge is LK11. Externs resolve against the per-format walker's import-
+    // table emission (LK6 cycle 2 — PE IAT / ELF GOT+PLT / Mach-O chained-fixups).
+    std::unordered_map<LinkedSymbolKey, SymbolKind> symbolIndex;
+    buildCompoundIndex(symbolIndex, module, reporter);
+    image.symbolCount = symbolIndex.size();
 
     for (auto const& fn : module.functions) {
         bool funcResolved = true;
@@ -208,9 +213,7 @@ LinkedImage link(AssembledModule const&    inputModule,
             //       2026-06-02 — the per-format walker merges these
             //       into its symbolVa map at section-relative offsets).
             // Anything else is a hard undefined.
-            if (!declaredSymbols.contains(reloc.target)
-             && !externSymbols.contains(reloc.target)
-             && !dataSymbols.contains(reloc.target)) {
+            if (!symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})) {
                 std::string msg = "relocation in symbol #";
                 msg += std::to_string(fn.symbol.v);
                 msg += " references undefined symbol #";
@@ -377,6 +380,16 @@ LinkedImage link(AssembledModule const&    inputModule,
     }
 
     return image;
+}
+
+// D-LK4-3 single-module convenience overload — delegates to the span entry with a
+// 1-element span. Keeps every existing single-CU caller source-unchanged.
+LinkedImage link(AssembledModule const&    module,
+                 TargetSchema const&       targetSchema,
+                 ObjectFormatSchema const& objectFormatSchema,
+                 DiagnosticReporter&       reporter) {
+    return link(std::span<AssembledModule const>{&module, 1},
+                targetSchema, objectFormatSchema, reporter);
 }
 
 } // namespace dss::linker

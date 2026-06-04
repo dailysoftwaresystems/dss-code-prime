@@ -373,6 +373,11 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     }
     assembled.dataItems = std::move(dataItems);
 
+    // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
+    // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; the
+    // compound key only matters once LK11 links multiple CUs in one image.
+    assembled.cuId = cu.id();
+
     // 11. Link.
     auto const linkEntry = reporter.errorCount();
     auto image = linker::link(assembled, target, format, reporter);

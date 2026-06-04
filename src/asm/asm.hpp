@@ -237,6 +237,14 @@ struct DSS_EXPORT AssembledModule {
     std::vector<AssembledFunction> functions;  // parallel-index with lir.funcAt(i)
     std::size_t                    expectedFuncCount = 0;
 
+    // D-LK4-3 (cross-CU symbol namespacing): the CompilationUnit this module was
+    // assembled from. `SymbolId` is per-arena (per-CU), so when the linker holds
+    // multiple modules (LK11) two CUs can mint the same integer for DIFFERENT
+    // symbols — the linker keys its symbol index by `(cuId, SymbolId)` to keep them
+    // distinct. Default-invalid; the compile pipeline stamps it from the owning
+    // CompilationUnit. Single-CU builds (every shipped corpus today) carry one cuId.
+    CompilationUnitId              cuId{};
+
     // FFI extern imports (LK6 cycle 2 — closes D-LK6-2 partial).
     // Populated by the assembler from upstream HIR `ExternFunction`
     // / `ExternGlobal` declarations once the HIR→AS thread-through

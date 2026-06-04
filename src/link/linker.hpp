@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 // Linker engine (plan 14, LK1–LK10 closed end-to-end 2026-05-30).
@@ -53,6 +54,11 @@ struct DSS_EXPORT LinkedImage {
     // the per-function-resolved count.
     std::size_t               expectedFuncCount = 0;
     std::size_t               resolvedFuncCount = 0;
+    // D-LK4-3: count of distinct (cuId, SymbolId) compound keys indexed across all
+    // input modules. The compound key keeps two CUs minting the same bare SymbolId
+    // distinct (count reflects both); a regression to a bare-SymbolId key collapses
+    // them (the collision pin asserts the count + the absence of a false duplicate).
+    std::size_t               symbolCount = 0;
 
     [[nodiscard]] bool ok() const noexcept {
         return expectedFuncCount > 0
@@ -90,6 +96,21 @@ namespace dss::linker {
 // Returns a `LinkedImage` whose `ok()` reflects parallel-index
 // shape. The reporter is the success channel for per-relocation
 // failures.
+// D-LK4-3 — multi-module entry. The linker indexes every module's symbols under
+// its `AssembledModule::cuId` (compound key `(cuId, SymbolId)`) so N CUs' tables
+// coexist without per-arena SymbolId collisions. A 1-element span is the single-CU
+// path (full image emission, behavior unchanged). N>1 builds the collision-proof
+// index + validates, then fail-louds `K_CrossCuMergeUnsupported` — the multi-CU
+// image MERGE (cross-CU name resolution + weak-vs-strong) is LK11.
+[[nodiscard]] DSS_EXPORT LinkedImage
+link(std::span<AssembledModule const> modules,
+     TargetSchema const&          targetSchema,
+     ObjectFormatSchema const&    objectFormatSchema,
+     DiagnosticReporter&          reporter);
+
+// Single-module convenience overload (the v1 single-CU signature). Delegates to
+// the span entry with a 1-element span — every existing single-CU caller is
+// source-unchanged.
 [[nodiscard]] DSS_EXPORT LinkedImage
 link(AssembledModule const&       module,
      TargetSchema const&          targetSchema,

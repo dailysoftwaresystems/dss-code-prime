@@ -810,7 +810,14 @@ enum class DiagnosticCode : std::uint16_t {
     //   convergence as K_DuplicateDataSymbol above.
     K_DuplicateDataSymbol          = 0x800E,
     K_BssDataHasBytes              = 0x800F,
-    // K-NEXT-SLOT: 0x8010 — grep this marker before adding a K_* code.
+    // K_CrossCuMergeUnsupported: link() received N>1 AssembledModules, but the
+    //   multi-CU symbol-table MERGE (combining N CUs into one image — cross-CU
+    //   name resolution + weak-vs-strong) is LK11. D-LK4-3 ships the collision-
+    //   proof compound-key index + the multi-module entry; the merge fail-louds
+    //   here until LK11 replaces this emission with the real merge. No single-CU
+    //   build trips this — the single-module overload never passes N>1.
+    K_CrossCuMergeUnsupported      = 0x8010,
+    // K-NEXT-SLOT: 0x8011 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

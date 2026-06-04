@@ -26,8 +26,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 using namespace dss;
 
@@ -182,6 +184,50 @@ TEST(Linker, UnknownSymbolEmitsK_SymbolUndefined) {
     auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u);
+}
+
+// D-LK4-3 collision pin: two CompilationUnits (distinct cuIds) each define a
+// function with the SAME bare SymbolId #42. The linker's compound key
+// (cuId, SymbolId) keeps them DISTINCT — the index holds 2 entries, no false
+// duplicate. The multi-CU image MERGE itself is LK11 (fail-loud expected).
+// RED-ON-DISABLE: drop cuId from LinkedSymbolKey's ==/hash and #42 collides →
+// symbolCount==1 + a spurious "declared more than once" K_SymbolUndefined.
+TEST(Linker, CrossCuSymbolIdCollisionDisambiguatedByCuId) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;
+        m.cuId = CompilationUnitId{1};
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{42};
+        m.functions.push_back(std::move(fn));
+        mods.push_back(std::move(m));
+    }
+    {
+        AssembledModule m;
+        m.cuId = CompilationUnitId{2};
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{42};  // SAME bare SymbolId as CU #1's function
+        m.functions.push_back(std::move(fn));
+        mods.push_back(std::move(m));
+    }
+
+    DiagnosticReporter rep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{mods.data(), mods.size()},
+        *loaded.target, *loaded.format, rep);
+
+    // The compound key kept the two CUs' #42 distinct: 2 index entries, NOT 1.
+    EXPECT_EQ(image.symbolCount, 2u)
+        << "(cuId, SymbolId) compound key must keep two CUs' colliding #42 distinct";
+    // No spurious duplicate-symbol diagnostic — the two #42s are distinct keys.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u);
+    // The multi-CU image MERGE is LK11 — fail-loud, not a silent empty image.
+    EXPECT_GE(countCode(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 1u);
 }
 
 TEST(Linker, RelocationKindMissingFromFormatEmitsMismatch) {
