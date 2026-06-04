@@ -280,6 +280,85 @@ TEST(X86VariableEncoder, MovR12Imm32AlsoDerivesRexB) {
     EXPECT_EQ(bytes[6], 0x00);
 }
 
+// ── `sext` (movsxd r64, r/m32) — REX.W 0x63 /r ──────────────────────
+//
+// D-CSUBSET-LONG-PRIMITIVE byte-pin (cycle 10h post-fold,
+// 2026-06-04): pins the JSON-declared encoding for the sext
+// mnemonic at the assembler-tier. Without this pin, a hand-edit
+// to x86_64.target.json's sext row that swaps the opcode byte
+// (e.g., to 0x98 `cdqe`, which also sign-extends but with a
+// different operand convention — implicit rax-only) would slip
+// past the corpus smoke (`long_primitive_smoke`) because the
+// runtime exit would still happen to be 42 by coincidence on
+// many witness values. This pin is target-schema-consuming:
+// the test reads only what JSON declared, so the JSON-as-
+// contract discipline is enforced directly.
+
+TEST(X86VariableEncoder, SextRaxRaxEmits48_63_C0) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const sextOp = (*schema)->opcodeByMnemonic("sext");
+    ASSERT_TRUE(sextOp.has_value());
+    auto const raxOrd = (*schema)->registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+
+    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
+                     /*isPhysical=*/1,
+                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(rax) };
+        (void)b.addInst(*sextOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // sext rax, eax = REX.W (0x48) + opcode 0x63 + ModR/M (mod=3
+    // reg=rax(0) rm=rax(0) → 0xC0); then ret = 0xC3.
+    ASSERT_EQ(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x63);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0xC3);
+}
+
+// ── `zext` (movzx r64, r/m8) — REX.W 0x0F 0xB6 /r ───────────────────
+//
+// Companion to the sext byte-pin: the existing zext mnemonic
+// row (used by setcc-zext lowering for booleans) had the same
+// no-byte-pin gap. This pin closes it.
+
+TEST(X86VariableEncoder, ZextRaxRaxEmits48_0F_B6_C0) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const zextOp = (*schema)->opcodeByMnemonic("zext");
+    ASSERT_TRUE(zextOp.has_value());
+    auto const raxOrd = (*schema)->registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+
+    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
+                     /*isPhysical=*/1,
+                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(rax) };
+        (void)b.addInst(*zextOp, rax, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // zext rax, al = REX.W (0x48) + opcode 0x0F 0xB6 + ModR/M
+    // (mod=3 reg=rax(0) rm=rax(0) → 0xC0); then ret = 0xC3.
+    ASSERT_EQ(bytes.size(), 5u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xB6);
+    EXPECT_EQ(bytes[3], 0xC0);
+    EXPECT_EQ(bytes[4], 0xC3);
+}
+
 // ── Variant-guard mismatch — A_NoMatchingEncodingVariant ─────────────
 
 TEST(X86VariableEncoder, NoMatchingVariantFiresLoudDiagnostic_KindMismatch) {

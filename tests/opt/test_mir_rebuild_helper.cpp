@@ -66,19 +66,38 @@ std::size_t countOp(Mir const& mir, MirOpcode op) {
 // callers pin the input + output opcode counts; this helper is the
 // rebuild plumbing they share. `cloneGlobalsOrCarveOut` is called
 // first to match the production rebuild prelude.
-Mir identityRebuild(Mir const& src) {
+//
+// Cross-compiler portability + fail-loud discipline (cycle 10h
+// post-fold, 2026-06-04): the helper returns `[[nodiscard]] bool` +
+// writes to an output parameter, NOT a `Mir` return. Two reasons:
+//   * `Mir` return is incompatible with internal `ASSERT_*` macros
+//     — they expand to `return;` (void), which GCC rejects from a
+//     `Mir`-returning function. MSVC accepted the prior shape;
+//     cycle 10g CI on Linux/GCC was the catch.
+//   * `[[nodiscard]]` (vs plain void) gives compile-time
+//     enforcement that callers check the result. A caller that
+//     wrote `identityRebuild(src, dst);` without `ASSERT_TRUE(...)`
+//     would receive an unused-result warning AND silently proceed
+//     past a carve-out failure with a default-constructed `dst`.
+//     The nodiscard keeps the silent-failure trap closed.
+// Callers: `ASSERT_TRUE(identityRebuild(src, dst));` — the
+// out-param is populated only on success.
+[[nodiscard]] bool identityRebuild(Mir const& src, Mir& out) {
     MirBuilder dst;
     DiagnosticReporter rep;
     auto const carveOut = cloneGlobalsOrCarveOut(src, dst, rep,
                                                   "IdentityRoundTrip");
-    // Fail-loud (ASSERT not EXPECT) so a future module mutation that
-    // accidentally adds a runtime-init global halts here with an
-    // attribution-clear failure rather than degrading the rebuild to
-    // a silent no-op.
-    ASSERT_EQ(carveOut, GlobalClonePrelude::Cloned)
-        << "test modules don't use runtime-init globals; the carve-out "
-           "branch shouldn't fire — otherwise the IdentityPolicy test "
-           "is silently no-ops";
+    // Fail-loud at the test boundary: caller's ASSERT_TRUE on our
+    // return value catches this. Returning false (not asserting
+    // internally) keeps the helper compiler-portable + lets the
+    // [[nodiscard]] warning surface forgotten-check call sites.
+    if (carveOut != GlobalClonePrelude::Cloned) {
+        ADD_FAILURE() << "test modules don't use runtime-init globals; "
+                         "the carve-out branch shouldn't fire — "
+                         "otherwise the IdentityPolicy test is "
+                         "silently no-ops";
+        return false;
+    }
     IdentityPolicy policy;
     std::size_t const nf = src.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
@@ -86,7 +105,8 @@ Mir identityRebuild(Mir const& src) {
         MirFunctionRebuilder rb{src, dst, policy};
         rb.rebuildFunction(f);
     }
-    return std::move(dst).finish();
+    out = std::move(dst).finish();
+    return true;
 }
 
 } // namespace
@@ -138,7 +158,8 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesDiamondCfg) {
     std::size_t const srcBrCount     = countOp(src, MirOpcode::Br);
     std::size_t const srcReturnCount = countOp(src, MirOpcode::Return);
 
-    Mir dst = identityRebuild(src);
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
 
     EXPECT_EQ(dst.instCount(),  srcInstCount);
     EXPECT_EQ(dst.blockCount(), srcBlockCount);
@@ -194,7 +215,8 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesGlobalAddrLoadStoreReturn) {
     std::size_t const srcBrCount          = countOp(src, MirOpcode::Br);
     std::size_t const srcReturnCount      = countOp(src, MirOpcode::Return);
 
-    Mir dst = identityRebuild(src);
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
 
     EXPECT_EQ(dst.instCount(),         srcInstCount);
     EXPECT_EQ(dst.blockCount(),        srcBlockCount);

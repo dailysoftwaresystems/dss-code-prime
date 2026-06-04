@@ -485,14 +485,25 @@
       }
     },
     {
-      "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). Operands: [src_reg]. Width comes from the result reg's class + the source reg's width-of-record. AS1 emits movsx.",
+      "$comment": "Sign-extend integer (cycle 3c cast lowering for MIR SExt). D-CSUBSET-LONG-PRIMITIVE closure (cycle 10h, 2026-06-04): I32→I64 variant landed. Per Intel SDM Vol. 2A, opcode 0x63 in 64-bit mode is unconditionally MOVSXD (in legacy mode it would be ARPL, but the assembler emits only 64-bit-mode code); REX.W=1 widens `r/m32 → r64` (the canonical I32→I64 sign-extend used here), REX.W=0 widens `r/m32 → r32` (effectively a mov). ModR/M.reg = dest (r64); ModR/M.rm = src (r/m32). Pairs with the next mnemonic's zext (byte→r64) — same single-variant shape. Other widths (I8→I32/I64, I16→I32/I64) NOT encoded — anchored D-TARGET-ENCODING-WIDTH-GUARD because today's variant `guard` has no operand-width discriminator; a naïve second variant would silently first-match-win on wrong widths. Deferred until a c-subset corpus row actually emits an I8/I16→wider widening.",
       "mnemonic":      "sext",
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
       "maxOperands":   1,
       "minSuccessors": 0,
-      "maxSuccessors": 0
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"] },
+            "template":   { "rexW": true, "opcode": [99] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
     },
     {
       "$comment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): zero-extend the low BYTE of a register to a full r64. Encoding `REX.W 0F B6 /r` — movzx r64, r/m8. ModR/M.reg = result (dest, 64-bit); ModR/M.rm = operand[0] (src, low-byte). REX.W=true serves double duty: (a) sets dest to r64, (b) forces REX prefix presence so the SRC low-byte access uses the spl/bpl/sil/dil aliasing (proper 8-bit access of r4..r7) instead of the legacy ah/ch/dh/bh high-byte alias. The natural consumer is the setcc → zext pair lowered by `lowerICmp`, but it is also reused by MIR ZExt for arbitrary boolean-typed → int widening.",

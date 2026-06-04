@@ -162,6 +162,7 @@
 
     { "word": "void",    "kind": "VoidKeyword"    },
     { "word": "int",     "kind": "IntKeyword"     },
+    { "word": "long",    "kind": "LongKeyword"    },
     { "word": "char",    "kind": "CharKeyword"    },
     { "word": "const",   "kind": "ConstKeyword"   },
     { "word": "typedef", "kind": "TypedefKeyword" },
@@ -333,7 +334,7 @@
       ]
     },
 
-    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "Identifier" ] },
+    "typeBase": { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "Identifier" ] },
 
     "typeRef": {
       "sequence": [
@@ -345,7 +346,7 @@
     },
 
     "typeBaseAllowingStruct": {
-      "alt": [ "VoidKeyword", "IntKeyword", "CharKeyword", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+      "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
     },
 
     "typeRefAllowingStruct": {
@@ -653,6 +654,7 @@
     "loopControls": [ { "rule": "breakStmt" }, { "rule": "continueStmt" } ],
     "builtinTypes": [
       { "name": "int",  "core": "I32"  },
+      { "name": "long", "core": "I64"  },
       { "name": "char", "core": "Char" },
       { "name": "void", "core": "Void" }
     ],
