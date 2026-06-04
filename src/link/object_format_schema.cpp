@@ -31,7 +31,7 @@ LoadResult<std::shared_ptr<ObjectFormatSchema>>
 ObjectFormatSchema::loadShipped(std::string_view name) {
     auto path = findShippedConfig({name, "object-formats", ".format.json",
                                    "object format",
-                                   DiagnosticCode::C_InvalidLanguageName});
+                                   DiagnosticCode::C_InvalidFormatName});
     if (!path) return std::unexpected(std::move(path).error());
     return loadFromFile(*path);
 }

@@ -72,6 +72,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_UnknownArtifactProfile:   return "C_UnknownArtifactProfile";
         case DiagnosticCode::C_InvalidHirLowering:       return "C_InvalidHirLowering";
         case DiagnosticCode::C_InvalidShippedFfiHeaderPath: return "C_InvalidShippedFfiHeaderPath";
+        case DiagnosticCode::C_InvalidTargetName:        return "C_InvalidTargetName";
+        case DiagnosticCode::C_InvalidFormatName:        return "C_InvalidFormatName";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";

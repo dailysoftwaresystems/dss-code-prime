@@ -140,7 +140,7 @@ TEST(TargetSchema, LoadShippedRejectsPathLikeNames) {
                       std::string_view{"a\\b"}}) {
         auto r = TargetSchema::loadShipped(name);
         ASSERT_FALSE(r.has_value()) << "expected rejection for: " << name;
-        EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_InvalidLanguageName))
+        EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_InvalidTargetName))
             << "name='" << name << "'";
     }
 }
@@ -148,7 +148,7 @@ TEST(TargetSchema, LoadShippedRejectsPathLikeNames) {
 TEST(TargetSchema, LoadShippedReportsNotFoundForUnknownName) {
     auto r = TargetSchema::loadShipped("definitely_not_a_real_target_xyz");
     ASSERT_FALSE(r.has_value());
-    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_InvalidLanguageName));
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_InvalidTargetName));
 }
 
 TEST(TargetSchema, EachLoadMintsDistinctSchemaId) {

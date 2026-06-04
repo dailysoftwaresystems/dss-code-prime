@@ -162,6 +162,17 @@ enum class DiagnosticCode : std::uint16_t {
     // arbitrary-path header substrate (readCHeader / readCHeaderFromText)
     // stays as unused-feature substrate awaiting its trigger.
     C_InvalidShippedFfiHeaderPath = 0xC034,  // RETIRED — see comment
+    // D-CONFIG-DIAGNOSTIC-CODE-PER-KIND closure (cycle 10m, 2026-06-04):
+    // pre-cycle `findShippedConfig`'s `invalidNameCode` field carried
+    // `C_InvalidLanguageName` regardless of whether the lookup was for
+    // a language, target, or object-format config. The kindLabel prose
+    // differentiated; the diagnostic code did not. These per-kind
+    // codes let downstream consumers (LSP, diff-verify harnesses,
+    // human readers) attribute "invalid-name" errors to the correct
+    // config tier without parsing the message string. Mirrors
+    // `D-OPT-DIAGNOSTIC-CODE-SPLIT-OOR-VS-FILE` precedent.
+    C_InvalidTargetName           = 0xC035,
+    C_InvalidFormatName           = 0xC036,
 
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer

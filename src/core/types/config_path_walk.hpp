@@ -22,7 +22,7 @@ struct DSS_EXPORT ShippedConfigLocator {
     std::string_view subdir;           // "sources" / "targets"
     std::string_view suffix;           // ".lang.json" / ".target.json"
     std::string_view kindLabel;        // "language" / "target" — diag prose
-    DiagnosticCode   invalidNameCode;  // C_InvalidLanguageName-shaped
+    DiagnosticCode   invalidNameCode;  // C_Invalid{Language,Target,Format}Name per kind
 };
 
 // Locate a shipped config file by walking up from cwd. Returns the

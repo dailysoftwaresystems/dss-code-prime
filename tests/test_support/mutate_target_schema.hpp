@@ -62,7 +62,7 @@ mutateShippedTargetSchemaJson(
 
     auto pathR = findShippedConfig(
         ShippedConfigLocator{targetName, "targets", ".target.json",
-                             "target", DiagnosticCode::C_InvalidLanguageName});
+                             "target", DiagnosticCode::C_InvalidTargetName});
     if (!pathR.has_value()) {
         return std::unexpected(std::move(pathR).error());
     }

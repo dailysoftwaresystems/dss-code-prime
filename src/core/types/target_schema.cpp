@@ -54,7 +54,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadShipped(
     std::string_view name) {
     auto path = findShippedConfig({name, "targets", ".target.json", "target",
-                                   DiagnosticCode::C_InvalidLanguageName});
+                                   DiagnosticCode::C_InvalidTargetName});
     if (!path) return std::unexpected(std::move(path).error());
     return loadFromFile(*path);
 }

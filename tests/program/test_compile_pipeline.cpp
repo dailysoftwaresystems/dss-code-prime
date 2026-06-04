@@ -568,8 +568,17 @@ TEST(Program_CompileFiles, CapMarkerAppearsExactlyOnceAfterMultiTargetSaturation
     // shifting cap-fill semantics. The comment above already claimed
     // this identity; the test now enforces it.
     ASSERT_GE(rep.all().size(), 1u);
-    EXPECT_EQ(rep.all()[0].code, DiagnosticCode::C_InvalidLanguageName)
-        << "first cap-filling diagnostic must be C_InvalidLanguageName "
+    // Cycle 10m closure of D-CONFIG-DIAGNOSTIC-CODE-PER-KIND: the
+    // first cap-filling diagnostic was historically `C_Invalid
+    // LanguageName` because `findShippedConfig` callers all routed
+    // their "name invalid / not found" errors through that one code
+    // regardless of config kind. Post-cycle the format-schema JSON
+    // load emits `C_InvalidFormatName` (per-kind specificity). The
+    // identity-pin discipline (catch a refactor that swaps the
+    // emitted code) is preserved — just on the new kind-specific
+    // code.
+    EXPECT_EQ(rep.all()[0].code, DiagnosticCode::C_InvalidFormatName)
+        << "first cap-filling diagnostic must be C_InvalidFormatName "
            "(forwardConfigDiagnostics fires at format-schema JSON load). "
            "A different first code signals a refactor in the config-"
            "diagnostic plumbing.";
