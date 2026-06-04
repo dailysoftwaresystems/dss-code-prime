@@ -22,7 +22,10 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
     // ...]` silently downgrades strict-TBAA to Permissive after the
     // first rebuild — CSE/LICM later in the pipeline read the wrong
     // polarity. Closes D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE.
+    // Same propagation discipline for `charTypesAliasAll` (per-language
+    // C99 §6.5 ¶7 opt-in).
     builder.setAliasingMode(mir.aliasingMode());
+    builder.setCharTypesAliasAll(mir.charTypesAliasAll());
 
     std::size_t const ng = mir.moduleGlobalCount();
     for (std::uint32_t i = 0; i < ng; ++i) {

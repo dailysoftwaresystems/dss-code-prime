@@ -2180,6 +2180,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
     lwr.mir.setAliasingMode(config.strictAliasingOnDistinctTypes
         ? MirAliasingMode::StrictTBAA
         : MirAliasingMode::Permissive);
+    lwr.mir.setCharTypesAliasAll(config.charTypesAliasAll);
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();

@@ -77,19 +77,20 @@ namespace detail {
     TypeId              pointeeA,
     TypeId              pointeeB) noexcept
 {
-    // NOTE: `Char` and `Byte` deliberately NOT included here. The
-    // caller (mirMayAlias) handles the character-type exception via
-    // a dedicated Rule 5 BEFORE reaching this helper; excluding them
-    // here is defense in depth — even if the rule ordering were
-    // accidentally swapped, a char-vs-int strict-TBAA query would
-    // fall through to the conservative Maybe instead of wrongly
-    // returning No.
+    // `Char` and `Byte` ARE classified as primitive here. The Rule 5
+    // char-exception (above the caller's switch) is now per-language
+    // configurable via `charTypesAliasAll` — when a language sets
+    // false (Rust / strict-typed DSL), strict-TBAA MUST be able to
+    // distinguish `char*` from `int*` and return No. Classifying
+    // Char/Byte as primitive lets Rule 6 fire correctly in that path.
     auto const isPrimitiveNonVoid = [&](TypeKind k) noexcept {
         switch (k) {
             case TypeKind::Bool:
             case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32: case TypeKind::I64:
             case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32: case TypeKind::U64:
             case TypeKind::F16: case TypeKind::F32: case TypeKind::F64: case TypeKind::F128:
+            case TypeKind::Char:
+            case TypeKind::Byte:
                 return true;
             default:
                 return false;
@@ -111,11 +112,12 @@ namespace detail {
 //      pointer-ness on a non-pointer SSA value)
 //   4. Either pointee is `Void`               → Maybe (universal escape
 //      hatch — `void*` may legally alias anything)
-//   5. Either pointee is a character type     → Maybe (C99 §6.5 ¶7
-//      character-type exception — `char*`/`signed char*`/`unsigned
-//      char*` may legally alias an object of any type, even under
-//      strict aliasing; serializers / hash visitors / memcpy
-//      implementations rely on this)
+//   5. Either pointee is a character type AND `charTypesAliasAll`
+//                                             → Maybe (C99 §6.5 ¶7
+//      character-type exception — C/C++/Objective-C declare
+//      `charTypesAliasAll = true`; Rust / strict-typed DSLs declare
+//      `charTypesAliasAll = false` so this rule is bypassed and
+//      Rule 6's strict-TBAA can return No on `char*` vs `int*`)
 //   6. Distinct primitive pointees AND `StrictTbaa::Yes`
 //                                             → No   (C-style strict-
 //      aliasing; opt-in via SemanticConfig)
@@ -134,12 +136,21 @@ namespace detail {
 //   — Cross-function escape analysis (address-taken propagation)
 //   — Heap-allocation tracking (malloc/calloc-distinct)
 //   — Loop-carried clobber (MemorySSA: `D-OPT-MEMORYSSA-CLOBBER-WALK`)
+// Defaults (`StrictTbaa::No` + `charTypesAliasAll = true`) match the
+// MOST CONSERVATIVE direction — a consumer that forgets to thread the
+// per-language values gets soundness, never wrong-No. Production
+// consumers (CSE / LICM Load admission) MUST read from
+// `Mir::aliasingMode()` + `Mir::charTypesAliasAll()` to get language-
+// correct precision; the defaults are for the test layer and for
+// callers exploring alias-ness on values whose language origin is
+// indeterminate.
 [[nodiscard]] inline MirAliasResult mirMayAlias(
     Mir const&          mir,
     TypeInterner const& interner,
     MirInstId           ptrA,
     MirInstId           ptrB,
-    StrictTbaa          strictTBAA = StrictTbaa::No)
+    StrictTbaa          strictTBAA       = StrictTbaa::No,
+    bool                charTypesAliasAll = true)
 {
     if (!ptrA.valid() || !ptrB.valid()) {
         std::fprintf(stderr,
@@ -167,16 +178,21 @@ namespace detail {
         return MirAliasResult::Maybe;
     }
 
-    // Rule 5: C99 §6.5 ¶7 character-type exception. Char/Byte may alias
-    // an object of ANY type, even under strict TBAA. Override anchored
-    // at `D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE` for future languages
-    // that want strict-without-char-exception.
-    auto const isCharType = [&](TypeId t) noexcept {
-        TypeKind const k = interner.kind(t);
-        return k == TypeKind::Char || k == TypeKind::Byte;
-    };
-    if (isCharType(pointeeA) || isCharType(pointeeB)) {
-        return MirAliasResult::Maybe;
+    // Rule 5: C99 §6.5 ¶7 character-type exception (per-language opt-in).
+    // Char/Byte may alias an object of ANY type when the source language
+    // declares this semantic. Default `true` matches C/C++/Objective-C;
+    // a Rust frontend (or a strict-typed DSL where `char` is opaque)
+    // would set `false` via `Mir::charTypesAliasAll()` so a `char*`
+    // vs `i32*` strict-TBAA query CAN return `No`. Threading anchor:
+    // closes `D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE`.
+    if (charTypesAliasAll) {
+        auto const isCharType = [&](TypeId t) noexcept {
+            TypeKind const k = interner.kind(t);
+            return k == TypeKind::Char || k == TypeKind::Byte;
+        };
+        if (isCharType(pointeeA) || isCharType(pointeeB)) {
+            return MirAliasResult::Maybe;
+        }
     }
 
     if (strictTBAA == StrictTbaa::Yes
@@ -314,7 +330,8 @@ mirAnyMayAliasingStoreInRegion(
     TypeInterner const&              interner,
     MirInstId                        loadPtr,
     std::span<MirBlockId const>      region,
-    StrictTbaa                       strictTBAA = StrictTbaa::No)
+    StrictTbaa                       strictTBAA       = StrictTbaa::No,
+    bool                             charTypesAliasAll = true)
 {
     for (MirBlockId const b : region) {
         std::uint32_t const ninst = mir.blockInstCount(b);
@@ -330,7 +347,8 @@ mirAnyMayAliasingStoreInRegion(
                 std::abort();
             }
             MirInstId const storePtr = ops[1];
-            if (mirMayAlias(mir, interner, loadPtr, storePtr, strictTBAA)
+            if (mirMayAlias(mir, interner, loadPtr, storePtr,
+                            strictTBAA, charTypesAliasAll)
                 != MirAliasResult::No) {
                 return true;  // could clobber
             }
@@ -349,10 +367,12 @@ mirAnyMayAliasingStoreInLoop(
     TypeInterner const&              interner,
     MirInstId                        loadPtr,
     std::span<MirBlockId const>      loopBody,
-    StrictTbaa                       strictTBAA = StrictTbaa::No)
+    StrictTbaa                       strictTBAA       = StrictTbaa::No,
+    bool                             charTypesAliasAll = true)
 {
     return mirAnyMayAliasingStoreInRegion(mir, interner, loadPtr,
-                                          loopBody, strictTBAA);
+                                          loopBody, strictTBAA,
+                                          charTypesAliasAll);
 }
 
 } // namespace dss::opt::analysis

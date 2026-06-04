@@ -202,6 +202,30 @@ TEST(MirAlias, Rule5_CharPointeeAliasesAllUnderStrict) {
               MirAliasResult::Maybe);
 }
 
+// Negative polarity: when the language declares charTypesAliasAll=false
+// (Rust-like / strict-typed DSL), Rule 5 does NOT fire and the strict-
+// TBAA verdict applies even to char vs distinct-primitive pairs. Closes
+// D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE via the predicate parameter.
+TEST(MirAlias, Rule5_CharExceptionDisabledLetsStrictTBAAReturnNo) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const charT  = interner.primitive(TypeKind::Char);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const ptrCh  = interner.pointer(charT);
+    std::array<TypeId, 2> const params{ptrI32, ptrCh};
+    auto m = buildArgModule(interner, params);
+
+    // Default charTypesAliasAll=true: Rule 5 fires → Maybe.
+    EXPECT_EQ(mirMayAlias(m.mir, interner, m.args[0], m.args[1],
+                          StrictTbaa::Yes, /*charTypesAliasAll=*/true),
+              MirAliasResult::Maybe);
+    // Opt out: char-exception disabled, distinct primitive pointees
+    // fall through to Rule 6 strict-TBAA → No.
+    EXPECT_EQ(mirMayAlias(m.mir, interner, m.args[0], m.args[1],
+                          StrictTbaa::Yes, /*charTypesAliasAll=*/false),
+              MirAliasResult::No);
+}
+
 TEST(MirAlias, Rule5_BytePointeeAliasesAllUnderStrict) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32    = interner.primitive(TypeKind::I32);
@@ -296,6 +320,38 @@ TEST(MirAlias, MirAliasingModeDefaultIsPermissive) {
 
 // MirBuilder::setAliasingMode propagates through finish() — the
 // frozen Mir reflects what the builder was told. Round-trip pin.
+// Default charTypesAliasAll is true (sound out of the box for any
+// language that doesn't explicitly opt out).
+TEST(MirAlias, MirCharTypesAliasAllDefaultsToTrue) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    EXPECT_TRUE(mir.charTypesAliasAll());
+}
+
+// MirBuilder::setCharTypesAliasAll propagates through finish().
+TEST(MirAlias, MirBuilderSetCharTypesAliasAllRoundTrips) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.setCharTypesAliasAll(false);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    EXPECT_FALSE(mir.charTypesAliasAll());
+}
+
 TEST(MirAlias, MirBuilderSetAliasingModeRoundTrips) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const voidT = interner.primitive(TypeKind::Void);

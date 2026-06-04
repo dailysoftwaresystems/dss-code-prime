@@ -589,37 +589,62 @@ struct DSS_EXPORT SemanticConfig {
     };
     PointerConversionRules pointerConversions;
 
-    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d): per-
-    // language strict-aliasing opt-in. Threaded by the compile pipeline
-    // into `MirLoweringConfig.strictAliasingOnDistinctTypes`, which the
-    // HIR→MIR lowering forwards to `MirBuilder::setAliasingMode` —
-    // CSE/LICM consumers then read it via `Mir.aliasingMode()`.
+    // Two orthogonal per-language alias-analysis opt-ins, both threaded
+    // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load
+    // admission via `Mir.aliasingMode()` + `Mir.charTypesAliasAll()`.
     //
-    // The C99 §6.5 ¶7 character-type exception is BAKED INTO the MIR
-    // alias predicate (`mirMayAlias` Rule 5) — opting in here is sound
-    // for any C-family language without further configuration. A
-    // future language wanting "strict aliasing without the character
-    // exception" needs a separate `PointerAliasingRules` bit (anchored
-    // at `D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE`).
+    //   * `strictAliasingOnDistinctTypes` — C99 §6.5 strict aliasing.
+    //     Lets `Ptr<I32>` vs `Ptr<I64>` resolve to No (Rule 6).
+    //   * `charTypesAliasAll` — C99 §6.5 ¶7 character-type exception.
+    //     Defaults true (sound for C/C++/Objective-C/Java/Go); a Rust
+    //     frontend or strict-typed DSL sets false.
+    //
+    // The two compose: with `strict=true` + `charAliasAll=true`, a
+    // `char*` Store does not alias an `int*` Load only by character-
+    // exception (i.e., it MAY alias — Maybe). With `strict=true` +
+    // `charAliasAll=false`, the same pair resolves to No.
     //
     // Loader-level unknown-key fail-loud mirrors the
     // `pointerConversions` pattern (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD
-    // discipline — a typo'd `strictAliasing` would otherwise silently
-    // fall back to default-false and flip the language's optimization
-    // polarity).
+    // discipline — a typo'd key would otherwise silently fall back to
+    // the default and flip the language's optimization polarity).
     struct PointerAliasingRules {
         // Per C99 §6.5 ¶7 / C++ [basic.lval]: a glvalue accessed
         // through a pointer of a type that is NOT compatible with the
         // dynamic object type is undefined behavior. Optimizers that
         // honor this can prove `Ptr<I32>` and `Ptr<I64>` don't alias
-        // (Rule 6 in `mirMayAlias`). Character-type pointers stay
-        // alias-all regardless of this flag (Rule 5).
+        // (Rule 6 in `mirMayAlias`). Character-type pointer behavior
+        // is controlled INDEPENDENTLY by `charTypesAliasAll` below
+        // (the two semantics compose orthogonally).
         //
         // C, C++, Objective-C: true. Rust (via its borrow checker) is
         // arguably stricter but does NOT use this MIR-tier flag — it
         // enforces non-aliasing at the type-checker tier. Java / Go /
         // dynamic languages: false (no spec-level guarantee).
         bool strictAliasingOnDistinctTypes = false;
+
+        // C99 §6.5 ¶7 character-type exception: a character-typed
+        // pointer (`char*` / `signed char*` / `unsigned char*` — at the
+        // MIR tier `Char`/`Byte` pointees) may alias an object of ANY
+        // type. Enables serializers, hash visitors, memcpy
+        // implementations, and bytewise inspection to be sound under
+        // strict aliasing.
+        //
+        // Default `true` is the CONSERVATIVE direction — every
+        // language gets the safe sound-but-imprecise answer until it
+        // declares otherwise. C / C++ / Objective-C declare true.
+        // Rust's `u8` does NOT have this exception (Rust enforces
+        // aliasing at the borrow-checker tier and treats `&[u8]` like
+        // any other typed slice); a Rust frontend would declare
+        // false. A hypothetical strict-typed DSL where `char` is
+        // truly opaque would also declare false.
+        //
+        // This flag is independent of `strictAliasingOnDistinctTypes`:
+        // disabling the char-exception only matters in combination
+        // with strict aliasing (the exception is what stops a Rule 5
+        // strict-TBAA verdict from firing on a char pointer). Closes
+        // `D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE`.
+        bool charTypesAliasAll = true;
     };
     PointerAliasingRules pointerAliasing;
 };

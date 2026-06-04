@@ -4602,16 +4602,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readBool("strictAliasingOnDistinctTypes",
                              cfg.pointerAliasing
                                  .strictAliasingOnDistinctTypes);
+                    readBool("charTypesAliasAll",
+                             cfg.pointerAliasing.charTypesAliasAll);
                     for (auto const& [k, _] : obj.items()) {
-                        if (k != "strictAliasingOnDistinctTypes") {
+                        if (k != "strictAliasingOnDistinctTypes" &&
+                            k != "charTypesAliasAll") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       std::format(
                                           "/semantics/pointerAliasing/{}",
                                           k),
                                       std::format(
                                           "unknown 'pointerAliasing' "
-                                          "field '{}' — expected "
-                                          "'strictAliasingOnDistinctTypes'",
+                                          "field '{}' — expected one "
+                                          "of 'strictAliasingOnDistinctTypes' "
+                                          "or 'charTypesAliasAll'",
                                           k));
                         }
                     }
