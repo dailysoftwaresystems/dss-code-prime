@@ -1,0 +1,17 @@
+{
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 0,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "licm-after-mem2reg", "passes": ["Mem2Reg", "Licm"]},
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+  ]
+}
