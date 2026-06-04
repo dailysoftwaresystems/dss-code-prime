@@ -241,12 +241,23 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter) {
         // `hoistedInThisLoop`. Termination: the set can only grow
         // by `|loop.body inst count|` total; a no-progress
         // iteration breaks via `changed=false`.
+        //
+        // Iter cap (post-fold 2026-06-04 audit FOLD-NOW): the cap
+        // DERIVES from the structural bound — `sum of blockInstCount
+        // over loop.body + 1` — so the abort is a "recordHoist
+        // behavior changed" guard, NOT a chain-length ceiling. The
+        // prior `kMaxIter = 64` literal would have falsely aborted
+        // on legitimate >64-link chains (e.g., a body with 100
+        // sequentially-dependent invariants).
         std::unordered_set<MirInstId> hoistedInThisLoop;
         bool changed = true;
         std::size_t iterCap = 0;
-        constexpr std::size_t kMaxIter = 64;
+        std::size_t maxIter = 1;  // +1 slack on the structural bound
+        for (MirBlockId const b : loop.body) {
+            maxIter += src_.blockInstCount(b);
+        }
         while (changed) {
-            if (iterCap++ >= kMaxIter) {
+            if (iterCap++ >= maxIter) {
                 // Defensive step cap: the per-loop fixed point is
                 // structurally bounded by `|body insts|`, but an
                 // unanticipated recordHoist behavior change could
@@ -255,9 +266,10 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter) {
                 std::fprintf(stderr,
                     "dss::opt::passes::Licm fatal: chained-invariant "
                     "fixed point exceeded %zu iterations on a single "
-                    "loop (header v=%u) — substrate-contract "
-                    "violation (D-OPT6-LICM-CHAINED-INVARIANTS).\n",
-                    kMaxIter, loop.header.v);
+                    "loop (header v=%u, body inst count + 1 = %zu) — "
+                    "substrate-contract violation "
+                    "(D-OPT6-LICM-CHAINED-INVARIANTS).\n",
+                    iterCap, loop.header.v, maxIter);
                 std::abort();
             }
             changed = false;

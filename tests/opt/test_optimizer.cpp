@@ -429,6 +429,13 @@ TEST(Optimizer, EffectivenessAliasArcStrictTBAACapstone) {
     // test pairs ConstFold with DCE to make the Mul disappear.
     // Tests that don't include the sweep would erroneously
     // measure the substrate, not the user-visible outcome.
+    // Fixture-property anchor for the `== 1u` count below (T3 post-fold
+    // 2026-06-04 audit): `buildAliasArcStrictCapstoneMir` produces
+    // exactly TWO Load insts and NO other CSE-eligible duplicate
+    // (1 Const, 1 Store, 1 Add — none commutatively-equal in pairs).
+    // A future fixture edit adding a second Const(7) or similar would
+    // break the exact-one-CSE-event invariant; the tightened ARM 2
+    // count below makes that surface loudly.
     {
         TypeInterner interner{CompilationUnitId{1}};
         Mir mir = buildAliasArcStrictCapstoneMir(interner);
@@ -439,14 +446,55 @@ TEST(Optimizer, EffectivenessAliasArcStrictTBAACapstone) {
         DiagnosticReporter rep;
         auto const result = opt::optimize(mir, target, interner, cseDce, rep);
         ASSERT_TRUE(result.ok);
-        EXPECT_GE(result.mutationCount(opt::PassId::Cse), 1u)
-            << "passMutationCount[Cse] must be ≥1 — Rule 6 distinct "
-               "non-char primitives admits the second Load(pI) "
-               "against the first under strict-TBAA";
+        // T1 (HIGH, audit FOLD-NOW 2026-06-04): tightened from `>= 1u`
+        // to `== 1u`. The fixture has exactly one CSE candidate pair
+        // (the two Loads); an incidental extra mutation would surface
+        // as a regression here rather than silently passing.
+        EXPECT_EQ(result.mutationCount(opt::PassId::Cse), 1u)
+            << "passMutationCount[Cse] must be EXACTLY 1 — fixture "
+               "has exactly one CSE candidate (the two Loads). A "
+               "higher count means a non-Load CSE fired (incidental "
+               "regression class); a lower count means Load CSE "
+               "didn't fire (alias-rule regression).";
         EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 1u)
             << "after Cse-then-Dce the redundant Load must be swept. "
                "Two surviving Loads = either Cse didn't fire (alias "
                "regression) OR Dce didn't sweep (DCE regression).";
+        // T2 (HIGH, audit FOLD-NOW 2026-06-04): pin CSE substitution
+        // direction, not just "a Load disappeared". The capstone's
+        // single Add must now have BOTH operands resolving to the
+        // SAME MirInstId — proves Load2 was redirected to Load1 (or
+        // vice versa) at the USE site, not merely DCE'd. A regression
+        // where CSE incremented its counter but didn't rewrite the
+        // Add's operand would leave Add(loadX, loadY) with distinct
+        // ids; this assertion catches that class.
+        MirInstId addId = InvalidMirInst;
+        std::size_t const nfn = mir.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < nfn; ++fi) {
+            MirFuncId const f = mir.funcAt(fi);
+            std::uint32_t const nb = mir.funcBlockCount(f);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                MirBlockId const b = mir.funcBlockAt(f, bi);
+                std::uint32_t const ni = mir.blockInstCount(b);
+                for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                    MirInstId const id = mir.blockInstAt(b, ii);
+                    if (mir.instOpcode(id) == MirOpcode::Add) {
+                        addId = id;
+                        break;
+                    }
+                }
+            }
+        }
+        ASSERT_TRUE(addId.valid())
+            << "post-opt MIR must still contain the Add inst — "
+               "the function returns its sum";
+        auto const addOps = mir.instOperands(addId);
+        ASSERT_EQ(addOps.size(), 2u);
+        EXPECT_EQ(addOps[0].v, addOps[1].v)
+            << "Add(load1, load2) post-CSE must collapse to "
+               "Add(loadN, loadN) — both operand ids point at the "
+               "surviving Load. A regression that didn't rewrite "
+               "the Add's operand would surface as distinct ids.";
     }
 
     // ARM 3 — SHIPPED release pipeline integration. Closes the loop
@@ -491,7 +539,40 @@ TEST(Optimizer, EffectivenessAliasArcStrictTBAACapstone) {
             << "shipped release pipeline must achieve the same Load-"
                "count effectiveness as ARM 2 — pinning the JSON "
                "config + the inline pipeline together";
+        // Shipped pipeline runs fixed-point iterations so Cse may fire
+        // more than once across iterations (e.g., second iteration
+        // hitting another opportunity surfaced by an intervening
+        // pass). `>= 1u` is the correct shape here — the EXACT-one-
+        // mutation invariant is enforced by ARM 2 on the minimal
+        // [Cse, Dce] pipeline.
         EXPECT_GE(result.mutationCount(opt::PassId::Cse), 1u);
+        // T2 (HIGH, audit FOLD-NOW 2026-06-04): same Add-operand-
+        // identity pin as ARM 2 — proves the shipped pipeline rewrote
+        // the Add's operand (not just incremented a counter +
+        // DCE-swept a dead Load).
+        MirInstId addId = InvalidMirInst;
+        std::size_t const nfn = mir.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < nfn; ++fi) {
+            MirFuncId const f = mir.funcAt(fi);
+            std::uint32_t const nb = mir.funcBlockCount(f);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                MirBlockId const b = mir.funcBlockAt(f, bi);
+                std::uint32_t const ni = mir.blockInstCount(b);
+                for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                    MirInstId const id = mir.blockInstAt(b, ii);
+                    if (mir.instOpcode(id) == MirOpcode::Add) {
+                        addId = id;
+                        break;
+                    }
+                }
+            }
+        }
+        ASSERT_TRUE(addId.valid());
+        auto const addOps = mir.instOperands(addId);
+        ASSERT_EQ(addOps.size(), 2u);
+        EXPECT_EQ(addOps[0].v, addOps[1].v)
+            << "shipped pipeline must also collapse Add(load1, load2) "
+               "to Add(loadN, loadN) — substitution direction pinned";
     }
 }
 
