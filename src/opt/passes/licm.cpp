@@ -71,7 +71,7 @@ public:
         return instructionsHoisted_;
     }
 
-    void analyze(MirFuncId fn);
+    void analyze(MirFuncId fn, DiagnosticReporter& reporter);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -171,7 +171,7 @@ private:
     std::size_t instructionsHoisted_ = 0;
 };
 
-void LicmPolicy::analyze(MirFuncId fn) {
+void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter) {
     resetPerFunction();
     MirBlockId const entry = src_.funcEntry(fn);
     auto const rpo = mirReversePostOrder(src_, entry);
@@ -200,7 +200,29 @@ void LicmPolicy::analyze(MirFuncId fn) {
             if (preheader.valid()) { ambiguous = true; break; }
             preheader = p;
         }
-        if (ambiguous || !preheader.valid()) continue;
+        if (ambiguous || !preheader.valid()) {
+            // D-OPT6-LICM-PREHEADER-INSERTION (cycle 10l, 2026-06-04):
+            // pre-cycle this `continue` was silent — the pass silently
+            // skipped hoist-eligible loops with no unique non-back-
+            // edge predecessor (ambiguous = multiple non-back-edge
+            // preds; !preheader.valid() = unreachable loop header).
+            // The skipped effectiveness is observable now via an
+            // Info-severity diagnostic citing the deferred anchor
+            // (preheader insertion + Phi-incoming merge). Mirror of
+            // DCE's runtime-init-globals Info skip pattern.
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::X_OptPassSkipped;
+            d.severity = DiagnosticSeverity::Info;
+            d.actual   = std::format(
+                "opt::Licm: skipped loop with header v={} — {} "
+                "non-back-edge predecessor(s); preheader insertion "
+                "+ Phi-incoming merge not yet implemented "
+                "(D-OPT6-LICM-PREHEADER-INSERTION).",
+                loop.header.v,
+                ambiguous ? ">1" : "0");
+            reporter.report(std::move(d));
+            continue;
+        }
 
         // For each inst in the loop body (skip the header's Phis
         // implicitly since Phi isn't a candidate opcode):
@@ -315,7 +337,7 @@ LicmResult runLicm(Mir& mir, TypeInterner const& interner,
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f);
+        policy.analyze(f, reporter);
         MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(f);
     }

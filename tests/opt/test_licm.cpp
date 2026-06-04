@@ -24,6 +24,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "diagnostic_count.hpp"
 #include "opt/passes/licm.hpp"
 
 #include <gtest/gtest.h>
@@ -728,6 +729,15 @@ TEST(Licm, MultiplePreheaderPredsSkipsLoop) {
     EXPECT_EQ(r.instructionsHoisted, 0u)
         << "loop with >1 external pred has no unique preheader → "
            "c1 conservatively skips (D-OPT6-LICM-PREHEADER-INSERTION)";
+    // Cycle 10l closure: the skip is now observable via Info-severity
+    // X_OptPassSkipped citing the deferred anchor. Pre-10l this was
+    // a silent `continue` — developers couldn't tell why LICM didn't
+    // fire on a hoist-eligible loop with multiple external preds.
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::X_OptPassSkipped), 1u)
+        << "ambiguous-preheader skip must emit exactly one Info-severity "
+           "X_OptPassSkipped diagnostic citing "
+           "D-OPT6-LICM-PREHEADER-INSERTION — observable for developers";
 }
 
 // Nested-loop invariant — surfaced by the OPT6 2nd-look review as
