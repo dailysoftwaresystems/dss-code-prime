@@ -11,6 +11,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
 #include "diagnostic_count.hpp"
+#include "mutate_target_schema.hpp"
 #include "lir/lir.hpp"
 
 #include <algorithm>
@@ -1708,4 +1709,84 @@ TEST(LirCallconvAbi, AllocaWithVirtualResultFailsLoud) {
                   DiagnosticCode::L_VirtualRegInPostRegalloc), 1u)
         << "the diagnostic code must be the post-regalloc invariant "
            "code specifically, not any other error";
+}
+
+// D-CSUBSET-LOCAL-INT-CODEGEN-NEGATIVE-PIN closure (cycle 10k,
+// 2026-06-04): a target schema that declares the `alloca` opcode
+// but OMITS `lea` is structurally misconfigured — the materialize
+// pass cannot lower `alloca` to its `lea result, [sp + offset]`
+// form. Per `lir_callconv.cpp:877` the pass MUST fail loud with
+// `L_RequiredLirOpcodeMissing` when it encounters an `alloca`
+// instruction without the `lea` handle resolved.
+//
+// Pre-10k this defense was internal-only — no shipping target hits
+// it (x86_64.target.json declares both). The pin exists to catch a
+// future schema author who adds `alloca` but forgets `lea`. With
+// the `mutateShippedTargetSchemaJson` test-support substrate
+// (cycle 10k), the negative pin is now expressible without an
+// always-stale parallel "broken" JSON file: load shipped, strip
+// `lea`, exercise the materialize path.
+TEST(LirCallconvAbi,
+     AllocaWithoutLeaInSchemaFailsLoudInMaterialize) {
+    auto mutatedR = ::dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"lea"});
+    ASSERT_TRUE(mutatedR.has_value())
+        << "mutated x86_64 schema (with `lea` stripped) must still "
+           "load — the helper's JSON parse + re-serialize round-trip "
+           "is what's exercised here; the substrate failure is in "
+           "the callconv lowering, not the schema loader.";
+    auto const& sch = **mutatedR;
+
+    // Sanity: the mutation actually removed `lea`. Without this
+    // attribution pin a future regression in the helper (e.g.,
+    // string-compare bug) would silently let `lea` survive and
+    // make the test pass for the WRONG reason (lookup succeeds
+    // because lea is still there).
+    ASSERT_FALSE(sch.opcodeByMnemonic("lea").has_value())
+        << "mutateShippedTargetSchemaJson contract violated: "
+           "`lea` survived the removal";
+    ASSERT_TRUE(sch.opcodeByMnemonic("alloca").has_value())
+        << "alloca must remain in the mutated schema — it's the "
+           "opcode whose presence triggers the lea-required check";
+
+    auto const allocaOp = sch.opcodeByMnemonic("alloca");
+    auto const retOp    = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(retOp.has_value());
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    // alloca with a PHYSICAL result reg (post-regalloc shape) so
+    // the lea-missing arm fires BEFORE the virtual-result arm
+    // (otherwise we'd be testing the wrong negative pin).
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    LirReg const presult{static_cast<std::uint32_t>(*raxOrd),
+                         /*isPhysical=*/1,
+                         /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    b.addInst(*allocaOp, presult, std::span<LirOperand const>{});
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    EXPECT_FALSE(result.ok())
+        << "materialize must reject a schema that has `alloca` but "
+           "no `lea` — the lowering depends on emitting `lea result, "
+           "[sp + offset]` which requires the lea opcode handle.";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  ccRep,
+                  DiagnosticCode::L_RequiredLirOpcodeMissing), 1u)
+        << "the diagnostic code must be `L_RequiredLirOpcodeMissing` "
+           "specifically — a regression that hit a DIFFERENT error "
+           "would pass `EXPECT_FALSE(result.ok())` but fail this "
+           "specificity pin, making the regression cause attributable.";
 }

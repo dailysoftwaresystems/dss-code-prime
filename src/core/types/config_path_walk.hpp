@@ -28,7 +28,7 @@ struct DSS_EXPORT ShippedConfigLocator {
 // Locate a shipped config file by walking up from cwd. Returns the
 // resolved absolute path on success, or a single-entry diagnostic
 // vector on rejection (bad name) / not-found (no file in ancestry).
-[[nodiscard]] LoadResult<std::filesystem::path>
+[[nodiscard]] DSS_EXPORT LoadResult<std::filesystem::path>
 findShippedConfig(ShippedConfigLocator const& loc);
 
 } // namespace dss
