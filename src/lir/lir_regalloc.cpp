@@ -163,9 +163,24 @@ rangeCrossesCall(LirLiveRange const& r,
 // crossed clobbers to the exclusion set passed to tryAllocate
 // Excluding. Universal across CPUs: the constraint is per-opcode-
 // JSON-declared; no `if (opcode == idiv)` ever.
+// `forbiddenOrdinals` = (implicitRegisters.inputs ∪
+// implicitRegisters.clobbered) at this position. Cycle-10r fix:
+// the operand vregs USED AT a compound op must avoid BOTH input
+// AND clobbered regs:
+//   - Operand allocated to an implicit-INPUT reg: the implicit-
+//     input-pinning mov (e.g., `mov rax, dividend` in lowerDiv)
+//     happens BEFORE the op reads the operand — overwriting the
+//     operand's value with the implicit-input's value. Silent
+//     miscompile (divisor reads as dividend; 100/100 = 1).
+//   - Operand allocated to an implicit-CLOBBERED reg: the op's
+//     pre-emit (CQO writes RDX before IDIV reads operand 0)
+//     destroys the operand's value mid-op. Silent miscompile
+//     (operand becomes sign-extension of dividend; 100/0 = trap).
+// Outputs are not forbidden (the op reads the operand BEFORE
+// writing outputs; same-reg overlap is fine).
 struct ImplicitClobberAt {
     std::uint32_t              position;
-    std::vector<std::uint16_t> clobberedOrdinals;
+    std::vector<std::uint16_t> forbiddenOrdinals;
 };
 
 [[nodiscard]] std::vector<ImplicitClobberAt>
@@ -179,10 +194,23 @@ collectImplicitClobberPositions(Lir const& lir, TargetSchema const& schema,
             LirInstId const inst = lir.blockInstAt(b, i);
             auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
             if (info != nullptr
-             && info->implicitRegisters.has_value()
-             && !info->implicitRegisters->clobberedOrdinals.empty()) {
-                out.push_back({pos,
-                               info->implicitRegisters->clobberedOrdinals});
+             && info->implicitRegisters.has_value()) {
+                auto const& ir = *info->implicitRegisters;
+                if (!ir.inputOrdinals.empty()
+                 || !ir.clobberedOrdinals.empty()) {
+                    std::vector<std::uint16_t> forbidden;
+                    forbidden.reserve(ir.inputOrdinals.size()
+                                      + ir.clobberedOrdinals.size());
+                    for (auto const o : ir.inputOrdinals)     forbidden.push_back(o);
+                    for (auto const o : ir.clobberedOrdinals) {
+                        // dedup against inputs (idiv's RDX is both
+                        // input + clobbered)
+                        bool dup = false;
+                        for (auto const e : forbidden) if (e == o) { dup = true; break; }
+                        if (!dup) forbidden.push_back(o);
+                    }
+                    out.push_back({pos, std::move(forbidden)});
+                }
             }
             pos += 2u;
         }
@@ -191,11 +219,33 @@ collectImplicitClobberPositions(Lir const& lir, TargetSchema const& schema,
 }
 
 // Returns the union of clobbered-register ordinals across every
-// implicit-clobber opcode the range crosses (range.start <= pos+1 <
-// range.end — same "strictly past" semantics as rangeCrossesCall).
-// The result is written into `out` and the size returned via
-// reference so callers can chain into the existing fixed-size
-// exclusion array without heap allocation per range.
+// implicit-clobber opcode whose position is COVERED by the range
+// (range.start <= pos < range.end). This is DIFFERENT from
+// rangeCrossesCall's "strictly past" semantics — discovered cycle
+// 10r catastrophically:
+//
+// A call clobbers its caller-saved registers AFTER the call returns
+// — args consumed at call.early are safe even if held in
+// caller-saved. So `rangeCrossesCall` uses `pos + 1 < r.end`
+// (range must extend PAST the call's late slot).
+//
+// A compound op (x86 sdiv_compound = CQO + IDIV; udiv_compound =
+// XOR + DIV) clobbers MID-OP: CQO destroys RDX BEFORE IDIV reads
+// its operand 0. A divisor vreg whose range ENDS at the compound
+// op (range.end = pos + 1, the "consumed by op" case in
+// `rangeCrossesCall`'s reasoning) is STILL READ AFTER THE
+// CLOBBER — the call-style "safe because consumed at early slot"
+// invariant DOES NOT hold for compound ops. Pre-10r-fix this
+// shipped silent-miscompile: a divisor allocated to RDX would be
+// destroyed by CQO before IDIV read it, producing IDIV by
+// (sign-extension-of-RAX) which traps with STATUS_INTEGER_DIVIDE_
+// BY_ZERO when the dividend happens to be a small positive value.
+// Caught by `examples/c-subset/division/` exiting with the OS's
+// trap signature instead of 47.
+//
+// The fix: use "covers position P" semantics — exclude clobbers
+// from any range with `r.start <= pos < r.end`. Captures both
+// (a) ranges crossing past, AND (b) ranges with use-at-pos.
 template <std::size_t N>
 [[nodiscard]] std::size_t
 implicitClobbersCrossedBy(LirLiveRange const& r,
@@ -205,8 +255,8 @@ implicitClobbersCrossedBy(LirLiveRange const& r,
     std::size_t filled = outAlreadyFilled;
     for (auto const& c : clobbers) {
         if (c.position < r.start) continue;
-        if (c.position + 1u >= r.end) continue;
-        for (std::uint16_t const ord : c.clobberedOrdinals) {
+        if (c.position >= r.end) continue;
+        for (std::uint16_t const ord : c.forbiddenOrdinals) {
             // Dedup against what's already in `out` (the
             // requires2Address pass populated the leading slice;
             // multiple implicit-clobber positions may repeat the
