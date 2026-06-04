@@ -359,70 +359,158 @@ TEST(X86VariableEncoder, ZextRaxRaxEmits48_0F_B6_C0) {
     EXPECT_EQ(bytes[4], 0xC3);
 }
 
-// ── D-CSUBSET-DIVISION-OP-CODEGEN byte-pins (cycle 10q, 2026-06-04) ──
+// ── D-CSUBSET-DIVISION-OP-CODEGEN byte-pins (cycle 10r split, 2026-06-04) ──
 //
-// Compound divide opcodes pack a pre-divide register-setup byte
-// sequence with the actual divide. Each opcode emits 5 bytes total:
-// 4 from template.opcode + 1 ModR/M derived from operand 0 (divisor)
-// + modrmRegExt. The byte sequences MUST differ — they encode
-// signed vs unsigned divide. FLAG 1 (silent-miscompile guard):
-// confusing the two routes any high-bit-set dividend through the
-// wrong sign interpretation — silent miscompile. The shared helper
-// + two parameterized tests fail loud at the assembler tier if the
-// JSON contract drifts. Post-fold helper extraction (10q FOLD-NOW)
-// eliminates ~25 LOC of duplication + collapses the drift surface
-// for future div-variant rows (e.g., 32-bit i32 div / SMod / UMod).
+// Cycle 10r splits the cycle-10q compound opcodes into separate pre
+// + core opcodes. Rationale (full doc in mir_to_lir.cpp / target.json):
+// the encoder auto-emits ONE REX prefix per inst computed from
+// operand high bits; cycle 10q's `[0x48, 0x99, 0x48, 0xF7]` embedded
+// REX bytes overrode the auto-REX for high-reg divisors (R8-R15),
+// losing REX.B → modrm.rm decoded as the wrong register → silent
+// miscompile + STATUS_INTEGER_DIVIDE_BY_ZERO trap. Splitting lets
+// each instruction get its own correctly-computed REX prefix.
+//
+// FLAG 1 (silent-miscompile guard, preserved): the four byte
+// patterns are STRUCTURALLY DIFFERENT — schema swaps fail at the
+// assembler tier before any high-bit dividend test could silently
+// pass with wrong sign interpretation.
 
 namespace {
-void expectCompoundDivBytes(char const* mnemonic,
-                            std::array<std::uint8_t, 5> const& expected) {
+// Unified helper for divide-family byte-pin tests. Accepts a single
+// optional divisor register (nullopt for zero-operand pre-ops like
+// CQO / XOR-RDX; named register for core ops like IDIV / DIV).
+// Replaces the two separate helpers (cycle 10r 7-agent review fold
+// code-simplifier #2) since the surface grows linearly with each
+// new div-variant + register-pin combination otherwise.
+void expectDivBytes(char const* mnemonic,
+                    std::optional<char const*> divisorRegName,
+                    std::vector<std::uint8_t> const& expected) {
     auto schema = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(schema.has_value());
-    auto const compoundOp = (*schema)->opcodeByMnemonic(mnemonic);
-    ASSERT_TRUE(compoundOp.has_value()) << "missing opcode: " << mnemonic;
-    auto const raxOrd = (*schema)->registerByName("rax");
-    ASSERT_TRUE(raxOrd.has_value());
+    auto const op = (*schema)->opcodeByMnemonic(mnemonic);
+    ASSERT_TRUE(op.has_value()) << "missing opcode: " << mnemonic;
 
-    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
-                     /*isPhysical=*/1,
-                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    auto const label = [&] {
+        std::string s = mnemonic;
+        if (divisorRegName.has_value()) {
+            s += "("; s += *divisorRegName; s += ")";
+        }
+        return s;
+    };
 
     Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
-        LirOperand const ops[] = { LirOperand::makeReg(rax) };
-        (void)b.addInst(*compoundOp, InvalidLirReg, ops);
+        if (divisorRegName.has_value()) {
+            auto const ord = (*schema)->registerByName(*divisorRegName);
+            ASSERT_TRUE(ord.has_value())
+                << "missing register: " << *divisorRegName;
+            LirReg const divisor{static_cast<std::uint32_t>(*ord),
+                                 /*isPhysical=*/1,
+                                 /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+            LirOperand const ops[] = { LirOperand::makeReg(divisor) };
+            (void)b.addInst(*op, InvalidLirReg, ops);
+        } else {
+            (void)b.addInst(*op, InvalidLirReg, std::span<LirOperand const>{});
+        }
     });
-
     DiagnosticReporter rep;
     auto const bytes = assembleFirstFn(lir, **schema, rep);
     EXPECT_EQ(rep.errorCount(), 0u);
-    ASSERT_EQ(bytes.size(), 6u);  // 5 compound bytes + ret
-    for (std::size_t i = 0; i < 5; ++i) {
+    ASSERT_EQ(bytes.size(), expected.size() + 1u)  // + ret
+        << label() << " unexpected size";
+    for (std::size_t i = 0; i < expected.size(); ++i) {
         EXPECT_EQ(bytes[i], expected[i])
-            << mnemonic << " byte " << i << " mismatch";
+            << label() << " byte " << i << " mismatch";
     }
-    EXPECT_EQ(bytes[5], 0xC3);  // ret
+    EXPECT_EQ(bytes[expected.size()], 0xC3);  // ret
 }
 } // namespace
 
-TEST(X86VariableEncoder, SdivCompoundRaxEmits48_99_48_F7_F8) {
-    // sdiv_compound rax = REX.W 0x99 CQO (sign-extend RAX→RDX:RAX)
-    // + REX.W 0xF7 /7 IDIV r/m64 (divides RDX:RAX by rax).
-    // ModR/M byte 0xF8 = mod=11 /7 rm=rax(0).
-    expectCompoundDivBytes("sdiv_compound",
-        {0x48, 0x99, 0x48, 0xF7, 0xF8});
+TEST(X86VariableEncoder, CqoEmits48_99) {
+    // CQO = REX.W 0x99 sign-extends RAX into RDX:RAX. No operand,
+    // no ModR/M. Encoder synthesizes the REX byte from template's
+    // rexW=true; the opcode array is just [0x99]. 2 bytes total.
+    expectDivBytes("cqo", std::nullopt, {0x48, 0x99});
 }
 
-TEST(X86VariableEncoder, UdivCompoundRaxEmits31_D2_48_F7_F0) {
-    // udiv_compound rax = 0x31 0xD2 XOR EDX, EDX (zeroes RDX —
-    // 32-bit op zero-extends to RDX) + REX.W 0xF7 /6 DIV r/m64.
-    // ModR/M byte 0xF0 = mod=11 /6 rm=rax(0).
-    //
-    // FLAG 1 discrimination: udiv's bytes[0..1] = 31 D2 are
-    // STRUCTURALLY DIFFERENT from sdiv's 48 99. A schema swap
-    // would fail at byte 0 BEFORE any high-bit dividend test
-    // could silently pass with wrong sign interpretation.
-    expectCompoundDivBytes("udiv_compound",
-        {0x31, 0xD2, 0x48, 0xF7, 0xF0});
+TEST(X86VariableEncoder, XorRdxZeroEmits31_D2) {
+    // XOR EDX, EDX = 0x31 0xD2 (32-bit op zero-extends to RDX).
+    // No REX byte emitted: EDX's ordinal high bit = 0 (so rexB=0)
+    // and the template omits rexW. 2 bytes total.
+    expectDivBytes("xor_rdx_zero", std::nullopt, {0x31, 0xD2});
+}
+
+TEST(X86VariableEncoder, IDivOpRaxEmits48_F7_F8) {
+    // IDIV r/m64 with divisor in RAX: REX.W 0xF7 /7 with
+    // ModR/M = mod=11 reg=/7=111 rm=rax(000) = 0xF8. Encoder
+    // synthesizes the 0x48 REX byte from template's rexW=true;
+    // the opcode array is just [0xF7]. 3 bytes total.
+    expectDivBytes("idiv_op", "rax", {0x48, 0xF7, 0xF8});
+}
+
+TEST(X86VariableEncoder, DivOpRaxEmits48_F7_F0) {
+    // DIV r/m64 with divisor in RAX: REX.W 0xF7 /6 with
+    // ModR/M = mod=11 reg=/6=110 rm=rax(000) = 0xF0. 3 bytes.
+    // FLAG 1 discrimination: differs from idiv_op's /7 byte
+    // (0xF0 vs 0xF8) — schema swap would fail at byte 2.
+    expectDivBytes("div_op", "rax", {0x48, 0xF7, 0xF0});
+}
+
+// ── REX.B regression pins for high-numbered registers (R8-R15) ──
+//
+// **Background**: cycle-10q's compound encoding bug was that the
+// encoder's auto-REX prefix was followed by an embedded literal
+// 0x48 inside the opcode bytes; per x86 decode the LAST REX prefix
+// before the opcode wins, so REX.B was lost for any divisor in
+// R8-R15. The cycle-10r split makes the encoder's auto-REX path
+// the SINGLE place handling REX, so each instruction gets its own
+// correctly-computed prefix.
+//
+// **Coverage breadth** (7-agent review fold pr-test #1 9/10):
+// A single R14 pin would only attest one specific bit pattern.
+// The pins below additionally cover R8 (low 3 bits = 0, the very
+// case the 10q bug decoded as RAX-without-REX.B) and R15 (low 3
+// bits = 7, the all-ones boundary that any `& 7` mask off-by-one
+// would slip past). Combined with the RAX low-reg pins above, the
+// REX byte's W + B bits are fully exercised.
+
+TEST(X86VariableEncoder, IDivOpR8EmitsREX_B_49_F7_F8_LowBitsZero) {
+    // R8: ordinal=8 = high-bit set, low 3 bits = 000.
+    // With the cycle-10q bug, the lost REX.B made modrm.rm=000
+    // decode as RAX (not R8) — but RAX held the DIVIDEND, so IDIV
+    // would divide RDX:RAX by itself = 1. This is a different
+    // failure mode from R14's "RSI=garbage" but equally a silent
+    // miscompile. REX = 0x49, modrm = mod=11 reg=/7=111 rm=000 = 0xF8.
+    expectDivBytes("idiv_op", "r8", {0x49, 0xF7, 0xF8});
+}
+
+TEST(X86VariableEncoder, IDivOpR14EmitsREX_B_49_F7_FE) {
+    // R14: ordinal=14 = high-bit set, low 3 bits = 110 (= 14 & 7).
+    // With the cycle-10q REX-overlap bug the encoder emitted the
+    // auto-REX 0x41 (B=1) followed by the embedded literal 0x48;
+    // per x86 decode the last REX before the opcode wins, so
+    // REX.B was lost and modrm.rm=110 decoded as RSI rather than
+    // R14 — silent miscompile + STATUS_INTEGER_DIVIDE_BY_ZERO when
+    // RSI held zero. REX = 0x49, modrm = 0xFE.
+    expectDivBytes("idiv_op", "r14", {0x49, 0xF7, 0xFE});
+}
+
+TEST(X86VariableEncoder, IDivOpR15EmitsREX_B_49_F7_FF_LowBitsAllOnes) {
+    // R15: ordinal=15, low 3 bits = 111. Boundary pin: any encoder
+    // `& 7` mask off-by-one (e.g., `& 0x7f`) would slip past R14
+    // (the mid-range pin) but fail R15. REX = 0x49, modrm = 0xFF.
+    expectDivBytes("idiv_op", "r15", {0x49, 0xF7, 0xFF});
+}
+
+TEST(X86VariableEncoder, DivOpR14EmitsREX_B_49_F7_F6) {
+    // Same REX.B regression class for unsigned DIV.
+    // modrm = mod=11 reg=/6=110 rm=110 = 0xF6.
+    expectDivBytes("div_op", "r14", {0x49, 0xF7, 0xF6});
+}
+
+TEST(X86VariableEncoder, DivOpR15EmitsREX_B_49_F7_F7_LowBitsAllOnes) {
+    // Unsigned all-ones boundary pin (mirror of IDivOpR15...).
+    // modrm = mod=11 reg=/6=110 rm=111 = 0xF7.
+    expectDivBytes("div_op", "r15", {0x49, 0xF7, 0xF7});
 }
 
 // ── Variant-guard mismatch — A_NoMatchingEncodingVariant ─────────────

@@ -12,6 +12,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1244,6 +1245,47 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         resolveArr(ir.inputNames,     ir.inputOrdinals,     "inputs");
         resolveArr(ir.outputNames,    ir.outputOrdinals,    "outputs");
         resolveArr(ir.clobberedNames, ir.clobberedOrdinals, "clobbered");
+
+        // D-TARGET-IMPLICIT-REGISTER-CONSTRAINT cross-array invariant
+        // (cycle 10r 7-agent review fold F1 CRITICAL 9/10, 2026-06-04):
+        // every `outputs` register MUST also appear in `clobbered`. An
+        // implicit-output is a register the instruction WRITES — by
+        // definition any vreg whose live range covers this op gets
+        // destroyed if it lives in that register, which is exactly
+        // what `clobbered` declares to regalloc's
+        // `collectImplicitClobberPositions`. The regalloc consumes
+        // only `inputs` + `clobbered` to build the forbidden set;
+        // `outputs` informs the lowering's ordinal lookup but does
+        // not by itself constrain allocation. A JSON edit that drops
+        // `clobbered: ["rdx"]` from `xor_rdx_zero` while keeping
+        // `outputs: ["rdx"]` is internally inconsistent + would
+        // silently allow divisor vregs into RDX → zeroed by xor →
+        // divide-by-zero trap. Fail loud at load time.
+        std::set<std::uint16_t> const clobberedSet(
+            ir.clobberedOrdinals.begin(),
+            ir.clobberedOrdinals.end());
+        for (std::size_t k = 0; k < ir.outputOrdinals.size(); ++k) {
+            if (clobberedSet.find(ir.outputOrdinals[k]) == clobberedSet.end()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format(
+                              "/opcodes/{}/implicitRegisters/outputs/{}",
+                              opIdx, k),
+                          std::format("opcode '{}': implicit-output "
+                                      "register '{}' must also be "
+                                      "declared in implicitRegisters."
+                                      "clobbered (every register the "
+                                      "instruction WRITES is by "
+                                      "definition clobbered for any "
+                                      "prior live value — the regalloc "
+                                      "consumes clobbered to build its "
+                                      "forbidden set; missing this "
+                                      "declaration would silently admit "
+                                      "vregs into a register the op is "
+                                      "about to overwrite)",
+                                      info.mnemonic,
+                                      ir.outputNames[k]));
+            }
+        }
     }
 
     // ── Cross-field invariants (validate after per-field parse) ───

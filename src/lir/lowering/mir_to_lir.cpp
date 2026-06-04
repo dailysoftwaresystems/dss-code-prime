@@ -89,19 +89,31 @@ namespace {
 // + one table row, never a missing-bool flag.
 enum class MnemonicSlot : std::uint8_t {
     Arg, Mov, Add, Sub, Mul,
-    // D-CSUBSET-DIVISION-OP-CODEGEN (cycle 10q, 2026-06-04):
-    // signed/unsigned divide compound ops. Each target maps these
-    // slots to its own LIR opcode; x86 uses compound encodings
-    // (sdiv_compound = CQO+IDIV, udiv_compound = XOR+DIV) with
-    // implicit-register constraints on RDX:RAX; future ARM64 maps
-    // to direct SDIV/UDIV opcodes. The MIR→LIR Div arm emits ONE
-    // op via these slots — the per-target sequence expansion lives
-    // in the target.json's encoding declaration, not in shared
-    // lowerInst(). The follow-up `mov result_vreg, rax` to capture
-    // the quotient is x86-shaped today; anchored
-    // D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC for ARM64's no-followup
-    // case.
-    SDivCore, UDivCore,
+    // D-CSUBSET-DIVISION-OP-CODEGEN (cycle 10r split, 2026-06-04):
+    // signed/unsigned divide pre+core slots. Cycle 10q used a single
+    // compound slot with packed `[REX.W, 0x99, REX.W, 0xF7]` opcode
+    // bytes — but the encoder auto-emits ONE REX prefix at the start
+    // computed from operand high bits (e.g. REX.B for R14). The
+    // embedded literal second 0x48 (REX.W only); per x86 decode the
+    // LAST REX prefix before the opcode wins → the auto-REX 0x41 was
+    // REX.B → IDIV operand-low-3-bits=6 decodes as RSI (without REX.B)
+    // instead of R14 → divide-by-zero trap. Cycle 10r splits into pre
+    // (CQO / XOR-RDX) and core (IDIV /7 / DIV /6) so each instruction
+    // gets its own auto-REX. FLAG 1 silent-miscompile guard preserved:
+    // SDiv routes pre=cqo + core=idiv_op; UDiv routes pre=xor_rdx_zero
+    // + core=div_op. ARM64 closure (single 3-addr SDIV/UDIV with no
+    // pre + no implicit RDX:RAX) is anchored
+    // D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC.
+    SDivPre, SDivCore, UDivPre, UDivCore,
+    // D-CSUBSET-DIVISION-OP-CODEGEN type-fold (cycle 10r post-7-agent
+    // review, 2026-06-04): the four divide slots above are PAIRED
+    // (pre + core). The `DivSlotPair` struct below makes the pairing
+    // a type-level invariant so callers cannot transpose pre/core
+    // arguments to `lowerDiv` (a silent-miscompile vector that would
+    // emit IDIV before CQO → reads uninitialized RDX → nondeterministic
+    // quotient or trap, with no diagnostic). The two `constexpr`
+    // instances `kSDivPair` / `kUDivPair` define the only valid pairs
+    // the lowering dispatch can use.
     Cmp, Setcc, Jmp, Jcc,
     Ret, Unreachable,
     Alloca, Load, Store, Lea,        // cycle 3c memory ops
@@ -128,6 +140,22 @@ enum class MnemonicSlot : std::uint8_t {
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
 
+// D-CSUBSET-DIVISION-OP-CODEGEN type-fold (cycle 10r 7-agent review,
+// 2026-06-04): named-aggregate enforcing the (pre, core) ordering at
+// the type system level. The MIR→LIR Div arm dispatches via these
+// constants — there is no path for a caller to pass an arbitrary
+// (MnemonicSlot, MnemonicSlot) pair to `lowerDiv`. ARM64 will add its
+// own DivSlotPair (likely `{Invalid, Sdiv}` with a pre-op-absent
+// sentinel) when the 2nd target lands; the substrate already
+// supports that via `lowerDiv`'s preOp-absent fail-loud below — see
+// D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC.
+struct DivSlotPair {
+    MnemonicSlot pre;
+    MnemonicSlot core;
+};
+constexpr DivSlotPair kSDivPair{MnemonicSlot::SDivPre,  MnemonicSlot::SDivCore};
+constexpr DivSlotPair kUDivPair{MnemonicSlot::UDivPre,  MnemonicSlot::UDivCore};
+
 struct MnemonicCache {
     std::string_view             mnemonic;
     std::optional<std::uint16_t> id;
@@ -146,8 +174,10 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::Add,           "add"},
     {MnemonicSlot::Sub,           "sub"},
     {MnemonicSlot::Mul,           "mul"},
-    {MnemonicSlot::SDivCore,      "sdiv_compound"},
-    {MnemonicSlot::UDivCore,      "udiv_compound"},
+    {MnemonicSlot::SDivPre,       "cqo"},
+    {MnemonicSlot::SDivCore,      "idiv_op"},
+    {MnemonicSlot::UDivPre,       "xor_rdx_zero"},
+    {MnemonicSlot::UDivCore,      "div_op"},
     {MnemonicSlot::Cmp,           "cmp"},
     {MnemonicSlot::Setcc,         "setcc"},
     {MnemonicSlot::Jmp,           "jmp"},
@@ -414,8 +444,8 @@ struct Lowerer {
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
             case MirOpcode::Mul:    return lowerBinaryOp(id, MnemonicSlot::Mul);
-            case MirOpcode::SDiv:   return lowerDiv(id, MnemonicSlot::SDivCore);
-            case MirOpcode::UDiv:   return lowerDiv(id, MnemonicSlot::UDivCore);
+            case MirOpcode::SDiv:   return lowerDiv(id, kSDivPair);
+            case MirOpcode::UDiv:   return lowerDiv(id, kUDivPair);
             case MirOpcode::ICmpEq: case MirOpcode::ICmpNe:
             case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
             case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
@@ -1083,48 +1113,66 @@ struct Lowerer {
     void lowerBinaryOp(MirInstId id, MnemonicSlot slot) { lowerNAryOp<2>(id, slot); }
     void lowerUnaryOp (MirInstId id, MnemonicSlot slot) { lowerNAryOp<1>(id, slot); }
 
-    // ── cycle 10q: MIR SDiv/UDiv lowering (D-CSUBSET-DIVISION-OP-CODEGEN) ──
+    // ── cycle 10r: MIR SDiv/UDiv lowering (D-CSUBSET-DIVISION-OP-CODEGEN) ──
     //
-    // x86 division is structurally 3-LIR-inst on this target because:
-    //   1. The compound op (CQO+IDIV or XOR+DIV) has implicit-register
-    //      semantics (RAX must hold dividend; RAX/RDX get the result).
-    //   2. The compound op declares `result: none` in the schema —
-    //      its outputs live in implicit physical registers, not in an
-    //      encoding slot.
-    //   3. The SSA result vreg is created by a follow-up `mov` from
-    //      RAX (for SDiv/UDiv quotient).
+    // x86 division is structurally 4-LIR-inst on this target because:
+    //   1. The CORE op (IDIV /7 or DIV /6) has implicit-register
+    //      semantics: reads RDX:RAX, writes RDX:RAX, clobbers RDX.
+    //   2. A PRE op must zero/sign-extend RAX into RDX before the
+    //      core: CQO (signed sign-extend) or XOR RDX,RDX (unsigned
+    //      zero-extend).
+    //   3. Both PRE and CORE declare `result: none` — outputs live
+    //      in implicit physical registers, not encoding slots.
+    //   4. The SSA result vreg is created by a follow-up `mov` from
+    //      RAX (quotient).
     //
     // Sequence emitted (x86 today):
-    //   mov rax_phys, dividend_vreg         ; pin dividend to RAX
-    //   {sdiv,udiv}_compound divisor_vreg   ; implicit-reg op (no result)
-    //   mov result_vreg, rax_phys           ; capture quotient
+    //   mov rax_phys, dividend_vreg     ; pin dividend to RAX
+    //   {cqo,xor_rdx_zero}              ; pre op (no operands, no result)
+    //   {idiv_op,div_op} divisor_vreg   ; core op (no result)
+    //   mov result_vreg, rax_phys       ; capture quotient
     //
-    // FLAG 1 (silent-miscompile guard, 2026-06-04): SDiv routes to
-    // `SDivCore` (sdiv_compound = CQO+IDIV /7); UDiv routes to
-    // `UDivCore` (udiv_compound = XOR+DIV /6). Routing UDiv through
-    // SDivCore would mis-sign-interpret any dividend ≥ INT_MAX as
-    // negative — silent miscompile. The two slots differ only in
-    // the byte sequence emitted; the MIR opcode-to-slot mapping
-    // here is the only point of decision.
+    // **Cycle 10r split rationale** — cycle 10q packaged CQO+IDIV
+    // into a single compound op with opcode bytes `[0x48, 0x99,
+    // 0x48, 0xF7]`. The encoder auto-emits ONE REX prefix at the
+    // start (e.g. `0x41` for REX.B when the divisor is in R14);
+    // the embedded second `0x48` (REX.W only) then SUPERSEDED the
+    // auto-REX prefix, losing REX.B. The IDIV operand decodes as
+    // `modrm.rm low 3 bits` = 6 = RSI (without REX.B) instead of
+    // R14 — dividing by garbage → STATUS_INTEGER_DIVIDE_BY_ZERO.
+    // Splitting into two opcodes lets each instruction's REX be
+    // auto-computed correctly with its operand's high bit.
     //
-    // FLAG 2 anchor (sequence agnosticism, 2026-06-04): the 3-LIR-
+    // FLAG 1 (silent-miscompile guard, 2026-06-04, preserved through
+    // 10r split): SDiv routes pre=cqo + core=idiv_op; UDiv routes
+    // pre=xor_rdx_zero + core=div_op. Routing UDiv through idiv would
+    // mis-sign-interpret any dividend ≥ INT_MAX as negative — silent
+    // miscompile.
+    //
+    // FLAG 2 anchor (sequence agnosticism, 2026-06-04): the 4-LIR-
     // op shape is x86-specific. ARM64's direct `SDIV Xd, Xn, Xm` is
     // a single inst with SSA result and no implicit registers — a
-    // future ARM64 target.json would map SDivCore/UDivCore to its
-    // ARM SDIV/UDIV opcodes; the MIR→LIR Div arm would then need to
-    // detect "result: value vs result: none" + branch accordingly.
-    // Anchored D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC for the closure
-    // when the 2nd target lands.
+    // future ARM64 target.json would map the four slots to its
+    // ARM SDIV/UDIV opcodes (pre slots possibly absent / no-op);
+    // the MIR→LIR Div arm would then need to detect "result: value
+    // vs result: none" + branch accordingly. Anchored
+    // D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC for the closure when the
+    // 2nd target lands.
     //
     // Physical-RAX resolution: the dividend-input + quotient-output
-    // ordinals are read from the compound op's `implicitRegisters`
+    // ordinals are read from the CORE op's `implicitRegisters`
     // declaration — NOT hardcoded `rax`. This keeps the lowering
     // target-blind at the lir-emit tier; the target.json declares
     // which physical register plays the dividend / quotient role.
-    void lowerDiv(MirInstId id, MnemonicSlot slot) {
-        auto const compoundOp = opcode(slot);
-        if (!compoundOp.has_value()) {
-            reportMissingOpcode(slot, mirOpcodeName(mir.instOpcode(id)));
+    void lowerDiv(MirInstId id, DivSlotPair pair) {
+        auto const preOp = opcode(pair.pre);
+        if (!preOp.has_value()) {
+            reportMissingOpcode(pair.pre, mirOpcodeName(mir.instOpcode(id)));
+            return;
+        }
+        auto const coreOp = opcode(pair.core);
+        if (!coreOp.has_value()) {
+            reportMissingOpcode(pair.core, mirOpcodeName(mir.instOpcode(id)));
             return;
         }
         auto const movOp = opcode(MnemonicSlot::Mov);
@@ -1141,31 +1189,46 @@ struct Lowerer {
         std::optional<LirReg> const divisor  = regForValue(operands[1]);
         if (!dividend.has_value() || !divisor.has_value()) return;
 
+        // 7-agent review fold F2 (silent-failure 8/10, 2026-06-04):
+        // validate that BOTH the pre AND core op carry implicit-
+        // register declarations. Pre-fold only the core was checked,
+        // leaving the pre silently un-validated. If a future JSON
+        // edit drops `implicitRegisters` from `cqo` or `xor_rdx_zero`,
+        // regalloc's `collectImplicitClobberPositions` skips that
+        // position with no diagnostic — divisor vreg could land in
+        // RDX, get zeroed by xor, idiv would divide by zero. Fail
+        // loud at the lowering tier captures the misconfiguration
+        // BEFORE regalloc silently mis-allocates.
+        auto const* preInfo = target.opcodeInfo(*preOp);
+        if (preInfo == nullptr
+         || !preInfo->implicitRegisters.has_value()
+         || preInfo->implicitRegisters->clobberedOrdinals.empty()) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
         // Read implicit-input + implicit-output ordinals from the
-        // compound op's schema declaration — config-driven (no
-        // hardcoded "rax"). The compound op DECLARES that operand 0
-        // of the implicit-input array is the dividend register; the
-        // first implicit-output is the quotient register. For
-        // x86_64 both resolve to RAX; for a future ARM64 mapping
-        // they'd be N/A (single 3-addr SDIV).
-        auto const* compoundInfo = target.opcodeInfo(*compoundOp);
-        if (compoundInfo == nullptr
-         || !compoundInfo->implicitRegisters.has_value()
-         || compoundInfo->implicitRegisters->inputOrdinals.empty()
-         || compoundInfo->implicitRegisters->outputOrdinals.empty()) {
+        // CORE op's schema declaration — config-driven (no
+        // hardcoded "rax"). The core op declares that the FIRST
+        // implicit-input is the dividend register; the first
+        // implicit-output is the quotient register. For x86_64 both
+        // resolve to RAX; for a future ARM64 mapping they'd be N/A.
+        auto const* coreInfo = target.opcodeInfo(*coreOp);
+        if (coreInfo == nullptr
+         || !coreInfo->implicitRegisters.has_value()
+         || coreInfo->implicitRegisters->inputOrdinals.empty()
+         || coreInfo->implicitRegisters->outputOrdinals.empty()) {
             // Without the implicit-register declaration, the lowering
             // cannot determine the dividend/quotient physical
             // registers. This indicates a target.json misconfiguration
-            // (compound divide opcode declared without
-            // implicitRegisters). Fail loud rather than emit code
-            // that silently mis-pins.
+            // (divide core opcode declared without implicitRegisters).
+            // Fail loud rather than emit code that silently mis-pins.
             reportUnsupported(mir.instOpcode(id), id);
             return;
         }
         std::uint16_t const dividendOrdinal =
-            compoundInfo->implicitRegisters->inputOrdinals[0];
+            coreInfo->implicitRegisters->inputOrdinals[0];
         std::uint16_t const quotientOrdinal =
-            compoundInfo->implicitRegisters->outputOrdinals[0];
+            coreInfo->implicitRegisters->outputOrdinals[0];
         // 7-agent fold F1 (HIGH, 2026-06-04): read register CLASS
         // from the schema's register table (NOT hardcoded GPR). The
         // dividend/quotient ordinals were already config-driven; the
@@ -1193,16 +1256,24 @@ struct Lowerer {
             LirOperand::makeReg(*dividend)};
         emitInst(*movOp, raxPhys, movInOps);
 
-        // 2. Emit compound div op. No SSA result; the op declares
+        // 2. Emit PRE op (CQO / XOR RDX,RDX). Zero operands, no
+        //    SSA result. The op declares its own implicit-input/
+        //    output/clobber set (RAX → RDX for CQO; RDX clobber for
+        //    XOR). Regalloc reads each PRE op's implicit-register
+        //    declaration independently — no extra coupling required.
+        emitInst(*preOp, InvalidLirReg, std::span<LirOperand const>{});
+
+        // 3. Emit CORE op (IDIV /7 or DIV /6). One operand (divisor
+        //    in modrm.rm), no SSA result; the op declares
         //    `result: none` because outputs live in implicit phys
         //    regs. Regalloc reads the implicit-clobbered set from
-        //    the schema (cycle 10q consumer) and excludes the
-        //    clobbered regs from any range crossing this position.
+        //    the schema and excludes the clobbered regs from any
+        //    range that COVERS this position.
         std::array<LirOperand, 1> const divOps{
             LirOperand::makeReg(*divisor)};
-        emitInst(*compoundOp, InvalidLirReg, divOps);
+        emitInst(*coreOp, InvalidLirReg, divOps);
 
-        // 3. Capture quotient from RAX_phys into a fresh SSA result.
+        // 4. Capture quotient from RAX_phys into a fresh SSA result.
         // SMod/UMod would project outputOrdinals[1] (remainder) here
         // — anchored D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT
         // for the role-tagged implicit-register declaration that

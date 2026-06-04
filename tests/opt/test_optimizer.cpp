@@ -620,6 +620,141 @@ TEST(Optimizer, MaxIterationsFixedPointLoop) {
            "AFTER running through the full pipeline list)";
 }
 
+// D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b) (cycle 10r,
+// 2026-06-04). The corpus example (`examples/c-subset/division/`)
+// exercises the full source→optimized→binary pipeline, but a
+// hypothetical regression that silently CONST-FOLDS the divide away
+// (e.g. a future inlining pass that propagates the literal 100, 7
+// across the call) would make the corpus exit-code witness pass with
+// NO live IDIV in the binary — defeating the gate's purpose. This
+// MIR-level test is the COMPLEMENTARY pin: a hand-built function
+// shaped `int divide(int a, int b) { return a / b; }` (with args =
+// runtime-opaque MirArg values, NOT constants) runs through the
+// SHIPPED release pipeline; the post-optimization MIR MUST still
+// contain at least one MirOpcode::SDiv. Without this assertion, the
+// closure gate's "optimized arm contains a live idiv" requirement
+// reduces to "we ran the release pipeline and didn't crash" — which
+// is necessary but not sufficient.
+//
+// Why this matters specifically for cycle 10r: the REX-overlap bug
+// (cycle 10q's compound encoding) was a CODEGEN bug — it would only
+// manifest when the IDIV instruction actually reached the assembler.
+// If a future optimizer regression silently optimized away the
+// divide BEFORE codegen, the corpus would still exit 14 (because
+// ConstFold would compute 100/7=14 at compile time and the binary
+// would just return 14 via mov), giving the FALSE impression that
+// the codegen is healthy. This MIR-level test pins that the
+// optimizer DOES NOT remove the divide when its operands are
+// runtime-opaque — preserving the codegen path for the byte-pin
+// tests to attest.
+TEST(Optimizer, EffectivenessSDivSurvivesShippedReleasePipeline) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
+    auto buildDivideArgsMir = [](TypeInterner& interner) -> Mir {
+        TypeId const i32 = interner.primitive(TypeKind::I32);
+        TypeId const params[] = {i32, i32};
+        TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+        MirBuilder b;
+        b.addFunction(fnSig, SymbolId{100},
+                      SymbolBinding::Global, SymbolVisibility::Default);
+        MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+        b.beginBlock(entry);
+        MirInstId const a = b.addArg(0, i32);  // runtime-opaque
+        MirInstId const c = b.addArg(1, i32);  // runtime-opaque
+        MirInstId const ops[] = {a, c};
+        MirInstId const q = b.addInst(MirOpcode::SDiv, ops, i32);
+        b.addReturn(q);
+        return std::move(b).finish();
+    };
+
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value())
+        << "shipped release.pipeline.json must load";
+
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildDivideArgsMir(interner);
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(mir, target, interner, *pipelineR, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_TRUE(result.fixedPointReached);
+
+    // 7-agent review fold (silent-failure F3 8/10 + type-design
+    // Concern 4 7/10, 2026-06-04): tightened from `EXPECT_GE >= 1` to
+    // `ASSERT_EQ == 1`. The fixture builds EXACTLY ONE SDiv; an
+    // ASSERT_EQ catches BOTH (a) the original silent-miscompile
+    // class (optimizer removes the divide → count drops to 0) AND
+    // (b) a new failure mode (a faulty LICM/peephole that DUPLICATES
+    // the SDiv — e.g. cloning across a loop header → count rises to
+    // 2). ASSERT (not EXPECT) makes the test stop on this load-
+    // bearing invariant rather than soft-fail with no further
+    // attribution.
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::SDiv), 1u)
+        << "MIR SDiv with runtime-opaque (MirArg) operands MUST survive "
+           "the SHIPPED release pipeline exactly once — ConstFold "
+           "cannot fold args, DCE cannot eliminate a Return-feeding "
+           "inst, CopyProp/CSE/SimplifyCFG/LICM have no transformation "
+           "that removes a single-use divide. A regression that "
+           "silently eliminates this divide (e.g. an over-eager "
+           "inliner) OR silently duplicates it (e.g. faulty LICM "
+           "hoist that clones across a header) defeats the codegen-"
+           "tier byte-pin tests' purpose — they only run when "
+           "exactly one IDIV reaches the assembler. (D-CSUBSET-"
+           "DIVISION-OP-CODEGEN closure-gate item (b), 2026-06-04.)";
+}
+
+// D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b) — UDiv analog
+// (cycle 10r 7-agent review fold pr-test #3 7/10, 2026-06-04). The
+// SDiv test above pins that the signed divide survives the shipped
+// release pipeline. UDiv has NO source-language entry in c-subset
+// today (no unsigned types yet — anchored D-CSUBSET-UDIV-RUNTIME-
+// HIGH-BIT-PIN), so the only way UDiv reaches codegen is via hand-
+// built MIR — exactly the path this test pins. Without this analog,
+// a future opt-pass regression that folded MirOpcode::UDiv with
+// opaque args would silently disappear the entire `xor_rdx_zero +
+// div_op` codegen with no corpus row to catch it (the corpus
+// `division/main.c` exercises SDiv, not UDiv).
+TEST(Optimizer, EffectivenessUDivSurvivesShippedReleasePipeline) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
+    auto buildUDivideArgsMir = [](TypeInterner& interner) -> Mir {
+        TypeId const i32 = interner.primitive(TypeKind::I32);
+        TypeId const params[] = {i32, i32};
+        TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+        MirBuilder b;
+        b.addFunction(fnSig, SymbolId{100},
+                      SymbolBinding::Global, SymbolVisibility::Default);
+        MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+        b.beginBlock(entry);
+        MirInstId const a = b.addArg(0, i32);  // runtime-opaque
+        MirInstId const c = b.addArg(1, i32);  // runtime-opaque
+        MirInstId const ops[] = {a, c};
+        MirInstId const q = b.addInst(MirOpcode::UDiv, ops, i32);
+        b.addReturn(q);
+        return std::move(b).finish();
+    };
+
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildUDivideArgsMir(interner);
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(mir, target, interner, *pipelineR, rep);
+    ASSERT_TRUE(result.ok);
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::UDiv), 1u)
+        << "MIR UDiv with runtime-opaque operands MUST survive the "
+           "shipped release pipeline exactly once — same invariant as "
+           "SDiv's analog. No c-subset corpus row exercises UDiv today "
+           "(anchored D-CSUBSET-UDIV-RUNTIME-HIGH-BIT-PIN); this MIR-"
+           "level pin is the sole codegen-tier-survives guard for the "
+           "`xor_rdx_zero + div_op` shape until unsigned types land.";
+}
+
 // D-OPT1-PASS-DUP-POLICY engine-arm pin: a pipeline declaring
 // `{ConstFold, ConstFold}` doesn't get silently de-duped by the engine.
 // The loader admits the shape (test_pipeline_loader); the engine must

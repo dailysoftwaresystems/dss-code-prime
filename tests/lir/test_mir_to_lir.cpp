@@ -230,69 +230,71 @@ TEST(MirToLir, MulReturnLowersThreeInstructions) {
               *L.target->opcodeByMnemonic("mul"));
 }
 
-// D-CSUBSET-DIVISION-OP-CODEGEN (cycle 10q, 2026-06-04): signed
+// D-CSUBSET-DIVISION-OP-CODEGEN (cycle 10r split, 2026-06-04): signed
 // divide. c-subset has only signed int/long → `/` lowers via
-// HirOpKind::Div → MirOpcode::SDiv → LIR MnemonicSlot::SDivCore →
-// the x86 `sdiv_compound` opcode (REX.W 0x99 CQO + REX.W 0xF7 /7
-// IDIV, byte-pinned in test_asm_x86_variable.cpp). The Div lowering
-// emits 3 LIR ops: (1) `mov rax_phys, dividend_vreg` to pin
-// dividend into RAX; (2) the compound div (no SSA result; outputs
-// live implicit in RAX/RDX); (3) `mov result_vreg, rax_phys` to
-// capture quotient.
-TEST(MirToLir, SignedDivisionLowersToSDivCompound) {
+// HirOpKind::Div → MirOpcode::SDiv → LIR MnemonicSlot::{SDivPre,
+// SDivCore} → the x86 `cqo` + `idiv_op` opcodes (REX.W 0x99 CQO
+// sign-extends RAX into RDX:RAX; REX.W 0xF7 /7 IDIV divides
+// RDX:RAX by the modrm.rm operand; byte-pinned in
+// test_asm_x86_variable.cpp). The Div lowering emits 4 LIR ops:
+//   (1) `mov rax_phys, dividend_vreg`   pin dividend into RAX
+//   (2) `cqo`                            sign-extend (no result)
+//   (3) `idiv_op divisor_vreg`           the divide (no SSA result)
+//   (4) `mov result_vreg, rax_phys`      capture quotient
+// **Cycle 10r split rationale**: cycle 10q packaged CQO+IDIV into
+// a single compound opcode but the encoder's auto-REX prefix was
+// overridden by the embedded second 0x48, losing REX.B for
+// high-reg divisors → silent miscompile + STATUS_INTEGER_DIVIDE_BY_ZERO.
+TEST(MirToLir, SignedDivisionLowersToCqoPlusIDiv) {
     auto L = lowerCSubsetToLir("int q(int a, int b) { return a / b; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
 
     Lir const& lir = L.lir.lir;
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
-    // Expected sequence (instructions in the entry block):
-    //   0: arg a
-    //   1: arg b
-    //   2: mov rax_phys, a_vreg        (pin dividend)
-    //   3: sdiv_compound b_vreg        (no result)
-    //   4: mov result_vreg, rax_phys   (capture quotient)
-    //   5: mov ret_phys, result_vreg   (return convention)
-    //   6: ret
-    auto const sdivOp = L.target->opcodeByMnemonic("sdiv_compound");
-    auto const movOp  = L.target->opcodeByMnemonic("mov");
-    ASSERT_TRUE(sdivOp.has_value());
+    // Expected sequence:
+    //   0..1: args
+    //   N:   mov rax_phys, a_vreg  (pin dividend)
+    //   N+1: cqo                   (sign-extend, no operands)
+    //   N+2: idiv_op b_vreg        (the divide, no SSA result)
+    //   N+3: mov result, rax_phys  (capture quotient)
+    auto const cqoOp     = L.target->opcodeByMnemonic("cqo");
+    auto const idivOp    = L.target->opcodeByMnemonic("idiv_op");
+    auto const movOp     = L.target->opcodeByMnemonic("mov");
+    ASSERT_TRUE(cqoOp.has_value());
+    ASSERT_TRUE(idivOp.has_value());
     ASSERT_TRUE(movOp.has_value());
-    // Locate the sdiv_compound inst by opcode scan (position-
-    // resilient to upstream lowering changes that add/remove ops).
-    std::uint32_t sdivIdx = lir.blockInstCount(bb);
+    // Locate the idiv_op inst by opcode scan (position-resilient).
+    std::uint32_t idivIdx = lir.blockInstCount(bb);
     for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
-        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *sdivOp) {
-            sdivIdx = i;
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *idivOp) {
+            idivIdx = i;
             break;
         }
     }
-    ASSERT_LT(sdivIdx, lir.blockInstCount(bb))
-        << "MIR SDiv must lower to LIR sdiv_compound — present "
-           "verification via opcode scan in the function's entry "
-           "block";
-    // The sdiv_compound MUST be preceded by a mov-to-RAX (the
-    // dividend pin) and followed by a mov-from-RAX (the capture).
-    // Both are `mov`-mnemonic ops.
-    ASSERT_GT(sdivIdx, 0u);
-    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, sdivIdx - 1)), *movOp)
-        << "sdiv_compound must be preceded by `mov rax, dividend`";
-    ASSERT_LT(sdivIdx + 1, lir.blockInstCount(bb));
-    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, sdivIdx + 1)), *movOp)
-        << "sdiv_compound must be followed by `mov result, rax`";
+    ASSERT_LT(idivIdx, lir.blockInstCount(bb))
+        << "MIR SDiv must lower to LIR idiv_op — opcode scan failed.";
+    // idiv_op must be preceded by `cqo` (sign-extend), and that by
+    // `mov rax, dividend`, and followed by `mov result, rax`.
+    ASSERT_GE(idivIdx, 2u);
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, idivIdx - 1)), *cqoOp)
+        << "idiv_op must be preceded by `cqo` (REX.W 0x99 sign-extend).";
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, idivIdx - 2)), *movOp)
+        << "cqo must be preceded by `mov rax, dividend`.";
+    ASSERT_LT(idivIdx + 1, lir.blockInstCount(bb));
+    EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, idivIdx + 1)), *movOp)
+        << "idiv_op must be followed by `mov result, rax`.";
 }
 
-// FLAG 1 discrimination test (10q, 2026-06-04): a hand-built MIR
-// with a UDiv inst MUST lower to the udiv_compound LIR opcode
-// (different byte sequence: XOR-zero-RDX + DIV /6) and NOT to
-// sdiv_compound (CQO-sign-extend + IDIV /7). c-subset itself has
-// no unsigned source today, so this test uses a hand-built MIR
-// fixture to exercise the UDiv arm directly. A regression that
-// routes UDiv through SDivCore would pass any high-bit-set
-// dividend test with the wrong sign interpretation (silent
-// miscompile) — this test catches it at the opcode level before
-// the bytes are even assembled.
-TEST(MirToLir, UnsignedDivisionLowersToUDivCompoundNotSDiv) {
+// FLAG 1 discrimination test (10r, 2026-06-04): a hand-built MIR
+// with a UDiv inst MUST lower to the udiv pre+core slots
+// (xor_rdx_zero + div_op = XOR EDX,EDX zero-extend + DIV /6) and
+// NOT to the sdiv pre+core slots (cqo + idiv_op = CQO sign-extend
+// + IDIV /7). c-subset has no unsigned source today, so this test
+// uses a hand-built MIR fixture to exercise the UDiv arm directly.
+// Routing UDiv through SDivCore would pass any high-bit-set
+// dividend with the wrong sign interpretation (silent miscompile).
+TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32 = interner.primitive(TypeKind::I32);
     TypeId const params[] = {i32, i32};
@@ -316,27 +318,42 @@ TEST(MirToLir, UnsignedDivisionLowersToUDivCompoundNotSDiv) {
     ASSERT_TRUE(lirR.ok);
     Lir const& lir = lirR.lir;
 
-    auto const udivOp = (*target)->opcodeByMnemonic("udiv_compound");
-    auto const sdivOp = (*target)->opcodeByMnemonic("sdiv_compound");
-    ASSERT_TRUE(udivOp.has_value());
-    ASSERT_TRUE(sdivOp.has_value());
+    auto const xorRdxOp = (*target)->opcodeByMnemonic("xor_rdx_zero");
+    auto const divOp    = (*target)->opcodeByMnemonic("div_op");
+    auto const cqoOp    = (*target)->opcodeByMnemonic("cqo");
+    auto const idivOp   = (*target)->opcodeByMnemonic("idiv_op");
+    ASSERT_TRUE(xorRdxOp.has_value());
+    ASSERT_TRUE(divOp.has_value());
+    ASSERT_TRUE(cqoOp.has_value());
+    ASSERT_TRUE(idivOp.has_value());
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
-    bool foundUdiv = false;
-    bool foundSdiv = false;
+    bool foundXorRdx = false;
+    bool foundDiv    = false;
+    bool foundCqo    = false;
+    bool foundIdiv   = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
         auto const op = lir.instOpcode(lir.blockInstAt(bb, i));
-        if (op == *udivOp) foundUdiv = true;
-        if (op == *sdivOp) foundSdiv = true;
+        if (op == *xorRdxOp) foundXorRdx = true;
+        if (op == *divOp)    foundDiv    = true;
+        if (op == *cqoOp)    foundCqo    = true;
+        if (op == *idivOp)   foundIdiv   = true;
     }
-    EXPECT_TRUE(foundUdiv)
-        << "MIR UDiv must lower to LIR udiv_compound (REX.W XOR + "
-           "DIV /6). Routing UDiv through sdiv_compound would mis-"
-           "sign-interpret dividends >= INT_MAX — silent miscompile.";
-    EXPECT_FALSE(foundSdiv)
-        << "MIR UDiv MUST NOT lower to sdiv_compound — the test "
-           "would pass with a small dividend but silently miscompile "
-           "any high-bit-set dividend (CRITICAL discriminator for "
-           "FLAG 1 of cycle 10q's silent-miscompile guard).";
+    EXPECT_TRUE(foundXorRdx)
+        << "MIR UDiv must emit `xor_rdx_zero` (XOR EDX, EDX) to "
+           "zero-extend RAX→RDX:RAX. Missing pre-op would leave RDX "
+           "with stale bits → wrong quotient.";
+    EXPECT_TRUE(foundDiv)
+        << "MIR UDiv must lower to `div_op` (REX.W 0xF7 /6). Missing "
+           "core would silently no-op the divide.";
+    EXPECT_FALSE(foundCqo)
+        << "MIR UDiv MUST NOT emit `cqo` — that sign-extends and is "
+           "used only by SDiv. FLAG 1 silent-miscompile guard: any "
+           "dividend with the high bit set would interpret as negative.";
+    EXPECT_FALSE(foundIdiv)
+        << "MIR UDiv MUST NOT emit `idiv_op` — would silently "
+           "mis-sign-interpret dividends ≥ INT_MAX (CRITICAL "
+           "discriminator for FLAG 1 of cycle 10q's silent-"
+           "miscompile guard, preserved through 10r split).";
 }
 
 // Cycle 3a wide-literal coverage (>INT32_MAX) is deferred to cycle 3b's

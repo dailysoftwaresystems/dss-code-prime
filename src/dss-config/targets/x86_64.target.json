@@ -147,8 +147,32 @@
       }
     },
     {
-      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — signed-divide compound op (cycle 10q, 2026-06-04). One LIR op packs CQO+IDIV (5 bytes total): REX.W 0x99 sign-extends RAX into RDX:RAX; then REX.W 0xF7 /7 IDIV r/m64 divides RDX:RAX by the divisor (operand 0), placing quotient in RAX + remainder in RDX. The MIR→LIR Div arm emits this op followed by `mov result_vreg, rax` to capture the quotient (SMod/UMod would capture RDX instead — anchored D-CSUBSET-MOD-OP-CODEGEN). `result: none` is intentional — the SSA result is created by the follow-up mov, not this op. `hasSideEffects: true` because the implicit RAX/RDX writes are not modeled as a wire-slot result. **implicitRegisters consumes 10p's substrate**: inputs=[rax] (dividend) — CQO derives RDX from RAX so RDX is NOT a true input; outputs=[rax,rdx] (quotient + remainder); clobbered=[rdx] (any prior live value in RDX is destroyed). ARM64's future direct SDIV opcode would land as a separate row with `result: value` + no implicitRegisters — the MIR→LIR Div arm's per-target divergence (compound + follow-up mov on x86 vs single SSA-result op on ARM64) is anchored D-MIR-TO-LIR-DIV-SEQUENCE-AGNOSTIC for closure when the 2nd target lands.",
-      "mnemonic":      "sdiv_compound",
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — CQO sign-extend (cycle 10r split, 2026-06-04). Sign-extends RAX into RDX:RAX as the pre-divide setup for signed division. REX.W 0x99 = 0x48 0x99 (2 bytes, no ModR/M). **Cycle 10r REX-overlap bug fix**: cycle 10q packaged CQO+IDIV as a single compound opcode with `opcode: [72, 153, 72, 247]`. But the encoder auto-emits one REX prefix at the start (e.g., 0x41 for REX.B when the operand is R14) — per x86 decode the LAST REX prefix before the opcode wins, so the embedded literal second 0x48 (REX.W only) superseded the auto-REX 0x41, losing REX.B for the IDIV operand. Result: IDIV reads `modrm.rm low 3 bits` as RSI (without REX.B) instead of R14, dividing by garbage — STATUS_INTEGER_DIVIDE_BY_ZERO trap. Splitting CQO into its own opcode lets each instruction get its own auto-REX correctly. implicitRegisters: inputs=[rax] (CQO reads RAX); outputs=[rdx] (CQO writes the sign-extended high half); clobbered=[rdx] (RDX's prior value is destroyed).",
+      "mnemonic":      "cqo",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":    ["rax"],
+        "outputs":   ["rdx"],
+        "clobbered": ["rdx"]
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "rexW": true, "opcode": [153] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — signed-divide single op (cycle 10r split). IDIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit), correctly handling R8-R15 operands. Cycle 10r split from the prior compound encoding to fix REX-prefix overlap silent-miscompile (see cqo $comment). implicitRegisters: inputs=[rax,rdx] (IDIV reads RDX:RAX as 128-bit dividend); outputs=[rax,rdx] (quotient + remainder); clobbered=[rax,rdx] (both prior values destroyed — required by the schema-loader `outputs ⊆ clobbered` invariant added in the 10r 7-agent review fold, since regalloc consumes `clobbered` to build its forbidden set).",
+      "mnemonic":      "idiv_op",
       "result":        "none",
       "hasSideEffects": true,
       "minOperands":   1,
@@ -156,16 +180,16 @@
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "implicitRegisters": {
-        "inputs":    ["rax"],
+        "inputs":    ["rax", "rdx"],
         "outputs":   ["rax", "rdx"],
-        "clobbered": ["rdx"]
+        "clobbered": ["rax", "rdx"]
       },
       "encoding": {
         "format": "x86-variable",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"] },
-            "template": { "opcode": [72, 153, 72, 247], "modrmRegExt": 7 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 7 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -174,8 +198,31 @@
       }
     },
     {
-      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — unsigned-divide compound op (cycle 10q, 2026-06-04). Sibling to sdiv_compound; same shape, different bytes. 5 bytes total: 0x31 0xD2 (XOR EDX, EDX — 32-bit XOR with destination=EDX, source=EDX zero-extends to clear all 64 bits of RDX); then REX.W 0xF7 /6 DIV r/m64 divides the zero-extended RDX:RAX by operand 0. **FLAG 1 of cycle 10q (silent-miscompile guard)**: routing MIR UDiv through `sdiv_compound` (idiv) would mis-sign-interpret any dividend ≥ INT_MAX as negative — producing a wrong quotient with no diagnostic. The tests pin discrimination by inspecting the actual emitted bytes (sdiv_compound starts with 0x48 0x99; udiv_compound starts with 0x31 0xD2). implicitRegisters: inputs=[rax] only (XOR zeroes RDX so it's not an input); outputs=[rax,rdx]; clobbered=[rdx].",
-      "mnemonic":      "udiv_compound",
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — XOR EDX, EDX as the pre-divide zero-extend for unsigned divide (cycle 10r split). 0x31 0xD2 — 32-bit XOR with explicit dest/src both = EDX. 32-bit op zero-extends to RDX, clearing all 64 bits. No REX prefix (32-bit operands). FLAG 1 silent-miscompile guard at byte-level: the unsigned-divide pre-emit uses ZERO-extend (this op); signed-divide uses SIGN-extend (cqo). implicitRegisters: outputs=[rdx]; clobbered=[rdx]. No inputs declared (the op writes a constant zero, doesn't read the prior RDX value).",
+      "mnemonic":      "xor_rdx_zero",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "outputs":   ["rdx"],
+        "clobbered": ["rdx"]
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [49, 210] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — unsigned-divide single op (cycle 10r split). DIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit). implicitRegisters: inputs=[rax,rdx]; outputs=[rax,rdx]; clobbered=[rax,rdx] (mirrors `idiv_op` — required by the `outputs ⊆ clobbered` invariant).",
+      "mnemonic":      "div_op",
       "result":        "none",
       "hasSideEffects": true,
       "minOperands":   1,
@@ -183,16 +230,16 @@
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "implicitRegisters": {
-        "inputs":    ["rax"],
+        "inputs":    ["rax", "rdx"],
         "outputs":   ["rax", "rdx"],
-        "clobbered": ["rdx"]
+        "clobbered": ["rax", "rdx"]
       },
       "encoding": {
         "format": "x86-variable",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"] },
-            "template": { "opcode": [49, 210, 72, 247], "modrmRegExt": 6 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 6 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]

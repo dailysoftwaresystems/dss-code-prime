@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <gtest/gtest.h>
+#include <set>
 #include <string_view>
 
 // Negative-path tests for the `TargetSchema` JSON loader. Mirrors the
@@ -253,10 +254,11 @@ TEST(TargetSchema, RegisterSubOfMustResolve) {
 
 TEST(TargetSchema, ImplicitRegistersValidDeclarationLoads) {
     // Mirror idiv's contract: dividend in RAX/RDX (implicit input),
-    // quotient in RAX (output), remainder in RDX (output), and RDX
-    // is also recorded as clobbered. Cross-array overlap IS legal —
-    // a register may legitimately appear in inputs + outputs +
-    // clobbered (idiv's RDX/RAX do).
+    // quotient in RAX (output), remainder in RDX (output), and both
+    // are clobbered. Cross-array overlap IS legal — a register may
+    // legitimately appear in inputs + outputs + clobbered (idiv's
+    // RDX/RAX do). Cycle 10r 7-agent review fold F1 invariant:
+    // every output must also appear in clobbered.
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[
@@ -265,7 +267,7 @@ TEST(TargetSchema, ImplicitRegistersValidDeclarationLoads) {
                "implicitRegisters":{
                  "inputs":["rax","rdx"],
                  "outputs":["rax","rdx"],
-                 "clobbered":["rdx"]
+                 "clobbered":["rax","rdx"]
                }}
             ],
             "registers":[
@@ -283,10 +285,11 @@ TEST(TargetSchema, ImplicitRegistersValidDeclarationLoads) {
     auto const& ir = *info->implicitRegisters;
     EXPECT_EQ(ir.inputNames.size(),    2u);
     EXPECT_EQ(ir.outputNames.size(),   2u);
-    EXPECT_EQ(ir.clobberedNames.size(), 1u);
+    EXPECT_EQ(ir.clobberedNames.size(), 2u);
     EXPECT_EQ(ir.inputNames[0],    "rax");
     EXPECT_EQ(ir.inputNames[1],    "rdx");
-    EXPECT_EQ(ir.clobberedNames[0], "rdx");
+    EXPECT_EQ(ir.clobberedNames[0], "rax");
+    EXPECT_EQ(ir.clobberedNames[1], "rdx");
     // Loader-populated ordinals parallel the names (consumer-O(1)
     // pin — regalloc reads ordinals, not names).
     EXPECT_EQ(ir.inputOrdinals.size(),    ir.inputNames.size());
@@ -305,7 +308,39 @@ TEST(TargetSchema, ImplicitRegistersValidDeclarationLoads) {
     EXPECT_EQ(ir.inputOrdinals[1],    *rdxOrd);
     EXPECT_EQ(ir.outputOrdinals[0],   *raxOrd);
     EXPECT_EQ(ir.outputOrdinals[1],   *rdxOrd);
-    EXPECT_EQ(ir.clobberedOrdinals[0], *rdxOrd);
+    EXPECT_EQ(ir.clobberedOrdinals[0], *raxOrd);
+    EXPECT_EQ(ir.clobberedOrdinals[1], *rdxOrd);
+}
+
+// D-TARGET-IMPLICIT-REGISTER-CONSTRAINT outputs ⊆ clobbered invariant
+// (cycle 10r 7-agent review fold F1 CRITICAL 9/10, 2026-06-04). A
+// schema declaring `outputs:[rax]` without `clobbered:[rax]` must
+// FAIL LOUD at load time — every register the instruction writes is
+// by definition clobbered for any prior live vreg in it; the regalloc
+// consumes only `clobbered` (not `outputs`) to build its forbidden
+// set. Missing this declaration would silently admit divisor vregs
+// into a register the op is about to overwrite.
+TEST(TargetSchema, ImplicitRegistersOutputMissingFromClobberedRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"badop","result":"value",
+               "implicitRegisters":{
+                 "outputs":["rax"],
+                 "clobbered":[]
+               }}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "outputs without matching clobbered MUST fail loud — the "
+           "schema-loader invariant catches the JSON-typo silent-"
+           "miscompile class (e.g., dropping clobbered:[rdx] from "
+           "xor_rdx_zero while keeping outputs:[rdx]).";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
 
 // II1 (7-agent fold FOLD-NOW): inputs-only positive shape — the
@@ -519,16 +554,19 @@ TEST(TargetSchema, ImplicitRegistersOmissionLeavesNullopt) {
 
 TEST(TargetSchema, ShippedX86_64ImplicitRegistersConsumerCount) {
     // Cycle 10p landed the substrate UNCONSUMED. Cycle 10q opened
-    // consumption by adding sdiv_compound + udiv_compound (the
-    // two compound divide opcodes). This test pins the consumer
+    // consumption with sdiv_compound + udiv_compound; cycle 10r
+    // SPLIT those into 4 separate opcodes (cqo + idiv_op + xor_rdx_zero
+    // + div_op) to fix the REX-prefix overlap silent-miscompile (see
+    // mir_to_lir.cpp lowerDiv $comment for the full diagnosis). All
+    // four declare implicitRegisters. This test pins the consumer
     // count + names so:
-    //   * future cycles adding new implicit-register-bearing
-    //     opcodes (mul-1-op for 128-bit results / shift-by-CL /
-    //     ARM64 fixed-operand ops) update this list intentionally,
-    //     not silently;
-    //   * a regression that accidentally drops the implicit-
-    //     register declaration during a JSON edit fails loud with
-    //     attribution-clear "expected 2, got 1" diagnostic.
+    //   * future cycles adding new implicit-register-bearing opcodes
+    //     (mul-1-op for 128-bit results / shift-by-CL / ARM64
+    //     fixed-operand ops) update this list intentionally, not
+    //     silently;
+    //   * a regression that accidentally drops the implicit-register
+    //     declaration during a JSON edit fails loud with attribution-
+    //     clear "expected 4, got 3" diagnostic.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
     auto const& sch = **r;
@@ -539,38 +577,110 @@ TEST(TargetSchema, ShippedX86_64ImplicitRegistersConsumerCount) {
             mnemonicsWithConstraint.push_back(info->mnemonic);
         }
     }
-    ASSERT_EQ(mnemonicsWithConstraint.size(), 2u)
-        << "expected exactly 2 implicit-register-bearing opcodes "
-           "(sdiv_compound + udiv_compound from cycle 10q); update "
-           "this count when a new consumer lands.";
-    EXPECT_EQ(mnemonicsWithConstraint[0], "sdiv_compound");
-    EXPECT_EQ(mnemonicsWithConstraint[1], "udiv_compound");
-    // FLAG 1 discrimination: both ops carry the same implicit-
-    // register profile (RAX in, RAX/RDX out, RDX clobbered), but
-    // their BYTE sequences must differ (sdiv starts with CQO; udiv
-    // with XOR-RDX-RDX). The byte-pin tests in test_asm_x86_variable
-    // assert the difference at the assembler tier; this test
-    // attests the schema-tier shape.
-    auto const sdivOp = sch.opcodeByMnemonic("sdiv_compound");
-    auto const udivOp = sch.opcodeByMnemonic("udiv_compound");
-    ASSERT_TRUE(sdivOp.has_value());
-    ASSERT_TRUE(udivOp.has_value());
-    auto const* sdivInfo = sch.opcodeInfo(*sdivOp);
-    auto const* udivInfo = sch.opcodeInfo(*udivOp);
-    ASSERT_TRUE(sdivInfo->implicitRegisters.has_value());
-    ASSERT_TRUE(udivInfo->implicitRegisters.has_value());
-    EXPECT_EQ(sdivInfo->implicitRegisters->inputNames,
+    // 7-agent review fold F4 (silent-failure 7/10, 2026-06-04):
+    // unordered identity compare. Positional `[i] == "name"` style
+    // gives muddy diagnostics on positional-swap regressions (e.g.,
+    // dropping `xor_rdx_zero` at position 2 and adding `shl_cl` at
+    // the end fails with a misleading "got div_op" at index 2). Use
+    // a sorted set compare so "which one disappeared" reads cleanly.
+    ASSERT_EQ(mnemonicsWithConstraint.size(), 4u)
+        << "expected exactly 4 implicit-register-bearing opcodes "
+           "(cqo + idiv_op + xor_rdx_zero + div_op from cycle 10r "
+           "split); update this count when a new consumer lands.";
+    std::set<std::string> const observedSet(
+        mnemonicsWithConstraint.begin(),
+        mnemonicsWithConstraint.end());
+    std::set<std::string> const expectedSet{
+        "cqo", "idiv_op", "xor_rdx_zero", "div_op"};
+    EXPECT_EQ(observedSet, expectedSet);
+
+    // FLAG 1 discrimination: the four ops carry DIFFERENT implicit-
+    // register profiles reflecting their distinct semantics.
+    auto const cqoOp     = sch.opcodeByMnemonic("cqo");
+    auto const idivOp    = sch.opcodeByMnemonic("idiv_op");
+    auto const xorRdxOp  = sch.opcodeByMnemonic("xor_rdx_zero");
+    auto const divOp     = sch.opcodeByMnemonic("div_op");
+    ASSERT_TRUE(cqoOp.has_value());
+    ASSERT_TRUE(idivOp.has_value());
+    ASSERT_TRUE(xorRdxOp.has_value());
+    ASSERT_TRUE(divOp.has_value());
+
+    // CQO: reads RAX, writes RDX, clobbers RDX. RAX is unchanged.
+    auto const* cqoInfo = sch.opcodeInfo(*cqoOp);
+    ASSERT_TRUE(cqoInfo->implicitRegisters.has_value());
+    EXPECT_EQ(cqoInfo->implicitRegisters->inputNames,
               (std::vector<std::string>{"rax"}));
-    EXPECT_EQ(sdivInfo->implicitRegisters->outputNames,
-              (std::vector<std::string>{"rax", "rdx"}));
-    EXPECT_EQ(sdivInfo->implicitRegisters->clobberedNames,
+    EXPECT_EQ(cqoInfo->implicitRegisters->outputNames,
               (std::vector<std::string>{"rdx"}));
-    EXPECT_EQ(udivInfo->implicitRegisters->inputNames,
-              sdivInfo->implicitRegisters->inputNames)
-        << "udiv must declare the SAME implicit-register profile as "
-           "sdiv — both consume RAX, produce RAX/RDX, clobber RDX. "
-           "Distinction is byte-level (CQO vs XOR-zero), not regalloc-"
-           "level. A divergence here would indicate a profile typo.";
+    EXPECT_EQ(cqoInfo->implicitRegisters->clobberedNames,
+              (std::vector<std::string>{"rdx"}));
+
+    // IDIV /7: reads RDX:RAX, writes RDX:RAX, clobbers RDX:RAX.
+    // The `clobbered=[rax,rdx]` is required by the `outputs ⊆
+    // clobbered` schema-loader invariant added in cycle 10r 7-agent
+    // review fold F1 — every implicit-output register is by
+    // definition clobbered for any prior live vreg in it.
+    auto const* idivInfo = sch.opcodeInfo(*idivOp);
+    ASSERT_TRUE(idivInfo->implicitRegisters.has_value());
+    EXPECT_EQ(idivInfo->implicitRegisters->inputNames,
+              (std::vector<std::string>{"rax", "rdx"}));
+    EXPECT_EQ(idivInfo->implicitRegisters->outputNames,
+              (std::vector<std::string>{"rax", "rdx"}));
+    EXPECT_EQ(idivInfo->implicitRegisters->clobberedNames,
+              (std::vector<std::string>{"rax", "rdx"}));
+
+    // XOR RDX,RDX: writes RDX (zero), clobbers RDX. No inputs.
+    auto const* xorInfo = sch.opcodeInfo(*xorRdxOp);
+    ASSERT_TRUE(xorInfo->implicitRegisters.has_value());
+    EXPECT_TRUE(xorInfo->implicitRegisters->inputNames.empty())
+        << "XOR RDX,RDX writes a constant zero; it does NOT depend on "
+           "the prior RDX value.";
+    EXPECT_EQ(xorInfo->implicitRegisters->outputNames,
+              (std::vector<std::string>{"rdx"}));
+    EXPECT_EQ(xorInfo->implicitRegisters->clobberedNames,
+              (std::vector<std::string>{"rdx"}));
+
+    // DIV /6: reads RDX:RAX, writes RDX:RAX, clobbers RDX. Same as
+    // IDIV /7 at the register-profile level; distinction is byte-level.
+    auto const* divInfo = sch.opcodeInfo(*divOp);
+    ASSERT_TRUE(divInfo->implicitRegisters.has_value());
+    EXPECT_EQ(divInfo->implicitRegisters->inputNames,
+              idivInfo->implicitRegisters->inputNames)
+        << "DIV /6 must declare the SAME implicit-input profile as "
+           "IDIV /7 — both consume RDX:RAX. Distinction is the modrm "
+           "/6 vs /7 byte, not the register profile.";
+    EXPECT_EQ(divInfo->implicitRegisters->outputNames,
+              idivInfo->implicitRegisters->outputNames);
+}
+
+// D-CSUBSET-DIVISION-OP-CODEGEN anti-regression pin (cycle 10r
+// 7-agent review fold pr-test #2 8/10, 2026-06-04). The cycle-10q
+// compound mnemonics (`sdiv_compound`, `udiv_compound`) packed
+// `[REX.W 0x99, REX.W 0xF7 /7]` (and the unsigned analog) into a
+// single opcode whose embedded second 0x48 OVERRODE the encoder's
+// auto-REX prefix — losing REX.B for high-reg divisors and silently
+// miscompiling. Cycle 10r split each compound into pre + core
+// opcodes so each instruction's REX is auto-computed correctly.
+//
+// **Why this anti-regression test matters**: nothing else in the
+// suite directly asserts the OLD names are absent. A merge that
+// reintroduces the compound rows (e.g., from a stale branch, a
+// partial revert, or a wrong cherry-pick) would silently re-enable
+// both encodings — the new split tests would still pass, the byte
+// pins would still pass, and the silent-miscompile would return.
+// This test makes any such reintroduction fail loud immediately.
+TEST(TargetSchema, ShippedX86_64HasNoLegacyCompoundDivideOpcodes) {
+    auto r = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(r.has_value());
+    auto const& sch = **r;
+    EXPECT_FALSE(sch.opcodeByMnemonic("sdiv_compound").has_value())
+        << "the cycle-10q compound `sdiv_compound` mnemonic must NOT "
+           "be present in the shipped schema — cycle 10r split it into "
+           "`cqo` + `idiv_op` to fix the REX-overlap silent-miscompile.";
+    EXPECT_FALSE(sch.opcodeByMnemonic("udiv_compound").has_value())
+        << "the cycle-10q compound `udiv_compound` mnemonic must NOT "
+           "be present in the shipped schema — cycle 10r split it into "
+           "`xor_rdx_zero` + `div_op`.";
 }
 
 // ─── cycle 2b — calling conventions ──────────────────────────────────────

@@ -370,26 +370,28 @@ TEST(LirRegAlloc, HighPressureFunctionSpillsSome) {
         << "high-pressure function should require ≥ 1 spill";
 }
 
-// D-CSUBSET-DIVISION-OP-CODEGEN regalloc unit pin (cycle 10r,
+// D-CSUBSET-DIVISION-OP-CODEGEN regalloc unit pin (cycle 10r split,
 // 2026-06-04). Per user mandate (cycle 10r non-negotiable #2):
 // the regalloc's implicit-register-clobber exclusion must be
-// PROVEN at the unit level. The compound divide opcode
-// (sdiv_compound = CQO+IDIV) declares implicitRegisters with
-// inputs=[rax] + outputs=[rax,rdx] + clobbered=[rdx]. The regalloc
-// consumer reads these and forbids RAX/RDX for any vreg whose
-// range COVERS the compound op (including operand vregs USED at
-// the op — the "covers" semantics, NOT the "crosses past"
-// semantics used for caller-saved across calls).
+// PROVEN at the unit level. The split divide opcodes
+// (cqo + idiv_op, xor_rdx_zero + div_op) each declare
+// implicitRegisters; the regalloc consumer reads these and
+// forbids RAX/RDX for any vreg whose range COVERS the pre or core
+// op (the "covers" semantics, NOT the "crosses past" semantics
+// used for caller-saved across calls). idiv_op declares
+// implicitInputs=[rax,rdx] + implicitClobbered=[rdx]; cqo
+// declares implicitInputs=[rax] + implicitOutputs=[rdx] +
+// implicitClobbered=[rdx]. The divisor vreg is live at BOTH cqo
+// and idiv_op, so the regalloc must exclude RAX + RDX from its
+// allocation candidates at both positions.
 //
-// **The red-on-disable demonstration**: I manually disabled the
+// **The red-on-disable demonstration**: manually disabling the
 // `excludedCount = implicitClobbersCrossedBy(...)` line in
-// lir_regalloc.cpp and re-ran this test. The divisor vreg
+// lir_regalloc.cpp + re-running this test shows the divisor vreg
 // ALLOCATED to RDX (ordinal 2) because cc.argGprs[1] = RDX on
 // SysV — without the exclusion, the linear-scan picks the
-// already-occupied register. This test went RED, proving the
-// guard catches the regression class. Then I reverted (added the
-// line back); the test went green again with the divisor in an
-// excluded-set-respecting ordinal.
+// already-occupied register. The test goes RED, proving the
+// guard catches the regression class.
 TEST(LirRegAlloc, DivisorVregExcludesImplicitClobberSet) {
     // Source: a helper with TWO params. The divisor (param 1) is
     // the use site we want to verify NEVER lands in RAX (ord 0)
