@@ -1017,16 +1017,43 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             std::int64_t value = nextValue;
                                             bool hadExplicit = false;
                                             bool explicitFailed = false;
-                                            auto eKids = visibleChildren(tree, erec.declRuleNode);
-                                            for (NodeId c : eKids) {
-                                                if (tree.kind(c) != NodeKind::Internal) continue;
+                                            // D-DECL-SPECIFIER-PREFIX-SUBSTRATE (cycle-13 audit fix):
+                                            // resolve the enumerator's `= expr` value through the SHARED
+                                            // `findInitExprInDecl` chokepoint (mirrors
+                                            // `resolveConstSymbolInit` ~:598) instead of an open-coded
+                                            // "first Internal child" scan. The chokepoint STRIPS a leading
+                                            // specifier prefix before selecting the value child; the old
+                                            // raw scan bypassed it, so an enumerator decl carrying a future
+                                            // `static`/`__attribute__` prefix would select the specifier
+                                            // subtree as its value (silent-wrong value / phantom
+                                            // S_NonConstantEnumeratorValue). `enumerator` is a registered
+                                            // decl rule, so the lookup resolves; the defensive branch keeps
+                                            // the prior behavior for any enumerator minted by a rule with
+                                            // no DeclarationRule (⇒ no specifierPrefixRule possible).
+                                            std::optional<NodeId> valueExpr;
+                                            if (auto eDeclIt = s.idx().declByRule.find(
+                                                    tree.rule(erec.declRuleNode).v);
+                                                eDeclIt != s.idx().declByRule.end()) {
+                                                valueExpr = findInitExprInDecl(
+                                                    tree, cfg.declarations[eDeclIt->second],
+                                                    erec.declRuleNode);
+                                            } else {
+                                                for (NodeId c :
+                                                     visibleChildren(tree, erec.declRuleNode))
+                                                    if (tree.kind(c) == NodeKind::Internal) {
+                                                        valueExpr = c;
+                                                        break;
+                                                    }
+                                            }
+                                            if (valueExpr.has_value()) {
                                                 hadExplicit = true;
-                                                if (auto iv = constIntExpr(s, tree, c, erec.scope, &cfg); iv.has_value()) {
+                                                if (auto iv = constIntExpr(
+                                                        s, tree, *valueExpr, erec.scope, &cfg);
+                                                    iv.has_value()) {
                                                     value = *iv;
                                                 } else {
                                                     explicitFailed = true;
                                                 }
-                                                break;  // exactly one expression child per enumerator
                                             }
                                             if (hadExplicit && explicitFailed) {
                                                 ParseDiagnostic d2;

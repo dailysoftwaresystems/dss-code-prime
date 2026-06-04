@@ -55,6 +55,17 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    (exact counts, full-sequence/byte equality, `static_assert`, death-test message match).
    See the `dss-code-prime` skill §7. A test that still passes when the implementation is
    silently broken is not strict enough.
+   - **Multi-site / multi-form contracts** — the "apply X at every site/form of class C"
+     class (e.g. "strip the specifier prefix at every positional decl resolution"). A green
+     suite over a SUBSET of the sites/forms is NOT proof: latent misses at the unexercised
+     sites survive review *and* green. (Cycle-13 audit case: a 4th missed strip site — the
+     enum-enumerator value loop — survived the cycle-12 review because its test exercised
+     only a variable decl.) Close it one of two ways: **(a)** funnel ALL sites through ONE
+     chokepoint so coverage is by-construction — duplication is what breeds the missed site;
+     or **(b)** have the closing test exercise EVERY form of C, *including forms not yet
+     consumed by any shipped language*, via a synthetic schema that constructs the consuming
+     shape itself. An unconsumed substrate's misses are latent by definition — the test must
+     build the consuming shape, not wait for a real consumer to expose it.
 6. **The full commit gate.** The operational checklist (with commands) is **Step 6 (§C)** —
    the single source of truth for the gate items. **Any red the cycle cannot self-repair →
    STOP and report. Do not push.** Self-repair = a mechanical fix obvious from the failure
