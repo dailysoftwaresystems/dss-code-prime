@@ -70,6 +70,123 @@ TEST(Licm, InvariantAddHoistedFromLoopBody) {
     EXPECT_EQ(r.instructionsHoisted, 1u);
 }
 
+// D-OPT6-LICM-CHAINED-INVARIANTS closure (cycle 10j, 2026-06-04):
+// a second-order invariant `y = x*c` whose operand `x = a+b` is
+// itself a first-order invariant (all of a, b, c defined in
+// entry) gets hoisted in the SAME analyze() call via the per-
+// loop fixed-point iteration. Pre-10j only the first-order `x`
+// would hoist (instructionsHoisted == 1); post-10j both hoist
+// (instructionsHoisted == 2).
+//
+// Without this, a release pipeline `[..., Licm, ..., Licm, ...]`
+// would have to run LICM twice to surface the chained case —
+// burning a pipeline iteration for what's structurally a
+// single per-loop fixed point. The fixed point also catches
+// arbitrary-depth chains in one pass (z = y*d → w = z*e → ...
+// each yielding to the prior).
+TEST(Licm, ChainedInvariantsHoistedInFixedPoint) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirLiteralValue v5; v5.value = std::int64_t{5}; v5.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const b = mb.addConst(v4, i32);
+    MirInstId const c = mb.addConst(v5, i32);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    // x = a + b (first-order invariant)
+    MirInstId const addOps[] = {a, b};
+    MirInstId const x = mb.addInst(MirOpcode::Add, addOps, i32);
+    // y = x * c (second-order — chained via x)
+    MirInstId const mulOps[] = {x, c};
+    (void)mb.addInst(MirOpcode::Mul, mulOps, i32);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 2u)
+        << "chained-invariant fixed point must hoist BOTH x = a+b "
+           "(first-order) AND y = x*c (second-order, via the "
+           "round-2 admit of x into the hoistedInThisLoop set). "
+           "A regression that left the analyze() at single-pass "
+           "would yield 1 (only x hoisted).";
+}
+
+// Chained-invariant NEGATIVE — `y = x * d` where `d` is a loop-
+// variant value (e.g., the loop's induction Phi). Even though `x`
+// is hoisted, `y` MUST stay in the loop because `d` is not
+// invariant. Regression guard against a fixed-point bug that
+// blanket-admits ALL loop-body operands of an already-hoisted
+// inst as "hoisted-too".
+TEST(Licm, ChainedInvariantsRejectedWhenSiblingOperandIsLoopVariant) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    MirInstId const a     = mb.addConst(v3, i32);
+    MirInstId const b     = mb.addConst(v4, i32);
+    MirInstId const initI = mb.addConst(v0, i32);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirInstId const phi = mb.addPhi(i32);  // loop induction var
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    // x = a + b   — first-order invariant; hoist OK
+    MirInstId const addOps[] = {a, b};
+    MirInstId const x = mb.addInst(MirOpcode::Add, addOps, i32);
+    // y = x * phi — sibling operand `phi` is loop-variant; y NOT hoist
+    MirInstId const mulOps[] = {x, phi};
+    MirInstId const next = mb.addInst(MirOpcode::Mul, mulOps, i32);
+    mb.addBr(header);
+    mb.addPhiIncoming(phi, {initI, entry});
+    mb.addPhiIncoming(phi, {next, body});
+    mb.beginBlock(exitB);
+    mb.addReturn(phi);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 1u)
+        << "only x must hoist; y depends on the loop-induction phi "
+           "and is loop-variant. A regression that blanket-accepts "
+           "all operands once one is hoisted would silently move y "
+           "out of the loop → silent miscompile (y would compute "
+           "using whatever phi value happens to be at preheader "
+           "entry, not per-iteration).";
+}
+
 // Non-invariant inst (depends on a loop-body Phi) → NOT hoisted.
 TEST(Licm, NonInvariantNotHoisted) {
     TypeInterner interner{CompilationUnitId{1}};

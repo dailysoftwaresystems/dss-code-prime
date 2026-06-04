@@ -21,10 +21,13 @@
 //     might never execute, this changes observable behavior). Anchor
 //     `D-OPT6-LICM-TRAP-SAFE-HOIST` for a future cycle that proves
 //     non-zero divisor via interval / value-range analysis.
-//   - ALL operands defined OUTSIDE the loop body (no chained-
-//     invariant resolution in c1; D-OPT6-LICM-CHAINED-INVARIANTS
-//     anchors a fixed-point iteration over invariants-of-invariants
-//     in a future cycle).
+//   - ALL operands defined OUTSIDE the loop body OR already
+//     hoisted earlier this loop (chained-invariant resolution,
+//     D-OPT6-LICM-CHAINED-INVARIANTS, cycle 10j closure
+//     2026-06-04). Termination: a per-loop monotone-growing
+//     `hoistedInThisLoop` set; the iterator breaks on a no-
+//     progress round. Defensive step cap at 64 (bounded above by
+//     `|loop.body inst count|`).
 //
 // **Preheader requirement (c1)**: the pass hoists ONLY when the
 // loop header has EXACTLY ONE non-back-edge predecessor — that

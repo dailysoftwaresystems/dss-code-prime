@@ -205,68 +205,94 @@ void LicmPolicy::analyze(MirFuncId fn) {
         // For each inst in the loop body (skip the header's Phis
         // implicitly since Phi isn't a candidate opcode):
         //   - Eligibility: opcode + flags.
-        //   - All operands defined OUTSIDE the loop body.
-        for (MirBlockId const b : loop.body) {
-            std::uint32_t const ninst = src_.blockInstCount(b);
-            for (std::uint32_t i = 0; i < ninst; ++i) {
-                MirInstId const id = src_.blockInstAt(b, i);
-                MirOpcode const op = src_.instOpcode(id);
-                if (!isLicmCandidateOpcode(op)) continue;
-                if (has(src_.instFlags(id), MirInstFlags::Volatile)) continue;
+        //   - All operands defined OUTSIDE the loop body
+        //     OR already hoisted earlier this loop (chained
+        //     invariants, D-OPT6-LICM-CHAINED-INVARIANTS, cycle
+        //     10j, 2026-06-04).
+        //
+        // Chained-invariant fixed point: a body inst whose operands
+        // include some `y = x*c` where `x = a+b` is itself
+        // hoist-eligible is also hoistable — but only AFTER `x` has
+        // been recorded. The iterative loop re-scans until no new
+        // candidates surface, monotonically growing
+        // `hoistedInThisLoop`. Termination: the set can only grow
+        // by `|loop.body inst count|` total; a no-progress
+        // iteration breaks via `changed=false`.
+        std::unordered_set<MirInstId> hoistedInThisLoop;
+        bool changed = true;
+        std::size_t iterCap = 0;
+        constexpr std::size_t kMaxIter = 64;
+        while (changed) {
+            if (iterCap++ >= kMaxIter) {
+                // Defensive step cap: the per-loop fixed point is
+                // structurally bounded by `|body insts|`, but an
+                // unanticipated recordHoist behavior change could
+                // in principle loop forever — fail loud rather
+                // than hang.
+                std::fprintf(stderr,
+                    "dss::opt::passes::Licm fatal: chained-invariant "
+                    "fixed point exceeded %zu iterations on a single "
+                    "loop (header v=%u) — substrate-contract "
+                    "violation (D-OPT6-LICM-CHAINED-INVARIANTS).\n",
+                    kMaxIter, loop.header.v);
+                std::abort();
+            }
+            changed = false;
+            for (MirBlockId const b : loop.body) {
+                std::uint32_t const ninst = src_.blockInstCount(b);
+                for (std::uint32_t i = 0; i < ninst; ++i) {
+                    MirInstId const id = src_.blockInstAt(b, i);
+                    if (hoistedInThisLoop.count(id)) continue;
+                    MirOpcode const op = src_.instOpcode(id);
+                    if (!isLicmCandidateOpcode(op)) continue;
+                    if (has(src_.instFlags(id), MirInstFlags::Volatile)) continue;
 
-                // All-operands-outside-loop check. The operand's
-                // block is `src_.instBlock(operand)`; if it's IN
-                // the loop body, the inst is NOT a c1 hoist target
-                // (chained invariants are anchored for a future
-                // cycle).
-                bool allOutside = true;
-                for (MirInstId const o : src_.instOperands(id)) {
-                    MirBlockId const opBlock = src_.instBlock(o);
-                    // Defensive: an invalid operand-block would
-                    // suggest a malformed source MIR (verifier should
-                    // have caught it); treat as not-hoistable so
-                    // LICM emits a no-op rather than silently
-                    // claiming "outside" for an unresolved operand.
-                    if (!opBlock.valid()) { allOutside = false; break; }
-                    if (bodySet.count(opBlock.v)) {
-                        allOutside = false;
-                        break;
+                    // Operand check: defined outside the loop body
+                    // OR already in this-loop's hoisted set.
+                    bool allOutside = true;
+                    for (MirInstId const o : src_.instOperands(id)) {
+                        MirBlockId const opBlock = src_.instBlock(o);
+                        if (!opBlock.valid()) { allOutside = false; break; }
+                        if (bodySet.count(opBlock.v)) {
+                            // Operand defined in loop body — accept
+                            // ONLY if it was hoisted earlier this
+                            // round (chained invariant). Otherwise
+                            // it's loop-variant and disqualifies.
+                            if (!hoistedInThisLoop.count(o)) {
+                                allOutside = false;
+                                break;
+                            }
+                        }
                     }
+                    if (!allOutside) continue;
+                    // Load admission gate (unchanged): a Load is
+                    // hoist-eligible only when no Store in the loop
+                    // body may alias its pointer.
+                    if (op == MirOpcode::Load) {
+                        auto const lops = src_.instOperands(id);
+                        if (lops.empty()) {
+                            std::fprintf(stderr,
+                                "dss::opt::passes::Licm fatal: Load inst "
+                                "v=%u has zero operands — verifier-contract "
+                                "violation.\n", id.v);
+                            std::abort();
+                        }
+                        if (mirAnyMayAliasingStoreInLoop(
+                                src_, interner_, lops[0], loop.body,
+                                strictTbaa_, charTypesAliasAll_)) {
+                            continue;  // clobbered in body
+                        }
+                    }
+                    // Nested-loop dedup (CRITICAL fix): an inst that's
+                    // invariant in BOTH an inner and an outer enclosing
+                    // loop (e.g. operands all in function entry) would
+                    // appear as a candidate in BOTH loops. The first
+                    // record wins; subsequent visits skip.
+                    if (hoistedInsts_.count(id)) continue;
+                    recordHoist(id, preheader);
+                    hoistedInThisLoop.insert(id);
+                    changed = true;
                 }
-                if (!allOutside) continue;
-                // Load admission gate: a Load is hoist-eligible only
-                // when no Store in the loop body may alias its pointer.
-                // The pointer-operand-defined-outside check above is a
-                // necessary but not sufficient condition; a Store
-                // whose target may alias the loaded location would
-                // make the Load's value loop-variant.
-                if (op == MirOpcode::Load) {
-                    auto const lops = src_.instOperands(id);
-                    if (lops.empty()) {
-                        std::fprintf(stderr,
-                            "dss::opt::passes::Licm fatal: Load inst "
-                            "v=%u has zero operands — verifier-contract "
-                            "violation.\n", id.v);
-                        std::abort();
-                    }
-                    if (mirAnyMayAliasingStoreInLoop(
-                            src_, interner_, lops[0], loop.body,
-                            strictTbaa_, charTypesAliasAll_)) {
-                        continue;  // clobbered in body
-                    }
-                }
-                // Nested-loop dedup (CRITICAL fix): an inst that's
-                // invariant in BOTH an inner and an outer enclosing
-                // loop (e.g. operands all in function entry) would
-                // appear as a candidate in BOTH loops. The first
-                // record wins; subsequent visits skip — this prevents
-                // `recordHoist`'s duplicate-guard from firing on
-                // legitimate nested-loop input. The loop iteration
-                // order (sorted by header.v) typically hits the
-                // outer loop first, hoisting to the OUTERMOST valid
-                // preheader (deepest hoist).
-                if (hoistedInsts_.count(id)) continue;
-                recordHoist(id, preheader);
             }
         }
     }
