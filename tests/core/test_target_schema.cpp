@@ -242,6 +242,306 @@ TEST(TargetSchema, RegisterSubOfMustResolve) {
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
 
+// ─── cycle 10p — implicit-register constraint substrate ───────────────
+//
+// The new `implicitRegisters` per-opcode block declares fixed-register
+// semantic constraints (e.g., x86 idiv ties RDX:RAX). This cycle lands
+// substrate-only: struct + loader + validator + tests. No opcode in
+// the shipped schemas declares it yet (consumer wiring is cycle 10q).
+// Each test pins one positive or negative path through the substrate
+// so a future regression in the loader or validator surfaces here.
+
+TEST(TargetSchema, ImplicitRegistersValidDeclarationLoads) {
+    // Mirror idiv's contract: dividend in RAX/RDX (implicit input),
+    // quotient in RAX (output), remainder in RDX (output), and RDX
+    // is also recorded as clobbered. Cross-array overlap IS legal —
+    // a register may legitimately appear in inputs + outputs +
+    // clobbered (idiv's RDX/RAX do).
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{
+                 "inputs":["rax","rdx"],
+                 "outputs":["rax","rdx"],
+                 "clobbered":["rdx"]
+               }}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8},
+              {"name":"rdx","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value()) << "valid implicitRegisters must load";
+    auto const& sch = **r;
+    auto const op = sch.opcodeByMnemonic("fakediv");
+    ASSERT_TRUE(op.has_value());
+    auto const* info = sch.opcodeInfo(*op);
+    ASSERT_NE(info, nullptr);
+    ASSERT_TRUE(info->implicitRegisters.has_value());
+    auto const& ir = *info->implicitRegisters;
+    EXPECT_EQ(ir.inputNames.size(),    2u);
+    EXPECT_EQ(ir.outputNames.size(),   2u);
+    EXPECT_EQ(ir.clobberedNames.size(), 1u);
+    EXPECT_EQ(ir.inputNames[0],    "rax");
+    EXPECT_EQ(ir.inputNames[1],    "rdx");
+    EXPECT_EQ(ir.clobberedNames[0], "rdx");
+    // Loader-populated ordinals parallel the names (consumer-O(1)
+    // pin — regalloc reads ordinals, not names).
+    EXPECT_EQ(ir.inputOrdinals.size(),    ir.inputNames.size());
+    EXPECT_EQ(ir.outputOrdinals.size(),   ir.outputNames.size());
+    EXPECT_EQ(ir.clobberedOrdinals.size(), ir.clobberedNames.size());
+    // CG2 (7-agent fold FOLD-NOW): pin ordinal VALUES via schema's
+    // own register-lookup — target-agnostic (no hardcoded "rax=0").
+    // A regression in the loader that pushed `j` (index) instead of
+    // `it->second` (registerIndex value) would pass the size-equality
+    // pin but fail this value pin.
+    auto const raxOrd = sch.registerByName("rax");
+    auto const rdxOrd = sch.registerByName("rdx");
+    ASSERT_TRUE(raxOrd.has_value());
+    ASSERT_TRUE(rdxOrd.has_value());
+    EXPECT_EQ(ir.inputOrdinals[0],    *raxOrd);
+    EXPECT_EQ(ir.inputOrdinals[1],    *rdxOrd);
+    EXPECT_EQ(ir.outputOrdinals[0],   *raxOrd);
+    EXPECT_EQ(ir.outputOrdinals[1],   *rdxOrd);
+    EXPECT_EQ(ir.clobberedOrdinals[0], *rdxOrd);
+}
+
+// II1 (7-agent fold FOLD-NOW): inputs-only positive shape — the
+// canonical x86 shift-by-CL / cdq / cqo precedent. cdq for example
+// has implicit input RAX → output RDX (sign-extended); the
+// clobbered array stays empty (no separate destruction beyond the
+// declared output). A regression that gated non-empty-block check
+// on `inputs.empty() && outputs.empty()` (forgetting `clobbered`)
+// or that REQUIRED all three arrays non-empty would fail this pin.
+TEST(TargetSchema, ImplicitRegistersInputsOnlyShapeLoads) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"shl_cl","result":"value",
+               "implicitRegisters":{"inputs":["rcx"]}}
+            ],
+            "registers":[
+              {"name":"rcx","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value()) << "inputs-only shape must load";
+    auto const& sch = **r;
+    auto const op = sch.opcodeByMnemonic("shl_cl");
+    ASSERT_TRUE(op.has_value());
+    auto const* info = sch.opcodeInfo(*op);
+    ASSERT_NE(info, nullptr);
+    ASSERT_TRUE(info->implicitRegisters.has_value());
+    auto const& ir = *info->implicitRegisters;
+    EXPECT_EQ(ir.inputNames.size(),     1u);
+    EXPECT_TRUE(ir.outputNames.empty());
+    EXPECT_TRUE(ir.clobberedNames.empty());
+    EXPECT_TRUE(ir.outputOrdinals.empty());
+    EXPECT_TRUE(ir.clobberedOrdinals.empty());
+}
+
+// CG1 (7-agent fold FOLD-NOW): loader-tier shape rejects.
+// Three distinct emit sites in the loader — each needs its own
+// negative-pin so a regression in any one of them surfaces
+// independently.
+
+TEST(TargetSchema, ImplicitRegistersNonObjectBlockRejected) {
+    // `"implicitRegisters": "rax"` (string instead of object).
+    // Classic copy-paste-from-`callerSaved`-style typo.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":"rax"}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "non-object implicitRegisters must fail-loud";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, ImplicitRegistersNonArrayInputsRejected) {
+    // `"inputs": "rax"` (string instead of array).
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{"inputs":"rax"}}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "non-array implicitRegisters.inputs must fail-loud";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, ImplicitRegistersNonStringEntryRejected) {
+    // `"inputs": [42]` (number instead of register-name string).
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{"inputs":[42]}}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "non-string entry in implicitRegisters.inputs must fail-loud";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// Unknown sub-key reject (per D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD
+// discipline; 7-agent fold FOLD-NOW). A typo like `"inpts": [...]`
+// pre-fold silently dropped the field, then the empty-block check
+// fired with a misleading "typo discriminator" diagnostic. Post-
+// fold the unknown-key check fires loud at the right path.
+TEST(TargetSchema, ImplicitRegistersUnknownSubKeyRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{"inpts":["rax"]}}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "typo'd sub-key 'inpts' must fail-loud (D-CONFIG-LOADER-"
+           "UNKNOWN-KEYS-FAIL-LOUD discipline)";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, ImplicitRegistersUnknownNameRejected) {
+    // `rxyz` is not in the register table → loud reject. Critical
+    // for the substrate's silent-failure surface: a typo'd register
+    // name would otherwise leave the regalloc consumer reading an
+    // empty ordinal list and treating the opcode as constraint-free
+    // — silent miscompile in the eventual regalloc wiring.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{"inputs":["rxyz"]}}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "implicitRegisters.inputs=['rxyz'] must fail-loud — rxyz is "
+           "not in the register table";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, ImplicitRegistersEmptyBlockRejected) {
+    // A block with all three arrays empty (or with no arrays at all)
+    // is structurally meaningless and almost certainly a typo
+    // discriminator (the author intended to constrain something but
+    // miswrote the keys, e.g. `implictInputs` instead of `inputs`).
+    // Loud reject covers that class.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{}}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "empty implicitRegisters block must fail-loud (typo "
+           "discriminator pin)";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, ImplicitRegistersDuplicateWithinArrayRejected) {
+    // Within-array duplicates are never intentional. Cross-array
+    // overlap IS allowed (covered by ImplicitRegistersValidDeclaration
+    // Loads). This negative pin guards the discrimination.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"fakediv","result":"value",
+               "implicitRegisters":{"inputs":["rax","rax"]}}
+            ],
+            "registers":[
+              {"name":"rax","class":"gpr","widthBytes":8}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "duplicate register name within implicitRegisters.inputs "
+           "must fail-loud";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, ImplicitRegistersOmissionLeavesNullopt) {
+    // Most opcodes (mov / add / sub / ret / etc.) have no implicit-
+    // register constraint. The pre-cycle invariant: every shipped
+    // x86_64 opcode row omits the block; loading shipped schema is a
+    // no-op pass through the new arm. Silent regression class: a
+    // future bug that mis-defaults the optional to "empty constraint"
+    // instead of nullopt would change behavior under future regalloc
+    // consumers. Pin the default explicitly.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"mov","result":"value"}
+            ]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    auto const op = (*r)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(op.has_value());
+    auto const* info = (*r)->opcodeInfo(*op);
+    ASSERT_NE(info, nullptr);
+    EXPECT_FALSE(info->implicitRegisters.has_value())
+        << "opcodes omitting implicitRegisters must leave the optional "
+           "nullopt — not auto-default to an empty constraint";
+}
+
+TEST(TargetSchema, ShippedX86_64NoOpcodeDeclaresImplicitRegisters) {
+    // Pre-cycle-10q invariant: NO shipped x86_64 opcode declares
+    // implicit-register constraints yet. The substrate ships
+    // unconsumed in 10p. When 10q adds idiv/cdq/cqo with declarations,
+    // this test will need an update — it's an attribution pin so
+    // that update is intentional, not silent (a future regression
+    // that accidentally re-defaults to nullopt during the loader's
+    // pre-10q absence would otherwise read green here).
+    auto r = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(r.has_value());
+    auto const& sch = **r;
+    std::size_t withConstraint = 0;
+    for (std::uint16_t op = 0; op < sch.opcodeCount(); ++op) {
+        auto const* info = sch.opcodeInfo(op);
+        if (info && info->implicitRegisters.has_value()) {
+            ++withConstraint;
+        }
+    }
+    EXPECT_EQ(withConstraint, 0u)
+        << "pre-cycle-10q: no shipped x86_64 opcode should declare "
+           "implicitRegisters yet. The substrate (cycle 10p) lands "
+           "unconsumed. Update this count when idiv/cdq/cqo land in "
+           "cycle 10q.";
+}
+
 // ─── cycle 2b — calling conventions ──────────────────────────────────────
 
 TEST(TargetSchema, ShippedX86_64HasBothSysVAndMsX64) {

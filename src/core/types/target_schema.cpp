@@ -586,6 +586,13 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 }
             }
         }
+
+        // Implicit-register-constraint resolution + per-field
+        // validation happens at LOAD time in target_schema_json.cpp
+        // (after the register table is populated). validate() stays
+        // const + cross-opcode-only — see the loader's
+        // "Implicit-register-constraint resolution + validation"
+        // block for the resolution + per-field reject arms.
     }
 
     // ── Convergence-fix A (schema-level): `mov` opcode required ────
