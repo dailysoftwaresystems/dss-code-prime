@@ -491,9 +491,15 @@ struct Lowerer {
     }
     // Fold the linkage effects of every specifier token in `prefixNode` onto a
     // LinkageAttr, per the declaration's `linkageSpecifiers` facet (token SOURCE
-    // TEXT → effect). Non-specifier tokens (`__attribute__`, parens) simply miss
-    // the map and are skipped. Agnostic: the map is per-language config.
-    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl) const {
+    // TEXT → effect). A token whose KIND is in `linkageSpecifierIgnoredKinds` (the
+    // prefix's declared STRUCTURAL syntax — `__attribute__`, parens) is skipped;
+    // any OTHER token MUST resolve in `linkageSpecifiers`, else it is an
+    // unrecognized specifier and fails loud (`H_UnknownLinkageSpecifier`) — a typo
+    // (`__attribute__((wek))`) or an unsupported attribute, never a silent no-op
+    // (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC). Agnostic: BOTH the effect
+    // map and the ignored-kind set are per-language config; the engine compares
+    // resolved SchemaTokenIds + source text, never a hardcoded kind/identity.
+    [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl) {
         LinkageAttr attr{};
         if (!prefixNode.valid() || decl.linkageSpecifiers.empty()) return attr;
         std::vector<NodeId> stack{prefixNode};
@@ -501,10 +507,19 @@ struct Lowerer {
             NodeId n = stack.back();
             stack.pop_back();
             if (isToken(n)) {
+                SchemaTokenId const kind = tree().tokenKind(n);
+                bool ignored = false;
+                for (SchemaTokenId k : decl.linkageSpecifierIgnoredKinds)
+                    if (k == kind) { ignored = true; break; }
+                if (ignored) continue;  // declared structural syntax (e.g. __attribute__, parens)
                 auto it = decl.linkageSpecifiers.find(std::string{tree().text(n)});
                 if (it != decl.linkageSpecifiers.end()) {
                     if (it->second.binding)    attr.binding    = *it->second.binding;
                     if (it->second.visibility) attr.visibility = *it->second.visibility;
+                } else {
+                    emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                          std::format("'{}' is not a recognized linkage specifier",
+                                      tree().text(n)));
                 }
             } else {
                 for (NodeId c : visible(n)) stack.push_back(c);
@@ -2778,7 +2793,7 @@ struct Lowerer {
         auto it = declMap_.find(tree().rule(node).v);
         if (it == declMap_.end()) return reportedError(node, "extern decl has no semantics rule");
         DeclarationRule const& decl = sem.declarations[it->second];
-        auto vis = visible(node);
+        auto vis = declVisible(node, decl);
         SymbolId sym{};
         TypeId type = InvalidType;
         if (decl.nameChild && *decl.nameChild < vis.size()) {
@@ -2854,6 +2869,14 @@ struct Lowerer {
         // FIRST and short-circuits before the per-extern guard.
         // Both surfaces are unsuppressable + upstream-of-link.
         auto recordExtern = [&](HirNodeId h) {
+            // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14, design-audit
+            // Gate 1): route the extern arm through the SAME linkageFrom chokepoint
+            // as lowerTopLevel/lowerFunctionDecl, so specifier validation is
+            // by-construction for EVERY decl-lowering arm, not a hand-picked subset.
+            // A no-op today (externDecl declares no specifierPrefix → specifierPrefix
+            // returns invalid → linkageFrom early-returns); structural for the day an
+            // extern gains specifiers.
+            recordLinkage(h, linkageFrom(specifierPrefix(node, decl), decl));
             auto const* rec = model.recordFor(sym);
             externDecls.push_back({h,
                                    rec ? rec->name : std::string{},

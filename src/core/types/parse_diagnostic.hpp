@@ -427,6 +427,15 @@ enum class DiagnosticCode : std::uint16_t {
     //   error — language hasn't configured kindByChild) and from
     //   `H_ExternHasInitializer` (user-source init contradiction).
     H_ExternDeclMalformed         = 0xF00B,
+    // H_UnknownLinkageSpecifier: a declaration's specifier-prefix subtree held a
+    // token that is neither a declared structural-syntax kind
+    // (`linkageSpecifierIgnoredKinds` — e.g. `__attribute__`, parens) nor a
+    // recognized entry in the language's `linkageSpecifiers` map — a typo
+    // (`__attribute__((wek))`) or an unsupported attribute (`((noinline))`). Fail
+    // loud rather than silently ignore it (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-
+    // DIAGNOSTIC). Source-agnostic: the recognized + ignored sets are both
+    // per-language config; the engine never hardcodes a specifier identity.
+    H_UnknownLinkageSpecifier     = 0xF00C,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

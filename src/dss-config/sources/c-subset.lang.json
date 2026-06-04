@@ -605,6 +605,7 @@
           "static": { "binding": "local" },
           "weak":   { "binding": "weak"  }
         },
+        "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose"],
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
         "kindByChild": {
           "childPath": [2, 0],

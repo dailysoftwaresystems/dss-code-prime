@@ -3262,6 +3262,49 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14):
+                        // optional list of the specifier prefix's STRUCTURAL token
+                        // kinds to SKIP (syntax, not specifier-identities):
+                        //   "linkageSpecifierIgnoredKinds": ["AttributeKeyword",
+                        //                                    "ParenOpen", "ParenClose"]
+                        // Each entry is a token-KIND name → SchemaTokenId (unknown →
+                        // C_UnknownToken, mirrors variadicMarker). A prefix token whose
+                        // kind is NOT listed MUST resolve in linkageSpecifiers, else
+                        // H_UnknownLinkageSpecifier fails loud. Skip-list default is
+                        // fail-loud (unlisted ⇒ validated ⇒ unknown errors).
+                        if (entry.contains("linkageSpecifierIgnoredKinds")) {
+                            auto const& lik = entry.at("linkageSpecifierIgnoredKinds");
+                            if (!lik.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/linkageSpecifierIgnoredKinds",
+                                          std::format("'declarations[{}]."
+                                                      "linkageSpecifierIgnoredKinds' must be an "
+                                                      "array of token-kind names", i));
+                            } else {
+                                for (auto const& elem : lik) {
+                                    if (!elem.is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/linkageSpecifierIgnoredKinds",
+                                                  "each ignored-kind entry must be a "
+                                                  "token-kind name string");
+                                        continue;
+                                    }
+                                    auto const kn = elem.get<std::string>();
+                                    if (!data.schemaTokens->contains(kn)) {
+                                        coll.emit(DiagnosticCode::C_UnknownToken,
+                                                  path + "/linkageSpecifierIgnoredKinds",
+                                                  std::format("'declarations[{}]."
+                                                              "linkageSpecifierIgnoredKinds' "
+                                                              "references unknown token kind "
+                                                              "'{}'", i, kn));
+                                        continue;
+                                    }
+                                    rule.linkageSpecifierIgnoredKinds.push_back(
+                                        data.schemaTokens->find(kn));
+                                }
+                            }
+                        }
+
                         // SE-arrays (HR9): optional C-style declarator suffix.
                         //   "arraySuffix": { "rule": "arrayDeclSuffix",
                         //                    "lengthChild": 1 }

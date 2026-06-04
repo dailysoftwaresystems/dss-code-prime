@@ -220,6 +220,17 @@ struct DSS_EXPORT DeclarationRule {
     // agnostic: the VALUES reuse the shared `SymbolBinding`/`SymbolVisibility`
     // vocabulary; the token→effect MAP is per-language config.
     std::unordered_map<std::string, LinkageSpecifierEffect> linkageSpecifiers;
+    // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14): the specifier
+    // prefix's STRUCTURAL token kinds — syntax, NOT specifier-identities (e.g.
+    // `__attribute__`, `(`, `)`) — to SKIP when scanning the prefix for linkage.
+    // Any prefix token whose kind is NOT in this set MUST resolve in
+    // `linkageSpecifiers`, else it is an unrecognized specifier and fails loud
+    // (`H_UnknownLinkageSpecifier`). The skip-list's DEFAULT is fail-loud: an
+    // unanticipated/typo'd specifier (a kind not listed here) is validated, so it
+    // ERRORS rather than being silently ignored — the safe direction. Resolved
+    // loader-side from token-kind names (unknown name → fail-loud). Empty for a
+    // declaration form that derives no linkage from specifiers.
+    std::vector<SchemaTokenId> linkageSpecifierIgnoredKinds;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
     // D8 unused-variable warning: when true, a symbol minted by this

@@ -905,6 +905,35 @@ TEST(MirLoweringCSubsetLinkage, WeakAttributeThreadsToMirBinding) {
         << "__attribute__((weak)) must thread to exactly one MirFunc binding==Weak";
 }
 
+// D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14): an UNRECOGNIZED
+// specifier inside `__attribute__((...))` — a typo (`bogus`) or an unsupported
+// attribute — FAILS LOUD (H_UnknownLinkageSpecifier), never silently ignored. The
+// validation lives in the single `linkageFrom` chokepoint, which `lowerTopLevel`
+// (func + var) AND `lowerExternDecl` all route through — so coverage is
+// by-construction across every decl-lowering arm. RED-ON-DISABLE: drop the emit in
+// `linkageFrom` and `bogus` is silently skipped → both these go green-when-broken.
+TEST(MirLoweringCSubsetLinkage, UnknownAttributeOnFunctionFailsLoud) {
+    auto L = lowerCSubset("__attribute__((bogus)) int f() { return 0; }\n");
+    EXPECT_FALSE(L.hir->ok)
+        << "an unrecognized linkage specifier must fail HIR lowering, not be ignored";
+    std::size_t n = 0;
+    for (auto const& d : L.hirReporter.all())
+        if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;
+    EXPECT_EQ(n, 1u) << "exactly one H_UnknownLinkageSpecifier for 'bogus'";
+}
+
+// The variable FORM (the other arm through lowerTopLevel) — same fail-loud, proving
+// the contract holds for every form that carries a specifier prefix, not just funcs.
+TEST(MirLoweringCSubsetLinkage, UnknownAttributeOnVariableFailsLoud) {
+    auto L = lowerCSubset("__attribute__((bogus)) int g;\n");
+    EXPECT_FALSE(L.hir->ok)
+        << "an unrecognized linkage specifier on a variable must fail loud";
+    std::size_t n = 0;
+    for (auto const& d : L.hirReporter.all())
+        if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;
+    EXPECT_EQ(n, 1u) << "exactly one H_UnknownLinkageSpecifier for 'bogus' on the var form";
+}
+
 // ─── ML2 cycle 3b: lvalue-via-alloca ──────────────────────────────────────
 
 // Body-local VarDecl with initializer lowers to Alloca + Store. The local's
