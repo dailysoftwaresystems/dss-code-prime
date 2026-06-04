@@ -112,15 +112,15 @@ The master plan lists eight specific passes (constant folding, propagation, DCE,
 | G-401 | Constant folding. Trivially safe; produces noticeably smaller binaries. | **Mandatory.** Even at `-O0`. |
 | G-402 | Dead code elimination (block-level). Same. | **Mandatory.** Required for sensible binary sizes. |
 | G-403 | Copy propagation + value numbering. | **Mandatory at -O1.** Otherwise the IR is full of redundant temporaries. |
-| G-404 | CSE (common subexpression elimination). | **Optional v1.** Real gains but bug-prone; defer to v1.1. |
-| G-405 | Loop-invariant code motion. | **Optional v1.** Requires loop detection on the CFG — non-trivial. |
-| G-406 | Inlining. | **Out of v1.** Significant complexity; needs a heuristic + size budget. |
+| G-404 | CSE (common subexpression elimination). | ✅ **DONE 2026-06-03** — `src/opt/passes/cse.{hpp,cpp}` (OPT5 c1 `ec7220b`). Dom-tree-scoped value numbering with operand canonicalization for commutative 2-operand ops; transitive `cseMap_` resolution + path-compression. Alias-aware Load admission landed cycle 10a-10g (`mirMayAlias` Rule 6 distinct non-char primitives → No alias under strict-TBAA). Strict-aliasing arc capstone end-to-end (cycle 10i + tightened 10o): corpus binary differential + MIR-tier `mutationCount[Cse] == 1u` + Add-operand-identity substitution-direction pin. |
+| G-405 | Loop-invariant code motion. | ✅ **DONE 2026-06-03..04** — `src/opt/passes/licm.{hpp,cpp}` (OPT6 c1 `164a1ca` + `93362f1`). Natural-loop detection via back-edges (`mirNaturalLoops` in `mir_dom.hpp`); hoist pure invariants to unique non-back-edge preheader. **Chained-invariants closed cycle 10j** (`35cc798`): per-loop fixed-point iteration + monotone-growing `hoistedInThisLoop` set + structural-derived iter cap (10o) + silent-miscompile negative regression test. **Remaining deferrals**: preheader insertion for multi-non-back-edge-pred loops (D-OPT6-LICM-PREHEADER-INSERTION; ambiguous-preheader skip is now observable via Info diagnostic 10l `7629f5f`); trap-safe SDiv/UDiv hoist (D-OPT6-LICM-TRAP-SAFE-HOIST) blocked on D-CSUBSET-DIVISION-OP-CODEGEN. |
+| G-406 | Inlining. | **Out of v1.** Significant complexity; needs a heuristic + size budget. **HARD STOP boundary per autonomous-loop guardrails — supervised cycle when opened (OPT7).** |
 | G-407 | Strength reduction (`x*8` → `x<<3` etc.). | **Optional v1.** Backend can do these as peepholes instead. |
-| G-408 | Dominator-tree analysis. | **Mandatory.** SSA requires it. |
-| G-409 | Liveness analysis. | **Mandatory.** Register allocation requires it. |
+| G-408 | Dominator-tree analysis. | ✅ **DONE 2026-06-03** — `src/mir/mir_dom.hpp` + `.cpp` (extracted OPT4 c1 `256b970`; hpp/cpp split OPT7-prep cycle 10e). Cooper-Harvey-Kennedy idom + tri-state `dominates` + `mirDominanceFrontier` + `mirDomTreeChildren` + `mirIteratedDominanceFrontier`. Consumers: MirVerifier + Mem2Reg + CopyProp + CSE + SimplifyCFG + LICM (+ transitively mir_alias.hpp). |
+| G-409 | Liveness analysis. | ✅ **DONE 2026-06-03** — landed in DCE pass (OPT3 c1 `52c1380`) via 3-layer reachability (inter-procedural live-symbol BFS + per-function CFG RPO + intra-block live-inst worklist). Linear-scan regalloc's liveness analysis landed earlier in MIR plan (ML6 cycle 1 `bc596ae`). |
 | G-410 | Reaching definitions. | **Optional v1.** Required for some optimizations not in the v1 set. |
 
-**v1 acceptance:** Constant folding + DCE + copy propagation + dominator tree + liveness. Other passes deferred to v1.1.
+**v1 acceptance:** Constant folding + DCE + copy propagation + dominator tree + liveness. **OVER-DELIVERED 2026-06-03..04**: also shipped Mem2Reg (OPT4 c2) + CSE (OPT5 c1) + SimplifyCFG (OPT5+ c2/c3) + LICM (OPT6 c1 + chained-invariants 10j) + pipeline-level fixed-point loop (OPT5+ c2) + alias-arc strict capstone end-to-end (10i + 10o). Inlining (G-406) deferred to OPT7 (hard-stop per autonomous-loop guardrails — supervised cycle).
 
 ---
 
