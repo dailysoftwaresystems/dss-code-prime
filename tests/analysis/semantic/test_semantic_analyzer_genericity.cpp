@@ -243,6 +243,115 @@ TEST(SemanticAnalyzerGenericity, SyntheticWideningInitIsClean) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
+// ── D-DECL-SPECIFIER-PREFIX-SUBSTRATE genericity (specifier-prefix decl) ────
+//
+// A miniature language `SpecSynth` whose declaration form `sdecl` carries an
+// OPTIONAL leading declaration-specifier prefix (`specs` → the `stat`
+// keyword), declared via the `specifierPrefix` facet. Proves the engine
+// STRIPS that prefix before resolving the positional `type:0`/`name:1`
+// indices — so a `static`-style specifier does not shift them. Rule/token
+// names are non-shipped (engine-generic). RED-ON-DISABLE: delete the strip in
+// `declRoleChildren` and the first test fails (name:1 hits the type node,
+// type:0 hits the specifier).
+namespace {
+
+constexpr char kSpecPrefixSchemaText[] = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "SpecSynth", "version": "0.0.1", "fileExtensions": [".ssyn"] },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\t": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "=": [{ "kind": "Eq" }],
+    ";": [{ "kind": "Semi" }]
+  },
+  "keywords": [
+    { "word": "stat", "kind": "StatKw" },
+    { "word": "wide", "kind": "WideKw" },
+    { "word": "aa", "kind": "Word" },
+    { "word": "cc", "kind": "Word" }
+  ],
+  "syncTokens": [ "Semi" ],
+  "shapes": {
+    "root":     { "sequence": [ { "repeat": "sdecl" } ] },
+    "sdecl":    { "sequence": [ { "optional": "specs" }, "typeName", "Word", "Eq", "use", "Semi" ] },
+    "specs":    { "sequence": [ "StatKw" ] },
+    "typeName": { "alt": [ "WideKw" ] },
+    "use":      { "sequence": [ "Word" ] }
+  },
+  "semantics": {
+    "identifierToken": "Word",
+    "declarations": [
+      { "rule": "sdecl", "specifierPrefix": "specs",
+        "type": 0, "name": 1, "init": 3, "kind": "variable" }
+    ],
+    "references": [ { "rule": "use" } ],
+    "builtinTypes": [ { "name": "wide", "core": "I32" } ]
+  }
+})JSON";
+
+[[nodiscard]] std::shared_ptr<CompilationUnit const> buildSpecPrefixCu(std::string source) {
+    auto loaded = GrammarSchema::loadFromText(kSpecPrefixSchemaText, "<specsynth>");
+    if (!loaded) {
+        ADD_FAILURE() << "spec-prefix schema failed to load";
+        std::abort();
+    }
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(std::move(source), "<specsynth-mem>");
+    return std::make_shared<CompilationUnit>(std::move(builder).finish());
+}
+
+} // namespace
+
+// WITH a leading specifier: `stat wide aa = aa;` — the `stat` prefix is
+// stripped, so type:0 → `wide` (I32) and name:1 → `aa`. RED-ON-DISABLE:
+// without the strip, name:1 lands on the typeName node (symbol != "aa") and
+// type:0 lands on the `stat` specifier (not a builtin type).
+TEST(SemanticAnalyzerGenericity, SpecifierPrefixStrippedFromPositionalIndices) {
+    auto cu = buildSpecPrefixCu("stat wide aa = aa;");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_EQ(model.symbols().size() - 1, 1u);
+    EXPECT_EQ(model.symbols()[1].name, "aa")
+        << "name:1 resolves to the identifier AFTER the stripped specifier prefix";
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(model.symbols()[1].type), TypeKind::I32)
+        << "type:0 resolves to the typeName (wide=I32) AFTER the stripped prefix";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u);
+}
+
+// WITHOUT a specifier: `wide cc = cc;` resolves identically — proving the
+// strip is presence-gated (declRoleChildren == visibleChildren when the
+// prefix is absent), so the substrate is inert for no-specifier declarations.
+TEST(SemanticAnalyzerGenericity, SpecifierPrefixAbsentResolvesNormally) {
+    auto cu = buildSpecPrefixCu("wide cc = cc;");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_EQ(model.symbols().size() - 1, 1u);
+    EXPECT_EQ(model.symbols()[1].name, "cc");
+    auto const& interner = model.lattice().interner();
+    EXPECT_EQ(interner.kind(model.symbols()[1].type), TypeKind::I32);
+}
+
+// Fail-loud: a `specifierPrefix` naming a rule the grammar does not define is
+// rejected at load with C_UnknownShape (mirrors arraySuffix.rule validation).
+TEST(SemanticAnalyzerGenericity, SpecifierPrefixUnknownRuleRejectedAtLoad) {
+    std::string bad = kSpecPrefixSchemaText;
+    constexpr char kFrom[] = "\"specifierPrefix\": \"specs\"";
+    auto const pos = bad.find(kFrom);
+    ASSERT_NE(pos, std::string::npos);
+    bad.replace(pos, std::string(kFrom).size(),
+                "\"specifierPrefix\": \"noSuchRule\"");
+    auto loaded = GrammarSchema::loadFromText(bad, "<specsynth-bad>");
+    ASSERT_FALSE(loaded) << "unknown specifierPrefix rule must fail the load";
+    bool sawUnknownShape = false;
+    for (auto const& d : loaded.error()) {
+        if (d.code == DiagnosticCode::C_UnknownShape) sawUnknownShape = true;
+    }
+    EXPECT_TRUE(sawUnknownShape) << "unknown specifierPrefix rule → C_UnknownShape";
+}
+
 // ── SE4 + SE5 + SE6 genericity (a SECOND synthetic schema) ─────────────────
 //
 // A different miniature language `Synth2` proving const-correctness (SE4),

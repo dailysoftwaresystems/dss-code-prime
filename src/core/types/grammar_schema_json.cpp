@@ -3129,6 +3129,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // D-DECL-SPECIFIER-PREFIX-SUBSTRATE (2026-06-04): an
+                        // optional leading declaration-specifier prefix RULE
+                        // (e.g. C `static` / `__attribute__((...))`). When this
+                        // rule is the declaration's FIRST visible child it is
+                        // stripped before positional name/type/params/body/
+                        // kindByChild index resolution, so those indices stay
+                        // stable with or without specifiers. Unknown rule is
+                        // C_UnknownShape; the declaration is still usable (no
+                        // prefix stripped). Source-language agnostic — each
+                        // language names its own prefix rule.
+                        if (entry.contains("specifierPrefix")) {
+                            if (!entry.at("specifierPrefix").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/specifierPrefix",
+                                          "'specifierPrefix' must be a rule-name string");
+                            } else {
+                                auto const sp =
+                                    entry.at("specifierPrefix").get<std::string>();
+                                if (!data.rules->contains(sp)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/specifierPrefix",
+                                              std::format("'declarations[{}].specifierPrefix' "
+                                                          "references unknown shape '{}'",
+                                                          i, sp));
+                                } else {
+                                    rule.specifierPrefixRule = data.rules->find(sp);
+                                }
+                            }
+                        }
+
                         // SE-arrays (HR9): optional C-style declarator suffix.
                         //   "arraySuffix": { "rule": "arrayDeclSuffix",
                         //                    "lengthChild": 1 }

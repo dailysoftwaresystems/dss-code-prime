@@ -172,6 +172,19 @@ struct DSS_EXPORT DeclarationRule {
     // `nullopt` ⇒ the language has no variadic-marker for this
     // declaration form (the FnSig is always non-variadic).
     std::optional<SchemaTokenId> variadicMarker;
+    // D-DECL-SPECIFIER-PREFIX-SUBSTRATE (2026-06-04): an optional leading
+    // declaration-specifier prefix — a child whose rule is this RuleId, sitting
+    // BEFORE the type/name (e.g. C `static int f()` / `__attribute__((weak)) int
+    // g()`). When set AND the declaration's first visible child matches this
+    // rule, the resolver STRIPS it before resolving the positional
+    // `typeChild`/`nameChild`/`paramsChild`/`bodyChild`/`kindByChild` indices, so
+    // those indices stay stable whether or not specifiers are present (a leading
+    // optional child would otherwise shift them). The prefix subtree remains
+    // reachable for a per-language specifier→attribute scan (e.g. linkage). The
+    // engine learns nothing language-specific: WHICH rule is the prefix, and what
+    // its specifiers mean, are both per-language config. `nullopt` ⇒ this
+    // declaration form has no specifier prefix (every shipped decl today).
+    std::optional<RuleId>        specifierPrefixRule;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
     // D8 unused-variable warning: when true, a symbol minted by this

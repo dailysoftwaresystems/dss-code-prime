@@ -185,6 +185,46 @@ descendVisible(Tree const& tree, NodeId start,
     return cur;
 }
 
+// D-DECL-SPECIFIER-PREFIX-SUBSTRATE (2026-06-04): a declaration's "role
+// children" — its visible children with a leading declaration-specifier prefix
+// stripped, when the rule declares a `specifierPrefixRule` AND that rule is the
+// first visible child. Positional name/type/params/body/kindByChild indices
+// resolve against THESE, so they stay stable whether or not specifiers
+// (`static`, `__attribute__((...))`) are present. With no prefix
+// declared/present this is exactly `visibleChildren` — the no-op that keeps
+// every shipped declaration (none declare a prefix today) unchanged.
+[[nodiscard]] std::vector<NodeId>
+declRoleChildren(Tree const& tree, NodeId node, DeclarationRule const& decl) {
+    auto kids = visibleChildren(tree, node);
+    if (decl.specifierPrefixRule.has_value() && !kids.empty()
+        && tree.kind(kids.front()) == NodeKind::Internal
+        && tree.rule(kids.front()) == *decl.specifierPrefixRule) {
+        kids.erase(kids.begin());
+    }
+    return kids;
+}
+
+// `descendVisible` whose FIRST path step indexes into the declaration's
+// role-children (specifier-prefix stripped); later steps descend via the
+// ordinary `visibleChildren`. Lets a `kindByChild` childPath be authored
+// against the same prefix-free numbering as name/type/etc.
+[[nodiscard]] NodeId
+descendVisibleDecl(Tree const& tree, NodeId start,
+                   std::vector<std::uint32_t> const& path,
+                   DeclarationRule const& decl) {
+    if (path.empty()) return start;
+    auto roleKids = declRoleChildren(tree, start, decl);
+    if (path.front() >= roleKids.size()) return {};
+    NodeId cur = roleKids[path.front()];
+    for (std::size_t i = 1; i < path.size(); ++i) {
+        if (!cur.valid()) return {};
+        auto kids = visibleChildren(tree, cur);
+        if (path[i] >= kids.size()) return {};
+        cur = kids[path[i]];
+    }
+    return cur;
+}
+
 // Forward declarations (these helpers are referenced by the passes
 // before their definitions appear). `CallRule` comes from
 // semantic_config.hpp (dss namespace).
@@ -667,7 +707,7 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         auto declIt = s.idx().declByRule.find(rule.v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = visibleChildren(tree, node);
+            auto kids = declRoleChildren(tree, node, decl);
 
             // Evaluate the kindByChild discriminator (if any) BEFORE
             // minting the symbol so its `kind` reflects the structural
@@ -676,7 +716,7 @@ void pass1(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             DeclarationKind effectiveKind = decl.kind;
             if (decl.kindByChild.has_value()) {
                 auto const& disc = *decl.kindByChild;
-                NodeId const disChild = descendVisible(tree, node, disc.childPath);
+                NodeId const disChild = descendVisibleDecl(tree, node, disc.childPath, decl);
                 if (disChild.valid()
                     && tree.kind(disChild) == NodeKind::Internal
                     && tree.rule(disChild) == disc.whenRule) {
@@ -819,7 +859,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
         auto declIt = s.idx().declByRule.find(rule.v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = visibleChildren(tree, node);
+            auto kids = declRoleChildren(tree, node, decl);
             if (decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 auto resolved = extractNameNode(
                     tree, kids[*decl.nameChild], decl.nameMatch, cfg.identifierToken,
@@ -846,7 +886,7 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     if (decl.kindByChild.has_value()) {
                         auto const& disc = *decl.kindByChild;
                         NodeId const disChild =
-                            descendVisible(tree, node, disc.childPath);
+                            descendVisibleDecl(tree, node, disc.childPath, decl);
                         if (disChild.valid()
                             && tree.kind(disChild) == NodeKind::Internal
                             && tree.rule(disChild) == disc.whenRule) {
@@ -1149,7 +1189,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 auto parentDeclIt = s.idx().declByRule.find(parentRule.v);
                 if (parentDeclIt != s.idx().declByRule.end()) {
                     auto const& parentDecl = cfg.declarations[parentDeclIt->second];
-                    auto kids = visibleChildren(tree, parent);
+                    auto kids = declRoleChildren(tree, parent, parentDecl);
                     if (parentDecl.nameChild.has_value()
                         && *parentDecl.nameChild < kids.size()
                         && kids[*parentDecl.nameChild].v == node.v) {
@@ -1409,7 +1449,7 @@ void pass2(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         auto declIt = s.idx().declByRule.find(rule.v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = visibleChildren(tree, node);
+            auto kids = declRoleChildren(tree, node, decl);
             if (decl.initChild.has_value() && *decl.initChild < kids.size()
                 && decl.nameChild.has_value() && *decl.nameChild < kids.size()) {
                 NodeId initNode = kids[*decl.initChild];
@@ -1562,7 +1602,7 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
         auto declIt = s.idx().declByRule.find(tree.rule(cur).v);
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
-            auto kids = visibleChildren(tree, cur);
+            auto kids = declRoleChildren(tree, cur, decl);
             if (decl.typeChild.has_value() && *decl.typeChild < kids.size()) {
                 TypeId pty = resolveTypeNode(
                     s, cfg, tree, kids[*decl.typeChild], scope);
