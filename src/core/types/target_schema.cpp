@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <span>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
