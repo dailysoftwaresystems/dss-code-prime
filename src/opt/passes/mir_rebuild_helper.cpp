@@ -11,10 +11,19 @@
 
 namespace dss::opt::passes {
 
+
 GlobalClonePrelude
 cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
                        DiagnosticReporter& reporter,
                        std::string_view passName) {
+    // Propagate the module-level alias-analysis polarity through every
+    // optimizer pass's rebuild. WITHOUT this line, MirBuilder defaults
+    // to Permissive and a release pipeline `[ConstFold, ..., Cse, Licm,
+    // ...]` silently downgrades strict-TBAA to Permissive after the
+    // first rebuild — CSE/LICM later in the pipeline read the wrong
+    // polarity. Closes D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE.
+    builder.setAliasingMode(mir.aliasingMode());
+
     std::size_t const ng = mir.moduleGlobalCount();
     for (std::uint32_t i = 0; i < ng; ++i) {
         if (mir.globalInitFunc(mir.globalAt(i)).valid()) {

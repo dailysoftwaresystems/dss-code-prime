@@ -93,7 +93,9 @@ struct CseKeyHash {
 class CsePolicy final : public MirRebuildPolicy {
 public:
     CsePolicy(Mir const& src, TypeInterner const& interner) noexcept
-        : src_(src), interner_(interner) {}
+        : src_(src), interner_(interner),
+          strictTbaa_(src.aliasingMode() == MirAliasingMode::StrictTBAA
+                      ? StrictTbaa::Yes : StrictTbaa::No) {}
 
     [[nodiscard]] std::size_t instructionsCsed() const noexcept {
         return instructionsCsed_;
@@ -138,6 +140,7 @@ private:
 
     Mir const&          src_;
     TypeInterner const& interner_;
+    StrictTbaa const    strictTbaa_;
     // Old-id → canonical-old-id. Built by analyze() via dom-tree DFS
     // with a scoped value-numbering table; path-compressed after.
     std::unordered_map<MirInstId, MirInstId> cseMap_;
@@ -278,8 +281,7 @@ void CsePolicy::analyze(MirFuncId fn) {
                             }
                             if (mirMayAlias(src_, interner_,
                                             loadPtr, sops[1],
-                                            // TODO(D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING)
-                                            StrictTbaa::No)
+                                            strictTbaa_)
                                 != MirAliasResult::No) {
                                 return true;
                             }
@@ -318,8 +320,7 @@ void CsePolicy::analyze(MirFuncId fn) {
                                 src_, canonicalBlock, B);
                             if (mirAnyMayAliasingStoreInRegion(
                                     src_, interner_, loadPtr, region,
-                                    // TODO(D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING)
-                                    StrictTbaa::No)) {
+                                    strictTbaa_)) {
                                 admit = false;
                             }
                         }

@@ -227,6 +227,90 @@ TEST(MirAlias, RefAndPtrBothExtractPointee) {
               MirAliasResult::No);
 }
 
+// ── Mir.aliasingMode substrate (D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING) ──
+
+// Default aliasing mode is Permissive — substrate is sound out of the
+// box for any language that doesn't explicitly opt into strict TBAA.
+TEST(MirAlias, MirAliasingModeDefaultIsPermissive) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    EXPECT_EQ(mir.aliasingMode(), MirAliasingMode::Permissive);
+}
+
+// MirBuilder::setAliasingMode propagates through finish() — the
+// frozen Mir reflects what the builder was told. Round-trip pin.
+TEST(MirAlias, MirBuilderSetAliasingModeRoundTrips) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    EXPECT_EQ(mir.aliasingMode(), MirAliasingMode::StrictTBAA);
+}
+
+// Mir's move ctor preserves the aliasing mode (and resets the source
+// to Permissive — matching the reset-to-default discipline used for
+// the moved-from arena state).
+TEST(MirAlias, MirMoveCtorPreservesAliasingMode) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+    Mir const moved = std::move(mir);
+
+    EXPECT_EQ(moved.aliasingMode(), MirAliasingMode::StrictTBAA);
+    EXPECT_EQ(mir.aliasingMode(), MirAliasingMode::Permissive)
+        << "moved-from Mir must reset to Permissive";
+}
+
+// Move-assignment symmetry: assignment also propagates + resets. The
+// move ctor and move assignment are independently implemented in
+// rule-of-5 types, so this is a distinct pin from the ctor test above.
+TEST(MirAlias, MirMoveAssignmentPreservesAliasingMode) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+
+    MirBuilder mbStrict;
+    mbStrict.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mbStrict.addFunction(fnSig, SymbolId{100});
+    MirBlockId const e1 = mbStrict.createBlock(StructCfMarker::EntryBlock);
+    mbStrict.beginBlock(e1);
+    mbStrict.addReturn();
+    Mir strict = std::move(mbStrict).finish();
+
+    MirBuilder mbPerm;
+    mbPerm.addFunction(fnSig, SymbolId{101});
+    MirBlockId const e2 = mbPerm.createBlock(StructCfMarker::EntryBlock);
+    mbPerm.beginBlock(e2);
+    mbPerm.addReturn();
+    Mir target = std::move(mbPerm).finish();
+
+    target = std::move(strict);
+    EXPECT_EQ(target.aliasingMode(), MirAliasingMode::StrictTBAA);
+    EXPECT_EQ(strict.aliasingMode(), MirAliasingMode::Permissive);
+}
+
 // ── Symmetry property test (Rule 5 commutativity proven; widen
 // coverage so future asymmetric rules can't slip through) ────────────
 

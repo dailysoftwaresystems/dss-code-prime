@@ -257,6 +257,12 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
                  DiagnosticReporter& reporter) {
     DceResult result{};
     MirBuilder builder;
+    // DCE bypasses `cloneGlobalsOrCarveOut` (see comment below); we
+    // duplicate that helper's `setAliasingMode` propagation here so the
+    // fixed-point pipeline loop doesn't silently downgrade strict-TBAA
+    // to Permissive on the iteration following DCE
+    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE).
+    builder.setAliasingMode(mir.aliasingMode());
 
     // DCE has the same runtime-init carve-out as the other passes but
     // CANNOT use the shared `cloneGlobalsOrCarveOut` helper: DCE elides

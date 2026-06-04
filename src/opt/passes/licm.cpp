@@ -62,7 +62,9 @@ using dss::opt::analysis::mirAnyMayAliasingStoreInLoop;
 class LicmPolicy final : public MirRebuildPolicy {
 public:
     LicmPolicy(Mir const& src, TypeInterner const& interner) noexcept
-        : src_(src), interner_(interner) {}
+        : src_(src), interner_(interner),
+          strictTbaa_(src.aliasingMode() == MirAliasingMode::StrictTBAA
+                      ? StrictTbaa::Yes : StrictTbaa::No) {}
 
     [[nodiscard]] std::size_t instructionsHoisted() const noexcept {
         return instructionsHoisted_;
@@ -158,6 +160,7 @@ private:
 
     Mir const&          src_;
     TypeInterner const& interner_;
+    StrictTbaa const    strictTbaa_;
 
     // Per-function analysis state. Counters live across functions.
     std::unordered_set<MirInstId> hoistedInsts_;                          // body-side: skip via shouldEmit
@@ -246,8 +249,7 @@ void LicmPolicy::analyze(MirFuncId fn) {
                     }
                     if (mirAnyMayAliasingStoreInLoop(
                             src_, interner_, lops[0], loop.body,
-                            // TODO(D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING)
-                            StrictTbaa::No)) {
+                            strictTbaa_)) {
                         continue;  // clobbered in body
                     }
                 }

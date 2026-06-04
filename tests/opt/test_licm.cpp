@@ -242,6 +242,107 @@ TEST(Licm, LoadNotHoistedAcrossAliasingStoreInLoop) {
         << "aliasing Store in loop body must block Load hoist";
 }
 
+// Strict-TBAA precision pin: under MirAliasingMode::StrictTBAA, a Store
+// through Ptr<I64> inside the loop body cannot alias a Load through
+// Ptr<I32>; the Load hoists. Closes
+// D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING on the LICM side.
+TEST(Licm, LoadHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAA) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32     = interner.primitive(TypeKind::I32);
+    TypeId const i64     = interner.primitive(TypeKind::I64);
+    TypeId const boolT   = interner.primitive(TypeKind::Bool);
+    TypeId const ptrI32  = interner.pointer(i32);
+    TypeId const ptrI64  = interner.pointer(i64);
+    TypeId const params[] = {ptrI32, ptrI64};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirInstId const pI32 = mb.addArg(0, ptrI32);
+    MirInstId const pI64 = mb.addArg(1, ptrI64);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    MirInstId const lops[] = {pI32};
+    (void)mb.addInst(MirOpcode::Load, lops, i32);
+    // Store through Ptr<I64> — strict-TBAA: doesn't alias the I32 Load.
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I64;
+    MirInstId const c0 = mb.addConst(v0, i64);
+    MirInstId const sOps[] = {c0, pI64};
+    (void)mb.addInst(MirOpcode::Store, sOps, InvalidType);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0r; v0r.value = std::int64_t{0}; v0r.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0r, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 1u)
+        << "strict-TBAA: Store<I64> in body cannot alias Load<I32>; LICM hoists";
+}
+
+// Negative polarity for the above: same fixture under Permissive (the
+// default) refuses the hoist. Paired with the strict-TBAA positive,
+// proves the LICM consumer reads `mir.aliasingMode()` rather than
+// hardcoding one polarity.
+TEST(Licm, LoadNotHoistedAcrossDistinctPrimitiveStoreInLoopUnderPermissive) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32     = interner.primitive(TypeKind::I32);
+    TypeId const i64     = interner.primitive(TypeKind::I64);
+    TypeId const boolT   = interner.primitive(TypeKind::Bool);
+    TypeId const ptrI32  = interner.pointer(i32);
+    TypeId const ptrI64  = interner.pointer(i64);
+    TypeId const params[] = {ptrI32, ptrI64};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // Explicit (not relying on default) so a future flip of the default
+    // can't silently make this test vacuous.
+    mb.setAliasingMode(MirAliasingMode::Permissive);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirInstId const pI32 = mb.addArg(0, ptrI32);
+    MirInstId const pI64 = mb.addArg(1, ptrI64);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    MirInstId const lops[] = {pI32};
+    (void)mb.addInst(MirOpcode::Load, lops, i32);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I64;
+    MirInstId const c0 = mb.addConst(v0, i64);
+    MirInstId const sOps[] = {c0, pI64};
+    (void)mb.addInst(MirOpcode::Store, sOps, InvalidType);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0r; v0r.value = std::int64_t{0}; v0r.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0r, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 0u)
+        << "Permissive: distinct primitive pointees stay Maybe; LICM refuses";
+}
+
 // Volatile-flagged inst NOT hoisted even if otherwise invariant.
 TEST(Licm, VolatileBinaryOpNotHoisted) {
     TypeInterner interner{CompilationUnitId{1}};

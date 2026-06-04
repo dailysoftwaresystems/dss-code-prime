@@ -60,7 +60,8 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
          GlobalArena globalArena,
          std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
          std::vector<MirPhiIncoming> phiPool, std::vector<MirBlockId> succPool,
-         MirLiteralPool literalPool) noexcept
+         MirLiteralPool literalPool,
+         MirAliasingMode aliasingMode) noexcept
     : instArena_(std::move(instArena)),
       blockArena_(std::move(blockArena)),
       funcArena_(std::move(funcArena)),
@@ -69,7 +70,8 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
       operandPool_(std::move(operandPool)),
       phiPool_(std::move(phiPool)),
       succPool_(std::move(succPool)),
-      literalPool_(std::move(literalPool)) {
+      literalPool_(std::move(literalPool)),
+      aliasingMode_(aliasingMode) {
     // The four arenas are tagged by ONE module id (the cross-tier guard relies
     // on it: a MirBlockId and a MirInstId of the same module share the tag). A
     // direct (non-builder) ctor that mismatched them would let an id from one
@@ -105,7 +107,9 @@ Mir::Mir(Mir&& other) noexcept
       operandPool_(std::move(other.operandPool_)),
       phiPool_(std::move(other.phiPool_)),
       succPool_(std::move(other.succPool_)),
-      literalPool_(std::move(other.literalPool_)) {
+      literalPool_(std::move(other.literalPool_)),
+      aliasingMode_(other.aliasingMode_) {
+    other.aliasingMode_ = MirAliasingMode::Permissive;
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_);
@@ -122,6 +126,8 @@ Mir& Mir::operator=(Mir&& other) noexcept {
     phiPool_     = std::move(other.phiPool_);
     succPool_    = std::move(other.succPool_);
     literalPool_ = std::move(other.literalPool_);
+    aliasingMode_ = other.aliasingMode_;
+    other.aliasingMode_ = MirAliasingMode::Permissive;
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
                     other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_);
@@ -914,7 +920,8 @@ Mir MirBuilder::finish() && {
                std::move(funcArena_).finish(), std::move(globalArena_).finish(),
                std::move(instBlock_),
                std::move(operandPool_), std::move(phiPool_), std::move(succPool_),
-               std::move(literalPool_)};
+               std::move(literalPool_),
+               aliasingMode_};
 }
 
 } // namespace dss

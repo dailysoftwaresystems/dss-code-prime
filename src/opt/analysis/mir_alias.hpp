@@ -20,6 +20,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_cfg.hpp"
+#include "mir/mir_dom.hpp"
 #include "mir/mir_opcode.hpp"
 
 #include <cstdint>

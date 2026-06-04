@@ -288,6 +288,91 @@ TEST(Cse, LoadCsedAcrossDistinctAllocaStore) {
         << "Store to distinct Alloca must not block Load CSE on a different Alloca";
 }
 
+// Strict-TBAA precision pin: under MirAliasingMode::StrictTBAA, a Store
+// through a Ptr<I64> cannot alias a Load through Ptr<I32> (Rule 5 in
+// mirMayAlias). Pointers are Args (not Allocas), so Rule 2 doesn't
+// preempt — this is the only path that exercises Rule 5 in CSE.
+// Closes D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING.
+TEST(Cse, LoadCsedAcrossDistinctPrimitiveStoreUnderStrictTBAA) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32     = interner.primitive(TypeKind::I32);
+    TypeId const i64     = interner.primitive(TypeKind::I64);
+    TypeId const ptrI32  = interner.pointer(i32);
+    TypeId const ptrI64  = interner.pointer(i64);
+    TypeId const params[] = {ptrI32, ptrI64};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const pI32 = mb.addArg(0, ptrI32);
+    MirInstId const pI64 = mb.addArg(1, ptrI64);
+    MirInstId const lops[] = {pI32};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);
+    // Intervening Store through Ptr<I64> — strict-TBAA says this
+    // cannot alias the I32 Load.
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I64;
+    MirInstId const c0 = mb.addConst(v0, i64);
+    MirInstId const sOps[] = {c0, pI64};
+    (void)mb.addInst(MirOpcode::Store, sOps, InvalidType);
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);
+    MirInstId const sum[] = {ld1, ld2};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 1u)
+        << "strict-TBAA: Store<I64> cannot alias Load<I32>; CSE must admit";
+}
+
+// Negative polarity: same fixture under MirAliasingMode::Permissive
+// (the default). Rule 5 doesn't fire, conservative Rule 6 returns
+// Maybe, CSE refuses. Pins the strict-TBAA flag is actually being
+// read at the consumer site (a regression that hardcodes
+// StrictTbaa::No would PASS this negative but FAIL the positive
+// above — together they make the wiring testable).
+TEST(Cse, LoadNotCsedAcrossDistinctPrimitiveStoreUnderPermissive) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32     = interner.primitive(TypeKind::I32);
+    TypeId const i64     = interner.primitive(TypeKind::I64);
+    TypeId const ptrI32  = interner.pointer(i32);
+    TypeId const ptrI64  = interner.pointer(i64);
+    TypeId const params[] = {ptrI32, ptrI64};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // Explicit Permissive (not relying on default) so a future flip
+    // of the default can't silently make this test vacuous.
+    mb.setAliasingMode(MirAliasingMode::Permissive);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const pI32 = mb.addArg(0, ptrI32);
+    MirInstId const pI64 = mb.addArg(1, ptrI64);
+    MirInstId const lops[] = {pI32};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I64;
+    MirInstId const c0 = mb.addConst(v0, i64);
+    MirInstId const sOps[] = {c0, pI64};
+    (void)mb.addInst(MirOpcode::Store, sOps, InvalidType);
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);
+    MirInstId const sum[] = {ld1, ld2};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 0u)
+        << "Permissive: distinct primitive pointees stay Maybe; CSE refuses";
+}
+
 // Volatile exclusion: a Volatile-flagged binary op participates in
 // neither side of a CSE merge.
 TEST(Cse, VolatileBinaryOpNotCsed) {
