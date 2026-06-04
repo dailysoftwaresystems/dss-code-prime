@@ -3,9 +3,9 @@ name: dss-cycle
 description: >
   Advance the DSS Code Prime compiler by exactly ONE development cycle: pick the next
   priority from the plan-00 §0.1 stepper, clear its blockers first, plan it with
-  /feature-dev:feature-dev, implement the best long-term solution, run
-  /pr-review-toolkit:review-pr, pin every deferral with a priority, cross-plan update,
-  commit and push. One cycle per invocation — meant to be driven by /loop for continuous
+  /feature-dev:feature-dev, design-audit the plan against the bar before locking it,
+  implement the best long-term solution, run /pr-review-toolkit:review-pr, pin every
+  deferral with a priority, cross-plan update, commit and push. One cycle per invocation — meant to be driven by /loop for continuous
   autonomous progress. PAUSES and asks the user on any pending definition, architectural
   fork, gated anchor, or hard-stop boundary; never guesses, never workarounds, never
   breaks source (language) / target (processor) / linker (object-format) agnosticism.
@@ -95,7 +95,7 @@ The loop resumes only after the user answers. While paused, do not start a diffe
 
 ---
 
-## C. The cycle — ten steps
+## C. The cycle — ten steps (+ the plan-lock design gate at Step 3.5)
 
 ### Step 0 — Orient
 - Check `git status` + current branch + the last commit subject. A `… WIP` cycle in flight
@@ -133,6 +133,43 @@ The loop resumes only after the user answers. While paused, do not start a diffe
 - Run `/feature-dev:feature-dev` on the priority to produce the execution plan (understand →
   design → build sequence). Keep its TodoWrite list as the cycle's working plan.
 - If the plan exposes an architectural fork or a pending definition → **§B gate**.
+
+### Step 3.5 — Design-audit the plan before lock (the plan-lock gate)
+Before any code is built (Step 4), the plan from Step 3 is **judged against the bar by an
+independent reviewer** — the `dss-audit` design-review lens on the *plan*, not yet on code. An
+agnosticism break, a tight-slice, a speculative build, or a weak-test plan caught here is far
+cheaper than after the diff lands. (This is the gate run on the linkage P1+P2 plan, 2026-06-04.)
+
+- **Independence is the point.** Spawn an **independent subagent** that applies the `dss-audit`
+  bar to the plan — fresh context, no stake in having authored it, so it cannot rubber-stamp its
+  own reasoning. For a **substrate / architectural-fork / new-mechanism** cycle this is *also* a
+  §B pause: route the plan + the review's findings to the user (the human-side `dss-audit` pass)
+  before resuming. **Scale the rigor:** a trivial mechanical cycle needs only a quick self-check
+  against the list below; a new engine mechanism needs the full independent review.
+- **What it checks — the bar (§A) + guardrails (§D), applied to a plan:**
+  - *Agnosticism (the #1 break point):* every new vocabulary config-driven with a generic engine
+    lookup — no planned `if (lang/arch/format == …)` in shared substrate.
+  - *Best-long-term / no tight slice:* the complete solution with the hard part landing this
+    cycle, not a stub dressed as "phase 1".
+  - *Trigger-discipline:* no speculative build of a trigger-gated or consumer-less mechanism (the
+    no-workaround violation in the *other* direction).
+  - *Fail-loud (planned):* every unsupported construct gets a real diagnostic — never a silent ignore.
+  - *Strict-test (planned):* the plan names the *strongest provable* test — red-on-disable for a
+    guard, effectiveness assertion for an optimization, a behavioral/differential pin for a
+    feature — not just "add a test".
+  - *Guardrails:* no OPT7 / hard-stop crossing, no closing a gated anchor with an unfired trigger,
+    no correctness-critical close without a constructible negative pin (§D).
+  - *Deferral honesty:* every deferral named + pinned (§F); runtime proof that only manifests
+    cross-CU / at-link is legitimately gated, not silently dropped.
+- **The gate is real, not advisory.** Every finding is **resolved in the plan before locking**; a
+  finding that implies an architectural choice escalates to a **§B gate**. Only a plan that clears
+  the bar proceeds to Step 4.
+- **It does NOT replace the post-build checks.** Step 5 (review & fold), Step 6 (fail-loud gate),
+  and the separate post-cycle `dss-audit` of the *built* artifacts all still run in full — the
+  built result is re-verified from scratch (green is never clean until re-run). The plan-lock gate
+  is an upstream filter, never a substitute, and a blessed plan earns the code no trust until the
+  build is independently audited. Judging the *plan* against the bar is not authoring it — the
+  post-build auditor's independence on the *code* stays intact.
 
 ### Step 4 — Implement
 - Build the **best long-term, agnostic** solution (§A). Extend config vocabulary, never
@@ -257,6 +294,7 @@ Every deferral is explicit, located, and prioritized — never silent.
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0.1 |
 | Deferral registry | `.plans/_deferred-anchor-registry.md` |
 | Per-cycle plan | `/feature-dev:feature-dev` (Step 3) |
+| Plan-lock design audit | independent `dss-audit` lens on the plan, pre-build (Step 3.5) |
 | Per-cycle review | `/pr-review-toolkit:review-pr` (Step 5) |
 | Conventions + strict tests | the `dss-code-prime` skill (§7, §9, §13) |
 
