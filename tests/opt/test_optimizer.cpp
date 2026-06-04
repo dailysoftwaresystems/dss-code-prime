@@ -19,6 +19,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "opt/optimizer.hpp"
+#include "opt/passes/cse.hpp"
 
 #include <gtest/gtest.h>
 
@@ -194,17 +195,17 @@ Mir buildConstFoldInsideExprMir(TypeInterner& interner) {
     return std::move(b).finish();
 }
 
-std::size_t countMulInModule(Mir const& mir) {
+std::size_t countOpInModule(Mir const& mir, MirOpcode op) {
     std::size_t n = 0;
     std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        MirFuncId const f = mir.funcAt(i);
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
         std::uint32_t const nb = mir.funcBlockCount(f);
         for (std::uint32_t bi = 0; bi < nb; ++bi) {
             MirBlockId const b = mir.funcBlockAt(f, bi);
             std::uint32_t const ni = mir.blockInstCount(b);
-            for (std::uint32_t i2 = 0; i2 < ni; ++i2) {
-                if (mir.instOpcode(mir.blockInstAt(b, i2)) == MirOpcode::Mul) ++n;
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                if (mir.instOpcode(mir.blockInstAt(b, ii)) == op) ++n;
             }
         }
     }
@@ -246,7 +247,7 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
             << "Mem2Reg must fire at least once on `x` and `a` (both "
                "promotable scalar allocas). Without Mem2Reg, the 8*2 "
                "fold opportunity never surfaces.";
-        EXPECT_EQ(countMulInModule(mir), 0u)
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Mul), 0u)
             << "the Mul on `x * 2` must be eliminated — folded by the "
                "re-run ConstFold + DCE-swept. Surviving Mul means the "
                "post-Mem2Reg fold never fired.";
@@ -284,7 +285,7 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
             << "with maxIterations=1, ConstFold runs exactly once and "
                "cannot re-fold post-Mem2Reg — this is the regression "
                "shape ARM 1 guards against";
-        EXPECT_GE(countMulInModule(mir), 1u)
+        EXPECT_GE(countOpInModule(mir, MirOpcode::Mul), 1u)
             << "the Mul survives the single-iter pipeline — the post-"
                "Mem2Reg fold opportunity was never reached";
     }
@@ -313,7 +314,184 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
                "re-fold effectiveness — a JSON edit that drops "
                "Mem2Reg or reorders ConstFold-then-Mem2Reg would "
                "regress without an inline-literal test catching it";
-        EXPECT_EQ(countMulInModule(mir), 0u);
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Mul), 0u);
+    }
+}
+
+// ── D-OPT-ALIAS-ARC-CORPUS-CAPSTONE-STRICT effectiveness pin ────────
+//
+// Hand-built mirror of `examples/c-subset/strict_alias_cse_capstone/
+// main.c`'s `compute(int* pI, long* pL){int a=*pI; *pL=7; return
+// a+*pI;}` shape — but the alloca on `a` is elided because the
+// effectiveness arc closes at MIR level on the Args directly (the
+// corpus binary differential covers the full alloca-promoted Mem2Reg
+// → Cse pipeline path; this pin closes the alias-rule → opcode-count
+// → passMutationCount arc target-blind).
+//
+// Why this is the strict arm's capstone: cycles 10a-10g built up the
+// alias substrate (mirMayAlias Rule 6 distinct non-char primitives;
+// strict-TBAA opt-in via `MirAliasingMode::StrictTBAA`); cycle 10h
+// added the `long`→I64 primitive so `Ptr<I32>` vs `Ptr<I64>` is
+// expressible in c-subset source. This pin proves the FULL release
+// pipeline observes the effectiveness — the second Load(pI) is
+// eliminated AND `passMutationCount[Cse] >= 1`. Without it, the
+// corpus row's runtime exit code agreement between baseline + Cse
+// arms is necessary but not sufficient: a hypothetical regression
+// that disabled CSE entirely would still pass the corpus differential
+// (both arms exit 10) while silently losing all CSE effectiveness.
+namespace {
+Mir buildAliasArcStrictCapstoneMir(TypeInterner& interner) {
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const i64    = interner.primitive(TypeKind::I64);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const ptrI64 = interner.pointer(i64);
+    TypeId const params[] = {ptrI32, ptrI64};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder b;
+    // Match the c-subset config: strictAliasingOnDistinctTypes=true
+    // + charTypesAliasAll=true. The capstone exercises Rule 6 (not
+    // Rule 5), so charTypesAliasAll's value doesn't gate the
+    // outcome — but setting both flags here keeps the fixture
+    // faithful to what the c-subset HIR→MIR lowering would stamp.
+    b.setAliasingMode(MirAliasingMode::StrictTBAA);
+    b.setCharTypesAliasAll(true);
+    b.addFunction(fnSig, SymbolId{100},
+                  SymbolBinding::Global, SymbolVisibility::Default);
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const pI = b.addArg(0, ptrI32);
+    MirInstId const pL = b.addArg(1, ptrI64);
+
+    // int a = *pI;
+    MirInstId const lOps[] = {pI};
+    MirInstId const ld1 = b.addInst(MirOpcode::Load, lOps, i32);
+
+    // *pL = 7;   (we use a direct I64 Const here — matches the
+    // shape the optimizer sees after ConstFold collapses any
+    // intervening I32→I64 SExt. Equivalent to `*pL = 7L;`)
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I64;
+    MirInstId const c7    = b.addConst(v7, i64);
+    MirInstId const stOps[] = {c7, pL};
+    (void)b.addInst(MirOpcode::Store, stOps, InvalidType);
+
+    // return a + *pI;
+    MirInstId const ld2 = b.addInst(MirOpcode::Load, lOps, i32);
+    MirInstId const addOps[] = {ld1, ld2};
+    MirInstId const sum = b.addInst(MirOpcode::Add, addOps, i32);
+    b.addReturn(sum);
+    return std::move(b).finish();
+}
+// (countOpInModule is defined earlier in this file's anonymous
+// namespace; cycle 10i post-fold unified it with the prior
+// `countMulInModule`, eliminating one-pattern-per-opcode growth.)
+} // namespace
+
+TEST(Optimizer, EffectivenessAliasArcStrictTBAACapstone) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
+    // ARM 1 — Identity-only baseline. CSE not in pipeline → both
+    // Loads survive; passMutationCount[Cse] == 0. Establishes the
+    // un-optimised shape against which ARM 2 + ARM 3 diff.
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAliasArcStrictCapstoneMir(interner);
+        ASSERT_EQ(mir.aliasingMode(), MirAliasingMode::StrictTBAA)
+            << "MirBuilder must propagate the strict-TBAA flag onto "
+               "the finished Mir — a flag-propagation regression would "
+               "make ARMs 2/3 silently behave like Permissive";
+        opt::OptPipeline const noop{
+            "identity-only", {opt::PassId::Identity}, /*maxIterations*/1};
+        DiagnosticReporter rep;
+        auto const result = opt::optimize(mir, target, interner, noop, rep);
+        ASSERT_TRUE(result.ok);
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 2u)
+            << "Identity-only must preserve both Loads — this is the "
+               "baseline shape against which the Cse arms diff";
+        EXPECT_EQ(result.mutationCount(opt::PassId::Cse), 0u)
+            << "Identity-only never invokes Cse";
+    }
+
+    // ARM 2 — `[Cse, Dce]` minimal effectiveness pipeline. CSE
+    // substitutes uses of Load2 with Load1 (instructionsCsed++)
+    // but leaves the redundant Load instruction in the rebuild —
+    // DCE is the pass that physically removes it once it's dead.
+    // Together the pair drops the Load count from 2 → 1 AND
+    // `passMutationCount[Cse] >= 1`. Without CSE: 2 Loads remain
+    // (Load2 still has uses via Add). Without DCE: CSE counter
+    // increments but Load2 lingers in the rebuilt MIR.
+    //
+    // Why both passes are required: this captures how the corpus
+    // capstone's effectiveness is observable post-DCE — the same
+    // way the existing `EffectivenessConstFoldRerunPostMem2Reg`
+    // test pairs ConstFold with DCE to make the Mul disappear.
+    // Tests that don't include the sweep would erroneously
+    // measure the substrate, not the user-visible outcome.
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAliasArcStrictCapstoneMir(interner);
+        ASSERT_EQ(mir.aliasingMode(), MirAliasingMode::StrictTBAA);
+        opt::OptPipeline const cseDce{
+            "cse-dce", {opt::PassId::Cse, opt::PassId::Dce},
+            /*maxIterations*/1};
+        DiagnosticReporter rep;
+        auto const result = opt::optimize(mir, target, interner, cseDce, rep);
+        ASSERT_TRUE(result.ok);
+        EXPECT_GE(result.mutationCount(opt::PassId::Cse), 1u)
+            << "passMutationCount[Cse] must be ≥1 — Rule 6 distinct "
+               "non-char primitives admits the second Load(pI) "
+               "against the first under strict-TBAA";
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 1u)
+            << "after Cse-then-Dce the redundant Load must be swept. "
+               "Two surviving Loads = either Cse didn't fire (alias "
+               "regression) OR Dce didn't sweep (DCE regression).";
+    }
+
+    // ARM 3 — SHIPPED release pipeline integration. Closes the loop
+    // between the in-test inline pipeline (ARM 2) and the actually-
+    // shipped JSON. A future edit to release.pipeline.json that
+    // drops Cse OR reorders such that the prior pass clobbers the
+    // CSE opportunity would regress here without ARM 2 catching it.
+    //
+    // Two pins: (a) the shipped JSON's `passes[]` MUST contain Cse —
+    // a config edit removing Cse breaks this loudly with a JSON-
+    // content message, distinct from the effectiveness message
+    // (a) below; (b) the effectiveness shape (Load==1 + Cse≥1)
+    // matches ARM 2 — proves the JSON pipeline doesn't accidentally
+    // INHIBIT the CSE opportunity through pass ordering.
+    {
+        auto pipelineR = opt::loadShippedPipeline("release");
+        ASSERT_TRUE(pipelineR.has_value())
+            << "shipped release.pipeline.json must load";
+
+        // Pin (a): the shipped pipeline MUST contain Cse. A JSON edit
+        // that drops Cse fails this distinct from the effectiveness
+        // check below, so the diagnostic surfaces the right cause.
+        bool containsCse = false;
+        for (auto const p : pipelineR->passes) {
+            if (p == opt::PassId::Cse) { containsCse = true; break; }
+        }
+        EXPECT_TRUE(containsCse)
+            << "release.pipeline.json must contain Cse — a JSON edit "
+               "removing it would silently lose all CSE effectiveness; "
+               "this pin makes the regression cause attributable.";
+
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAliasArcStrictCapstoneMir(interner);
+        ASSERT_EQ(mir.aliasingMode(), MirAliasingMode::StrictTBAA)
+            << "ARM 3 silent-failure pin: a regression that drops the "
+               "strict-TBAA flag at finish() would let ARM 3 still pass "
+               "via incidental CSE under Permissive — match ARMs 1+2.";
+        DiagnosticReporter rep;
+        auto const result = opt::optimize(mir, target, interner, *pipelineR, rep);
+        ASSERT_TRUE(result.ok);
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 1u)
+            << "shipped release pipeline must achieve the same Load-"
+               "count effectiveness as ARM 2 — pinning the JSON "
+               "config + the inline pipeline together";
+        EXPECT_GE(result.mutationCount(opt::PassId::Cse), 1u);
     }
 }
 
