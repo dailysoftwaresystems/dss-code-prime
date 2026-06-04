@@ -4,6 +4,7 @@
 
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
+#include "hir/attributes/linkage_attr.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
 #include "hir/attributes/transpile_hints.hpp"
@@ -31,6 +32,13 @@ using HirSourceMap = HirAttribute<HirSourceLoc>;
 // FFI linkage/library metadata for extern nodes (HR4 shipped the value struct).
 // Populated by FFI ingestion (plan 11).
 using HirFfiMap = HirAttribute<FfiMetadata>;
+
+// Native-declaration linkage (binding/visibility) for decls that carried a
+// source linkage specifier (C `static` / `__attribute__`). Populated by CST→HIR
+// lowering from the language's `linkageSpecifiers` facet; read by HIR→MIR
+// lowering to stamp `MirFunc`/`MirGlobal` binding+visibility — the input the
+// optimizer's DCE-protect predicate `isExternallyVisible()` consults.
+using HirLinkageMap = HirAttribute<LinkageAttr>;
 
 // Shader stage / built-in / workgroup / binding data. Populated by shader-shape
 // lowering (plan 17); read by SPIR-V codegen.

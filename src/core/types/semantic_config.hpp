@@ -141,6 +141,30 @@ struct DSS_EXPORT FieldChildrenDescriptor {
     bool          liftToEnclosingScope = false;
 };
 
+// Forward-declared as opaque enums (a fixed underlying type makes them COMPLETE
+// types, hence valid by value in the `std::optional`s below) so this header need
+// not pull the heavy `symbol_attrs.hpp` → `target_schema.hpp` include — which
+// `grammar_schema.hpp` includes early, before `LoadResult` is defined, closing a
+// cycle. The full enum definitions + name tables live in
+// `core/types/symbol_attrs.hpp`, included by the .cpp consumers that read VALUES.
+enum class SymbolBinding : std::uint8_t;
+enum class SymbolVisibility : std::uint8_t;
+
+// D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1, 2026-06-04): the effect a single
+// declaration-specifier token has on the declared symbol's linkage. A language
+// maps each specifier's SOURCE TEXT (e.g. "static", "weak", "hidden") to one of
+// these via `DeclarationRule::linkageSpecifiers`; CST→HIR lowering walks the
+// declaration's specifier-prefix subtree (see `specifierPrefixRule`), looks each
+// specifier token's text up in that map, and folds the effects onto the HIR
+// node's `LinkageAttr`. A field left `nullopt` leaves that axis at its prior
+// value (so `static` sets only `binding`; `visibility("hidden")` sets only
+// `visibility`). Agnostic: the engine performs the lookup; WHICH texts exist and
+// what binding/visibility they mean are entirely per-language config.
+struct DSS_EXPORT LinkageSpecifierEffect {
+    std::optional<SymbolBinding>    binding;
+    std::optional<SymbolVisibility> visibility;
+};
+
 struct DSS_EXPORT DeclarationRule {
     // The rule (resolved to RuleId) whose subtree introduces the decl.
     RuleId          rule{};
@@ -185,6 +209,17 @@ struct DSS_EXPORT DeclarationRule {
     // its specifiers mean, are both per-language config. `nullopt` ⇒ this
     // declaration form has no specifier prefix (every shipped decl today).
     std::optional<RuleId>        specifierPrefixRule;
+    // D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1, 2026-06-04): maps a
+    // declaration-specifier token's SOURCE TEXT to its linkage effect (see
+    // `LinkageSpecifierEffect`). Consulted by CST→HIR lowering ONLY for the
+    // specifier tokens inside this declaration's `specifierPrefixRule` subtree;
+    // the resolved `LinkageAttr` is attached to the HIR Function/Global node and
+    // threaded to the MirFunc/MirGlobal binding+visibility (the DCE-protect
+    // input). Empty ⇒ this declaration form derives no linkage from specifiers
+    // (every shipped decl before c-subset `static` landed). Source/target/linker
+    // agnostic: the VALUES reuse the shared `SymbolBinding`/`SymbolVisibility`
+    // vocabulary; the token→effect MAP is per-language config.
+    std::unordered_map<std::string, LinkageSpecifierEffect> linkageSpecifiers;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
     // D8 unused-variable warning: when true, a symbol minted by this

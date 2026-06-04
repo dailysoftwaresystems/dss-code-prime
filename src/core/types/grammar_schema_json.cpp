@@ -9,6 +9,7 @@
 #include "core/types/scope_kind.hpp"
 #include "core/types/tree_node.hpp"
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
+#include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
 
 #include <nlohmann/json.hpp>
 
@@ -3155,6 +3156,108 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                           i, sp));
                                 } else {
                                     rule.specifierPrefixRule = data.rules->find(sp);
+                                }
+                            }
+                        }
+
+                        // D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1,
+                        // 2026-06-04): optional map from a declaration-
+                        // specifier token's SOURCE TEXT to its linkage effect:
+                        //   "linkageSpecifiers": {
+                        //       "static": { "binding": "local" },
+                        //       "weak":   { "binding": "weak" },
+                        //       "hidden": { "visibility": "hidden" } }
+                        // Keys are raw specifier texts (NOT schema-token names —
+                        // the lowerer matches on `tree().text(token)`). Each
+                        // value is an object with optional "binding" /
+                        // "visibility" strings validated against the shared
+                        // SymbolBinding/SymbolVisibility name tables. Fail-loud
+                        // on a non-object map, a non-object effect, an unknown
+                        // binding/visibility name, or an effect setting neither
+                        // axis. Source/target/linker agnostic.
+                        if (entry.contains("linkageSpecifiers")) {
+                            auto const& ls = entry.at("linkageSpecifiers");
+                            if (!ls.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/linkageSpecifiers",
+                                          std::format("'declarations[{}]."
+                                                      "linkageSpecifiers' must be "
+                                                      "an object mapping specifier "
+                                                      "text to a {{binding?, "
+                                                      "visibility?}} effect", i));
+                            } else {
+                                for (auto it = ls.begin(); it != ls.end(); ++it) {
+                                    auto const& specText = it.key();
+                                    auto const& eff = it.value();
+                                    auto const effPath = std::format(
+                                        "{}/linkageSpecifiers/{}", path, specText);
+                                    if (!eff.is_object()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  effPath,
+                                                  "linkage effect must be an object "
+                                                  "with optional 'binding' and/or "
+                                                  "'visibility' string fields");
+                                        continue;
+                                    }
+                                    LinkageSpecifierEffect effect{};
+                                    bool any = false;
+                                    if (eff.contains("binding")) {
+                                        if (!eff.at("binding").is_string()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'binding' must be a string "
+                                                      "('local'|'global'|'weak')");
+                                            continue;
+                                        }
+                                        auto const bn =
+                                            eff.at("binding").get<std::string>();
+                                        auto const b = symbolBindingFromName(bn);
+                                        if (!b.has_value()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      std::format("'{}' is not a "
+                                                          "recognized SymbolBinding "
+                                                          "(expected 'local', "
+                                                          "'global', or 'weak')", bn));
+                                            continue;
+                                        }
+                                        effect.binding = *b;
+                                        any = true;
+                                    }
+                                    if (eff.contains("visibility")) {
+                                        if (!eff.at("visibility").is_string()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'visibility' must be a string "
+                                                      "('default'|'hidden'|"
+                                                      "'protected'|'internal')");
+                                            continue;
+                                        }
+                                        auto const vn =
+                                            eff.at("visibility").get<std::string>();
+                                        auto const v = symbolVisibilityFromName(vn);
+                                        if (!v.has_value()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      std::format("'{}' is not a "
+                                                          "recognized "
+                                                          "SymbolVisibility (expected "
+                                                          "'default', 'hidden', "
+                                                          "'protected', or "
+                                                          "'internal')", vn));
+                                            continue;
+                                        }
+                                        effect.visibility = *v;
+                                        any = true;
+                                    }
+                                    if (!any) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  effPath,
+                                                  "linkage effect must set at least "
+                                                  "one of 'binding' or 'visibility'");
+                                        continue;
+                                    }
+                                    rule.linkageSpecifiers.emplace(specText, effect);
                                 }
                             }
                         }

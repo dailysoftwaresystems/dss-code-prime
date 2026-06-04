@@ -13,6 +13,9 @@
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir_text.hpp"
 #include "mir/mir_verifier.hpp"
+#include "opt/optimizer.hpp"
+#include "core/types/symbol_attrs.hpp"
+#include "core/types/target_schema.hpp"
 
 #include <gtest/gtest.h>
 
@@ -55,9 +58,14 @@ struct Lowered {
     // in `c-subset.lang.json`.
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
+    // exactly as compile_pipeline.cpp does — so `static`/`__attribute__` source
+    // flows binding/visibility into the MIR. Existing fixtures (no specifiers)
+    // get an empty map ⇒ every symbol stays Global/Default (unchanged).
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
-                                    &hir->sourceMap, mirCfg);
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    &hir->linkageMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -800,6 +808,101 @@ TEST(MirLoweringCSubset, SignedDivisionLowersToSDiv) {
     // [arg0, arg1, SDiv, return]
     ASSERT_EQ(m.blockInstCount(entry), 4u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 2)), MirOpcode::SDiv);
+}
+
+// ─── D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1): static / __attribute__ ─────
+//
+// End-to-end proof that a source linkage specifier flows
+//   source → grammar specifier-prefix → HIR LinkageAttr → MirFunc binding →
+//   the optimizer's DCE protect predicate (`isExternallyVisible`).
+// The discriminator is PURELY the `static` keyword: the SAME unused helper is
+// DCE-eliminated when `static` (Local binding) and PRESERVED when omitted
+// (Global = externally visible). Regression-proof: if the linkage thread breaks
+// (a `static` helper stays Global), Arm A keeps 2 functions and `== 1u` is RED.
+
+// Arm A — `static` makes an unused helper Local ⇒ DCE eliminates it.
+TEST(MirLoweringCSubsetLinkage, StaticUnusedFunctionIsDceEliminated) {
+    auto L = lowerCSubset(
+        "static int helper(int x) { return x + 1; }\n"
+        "int main() { return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u) << "pre-DCE: static helper + main";
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"linkage-dce", {opt::PassId::Dce}};
+    auto const result =
+        opt::optimize(m, target, L.model.lattice().interner(), pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // `helper` is Local (from `static`) + has no callers ⇒ eliminated; `main`
+    // is Global (externally visible) ⇒ preserved as a DCE root.
+    EXPECT_EQ(m.moduleFuncCount(), 1u)
+        << "static helper (Local, no callers) must be DCE-eliminated; only "
+           "main (Global) survives";
+    EXPECT_GE(result.mutationCount(opt::PassId::Dce), 1u)
+        << "DCE must record having removed the static helper";
+}
+
+// Arm B — control: WITHOUT `static`, the SAME unused helper is Global
+// (externally visible) ⇒ DCE preserves it. The ONLY source difference from Arm
+// A is the `static` keyword, and it flips elimination ⇒ the linkage specifier
+// is provably what drives the behavior (the red-on-disable pair for Arm A).
+TEST(MirLoweringCSubsetLinkage, NonStaticUnusedFunctionSurvivesDce) {
+    auto L = lowerCSubset(
+        "int helper(int x) { return x + 1; }\n"
+        "int main() { return 0; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"linkage-dce", {opt::PassId::Dce}};
+    auto const result =
+        opt::optimize(m, target, L.model.lattice().interner(), pipeline, rep);
+    ASSERT_TRUE(result.ok);
+
+    EXPECT_EQ(m.moduleFuncCount(), 2u)
+        << "without `static`, helper is Global (externally visible) and MUST "
+           "survive DCE even with no callers";
+}
+
+// Arm C — `__attribute__((weak))` threads to MirFunc binding == Weak. Weak is
+// externally visible (the linker may supersede it), so it is NOT DCE-eligible;
+// the proof is the binding VALUE on the lowered MIR, not elimination. Pins that
+// the second linkage value (besides Local) also flows source → HIR → MIR.
+TEST(MirLoweringCSubsetLinkage, WeakAttributeThreadsToMirBinding) {
+    auto L = lowerCSubset(
+        "__attribute__((weak)) int wfn() { return 7; }\n"
+        "int main() { return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+
+    // Exactly one function carries Weak binding (the `__attribute__((weak))`
+    // one); `main` stays Global. Anything but 1 means the specifier failed to
+    // thread (0) or leaked onto another symbol (2).
+    int weakCount = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcBinding(m.funcAt(i)) == SymbolBinding::Weak) ++weakCount;
+    EXPECT_EQ(weakCount, 1)
+        << "__attribute__((weak)) must thread to exactly one MirFunc binding==Weak";
 }
 
 // ─── ML2 cycle 3b: lvalue-via-alloca ──────────────────────────────────────

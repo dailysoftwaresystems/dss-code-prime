@@ -54,6 +54,9 @@ struct Lowerer {
     MirLoweringConfig const& config;      // schema-driven knobs (plan 12.5 §0.2 D3)
     HirFfiMap const*         ffiMap;      // optional — populated by CST→HIR or FF5
                                            // (LK6 cycle 2d, D-LK6-6).
+    HirLinkageMap const*     linkageMap;  // optional — native-decl binding/
+                                           // visibility (D-CSUBSET-LINKAGE-
+                                           // SPECIFIERS). nullptr ⇒ all Global.
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -1690,7 +1693,15 @@ struct Lowerer {
         collectAddressTakenSymbols(body, addressTaken);
 
         // From here on a block is open — any return-false MUST seal it.
-        mir.addFunction(signature, symbol);
+        // D-CSUBSET-LINKAGE-SPECIFIERS / D-OPT7-LINKAGE-HIR-TO-MIR-MAPPING
+        // (pre-OPT7 P2): stamp the declared linkage (default Global/Default when
+        // unannotated) so DCE's `isExternallyVisible` protect predicate sees a
+        // `static` function as Local (eliminable) and `__attribute__((weak))` as
+        // Weak. Closes the P2 stub: linkage now flows source → HIR → MIR.
+        LinkageAttr la{};
+        if (linkageMap != nullptr)
+            if (auto const* p = linkageMap->tryGet(node)) la = *p;
+        mir.addFunction(signature, symbol, la.binding, la.visibility);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 
@@ -1919,6 +1930,10 @@ struct Lowerer {
         std::optional<MirLiteralValue> constInit;   // foldable literal
         HirNodeId                      runtimeInit; // non-constant init expr
         // Both unset → zero-init (no `=` in the declaration).
+        // D-CSUBSET-LINKAGE-SPECIFIERS: declared binding/visibility (default
+        // Global/Default ⇒ externally visible). Carried so emitGlobals stamps a
+        // `static`/`__attribute__` global's linkage onto the MirGlobal.
+        LinkageAttr                    linkage{};
     };
     std::vector<PendingGlobal> pendingGlobals;
 
@@ -1972,6 +1987,8 @@ struct Lowerer {
             PendingGlobal pg;
             pg.symbol = hir.globalSymbol(decl);
             pg.type   = hir.globalType(decl);
+            if (linkageMap != nullptr)
+                if (auto const* p = linkageMap->tryGet(decl)) pg.linkage = *p;
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
                 // The resolver covers Refs to sibling globals; literal /
                 // arithmetic / Cast paths still fold per CE1.
@@ -2034,11 +2051,14 @@ struct Lowerer {
             }
             if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
-                mir.addGlobal(pg.type, pg.symbol, idx);
+                mir.addGlobal(pg.type, pg.symbol, idx, {},
+                              pg.linkage.binding, pg.linkage.visibility);
             } else if (pg.runtimeInit.valid()) {
-                mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc);
+                mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc,
+                              pg.linkage.binding, pg.linkage.visibility);
             } else {
-                mir.addGlobal(pg.type, pg.symbol);
+                mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, {},
+                              pg.linkage.binding, pg.linkage.visibility);
             }
         }
         // Step 3: fill the init function's body — Store each runtime
@@ -2156,7 +2176,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           DiagnosticReporter&      reporter,
                           HirSourceMap const*      sourceMap,
                           MirLoweringConfig const& config,
-                          HirFfiMap const*         ffiMap) {
+                          HirFfiMap const*         ffiMap,
+                          HirLinkageMap const*     linkageMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -2170,6 +2191,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .sourceMap = sourceMap,
         .config    = config,
         .ffiMap    = ffiMap,
+        .linkageMap = linkageMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

@@ -108,6 +108,15 @@ lowerToMir(Hir const&               hir,
            // declarations are unaffected by the parameter and
            // produce an empty `HirToMirResult.externImports`.
            // (LK6 cycle 2d — D-LK6-6 closure.)
-           HirFfiMap const*         ffiMap    = nullptr);
+           HirFfiMap const*         ffiMap    = nullptr,
+           // D-CSUBSET-LINKAGE-SPECIFIERS / D-OPT7-LINKAGE-HIR-TO-MIR-MAPPING
+           // (pre-OPT7 P2): native-declaration linkage side-table, populated by
+           // the CST→HIR lowerer from the language's `linkageSpecifiers` facet.
+           // Optional: if nullptr (or a decl carries no entry) the
+           // function/global defaults to (Global, Default) — externally visible
+           // — exactly the pre-linkage behavior. Read here to stamp
+           // MirFunc/MirGlobal binding+visibility, the input the optimizer's
+           // DCE-protect predicate `isExternallyVisible()` consults.
+           HirLinkageMap const*     linkageMap = nullptr);
 
 } // namespace dss

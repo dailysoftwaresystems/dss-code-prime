@@ -182,7 +182,10 @@
     { "word": "break",    "kind": "BreakKeyword"    },
     { "word": "continue", "kind": "ContinueKeyword" },
 
-    { "word": "extern",  "kind": "ExternKeyword"  }
+    { "word": "extern",  "kind": "ExternKeyword"  },
+
+    { "word": "static",        "kind": "StaticKeyword"    },
+    { "word": "__attribute__", "kind": "AttributeKeyword" }
   ],
 
   "shapes": {
@@ -267,7 +270,17 @@
     },
 
     "topLevelDecl": {
-      "sequence": [ "typeRef", "Identifier", "topLevelDeclTail" ]
+      "sequence": [ { "optional": "declSpecifiers" }, "typeRef", "Identifier", "topLevelDeclTail" ]
+    },
+
+    "declSpecifiers": {
+      "sequence": [ "singleDeclSpecifier", { "repeat": "singleDeclSpecifier" } ]
+    },
+    "singleDeclSpecifier": {
+      "alt": [ "StaticKeyword", "attrSpec" ]
+    },
+    "attrSpec": {
+      "sequence": [ "AttributeKeyword", "ParenOpen", "ParenOpen", { "optional": "Identifier" }, "ParenClose", "ParenClose" ]
     },
 
     "topLevelDeclTail": {
@@ -586,6 +599,12 @@
         "constMarker": "ConstKeyword" },
       { "rule": "topLevelDecl", "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword",
+        "$linkageSpecifiersComment": "D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1): 'static' -> internal (Local) binding; '__attribute__((weak))' -> Weak. 'specifierPrefix' names the optional leading declSpecifiers rule the resolver strips before positional name/type/body resolution; 'linkageSpecifiers' maps each specifier token's SOURCE TEXT to its binding/visibility effect, stamped onto the HIR/MIR symbol so DCE preserves externally-visible symbols and elides a static-with-no-callers. Visibility (__attribute__((visibility(\"hidden\")))) is substrate-ready (facet + HIR + MIR all carry visibility) but the c-subset string-arg grammar form is deferred -- see plan 22 + the deferred-anchor registry.",
+        "specifierPrefix": "declSpecifiers",
+        "linkageSpecifiers": {
+          "static": { "binding": "local" },
+          "weak":   { "binding": "weak"  }
+        },
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 },
         "kindByChild": {
           "childPath": [2, 0],

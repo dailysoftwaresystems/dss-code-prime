@@ -175,7 +175,8 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         grammar.semantics().pointerAliasing.charTypesAliasAll;
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
-                          &hir->sourceMap, mirCfg, &ffiMap);
+                          &hir->sourceMap, mirCfg, &ffiMap,
+                          &hir->linkageMap);
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return false;
     }
