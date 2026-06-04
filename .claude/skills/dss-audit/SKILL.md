@@ -4,8 +4,9 @@ description: >
   Audit the DSS Code Prime compiler against the bar — the read-only manager/auditor
   counterpart to dss-cycle. Independently verifies the implementer's output (status checks,
   green/registry/agnosticism battery, guardrail enforcement, silent-gap hunting) and renders
-  a verdict that separates VERIFIED-CLEAN from GREEN-BUT-RULE-BREAKING. Never builds, never
-  edits src/ — its integrity comes from not having written the code it judges. May commit
+  a verdict that separates VERIFIED-CLEAN from GREEN-BUT-RULE-BREAKING. Also design-reviews a
+  developed plan against the bar before it is locked for build (dss-cycle Step 3.5). Never builds,
+  never edits src/ — its integrity comes from not having written the code it judges. May commit
   ONLY markdown, separately tagged — trivial plan/doc staleness, and test-discipline ratchets
   into the dss-cycle skill on a recurring weak-test class. On any gap it authors the exact
   ready-to-paste implementer prompt. Judges by: best long-term / no workarounds / source
@@ -121,6 +122,28 @@ proof, absent hardening, or a test that stays green on a silently-broken impl �
 ### Step 5 — Verdict (+ prompt)
 Render the verdict in the §G shape (verified-clean vs green-but-rule-breaking vs unverified). For
 every green-but-rule-breaking or unverified item, author the implementer prompt that closes it (§H).
+
+### Pre-build variant — the plan-lock design review (`dss-cycle` Step 3.5)
+The steps above audit *committed code*; the same bar also judges a **plan before it is built** — the
+gate `dss-cycle` runs at its Step 3.5, and the mode this skill applied to the linkage P1+P2 plan
+(2026-06-04). What changes:
+
+- **No battery.** Nothing is built, so §D (build/ctest) does not apply. Apply the bar (§A), the
+  rule-lens (§E), and the guardrails (§F) **to the plan**: *would this design, built faithfully,
+  hold the line?* A planned `if (lang/arch/format == …)`, a tight-slice dressed as "phase 1", a
+  speculative trigger-gated build, a silent-ignore, a "just add a test" where the strongest provable
+  pin is required, an OPT7 / hard-stop crossing — each is a finding **now**.
+- **Verify the premises, don't trust the narrative** (§B, applied to a design). Independently confirm
+  the plan's load-bearing claims against the *actual code* — the vocabulary it reuses, the stub it
+  says it closes, the precedent it leans on, the deferral anchor it cites. A grounded GO beats a
+  plausible one.
+- **Render a design-review GO / findings**, never a verified-clean verdict (nothing is built). State
+  the **closure gates** the built result must satisfy (§H shape) so the implementation is bound to them.
+- **Independence is preserved.** Judging a plan against the bar is **not authoring it**: the
+  post-build audit stays fully independent and re-verifies the built artifacts from scratch — a GO on
+  the plan buys the *code* no trust (green is never clean until re-run). In an autonomous loop the
+  plan review runs as an *independent* reviewer (a fresh subagent), distinct from the post-build
+  auditor, so neither rubber-stamps the other.
 
 ---
 
@@ -397,6 +420,7 @@ same laziness is structurally impossible next cycle.
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0 / §0.1 |
 | Deferral registry + triggers | `.plans/_deferred-anchor-registry.md` |
 | The implementer it checks | the `dss-cycle` skill |
+| Pre-build plan review (design GO) | apply the bar to the plan, not code — `dss-cycle` Step 3.5 (§C) |
 | Ratchet a recurring weak-test class | strengthen `dss-cycle` test-discipline prose · separate tagged commit (§J) |
 | Conventions + strict tests | the `dss-code-prime` skill (§7, §9, §13) |
 
