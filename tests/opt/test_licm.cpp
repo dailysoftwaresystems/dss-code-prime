@@ -285,6 +285,11 @@ TEST(Licm, LoadHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAA) {
     mb.addReturn(mb.addConst(v0r, i32));
     Mir mir = std::move(mb).finish();
 
+    // Flag-state attribution pin (symmetric with CSE): if a future
+    // MirBuilder regression drops `setAliasingMode`, attribute the
+    // failure at the mode-threading, not the alias predicate.
+    ASSERT_EQ(mir.aliasingMode(), MirAliasingMode::StrictTBAA);
+
     DiagnosticReporter rep;
     auto const r = opt::passes::runLicm(mir, interner, rep);
     EXPECT_TRUE(r.ok);
@@ -390,6 +395,10 @@ TEST(Licm, LoadHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAANoCharExc
     MirLiteralValue v0r; v0r.value = std::int64_t{0}; v0r.core = TypeKind::Char;
     mb.addReturn(mb.addConst(v0r, charT));
     Mir mir = std::move(mb).finish();
+
+    // Flag-state attribution pin (symmetric with CSE).
+    ASSERT_EQ(mir.aliasingMode(), MirAliasingMode::StrictTBAA);
+    ASSERT_FALSE(mir.charTypesAliasAll());
 
     DiagnosticReporter rep;
     auto const r = opt::passes::runLicm(mir, interner, rep);

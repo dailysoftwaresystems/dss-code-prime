@@ -323,6 +323,12 @@ TEST(Cse, LoadCsedAcrossDistinctPrimitiveStoreUnderStrictTBAA) {
     mb.addReturn(r);
     Mir mir = std::move(mb).finish();
 
+    // Flag-state attribution pin: if a future MirBuilder regression
+    // drops `setAliasingMode` (e.g. move-ctor reset bug), this
+    // assertion fails BEFORE the CSE counter — making the diagnostic
+    // path point at the mode-threading, not the alias predicate.
+    ASSERT_EQ(mir.aliasingMode(), MirAliasingMode::StrictTBAA);
+
     DiagnosticReporter rep;
     auto const res = opt::passes::runCse(mir, interner, rep);
     EXPECT_TRUE(res.ok);
@@ -416,6 +422,12 @@ TEST(Cse, LoadCsedAcrossDistinctPrimitiveStoreUnderStrictTBAANoCharException) {
     DiagnosticReporter rep;
     auto const res = opt::passes::runCse(mir, interner, rep);
     EXPECT_TRUE(res.ok);
+    // Flag-state attribution pin: both flags must round-trip through
+    // finish() — a regression in either Mir field threading would
+    // attribute the failure here, not in the alias predicate.
+    ASSERT_EQ(mir.aliasingMode(), MirAliasingMode::StrictTBAA);
+    ASSERT_FALSE(mir.charTypesAliasAll());
+
     EXPECT_EQ(res.instructionsCsed, 1u)
         << "strict + char-exception-disabled: Store<I32> cannot alias "
            "Load<Char>; CSE must admit";

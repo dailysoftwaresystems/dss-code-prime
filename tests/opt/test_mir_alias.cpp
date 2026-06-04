@@ -88,12 +88,20 @@ TEST(MirAlias, Rule1_SamePointerIdReturnsYes) {
     std::array<TypeId, 1> const elems{i32};
     auto m = buildAllocaModule(interner, elems);
 
-    EXPECT_EQ(mirMayAlias(m.mir, interner, m.allocas[0], m.allocas[0]),
-              MirAliasResult::Yes);
-    // Strict-mode must not change the same-id verdict.
-    EXPECT_EQ(mirMayAlias(m.mir, interner, m.allocas[0], m.allocas[0],
-                          StrictTbaa::Yes),
-              MirAliasResult::Yes);
+    // Rule 1 must dominate every other rule across the full polarity
+    // matrix — its ptrA.v == ptrB.v early-return precedes Rule 2's
+    // alloca check, Rule 5's char-exception, and Rule 6's strict-TBAA.
+    for (StrictTbaa const strict : {StrictTbaa::No, StrictTbaa::Yes}) {
+        for (bool const charAll : {false, true}) {
+            EXPECT_EQ(mirMayAlias(m.mir, interner,
+                                  m.allocas[0], m.allocas[0],
+                                  strict, charAll),
+                      MirAliasResult::Yes)
+                << "Rule 1 must short-circuit on same-SSA id (strict="
+                << (strict == StrictTbaa::Yes ? "Yes" : "No")
+                << ", charAll=" << charAll << ")";
+        }
+    }
 }
 
 // ── Rule 2: distinct Allocas → No ────────────────────────────────────

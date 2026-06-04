@@ -18,6 +18,7 @@
 //   Phase 2 — fill blocks with instructions; Phi incomings deferred.
 //   Phase 3 — flush Phi incomings via the now-complete rewrite map.
 
+#include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
@@ -39,7 +40,7 @@ namespace dss::opt::passes {
 // D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS.
 enum class GlobalClonePrelude : std::uint8_t { Cloned, CarvedOut };
 
-[[nodiscard]] GlobalClonePrelude
+[[nodiscard]] DSS_EXPORT GlobalClonePrelude
 cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
                        DiagnosticReporter& reporter,
                        std::string_view passName);
@@ -49,7 +50,7 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
 // the per-function block map. Default-method implementations express
 // the "no special handling" path; a concrete policy overrides only
 // the hooks it needs.
-class MirRebuildPolicy {
+class DSS_EXPORT MirRebuildPolicy {
 public:
     virtual ~MirRebuildPolicy() = default;
 
@@ -218,7 +219,7 @@ public:
 // points. Pass-specific counters live on the policy (the rebuilder
 // is policy-agnostic about WHY a hook returned false; counting is the
 // policy's concern).
-class MirFunctionRebuilder {
+class DSS_EXPORT MirFunctionRebuilder {
 public:
     MirFunctionRebuilder(Mir const& src, MirBuilder& dst,
                          MirRebuildPolicy& policy)

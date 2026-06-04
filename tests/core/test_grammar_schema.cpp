@@ -1696,6 +1696,109 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroNonStringElementReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD pins for the
+// `semantics.pointerAliasing` block (D-OPT-LOAD-ALIAS-ANALYSIS arc,
+// cycle 10g). A typo'd sub-key (e.g. `strictAliasng` missing 'i' or
+// `charTypeAliasAll` missing 's') would otherwise silently fall back
+// to the default and flip the language's optimization polarity —
+// strict-aliasing silently disabled for c-subset / char-exception
+// silently disabled for a hypothetical Rust frontend.
+TEST(GrammarSchema, SemanticsPointerAliasingUnknownKeyReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "pointerAliasing": {
+          "strictAliasng": true
+        }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value())
+        << "typo'd key under pointerAliasing must reject; otherwise the "
+           "language's optimization polarity silently flips";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsPointerAliasingUnknownKeyCharTypoReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "pointerAliasing": {
+          "charTypeAliasAll": true
+        }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value())
+        << "typo'd key `charTypeAliasAll` (missing 's') must reject";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsPointerAliasingNonObjectReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "pointerAliasing": true
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+TEST(GrammarSchema, SemanticsPointerAliasingNonBoolFieldReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "pointerAliasing": {
+          "strictAliasingOnDistinctTypes": "yes"
+        }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value())
+        << "non-bool field value must reject (a typo'd literal otherwise "
+           "silently parses as truthy)";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// Positive complement: a CORRECTLY-spelled `pointerAliasing` block
+// with both fields loads cleanly. Pairs with the typo tests so a
+// future loader regression that REJECTS the canonical shape (over-
+// correcting to "any pointerAliasing block invalid") fails this arm.
+TEST(GrammarSchema, SemanticsPointerAliasingCanonicalShapeLoadsCleanly) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": {
+        "pointerAliasing": {
+          "strictAliasingOnDistinctTypes": true,
+          "charTypesAliasAll": false
+        }
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(r.has_value())
+        << "canonical pointerAliasing shape must load — see error count="
+        << (r.has_value() ? 0u : r.error().size());
+    EXPECT_TRUE((*r)->semantics().pointerAliasing.strictAliasingOnDistinctTypes);
+    EXPECT_FALSE((*r)->semantics().pointerAliasing.charTypesAliasAll);
+}
+
 TEST(GrammarSchema, SemanticsImplicitReturnZeroEmptyStringElementReportsInvalid) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 4,
