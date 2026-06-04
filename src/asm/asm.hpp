@@ -6,6 +6,7 @@
 #include "core/types/extern_import.hpp"
 #include "core/types/section_kind.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 // Assembler — plan 13 AS1.
@@ -233,6 +235,21 @@ validateAssembledData(std::span<AssembledData const> items,
 // `core/types/extern_import.hpp` and threads it from HIR via
 // `HirAttribute<FfiMetadata>` through MIR/LIR/assembler.
 
+// LK11a (cross-CU symbol resolution): the per-module symbol table the linker
+// matches by NAME across CUs. `SymbolId` is per-CU (per-arena), so two CUs can
+// mint the same integer for different symbols; cross-CU resolution must match by
+// the DECLARED NAME, which the numeric IR does not carry (MirFunc / MirGlobal hold
+// only SymbolId + binding/visibility). The compile pipeline emits one entry per
+// DEFINED function / global — NOT extern imports (those are references, carried in
+// `AssembledModule::externImports`). The linker builds a global name table from the
+// Global/Weak entries (Local stays module-private) and applies weak-vs-strong.
+struct DSS_EXPORT ModuleSymbol {
+    SymbolId         symbol{};                           // the per-CU SymbolId (compound-key half)
+    std::string      name;                               // declared identifier — the cross-CU match key
+    SymbolBinding    binding    = SymbolBinding::Global; // Local: module-private; Global/Weak: enter the global table
+    SymbolVisibility visibility = SymbolVisibility::Default;
+};
+
 struct DSS_EXPORT AssembledModule {
     std::vector<AssembledFunction> functions;  // parallel-index with lir.funcAt(i)
     std::size_t                    expectedFuncCount = 0;
@@ -244,6 +261,13 @@ struct DSS_EXPORT AssembledModule {
     // distinct. Default-invalid; the compile pipeline stamps it from the owning
     // CompilationUnit. Single-CU builds (every shipped corpus today) carry one cuId.
     CompilationUnitId              cuId{};
+
+    // LK11a: the per-module symbol table (one ModuleSymbol per DEFINED function /
+    // global; extern imports are NOT here — see `externImports`). The linker uses it
+    // for cross-CU NAME matching + weak-vs-strong resolution. Populated by the
+    // compile pipeline from the semantic symbol table (name) + MIR (binding /
+    // visibility). Empty for hand-built substrate modules that don't exercise it.
+    std::vector<ModuleSymbol>      symbols;
 
     // FFI extern imports (LK6 cycle 2 — closes D-LK6-2 partial).
     // Populated by the assembler from upstream HIR `ExternFunction`

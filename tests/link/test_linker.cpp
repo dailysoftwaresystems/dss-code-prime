@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -187,11 +188,12 @@ TEST(Linker, UnknownSymbolEmitsK_SymbolUndefined) {
 }
 
 // D-LK4-3 collision pin: two CompilationUnits (distinct cuIds) each define a
-// function with the SAME bare SymbolId #42. The linker's compound key
-// (cuId, SymbolId) keeps them DISTINCT — the index holds 2 entries, no false
-// duplicate. The multi-CU image MERGE itself is LK11 (fail-loud expected).
-// RED-ON-DISABLE: drop cuId from LinkedSymbolKey's ==/hash and #42 collides →
-// symbolCount==1 + a spurious "declared more than once" K_SymbolUndefined.
+// function with the SAME bare SymbolId #42, and each NAMES its #42 in the symbol
+// table (with DISTINCT names "foo"/"bar"). The linker's compound key (cuId,
+// SymbolId) keeps the two #42s distinct in the per-CU validation index — no false
+// "declared more than once" — and the cross-CU merge (LK11a) resolves two global
+// definitions. RED-ON-DISABLE: drop cuId from LinkedSymbolKey's ==/hash and the
+// two #42s collide in buildCompoundIndex → a spurious K_SymbolUndefined.
 TEST(Linker, CrossCuSymbolIdCollisionDisambiguatedByCuId) {
     auto loaded = loadMinimal();
     ASSERT_TRUE(loaded.target && loaded.format);
@@ -204,6 +206,8 @@ TEST(Linker, CrossCuSymbolIdCollisionDisambiguatedByCuId) {
         AssembledFunction fn;
         fn.symbol = SymbolId{42};
         m.functions.push_back(std::move(fn));
+        m.symbols.push_back(ModuleSymbol{SymbolId{42}, "foo",
+                                         SymbolBinding::Global, SymbolVisibility::Default});
         mods.push_back(std::move(m));
     }
     {
@@ -213,6 +217,8 @@ TEST(Linker, CrossCuSymbolIdCollisionDisambiguatedByCuId) {
         AssembledFunction fn;
         fn.symbol = SymbolId{42};  // SAME bare SymbolId as CU #1's function
         m.functions.push_back(std::move(fn));
+        m.symbols.push_back(ModuleSymbol{SymbolId{42}, "bar",
+                                         SymbolBinding::Global, SymbolVisibility::Default});
         mods.push_back(std::move(m));
     }
 
@@ -221,13 +227,271 @@ TEST(Linker, CrossCuSymbolIdCollisionDisambiguatedByCuId) {
         std::span<AssembledModule const>{mods.data(), mods.size()},
         *loaded.target, *loaded.format, rep);
 
-    // The compound key kept the two CUs' #42 distinct: 2 index entries, NOT 1.
-    EXPECT_EQ(image.symbolCount, 2u)
+    // THE D-LK4-3 regression guard: the compound key kept the two CUs' #42 distinct
+    // in per-CU validation — no spurious duplicate-symbol diagnostic.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u)
         << "(cuId, SymbolId) compound key must keep two CUs' colliding #42 distinct";
-    // No spurious duplicate-symbol diagnostic — the two #42s are distinct keys.
+    // Two DISTINCT names → two resolved global definitions.
+    EXPECT_EQ(image.symbolCount, 2u);
+    EXPECT_EQ(image.resolvedGlobalDefs.size(), 2u);
+    // Distinct names → no redefinition; resolution succeeded → byte emission is LK11b.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
+    EXPECT_GE(countCode(rep, DiagnosticCode::K_CrossCuImageEmitDeferred), 1u);
+}
+
+// ── LK11a cross-CU symbol-resolution tests ──────────────────────────────────
+// Hand-built multi-module inputs exercise the linker's DEFINITION merge +
+// weak-vs-strong resolution (the D-LK4-3 collision-pin pattern). They assert the
+// WINNING definition's compound key — not just a diagnostic count — the property
+// the OPT7 Weak-inline guard is built on. Reference/reloc resolution to a cross-CU
+// def (the extern -> sibling-def path) + merged-image bytes are LK11b.
+
+static ModuleSymbol lkSym(std::uint32_t id, std::string name, SymbolBinding b) {
+    return ModuleSymbol{SymbolId{id}, std::move(name), b, SymbolVisibility::Default};
+}
+static AssembledModule lkCu(std::uint32_t cuId, std::vector<ModuleSymbol> syms) {
+    AssembledModule m;
+    m.cuId    = CompilationUnitId{cuId};
+    m.symbols = std::move(syms);
+    return m;
+}
+static LinkedImage lkLink(std::vector<AssembledModule> const& mods,
+                          TargetSchema const& target,
+                          ObjectFormatSchema const& format,
+                          DiagnosticReporter& rep) {
+    return linker::link(std::span<AssembledModule const>{mods.data(), mods.size()},
+                        target, format, rep);
+}
+
+// Two distinct global names across CUs → two resolved definitions, each mapped to
+// its defining CU's compound key. Resolution clean → byte emission deferred (LK11b).
+TEST(Linker, CrossCuTwoDistinctGlobalsResolve) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    mods.push_back(lkCu(1, {lkSym(1, "foo", SymbolBinding::Global)}));
+    mods.push_back(lkCu(2, {lkSym(2, "bar", SymbolBinding::Global)}));
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(image.symbolCount, 2u);
+    ASSERT_EQ(image.resolvedGlobalDefs.count("foo"), 1u);
+    ASSERT_EQ(image.resolvedGlobalDefs.count("bar"), 1u);
+    EXPECT_EQ(image.resolvedGlobalDefs.at("foo").cuId.v, 1u);
+    EXPECT_EQ(image.resolvedGlobalDefs.at("foo").symbol.v, 1u);
+    EXPECT_EQ(image.resolvedGlobalDefs.at("bar").cuId.v, 2u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
+    EXPECT_GE(countCode(rep, DiagnosticCode::K_CrossCuImageEmitDeferred), 1u);
+}
+
+// A strong (Global) definition shadows a weak one of the same name — the winning
+// key is the STRONG def's, regardless of which CU it lives in.
+TEST(Linker, CrossCuStrongShadowsWeak) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    mods.push_back(lkCu(1, {lkSym(1, "foo", SymbolBinding::Weak)}));
+    mods.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Global)}));
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(image.resolvedGlobalDefs.count("foo"), 1u);
+    EXPECT_EQ(image.resolvedGlobalDefs.at("foo").cuId.v, 2u)   // the strong def in CU #2 wins
+        << "a strong (Global) definition must shadow the weak one";
+    EXPECT_EQ(image.resolvedGlobalDefs.at("foo").symbol.v, 2u);
+    EXPECT_EQ(image.symbolCount, 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
+}
+
+// Two strong (Global) definitions of one name across CUs is an ambiguous
+// redefinition — fail loud.
+TEST(Linker, CrossCuDuplicateStrongRedefines) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    mods.push_back(lkCu(1, {lkSym(1, "foo", SymbolBinding::Global)}));
+    mods.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Global)}));
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    // K strong defs of one name → exactly K-1 redefinition diagnostics, order-
+    // independent. Two strong defs → exactly 1 (not just >= 1) — pins count determinism.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 1u);
+}
+
+// Among all-weak definitions the lowest (cuId, SymbolId) wins — INDEPENDENT of
+// module order. Link both orderings; the winner must be identical.
+TEST(Linker, CrossCuAllWeakDeterministicBothOrderings) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    DiagnosticReporter repA;
+    std::vector<AssembledModule> a;
+    a.push_back(lkCu(1, {lkSym(1, "foo", SymbolBinding::Weak)}));
+    a.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Weak)}));
+    auto imageA = lkLink(a, *loaded.target, *loaded.format, repA);
+
+    DiagnosticReporter repB;
+    std::vector<AssembledModule> b;  // reversed module order
+    b.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Weak)}));
+    b.push_back(lkCu(1, {lkSym(1, "foo", SymbolBinding::Weak)}));
+    auto imageB = lkLink(b, *loaded.target, *loaded.format, repB);
+
+    ASSERT_EQ(imageA.resolvedGlobalDefs.count("foo"), 1u);
+    ASSERT_EQ(imageB.resolvedGlobalDefs.count("foo"), 1u);
+    EXPECT_EQ(imageA.resolvedGlobalDefs.at("foo").cuId.v, 1u);  // lowest cuId wins
+    EXPECT_EQ(imageB.resolvedGlobalDefs.at("foo").cuId.v, 1u)
+        << "all-weak resolution must be order-independent";
+    EXPECT_EQ(countCode(repA, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
+    EXPECT_EQ(countCode(repB, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
+}
+
+// Local definitions never enter the global table — two Locals of the same name in
+// different CUs do NOT collide and do NOT resolve to a shared definition.
+TEST(Linker, CrossCuLocalStaysModulePrivate) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    mods.push_back(lkCu(1, {lkSym(1, "foo", SymbolBinding::Local)}));
+    mods.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Local)}));
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(image.resolvedGlobalDefs.count("foo"), 0u);
+    EXPECT_EQ(image.symbolCount, 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
+}
+
+// A Local "foo" in one CU must NOT collide with a Global "foo" in another — the
+// global resolves to the Global def alone; no false redefinition (audit Gap-1).
+TEST(Linker, CrossCuLocalDoesNotCollideWithGlobal) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    mods.push_back(lkCu(1, {lkSym(1, "foo", SymbolBinding::Local)}));   // module-private
+    mods.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Global)}));  // the global "foo"
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(image.resolvedGlobalDefs.count("foo"), 1u);
+    EXPECT_EQ(image.resolvedGlobalDefs.at("foo").cuId.v, 2u);
+    EXPECT_EQ(image.symbolCount, 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
+}
+
+// REFERENCE resolution: an extern import whose name is DEFINED in a sibling CU is a
+// cross-CU reference — it BINDS to that definition (the definition shadows the extern
+// declaration), recorded as an edge in resolvedCrossCuRefs. NOT fail-loud, NOT a DLL
+// import. Asserts the actual (reference -> definition) edge keys.
+TEST(Linker, CrossCuExternResolvesToSiblingDefinition) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;  // CU #1 references "foo" via an extern import
+        m.cuId = CompilationUnitId{1};
+        ExternImport ext;
+        ext.symbol      = SymbolId{5};
+        ext.mangledName = "foo";
+        ext.libraryPath = "lib.dll";  // moot once the reference binds to the sibling def
+        m.externImports.push_back(std::move(ext));
+        mods.push_back(std::move(m));
+    }
+    mods.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Global)}));  // CU #2 DEFINES "foo"
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    // The reference (CU #1, extern #5) binds to the definition (CU #2, #2).
+    ASSERT_EQ(image.resolvedCrossCuRefs.size(), 1u);
+    EXPECT_EQ(image.resolvedCrossCuRefs[0].reference.cuId.v, 1u);
+    EXPECT_EQ(image.resolvedCrossCuRefs[0].reference.symbol.v, 5u);
+    EXPECT_EQ(image.resolvedCrossCuRefs[0].definition.cuId.v, 2u);
+    EXPECT_EQ(image.resolvedCrossCuRefs[0].definition.symbol.v, 2u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u);
-    // The multi-CU image MERGE is LK11 — fail-loud, not a silent empty image.
-    EXPECT_GE(countCode(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 1u);
+}
+
+// An extern import with NO cross-CU definition stays a real FFI import — no cross-CU
+// edge, no diagnostic (it is resolved via the import table, unchanged).
+TEST(Linker, CrossCuExternWithoutDefinitionStaysFfiImport) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;  // CU #1 imports "printf" from a DLL
+        m.cuId = CompilationUnitId{1};
+        ExternImport ext;
+        ext.symbol      = SymbolId{5};
+        ext.mangledName = "printf";
+        ext.libraryPath = "msvcrt.dll";
+        m.externImports.push_back(std::move(ext));
+        mods.push_back(std::move(m));
+    }
+    mods.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Global)}));  // unrelated def
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(image.resolvedCrossCuRefs.size(), 0u)
+        << "an extern defined by no CU must stay a real FFI import, not a cross-CU edge";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 0u);
+}
+
+// A relocation whose target is neither defined nor imported in its own CU is an
+// undefined reference — fail loud (the per-CU compound index does not contain it).
+TEST(Linker, CrossCuUndefinedRelocationFailsLoud) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;  // CU #1: a function with a reloc to an undeclared symbol
+        m.cuId = CompilationUnitId{1};
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        Relocation rel;
+        rel.target = SymbolId{99};  // not defined, not imported anywhere in CU #1
+        fn.relocations.push_back(rel);
+        m.functions.push_back(std::move(fn));
+        m.symbols.push_back(ModuleSymbol{SymbolId{1}, "f1",
+                                         SymbolBinding::Global, SymbolVisibility::Default});
+        mods.push_back(std::move(m));
+    }
+    mods.push_back(lkCu(2, {lkSym(2, "g2", SymbolBinding::Global)}));
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    EXPECT_GE(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << "a relocation to an undeclared symbol must fail loud";
+}
+
+// An extern reference binds to a WEAK cross-CU definition (not only Global) — the
+// def `table` is Global∪Weak, so a Weak def satisfies a reference (only Local is
+// excluded). Also exercises the MULTI-edge shape (two references, two definitions).
+TEST(Linker, CrossCuExternBindsToWeakDefAndMultiEdge) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;  // CU #1 references both "w" and "g"
+        m.cuId = CompilationUnitId{1};
+        ExternImport ew; ew.symbol = SymbolId{5}; ew.mangledName = "w"; ew.libraryPath = "lib.dll";
+        ExternImport eg; eg.symbol = SymbolId{6}; eg.mangledName = "g"; eg.libraryPath = "lib.dll";
+        m.externImports.push_back(std::move(ew));
+        m.externImports.push_back(std::move(eg));
+        mods.push_back(std::move(m));
+    }
+    // CU #2 defines "w" WEAK and "g" Global.
+    mods.push_back(lkCu(2, {lkSym(2, "w", SymbolBinding::Weak),
+                            lkSym(3, "g", SymbolBinding::Global)}));
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(image.resolvedCrossCuRefs.size(), 2u);
+    // Find each edge by its referencing symbol and assert it binds to the right def.
+    auto edgeFor = [&](std::uint32_t refSym) -> LinkedImage::CrossCuRef const* {
+        for (auto const& e : image.resolvedCrossCuRefs)
+            if (e.reference.symbol.v == refSym) return &e;
+        return nullptr;
+    };
+    auto const* wEdge = edgeFor(5);
+    auto const* gEdge = edgeFor(6);
+    ASSERT_NE(wEdge, nullptr);
+    ASSERT_NE(gEdge, nullptr);
+    EXPECT_EQ(wEdge->definition.cuId.v, 2u);   // "w" binds to the WEAK def in CU #2
+    EXPECT_EQ(wEdge->definition.symbol.v, 2u);
+    EXPECT_EQ(gEdge->definition.symbol.v, 3u); // "g" binds to the Global def
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u);
 }
 
 TEST(Linker, RelocationKindMissingFromFormatEmitsMismatch) {

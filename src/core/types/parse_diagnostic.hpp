@@ -810,14 +810,30 @@ enum class DiagnosticCode : std::uint16_t {
     //   convergence as K_DuplicateDataSymbol above.
     K_DuplicateDataSymbol          = 0x800E,
     K_BssDataHasBytes              = 0x800F,
-    // K_CrossCuMergeUnsupported: link() received N>1 AssembledModules, but the
-    //   multi-CU symbol-table MERGE (combining N CUs into one image — cross-CU
-    //   name resolution + weak-vs-strong) is LK11. D-LK4-3 ships the collision-
-    //   proof compound-key index + the multi-module entry; the merge fail-louds
-    //   here until LK11 replaces this emission with the real merge. No single-CU
-    //   build trips this — the single-module overload never passes N>1.
+    // K_CrossCuMergeUnsupported: a cross-CU link the engine cannot perform. At LK11a
+    //   (2026-06-04) this narrowed to the N==0 caller error (link() received no
+    //   modules to merge). The former "extern import vs cross-CU definition" use is
+    //   GONE — LK11a's reference resolution now BINDS such a reference to the sibling
+    //   definition (the definition shadows the extern declaration; see
+    //   `LinkedImage::resolvedCrossCuRefs`). Reserved for any future genuinely-
+    //   unsupported merge interaction so callers keep a code distinct from the
+    //   resolution diagnostics (K_SymbolRedefinedAcrossUnits / K_CrossCuImageEmitDeferred).
     K_CrossCuMergeUnsupported      = 0x8010,
-    // K-NEXT-SLOT: 0x8011 — grep this marker before adding a K_* code.
+    // K_SymbolRedefinedAcrossUnits: two or more STRONG (Global) definitions of the
+    //   same symbol NAME across CUs. The cross-CU analog of K_DuplicateDataSymbol
+    //   (which is within-module). Weak defs never trip this (a strong def shadows
+    //   weak; multiple weak resolve to a deterministic pick); Local defs never trip
+    //   it (they stay module-private and are matched only within their own module).
+    K_SymbolRedefinedAcrossUnits   = 0x8011,
+    // K_CrossCuImageEmitDeferred: cross-CU symbol resolution SUCCEEDED (every
+    //   relocation resolved, no redefinition conflict), but emitting the merged
+    //   image BYTES (cross-CU section layout + VA assignment + cross-module reloc
+    //   application + per-format walker) is LK11b — it co-lands with the multi-CU
+    //   build driver, since real merged bytes need real multi-CU input to verify.
+    //   Distinct from K_CrossCuMergeUnsupported so a caller can tell "resolution
+    //   passed, bytes pending" from "this merge interaction isn't supported".
+    K_CrossCuImageEmitDeferred     = 0x8012,
+    // K-NEXT-SLOT: 0x8013 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

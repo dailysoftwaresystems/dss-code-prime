@@ -5,10 +5,13 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
+#include "link/symbol_kind.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 // Linker engine (plan 14, LK1–LK10 closed end-to-end 2026-05-30).
@@ -54,11 +57,35 @@ struct DSS_EXPORT LinkedImage {
     // the per-function-resolved count.
     std::size_t               expectedFuncCount = 0;
     std::size_t               resolvedFuncCount = 0;
-    // D-LK4-3: count of distinct (cuId, SymbolId) compound keys indexed across all
-    // input modules. The compound key keeps two CUs minting the same bare SymbolId
-    // distinct (count reflects both); a regression to a bare-SymbolId key collapses
-    // them (the collision pin asserts the count + the absence of a false duplicate).
+    // Count of indexed symbols — meaning depends on the link arity:
+    //   * Single-CU (N==1): distinct (cuId, SymbolId) compound keys in the per-module
+    //     index (D-LK4-3 — the compound key keeps two CUs' colliding bare SymbolId
+    //     distinct; a regression to a bare key collapses them, which the collision pin
+    //     asserts via the count + the absence of a false duplicate).
+    //   * Cross-CU (N>1, LK11a): the number of resolved global DEFINITIONS in
+    //     `resolvedGlobalDefs` after weak-vs-strong resolution.
+    // Read by tests; not load-bearing for emission.
     std::size_t               symbolCount = 0;
+
+    // LK11a: the cross-CU symbol-resolution outcome — for each externally-visible
+    // NAME defined across the linked CUs, the WINNING definition's compound key after
+    // weak-vs-strong resolution (a strong/Global def shadows weak; among all-weak the
+    // lowest (cuId, SymbolId) wins deterministically). Empty for single-CU links (no
+    // cross-CU merge). Load-bearing for the OPT7 Weak-inline guard: the optimizer must
+    // not inline a weak callee whose winning definition here is a DIFFERENT, strong one.
+    std::unordered_map<std::string, LinkedSymbolKey> resolvedGlobalDefs;
+
+    // LK11a: a resolved cross-CU REFERENCE — an extern import (a reference) whose name
+    // is DEFINED in a sibling CU. A local/sibling definition shadows the extern
+    // declaration, so the reference binds to that definition (NOT a DLL import). LK11a
+    // records the symbolic edge; LK11b patches the referencing relocations to the
+    // definition's address once the merged image is laid out. An extern with NO cross-CU
+    // definition stays a real FFI import (resolved via the import table, unchanged).
+    struct CrossCuRef {
+        LinkedSymbolKey reference;   // (referencing cuId, the extern import's SymbolId)
+        LinkedSymbolKey definition;  // the winning sibling-CU definition's compound key
+    };
+    std::vector<CrossCuRef> resolvedCrossCuRefs;
 
     [[nodiscard]] bool ok() const noexcept {
         return expectedFuncCount > 0

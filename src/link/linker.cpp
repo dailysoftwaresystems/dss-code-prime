@@ -66,6 +66,95 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
 }
 
+// LK11a — the cross-CU symbol merge + resolution, in three steps:
+//  (1) DEFINITION merge + weak-vs-strong: only Global/Weak definitions participate
+//      (Local stays module-private); the surviving definition of each name lands in
+//      `image.resolvedGlobalDefs` (name -> winning (cuId, SymbolId)). Order-INDEPENDENT:
+//      a strong (Global) def always shadows weak; two strong defs of one name are an
+//      ambiguous redefinition (K_SymbolRedefinedAcrossUnits); among all-weak defs the
+//      lowest (cuId, SymbolId) wins (same result regardless of module order).
+//  (2) REFERENCE resolution: an extern import whose name is DEFINED in a sibling CU is a
+//      cross-CU reference — a local/sibling definition shadows the extern declaration, so
+//      the reference binds to that definition (recorded in `image.resolvedCrossCuRefs`),
+//      NOT a DLL import. An extern with no cross-CU definition stays a real FFI import.
+//  (3) per-CU relocation resolution: every relocation target must be declared in its own
+//      CU (a definition or an extern import) per the compound index, else K_SymbolUndefined.
+// Byte patching against the resolved addresses is LK11b (needs the merged-image layout).
+void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
+                           std::unordered_map<LinkedSymbolKey, SymbolKind> const& compoundIndex,
+                           LinkedImage&        image,
+                           DiagnosticReporter& reporter) {
+    auto lessKey = [](LinkedSymbolKey a, LinkedSymbolKey b) {
+        return (a.cuId.v != b.cuId.v) ? (a.cuId.v < b.cuId.v)
+                                      : (a.symbol.v < b.symbol.v);
+    };
+    struct Winner { LinkedSymbolKey key; SymbolBinding binding; };
+    std::unordered_map<std::string, Winner> table;
+    for (auto const& m : modules) {
+        for (auto const& s : m.symbols) {
+            if (s.binding == SymbolBinding::Local) continue;  // module-private
+            if (s.name.empty()) continue;  // producer-guarded; defensive
+            LinkedSymbolKey const key{m.cuId, s.symbol};
+            auto [it, inserted] = table.try_emplace(s.name, Winner{key, s.binding});
+            if (inserted) continue;
+            Winner& cur = it->second;
+            bool const newStrong = (s.binding == SymbolBinding::Global);
+            bool const curStrong = (cur.binding == SymbolBinding::Global);
+            if (newStrong && curStrong) {
+                report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits,
+                       DiagnosticSeverity::Error,
+                       "symbol \"" + s.name + "\" has multiple strong (Global) "
+                       "definitions across CompilationUnits (CU #" +
+                       std::to_string(cur.key.cuId.v) + " and CU #" +
+                       std::to_string(key.cuId.v) + ") — a strong symbol may be "
+                       "defined only once across the linked image.");
+                if (lessKey(key, cur.key)) cur = Winner{key, s.binding};  // order-independent reported state
+            } else if (newStrong) {        // strong shadows the existing weak
+                cur = Winner{key, s.binding};
+            } else if (!curStrong) {       // both weak — lowest key wins deterministically
+                if (lessKey(key, cur.key)) cur = Winner{key, s.binding};
+            }                              // else: existing strong shadows the new weak
+        }
+    }
+    // (2) Reference resolution — an extern import whose name is DEFINED in a sibling CU
+    // binds to that definition (the definition shadows the extern declaration). Record
+    // the symbolic edge; LK11b patches the referencing relocations to the def's address.
+    // An extern with no cross-CU definition stays a real FFI import (resolved via the
+    // import table — unchanged). Local defs are not in `table`, so a Local of the same
+    // name never satisfies an extern (correct — Local is module-private).
+    image.resolvedCrossCuRefs.clear();
+    for (auto const& m : modules) {
+        for (auto const& ext : m.externImports) {
+            auto it = table.find(ext.mangledName);
+            if (it != table.end()) {
+                image.resolvedCrossCuRefs.push_back(LinkedImage::CrossCuRef{
+                    LinkedSymbolKey{m.cuId, ext.symbol}, it->second.key});
+            }
+        }
+    }
+    // (3) Per-CU relocation resolution — every relocation target must resolve to a symbol
+    // declared in its own CU (a definition or an extern import). An unresolved target is
+    // undefined. (The compound index is keyed by (cuId, SymbolId), so the lookup is
+    // per-CU.) Byte patching against the resolved address is LK11b.
+    for (auto const& m : modules) {
+        for (auto const& fn : m.functions) {
+            for (auto const& rel : fn.relocations) {
+                if (!compoundIndex.contains(LinkedSymbolKey{m.cuId, rel.target})) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "relocation in CU #" + std::to_string(m.cuId.v) +
+                           " targets symbol #" + std::to_string(rel.target.v) +
+                           " which is not defined or imported in that CompilationUnit "
+                           "(a cross-CU reference must be declared as an extern import).");
+                }
+            }
+        }
+    }
+    image.resolvedGlobalDefs.clear();
+    for (auto const& [name, w] : table) image.resolvedGlobalDefs.emplace(name, w.key);
+    image.symbolCount = image.resolvedGlobalDefs.size();
+}
+
 } // namespace
 
 LinkedImage link(std::span<AssembledModule const> modules,
@@ -86,15 +175,31 @@ LinkedImage link(std::span<AssembledModule const> modules,
         return image;
     }
     if (modules.size() > 1) {
-        std::unordered_map<LinkedSymbolKey, SymbolKind> crossCuIndex;
-        for (auto const& m : modules) buildCompoundIndex(crossCuIndex, m, reporter);
-        image.symbolCount = crossCuIndex.size();
-        report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported,
+        // Per-CU validation first (within-CU duplicate SymbolId + empty extern
+        // name/path), via the same compound-key gate the single-CU path uses.
+        // Cross-CU entries never collide (distinct cuId), so one shared index
+        // validates every CU's internal consistency.
+        std::unordered_map<LinkedSymbolKey, SymbolKind> compoundIndex;
+        for (auto const& m : modules) buildCompoundIndex(compoundIndex, m, reporter);
+
+        // Cross-CU merge: DEFINITION merge + weak-vs-strong (-> resolvedGlobalDefs) +
+        // REFERENCE resolution (extern -> sibling def -> resolvedCrossCuRefs) + per-CU
+        // relocation resolution (undefined -> K_SymbolUndefined).
+        resolveCrossCuSymbols(modules, compoundIndex, image, reporter);
+
+        // The merged-image BYTE emission (cross-CU section layout + VA assignment +
+        // cross-module relocation apply + per-format walker) AND resolving a
+        // reference to a sibling-CU definition (the extern -> definition path) are
+        // LK11b — they co-land with the multi-CU build driver, since real merged
+        // bytes need real multi-CU input to verify. Distinct code so a caller can
+        // tell "resolution passed, emission pending" from a true merge failure.
+        report(reporter, DiagnosticCode::K_CrossCuImageEmitDeferred,
                DiagnosticSeverity::Error,
-               "multi-CU image merge (" + std::to_string(modules.size()) +
-               " CompilationUnits) is LK11 — D-LK4-3 ships the collision-proof "
-               "compound-key index + the multi-module entry; the cross-CU symbol "
-               "merge + name resolution + weak-vs-strong is not yet implemented.");
+               "cross-CU symbol resolution completed for " +
+               std::to_string(modules.size()) + " CompilationUnits (" +
+               std::to_string(image.symbolCount) + " global definition(s) resolved); "
+               "merged-image byte emission is LK11b (co-lands with the multi-CU "
+               "build driver).");
         return image;
     }
 

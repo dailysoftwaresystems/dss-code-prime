@@ -378,6 +378,64 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     // compound key only matters once LK11 links multiple CUs in one image.
     assembled.cuId = cu.id();
 
+    // LK11a: build the per-module symbol table the linker matches by NAME across
+    // CUs (cross-CU resolution + weak-vs-strong). One entry per DEFINED function /
+    // global — extern imports are references, not definitions, and are carried
+    // separately in `externImports`. The name comes from the semantic symbol table
+    // (raw declared identifier, no mangling); binding/visibility from MIR. IRs stay
+    // numeric — the name is assembled here, where `model` + `mir` are both in scope,
+    // not threaded through MIR/LIR. A defined symbol with no semantic record, or a
+    // Global/Weak with an empty name, is a producer-contract breach the linker could
+    // only mis-resolve cross-CU — fail loud here rather than emit an unmatchable
+    // symbol. (Source/target/format-agnostic: reads the symbol table + MIR linkage,
+    // no language/CPU/format branch.)
+    {
+        auto appendSym = [&](SymbolId sym, SymbolBinding bind,
+                             SymbolVisibility vis) -> bool {
+            SymbolRecord const* rec = model.recordFor(sym);
+            if (rec == nullptr) {
+                // No semantic record → a compiler-SYNTHESIZED, module-internal symbol:
+                // e.g. a string-literal rodata global (its SymbolId is minted ABOVE the
+                // semantic range per D-LK4-RODATA-PRODUCER-STRING, so it lands out of
+                // range here, never a wrong-record collision), or a synthesized init
+                // thunk. Such a symbol is never referenced across CUs by name — exclude
+                // it from the cross-CU symbol table; it stays module-private, resolved
+                // intra-CU by its SymbolId. (A genuinely corrupted producer id — OOR for
+                // a real source symbol — is indistinguishable from a synthetic one at
+                // this layer, so it is likewise skipped rather than fail-loud; such
+                // corruption surfaces downstream where the SymbolId is actually consumed.
+                // That is the honest reason this is a skip, not a hard error.)
+                return true;
+            }
+            if (rec->name.empty() && bind != SymbolBinding::Local) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_SymbolUndefined;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "compile_pipeline: externally-visible symbol #{} has an empty "
+                    "name — the linker cannot match it across CUs (LK11a).", sym.v);
+                reporter.report(std::move(d));
+                return false;
+            }
+            assembled.symbols.push_back(ModuleSymbol{sym, rec->name, bind, vis});
+            return true;
+        };
+        for (std::uint32_t i = 0; i < mir.mir.moduleFuncCount(); ++i) {
+            MirFuncId const fid = mir.mir.funcAt(i);
+            if (!appendSym(mir.mir.funcSymbol(fid), mir.mir.funcBinding(fid),
+                           mir.mir.funcVisibility(fid))) {
+                return false;
+            }
+        }
+        for (std::uint32_t i = 0; i < mir.mir.moduleGlobalCount(); ++i) {
+            MirGlobalId const gid = mir.mir.globalAt(i);
+            if (!appendSym(mir.mir.globalSymbol(gid), mir.mir.globalBinding(gid),
+                           mir.mir.globalVisibility(gid))) {
+                return false;
+            }
+        }
+    }
+
     // 11. Link.
     auto const linkEntry = reporter.errorCount();
     auto image = linker::link(assembled, target, format, reporter);

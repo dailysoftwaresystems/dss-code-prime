@@ -160,6 +160,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_DuplicateDataSymbol:          return "K_DuplicateDataSymbol";
         case DiagnosticCode::K_BssDataHasBytes:              return "K_BssDataHasBytes";
         case DiagnosticCode::K_CrossCuMergeUnsupported:      return "K_CrossCuMergeUnsupported";
+        case DiagnosticCode::K_SymbolRedefinedAcrossUnits:   return "K_SymbolRedefinedAcrossUnits";
+        case DiagnosticCode::K_CrossCuImageEmitDeferred:     return "K_CrossCuImageEmitDeferred";
 
         case DiagnosticCode::D_TargetFormatMismatch:         return "D_TargetFormatMismatch";
         case DiagnosticCode::D_TargetMachineCodeMismatch:    return "D_TargetMachineCodeMismatch";
