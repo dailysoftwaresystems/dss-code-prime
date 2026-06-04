@@ -146,10 +146,10 @@ TEST(MirAlias, Rule4_PtrToVoidPointeeReturnsMaybeUnderStrict) {
               MirAliasResult::Maybe);
 }
 
-// ── Rule 5: distinct primitive pointees + StrictTbaa::Yes → No ───────
+// ── Rule 6: distinct primitive pointees + StrictTbaa::Yes → No ───────
 //                                + StrictTbaa::No  → Maybe (polarity proof)
 
-TEST(MirAlias, Rule5_DistinctPrimitivePointeesViaArgsUnderStrictTBAA) {
+TEST(MirAlias, Rule6_DistinctPrimitivePointeesViaArgsUnderStrictTBAA) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32    = interner.primitive(TypeKind::I32);
     TypeId const i64    = interner.primitive(TypeKind::I64);
@@ -174,9 +174,58 @@ TEST(MirAlias, Rule5_DistinctPrimitivePointeesViaArgsUnderStrictTBAA) {
               MirAliasResult::Maybe);
 }
 
-// ── Rule 6: same primitive pointees → Maybe (catch-all) ──────────────
+// ── Rule 5: character-type exception (C99 §6.5 ¶7) ───────────────────
+// A character-typed pointer may alias an object of ANY type, even under
+// strict TBAA. This is part of the strict-aliasing rule itself, not an
+// opt-out — `char*` punning is the canonical exception that lets
+// serializers / hash visitors / memcpy implementations be sound.
 
-TEST(MirAlias, Rule6_SamePrimitivePointeesUnderStrictReturnMaybe) {
+TEST(MirAlias, Rule5_CharPointeeAliasesAllUnderStrict) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const charT  = interner.primitive(TypeKind::Char);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const ptrCh  = interner.pointer(charT);
+    (void)voidT;
+    std::array<TypeId, 2> const params{ptrI32, ptrCh};
+    auto m = buildArgModule(interner, params);
+
+    // Even under strict TBAA, char-vs-i32 must stay Maybe (NOT No).
+    EXPECT_EQ(mirMayAlias(m.mir, interner, m.args[0], m.args[1],
+                          StrictTbaa::Yes),
+              MirAliasResult::Maybe)
+        << "C99 §6.5 ¶7: char* may alias any object type";
+    // Symmetric.
+    EXPECT_EQ(mirMayAlias(m.mir, interner, m.args[1], m.args[0],
+                          StrictTbaa::Yes),
+              MirAliasResult::Maybe);
+}
+
+TEST(MirAlias, Rule5_BytePointeeAliasesAllUnderStrict) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const byteT  = interner.primitive(TypeKind::Byte);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const ptrBy  = interner.pointer(byteT);
+    std::array<TypeId, 2> const params{ptrI32, ptrBy};
+    auto m = buildArgModule(interner, params);
+
+    // Byte is the MIR-tier byte-addressable companion to Char; same
+    // alias-all rule applies (the rationale is byte-addressability,
+    // not the C-standard's specific character types).
+    EXPECT_EQ(mirMayAlias(m.mir, interner, m.args[0], m.args[1],
+                          StrictTbaa::Yes),
+              MirAliasResult::Maybe);
+    // Symmetric — Rule 5 must fire regardless of argument order.
+    EXPECT_EQ(mirMayAlias(m.mir, interner, m.args[1], m.args[0],
+                          StrictTbaa::Yes),
+              MirAliasResult::Maybe);
+}
+
+// ── Rule 7: same primitive pointees → Maybe (catch-all) ──────────────
+
+TEST(MirAlias, Rule7_SamePrimitivePointeesUnderStrictReturnMaybe) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32    = interner.primitive(TypeKind::I32);
     TypeId const ptrI32 = interner.pointer(i32);
@@ -189,9 +238,9 @@ TEST(MirAlias, Rule6_SamePrimitivePointeesUnderStrictReturnMaybe) {
               MirAliasResult::Maybe);
 }
 
-// ── Rule 6: aggregate vs primitive → Maybe (positive) ────────────────
+// ── Rule 7: aggregate vs primitive → Maybe (positive) ────────────────
 
-TEST(MirAlias, Rule6_AggregateVsPrimitivePointeesReturnMaybeUnderStrict) {
+TEST(MirAlias, Rule7_AggregateVsPrimitivePointeesReturnMaybeUnderStrict) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32 = interner.primitive(TypeKind::I32);
     std::array<TypeId, 1> const structFields{i32};

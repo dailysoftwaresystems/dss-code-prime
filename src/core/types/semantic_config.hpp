@@ -588,6 +588,40 @@ struct DSS_EXPORT SemanticConfig {
         bool nullPointerConstantFromIntegerZero = false;
     };
     PointerConversionRules pointerConversions;
+
+    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d): per-
+    // language strict-aliasing opt-in. Threaded by the compile pipeline
+    // into `MirLoweringConfig.strictAliasingOnDistinctTypes`, which the
+    // HIR→MIR lowering forwards to `MirBuilder::setAliasingMode` —
+    // CSE/LICM consumers then read it via `Mir.aliasingMode()`.
+    //
+    // The C99 §6.5 ¶7 character-type exception is BAKED INTO the MIR
+    // alias predicate (`mirMayAlias` Rule 5) — opting in here is sound
+    // for any C-family language without further configuration. A
+    // future language wanting "strict aliasing without the character
+    // exception" needs a separate `PointerAliasingRules` bit (anchored
+    // at `D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE`).
+    //
+    // Loader-level unknown-key fail-loud mirrors the
+    // `pointerConversions` pattern (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD
+    // discipline — a typo'd `strictAliasing` would otherwise silently
+    // fall back to default-false and flip the language's optimization
+    // polarity).
+    struct PointerAliasingRules {
+        // Per C99 §6.5 ¶7 / C++ [basic.lval]: a glvalue accessed
+        // through a pointer of a type that is NOT compatible with the
+        // dynamic object type is undefined behavior. Optimizers that
+        // honor this can prove `Ptr<I32>` and `Ptr<I64>` don't alias
+        // (Rule 6 in `mirMayAlias`). Character-type pointers stay
+        // alias-all regardless of this flag (Rule 5).
+        //
+        // C, C++, Objective-C: true. Rust (via its borrow checker) is
+        // arguably stricter but does NOT use this MIR-tier flag — it
+        // enforces non-aliasing at the type-checker tier. Java / Go /
+        // dynamic languages: false (no spec-level guarantee).
+        bool strictAliasingOnDistinctTypes = false;
+    };
+    PointerAliasingRules pointerAliasing;
 };
 
 } // namespace dss

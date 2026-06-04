@@ -59,6 +59,18 @@ struct DSS_EXPORT HirToMirResult {
 // `false`) until per-Global routing lands in plan 20.
 struct DSS_EXPORT MirLoweringConfig {
     bool globalsAllowFloat = true;
+    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
+    // threaded from the source-language schema's
+    // `semantics.pointerAliasing.strictAliasingOnDistinctTypes`. When
+    // true, `lowerToMir` calls `MirBuilder::setAliasingMode(StrictTBAA)`
+    // before `finish()` — CSE/LICM Load admission then admits Rule 6
+    // (distinct primitive pointees) on top of the already-sound Rules
+    // 1–5 (same-SSA / distinct-Allocas / non-pointer / Ptr<Void> /
+    // character-type alias-all). Default false (sound — every CSE/LICM
+    // admission stays conservative without opt-in). Multi-language CUs
+    // AND each schema's knob (any `false` ⇒ module-wide `false`),
+    // matching the existing `globalsAllowFloat` discipline.
+    bool strictAliasingOnDistinctTypes = false;
 };
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool

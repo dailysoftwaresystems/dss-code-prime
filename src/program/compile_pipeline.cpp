@@ -163,6 +163,14 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat =
         grammar.hirLowering().globalsConstEval.allowFloat;
+    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d): thread
+    // the source-language strict-aliasing opt-in from the SemanticConfig
+    // through to the HIR→MIR lowering, which stamps it onto the Mir
+    // for CSE/LICM Load admission. Multi-language CUs will eventually
+    // AND each schema's knob; today's single-language-per-CU shape
+    // reads directly.
+    mirCfg.strictAliasingOnDistinctTypes =
+        grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes;
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap);

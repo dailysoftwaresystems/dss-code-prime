@@ -572,6 +572,10 @@
       "implicitFromVoidPtr":                true,
       "nullPointerConstantFromIntegerZero": true
     },
+    "$pointerAliasingComment": "D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d, 2026-06-03): C99 §6.5 ¶7 strict aliasing — accessing an object through a pointer of an incompatible type is undefined behavior. Opting in lets the MIR optimizer's CSE/LICM Load admission prove Ptr<I32> and Ptr<I64> don't alias (Rule 6 in mirMayAlias). The C99 §6.5 ¶7 character-type exception (Char/Byte alias all) is BAKED INTO the predicate (Rule 5) — opting in here is sound for C without further configuration.",
+    "pointerAliasing": {
+      "strictAliasingOnDistinctTypes":      true
+    },
     "declarations": [
       { "rule": "varDeclHead", "name": 1, "type": 0, "kind": "variable",
         "constMarker": "ConstKeyword", "warnIfUnused": true,

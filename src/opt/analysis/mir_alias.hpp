@@ -77,14 +77,19 @@ namespace detail {
     TypeId              pointeeA,
     TypeId              pointeeB) noexcept
 {
+    // NOTE: `Char` and `Byte` deliberately NOT included here. The
+    // caller (mirMayAlias) handles the character-type exception via
+    // a dedicated Rule 5 BEFORE reaching this helper; excluding them
+    // here is defense in depth — even if the rule ordering were
+    // accidentally swapped, a char-vs-int strict-TBAA query would
+    // fall through to the conservative Maybe instead of wrongly
+    // returning No.
     auto const isPrimitiveNonVoid = [&](TypeKind k) noexcept {
         switch (k) {
             case TypeKind::Bool:
             case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32: case TypeKind::I64:
             case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32: case TypeKind::U64:
             case TypeKind::F16: case TypeKind::F32: case TypeKind::F64: case TypeKind::F128:
-            case TypeKind::Char:
-            case TypeKind::Byte:
                 return true;
             default:
                 return false;
@@ -106,10 +111,15 @@ namespace detail {
 //      pointer-ness on a non-pointer SSA value)
 //   4. Either pointee is `Void`               → Maybe (universal escape
 //      hatch — `void*` may legally alias anything)
-//   5. Distinct primitive pointees AND `StrictTbaa::Yes`
+//   5. Either pointee is a character type     → Maybe (C99 §6.5 ¶7
+//      character-type exception — `char*`/`signed char*`/`unsigned
+//      char*` may legally alias an object of any type, even under
+//      strict aliasing; serializers / hash visitors / memcpy
+//      implementations rely on this)
+//   6. Distinct primitive pointees AND `StrictTbaa::Yes`
 //                                             → No   (C-style strict-
 //      aliasing; opt-in via SemanticConfig)
-//   6. Otherwise                              → Maybe (conservative)
+//   7. Otherwise                              → Maybe (conservative)
 //
 // `strictTBAA` defaults to `StrictTbaa::No`; consumers thread the per-
 // language value in. Until threaded, every pair stays Maybe — substrate
@@ -157,12 +167,24 @@ namespace detail {
         return MirAliasResult::Maybe;
     }
 
-    if (strictTBAA == StrictTbaa::Yes
-     && detail::isDistinctPrimitivePair(interner, pointeeA, pointeeB)) {
-        return MirAliasResult::No;                                     // Rule 5
+    // Rule 5: C99 §6.5 ¶7 character-type exception. Char/Byte may alias
+    // an object of ANY type, even under strict TBAA. Override anchored
+    // at `D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE` for future languages
+    // that want strict-without-char-exception.
+    auto const isCharType = [&](TypeId t) noexcept {
+        TypeKind const k = interner.kind(t);
+        return k == TypeKind::Char || k == TypeKind::Byte;
+    };
+    if (isCharType(pointeeA) || isCharType(pointeeB)) {
+        return MirAliasResult::Maybe;
     }
 
-    return MirAliasResult::Maybe;                                      // Rule 6
+    if (strictTBAA == StrictTbaa::Yes
+     && detail::isDistinctPrimitivePair(interner, pointeeA, pointeeB)) {
+        return MirAliasResult::No;                                     // Rule 6
+    }
+
+    return MirAliasResult::Maybe;                                      // Rule 7
 }
 
 // ── Region + loop clobber walkers ────────────────────────────────────

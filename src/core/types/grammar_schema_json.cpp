@@ -4568,6 +4568,56 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
+            // per-language `pointerAliasing` block. Single bool field
+            // today (`strictAliasingOnDistinctTypes`); designed to
+            // accept additional fields when future strict-aliasing
+            // variants land (e.g. `excludeCharExceptionOverride` —
+            // anchored at D-OPT-MIR-ALIAS-CHAR-EXCEPTION-OVERRIDE).
+            // Unknown-key fail-loud mirrors the `pointerConversions`
+            // discipline above.
+            if (sem.contains("pointerAliasing")) {
+                auto const& obj = sem.at("pointerAliasing");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/pointerAliasing",
+                              "'pointerAliasing' must be an object with "
+                              "optional `strictAliasingOnDistinctTypes` "
+                              "boolean field");
+                } else {
+                    auto readBool = [&](char const* field, bool& out) {
+                        if (!obj.contains(field)) return;
+                        auto const& val = obj.at(field);
+                        if (!val.is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format(
+                                          "/semantics/pointerAliasing/{}",
+                                          field),
+                                      std::format("'{}' must be a boolean",
+                                                  field));
+                            return;
+                        }
+                        out = val.get<bool>();
+                    };
+                    readBool("strictAliasingOnDistinctTypes",
+                             cfg.pointerAliasing
+                                 .strictAliasingOnDistinctTypes);
+                    for (auto const& [k, _] : obj.items()) {
+                        if (k != "strictAliasingOnDistinctTypes") {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format(
+                                          "/semantics/pointerAliasing/{}",
+                                          k),
+                                      std::format(
+                                          "unknown 'pointerAliasing' "
+                                          "field '{}' — expected "
+                                          "'strictAliasingOnDistinctTypes'",
+                                          k));
+                        }
+                    }
+                }
+            }
+
             // A `nameMatch: "lastIdentifier"` rule (declaration or
             // reference) descends a subtree for its LAST identifier token —
             // which requires the engine to know which token kind IS the

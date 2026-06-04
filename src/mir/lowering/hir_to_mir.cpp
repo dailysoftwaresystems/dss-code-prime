@@ -2172,6 +2172,14 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .ffiMap    = ffiMap,
         .mir       = MirBuilder{},
     };
+    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-
+    // level alias-analysis polarity from the schema BEFORE any lowering
+    // work runs. Unconditional (matches `globalsAllowFloat` discipline)
+    // so a future default-flip in `MirBuilder` can't silently diverge
+    // from the schema, AND both polarities are grep-discoverable.
+    lwr.mir.setAliasingMode(config.strictAliasingOnDistinctTypes
+        ? MirAliasingMode::StrictTBAA
+        : MirAliasingMode::Permissive);
     lwr.lower();
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();

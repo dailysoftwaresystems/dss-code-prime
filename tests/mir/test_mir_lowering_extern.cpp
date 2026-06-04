@@ -52,6 +52,53 @@ struct Built {
 
 } // namespace
 
+// D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d): proves the
+// MirLoweringConfig.strictAliasingOnDistinctTypes flag is honored at
+// HIR→MIR boundary. The compile_pipeline reads from
+// `grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes`
+// and threads into MirLoweringConfig; lowerToMir calls
+// MirBuilder::setAliasingMode based on the field. Paired
+// (default false / explicit true) so a regression that ignores the
+// field fails one arm.
+TEST(MirLoweringExtern, MirAliasingModeDefaultsToPermissive) {
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+    FfiMetadata meta;
+    meta.mangledName   = "printf";
+    meta.importLibrary = "libc.so.6";
+    ffi.set(built.externNode, meta);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    MirLoweringConfig cfg;  // strictAliasingOnDistinctTypes defaults false
+    auto result = lowerToMir(built.hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr, cfg, &ffi);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(result.mir.aliasingMode(), MirAliasingMode::Permissive);
+}
+
+TEST(MirLoweringExtern, MirAliasingModeFlipsToStrictTBAAWhenConfigOptsIn) {
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+    FfiMetadata meta;
+    meta.mangledName   = "printf";
+    meta.importLibrary = "libc.so.6";
+    ffi.set(built.externNode, meta);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    MirLoweringConfig cfg;
+    cfg.strictAliasingOnDistinctTypes = true;
+    auto result = lowerToMir(built.hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr, cfg, &ffi);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(result.mir.aliasingMode(), MirAliasingMode::StrictTBAA)
+        << "MirLoweringConfig.strictAliasingOnDistinctTypes=true must "
+           "translate to StrictTBAA on the lowered Mir";
+}
+
 TEST(MirLoweringExtern, ExternFunctionWithFfiMetadataPopulatesExternImports) {
     TypeInterner ti = makeInterner();
     auto built = buildModuleWithExtern(ti);
