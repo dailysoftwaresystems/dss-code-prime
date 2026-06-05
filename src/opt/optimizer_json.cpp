@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -159,8 +160,34 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
         }
     }
 
+    // Inline COST bound (OPT7 cycle 28). Optional. Default =
+    // `kDefaultInlineThreshold` (absent → the size cap that ships in
+    // `release.pipeline.json`). Mirrors the `maxIterations` parse:
+    // rejected outside [1, kMaxInlineThreshold] (0 is a silent
+    // refuse-all trap; the upper cap is a pathological-size sanity
+    // bound) → X_PipelineMalformed via `emitMalformed`. A non-integer
+    // is likewise X_PipelineMalformed.
+    std::uint32_t inlineThreshold = kDefaultInlineThreshold;
+    if (pipe.contains("inlineThreshold")) {
+        if (!pipe.at("inlineThreshold").is_number_integer()) {
+            emitMalformed(coll,
+                          std::string{sourceLabel} + "/pipeline/inlineThreshold",
+                          "must be an integer");
+        } else {
+            auto const v = pipe.at("inlineThreshold").get<std::int64_t>();
+            if (v < 1 || v > static_cast<std::int64_t>(kMaxInlineThreshold)) {
+                emitMalformed(coll,
+                    std::string{sourceLabel} + "/pipeline/inlineThreshold",
+                    std::format("must be in [1, {}] (got {})",
+                                kMaxInlineThreshold, v));
+            } else {
+                inlineThreshold = static_cast<std::uint32_t>(v);
+            }
+        }
+    }
+
     rejectUnknownKeys(coll, pipe, std::string{sourceLabel} + "/pipeline",
-                      {"name", "passes", "maxIterations"});
+                      {"name", "passes", "maxIterations", "inlineThreshold"});
 
     // Empty pipeline = silent no-op at the optimizer engine. Reject
     // at load-time so a stray `"passes": []` doesn't ship a build
@@ -173,7 +200,8 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     if (coll.hasErrors()) {
         return std::unexpected(std::move(coll).release());
     }
-    return OptPipeline{std::move(name), std::move(passes), maxIterations};
+    return OptPipeline{std::move(name), std::move(passes), maxIterations,
+                       inlineThreshold};
 }
 
 } // namespace

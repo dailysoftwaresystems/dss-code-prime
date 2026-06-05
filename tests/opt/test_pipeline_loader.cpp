@@ -37,25 +37,38 @@ TEST(PipelineLoader, ShippedDebugLoadsIdentity) {
 }
 
 // Shipped `release.pipeline.json` declares
-// [Identity, ConstFold, Mem2Reg, CopyProp, Cse, Licm, SimplifyCfg, Dce]
-// with maxIterations=4. LICM sits AFTER CSE (canonicalized SSA
-// graph) and BEFORE SimplifyCFG (hoisting unconditional defs into
-// the preheader may expose new constant-condition CondBrs the
-// SimplifyCFG pass can fold).
+// [Identity, Inlining, ConstFold, Mem2Reg, CopyProp, Cse, Licm,
+// SimplifyCfg, Dce] with maxIterations=4 + inlineThreshold=50.
+// Inlining runs EARLY (index 1, right after Identity, before
+// ConstFold) so the inlined callee bodies flow through the entire
+// downstream battery — ConstFold folds now-constant arguments,
+// Mem2Reg promotes any spliced allocas, CSE/LICM/SimplifyCFG/DCE
+// clean up — and the maxIterations=4 fixed-point loop re-optimizes
+// (OPT7 cycle 28: inlining shipped, bounded by the size threshold).
+// LICM sits AFTER CSE (canonicalized SSA graph) and BEFORE SimplifyCFG
+// (hoisting unconditional defs into the preheader may expose new
+// constant-condition CondBrs the SimplifyCFG pass can fold).
+//
+// EXACT-LIST pin: adding/removing/reordering a pass in the JSON breaks
+// this — it MUST be updated in lockstep (a complementary `contains`
+// check below — `ShippedReleaseContainsInlining` — guards the
+// Inlining membership specifically).
 TEST(PipelineLoader, ShippedReleaseLoadsAllPasses) {
     auto r = opt::loadShippedPipeline("release");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->name, "release");
-    ASSERT_EQ(r->passes.size(), 8u);
+    ASSERT_EQ(r->passes.size(), 9u);
     EXPECT_EQ(r->passes[0], opt::PassId::Identity);
-    EXPECT_EQ(r->passes[1], opt::PassId::ConstFold);
-    EXPECT_EQ(r->passes[2], opt::PassId::Mem2Reg);
-    EXPECT_EQ(r->passes[3], opt::PassId::CopyProp);
-    EXPECT_EQ(r->passes[4], opt::PassId::Cse);
-    EXPECT_EQ(r->passes[5], opt::PassId::Licm);
-    EXPECT_EQ(r->passes[6], opt::PassId::SimplifyCfg);
-    EXPECT_EQ(r->passes[7], opt::PassId::Dce);
+    EXPECT_EQ(r->passes[1], opt::PassId::Inlining);
+    EXPECT_EQ(r->passes[2], opt::PassId::ConstFold);
+    EXPECT_EQ(r->passes[3], opt::PassId::Mem2Reg);
+    EXPECT_EQ(r->passes[4], opt::PassId::CopyProp);
+    EXPECT_EQ(r->passes[5], opt::PassId::Cse);
+    EXPECT_EQ(r->passes[6], opt::PassId::Licm);
+    EXPECT_EQ(r->passes[7], opt::PassId::SimplifyCfg);
+    EXPECT_EQ(r->passes[8], opt::PassId::Dce);
     EXPECT_EQ(r->maxIterations, 4u);
+    EXPECT_EQ(r->inlineThreshold, 50u);
 }
 
 // maxIterations bounds (D-OPT-FIXED-POINT-LOOP): rejected when 0
@@ -95,6 +108,71 @@ TEST(PipelineLoader, MaxIterationsMissingDefaultsToOne) {
         "no-max-iter.json");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->maxIterations, 1u);
+}
+
+// inlineThreshold bounds (OPT7 cycle 28 cost model) — MIRRORS the
+// maxIterations trio. Rejected when 0 (silent refuse-all trap) or
+// > kMaxInlineThreshold; non-integer rejects; missing defaults to
+// kDefaultInlineThreshold; a valid in-range value parses.
+TEST(PipelineLoader, InlineThresholdZeroRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"], "inlineThreshold": 0}})",
+        "inline-thresh-zero.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, InlineThresholdOverflowRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"], "inlineThreshold": 100001}})",
+        "inline-thresh-overflow.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, InlineThresholdNonIntegerRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"], "inlineThreshold": "big"}})",
+        "inline-thresh-string.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, InlineThresholdDefaultsWhenAbsent) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"]}})",
+        "no-inline-thresh.json");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->inlineThreshold, opt::kDefaultInlineThreshold);
+}
+
+TEST(PipelineLoader, InlineThresholdInRange) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"], "inlineThreshold": 7}})",
+        "inline-thresh-7.json");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->inlineThreshold, 7u);
+}
+
+// SHIP pin (complementary to the exact-list ShippedReleaseLoadsAllPasses
+// above): the shipped `release.pipeline.json` CONTAINS `PassId::Inlining`
+// — a `std::find` membership check, robust to future reordering. OPT7
+// cycle 28 shipped inlining in release (bounded by inlineThreshold).
+// RED-on-disable: removing "Inlining" from release.json makes the find
+// fail this assertion.
+TEST(PipelineLoader, ShippedReleaseContainsInlining) {
+    auto r = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(r.has_value());
+    auto const& passes = r->passes;
+    EXPECT_NE(std::find(passes.begin(), passes.end(), opt::PassId::Inlining),
+              passes.end())
+        << "the shipped release pipeline MUST contain Inlining (OPT7 cycle "
+           "28 ships inlining, bounded by the inlineThreshold cost model)";
 }
 
 // D-OPT1-PASS-DUP-POLICY: a pipeline declaring the SAME pass twice

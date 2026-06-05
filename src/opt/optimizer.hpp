@@ -101,6 +101,25 @@ optPassIdName(PassId id) noexcept {
     return idx < kPassIdCount ? kPassNameTable[idx].second : "<unknown>";
 }
 
+// Default inline COST bound (OPT7 cycle 28): `OptPipeline::
+// inlineThreshold` defaults to this when the pipeline JSON omits the
+// key (and a programmatic `OptPipeline{}` construction inherits it).
+// 50 MIR instructions is a conservative size cap — large enough to
+// inline the small leaf/helper callees the c-subset frontend emits,
+// small enough that shipping `Inlining` in `release.pipeline.json`
+// cannot blow up code size on a big callee. A size-based bloat bound;
+// the SOPHISTICATED cost model (call-site hotness, growth-vs-benefit)
+// remains deferred (D-OPT7-INLINE-LEGALITY-GATE).
+inline constexpr std::uint32_t kDefaultInlineThreshold = 50;
+// Substrate UPPER bound on `OptPipeline::inlineThreshold` — the loader
+// rejects values outside [1, kMaxInlineThreshold]. 0 is a silent
+// refuse-all trap (rejected at load); the cap is a large sanity bound
+// (a callee with 100000+ MIR instructions is pathological, and a
+// threshold that high effectively means "inline everything"). Width
+// is uint32 (a callee's instruction-count can exceed a uint8/uint16
+// range; `<cstdint>` keeps it GCC-portable).
+inline constexpr std::uint32_t kMaxInlineThreshold = 100000;
+
 // A pipeline is an ordered list of passes to run on each MIR
 // function. Loaded from `src/dss-config/pipelines/*.pipeline.json`
 // (D-OPT1-PIPELINE-FROM-CONFIG) or constructed inline by tests +
@@ -127,6 +146,20 @@ struct OptPipeline {
     // any realistic mutually-enabling cluster — anything more is
     // either a non-converging pass or a pathological input).
     std::uint8_t        maxIterations = 1;
+    // Inline COST MODEL (OPT7 cycle 28) — a size-based bloat bound. The
+    // §2.9 legality gate inlines a callee ONLY IF its instruction-count
+    // is `<= inlineThreshold`; a callee larger than this is conservatively
+    // REFUSED (too large to inline profitably). This is the FIRST inline
+    // profitability heuristic — it bounds the code-size growth shipping
+    // `Inlining` in `release.pipeline.json` can cause. Config-driven (the
+    // pipeline JSON's optional `inlineThreshold`) — NOT a language /
+    // target / format branch. Default = `kDefaultInlineThreshold` (the
+    // value the loader fills when the key is absent + a programmatic
+    // construction inherits). FAIL-SAFE: a threshold BELOW the smallest
+    // callee refuses everything; threshold 1 (the loader's minimum) admits
+    // only a 1-instruction callee. The loader rejects 0 (a silent
+    // refuse-all trap) and caps at `kMaxInlineThreshold`.
+    std::uint32_t       inlineThreshold = kDefaultInlineThreshold;
 };
 
 // Substrate bound on `OptPipeline::maxIterations` — the loader

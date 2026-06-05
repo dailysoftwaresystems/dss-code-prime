@@ -31,6 +31,7 @@ struct PassRunResult {
 [[nodiscard]] PassRunResult runPass(PassId id, Mir& mir,
                                     TargetSchema const& /*target*/,
                                     TypeInterner const& interner,
+                                    OptPipeline const& pipeline,
                                     DiagnosticReporter& reporter) {
     switch (id) {
         case PassId::Identity:
@@ -70,7 +71,8 @@ struct PassRunResult {
             return {r.ok, r.instructionsHoisted > 0};
         }
         case PassId::Inlining: {
-            auto const r = passes::runInlining(mir, interner, reporter);
+            auto const r = passes::runInlining(mir, interner, reporter,
+                                               pipeline.inlineThreshold);
             return {r.ok, r.callsInlined > 0};
         }
     }
@@ -145,7 +147,8 @@ OptResult optimize(Mir& mir,
     for (std::uint8_t iter = 0; iter < maxIter; ++iter) {
         std::size_t const mutatedAtIterStart = result.passesMutated;
         for (PassId p : pipeline.passes) {
-            auto const passResult = runPass(p, mir, target, interner, reporter);
+            auto const passResult =
+                runPass(p, mir, target, interner, pipeline, reporter);
             ++result.passesRun;
             if (!passResult.ok) {
                 if (reporter.errorCount() <= entryErrorCount) {

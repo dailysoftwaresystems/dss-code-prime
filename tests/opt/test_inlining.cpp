@@ -170,7 +170,8 @@ TEST(Inlining, WeakCalleeIsNotInlined) {
     ASSERT_EQ(callsBefore, 1u);
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 0u)
         << "a Weak callee MUST NOT be inlined — a strong def of the same "
@@ -192,7 +193,8 @@ TEST(Inlining, GlobalLeafCalleeIsInlined) {
     ASSERT_EQ(constsBefore, 1u) << "before: only f holds the Const 7";
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 1u)
         << "a Global single-block leaf callee MUST be inlined";
@@ -255,7 +257,8 @@ TEST(Inlining, ArgumentIsSubstitutedIntoSplicedBody) {
     ASSERT_EQ(addsBefore, 1u) << "before: only g has the Add";
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 1u);
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
@@ -299,7 +302,8 @@ TEST(Inlining, SelfRecursiveCallIsNotInlined) {
     ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 0u)
         << "a self-recursive call MUST NOT be inlined this cycle";
@@ -345,7 +349,8 @@ TEST(Inlining, AddressTakenCalleeIsNotInlined) {
     ASSERT_EQ(callsBefore, 1u);  // only f()
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 0u)
         << "f's address escapes (stored to a slot) — its direct call MUST "
@@ -409,7 +414,8 @@ TEST(Inlining, MultiBlockLeafCalleeIsInlined) {
     auto const totalBlocksBefore = blockCountInModule(mir);
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 1u)
         << "a multi-block LEAF callee MUST be inlined (cycle 2)";
@@ -576,7 +582,8 @@ TEST(Inlining, MultiBlockNonLeafCalleeIsInlined) {
         Mir mir = buildModule();
         ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // g→h + main→g
         DiagnosticReporter rep;
-        auto const r = opt::passes::runInlining(mir, interner, rep);
+        auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
         EXPECT_TRUE(r.ok);
         EXPECT_EQ(r.callsInlined, 2u)
             << "OPT7 c3: BOTH h→g AND the multi-block NON-leaf g→main inline "
@@ -660,7 +667,8 @@ TEST(Inlining, NonReturningLeafCalleeIsNotInlined) {
     }
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 0u)
         << "a callee with NO returning path (every path ends in Unreachable) "
@@ -737,7 +745,8 @@ TEST(Inlining, NonLeafCalleeIsInlined) {
         Mir mir = buildModule();
         ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // f→g + main→f
         DiagnosticReporter rep;
-        auto const r = opt::passes::runInlining(mir, interner, rep);
+        auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
         EXPECT_TRUE(r.ok);
         EXPECT_EQ(r.callsInlined, 2u)
             << "OPT7 c3: BOTH g→f AND the NON-LEAF f→main inline in one pass "
@@ -817,7 +826,8 @@ TEST(Inlining, MutualRecursiveCallIsNotInlined) {
             << "before: f→g and g→f (the cyclic pair) are the only Calls";
 
         DiagnosticReporter rep;
-        auto const r = opt::passes::runInlining(mir, interner, rep);
+        auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
         EXPECT_TRUE(r.ok);
         // THE discriminating assertion: NOTHING inlines — both f→g and g→f
         // are refused by the SCC gate. (With the gate OFF, each would
@@ -866,7 +876,8 @@ TEST(Inlining, MutualRecursiveCallIsNotInlined) {
         ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // A→B + B→C
 
         DiagnosticReporter rep;
-        auto const r = opt::passes::runInlining(mir, interner, rep);
+        auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
         EXPECT_TRUE(r.ok);
         // Both acyclic non-leaf calls inline in one pass (B→C and A→B).
         EXPECT_EQ(r.callsInlined, 2u)
@@ -924,7 +935,8 @@ TEST(Inlining, IntrinsicCalleeIsNotInlined) {
     ASSERT_EQ(countOpInModule(mir, MirOpcode::IntrinsicCall), 1u);  // in f
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 0u)
         << "a single-block callee containing an IntrinsicCall is NOT a leaf "
@@ -977,7 +989,8 @@ TEST(Inlining, VoidLeafCalleeIsInlined) {
     ASSERT_EQ(constsBefore, 2u);
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 1u)
         << "a void single-block leaf callee MUST be inlined";
@@ -1053,7 +1066,8 @@ TEST(Inlining, MixedSingleAndMultiBlockLeavesBothInlined) {
     ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 2u)
         << "both the single-block s() and the multi-block m() are inlined";
@@ -1131,7 +1145,8 @@ TEST(Inlining, MultiBlockSingleReturnLeafElidesMergePhi) {
     auto const totalBlocksBefore = blockCountInModule(mir);
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 1u)
         << "a multi-block LEAF callee with one return MUST be inlined";
@@ -1266,7 +1281,8 @@ TEST(Inlining, MultiBlockVoidLeafIsInlined) {
     auto const totalBlocksBefore = blockCountInModule(mir);
 
     DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 1u)
         << "a multi-block VOID leaf callee MUST be inlined";
@@ -1377,6 +1393,274 @@ TEST(Inlining, WeakCalleeSurvivingMergeIsRefusedByMergedOptimize) {
 
     // The module the merged optimize produced still verifies (the refusal is a no-op,
     // not a malformed rewrite).
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── INLINE COST MODEL (OPT7 cycle 28) ───────────────────────────────
+// The §2.9 legality gate refuses a callee whose instruction-count
+// (summed across ALL blocks) exceeds `inlineThreshold`. These pins
+// exercise the size gate: a real >threshold callee refused, a small
+// one inlined, the EXACT-threshold/over-by-one boundary (proving `>`
+// not `>=`), and the threshold-0 fail-safe (everything refused).
+
+namespace {
+
+// Build a SINGLE-BLOCK LEAF callee with EXACTLY `instCount` MIR
+// instructions, returning an I32 value. The body is a Const seed
+// followed by a chain of `Add`s, terminated by a `Return` — every one
+// of which the gate's body scan counts. `instCount` must be >= 2 (a
+// Const + a Return is the minimum returning leaf). Global binding,
+// nullary, non-recursive, address-not-taken, no Call/IntrinsicCall/Phi
+// → it passes EVERY other gate rule, so the ONLY thing that can refuse
+// it is the size bound. Appends the callee to `mb` under `calleeSym`.
+void addSizedLeafCallee(MirBuilder& mb, TypeInterner& interner,
+                        SymbolId calleeSym, std::uint32_t instCount) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    mb.addFunction(fnSig, calleeSym, SymbolBinding::Global,
+                   SymbolVisibility::Default);
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    // inst 1: the Const seed.
+    MirInstId acc = mb.addConst(i32Lit(1), i32);
+    // insts 2 .. (instCount - 1): a chain of Adds (instCount-2 of them).
+    for (std::uint32_t k = 2; k < instCount; ++k) {
+        MirInstId const addOps[] = {acc, acc};
+        acc = mb.addInst(MirOpcode::Add, addOps, i32);
+    }
+    // inst instCount: the Return terminator.
+    mb.addReturn(acc);
+}
+
+// Count the instructions in a single-block leaf identified by symbol —
+// a self-check that `addSizedLeafCallee` produced exactly the intended
+// size (so the boundary tests below pin the gate, not a miscounted
+// fixture).
+std::size_t leafInstCountBySymbol(Mir const& mir, std::uint32_t sym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v != sym) continue;
+        std::size_t n = 0;
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            n += mir.blockInstCount(mir.funcBlockAt(f, bi));
+        }
+        return n;
+    }
+    return 0;
+}
+
+// Build a module: a SMALL leaf (`smallSize` insts, sym 50) + a LARGE
+// leaf (`largeSize` insts, sym 60), and `main` (sym 100) that calls
+// BOTH and returns their sum. Used by the discriminating cost-model
+// pin: with a threshold BETWEEN the two sizes, only the small one
+// inlines.
+Mir buildSmallAndLargeCalleeModule(TypeInterner& interner,
+                                   std::uint32_t smallSize,
+                                   std::uint32_t largeSize) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    addSizedLeafCallee(mb, interner, SymbolId{50}, smallSize);
+    addSizedLeafCallee(mb, interner, SymbolId{60}, largeSize);
+    // main (SymbolId 100): return small() + large();
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const smallAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const smallOps[] = {smallAddr};
+    MirInstId const smallCall = mb.addInst(MirOpcode::Call, smallOps, i32);
+    MirInstId const largeAddr = mb.addGlobalAddr(SymbolId{60}, fnSig);
+    MirInstId const largeOps[] = {largeAddr};
+    MirInstId const largeCall = mb.addInst(MirOpcode::Call, largeOps, i32);
+    MirInstId const sumOps[] = {smallCall, largeCall};
+    MirInstId const sum = mb.addInst(MirOpcode::Add, sumOps, i32);
+    mb.addReturn(sum);
+    return std::move(mb).finish();
+}
+
+// Whether `main` (sym 100) still calls the callee at `calleeSym` — i.e.
+// a Call in main whose operand[0] is a GlobalAddr to `calleeSym`. Used
+// to assert PRECISELY which call survived (vs. a module-wide Call count
+// that a residual inner call could confuse).
+bool mainStillCalls(Mir const& mir, std::uint32_t calleeSym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v != 100u) continue;
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirInstId const id = mir.blockInstAt(b, ii);
+                if (mir.instOpcode(id) != MirOpcode::Call) continue;
+                auto const ops = mir.instOperands(id);
+                if (ops.empty()) continue;
+                if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr) continue;
+                if (mir.globalAddrSymbol(ops[0]).v == calleeSym) return true;
+            }
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+// ── COST MODEL: a callee larger than the threshold is REFUSED; a
+// smaller one is inlined. ────────────────────────────────────────────
+// Module: small leaf (3 insts, sym 50) + large leaf (12 insts, sym 60),
+// main calls BOTH. Run `runInlining` with threshold = 5 (BETWEEN 3 and
+// 12): the small callee (3 <= 5) IS inlined; the large callee (12 > 5)
+// is REFUSED. Asserts callsInlined == 1 (ONLY the small one), main no
+// longer calls the small callee, AND main STILL calls the large one.
+// RED-on-disable: removing the `if (instCount > inlineThreshold) return
+// std::nullopt;` check in inlineLegalityGate admits the large callee →
+// callsInlined becomes 2 and `mainStillCalls(large)` becomes false →
+// both assertions fail.
+TEST(Inlining, InlineCostModelRefusesLargeCallee) {
+    TypeInterner interner{CompilationUnitId{1}};
+    constexpr std::uint32_t kSmall = 3;
+    constexpr std::uint32_t kLarge = 12;
+    constexpr std::uint32_t kThreshold = 5;  // 3 <= 5 < 12
+    Mir mir = buildSmallAndLargeCalleeModule(interner, kSmall, kLarge);
+
+    // Fixture self-check: the two callees have EXACTLY the intended
+    // sizes, so the assertions below pin the gate, not a miscount.
+    ASSERT_EQ(leafInstCountBySymbol(mir, 50), kSmall);
+    ASSERT_EQ(leafInstCountBySymbol(mir, 60), kLarge);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u)
+        << "before: main calls both the small and large callee";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep, kThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "only the SMALL callee (<= threshold) inlines; the large one "
+           "(> threshold) is refused by the cost model";
+    EXPECT_FALSE(mainStillCalls(mir, 50))
+        << "the small callee's call must be spliced away (inlined)";
+    EXPECT_TRUE(mainStillCalls(mir, 60))
+        << "the LARGE callee's call MUST survive — it exceeds the size "
+           "threshold (RED if the instCount>threshold gate is removed)";
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the cost-gated module must verify clean";
+}
+
+// ── COST MODEL BOUNDARY: EXACTLY threshold inlines, threshold+1 is
+// refused (pins `>` not `>=`). ───────────────────────────────────────
+// Two independent observations, each main()→callee():
+//   (a) a callee of EXACTLY `kThreshold` insts, threshold = kThreshold
+//       → INLINED (instCount == threshold is NOT > threshold).
+//   (b) a callee of `kThreshold + 1` insts, threshold = kThreshold
+//       → REFUSED (instCount == threshold+1 IS > threshold).
+// RED-on-disable: changing the gate from `>` to `>=` flips (a) to
+// refused (the at-threshold callee no longer inlines) → arm (a) fails.
+TEST(Inlining, InlineCostModelBoundaryIsExclusiveUpper) {
+    constexpr std::uint32_t kThreshold = 6;
+
+    // (a) EXACTLY threshold insts → inlined.
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i32   = interner.primitive(TypeKind::I32);
+        TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        addSizedLeafCallee(mb, interner, SymbolId{50}, kThreshold);
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(mEntry);
+        MirInstId const cAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+        MirInstId const cOps[] = {cAddr};
+        MirInstId const cCall = mb.addInst(MirOpcode::Call, cOps, i32);
+        mb.addReturn(cCall);
+        Mir mir = std::move(mb).finish();
+
+        ASSERT_EQ(leafInstCountBySymbol(mir, 50), kThreshold)
+            << "fixture: the callee has EXACTLY threshold instructions";
+
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep, kThreshold);
+        EXPECT_TRUE(r.ok);
+        EXPECT_EQ(r.callsInlined, 1u)
+            << "a callee of EXACTLY threshold instructions MUST inline "
+               "(instCount == threshold is not > threshold; `>` not `>=`)";
+        EXPECT_FALSE(mainStillCalls(mir, 50))
+            << "the at-threshold callee's call must be spliced away";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
+
+    // (b) threshold + 1 insts → refused.
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i32   = interner.primitive(TypeKind::I32);
+        TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        addSizedLeafCallee(mb, interner, SymbolId{50}, kThreshold + 1);
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(mEntry);
+        MirInstId const cAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+        MirInstId const cOps[] = {cAddr};
+        MirInstId const cCall = mb.addInst(MirOpcode::Call, cOps, i32);
+        mb.addReturn(cCall);
+        Mir mir = std::move(mb).finish();
+
+        ASSERT_EQ(leafInstCountBySymbol(mir, 50), kThreshold + 1)
+            << "fixture: the callee has threshold+1 instructions";
+
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep, kThreshold);
+        EXPECT_TRUE(r.ok);
+        EXPECT_EQ(r.callsInlined, 0u)
+            << "a callee ONE instruction over the threshold MUST be refused";
+        EXPECT_TRUE(mainStillCalls(mir, 50))
+            << "the over-by-one callee's call must survive";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
+}
+
+// ── COST MODEL FAIL-SAFE: threshold 0 refuses EVERYTHING. ────────────
+// A threshold of 0 (impossible from the loader, which rejects 0, but
+// reachable via a programmatic OptPipeline construction) means NO callee
+// inlines — even the smallest 2-instruction leaf has instCount (2) > 0.
+// This is the conservative fail-safe: a threshold below the smallest
+// callee refuses all inlining; nothing miscompiles. RED-on-disable:
+// removing the size gate inlines the 2-inst callee even at threshold 0.
+TEST(Inlining, InlineCostModelZeroThresholdRefusesAll) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    // The smallest possible returning leaf: Const + Return = 2 insts.
+    addSizedLeafCallee(mb, interner, SymbolId{50}, 2);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const cAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const cOps[] = {cAddr};
+    MirInstId const cCall = mb.addInst(MirOpcode::Call, cOps, i32);
+    mb.addReturn(cCall);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(leafInstCountBySymbol(mir, 50), 2u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep, /*threshold=*/0);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "threshold 0 must refuse EVERY callee — even a 2-instruction "
+           "leaf has instCount (2) > 0 (fail-safe: refuse-all below the "
+           "smallest callee, never a miscompile)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+        << "the smallest leaf's call must survive at threshold 0";
+
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep));
 }

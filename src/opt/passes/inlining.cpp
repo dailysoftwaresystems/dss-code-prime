@@ -156,7 +156,8 @@ resolveDirectCallee(Mir const& mir, ModuleAnalysis const& a,
 // scope; nullopt = conservatively REFUSE (leave the call as-is).
 [[nodiscard]] std::optional<MirFuncId>
 inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
-                   MirFuncId caller, MirInstId callId) {
+                   MirFuncId caller, MirInstId callId,
+                   std::uint32_t inlineThreshold) {
     // Rule 1: direct call to a defined callee in this module.
     auto const calleeOpt = resolveDirectCallee(mir, a, callId);
     if (!calleeOpt.has_value()) return std::nullopt;
@@ -228,6 +229,7 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     auto const callOps = mir.instOperands(callId);
     std::size_t const callArgCount = callOps.empty() ? 0 : callOps.size() - 1;
     bool hasReturn = false;  // at least one returning path (rule 5, above)
+    std::uint32_t instCount = 0;  // COST MODEL: total callee instructions
     std::uint32_t const nb = mir.funcBlockCount(callee);
     for (std::uint32_t bi = 0; bi < nb; ++bi) {
         MirBlockId const cb = mir.funcBlockAt(callee, bi);
@@ -235,6 +237,7 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
         for (std::uint32_t i = 0; i < ni; ++i) {
             MirInstId const cid = mir.blockInstAt(cb, i);
             MirOpcode const op  = mir.instOpcode(cid);
+            ++instCount;  // every callee inst counts toward the size bound
             // OPT7 cycle 3: a regular `Call` is NO LONGER a refusal — a
             // non-leaf callee whose body contains a direct/indirect `Call`
             // is now admitted (its inner Call clones correctly via the
@@ -256,6 +259,17 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // predecessor-less → MirVerifier rejects the module. Refuse (the Call
     // stays; the program compiles). See rule 5, above.
     if (!hasReturn) return std::nullopt;
+
+    // COST MODEL (rule 6 — OPT7 cycle 28): a size-based profitability
+    // gate. Inline only if the callee is no larger than `inlineThreshold`
+    // instructions; a bigger callee is conservatively REFUSED (too large
+    // to inline profitably). This is what bounds the code-size growth from
+    // shipping `Inlining` in `release.pipeline.json`. `>` (not `>=`): a
+    // callee of EXACTLY `inlineThreshold` instructions still inlines; one
+    // instruction over is refused. FAIL-SAFE: a threshold below the
+    // smallest callee — including 0, if constructed programmatically (the
+    // loader rejects 0) — refuses everything; nothing miscompiles.
+    if (instCount > inlineThreshold) return std::nullopt;
     return callee;
 }
 
@@ -381,8 +395,9 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
 // (and its tests + the Weak-inline pin) byte-for-byte.
 class InliningPolicy final : public MirRebuildPolicy {
 public:
-    InliningPolicy(Mir const& src, ModuleAnalysis const& analysis) noexcept
-        : src_(src), analysis_(analysis) {}
+    InliningPolicy(Mir const& src, ModuleAnalysis const& analysis,
+                   std::uint32_t inlineThreshold) noexcept
+        : src_(src), analysis_(analysis), inlineThreshold_(inlineThreshold) {}
 
     [[nodiscard]] std::size_t callsInlined() const noexcept {
         return callsInlined_;
@@ -402,7 +417,8 @@ public:
                 MirInstId const id = src_.blockInstAt(b, ii);
                 if (src_.instOpcode(id) != MirOpcode::Call) continue;
                 auto const callee =
-                    inlineLegalityGate(src_, analysis_, caller, id);
+                    inlineLegalityGate(src_, analysis_, caller, id,
+                                       inlineThreshold_);
                 if (!callee.has_value()) continue;
                 if (src_.funcBlockCount(*callee) != 1) continue;  // multi-block path
                 plan_.emplace(id.v, *callee);
@@ -501,6 +517,7 @@ private:
 
     Mir const&            src_;
     ModuleAnalysis const& analysis_;
+    std::uint32_t         inlineThreshold_;  // COST MODEL size bound
     // Per-function inline plan: caller Call old-id .v → callee MirFuncId.
     std::unordered_map<std::uint32_t, MirFuncId> plan_;
     std::size_t callsInlined_ = 0;
@@ -976,7 +993,8 @@ private:
 [[nodiscard]] bool
 planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
                   MirFuncId caller,
-                  std::unordered_map<std::uint32_t, MirFuncId>& planOut) {
+                  std::unordered_map<std::uint32_t, MirFuncId>& planOut,
+                  std::uint32_t inlineThreshold) {
     planOut.clear();
     bool anyMulti = false;
     std::uint32_t const nb = src.funcBlockCount(caller);
@@ -986,7 +1004,8 @@ planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
         for (std::uint32_t ii = 0; ii < ni; ++ii) {
             MirInstId const id = src.blockInstAt(b, ii);
             if (src.instOpcode(id) != MirOpcode::Call) continue;
-            auto const callee = inlineLegalityGate(src, analysis, caller, id);
+            auto const callee =
+                inlineLegalityGate(src, analysis, caller, id, inlineThreshold);
             if (!callee.has_value()) continue;
             planOut.emplace(id.v, *callee);
             if (src.funcBlockCount(*callee) != 1) anyMulti = true;
@@ -998,7 +1017,8 @@ planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
 } // namespace
 
 InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
-                           DiagnosticReporter& reporter) {
+                           DiagnosticReporter& reporter,
+                           std::uint32_t inlineThreshold) {
     InliningResult result{};
     MirBuilder builder;
 
@@ -1009,7 +1029,7 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     }
 
     ModuleAnalysis const analysis = analyzeModule(mir);
-    InliningPolicy policy{mir, analysis};
+    InliningPolicy policy{mir, analysis, inlineThreshold};
 
     std::size_t callsInlined = 0;
     bool        malformed    = false;
@@ -1025,7 +1045,7 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
         std::unordered_map<std::uint32_t, MirFuncId> plan;
-        if (planHasMultiBlock(mir, analysis, f, plan)) {
+        if (planHasMultiBlock(mir, analysis, f, plan, inlineThreshold)) {
             MultiBlockInliner mb{mir, builder, plan};
             mb.rebuildFunction(f);
             callsInlined += mb.callsInlined();

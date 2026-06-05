@@ -6,13 +6,21 @@
 // call to a SINGLE-BLOCK LEAF callee whose body splices LINEARLY into
 // the caller's block at the call site (no CFG merge — the simplest SSA
 // splice). Everything else is DEFERRED to a later OPT7 cycle and is
-// NOT built here:
-//   - cost-model profitability (this cycle inlines every eligible
-//     leaf unconditionally) + the inline-threshold config field;
+// NOT built here (subsequent cycles LANDED most of these — see below):
+//   - the inline COST MODEL: a SIZE-based bloat bound — `OptPipeline::
+//     inlineThreshold` (default 50, config-driven via the pipeline JSON)
+//     — LANDED in OPT7 cycle 28; the gate now refuses a callee whose
+//     instruction-count exceeds the threshold, and `Inlining` SHIPS in
+//     `release.pipeline.json` behind that bound. The SOPHISTICATED cost
+//     model (call-site hotness, growth-vs-benefit) remains deferred
+//     (D-OPT7-INLINE-LEGALITY-GATE);
 //   - general MULTI-BLOCK callee splice + StructCfMarker composition
-//     (D-OPT7-MULTIBLOCK-SPLICE);
-//   - recursion INLINING (this cycle only REFUSES self-recursion);
-//   - cross-CU inlining (D-OPT7-1 — the optimizer sees one CU module).
+//     (D-OPT7-MULTIBLOCK-SPLICE — LANDED cycle 2);
+//   - recursion INLINING (cycle 1 REFUSED self-recursion; cycle 3
+//     generalized to refuse all recursive cycles via the call-graph SCC
+//     gate; depth-bounded recursive inlining remains deferred);
+//   - cross-CU inlining (D-OPT7-1 — LANDED cycles 25/26 via the
+//     whole-program MIR merge).
 //
 // **§2.9 LEGALITY GATE** (the CORRECTNESS deliverable). A direct call
 // to callee F is inlined ONLY IF ALL of the following hold; otherwise
@@ -89,6 +97,7 @@
 #include "mir/mir.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace dss::opt::passes {
 
@@ -97,8 +106,19 @@ struct InliningResult {
     std::size_t callsInlined  = 0;
 };
 
+// `inlineThreshold` is the size-based COST bound (OPT7 cycle 28): a
+// callee is inlined ONLY IF its instruction-count is `<= inlineThreshold`
+// (counted across ALL blocks during the legality gate's body scan); a
+// larger callee is conservatively REFUSED. The production caller threads
+// `OptPipeline::inlineThreshold` (config-driven via the pipeline JSON);
+// tests pass `opt::kMaxInlineThreshold` (a permissive value) to inline the
+// tiny fixtures, or a value BETWEEN two callee sizes to exercise the
+// refusal boundary. A threshold of 0 is impossible from the loader (it
+// rejects 0) but, if constructed programmatically, refuses everything
+// (fail-safe). FAIL-SAFE: a threshold below the smallest callee refuses
+// all inlining; nothing miscompiles.
 [[nodiscard]] DSS_EXPORT InliningResult
 runInlining(Mir& mir, TypeInterner const& interner,
-            DiagnosticReporter& reporter);
+            DiagnosticReporter& reporter, std::uint32_t inlineThreshold);
 
 } // namespace dss::opt::passes

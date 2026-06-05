@@ -2,8 +2,9 @@
     "dssPipelineVersion": 1,
     "pipeline": {
         "name": "release",
-        "passes": ["Identity", "ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"],
-        "maxIterations": 4
+        "passes": ["Identity", "Inlining", "ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"],
+        "maxIterations": 4,
+        "inlineThreshold": 50
     }
 }
 
