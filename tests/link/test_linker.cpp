@@ -373,11 +373,10 @@ TEST(Linker, CrossCuLocalDoesNotCollideWithGlobal) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
 }
 
-// REFERENCE resolution: an extern import whose name is DEFINED in a sibling CU is a
-// cross-CU reference — it BINDS to that definition (the def shadows the extern decl),
-// recorded as an edge in resolvedCrossCuRefs. The RESOLUTION (the edge) lands this cycle;
-// byte-PATCHING the referencing relocation into the merged image needs the cross-CU-call
-// expression (the next LK11b step) — so the merge fail-louds K_CrossCuMergeUnsupported.
+// REFERENCE resolution + byte-patching: an extern import whose name is DEFINED in a sibling
+// CU is a cross-CU reference — it BINDS to that definition (the def shadows the extern decl
+// AND the library fallback). The merge retargets the referencing relocation to the def and
+// STRIPS the extern (no library import for it). Asserts the edge + the strip.
 TEST(Linker, CrossCuExternResolvesToSiblingDefinition) {
     auto loaded = loadMinimal();
     ASSERT_TRUE(loaded.target && loaded.format);
@@ -401,10 +400,12 @@ TEST(Linker, CrossCuExternResolvesToSiblingDefinition) {
     EXPECT_EQ(image.resolvedCrossCuRefs[0].reference.symbol.v, 5u);
     EXPECT_EQ(image.resolvedCrossCuRefs[0].definition.cuId.v, 2u);
     EXPECT_EQ(image.resolvedCrossCuRefs[0].definition.symbol.v, 2u);
-    // Edge resolved; merged-image byte-patching of the cross-CU reference is the next
-    // LK11b step — fail-loud rather than emit a wrong import.
-    EXPECT_GE(countCode(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 1u);
+    // The reference resolved to the sibling def: NO fail-loud, and "foo" is STRIPPED from
+    // the emitted image's imports (the sibling shadows the library fallback).
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u);
+    EXPECT_EQ(std::count(image.externImportNames.begin(), image.externImportNames.end(),
+                         std::string{"foo"}), 0);
 }
 
 // An extern import with NO cross-CU definition stays a real FFI import — no cross-CU
@@ -592,6 +593,118 @@ TEST(Linker, CrossCuMergeRetargetsIntraCuRelocation) {
     // which the merged symbol index does not contain.
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u)
         << "the merge must retarget the intra-CU relocation to the callee's merged id";
+}
+
+// LK11b cross-CU REFERENCE byte-patching: CU#1's `caller` calls an extern "crossfn"
+// (declared with a library fallback) that CU#2 DEFINES. The merge must (a) retarget the
+// call to CU#2's def (so it resolves — no K_SymbolUndefined) and (b) STRIP the extern (the
+// sibling shadows the library fallback — "crossfn" must NOT appear in the emitted image's
+// imports). Asserts both, plus the def's body bytes land in the merged image.
+TEST(Linker, CrossCuRetargetAndStripPatches) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<std::uint8_t> const calleeBody{0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};  // mov eax,42; ret
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;  // CU #1: caller calls extern "crossfn" (#2)
+        m.cuId = CompilationUnitId{1};
+        m.expectedFuncCount = 1;
+        AssembledFunction caller;
+        caller.symbol = SymbolId{1};
+        caller.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};  // call rel32; ret
+        Relocation rel;
+        rel.offset = 1;
+        rel.target = SymbolId{2};        // the extern "crossfn"
+        rel.kind   = RelocationKind{1};  // rel32
+        caller.relocations.push_back(rel);
+        m.functions.push_back(std::move(caller));
+        ExternImport ext;
+        ext.symbol      = SymbolId{2};
+        ext.mangledName = "crossfn";
+        ext.libraryPath = "lib.dll";     // library fallback — shadowed by the sibling def
+        m.externImports.push_back(std::move(ext));
+        m.symbols.push_back(ModuleSymbol{SymbolId{1}, "caller",
+                                         SymbolBinding::Global, SymbolVisibility::Default});
+        mods.push_back(std::move(m));
+    }
+    {
+        AssembledModule m;  // CU #2: DEFINES crossfn
+        m.cuId = CompilationUnitId{2};
+        m.expectedFuncCount = 1;
+        AssembledFunction callee;
+        callee.symbol = SymbolId{1};
+        callee.bytes  = calleeBody;
+        m.functions.push_back(std::move(callee));
+        m.symbols.push_back(ModuleSymbol{SymbolId{1}, "crossfn",
+                                         SymbolBinding::Global, SymbolVisibility::Default});
+        mods.push_back(std::move(m));
+    }
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+
+    // Resolution: caller's extern "crossfn" (CU#1) bound to CU#2's def.
+    ASSERT_EQ(image.resolvedCrossCuRefs.size(), 1u);
+    EXPECT_EQ(image.resolvedCrossCuRefs[0].reference.cuId.v, 1u);
+    EXPECT_EQ(image.resolvedCrossCuRefs[0].definition.cuId.v, 2u);
+    // Retarget: the call resolves (no undefined); the old N>1 fail-loud is gone.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 0u);
+    // Strip: "crossfn" resolved to the sibling def → NO library import for it.
+    EXPECT_EQ(std::count(image.externImportNames.begin(), image.externImportNames.end(),
+                         std::string{"crossfn"}), 0)
+        << "a cross-CU-resolved extern must be stripped, not emitted as a library import";
+    // Mint + fail-loud: the merge minted a GOT-like THUNK SLOT — an 8-byte rodata data item
+    // carrying the abs64 fixup to the sibling def, so the c-subset indirect call
+    // `call qword ptr [slot]` dereferences the def's runtime address. The thunk slot is an
+    // EXEC-image mechanism (the loader fills it via a base relocation). A relocatable OBJECT
+    // format — this synthetic `test-elf`, which carries rodata through the symbol table and
+    // so cannot declare `supportedDataSections` (legal only on exec flavors) — MUST reject
+    // the slot LOUDLY (K_NoMatchingObjectFormat) rather than silently drop the cross-CU
+    // indirect-call slot. So this diagnostic is POSITIVE evidence the slot was minted: the
+    // capability gate fires only on a rodata `dataItems` entry, which only the thunk-slot
+    // path produces here (the two CUs carry no other data). End-to-end EXEC emission of the
+    // slot (callee body + resolved pointer + base-reloc) is pinned by the runnable
+    // `examples/c-subset/cross_cu_call` (PE exec, exit 42). ELF/Mach-O exec thunk-slot
+    // emission is deferred — format-triggered anchor D-LK11-ELF-MACHO-CROSSCU-THUNK-EMISSION
+    // (needs the rodata + base-relocation walker arms). `calleeBody` stays the CU#2 def body.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_NoMatchingObjectFormat), 1u)
+        << "the merge must mint a rodata thunk slot, and a non-exec object format must reject "
+           "it loudly — never silently drop the cross-CU indirect-call slot";
+    EXPECT_TRUE(image.bytes.empty())
+        << "emission must abort when the thunk slot's section cannot be carried — no "
+           "half-emitted image past the capability gate";
+}
+
+// The strip must NOT over-strip: a real FFI extern (no sibling definition) survives the
+// merge as a genuine library import (the FF11 library tier owns it, untouched).
+TEST(Linker, CrossCuRealFfiExternSurvivesMerge) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;  // CU #1: imports "realffi" (no sibling def)
+        m.cuId = CompilationUnitId{1};
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0xC3};
+        m.functions.push_back(std::move(fn));
+        ExternImport ext;
+        ext.symbol      = SymbolId{2};
+        ext.mangledName = "realffi";
+        ext.libraryPath = "lib.dll";
+        m.externImports.push_back(std::move(ext));
+        m.symbols.push_back(ModuleSymbol{SymbolId{1}, "f1",
+                                         SymbolBinding::Global, SymbolVisibility::Default});
+        mods.push_back(std::move(m));
+    }
+    mods.push_back(lkCu(2, {lkSym(1, "other", SymbolBinding::Global)}));  // no "realffi" def
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(image.resolvedCrossCuRefs.size(), 0u);
+    EXPECT_EQ(std::count(image.externImportNames.begin(), image.externImportNames.end(),
+                         std::string{"realffi"}), 1)
+        << "a real FFI extern (no sibling def) must survive the merge as a library import";
 }
 
 TEST(Linker, RelocationKindMissingFromFormatEmitsMismatch) {

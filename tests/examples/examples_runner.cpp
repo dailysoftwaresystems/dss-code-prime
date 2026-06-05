@@ -77,6 +77,13 @@ struct OptimizedArm {
 struct ExampleManifest {
     std::string                  language;
     std::string                  source;
+    // Multi-CU (CU6): "sources":[...] makes each file its OWN CompilationUnit, and the
+    // linker MERGES them into one image (Program::compileUnits). The single "source":"x.c"
+    // form stays one CU5 multi-file unit (compileFiles). `sources` is the canonical file
+    // list for either form; `multiCu` selects the driver entry. Cross-file references in a
+    // multi-CU example resolve at LINK time (a sibling CU's definition or a library).
+    std::vector<std::string>     sources;
+    bool                         multiCu = false;
     std::int64_t                 exitCode = 0;
     // FF6 Slice 3 (2026-06-02): optional captured-stdout pin. When
     // present, the harness routes the child's STDOUT through an
@@ -112,6 +119,29 @@ struct ExampleManifest {
     ExampleManifest m;
     m.language = j.value("language", "");
     m.source   = j.value("source", "");
+    // "sources":[...] (multi-CU, CU6) takes precedence over "source" (single CU5 unit).
+    if (j.contains("sources")) {
+        if (!j.at("sources").is_array() || j.at("sources").empty()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'sources' must be a non-empty array of file names";
+            return m;
+        }
+        for (auto const& s : j.at("sources")) {
+            if (!s.is_string()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " 'sources' entries must be strings";
+                return m;
+            }
+            m.sources.push_back(s.get<std::string>());
+        }
+        m.multiCu = true;
+    } else if (!m.source.empty()) {
+        m.sources = {m.source};  // single-CU: the one "source" file
+    } else {
+        ADD_FAILURE() << "manifest " << path.generic_string()
+                      << " requires 'source' (single CU) or 'sources' (multi-CU)";
+        return m;
+    }
     if (!j.contains("exitCode") || !j.at("exitCode").is_number_integer()) {
         ADD_FAILURE() << "manifest " << path.generic_string()
                       << " missing integer 'exitCode'";
@@ -227,9 +257,15 @@ compileAndRunArm(fs::path const& exampleDir,
     SCOPED_TRACE(std::string{"arm="} + armLabel);
     ArmResult armResult;
     ScratchDir scratch{Location::InsideRepo, "examples"};
-    auto const srcPath = scratch.path() / m.source;
-    fs::copy_file(exampleDir / m.source, srcPath,
-                  fs::copy_options::overwrite_existing);
+    // Copy EVERY source file into the scratch dir (one file for the single-CU form, N for
+    // a multi-CU example). The first source names the artifact stem.
+    std::vector<std::string> srcPaths;
+    srcPaths.reserve(m.sources.size());
+    for (auto const& s : m.sources) {
+        auto const sp = scratch.path() / s;
+        fs::copy_file(exampleDir / s, sp, fs::copy_options::overwrite_existing);
+        srcPaths.push_back(sp.generic_string());
+    }
     scratch.useAsCwd();
     auto const outDir = scratch.path() / "out";
 
@@ -239,11 +275,10 @@ compileAndRunArm(fs::path const& exampleDir,
     if (pipelineOverride != nullptr) {
         prog.setOptimizerPipelineOverride(*pipelineOverride);
     }
-    int const rc = prog.compileFiles(
-        {srcPath.generic_string()},
-        m.language,
-        {t.spec},
-        rep);
+    // Multi-CU example → compileUnits (one CU per file, merged at link); single → compileFiles.
+    int const rc = m.multiCu
+        ? prog.compileUnits(srcPaths, m.language, {t.spec}, rep)
+        : prog.compileFiles(srcPaths, m.language, {t.spec}, rep);
 
     // Strict compile-side checks. EXPECT_ (not ASSERT_) because the
     // helper is non-void and must hand control back to the caller's
@@ -255,7 +290,7 @@ compileAndRunArm(fs::path const& exampleDir,
                  << "): " << d.actual;
     }
     EXPECT_EQ(rc, 0)
-        << "compileFiles failed for spec=" << t.spec
+        << "compile failed for spec=" << t.spec
         << " arm=" << armLabel
         << " example=" << exampleDir.generic_string()
         << " diagnostics:" << diagDump.str();

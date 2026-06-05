@@ -832,7 +832,20 @@ enum class DiagnosticCode : std::uint16_t {
     //   longer emitted. Retained (not reused — diagnostic codes are append-only) for
     //   log-decode back-compat; the slot stays burned.
     K_CrossCuImageEmitDeferred     = 0x8012,
-    // K-NEXT-SLOT: 0x8013 — grep this marker before adding a K_* code.
+    // K_AbsolutePointerRelocMissing: the cross-CU merge (LK11b) needs an
+    //   ABSOLUTE 64-bit pointer relocation kind to mint a GOT-like thunk
+    //   slot (so an INDIRECT cross-CU call — `call qword ptr [slot]` — reads
+    //   a slot containing the sibling definition's address). The merge finds
+    //   that kind AGNOSTICALLY by formula (`widthBytes == 8 && !pcRelative`)
+    //   on the active `TargetSchema` — never by a hardcoded "abs64" name /
+    //   kind constant. This fires when NO relocation row on the target schema
+    //   satisfies that formula: the target cannot express a 64-bit absolute
+    //   pointer fixup, so a thunk slot would be a broken (un-relocated) zero.
+    //   Fail loud rather than emit an image whose cross-CU calls dereference
+    //   a null slot. (A target that genuinely has no abs64 reloc must add the
+    //   row to its `*.target.json` before it can host cross-CU indirect calls.)
+    K_AbsolutePointerRelocMissing  = 0x8013,
+    // K-NEXT-SLOT: 0x8014 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

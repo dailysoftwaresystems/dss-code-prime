@@ -87,6 +87,13 @@ struct DSS_EXPORT LinkedImage {
     };
     std::vector<CrossCuRef> resolvedCrossCuRefs;
 
+    // The mangled names of the extern imports the EMITTED image carries (its import-table
+    // entries). A cross-CU reference that resolved to a sibling definition is STRIPPED
+    // (LK11b — the sibling shadows the library fallback) and does NOT appear here; only
+    // real FFI imports survive. Lets a test assert the cross-CU strip directly, without
+    // re-deriving it from the format-specific import-table bytes.
+    std::vector<std::string> externImportNames;
+
     [[nodiscard]] bool ok() const noexcept {
         return expectedFuncCount > 0
             && resolvedFuncCount == expectedFuncCount;

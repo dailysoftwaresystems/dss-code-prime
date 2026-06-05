@@ -11,6 +11,7 @@
 #include "lir/lir_pass_util.hpp"
 
 #include <format>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -161,26 +162,37 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
 // DEFINITION (image.resolvedGlobalDefs) gets one fresh id that all same-name versions
 // fold onto (dedup); a Local symbol gets a distinct fresh id (module-private — two CUs'
 // SymbolId{3} locals are different functions). Every function's relocations are
-// retargeted from (its cuId, old SymbolId) to the merged id. Cross-CU REFERENCE
-// byte-patching (an extern bound to a sibling-CU definition becomes an intra-image
-// relocation to that def) needs the cross-CU-call expression — the NEXT LK11b step; an
-// extern with no cross-CU definition is a real FFI import, kept (remapped). Fails loud
-// (rather than silently emit a DLL import for a resolved cross-CU reference) if any
-// reference resolved cross-CU.
+// retargeted from (its cuId, old SymbolId) to the merged id.
+//
+// Cross-CU REFERENCE resolution via a GOT-like THUNK SLOT (the c-subset extern call is
+// INDIRECT — `call qword ptr [slot]`, x86 `FF 15 disp32`, which DEREFERENCES the slot;
+// see `mir_to_lir.cpp` CallIndirectViaExtern). For each extern bound to a sibling-CU
+// definition (image.resolvedCrossCuRefs) the merge mints a fresh 8-byte data item — the
+// thunk slot — carrying ONE absolute-64-bit-pointer relocation to the definition, and
+// retargets the reference's merged id to THAT SLOT (not the def). So the indirect call
+// reads a slot that the walker fills with the def's runtime address. The extern import is
+// STRIPPED (the sibling def shadows the library fallback). An extern with NO cross-CU
+// definition is a real FFI import, kept (remapped) for the library tier (FF11).
+//
+// The absolute-pointer relocation kind is found AGNOSTICALLY from the `TargetSchema` —
+// the row whose `relocationInfo` reports `widthBytes == 8 && !pcRelative` — never by a
+// hardcoded "abs64" name / kind constant (the standing source/target/format agnosticism
+// veto). If no such row exists, fail loud (K_AbsolutePointerRelocMissing); a thunk slot
+// without its abs64 fixup would be a broken null pointer.
 AssembledModule mergeModules(std::span<AssembledModule const> modules,
                              LinkedImage const&  image,
+                             TargetSchema const& targetSchema,
                              DiagnosticReporter& reporter) {
-    if (!image.resolvedCrossCuRefs.empty()) {
-        report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported,
-               DiagnosticSeverity::Error,
-               std::to_string(image.resolvedCrossCuRefs.size()) +
-               " cross-CU reference(s) resolved to sibling-CU definitions; patching the "
-               "referencing relocations into the merged image is the next LK11b step "
-               "(co-lands with the cross-CU-call / sibling-CU-extern expression).");
-        return {};
-    }
-
     AssembledModule combined;
+
+    // Find the target's ABSOLUTE 64-bit pointer relocation kind by FORMULA (never by
+    // name/constant — agnosticism). This is the relocation the thunk slot carries so the
+    // format walker writes the sibling def's runtime address into the slot bytes.
+    // Resolved ONCE; consumed only if there is at least one cross-CU reference to thunk.
+    std::optional<RelocationKind> absPtrKind;
+    for (auto const& r : targetSchema.relocations()) {
+        if (r.widthBytes == 8 && !r.pcRelative) { absPtrKind = r.kind; break; }
+    }
 
     // Per-module SymbolId.v -> ModuleSymbol for O(1) name/binding lookup during remap.
     std::vector<std::unordered_map<std::uint32_t, ModuleSymbol const*>> byId(modules.size());
@@ -222,6 +234,70 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         for (auto& rel : relocs) rel.target = SymbolId{mergedIdFor(modIdx, rel.target)};
     };
 
+    // Cross-CU REFERENCE resolution via a GOT-like THUNK SLOT. An extern import bound to a
+    // sibling-CU definition (image.resolvedCrossCuRefs) resolves to that def. Because the
+    // c-subset extern call is INDIRECT (`call qword ptr [slot]` — dereferences a slot), the
+    // referencing relocation must point at a SLOT that CONTAINS the def's address, NOT at
+    // the def directly (a direct retarget would make the indirect call read def bytes as a
+    // pointer). So for each cross-CU reference the merge:
+    //   * mints a fresh thunk-slot SymbolId (8 zero bytes) carrying ONE absolute-64-bit
+    //     relocation to the definition's merged id (the walker writes the def's runtime VA
+    //     into the slot);
+    //   * retargets the reference's merged id to the THUNK SLOT (via `remap` — every
+    //     referencing reloc then routes through `retargetRelocs` to the slot);
+    //   * STRIPS the extern import (the sibling def shadows the library fallback).
+    // A real FFI extern (no sibling def, absent from resolvedCrossCuRefs) is untouched —
+    // that is FF11's library tier. The definition's merged id is resolvable from `remap`
+    // here (the def is a winning global, pre-assigned above).
+    std::unordered_map<std::uint32_t, std::size_t> cuIdToIdx;
+    for (std::size_t i = 0; i < modules.size(); ++i) cuIdToIdx.emplace(modules[i].cuId.v, i);
+    std::unordered_set<LinkedSymbolKey> strippedExterns;
+    if (!image.resolvedCrossCuRefs.empty() && !absPtrKind.has_value()) {
+        // The target cannot express a 64-bit absolute pointer fixup — a thunk slot would be
+        // an un-relocated null. Fail loud rather than emit an image whose cross-CU indirect
+        // calls dereference a null slot.
+        report(reporter, DiagnosticCode::K_AbsolutePointerRelocMissing,
+               DiagnosticSeverity::Error,
+               "cross-CU reference resolution needs an absolute 64-bit pointer relocation "
+               "(widthBytes == 8 && !pcRelative) to mint a thunk slot, but target schema '" +
+               std::string{targetSchema.name()} + "' declares no such relocation kind — "
+               "an indirect cross-CU call would dereference an un-relocated null slot. Add "
+               "the absolute-64-bit relocation row to the target's *.target.json.");
+        return combined;  // half-merge aborted; caller's errorCount delta short-circuits emit
+    }
+    for (auto const& ref : image.resolvedCrossCuRefs) {
+        auto const dit = cuIdToIdx.find(ref.definition.cuId.v);
+        if (dit == cuIdToIdx.end()) {
+            // INVARIANT: resolveCrossCuSymbols populated `ref.definition` from THIS same
+            // `modules` span, so its CU is always present. A miss means a future refactor
+            // breached that contract — fail LOUD instead of silently skipping: a silent
+            // `continue` would leave the indirect call un-thunked (no slot minted) yet the
+            // extern un-stripped, surfacing as a confusing downstream undefined rather than
+            // pointing at the breached merge contract here.
+            report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
+                   "cross-CU reference resolution: the definition's CompilationUnit (cuId " +
+                   std::to_string(ref.definition.cuId.v) + ") is not in the merge span — the "
+                   "resolvedCrossCuRefs invariant (definition comes from a merged CU) was "
+                   "breached.");
+            continue;
+        }
+        std::uint32_t const defId = mergedIdFor(dit->second, ref.definition.symbol);
+        std::uint32_t const thunkSlotId = nextId++;
+        AssembledData slot;
+        slot.symbol  = SymbolId{thunkSlotId};
+        slot.section = DataSectionKind::Rodata;     // read-only pointer table (loader fills via base-reloc)
+        slot.bytes.assign(8, std::uint8_t{0});      // 8 zero bytes — the abs64 fixup site
+        Relocation slotRel;
+        slotRel.offset = 0;
+        slotRel.target = SymbolId{defId};           // the sibling def's merged id
+        slotRel.kind   = *absPtrKind;               // abs64 (found by formula)
+        slotRel.addend = 0;
+        slot.relocations.push_back(slotRel);
+        combined.dataItems.push_back(std::move(slot));
+        remap[ref.reference] = thunkSlotId;         // the indirect call's reloc → the slot
+        strippedExterns.insert(ref.reference);
+    }
+
     for (std::size_t i = 0; i < modules.size(); ++i) {
         auto const& m = modules[i];
         for (auto const& fn : m.functions) {
@@ -237,6 +313,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             combined.dataItems.push_back(std::move(out));
         }
         for (auto const& ext : m.externImports) {
+            // A cross-CU-resolved extern was bound to a sibling def + retargeted above —
+            // strip it so the walker emits no (spurious) library import for it.
+            if (strippedExterns.contains(LinkedSymbolKey{m.cuId, ext.symbol})) continue;
             ExternImport out = ext;
             out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};
             combined.externImports.push_back(std::move(out));
@@ -304,7 +383,9 @@ LinkedImage link(std::span<AssembledModule const> modules,
             return image;
         }
         // Pre-merge into one combined module + flow it through the emission path below.
-        mergedStorage = mergeModules(modules, image, reporter);
+        // `targetSchema` is threaded in so the merge can find the absolute-64-bit pointer
+        // relocation kind by formula (thunk-slot minting) — never by a hardcoded name.
+        mergedStorage = mergeModules(modules, image, targetSchema, reporter);
         if (reporter.errorCount() != errsBeforeMerge) {
             return image;  // merge fail-loud (ambiguous entry / cross-CU ref pending).
         }
@@ -312,6 +393,12 @@ LinkedImage link(std::span<AssembledModule const> modules,
     }
     AssembledModule const& inputModule = *selectedInput;
     image.expectedFuncCount = inputModule.expectedFuncCount;
+    // The import-table symbol names the emitted image carries (cross-CU-resolved externs
+    // were stripped from the merged module, so they do not appear — see externImportNames).
+    image.externImportNames.clear();
+    for (auto const& ext : inputModule.externImports) {
+        image.externImportNames.push_back(ext.mangledName);
+    }
 
     // D-LK10-ENTRY Slice C (plan 14 §2.13): when the format declares
     // a `processExit` block + `entryCallingConvention` (validated by

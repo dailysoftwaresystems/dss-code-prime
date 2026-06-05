@@ -57,6 +57,24 @@ public:
         DiagnosticReporter&             rep
     );
 
+    /// Compile each source file as its OWN CompilationUnit (CU6 multi-CU model), then
+    /// link the N CUs into ONE image per target — the linker merges them (LK11): a
+    /// cross-file reference resolves to a sibling CU's definition or a library import at
+    /// LINK time. Distinct from `compileFiles`, which builds ONE CU5 multi-file CU
+    /// (cross-file refs resolved within the unit). Same overload shape as `compileFiles`.
+    int compileUnits(
+        const std::vector<std::string>& sourceFiles,
+        const std::string& languageName,
+        const std::vector<std::string>& targets,
+        DiagnosticReporter::Config const& reporterConfig = {}
+    );
+    int compileUnits(
+        const std::vector<std::string>& sourceFiles,
+        const std::string& languageName,
+        const std::vector<std::string>& targets,
+        DiagnosticReporter&             rep
+    );
+
     /// Compile every matching source file in a directory.
     /// `mode` selects recursive vs flat scan (D-LK10-1 closure axis).
     int compileDirectory(

@@ -52,6 +52,26 @@ using dss::link_format::test::readU64LE;
     return static_cast<std::int16_t>(readU16LE(b, off));
 }
 
+// Find a PE32+ EXEC section header by its 8-byte name; returns
+// {virtualAddress, pointerToRawData}, or {0,0} if absent (the caller
+// asserts). Section headers begin at file offset 0x188 (immediately
+// after the 240-byte optional header at 0x98); each is 40 bytes;
+// NumberOfSections is the u16 at IMAGE_FILE_HEADER+2 = 0x86.
+[[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
+findExecSection(std::vector<std::uint8_t> const& img,
+                std::array<char, 8> const&       name) {
+    std::uint16_t const n = readU16LE(img, 0x86);
+    for (std::uint16_t i = 0; i < n; ++i) {
+        std::size_t const h = 0x188u + static_cast<std::size_t>(i) * 40u;
+        bool eq = true;
+        for (std::size_t b = 0; b < 8; ++b) {
+            if (static_cast<char>(img[h + b]) != name[b]) { eq = false; break; }
+        }
+        if (eq) return {readU32LE(img, h + 12), readU32LE(img, h + 20)};
+    }
+    return {0u, 0u};
+}
+
 struct Loaded {
     std::shared_ptr<TargetSchema>       target;
     std::shared_ptr<ObjectFormatSchema> format;
@@ -563,6 +583,79 @@ TEST(PeExecWriter, IntraModuleRel32CallAppliedByteForByte) {
     EXPECT_EQ(bytes[textFileOff + 0], 0xE8u);
     EXPECT_EQ(readU32LE(bytes, textFileOff + 1), 1u);
     EXPECT_EQ(bytes[textFileOff + 5], 0xC3u);
+}
+
+// LK11b cross-CU thunk slot — the ASLR base-relocation correctness pin. A rodata pointer
+// slot carrying ONE abs64 (DIR64) fixup to a function is the exact shape the cross-CU merge
+// mints (linker.cpp). Because the exec keeps ASLR (DYNAMIC_BASE), the walker must (a) write
+// the slot's PREFERRED VA (imageBase + targetRVA) into the slot bytes AND (b) emit a `.reloc`
+// IMAGE_REL_BASED_DIR64 entry at the SLOT's RVA so the loader rebases it. This locks the
+// RVA-vs-VA distinction — the .reloc entry carries an RVA, the slot value carries a VA — the
+// single highest-risk arithmetic in the cross-CU feature. It runs CROSS-PLATFORM and purely
+// in memory (no process spawn), so Linux CI catches a base-reloc regression that the
+// Windows-only `examples/c-subset/cross_cu_call` run cannot.
+TEST(PeExecWriter, Abs64RodataSlotEmitsDir64BaseRelocation) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};                       // ret — the first .text fn, lands at RVA 0x1000
+    mod.functions.push_back(std::move(fn));
+    AssembledData slot;
+    slot.symbol  = SymbolId{2};
+    slot.section = DataSectionKind::Rodata;
+    slot.bytes.assign(8, std::uint8_t{0});    // 8-byte pointer slot — the abs64 fixup site
+    Relocation slotRel;
+    slotRel.offset = 0;
+    slotRel.target = SymbolId{1};             // the slot points at fn#1
+    slotRel.kind   = RelocationKind{2};       // abs64 (x86_64 target kind 2: width 8, !pcRel)
+    slotRel.addend = 0;
+    slot.relocations.push_back(slotRel);
+    mod.dataItems.push_back(std::move(slot));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    constexpr std::uint64_t kImageBase = 0x140000000ull;
+    // Sections present (no .idata — the module has no extern imports): .text, .rdata, .reloc.
+    auto const text  = findExecSection(bytes, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const rdata = findExecSection(bytes, {'.', 'r', 'd', 'a', 't', 'a', 0, 0});
+    auto const reloc = findExecSection(bytes, {'.', 'r', 'e', 'l', 'o', 'c', 0, 0});
+    ASSERT_NE(text.first, 0u)  << ".text section must exist";
+    ASSERT_NE(rdata.first, 0u) << ".rdata section (the rodata slot) must exist";
+    ASSERT_NE(reloc.first, 0u) << ".reloc section must exist for the abs64 slot";
+
+    // (a) The slot VALUE is a VA: imageBase + fn#1's RVA. fn#1 is the first .text function
+    //     (RVA == text.first); the slot is the first (only) .rdata item, at section offset 0.
+    EXPECT_EQ(readU64LE(bytes, rdata.second), kImageBase + text.first)
+        << "the rodata slot must hold the def's PREFERRED VA (imageBase + targetRVA)";
+
+    // (b) DataDirectory[5] (BASE RELOCATION TABLE): RVA @ file 0x130, Size @ 0x134 (the
+    //     PE32+ optional header is at 0x98; its DataDirectory array begins at 0x98+0x70=0x108;
+    //     entry 5 is +0x28 → 0x130). One DIR64 fixup → one block: 8-byte header + 1 two-byte
+    //     entry + 2-byte ABSOLUTE pad (odd entry count) = 12 bytes.
+    EXPECT_EQ(readU32LE(bytes, 0x130), reloc.first) << "data dir[5] RVA == .reloc section RVA";
+    EXPECT_EQ(readU32LE(bytes, 0x134), 12u)         << "one DIR64 block, padded to 4 bytes";
+
+    // (c) The IMAGE_BASE_RELOCATION block at the .reloc file offset:
+    //       [+0] PageRVA (u32)     = slotRVA & ~0xFFF  — an RVA (NOT a VA), the slot's page
+    //       [+4] SizeOfBlock (u32) = 12
+    //       [+8] entry (u16)       = (IMAGE_REL_BASED_DIR64=10 << 12) | (slotRVA & 0xFFF)
+    //       [+10] pad (u16)        = 0 (ABSOLUTE no-op)
+    std::uint32_t const slotRva = rdata.first;  // first .rdata item is at section offset 0
+    EXPECT_EQ(readU32LE(bytes, reloc.second + 0), slotRva & ~0xFFFu)
+        << "PageRVA must be the slot's RVA page — an RVA, never the slot's VA";
+    EXPECT_LT(readU32LE(bytes, reloc.second + 0), kImageBase)
+        << "PageRVA must be an RVA (< imageBase): proof no VA leaked into the .reloc table";
+    EXPECT_EQ(readU32LE(bytes, reloc.second + 4), 12u);
+    EXPECT_EQ(readU16LE(bytes, reloc.second + 8),
+              static_cast<std::uint16_t>((10u << 12) | (slotRva & 0x0FFFu)))
+        << "entry = (DIR64 << 12) | page-offset";
+    EXPECT_EQ(readU16LE(bytes, reloc.second + 10), 0u)
+        << "odd DIR64 entry count → one ABSOLUTE(0) u16 pad to 4-byte alignment";
 }
 
 TEST(PeExecWriter, ExternTargetFailsLoudAsUndefined) {
