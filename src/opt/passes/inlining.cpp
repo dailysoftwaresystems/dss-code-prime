@@ -5,6 +5,7 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/analysis/call_graph_scc.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstdint>
@@ -37,6 +38,14 @@ struct ModuleAnalysis {
     // (rule 4): an indirect call could reach it, so its out-of-line
     // body must be preserved and inlining is unsafe/incomplete.
     std::unordered_set<std::uint32_t> addressEscaped;
+    // MirFuncId.v → strongly-connected-component id of the direct call
+    // graph (OPT7 cycle 3). The gate refuses inlining any call whose
+    // caller + callee share an SCC — generalizing the cycle-1/2 SELF-
+    // recursion refusal to MUTUAL recursion (`f→g→f`). Built once by
+    // `computeCallGraphSccs` over the immutable source module. Keyed by
+    // `funcId.v` (NOT funcSymbol) so the equality test is over the
+    // module's own function identities.
+    std::unordered_map<std::uint32_t, std::uint32_t> funcToScc;
 };
 
 // True iff `inst` is a `GlobalAddr` whose symbol is the callee slot
@@ -116,6 +125,12 @@ isCalleeOperandOf(Mir const& mir, MirInstId globalAddr, MirInstId user) {
             }
         }
     }
+
+    // (3) call-graph SCCs — the recursion-safety substrate (OPT7 cycle
+    // 3). Self-contained over `mir` (no target/format/language input);
+    // the gate uses it to refuse inlining any call inside a recursive
+    // cycle (self OR mutual).
+    a.funcToScc = analysis::computeCallGraphSccs(mir);
     return a;
 }
 
@@ -151,8 +166,19 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // strong definition of the same name may replace it at link.
     if (mir.funcBinding(callee) == SymbolBinding::Weak) return std::nullopt;
 
-    // Rule 3: never inline a self-recursive call (callee == caller).
-    if (mir.funcSymbol(callee).v == mir.funcSymbol(caller).v) {
+    // Rule 3: never inline a call WITHIN A RECURSIVE CYCLE (OPT7 cycle 3).
+    // The call graph's SCCs collapse every recursive cycle to one id; a
+    // call whose caller + callee share an SCC is part of a cycle, so
+    // inlining it would unroll an unbounded recursion at inline time.
+    // This SUBSUMES the old self-recursion check: a self-call (caller ==
+    // callee) is the singleton-SCC case — caller.v and callee.v map to
+    // the SAME scc id, so the equality below catches it — AND it also
+    // refuses MUTUAL recursion (`f→g→f`: f and g share a multi-member
+    // SCC), which the old funcSymbol-equality check missed. Keyed by
+    // funcId.v (the SCC map's key), not funcSymbol. (Admitting BOUNDED
+    // recursion behind a depth policy is deferred — each bounded form
+    // needs its own miscompile pin; D-OPT7-INLINE-LEGALITY-GATE.)
+    if (a.funcToScc.at(caller.v) == a.funcToScc.at(callee.v)) {
         return std::nullopt;
     }
 
@@ -160,13 +186,23 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // module (a function pointer could call it indirectly).
     if (a.addressEscaped.count(mir.funcSymbol(callee).v)) return std::nullopt;
 
-    // Rule 5: LEAF (single OR multi-block). The OPT7 cycle-2 scope LIFTS
-    // the single-block restriction — a GENERAL multi-block callee is now
-    // inlinable via the CFG-clone + call-site-block split + return-merge
-    // Phi machinery below (`spliceMultiBlockCallee`). What STAYS refused:
-    //   * NON-LEAF: any `Call` OR `IntrinsicCall` in ANY callee block (a
-    //     leaf can't recurse — so no recursion-depth policy is needed
-    //     this cycle; non-leaf + depth stay D-OPT7-INLINE-LEGALITY-GATE).
+    // Rule 5: the callee-body scope gate. OPT7 cycle 2 LIFTED the single-
+    // block restriction (general multi-block callees inline via the CFG-
+    // clone + return-merge-Phi machinery below); OPT7 cycle 3 LIFTS the
+    // NON-LEAF restriction — a callee whose body contains a regular `Call`
+    // is now ADMITTED. The splice's generic arm (`emitCalleeInst`) already
+    // clones an inner `Call` correctly: its operands remap through the
+    // `local` map and its callee `GlobalAddr` re-emits with the SAME
+    // symbol, so the inlined-in copy still targets the same function. The
+    // recursion danger a non-leaf body would introduce is handled by rule
+    // 3 (the SCC refusal), NOT by a leaf restriction — a non-recursive
+    // call chain inlines safely one level per pass, `maxIterations`-
+    // bounded. What STAYS refused:
+    //   * An `IntrinsicCall` in ANY callee block (OPT7 cycle 6 / c6 —
+    //     SEPARATE from the regular-`Call` relaxation; see the per-op
+    //     check below). Inlining it would be SSA-correct (the intrinsic
+    //     id is module-stable + correctly remapped), but relaxing the
+    //     IntrinsicCall arm is deferred (D-OPT7-INLINE-LEGALITY-GATE).
     //   * A callee `Phi` in ANY block. A multi-block callee CAN legally
     //     carry a Phi at a real CFG merge (e.g. a post-Mem2Reg join), but
     //     cloning a Phi requires remapping its incomings through the
@@ -199,15 +235,16 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
         for (std::uint32_t i = 0; i < ni; ++i) {
             MirInstId const cid = mir.blockInstAt(cb, i);
             MirOpcode const op  = mir.instOpcode(cid);
-            // "Leaf" = NO call-like op of ANY kind. `Call` (direct/indirect)
-            // AND `IntrinsicCall` (a distinct side-effecting call-like
-            // opcode) both disqualify in EVERY block. Inlining an
-            // IntrinsicCall-bearing body would be SSA-correct (the
-            // intrinsic id is module-stable + correctly remapped), but the
-            // correctness-first OPT7 cycles keep "leaf" strict; relaxing it
-            // is deferred (D-OPT7-INLINE-LEGALITY-GATE).
-            if (op == MirOpcode::Call) return std::nullopt;          // not a leaf
-            if (op == MirOpcode::IntrinsicCall) return std::nullopt;  // not a leaf
+            // OPT7 cycle 3: a regular `Call` is NO LONGER a refusal — a
+            // non-leaf callee whose body contains a direct/indirect `Call`
+            // is now admitted (its inner Call clones correctly via the
+            // splice's generic arm; recursion is caught by rule 3's SCC
+            // refusal, above). `IntrinsicCall` STAYS refused this cycle —
+            // a SEPARATE relaxation (c6): inlining it would be SSA-correct
+            // (the intrinsic id is module-stable + correctly remapped),
+            // but relaxing the IntrinsicCall arm is deferred
+            // (D-OPT7-INLINE-LEGALITY-GATE).
+            if (op == MirOpcode::IntrinsicCall) return std::nullopt;  // c6 — deferred
             if (op == MirOpcode::Phi)  return std::nullopt;  // deferred (see above)
             if (op == MirOpcode::Return) hasReturn = true;
             if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {

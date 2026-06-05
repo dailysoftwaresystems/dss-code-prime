@@ -21,11 +21,17 @@
 //     (block count rises), a return-merge Phi joins the two return
 //     paths, MirVerifier clean. [THE cycle-2 deliverable]
 //   * Multi-block NON-leaf callee (a cloned block contains a Call) →
-//     NOT inlined (the cycle-2 scope boundary: leaf stays required).
-//   * Non-leaf single-block callee (body contains a Call) → NOT inlined.
+//     IS inlined (OPT7 cycle 3 lifts the leaf restriction; the inner
+//     Call clones correctly + recursion is caught by the SCC gate).
+//   * Non-leaf single-block callee (body contains a Call) → IS inlined
+//     (OPT7 cycle 3): both levels of a g←f←main chain flatten.
+//   * MUTUAL recursion (f→g→f) → NOT inlined (the call-graph SCC gate
+//     refuses every call within a recursive cycle — generalizing the
+//     self-recursion refusal); an ACYCLIC non-leaf control IS inlined
+//     (proving the refusal is recursion-specific, not refuse-all).
 //   * IntrinsicCall-bearing single-block callee → NOT inlined ("leaf"
-//     means NO call-like op of any kind; deferred relaxation —
-//     D-OPT7-INLINE-LEGALITY-GATE).
+//     for the IntrinsicCall arm still means NO IntrinsicCall; a SEPARATE
+//     deferred relaxation — D-OPT7-INLINE-LEGALITY-GATE).
 //   * VOID single-block leaf callee → inlined; the invalid-result-id
 //     splice path threads cleanly + the module verifies.
 //   * callsInlined counter accuracy + verifier-clean rebuild.
@@ -94,6 +100,31 @@ std::size_t funcBlockCountBySymbol(Mir const& mir, std::uint32_t sym) {
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
         if (mir.funcSymbol(f).v == sym) return mir.funcBlockCount(f);
+    }
+    return 0;
+}
+
+// Count of a given opcode WITHIN one function identified by its symbol
+// id. Used by the mutual-recursion pin to assert the f↔g recursive
+// edges survive INSIDE f and INSIDE g specifically — stable regardless
+// of whether an unrelated (non-recursive) caller inlined f's body
+// elsewhere.
+std::size_t countOpInFuncBySymbol(Mir const& mir, std::uint32_t sym,
+                                  MirOpcode want) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v != sym) continue;
+        std::size_t n = 0;
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t i2 = 0; i2 < ni; ++i2) {
+                if (mir.instOpcode(mir.blockInstAt(b, i2)) == want) ++n;
+            }
+        }
+        return n;
     }
     return 0;
 }
@@ -479,72 +510,101 @@ TEST(Inlining, MultiBlockLeafCalleeIsInlined) {
         << "the multi-block-spliced module must pass the MIR verifier";
 }
 
-// ── Multi-block NON-leaf callee is NOT inlined (cycle-2 boundary) ──
+// ── Multi-block NON-leaf callee IS inlined (OPT7 c3) ───────────────
 // h() { return 11; }  g() { if (c) return h(); else return 5; }
-// main() { return g(); }. g is MULTI-BLOCK but NOT a leaf (a cloned
-// block would contain a Call to h). The cycle-2 scope keeps "leaf"
-// required across ALL blocks, so main's call to g is REFUSED. (h's
-// leaf call inside g's then-block IS inlined into g — fine; the pin
-// asserts main's Call to the now-still-multi-block g survives.)
-// RED-on-disable: dropping the all-blocks leaf scan in inlineLegalityGate
-// admits g → main's Call is spliced → the surviving-Call assert fails.
-TEST(Inlining, MultiBlockNonLeafCalleeIsNotInlined) {
+// main() { return g(); }. g is MULTI-BLOCK and NON-LEAF (a cloned block
+// contains a Call to h). OPT7 cycle 3 LIFTS the leaf restriction across
+// ALL blocks, so main's call to the multi-block g is now ADMITTED and
+// spliced via the CFG-clone machinery. A SINGLE pass inlines BOTH h→g
+// AND g→main (callsInlined == 2); main inlines g's SOURCE body, so its
+// cloned then-arm holds a residual Call-to-h until the next iteration.
+// A SECOND iteration (the real engine, maxIterations≥2) inlines that →
+// module-wide Call == 0.
+// RED-on-disable: re-adding the all-blocks `Call`-leaf refusal in
+// inlineLegalityGate refuses g → main's Call to g is NOT spliced
+// (callsInlined drops to 1, and main's Call survives) → the assertions
+// fail.
+TEST(Inlining, MultiBlockNonLeafCalleeIsInlined) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const boolT = interner.primitive(TypeKind::Bool);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
-    MirBuilder mb;
 
-    // h (SymbolId 30): single-block leaf returning 11.
-    mb.addFunction(fnSig, SymbolId{30});
-    MirBlockId const hEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    mb.beginBlock(hEntry);
-    mb.addReturn(mb.addConst(i32Lit(11), i32));
+    // `Mir` is move-only, so build a FRESH module per observation stage.
+    auto buildModule = [&] {
+        MirBuilder mb;
+        // h (SymbolId 30): single-block leaf returning 11.
+        mb.addFunction(fnSig, SymbolId{30});
+        MirBlockId const hEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(hEntry);
+        mb.addReturn(mb.addConst(i32Lit(11), i32));
+        // g (SymbolId 50): multi-block; then-arm CALLS h → NON-LEAF (now
+        // admitted). Balanced markers (entry=EntryBlock, return arms=
+        // ExitBlock) so g stays verifier-valid whether or not h is inlined.
+        mb.addFunction(fnSig, SymbolId{50});
+        MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const gThen  = mb.createBlock(StructCfMarker::ExitBlock);
+        MirBlockId const gElse  = mb.createBlock(StructCfMarker::ExitBlock);
+        mb.beginBlock(gEntry);
+        MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+        MirInstId const gcond = mb.addConst(tru, boolT);
+        mb.addCondBr(gcond, gThen, gElse);
+        mb.beginBlock(gThen);
+        MirInstId const hAddr = mb.addGlobalAddr(SymbolId{30}, fnSig);
+        MirInstId const hCallOps[] = {hAddr};
+        (void)mb.addInst(MirOpcode::Call, hCallOps, i32);
+        mb.addReturn(mb.addConst(i32Lit(11), i32));
+        mb.beginBlock(gElse);
+        mb.addReturn(mb.addConst(i32Lit(5), i32));
+        // main (SymbolId 100): return g();
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(mEntry);
+        MirInstId const gAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+        MirInstId const gCallOps[] = {gAddr};
+        MirInstId const gCall = mb.addInst(MirOpcode::Call, gCallOps, i32);
+        mb.addReturn(gCall);
+        return std::move(mb).finish();
+    };
 
-    // g (SymbolId 50): multi-block; then-arm CALLS h → NOT a leaf.
-    // Balanced markers (entry=EntryBlock, return arms=ExitBlock) so g
-    // stays verifier-valid whether or not h is inlined into it.
-    mb.addFunction(fnSig, SymbolId{50});
-    MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const gThen  = mb.createBlock(StructCfMarker::ExitBlock);
-    MirBlockId const gElse  = mb.createBlock(StructCfMarker::ExitBlock);
-    mb.beginBlock(gEntry);
-    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
-    MirInstId const gcond = mb.addConst(tru, boolT);
-    mb.addCondBr(gcond, gThen, gElse);
-    mb.beginBlock(gThen);
-    MirInstId const hAddr = mb.addGlobalAddr(SymbolId{30}, fnSig);
-    MirInstId const hCallOps[] = {hAddr};
-    MirInstId const hCall = mb.addInst(MirOpcode::Call, hCallOps, i32);
-    mb.addReturn(hCall);
-    mb.beginBlock(gElse);
-    mb.addReturn(mb.addConst(i32Lit(5), i32));
+    // (1) ONE pass inlines BOTH h→g AND the NON-LEAF multi-block g→main.
+    {
+        Mir mir = buildModule();
+        ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // g→h + main→g
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep);
+        EXPECT_TRUE(r.ok);
+        EXPECT_EQ(r.callsInlined, 2u)
+            << "OPT7 c3: BOTH h→g AND the multi-block NON-leaf g→main inline "
+               "(the old gate refused g→main, giving 1)";
+        // main no longer calls g; it holds the residual cloned call-to-h
+        // (spliced in from g's then-arm) until the next iteration.
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+            << "after one pass main holds the residual cloned call-to-h "
+               "(g itself is fully inlined into main)";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep))
+            << "the multi-block NON-leaf splice must verify clean";
+    }
 
-    // main (SymbolId 100): return g();
-    mb.addFunction(fnSig, SymbolId{100});
-    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    mb.beginBlock(mEntry);
-    MirInstId const gAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
-    MirInstId const gCallOps[] = {gAddr};
-    MirInstId const gCall = mb.addInst(MirOpcode::Call, gCallOps, i32);
-    mb.addReturn(gCall);
-    Mir mir = std::move(mb).finish();
-
-    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // g→h + main→g
-
-    DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
-    EXPECT_TRUE(r.ok);
-    // h's leaf call inside g IS inlined (callsInlined == 1); main's call
-    // to the multi-block-AND-non-leaf g is REFUSED. Exactly one Call
-    // remains module-wide (main→g).
-    EXPECT_EQ(r.callsInlined, 1u)
-        << "h's leaf call in g is inlined; main's call to non-leaf g is not";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
-        << "main's Call to the multi-block NON-leaf g must survive";
-
-    MirVerifier verifier{mir, &interner};
-    EXPECT_TRUE(verifier.verify(rep));
+    // (2) Two iterations flatten g→main→h entirely → Call == 0.
+    {
+        Mir mir = buildModule();
+        DiagnosticReporter rep;
+        opt::OptPipeline inlining{"inlining", {opt::PassId::Inlining}, 2};
+        auto const result = opt::optimize(mir, target, interner, inlining, rep);
+        EXPECT_TRUE(result.ok);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+            << "two iterations flatten the multi-block non-leaf chain — "
+               "no Call remains";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
 }
 
 // ── Non-RETURNING-path leaf callee is NOT inlined (robustness gate) ─
@@ -615,57 +675,206 @@ TEST(Inlining, NonReturningLeafCalleeIsNotInlined) {
         << "refusing the non-returning callee leaves a valid module";
 }
 
-// ── Non-leaf callee (its body contains a Call) is NOT inlined ──────
+// ── Non-leaf callee (its body contains a Call) IS inlined (OPT7 c3) ─
 // g() { return 9; }  f() { return g(); }  main() { return f(); }
-// f is single-block but NOT a leaf (it calls g) → f's call from main is
-// refused. (g's call from f IS a leaf call and gets inlined into f,
-// which is fine; the pin asserts main's Call to f survives.)
-TEST(Inlining, NonLeafCalleeIsNotInlined) {
+// f is single-block but NON-LEAF (it calls g). OPT7 cycle 3 LIFTS the
+// leaf restriction: BOTH g→f AND f→main are now legal. A SINGLE
+// `runInlining` pass (reads the immutable source, writes a fresh
+// builder) inlines BOTH levels at once — g splices into f's rebuild AND
+// f splices into main's rebuild — so `callsInlined == 2`. The KEY fact
+// the OLD test DENIED (asserting callsInlined==1, f's call refused) is
+// that the NON-LEAF f IS inlined into main; `callsInlined == 2` proves
+// it. Because main inlines f's SOURCE body (which still calls g), main
+// gains a residual Call-to-g after one pass; a SECOND iteration (the
+// real `optimize` engine, maxIterations≥2) flattens that → module-wide
+// `Call == 0`.
+// RED-on-disable: re-adding the line-209 `Call`-leaf refusal in
+// inlineLegalityGate refuses the non-leaf f → main's Call to f is NOT
+// spliced (callsInlined drops to 1, and main's Call survives every
+// iteration) → both assertions below fail.
+TEST(Inlining, NonLeafCalleeIsInlined) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
-    MirBuilder mb;
 
-    // g (SymbolId 40): leaf returning 9.
-    mb.addFunction(fnSig, SymbolId{40});
-    MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    mb.beginBlock(gEntry);
-    mb.addReturn(mb.addConst(i32Lit(9), i32));
+    // `Mir` is move-only, so build a FRESH module per observation stage.
+    auto buildModule = [&] {
+        MirBuilder mb;
+        // g (SymbolId 40): leaf returning 9.
+        mb.addFunction(fnSig, SymbolId{40});
+        MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(gEntry);
+        mb.addReturn(mb.addConst(i32Lit(9), i32));
+        // f (SymbolId 50): single block, calls g → NON-LEAF (now admitted).
+        mb.addFunction(fnSig, SymbolId{50});
+        MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(fEntry);
+        MirInstId const gAddr = mb.addGlobalAddr(SymbolId{40}, fnSig);
+        MirInstId const gCallOps[] = {gAddr};
+        (void)mb.addInst(MirOpcode::Call, gCallOps, i32);
+        mb.addReturn(mb.addConst(i32Lit(9), i32));
+        // main (SymbolId 100): return f();
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(mEntry);
+        MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+        MirInstId const fCallOps[] = {fAddr};
+        MirInstId const fCall = mb.addInst(MirOpcode::Call, fCallOps, i32);
+        mb.addReturn(fCall);
+        return std::move(mb).finish();
+    };
 
-    // f (SymbolId 50): single block, calls g → NOT a leaf.
-    mb.addFunction(fnSig, SymbolId{50});
-    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    mb.beginBlock(fEntry);
-    MirInstId const gAddr = mb.addGlobalAddr(SymbolId{40}, fnSig);
-    MirInstId const gCallOps[] = {gAddr};
-    MirInstId const gCall = mb.addInst(MirOpcode::Call, gCallOps, i32);
-    mb.addReturn(gCall);
+    // (1) ONE pass inlines BOTH levels → callsInlined == 2. This is the
+    // direct proof the NON-LEAF f is inlined into main (the old refusal
+    // gave 1). main's Call to f vanishes from main; f's call-to-g is
+    // cloned into main, so a residual Call remains until the next
+    // iteration.
+    {
+        Mir mir = buildModule();
+        ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // f→g + main→f
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep);
+        EXPECT_TRUE(r.ok);
+        EXPECT_EQ(r.callsInlined, 2u)
+            << "OPT7 c3: BOTH g→f AND the NON-LEAF f→main inline in one pass "
+               "(the old gate refused f→main, giving 1)";
+        // The non-leaf f is no longer called from main: main's only Call
+        // is now the cloned call-to-g spliced in from f's body.
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+            << "after one pass main holds the residual cloned call-to-g "
+               "(f itself is fully inlined into main)";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
 
-    // main (SymbolId 100): return f();
-    mb.addFunction(fnSig, SymbolId{100});
-    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    mb.beginBlock(mEntry);
-    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
-    MirInstId const fCallOps[] = {fAddr};
-    MirInstId const fCall = mb.addInst(MirOpcode::Call, fCallOps, i32);
-    mb.addReturn(fCall);
-    Mir mir = std::move(mb).finish();
+    // (2) The full engine with maxIterations≥2 flattens the whole chain:
+    // the second iteration inlines the residual call-to-g → module-wide
+    // Call == 0. RED-on-disable (re-adding the Call-leaf refusal): f→main
+    // never fires, main's Call to f survives every iteration → != 0.
+    {
+        Mir mir = buildModule();
+        DiagnosticReporter rep;
+        opt::OptPipeline inlining{"inlining", {opt::PassId::Inlining}, 2};
+        auto const result = opt::optimize(mir, target, interner, inlining, rep);
+        EXPECT_TRUE(result.ok);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+            << "two iterations flatten g→f→main entirely — no Call remains";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
+}
 
-    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // f→g + main→f
+// ── MUTUAL recursion is REFUSED via the SCC gate (OPT7 c3) ─────────
+// f() { return g(); }  g() { return f(); }  — f and g form a 2-member
+// call-graph SCC (f→g→f), so the §2.9 rule-3 SCC refusal declines to
+// inline BOTH the f→g AND g→f calls — generalizing the cycle-1/2 SELF-
+// recursion refusal to MUTUAL recursion. The cycle is the ONLY inline
+// candidate in module 1, so the refusal is exact: `callsInlined == 0`
+// and BOTH recursive Calls survive byte-for-byte.
+//
+// To prove the refusal is NON-VACUOUS (not a pass that refuses ALL non-
+// leaf inlining), module 2 inlines an ACYCLIC non-leaf control chain
+// A→B→C: A and B are non-leaf, C is a leaf, the chain is acyclic → every
+// call IS inlined. If the SCC gate were over-broad (refusing all non-
+// leaf), this control would fail.
+//
+// RED-on-disable: removing the rule-3 SCC refusal in inlineLegalityGate
+// ADMITS the f↔g calls → `callsInlined` jumps to 2 (each recursive call
+// "inlines", splicing the cyclic partner's body — an unroll attempt) →
+// the `callsInlined == 0` assertion fails.
+TEST(Inlining, MutualRecursiveCallIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
 
-    DiagnosticReporter rep;
-    auto const r = opt::passes::runInlining(mir, interner, rep);
-    EXPECT_TRUE(r.ok);
-    // g's call inside f IS a leaf call → inlined (callsInlined == 1).
-    // main's call to f is NOT a leaf → refused. So exactly ONE Call
-    // remains module-wide (main→f), and it is main's.
-    EXPECT_EQ(r.callsInlined, 1u)
-        << "g's leaf call in f is inlined; main's call to non-leaf f is not";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
-        << "main's Call to the non-leaf f must survive";
+    // ---- Module 1: the mutual-recursion cycle f↔g (the ONLY candidates).
+    {
+        MirBuilder mb;
+        // f (SymbolId 60): return g();
+        mb.addFunction(fnSig, SymbolId{60});
+        MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(fEntry);
+        MirInstId const gAddr = mb.addGlobalAddr(SymbolId{61}, fnSig);
+        MirInstId const gOps[] = {gAddr};
+        MirInstId const gCall = mb.addInst(MirOpcode::Call, gOps, i32);
+        mb.addReturn(gCall);
+        // g (SymbolId 61): return f();
+        mb.addFunction(fnSig, SymbolId{61});
+        MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(gEntry);
+        MirInstId const fAddr = mb.addGlobalAddr(SymbolId{60}, fnSig);
+        MirInstId const fOps[] = {fAddr};
+        MirInstId const fCall = mb.addInst(MirOpcode::Call, fOps, i32);
+        mb.addReturn(fCall);
+        Mir mir = std::move(mb).finish();
 
-    MirVerifier verifier{mir, &interner};
-    EXPECT_TRUE(verifier.verify(rep));
+        ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u)
+            << "before: f→g and g→f (the cyclic pair) are the only Calls";
+
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep);
+        EXPECT_TRUE(r.ok);
+        // THE discriminating assertion: NOTHING inlines — both f→g and g→f
+        // are refused by the SCC gate. (With the gate OFF, each would
+        // "inline" its cyclic partner → callsInlined == 2.)
+        EXPECT_EQ(r.callsInlined, 0u)
+            << "mutual recursion f↔g MUST NOT inline — the call-graph SCC "
+               "gate refuses every call within a recursive cycle";
+        // Both recursive Calls survive byte-for-byte (no rewrite happened).
+        EXPECT_EQ(countOpInFuncBySymbol(mir, 60, MirOpcode::Call), 1u)
+            << "f's recursive call to g MUST survive";
+        EXPECT_EQ(countOpInFuncBySymbol(mir, 61, MirOpcode::Call), 1u)
+            << "g's recursive call to f MUST survive";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
+
+    // ---- Module 2 (CONTROL): acyclic non-leaf chain A→B→C IS inlined.
+    // A (sym 70) calls B (sym 71) calls C (sym 72, leaf). Acyclic → each
+    // is its own SCC → every call is admitted. Proves the SCC refusal is
+    // not a blanket "refuse all non-leaf" gate.
+    {
+        MirBuilder mb;
+        // C (SymbolId 72): leaf returning 3.
+        mb.addFunction(fnSig, SymbolId{72});
+        MirBlockId const cEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(cEntry);
+        mb.addReturn(mb.addConst(i32Lit(3), i32));
+        // B (SymbolId 71): NON-leaf, return C().
+        mb.addFunction(fnSig, SymbolId{71});
+        MirBlockId const bEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(bEntry);
+        MirInstId const cAddr = mb.addGlobalAddr(SymbolId{72}, fnSig);
+        MirInstId const cOps[] = {cAddr};
+        MirInstId const cCall = mb.addInst(MirOpcode::Call, cOps, i32);
+        mb.addReturn(cCall);
+        // A (SymbolId 70): NON-leaf, return B().
+        mb.addFunction(fnSig, SymbolId{70});
+        MirBlockId const aEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(aEntry);
+        MirInstId const bAddr = mb.addGlobalAddr(SymbolId{71}, fnSig);
+        MirInstId const bOps[] = {bAddr};
+        MirInstId const bCall = mb.addInst(MirOpcode::Call, bOps, i32);
+        mb.addReturn(bCall);
+        Mir mir = std::move(mb).finish();
+
+        ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // A→B + B→C
+
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep);
+        EXPECT_TRUE(r.ok);
+        // Both acyclic non-leaf calls inline in one pass (B→C and A→B).
+        EXPECT_EQ(r.callsInlined, 2u)
+            << "an ACYCLIC non-leaf chain A→B→C MUST inline — proves the SCC "
+               "refusal is recursion-specific, not refuse-all-non-leaf";
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
 }
 
 // ── IntrinsicCall-bearing callee is NOT inlined ("leaf" = no call-like

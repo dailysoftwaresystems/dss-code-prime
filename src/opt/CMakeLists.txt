@@ -1,6 +1,7 @@
 add_library(opt OBJECT
     optimizer.cpp
     optimizer_json.cpp
+    analysis/call_graph_scc.cpp
     passes/const_fold.cpp
     passes/copy_prop.cpp
     passes/cse.cpp
