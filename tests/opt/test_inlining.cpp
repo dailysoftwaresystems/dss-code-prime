@@ -1,12 +1,13 @@
-// MIR-tier function INLINING unit tests (OPT7 cycle 1).
+// MIR-tier function INLINING unit tests (OPT7 cycles 1-2).
 //
-// Scope (LOCKED): inline a DIRECT call to a SINGLE-BLOCK LEAF callee
-// that splices LINEARLY at the call site, governed by the §2.9
-// legality gate. The gate's CORRECTNESS rule is: NEVER inline a Weak
-// callee (a strong def of the same name may replace it at link →
+// Scope (LOCKED): inline a DIRECT call to a LEAF callee — SINGLE-BLOCK
+// (cycle 1, LINEAR splice at the call site) OR MULTI-BLOCK (cycle 2,
+// CFG-clone + call-site-block split + return-merge Phi). Governed by
+// the §2.9 legality gate. The gate's CORRECTNESS rule is: NEVER inline
+// a Weak callee (a strong def of the same name may replace it at link →
 // inlining the weak body bakes in the wrong one = silent miscompile).
 //
-// Pins (each RED-on-disable for the gate it exercises):
+// Pins (each RED-on-disable for the gate / machinery it exercises):
 //   * Weak callee → call NOT inlined (Call survives; count unchanged).
 //     [THE correctness pin — D-OPT7-WEAK-INLINE-NEGATIVE-PIN, MIR tier]
 //   * Global callee (leaf) → call IS inlined (Call gone; callee body
@@ -15,8 +16,13 @@
 //     argument flows into the spliced body.
 //   * Self-recursive call → NOT inlined.
 //   * Address-taken callee → NOT inlined (escape via function pointer).
-//   * Multi-block callee → NOT inlined (scope boundary).
-//   * Non-leaf callee (callee body contains a Call) → NOT inlined.
+//   * MULTI-BLOCK LEAF callee (two returns → diamond) → IS inlined
+//     (cycle 2): Call gone, callee blocks cloned into the caller
+//     (block count rises), a return-merge Phi joins the two return
+//     paths, MirVerifier clean. [THE cycle-2 deliverable]
+//   * Multi-block NON-leaf callee (a cloned block contains a Call) →
+//     NOT inlined (the cycle-2 scope boundary: leaf stays required).
+//   * Non-leaf single-block callee (body contains a Call) → NOT inlined.
 //   * IntrinsicCall-bearing single-block callee → NOT inlined ("leaf"
 //     means NO call-like op of any kind; deferred relaxation —
 //     D-OPT7-INLINE-LEGALITY-GATE).
@@ -35,7 +41,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <variant>
 
 using namespace dss;
 
@@ -63,6 +71,29 @@ MirLiteralValue i32Lit(std::int64_t v) {
     lit.value = v;
     lit.core  = TypeKind::I32;
     return lit;
+}
+
+// Total basic-block count across every function in the module — used to
+// prove the multi-block splice CLONED the callee's blocks into the
+// caller (the count rises by the cloned-block + continuation count).
+std::size_t blockCountInModule(Mir const& mir) {
+    std::size_t n = 0;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        n += mir.funcBlockCount(mir.funcAt(i));
+    }
+    return n;
+}
+
+// Block count of a single function identified by its symbol id — used
+// to assert the CALLER (`main`) specifically grew its block count.
+std::size_t funcBlockCountBySymbol(Mir const& mir, std::uint32_t sym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == sym) return mir.funcBlockCount(f);
+    }
+    return 0;
 }
 
 // Build a 2-function module: a nullary leaf callee `f` that returns the
@@ -289,32 +320,45 @@ TEST(Inlining, AddressTakenCalleeIsNotInlined) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), callsBefore);
 }
 
-// ── Multi-block callee is NOT inlined (scope boundary) ─────────────
-// f() with two blocks (a CondBr diamond) is beyond the single-block
-// minimal splice. The gate refuses; general multi-block splice is
-// deferred (D-OPT7-MULTIBLOCK-SPLICE).
-TEST(Inlining, MultiBlockCalleeIsNotInlined) {
+// ── THE cycle-2 deliverable: a MULTI-BLOCK LEAF callee IS inlined ──
+// pick() { if (cond) return 7; else return 9; } — entry CondBr to two
+// return blocks (a diamond, NO callee Phi: each arm returns directly).
+// main() { return pick(); }. The cycle-2 machinery splices pick:
+//   * main's call-site block is SPLIT (Call removed);
+//   * pick's 3 blocks are CLONED into main (fresh block ids);
+//   * each callee Return becomes a Br to a CONTINUATION block;
+//   * a RETURN-MERGE PHI in the continuation joins (7, then-clone) +
+//     (9, else-clone); that Phi is the Call's result → main returns it.
+// Asserts: Call gone; callsInlined == 1; main's block count ROSE
+// (clone happened — red-on-disable for "blocks cloned"); a Phi now
+// exists (the merge — red-on-disable for "return-merge wired"); both
+// return-Const values were spliced; MirVerifier clean.
+TEST(Inlining, MultiBlockLeafCalleeIsInlined) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const boolT = interner.primitive(TypeKind::Bool);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
 
-    // f (SymbolId 50): entry → CondBr to two blocks that each return.
+    // pick (SymbolId 50): entry → CondBr to two blocks that each return.
+    // Markers: entry=EntryBlock; the two return blocks=ExitBlock (each
+    // terminates in Return). This keeps the un-inlined `pick` verifier-
+    // valid (no orphan IfThen/IfElse without an IfJoin) — the inliner
+    // re-derives the CLONED blocks to Linear regardless.
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const fThen  = mb.createBlock(StructCfMarker::IfThen);
-    MirBlockId const fElse  = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const fThen  = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const fElse  = mb.createBlock(StructCfMarker::ExitBlock);
     mb.beginBlock(fEntry);
     MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
     MirInstId const cond = mb.addConst(tru, boolT);
     mb.addCondBr(cond, fThen, fElse);
     mb.beginBlock(fThen);
-    mb.addReturn(mb.addConst(i32Lit(1), i32));
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
     mb.beginBlock(fElse);
-    mb.addReturn(mb.addConst(i32Lit(2), i32));
+    mb.addReturn(mb.addConst(i32Lit(9), i32));
 
-    // main (SymbolId 100): return f();
+    // main (SymbolId 100): return pick();
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(mEntry);
@@ -325,13 +369,248 @@ TEST(Inlining, MultiBlockCalleeIsNotInlined) {
     Mir mir = std::move(mb).finish();
 
     ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Phi), 0u)
+        << "before: no Phi anywhere (pick has none; main has none)";
+    auto const mainBlocksBefore = funcBlockCountBySymbol(mir, 100);
+    ASSERT_EQ(mainBlocksBefore, 1u) << "before: main is a single block";
+    auto const totalBlocksBefore = blockCountInModule(mir);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "a multi-block LEAF callee MUST be inlined (cycle 2)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "main's Call must be replaced by the spliced multi-block body";
+
+    // (b) The callee's blocks were CLONED into main: main's block count
+    // rose from 1 to (entry-remainder + 3 clones + 1 continuation) = 5,
+    // and the module total rose by the same 4. Red-on-disable for "the
+    // CFG was cloned" (a no-op-that-only-deletes would leave it at 1).
+    EXPECT_EQ(funcBlockCountBySymbol(mir, 100), mainBlocksBefore + 4)
+        << "pick's 3 blocks + 1 continuation must be cloned into main";
+    EXPECT_EQ(blockCountInModule(mir), totalBlocksBefore + 4)
+        << "module-wide block count rises by the cloned + continuation blocks";
+
+    // (c) A return-merge Phi now exists (joins the two return paths).
+    // Red-on-disable for "the merge Phi was wired".
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 1u)
+        << "the two return paths must merge via exactly one Phi";
+
+    // (c2) The merge Phi's incomings are CORRECTLY value↔pred paired —
+    // each return-value operand flows from the SAME cloned block whose
+    // Return produced it. `Const 7` came from pick's then-arm, `Const 9`
+    // from pick's else-arm; after the splice each lives in its own cloned
+    // predecessor block, and the rewritten Return→Br makes that block the
+    // Phi incoming's `pred`. The load-bearing invariant is therefore
+    // `instBlock(incoming.value) == incoming.pred` for BOTH edges: the
+    // value an edge carries must be defined in that edge's source block.
+    // A swapped mis-merge (7 attributed to the else-clone, 9 to the
+    // then-clone) breaks this pairing → RED. This catches a swap the MIR
+    // tier would otherwise miss (pick's cond is constant → still verifies
+    // even if the two incomings are transposed).
+    {
+        MirFuncId mainFn{};
+        std::size_t const nf = mir.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            if (mir.funcSymbol(mir.funcAt(i)).v == 100u) mainFn = mir.funcAt(i);
+        }
+        ASSERT_TRUE(mainFn.valid()) << "main (sym 100) must exist post-splice";
+
+        MirInstId mergePhi{};
+        std::uint32_t const nb = mir.funcBlockCount(mainFn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(mainFn, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t i = 0; i < ni; ++i) {
+                MirInstId const id = mir.blockInstAt(b, i);
+                if (mir.instOpcode(id) == MirOpcode::Phi) mergePhi = id;
+            }
+        }
+        ASSERT_TRUE(mergePhi.valid()) << "the return-merge Phi must be in main";
+
+        auto const incs = mir.phiIncomings(mergePhi);
+        ASSERT_EQ(incs.size(), 2u) << "the two return paths → two incomings";
+
+        std::int64_t valFromThen = 0;  // value on the edge whose value==7
+        std::int64_t valFromElse = 0;  // value on the edge whose value==9
+        bool sawSeven = false, sawNine = false;
+        for (MirPhiIncoming const& inc : incs) {
+            // Each incoming value must be one of pick's two return Consts.
+            ASSERT_EQ(mir.instOpcode(inc.value), MirOpcode::Const)
+                << "each merge-Phi incoming value must be a spliced Const";
+            std::int64_t const v = std::get<std::int64_t>(
+                mir.literalValue(mir.constLiteralIndex(inc.value)).value);
+            // THE PAIRING INVARIANT: the value is defined in its own pred.
+            EXPECT_EQ(mir.instBlock(inc.value).v, inc.pred.v)
+                << "merge-Phi incoming value " << v << " must be defined in "
+                   "its OWN predecessor block (a swapped incoming breaks "
+                   "this) — value↔pred mis-pairing";
+            if (v == 7) { sawSeven = true; valFromThen = v; }
+            else if (v == 9) { sawNine = true; valFromElse = v; }
+            else ADD_FAILURE() << "unexpected merge-Phi incoming value " << v;
+        }
+        EXPECT_TRUE(sawSeven) << "the then-arm's Const 7 must be a Phi incoming";
+        EXPECT_TRUE(sawNine) << "the else-arm's Const 9 must be a Phi incoming";
+        // The two incomings carry DISTINCT predecessor blocks (the two
+        // cloned return arms), never a single block feeding both values.
+        EXPECT_NE(incs[0].pred.v, incs[1].pred.v)
+            << "the two return paths must arrive from distinct cloned blocks";
+        EXPECT_EQ(valFromThen, 7);
+        EXPECT_EQ(valFromElse, 9);
+    }
+
+    // Both return-Const values (7 + 9) were spliced into main; pick's
+    // own copies still exist (not deleted — DCE's job). Module-wide
+    // Const count: pick had {true-cond, 7, 9} = 3; main had 0. After
+    // splice main gains {true-cond, 7, 9} = 3 more → 6.
+    // (We assert the two distinct return values are present by checking
+    // the Const count rose by pick's whole const set.)
+    // pick's consts: cond(bool) + 7 + 9 = 3.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Const), 6u)
+        << "pick's body consts (cond, 7, 9) must be cloned into main";
+
+    // (d) MirVerifier clean — SSA dominance + Phi-incoming completeness
+    // + valid CFG edges + marker parity all hold on the spliced result.
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the multi-block-spliced module must pass the MIR verifier";
+}
+
+// ── Multi-block NON-leaf callee is NOT inlined (cycle-2 boundary) ──
+// h() { return 11; }  g() { if (c) return h(); else return 5; }
+// main() { return g(); }. g is MULTI-BLOCK but NOT a leaf (a cloned
+// block would contain a Call to h). The cycle-2 scope keeps "leaf"
+// required across ALL blocks, so main's call to g is REFUSED. (h's
+// leaf call inside g's then-block IS inlined into g — fine; the pin
+// asserts main's Call to the now-still-multi-block g survives.)
+// RED-on-disable: dropping the all-blocks leaf scan in inlineLegalityGate
+// admits g → main's Call is spliced → the surviving-Call assert fails.
+TEST(Inlining, MultiBlockNonLeafCalleeIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // h (SymbolId 30): single-block leaf returning 11.
+    mb.addFunction(fnSig, SymbolId{30});
+    MirBlockId const hEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(hEntry);
+    mb.addReturn(mb.addConst(i32Lit(11), i32));
+
+    // g (SymbolId 50): multi-block; then-arm CALLS h → NOT a leaf.
+    // Balanced markers (entry=EntryBlock, return arms=ExitBlock) so g
+    // stays verifier-valid whether or not h is inlined into it.
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const gThen  = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const gElse  = mb.createBlock(StructCfMarker::ExitBlock);
+    mb.beginBlock(gEntry);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const gcond = mb.addConst(tru, boolT);
+    mb.addCondBr(gcond, gThen, gElse);
+    mb.beginBlock(gThen);
+    MirInstId const hAddr = mb.addGlobalAddr(SymbolId{30}, fnSig);
+    MirInstId const hCallOps[] = {hAddr};
+    MirInstId const hCall = mb.addInst(MirOpcode::Call, hCallOps, i32);
+    mb.addReturn(hCall);
+    mb.beginBlock(gElse);
+    mb.addReturn(mb.addConst(i32Lit(5), i32));
+
+    // main (SymbolId 100): return g();
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const gAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const gCallOps[] = {gAddr};
+    MirInstId const gCall = mb.addInst(MirOpcode::Call, gCallOps, i32);
+    mb.addReturn(gCall);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // g→h + main→g
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    // h's leaf call inside g IS inlined (callsInlined == 1); main's call
+    // to the multi-block-AND-non-leaf g is REFUSED. Exactly one Call
+    // remains module-wide (main→g).
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "h's leaf call in g is inlined; main's call to non-leaf g is not";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+        << "main's Call to the multi-block NON-leaf g must survive";
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── Non-RETURNING-path leaf callee is NOT inlined (robustness gate) ─
+// loopForever() { entry: Br L; L: Unreachable; }  — a MULTI-BLOCK leaf
+// (no Call/IntrinsicCall/Phi) whose EVERY path ends in Unreachable: it
+// has NO `Return` in any block. The multi-block splice would route each
+// callee Return to a fresh continuation block; with NO Return, that
+// continuation has ZERO predecessors → the MirVerifier (run after every
+// pass) flags the unreachable continuation → the whole module is
+// REJECTED → an otherwise-valid program becomes a build error UNDER
+// inlining. inlineLegalityGate REFUSES such a callee (the Call stays;
+// the program compiles).
+// RED-on-disable: deleting the `if (!hasReturn) return std::nullopt;`
+// gate admits loopForever → the splice emits a predecessor-less
+// continuation → verifier.verify(rep) returns false (OR callsInlined
+// becomes 1) and the assertions below fail.
+TEST(Inlining, NonReturningLeafCalleeIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // loopForever (SymbolId 50): entry block branches to L; L ends in
+    // Unreachable. Two blocks, leaf, NO Return on any path. Markers:
+    // entry=EntryBlock; L=ExitBlock terminating in Unreachable (the
+    // verifier explicitly allows an ExitBlock to end in Unreachable), so
+    // the un-inlined callee is itself verifier-valid.
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fLoop  = mb.createBlock(StructCfMarker::ExitBlock);
+    mb.beginBlock(fEntry);
+    mb.addBr(fLoop);
+    mb.beginBlock(fLoop);
+    mb.addUnreachable();
+
+    // main (SymbolId 100): return loopForever();
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const callOps[] = {fAddr};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    // The input module is itself verifier-valid before the pass.
+    {
+        DiagnosticReporter pre;
+        MirVerifier preV{mir, &interner};
+        ASSERT_TRUE(preV.verify(pre))
+            << "the non-returning callee module must be valid pre-inlining";
+    }
 
     DiagnosticReporter rep;
     auto const r = opt::passes::runInlining(mir, interner, rep);
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.callsInlined, 0u)
-        << "a multi-block callee is beyond the single-block splice scope";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+        << "a callee with NO returning path (every path ends in Unreachable) "
+           "MUST NOT be inlined — the splice's continuation would be "
+           "predecessor-less and the module would fail to compile";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+        << "main's Call to the non-returning loopForever must survive";
+
+    // The refusal keeps the program compilable: the module still verifies.
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "refusing the non-returning callee leaves a valid module";
 }
 
 // ── Non-leaf callee (its body contains a Call) is NOT inlined ──────
@@ -503,4 +782,343 @@ TEST(Inlining, VoidLeafCalleeIsInlined) {
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep))
         << "the void-callee splice (invalid result id) must verify clean";
+}
+
+// ── MIXED: one caller inlines BOTH a single-block leaf AND a multi-
+// block leaf (exercises the multi-block rebuild's single-block arm) ──
+// s() { return 3; }  (single-block leaf)
+// m() { if (c) return 7; return 9; }  (multi-block leaf)
+// main() { return s() + m(); }
+// main's plan has a MULTI-block target (m) → the whole function is
+// rebuilt by MultiBlockInliner, which must ALSO splice the single-block
+// s() linearly (its `spliceSingleBlock` arm). Both Calls vanish; the
+// merge Phi for m exists; the module verifies. RED-on-disable for the
+// multi-block path's single-block handling: if `spliceSingleBlock` mis-
+// threaded s()'s return, main's `s() + m()` sum would be wrong + the
+// verifier would reject a dangling operand.
+TEST(Inlining, MixedSingleAndMultiBlockLeavesBothInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // s (SymbolId 40): single-block leaf returning 3.
+    mb.addFunction(fnSig, SymbolId{40});
+    MirBlockId const sEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(sEntry);
+    mb.addReturn(mb.addConst(i32Lit(3), i32));
+
+    // m (SymbolId 50): multi-block leaf, two return paths (early-return
+    // shape; balanced markers so the un-inlined m is verifier-valid).
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const mEntryB = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const mThen   = mb.createBlock(StructCfMarker::ExitBlock);
+    MirBlockId const mAfter  = mb.createBlock(StructCfMarker::ExitBlock);
+    mb.beginBlock(mEntryB);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const mcond = mb.addConst(tru, boolT);
+    mb.addCondBr(mcond, mThen, mAfter);
+    mb.beginBlock(mThen);
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
+    mb.beginBlock(mAfter);
+    mb.addReturn(mb.addConst(i32Lit(9), i32));
+
+    // main (SymbolId 100): return s() + m();
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mainEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mainEntry);
+    MirInstId const sAddr = mb.addGlobalAddr(SymbolId{40}, fnSig);
+    MirInstId const sCallOps[] = {sAddr};
+    MirInstId const sCall = mb.addInst(MirOpcode::Call, sCallOps, i32);
+    MirInstId const mAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const mCallOps[] = {mAddr};
+    MirInstId const mCall = mb.addInst(MirOpcode::Call, mCallOps, i32);
+    MirInstId const addOps[] = {sCall, mCall};
+    MirInstId const sum = mb.addInst(MirOpcode::Add, addOps, i32);
+    mb.addReturn(sum);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 2u)
+        << "both the single-block s() and the multi-block m() are inlined";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "both Calls in main must be spliced away";
+    // m's two returns → one merge Phi; s's single return → no Phi
+    // (linear splice). So exactly one Phi module-wide.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 1u)
+        << "only m's two-return merge produces a Phi; s splices linearly";
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the mixed single+multi-block splice must verify clean";
+}
+
+// ── MULTI-BLOCK leaf with EXACTLY ONE return → the merge Phi is ELIDED
+// to the single value (the second of spliceMultiBlock's three return-
+// handling forms; the first — 2+ returns → Phi — is pinned above by
+// MultiBlockLeafCalleeIsInlined). ───────────────────────────────────
+// callee f() { entry: Br B1; B1: return 7; }  — MULTI-block (2 blocks,
+// so it routes through MultiBlockInliner::spliceMultiBlock, NOT the
+// single-block linear path) + LEAF (no Call/IntrinsicCall) + NO Phi +
+// exactly ONE Return. main() { return f(); }. The splice clones f's two
+// blocks into main, rewrites B1's `Return 7` to a `Br` into a fresh
+// continuation block, and — because there is exactly ONE return edge —
+// takes the `returnEdges.size() == 1` branch: `result = returnEdges[0]
+// .value` (the cloned `Const 7`), ELIDING a degenerate 1-incoming Phi.
+//
+// THE load-bearing assertion is `Phi count == 0`: it goes RED if a
+// future change to spliceMultiBlock drops the size()==1 special case
+// and instead emits a 1-incoming merge Phi for the single-return form.
+// We ALSO prove value correctness: main's Return resolves to the cloned
+// `Const 7` (not a Phi, not f's original const) — the elided value
+// actually flows to the caller's use of the call result.
+TEST(Inlining, MultiBlockSingleReturnLeafElidesMergePhi) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // f (SymbolId 50): entry branches to B1; B1 returns 7. Two blocks,
+    // leaf, NO Phi, exactly ONE Return. Markers: entry=EntryBlock;
+    // B1=ExitBlock (terminates in Return) so the un-inlined f is itself
+    // verifier-valid. The inliner re-derives the CLONED blocks to Linear.
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fB1    = mb.createBlock(StructCfMarker::ExitBlock);
+    mb.beginBlock(fEntry);
+    mb.addBr(fB1);
+    mb.beginBlock(fB1);
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
+
+    // main (SymbolId 100): return f();
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const callOps[] = {fAddr};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    // ROUTING pin: f is MULTI-block (2 blocks) → planHasMultiBlock is
+    // true → main is rebuilt by MultiBlockInliner and the call hits
+    // spliceMultiBlock (NOT the single-block linear arm). RED-on-disable
+    // if the builder ever collapsed the trivial entry→B1 chain to one
+    // block (it does not — MirBuilder is a faithful recorder).
+    ASSERT_EQ(funcBlockCountBySymbol(mir, 50), 2u)
+        << "f must be a 2-block callee so it routes through spliceMultiBlock";
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Phi), 0u)
+        << "before: no Phi anywhere (f has none; main has none)";
+    auto const mainBlocksBefore = funcBlockCountBySymbol(mir, 100);
+    ASSERT_EQ(mainBlocksBefore, 1u) << "before: main is a single block";
+    auto const totalBlocksBefore = blockCountInModule(mir);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "a multi-block LEAF callee with one return MUST be inlined";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "main's Call must be replaced by the spliced multi-block body";
+
+    // The callee's 2 blocks were CLONED + a continuation added: main's
+    // block count rose from 1 to (entry + 2 clones + 1 continuation) = 4,
+    // and the module total rose by the same 3. Red-on-disable for "the
+    // CFG was cloned".
+    EXPECT_EQ(funcBlockCountBySymbol(mir, 100), mainBlocksBefore + 3)
+        << "f's 2 blocks + 1 continuation must be cloned into main";
+    EXPECT_EQ(blockCountInModule(mir), totalBlocksBefore + 3)
+        << "module-wide block count rises by the cloned + continuation blocks";
+
+    // ★ THE load-bearing assertion: the single-return merge Phi was
+    // ELIDED. With exactly one return edge, spliceMultiBlock takes
+    // `result = returnEdges[0].value` and emits NO Phi. A regression that
+    // wrongly built a 1-incoming Phi for this form would make this == 1.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 0u)
+        << "a single-return multi-block callee MUST elide the merge Phi "
+           "(returnEdges.size()==1 → result = the value directly), NOT "
+           "create a degenerate 1-incoming Phi";
+
+    // VALUE correctness: the elided value flows to main's use of the call
+    // result. main's Return operand must be the CLONED `Const 7` (a
+    // Const, value 7) — never a Phi, never f's original const. f's own
+    // `Const 7` still exists (not deleted — DCE's job), so module-wide
+    // Const count rose by exactly one (1 → 2).
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Const), 2u)
+        << "f's Const 7 must be cloned into main (body present)";
+    {
+        MirFuncId mainFn{};
+        std::size_t const nf = mir.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            if (mir.funcSymbol(mir.funcAt(i)).v == 100u) mainFn = mir.funcAt(i);
+        }
+        ASSERT_TRUE(mainFn.valid()) << "main (sym 100) must exist post-splice";
+
+        // Find main's Return and inspect the value it carries.
+        MirInstId retVal{};
+        bool foundReturn = false;
+        std::uint32_t const nb = mir.funcBlockCount(mainFn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(mainFn, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t i = 0; i < ni; ++i) {
+                MirInstId const id = mir.blockInstAt(b, i);
+                if (mir.instOpcode(id) != MirOpcode::Return) continue;
+                foundReturn = true;
+                auto const rops = mir.instOperands(id);
+                ASSERT_EQ(rops.size(), 1u) << "main returns a value";
+                retVal = rops[0];
+            }
+        }
+        ASSERT_TRUE(foundReturn) << "main must still terminate in a Return";
+        ASSERT_TRUE(retVal.valid());
+        // The returned value is the cloned Const 7 — the ELIDED return
+        // value, threaded straight to main's Return (no Phi indirection).
+        EXPECT_EQ(mir.instOpcode(retVal), MirOpcode::Const)
+            << "main must return the elided cloned Const, NOT a merge Phi";
+        EXPECT_EQ(std::get<std::int64_t>(
+                      mir.literalValue(mir.constLiteralIndex(retVal)).value),
+                  7)
+            << "the elided single-return value (7) must reach main's Return";
+    }
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the single-return multi-block splice (Phi elided) must verify clean";
+}
+
+// ── MULTI-BLOCK leaf returning VOID → no return value, no merge Phi,
+// no rewrite entry (the third of spliceMultiBlock's return forms). ───
+// The existing VoidLeafCalleeIsInlined is SINGLE-block (routes through
+// spliceSingleBlock); this one is MULTI-block so it exercises the VOID
+// branch of spliceMultiBlock specifically (line: `result` stays invalid
+// → no `rewrite_.emplace(oldCall.v, ...)`; the void Return contributes
+// no return edge so `returnEdges` is empty → no Phi).
+// callee g() { entry: Br B1; B1: return; }  (void, two blocks, leaf).
+// main() { g(); return 0; }  (g's "result" is unused).
+// Asserts: callsInlined==1; Call gone; main's block count rose (clone
+// happened); Phi count == 0 (a void callee produces no merge Phi); the
+// void body inst (a Const) is spliced in; main returns its OWN Const 0
+// (the void call yields no value to thread); MirVerifier clean.
+TEST(Inlining, MultiBlockVoidLeafIsInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32     = interner.primitive(TypeKind::I32);
+    TypeId const voidSig = interner.fnSig({}, InvalidType, CallConv::CcSysV);
+    TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // g (SymbolId 80): VOID multi-block leaf. entry branches to B1; B1
+    // holds a real (non-terminator) body inst — a Const the splice must
+    // clone — then a bare void Return (no value). Markers: entry=Entry,
+    // B1=ExitBlock terminating in a (void) Return → un-inlined g valid.
+    mb.addFunction(voidSig, SymbolId{80}, SymbolBinding::Global,
+                   SymbolVisibility::Default);
+    MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const gB1    = mb.createBlock(StructCfMarker::ExitBlock);
+    mb.beginBlock(gEntry);
+    mb.addBr(gB1);
+    mb.beginBlock(gB1);
+    (void)mb.addConst(i32Lit(99), i32);  // real body inst to splice
+    mb.addReturn();                       // bare void Return — no value
+
+    // main (SymbolId 100): g(); return 0;  (the void Call's result is
+    // unused — it is NOT fed to main's Return).
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const gAddr = mb.addGlobalAddr(SymbolId{80}, voidSig);
+    MirInstId const callOps[] = {gAddr};
+    (void)mb.addInst(MirOpcode::Call, callOps, InvalidType);  // void call
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    // ROUTING pin: g is MULTI-block (2 blocks) → the call hits
+    // spliceMultiBlock (NOT spliceSingleBlock — that is the existing
+    // VoidLeafCalleeIsInlined's path). This is what makes this test cover
+    // the VOID branch of the MULTI-block splice specifically.
+    ASSERT_EQ(funcBlockCountBySymbol(mir, 80), 2u)
+        << "g must be a 2-block callee so it routes through spliceMultiBlock";
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Phi), 0u)
+        << "before: no Phi anywhere";
+    // Before: g holds Const 99; main holds Const 0 → 2 Consts module-wide.
+    auto const constsBefore = countOpInModule(mir, MirOpcode::Const);
+    ASSERT_EQ(constsBefore, 2u);
+    auto const mainBlocksBefore = funcBlockCountBySymbol(mir, 100);
+    ASSERT_EQ(mainBlocksBefore, 1u) << "before: main is a single block";
+    auto const totalBlocksBefore = blockCountInModule(mir);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "a multi-block VOID leaf callee MUST be inlined";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "main's void Call to g must be replaced by the spliced body";
+
+    // g's 2 blocks were CLONED + a continuation added → main rose by 3.
+    EXPECT_EQ(funcBlockCountBySymbol(mir, 100), mainBlocksBefore + 3)
+        << "g's 2 blocks + 1 continuation must be cloned into main";
+    EXPECT_EQ(blockCountInModule(mir), totalBlocksBefore + 3)
+        << "module-wide block count rises by the cloned + continuation blocks";
+
+    // ★ A void callee produces NO return value → NO merge Phi. The void
+    // Return contributes no return edge, so returnEdges is empty and the
+    // continuation gets no Phi. RED if a future change emitted a spurious
+    // Phi for the void form.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 0u)
+        << "a void callee must NOT produce a return-merge Phi";
+
+    // BODY-PRESENT pin: g's `Const 99` is spliced into main (g's own copy
+    // still exists) → module-wide Const count rose by exactly one (2 → 3).
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Const), constsBefore + 1)
+        << "the void callee's body (Const 99) must be SPLICED into main";
+
+    // No spurious result use: main returns its OWN Const 0 (the void call
+    // yields no value to thread; an invalid result id is recorded into NO
+    // rewrite entry). main's Return value must be a Const 0, never the
+    // cloned Const 99 and never a Phi.
+    {
+        MirFuncId mainFn{};
+        std::size_t const nf = mir.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            if (mir.funcSymbol(mir.funcAt(i)).v == 100u) mainFn = mir.funcAt(i);
+        }
+        ASSERT_TRUE(mainFn.valid()) << "main (sym 100) must exist post-splice";
+        MirInstId retVal{};
+        bool foundReturn = false;
+        std::uint32_t const nb = mir.funcBlockCount(mainFn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(mainFn, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t i = 0; i < ni; ++i) {
+                MirInstId const id = mir.blockInstAt(b, i);
+                if (mir.instOpcode(id) != MirOpcode::Return) continue;
+                foundReturn = true;
+                auto const rops = mir.instOperands(id);
+                ASSERT_EQ(rops.size(), 1u) << "main returns its own value";
+                retVal = rops[0];
+            }
+        }
+        ASSERT_TRUE(foundReturn) << "main must still terminate in a Return";
+        ASSERT_TRUE(retVal.valid());
+        EXPECT_EQ(mir.instOpcode(retVal), MirOpcode::Const)
+            << "main must return its own Const, not a spliced/void value";
+        EXPECT_EQ(std::get<std::int64_t>(
+                      mir.literalValue(mir.constLiteralIndex(retVal)).value),
+                  0)
+            << "main returns its own Const 0 (the void call yields no value)";
+    }
+
+    // The invalid-result-id (void Return) splice path must not break the
+    // verifier — SSA dominance, Phi completeness, CFG edges all hold.
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the void multi-block splice (invalid result id) must verify clean";
 }

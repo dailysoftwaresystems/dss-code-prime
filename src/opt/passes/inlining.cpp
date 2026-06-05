@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
+#include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
@@ -13,6 +14,7 @@
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace dss::opt::passes {
@@ -158,43 +160,188 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // module (a function pointer could call it indirectly).
     if (a.addressEscaped.count(mir.funcSymbol(callee).v)) return std::nullopt;
 
-    // Rule 5: single-block LEAF — exactly one block, no Call and no Phi
-    // in that block (the minimal linear-splice scope). Plus an arity
-    // safety gate: every `Arg(i)` the callee references must be in range
-    // of the actual arguments the call passes — otherwise the
-    // Arg(i)→actual substitution would be out-of-bounds (a structural
-    // call/signature mismatch). A callee that references FEWER args than
-    // it declares (an ignored parameter, or one a prior pass dropped) is
-    // still inlinable; only an out-of-range index disqualifies.
-    if (mir.funcBlockCount(callee) != 1) return std::nullopt;
-    MirBlockId const cb = mir.funcEntry(callee);
-    std::uint32_t const ni = mir.blockInstCount(cb);
-    // The call passes `callArgCount` actual args (operands[1..]).
+    // Rule 5: LEAF (single OR multi-block). The OPT7 cycle-2 scope LIFTS
+    // the single-block restriction — a GENERAL multi-block callee is now
+    // inlinable via the CFG-clone + call-site-block split + return-merge
+    // Phi machinery below (`spliceMultiBlockCallee`). What STAYS refused:
+    //   * NON-LEAF: any `Call` OR `IntrinsicCall` in ANY callee block (a
+    //     leaf can't recurse — so no recursion-depth policy is needed
+    //     this cycle; non-leaf + depth stay D-OPT7-INLINE-LEGALITY-GATE).
+    //   * A callee `Phi` in ANY block. A multi-block callee CAN legally
+    //     carry a Phi at a real CFG merge (e.g. a post-Mem2Reg join), but
+    //     cloning a Phi requires remapping its incomings through the
+    //     callee-block→caller-block map with the rebuilder's phase-3
+    //     deferral discipline — a distinct correctness surface deferred
+    //     to a later cycle (D-OPT7-MULTIBLOCK-SPLICE-PHI). The two-return
+    //     diamond this cycle delivers (`pick(x){if(x)return 7;else return
+    //     9;}`) has NO Phi — its merge IS the inserted return-merge Phi.
+    //   * A callee with NO RETURNING PATH (no `Return` in ANY block; every
+    //     path ends in `Unreachable` — e.g. `int f(){ while(1){} }`). The
+    //     multi-block splice routes each callee `Return` to a continuation
+    //     block; a callee that never returns leaves that continuation with
+    //     ZERO predecessors, which the MirVerifier (run after every pass)
+    //     flags → the whole module is REJECTED → an otherwise-valid program
+    //     becomes a build error UNDER inlining. Refusing here keeps the
+    //     Call out-of-line so the program still compiles (conservative,
+    //     never a miscompile — D-OPT7-MULTIBLOCK-SPLICE non-returning note).
+    // Plus the arity safety gate (unchanged): every `Arg(i)` the callee
+    // references must be in range of the actual args the call passes —
+    // an out-of-range index is a structural call/signature mismatch.
+    // A callee that references FEWER args than it declares is still
+    // inlinable; only an out-of-range index disqualifies.
     auto const callOps = mir.instOperands(callId);
     std::size_t const callArgCount = callOps.empty() ? 0 : callOps.size() - 1;
-    for (std::uint32_t i = 0; i < ni; ++i) {
-        MirInstId const cid = mir.blockInstAt(cb, i);
-        MirOpcode const op  = mir.instOpcode(cid);
-        // "Leaf" = NO call-like op of ANY kind. `Call` (direct/indirect)
-        // AND `IntrinsicCall` (a distinct side-effecting call-like opcode)
-        // both disqualify. Inlining an IntrinsicCall-bearing body would be
-        // SSA-correct (the intrinsic id is module-stable + correctly
-        // remapped), but the minimal correctness-first OPT7 cycle keeps
-        // "leaf" strict; relaxing it is deferred (D-OPT7-INLINE-LEGALITY-GATE).
-        if (op == MirOpcode::Call) return std::nullopt;          // not a leaf
-        if (op == MirOpcode::IntrinsicCall) return std::nullopt;  // not a leaf
-        if (op == MirOpcode::Phi)  return std::nullopt;  // malformed single-block phi
-        if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
-            return std::nullopt;  // arg index out of range → refuse
+    bool hasReturn = false;  // at least one returning path (rule 5, above)
+    std::uint32_t const nb = mir.funcBlockCount(callee);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const cb = mir.funcBlockAt(callee, bi);
+        std::uint32_t const ni = mir.blockInstCount(cb);
+        for (std::uint32_t i = 0; i < ni; ++i) {
+            MirInstId const cid = mir.blockInstAt(cb, i);
+            MirOpcode const op  = mir.instOpcode(cid);
+            // "Leaf" = NO call-like op of ANY kind. `Call` (direct/indirect)
+            // AND `IntrinsicCall` (a distinct side-effecting call-like
+            // opcode) both disqualify in EVERY block. Inlining an
+            // IntrinsicCall-bearing body would be SSA-correct (the
+            // intrinsic id is module-stable + correctly remapped), but the
+            // correctness-first OPT7 cycles keep "leaf" strict; relaxing it
+            // is deferred (D-OPT7-INLINE-LEGALITY-GATE).
+            if (op == MirOpcode::Call) return std::nullopt;          // not a leaf
+            if (op == MirOpcode::IntrinsicCall) return std::nullopt;  // not a leaf
+            if (op == MirOpcode::Phi)  return std::nullopt;  // deferred (see above)
+            if (op == MirOpcode::Return) hasReturn = true;
+            if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
+                return std::nullopt;  // arg index out of range → refuse
+            }
         }
     }
+    // No returning path → the splice's continuation block would be
+    // predecessor-less → MirVerifier rejects the module. Refuse (the Call
+    // stays; the program compiles). See rule 5, above.
+    if (!hasReturn) return std::nullopt;
     return callee;
 }
 
-// The inlining rebuild policy. Per-function `analyze` decides which
-// Call ids in THIS function are inline targets (and their resolved
-// callee); the rebuilder's `tryRewrite` hook performs the linear
-// single-block splice when it reaches one of those Calls.
+// ── shared splice helpers (free functions; consumed by BOTH the
+// single-block linear path AND the multi-block CFG-clone path) ─────
+//
+// The local map is calleeOld-inst-.v → callerNew-inst id, populated in
+// the callee's def-before-use order. `malformed` is a shared sticky
+// flag the arity-mismatch guard sets; the top-level `runInlining`
+// emits `X_InlineMalformedCallSite` + discards the module when set, so
+// neither path produces a wrong-arity splice.
+
+// Map a callee-block operand to its caller-NEW value via the LOCAL map.
+[[nodiscard]] MirInstId
+mapCalleeOperand(Mir const& src, MirInstId calleeOp,
+                 std::unordered_map<std::uint32_t, MirInstId> const& local,
+                 MirFuncId callee) {
+    (void)src;
+    auto const it = local.find(calleeOp.v);
+    if (it == local.end()) {
+        std::fprintf(stderr,
+            "dss::opt::passes::Inlining fatal: callee operand v=%u "
+            "(callee funcId v=%u) has no local mapping during splice "
+            "— def-before-use violation in the callee body.\n",
+            calleeOp.v, callee.v);
+        std::abort();
+    }
+    return it->second;
+}
+
+// Map one of the CALLER Call's own operands (callee address or an
+// actual argument) to its caller-NEW value via the rewrite map.
+[[nodiscard]] MirInstId
+mapCallerOperand(MirInstId callerOp,
+                 std::unordered_map<std::uint32_t, MirInstId> const& rewrite,
+                 MirInstId oldCall) {
+    auto const it = rewrite.find(callerOp.v);
+    if (it == rewrite.end()) {
+        std::fprintf(stderr,
+            "dss::opt::passes::Inlining fatal: caller Call v=%u "
+            "operand v=%u has no rewrite entry during splice — "
+            "operands must be emitted before the Call in block/RPO "
+            "order (D-OPT2-REWRITE-MAP-COMPLETENESS).\n",
+            oldCall.v, callerOp.v);
+        std::abort();
+    }
+    return it->second;
+}
+
+// Compute the Call's actual arguments as caller-NEW values. Call
+// operands are [calleeGlobalAddr, arg0, arg1, ...]; operand[0] (the
+// callee GlobalAddr) is intentionally dropped — inlining removes the
+// indirect-through-address call entirely.
+[[nodiscard]] std::vector<MirInstId>
+mapActualArgs(Mir const& src, MirInstId oldCall,
+              std::unordered_map<std::uint32_t, MirInstId> const& rewrite) {
+    auto const callOps = src.instOperands(oldCall);
+    std::vector<MirInstId> actualArgs;
+    actualArgs.reserve(callOps.size() > 0 ? callOps.size() - 1 : 0);
+    for (std::size_t i = 1; i < callOps.size(); ++i) {
+        actualArgs.push_back(mapCallerOperand(callOps[i], rewrite, oldCall));
+    }
+    return actualArgs;
+}
+
+// Re-emit one CALLEE instruction into the caller's currently-open
+// block. `Arg(i)` → the actual argument; Const / GlobalAddr re-emit
+// through their dedicated builders; every other op re-emits via
+// `addInst` with operands mapped through `local`. Records the
+// calleeOld→callerNew mapping into `local`. The legality gate excludes
+// callee Phis (any block), so a Phi here is a structural violation.
+// An out-of-range `Arg` index sets `malformed` (the gate guarantees it
+// can't happen; this is the defensive fail-loud guard).
+void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
+                    MirBuilder& dst,
+                    std::vector<MirInstId> const& actualArgs,
+                    std::unordered_map<std::uint32_t, MirInstId>& local,
+                    MirFuncId callee, bool& malformed) {
+    if (cop == MirOpcode::Arg) {
+        std::uint32_t const idx = src.argIndex(cid);
+        if (idx >= actualArgs.size()) {
+            malformed = true;
+            if (!actualArgs.empty()) local.emplace(cid.v, actualArgs[0]);
+            return;
+        }
+        local.emplace(cid.v, actualArgs[idx]);
+        return;
+    }
+    if (cop == MirOpcode::Const) {
+        local.emplace(cid.v, dst.addConst(
+            src.literalValue(src.constLiteralIndex(cid)), src.instType(cid)));
+        return;
+    }
+    if (cop == MirOpcode::GlobalAddr) {
+        local.emplace(cid.v, dst.addGlobalAddr(
+            src.globalAddrSymbol(cid), src.instType(cid)));
+        return;
+    }
+    if (cop == MirOpcode::Phi) {
+        std::fprintf(stderr,
+            "dss::opt::passes::Inlining fatal: callee funcId v=%u "
+            "contains a Phi during splice — the legality gate must "
+            "have excluded it (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n", callee.v);
+        std::abort();
+    }
+    auto const cops = src.instOperands(cid);
+    std::vector<MirInstId> newOps;
+    newOps.reserve(cops.size());
+    for (MirInstId const o : cops) {
+        newOps.push_back(mapCalleeOperand(src, o, local, callee));
+    }
+    local.emplace(cid.v, dst.addInst(cop, newOps, src.instType(cid),
+                                     src.instPayload(cid), src.instFlags(cid)));
+}
+
+// The single-block-leaf inlining rebuild policy (OPT7 cycle 1). Per-
+// function `analyze` decides which Call ids in THIS function are
+// single-block-leaf inline targets; the rebuilder's `tryRewrite` hook
+// performs the LINEAR splice into the call's own block. A function
+// containing ANY multi-block inline target is routed through
+// `MultiBlockInliner` instead (see `runInlining`), so this policy only
+// ever sees single-block targets — preserving the cycle-1 behavior
+// (and its tests + the Weak-inline pin) byte-for-byte.
 class InliningPolicy final : public MirRebuildPolicy {
 public:
     InliningPolicy(Mir const& src, ModuleAnalysis const& analysis) noexcept
@@ -205,8 +352,9 @@ public:
     }
     [[nodiscard]] bool malformed() const noexcept { return malformed_; }
 
-    // Compute the per-function inline plan: callId → callee. Called
-    // once before each function's rebuild.
+    // Compute the per-function single-block-leaf inline plan: callId →
+    // callee. Only callees with exactly one block are admitted here;
+    // multi-block targets are handled by `MultiBlockInliner`.
     void analyze(MirFuncId caller) {
         plan_.clear();
         std::uint32_t const nb = src_.funcBlockCount(caller);
@@ -218,7 +366,9 @@ public:
                 if (src_.instOpcode(id) != MirOpcode::Call) continue;
                 auto const callee =
                     inlineLegalityGate(src_, analysis_, caller, id);
-                if (callee.has_value()) plan_.emplace(id.v, *callee);
+                if (!callee.has_value()) continue;
+                if (src_.funcBlockCount(*callee) != 1) continue;  // multi-block path
+                plan_.emplace(id.v, *callee);
             }
         }
     }
@@ -260,31 +410,15 @@ private:
     [[nodiscard]] MirInstId
     spliceCallee(MirFuncId callee, MirInstId oldCall, MirBuilder& dst,
                  std::unordered_map<std::uint32_t, MirInstId> const& rewrite) {
-        // Map the Call's actual arguments (caller-NEW values). The Call
-        // operands are [calleeGlobalAddr, arg0, arg1, ...]; the callee
-        // GlobalAddr (operand[0]) is intentionally dropped — inlining
-        // removes the indirect-through-address call entirely.
-        auto const callOps = src_.instOperands(oldCall);
-        std::vector<MirInstId> actualArgs;
-        actualArgs.reserve(callOps.size() > 0 ? callOps.size() - 1 : 0);
-        for (std::size_t i = 1; i < callOps.size(); ++i) {
-            actualArgs.push_back(mapCallerOperand(callOps[i], rewrite, oldCall));
-        }
+        std::vector<MirInstId> const actualArgs =
+            mapActualArgs(src_, oldCall, rewrite);
 
-        // The legality gate (Rule 5) already validated that every
-        // `Arg(i)` the callee references satisfies `i < actualArgs.size()`,
-        // so the Arg(i)→actual substitution below is always in range.
-        // The per-Arg bounds check inside the loop is a defensive
-        // fail-loud guard: if a future gate change regressed and admitted
-        // an out-of-range call, the pass emits X_InlineMalformedCallSite
-        // and returns ok=false rather than producing a wrong-arity splice
-        // (D-OPT7-INLINE-LEGALITY-GATE).
         MirBlockId const cb = src_.funcEntry(callee);
         std::uint32_t const ni = src_.blockInstCount(cb);
 
-        // Walk the callee block: copy each NON-Arg / NON-terminator
-        // instruction into the caller via a LOCAL calleeOld→callerNew
-        // map. The terminator (a Return) is handled after the loop.
+        // Walk the callee block: copy each NON-terminator instruction
+        // into the caller via a LOCAL calleeOld→callerNew map. The
+        // terminator (a Return) is handled after the loop.
         std::unordered_map<std::uint32_t, MirInstId> local;
         local.reserve(ni);
         MirInstId result{};  // invalid until a Return value is mapped
@@ -292,30 +426,11 @@ private:
             MirInstId const cid = src_.blockInstAt(cb, i);
             MirOpcode const cop = src_.instOpcode(cid);
 
-            if (cop == MirOpcode::Arg) {
-                // Map the parameter to the corresponding actual arg. The
-                // gate (Rule 5) guarantees `idx < actualArgs.size()`; the
-                // bounds check is the defensive fail-loud guard. If it
-                // ever trips, mark the splice malformed and substitute
-                // arg 0 (or, with zero args, leave it unmapped — the
-                // top-level emits X_InlineMalformedCallSite and discards
-                // the module, so the placeholder is never observed).
-                std::uint32_t const idx = src_.argIndex(cid);
-                if (idx >= actualArgs.size()) {
-                    malformed_ = true;
-                    if (!actualArgs.empty()) {
-                        local.emplace(cid.v, actualArgs[0]);
-                    }
-                    continue;
-                }
-                local.emplace(cid.v, actualArgs[idx]);
-                continue;
-            }
             if (opcodeInfo(cop).isTerminator) {
                 if (cop == MirOpcode::Return) {
                     auto const rops = src_.instOperands(cid);
                     if (!rops.empty()) {
-                        result = mapCalleeOperand(rops[0], local, callee);
+                        result = mapCalleeOperand(src_, rops[0], local, callee);
                     }
                     // void Return → result stays invalid (no value).
                 } else {
@@ -337,84 +452,14 @@ private:
                 break;  // terminator is the last inst
             }
 
-            // Ordinary callee instruction: re-emit into the caller.
-            MirInstId const newId = emitCalleeInst(cid, cop, dst, local, callee);
-            local.emplace(cid.v, newId);
+            // Ordinary callee instruction (incl. Arg): re-emit into the
+            // caller's open block via the shared helper.
+            emitCalleeInst(src_, cid, cop, dst, actualArgs, local, callee,
+                           malformed_);
         }
 
         ++callsInlined_;
         return result;
-    }
-
-    // Re-emit one ordinary (non-Arg, non-terminator) callee instruction
-    // into the caller's open block. Leaves use their dedicated builders;
-    // other ops use addInst with operands mapped through the local map.
-    [[nodiscard]] MirInstId
-    emitCalleeInst(MirInstId cid, MirOpcode cop, MirBuilder& dst,
-                   std::unordered_map<std::uint32_t, MirInstId> const& local,
-                   MirFuncId callee) {
-        if (cop == MirOpcode::Const) {
-            return dst.addConst(
-                src_.literalValue(src_.constLiteralIndex(cid)),
-                src_.instType(cid));
-        }
-        if (cop == MirOpcode::GlobalAddr) {
-            return dst.addGlobalAddr(src_.globalAddrSymbol(cid),
-                                     src_.instType(cid));
-        }
-        if (cop == MirOpcode::Phi) {
-            // The gate excludes single-block callees containing a Phi.
-            std::fprintf(stderr,
-                "dss::opt::passes::Inlining fatal: callee funcId v=%u "
-                "contains a Phi during splice — the legality gate must "
-                "have excluded it.\n", callee.v);
-            std::abort();
-        }
-        auto const cops = src_.instOperands(cid);
-        std::vector<MirInstId> newOps;
-        newOps.reserve(cops.size());
-        for (MirInstId const o : cops) {
-            newOps.push_back(mapCalleeOperand(o, local, callee));
-        }
-        return dst.addInst(cop, newOps, src_.instType(cid),
-                           src_.instPayload(cid), src_.instFlags(cid));
-    }
-
-    // Map a callee-block operand to its caller-NEW value: an Arg or any
-    // prior callee inst is in the LOCAL map (populated in def order).
-    [[nodiscard]] MirInstId
-    mapCalleeOperand(MirInstId calleeOp,
-                     std::unordered_map<std::uint32_t, MirInstId> const& local,
-                     MirFuncId callee) {
-        auto const it = local.find(calleeOp.v);
-        if (it == local.end()) {
-            std::fprintf(stderr,
-                "dss::opt::passes::Inlining fatal: callee operand v=%u "
-                "(callee funcId v=%u) has no local mapping during splice "
-                "— def-before-use violation in the callee body.\n",
-                calleeOp.v, callee.v);
-            std::abort();
-        }
-        return it->second;
-    }
-
-    // Map one of the CALLER Call's own operands (callee address or an
-    // actual argument) to its caller-NEW value via the rewrite map.
-    [[nodiscard]] MirInstId
-    mapCallerOperand(MirInstId callerOp,
-                     std::unordered_map<std::uint32_t, MirInstId> const& rewrite,
-                     MirInstId oldCall) {
-        auto const it = rewrite.find(callerOp.v);
-        if (it == rewrite.end()) {
-            std::fprintf(stderr,
-                "dss::opt::passes::Inlining fatal: caller Call v=%u "
-                "operand v=%u has no rewrite entry during splice — "
-                "operands must be emitted before the Call in block/RPO "
-                "order (D-OPT2-REWRITE-MAP-COMPLETENESS).\n",
-                oldCall.v, callerOp.v);
-            std::abort();
-        }
-        return it->second;
     }
 
     Mir const&            src_;
@@ -424,6 +469,494 @@ private:
     std::size_t callsInlined_ = 0;
     bool        malformed_    = false;
 };
+
+// ── multi-block (general LEAF) inlining rebuild (OPT7 cycle 2) ──────
+//
+// A `tryRewrite`-style hook (cycle 1) maps ONE Call to ONE value and
+// runs mid-block-fill — it structurally CANNOT create blocks or split
+// the call-site block, which a multi-block splice requires. So a
+// function containing ANY multi-block inline target is rebuilt by this
+// dedicated routine instead of `MirFunctionRebuilder`.
+//
+// The inliner preserves the caller's CFG (it only rewrites Calls), so
+// each ORIGINAL caller block keeps its identity as a branch target
+// (`blockMap[old] → new entry`). A multi-block splice SPLITS the host
+// block at the Call: instructions before the Call stay; instructions
+// after move to a fresh CONTINUATION block. Between them the callee's
+// CFG is CLONED (fresh block + inst ids), every callee `Return` becomes
+// a `Br` to the continuation, and a RETURN-MERGE PHI in the
+// continuation joins the per-return values — that Phi IS the Call's
+// result. Because a caller block can be split more than once (multiple
+// inline Calls), the block that finally carries the original block's
+// terminator is tracked separately (`blockExitMap[old] → last cont`),
+// and caller Phi incomings redirect their `pred` through it.
+//
+// StructCfMarker: the cloned callee blocks + every continuation block
+// are re-derived to `Linear` (the SimplifyCfg cycle-9 marker re-
+// derivation precedent). Re-deriving is the clean choice — a clone of
+// the callee's `EntryBlock` would violate the verifier's "exactly one
+// EntryBlock == funcBlockAt(f,0)" rule, a clone of an `ExitBlock` whose
+// Return became a `Br` would violate "ExitBlock terminates in
+// Return/Unreachable", and transplanting the callee's If/Loop marker
+// COUNTS would pollute the caller's marker-parity checks. `Linear`
+// contributes to zero parity counts and to neither special rule, so
+// the post-splice CFG verifies. The caller's OWN block markers are
+// preserved unchanged (the caller's structure is untouched).
+//
+// SSA: callee blocks are emitted in RPO from the callee entry (a valid
+// def-before-use order for a Phi-free SSA body — every def dominates
+// its uses, and RPO visits a block's dominators first), so the shared
+// calleeOld→callerNew `local` map is always populated before a use.
+// The engine's verify-after-every-pass hook re-runs MirVerifier, so any
+// splice that broke SSA dominance / Phi completeness / a CFG edge is a
+// build break, never a runtime miscompile.
+class MultiBlockInliner {
+public:
+    // `plan` (callId .v → callee) is precomputed by `planHasMultiBlock`
+    // (it already ran the §2.9 gate per call); this rebuilder consumes
+    // it by reference, so its lifetime must outlive the rebuild.
+    MultiBlockInliner(Mir const& src, MirBuilder& dst,
+                      std::unordered_map<std::uint32_t, MirFuncId> const& plan)
+        : src_(src), dst_(dst), plan_(plan) {}
+
+    [[nodiscard]] std::size_t callsInlined() const noexcept { return callsInlined_; }
+    [[nodiscard]] bool malformed() const noexcept { return malformed_; }
+
+    void rebuildFunction(MirFuncId caller) {
+        dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
+                         src_.funcBinding(caller), src_.funcVisibility(caller));
+
+        std::uint32_t const nb = src_.funcBlockCount(caller);
+
+        // Phase 1: pre-create one NEW caller block per ORIGINAL caller
+        // block (preserving the caller's own marker), so terminators
+        // can target forward references (loop back-edges). The entry of
+        // each original block keeps its identity in `blockMap_`.
+        blockMap_.clear();
+        blockExitMap_.clear();
+        rewrite_.clear();
+        deferredPhis_.clear();
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const oldB = src_.funcBlockAt(caller, bi);
+            MirBlockId const newB = dst_.createBlock(src_.blockMarker(oldB));
+            blockMap_.emplace(oldB.v, newB);
+            blockExitMap_.emplace(oldB.v, newB);  // updated if split
+        }
+
+        // Phase 2: fill blocks.
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const oldB = src_.funcBlockAt(caller, bi);
+            MirBlockId cur = blockMap_.at(oldB.v);
+            dst_.beginBlock(cur);
+            std::uint32_t const ni = src_.blockInstCount(oldB);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirInstId const id = src_.blockInstAt(oldB, ii);
+                MirOpcode const op = src_.instOpcode(id);
+
+                if (op == MirOpcode::Phi) {
+                    // Caller's OWN phi — placeholder now, incomings in
+                    // phase 3 (the caller's CFG is preserved, so its
+                    // phis remain valid; only their `pred` may shift to
+                    // a split block's exit, handled via blockExitMap_).
+                    MirInstId const newPhi = dst_.addPhi(src_.instType(id));
+                    rewrite_.emplace(id.v, newPhi);
+                    deferredPhis_.push_back({id, newPhi, oldB});
+                    continue;
+                }
+
+                if (opcodeInfo(op).isTerminator) {
+                    emitTerminator(op, id);
+                    blockExitMap_[oldB.v] = cur;  // this block carries the term
+                    break;
+                }
+
+                // A selected inline Call?
+                if (op == MirOpcode::Call) {
+                    auto const it = plan_.find(id.v);
+                    if (it != plan_.end()) {
+                        MirFuncId const callee = it->second;
+                        if (src_.funcBlockCount(callee) == 1) {
+                            // Single-block leaf: splice linearly into cur.
+                            MirInstId const result =
+                                spliceSingleBlock(callee, id);
+                            rewrite_.emplace(id.v, result);
+                        } else {
+                            // Multi-block: split here. `cur` advances to
+                            // the continuation block; subsequent insts of
+                            // this original block emit into it.
+                            cur = spliceMultiBlock(callee, id, cur);
+                        }
+                        ++callsInlined_;
+                        continue;
+                    }
+                }
+
+                // Ordinary caller instruction (incl. a non-inlined Call):
+                // verbatim copy with operands mapped through rewrite_.
+                emitCallerInst(id, op);
+            }
+        }
+
+        // Phase 3: flush caller phi incomings. A phi-incoming pred that
+        // was a split block redirects to that block's EXIT (the block
+        // that actually branches into the phi's block).
+        for (auto const& dp : deferredPhis_) {
+            for (MirPhiIncoming const& inc : src_.phiIncomings(dp.oldPhi)) {
+                MirInstId const newVal = mapCallerValue(inc.value, dp.oldPhi);
+                auto const exitIt = blockExitMap_.find(inc.pred.v);
+                if (exitIt == blockExitMap_.end()) {
+                    std::fprintf(stderr,
+                        "dss::opt::passes::Inlining fatal: caller phi v=%u "
+                        "incoming pred v=%u has no blockExitMap_ entry — "
+                        "every reachable caller block is pre-created in "
+                        "phase 1 (substrate-contract violation).\n",
+                        dp.oldPhi.v, inc.pred.v);
+                    std::abort();
+                }
+                dst_.addPhiIncoming(dp.newPhi,
+                                    MirPhiIncoming{newVal, exitIt->second});
+            }
+        }
+    }
+
+private:
+    struct DeferredPhi {
+        MirInstId  oldPhi;
+        MirInstId  newPhi;
+        MirBlockId oldBlock;
+    };
+
+    // Map an operand of a CALLER instruction (a caller-OLD value) to its
+    // caller-NEW id via the function-wide rewrite map.
+    [[nodiscard]] MirInstId
+    mapCallerValue(MirInstId callerOld, MirInstId user) {
+        auto const it = rewrite_.find(callerOld.v);
+        if (it == rewrite_.end()) {
+            std::fprintf(stderr,
+                "dss::opt::passes::Inlining fatal: caller inst v=%u "
+                "operand v=%u has no rewrite entry during multi-block "
+                "rebuild — RPO/scan-order violation "
+                "(D-OPT2-REWRITE-MAP-COMPLETENESS).\n",
+                user.v, callerOld.v);
+            std::abort();
+        }
+        return it->second;
+    }
+
+    // Verbatim-copy one ordinary CALLER instruction into the open block.
+    void emitCallerInst(MirInstId id, MirOpcode op) {
+        if (op == MirOpcode::Const) {
+            rewrite_.emplace(id.v, dst_.addConst(
+                src_.literalValue(src_.constLiteralIndex(id)), src_.instType(id)));
+            return;
+        }
+        if (op == MirOpcode::Arg) {
+            rewrite_.emplace(id.v,
+                dst_.addArg(src_.argIndex(id), src_.instType(id)));
+            return;
+        }
+        if (op == MirOpcode::GlobalAddr) {
+            rewrite_.emplace(id.v, dst_.addGlobalAddr(
+                src_.globalAddrSymbol(id), src_.instType(id)));
+            return;
+        }
+        auto const ops = src_.instOperands(id);
+        std::vector<MirInstId> newOps;
+        newOps.reserve(ops.size());
+        for (MirInstId const o : ops) newOps.push_back(mapCallerValue(o, id));
+        rewrite_.emplace(id.v, dst_.addInst(op, newOps, src_.instType(id),
+                                            src_.instPayload(id),
+                                            src_.instFlags(id)));
+    }
+
+    // Emit a CALLER terminator into the open block, mapping operands via
+    // rewrite_ and successors via blockMap_ (each original block's entry).
+    void emitTerminator(MirOpcode op, MirInstId id) {
+        auto const oldOps  = src_.instOperands(id);
+        auto const oldBlk  = src_.instBlock(id);
+        auto const oldSucc = src_.blockSuccessors(oldBlk);
+        auto mapSucc = [&](MirBlockId oldS) -> MirBlockId {
+            auto const it = blockMap_.find(oldS.v);
+            if (it == blockMap_.end()) {
+                std::fprintf(stderr,
+                    "dss::opt::passes::Inlining fatal: caller terminator "
+                    "v=%u successor block v=%u not in blockMap_ — every "
+                    "caller block is pre-created in phase 1.\n", id.v, oldS.v);
+                std::abort();
+            }
+            return it->second;
+        };
+        switch (op) {
+            case MirOpcode::Br:
+                dst_.addBr(mapSucc(oldSucc[0]));
+                return;
+            case MirOpcode::CondBr:
+                dst_.addCondBr(mapCallerValue(oldOps[0], id),
+                               mapSucc(oldSucc[0]), mapSucc(oldSucc[1]));
+                return;
+            case MirOpcode::Switch: {
+                std::vector<std::pair<MirInstId, MirBlockId>> cases;
+                std::size_t const ncases = oldSucc.size() - 1;
+                cases.reserve(ncases);
+                for (std::size_t i = 0; i < ncases; ++i) {
+                    cases.emplace_back(mapCallerValue(oldOps[1 + i], id),
+                                       mapSucc(oldSucc[i]));
+                }
+                dst_.addSwitch(mapCallerValue(oldOps[0], id), cases,
+                               mapSucc(oldSucc[ncases]));
+                return;
+            }
+            case MirOpcode::Return: {
+                std::optional<MirInstId> rv;
+                if (!oldOps.empty()) rv = mapCallerValue(oldOps[0], id);
+                dst_.addReturn(rv);
+                return;
+            }
+            case MirOpcode::Unreachable:
+                dst_.addUnreachable();
+                return;
+            default:
+                std::fprintf(stderr,
+                    "dss::opt::passes::Inlining fatal: emitTerminator: "
+                    "MirOpcode %d marked isTerminator but no clone arm.\n",
+                    static_cast<int>(op));
+                std::abort();
+        }
+    }
+
+    // Splice a SINGLE-BLOCK leaf callee linearly into the open block
+    // `cur` (same shape as the cycle-1 path, reusing the shared emit
+    // helpers). Returns the threaded return value (invalid for void).
+    [[nodiscard]] MirInstId
+    spliceSingleBlock(MirFuncId callee, MirInstId oldCall) {
+        std::vector<MirInstId> const actualArgs =
+            mapActualArgs(src_, oldCall, rewrite_);
+        MirBlockId const cb = src_.funcEntry(callee);
+        std::uint32_t const ni = src_.blockInstCount(cb);
+        std::unordered_map<std::uint32_t, MirInstId> local;
+        local.reserve(ni);
+        MirInstId result{};
+        for (std::uint32_t i = 0; i < ni; ++i) {
+            MirInstId const cid = src_.blockInstAt(cb, i);
+            MirOpcode const cop = src_.instOpcode(cid);
+            if (opcodeInfo(cop).isTerminator) {
+                if (cop == MirOpcode::Return) {
+                    auto const rops = src_.instOperands(cid);
+                    if (!rops.empty()) {
+                        result = mapCalleeOperand(src_, rops[0], local, callee);
+                    }
+                } else {
+                    std::fprintf(stderr,
+                        "dss::opt::passes::Inlining fatal: single-block "
+                        "callee funcId v=%u terminates with non-Return "
+                        "opcode %d during multi-block rebuild.\n",
+                        callee.v, static_cast<int>(cop));
+                    std::abort();
+                }
+                break;
+            }
+            emitCalleeInst(src_, cid, cop, dst_, actualArgs, local, callee,
+                           malformed_);
+        }
+        return result;
+    }
+
+    // Splice a MULTI-BLOCK leaf callee. The open block `cur` is split:
+    // it is sealed with a Br to the cloned callee entry; the callee CFG
+    // is cloned; every callee Return becomes a Br to a fresh continuation
+    // block; a return-merge Phi in the continuation joins the per-return
+    // values. Returns the continuation block (the new open block for the
+    // remaining instructions of the host caller block).
+    [[nodiscard]] MirBlockId
+    spliceMultiBlock(MirFuncId callee, MirInstId oldCall, MirBlockId cur) {
+        std::vector<MirInstId> const actualArgs =
+            mapActualArgs(src_, oldCall, rewrite_);
+
+        // Callee blocks in RPO from entry — a valid def-before-use order
+        // for the Phi-free callee body (the gate forbids callee Phis).
+        MirBlockId const calleeEntry = src_.funcEntry(callee);
+        std::vector<MirBlockId> const calleeRpo =
+            mirReversePostOrder(src_, calleeEntry);
+
+        // Pre-create the continuation + one fresh caller block per cloned
+        // callee block (all Linear — see the class-doc marker rationale).
+        MirBlockId const contBlock = dst_.createBlock(StructCfMarker::Linear);
+        std::unordered_map<std::uint32_t, MirBlockId> calleeBlockMap;
+        calleeBlockMap.reserve(calleeRpo.size());
+        for (MirBlockId const fb : calleeRpo) {
+            calleeBlockMap.emplace(fb.v, dst_.createBlock(StructCfMarker::Linear));
+        }
+
+        // Seal `cur` with a Br to the cloned callee entry.
+        auto const entryIt = calleeBlockMap.find(calleeEntry.v);
+        if (entryIt == calleeBlockMap.end()) {
+            std::fprintf(stderr,
+                "dss::opt::passes::Inlining fatal: callee funcId v=%u entry "
+                "block v=%u missing from RPO clone map.\n",
+                callee.v, calleeEntry.v);
+            std::abort();
+        }
+        dst_.addBr(entryIt->second);
+
+        // Clone each callee block. ONE function-wide local map (callee
+        // values cross cloned blocks; RPO emission keeps def-before-use).
+        std::unordered_map<std::uint32_t, MirInstId> local;
+        // (value, cloned-pred-block) pairs collected from each rewritten
+        // callee Return — the incomings of the return-merge Phi.
+        std::vector<MirPhiIncoming> returnEdges;
+        for (MirBlockId const fb : calleeRpo) {
+            MirBlockId const newFb = calleeBlockMap.at(fb.v);
+            dst_.beginBlock(newFb);
+            std::uint32_t const ni = src_.blockInstCount(fb);
+            for (std::uint32_t i = 0; i < ni; ++i) {
+                MirInstId const cid = src_.blockInstAt(fb, i);
+                MirOpcode const cop = src_.instOpcode(cid);
+                if (opcodeInfo(cop).isTerminator) {
+                    emitCalleeTerminator(cop, cid, callee, calleeBlockMap,
+                                         local, contBlock, newFb, returnEdges);
+                    break;
+                }
+                emitCalleeInst(src_, cid, cop, dst_, actualArgs, local, callee,
+                               malformed_);
+            }
+        }
+
+        // Open the continuation + build the return-merge value.
+        dst_.beginBlock(contBlock);
+        MirInstId result{};
+        if (!returnEdges.empty()) {
+            if (returnEdges.size() == 1) {
+                // Single return path → elide the degenerate 1-incoming
+                // Phi to the value directly (verifier-legal either way;
+                // this keeps the merge minimal).
+                result = returnEdges[0].value;
+            } else {
+                MirInstId const phi = dst_.addPhi(src_.instType(oldCall));
+                for (MirPhiIncoming const& e : returnEdges) {
+                    dst_.addPhiIncoming(phi, e);
+                }
+                result = phi;
+            }
+        }
+        // For a value-returning callee, `result` is the Call's value;
+        // record it so caller operands referencing the Call resolve. A
+        // void callee leaves `result` invalid — a void Call's result is
+        // never used as an operand, so no rewrite entry is needed (and
+        // none must be emitted: an invalid id in rewrite_ would fail a
+        // later mapCallerValue lookup).
+        if (result.valid()) rewrite_.emplace(oldCall.v, result);
+        return contBlock;
+    }
+
+    // Emit a cloned-CALLEE terminator. A `Return` becomes a `Br` to the
+    // continuation (recording the (value, this-cloned-block) incoming for
+    // the merge Phi); Br/CondBr/Switch re-emit with targets remapped
+    // through calleeBlockMap; Unreachable re-emits verbatim.
+    void emitCalleeTerminator(
+        MirOpcode cop, MirInstId cid, MirFuncId callee,
+        std::unordered_map<std::uint32_t, MirBlockId> const& calleeBlockMap,
+        std::unordered_map<std::uint32_t, MirInstId> const& local,
+        MirBlockId contBlock, MirBlockId clonedPred,
+        std::vector<MirPhiIncoming>& returnEdges) {
+        auto const cops    = src_.instOperands(cid);
+        auto const cBlk    = src_.instBlock(cid);
+        auto const cSucc   = src_.blockSuccessors(cBlk);
+        auto mapCalleeSucc = [&](MirBlockId fs) -> MirBlockId {
+            auto const it = calleeBlockMap.find(fs.v);
+            if (it == calleeBlockMap.end()) {
+                std::fprintf(stderr,
+                    "dss::opt::passes::Inlining fatal: cloned callee "
+                    "funcId v=%u terminator v=%u successor block v=%u not "
+                    "in clone map — every callee block is pre-created.\n",
+                    callee.v, cid.v, fs.v);
+                std::abort();
+            }
+            return it->second;
+        };
+        switch (cop) {
+            case MirOpcode::Return: {
+                MirInstId rv{};
+                if (!cops.empty()) {
+                    rv = mapCalleeOperand(src_, cops[0], local, callee);
+                }
+                dst_.addBr(contBlock);
+                // A void callee's Return contributes no merge value (rv
+                // invalid). For a value-returning callee, rv is the value
+                // flowing into the merge Phi along this cloned block.
+                if (rv.valid()) returnEdges.push_back({rv, clonedPred});
+                return;
+            }
+            case MirOpcode::Br:
+                dst_.addBr(mapCalleeSucc(cSucc[0]));
+                return;
+            case MirOpcode::CondBr:
+                dst_.addCondBr(mapCalleeOperand(src_, cops[0], local, callee),
+                               mapCalleeSucc(cSucc[0]), mapCalleeSucc(cSucc[1]));
+                return;
+            case MirOpcode::Switch: {
+                std::vector<std::pair<MirInstId, MirBlockId>> cases;
+                std::size_t const ncases = cSucc.size() - 1;
+                cases.reserve(ncases);
+                for (std::size_t i = 0; i < ncases; ++i) {
+                    cases.emplace_back(
+                        mapCalleeOperand(src_, cops[1 + i], local, callee),
+                        mapCalleeSucc(cSucc[i]));
+                }
+                dst_.addSwitch(mapCalleeOperand(src_, cops[0], local, callee),
+                               cases, mapCalleeSucc(cSucc[ncases]));
+                return;
+            }
+            case MirOpcode::Unreachable:
+                dst_.addUnreachable();
+                return;
+            default:
+                std::fprintf(stderr,
+                    "dss::opt::passes::Inlining fatal: cloned callee "
+                    "funcId v=%u terminator opcode %d has no clone arm.\n",
+                    callee.v, static_cast<int>(cop));
+                std::abort();
+        }
+    }
+
+    Mir const&            src_;
+    MirBuilder&           dst_;
+    std::unordered_map<std::uint32_t, MirFuncId> const& plan_;
+    // OLD caller block .v → NEW caller block (its entry / branch target).
+    std::unordered_map<std::uint32_t, MirBlockId> blockMap_;
+    // OLD caller block .v → NEW block carrying its terminator (the last
+    // continuation in its split chain; == blockMap_ entry if not split).
+    std::unordered_map<std::uint32_t, MirBlockId> blockExitMap_;
+    // Function-wide caller-OLD inst .v → caller-NEW id.
+    std::unordered_map<std::uint32_t, MirInstId>  rewrite_;
+    std::vector<DeferredPhi> deferredPhis_;
+    std::size_t callsInlined_ = 0;
+    bool        malformed_    = false;
+};
+
+// True iff `caller`'s inline plan contains at least one MULTI-BLOCK
+// callee — the signal to route this function through the multi-block
+// rebuild rather than the cycle-1 `tryRewrite` path.
+[[nodiscard]] bool
+planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
+                  MirFuncId caller,
+                  std::unordered_map<std::uint32_t, MirFuncId>& planOut) {
+    planOut.clear();
+    bool anyMulti = false;
+    std::uint32_t const nb = src.funcBlockCount(caller);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = src.funcBlockAt(caller, bi);
+        std::uint32_t const ni = src.blockInstCount(b);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const id = src.blockInstAt(b, ii);
+            if (src.instOpcode(id) != MirOpcode::Call) continue;
+            auto const callee = inlineLegalityGate(src, analysis, caller, id);
+            if (!callee.has_value()) continue;
+            planOut.emplace(id.v, *callee);
+            if (src.funcBlockCount(*callee) != 1) anyMulti = true;
+        }
+    }
+    return anyMulti;
+}
 
 } // namespace
 
@@ -441,15 +974,35 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     ModuleAnalysis const analysis = analyzeModule(mir);
     InliningPolicy policy{mir, analysis};
 
+    std::size_t callsInlined = 0;
+    bool        malformed    = false;
+
+    // Per-function routing: a function whose inline plan is empty or
+    // contains ONLY single-block-leaf targets goes through the cycle-1
+    // `MirFunctionRebuilder` + `tryRewrite` path (UNCHANGED — preserving
+    // the cycle-1 behavior + the Weak-inline pin byte-for-byte). A
+    // function with ANY multi-block target is rebuilt by
+    // `MultiBlockInliner` (which subsumes the single-block linear case
+    // for any single-block targets in the same function).
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f);
-        MirFunctionRebuilder rb{mir, builder, policy};
-        rb.rebuildFunction(f);
+        std::unordered_map<std::uint32_t, MirFuncId> plan;
+        if (planHasMultiBlock(mir, analysis, f, plan)) {
+            MultiBlockInliner mb{mir, builder, plan};
+            mb.rebuildFunction(f);
+            callsInlined += mb.callsInlined();
+            malformed = malformed || mb.malformed();
+        } else {
+            policy.analyze(f);
+            MirFunctionRebuilder rb{mir, builder, policy};
+            rb.rebuildFunction(f);
+        }
     }
+    callsInlined += policy.callsInlined();
+    malformed = malformed || policy.malformed();
 
-    if (policy.malformed()) {
+    if (malformed) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::X_InlineMalformedCallSite;
         d.severity = DiagnosticSeverity::Error;
@@ -465,7 +1018,7 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
         return result;
     }
 
-    result.callsInlined = policy.callsInlined();
+    result.callsInlined = callsInlined;
     mir = std::move(builder).finish();
     result.ok = true;
     return result;
