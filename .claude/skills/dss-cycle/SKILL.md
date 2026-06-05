@@ -66,6 +66,22 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      consumed by any shipped language*, via a synthetic schema that constructs the consuming
      shape itself. An unconsumed substrate's misses are latent by definition — the test must
      build the consuming shape, not wait for a real consumer to expose it.
+   - **Real-execution corpus example** — when the feature produces *observable end-to-end
+     behavior* (a source construct that compiles to a binary whose exit code / stdout reflects
+     it), ship a **runnable corpus example** exercising it: `examples/<lang>/<name>/`
+     (`main.<ext>` + `expected.json` — the differential runner compiles → spawns → asserts the
+     exact exit/stdout). A binary that runs correctly proves the whole source→…→`.exe` chain a
+     unit/MIR-tier test cannot. **First check the existing corpus** — if a fixture already
+     exercises the feature, reuse it (add an `optimizedPipelines` arm or an assertion) rather
+     than duplicate; add a NEW example only for a genuine coverage gap. **Make it a *good*
+     exercise, not a vacuous one:** the feature must actually manifest at runtime with operands
+     no earlier pass can fold away (cycle 10r's division corpus uses runtime function-args,
+     never a literal `100/7` that const-folds before the idiv ever runs). **Carve-out — do not
+     manufacture a vacuous corpus:** a feature with *no* runtime-observable behavior (pure
+     substrate, a diagnostic-only fail-loud, a MIR-tier transform with no runtime difference —
+     e.g. single-CU `static`→Local DCE just drops an unused symbol — a behavior-preserving
+     refactor) is proven by its appropriate-tier strict test (+ red-on-disable); a corpus that
+     exercises nothing is itself the masked-effectiveness trap.
 6. **The full commit gate.** The operational checklist (with commands) is **Step 6 (§C)** —
    the single source of truth for the gate items. **Any red the cycle cannot self-repair →
    STOP and report. Do not push.** Self-repair = a mechanical fix obvious from the failure
