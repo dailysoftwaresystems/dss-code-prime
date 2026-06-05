@@ -13,9 +13,11 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <string>
 #include <system_error>
 
 using namespace dss;
@@ -1241,4 +1243,155 @@ TEST(SemanticAnalyzerCSubset, SpacedIncludeIsRecognized) {
     EXPECT_FALSE(hasCode(cu->driverDiagnostics(), DiagnosticCode::D_UnresolvedImport));
     std::error_code ec;
     fs::remove_all(dir, ec);
+}
+
+// ── FF11 GOAL-2: angle-include + a conflicting inline extern fails loud ──────
+
+namespace {
+// Build a c-subset CU whose `main.c` source is `mainSrc`, with `header`
+// written to a SYSTEM dir reachable by the angle form `#include <...>`.
+[[nodiscard]] std::shared_ptr<CompilationUnit const>
+buildAngleIncludeUnit(std::string const& headerName,
+                      std::string const& headerSrc,
+                      std::string const& mainSrc) {
+    namespace fs = std::filesystem;
+    static std::atomic<unsigned> counter{0};
+    auto dir = fs::temp_directory_path()
+             / ("dss_ff11_goal2_" + std::to_string(counter.fetch_add(1)));
+    fs::create_directories(dir);
+    std::ofstream(dir / headerName, std::ios::binary) << headerSrc;
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(dir);
+    builder.addInMemory(mainSrc, "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    return cu;
+}
+} // namespace
+
+// The C-faithful angle include with NO conflicting decl: `#include <io.h>`
+// brings in `puts`, the program uses it — clean, no redeclaration. This is
+// the additive happy path the GOAL-2 negative pins against.
+TEST(SemanticAnalyzerCSubset, FF11AngleIncludeNoConflictIsClean) {
+    auto cu = buildAngleIncludeUnit(
+        "io.h", "extern int puts(const char* s);\n",
+        "#include <io.h>\nint main() { puts(\"hi\"); return 0; }\n");
+    ASSERT_EQ(cu->trees().size(), 2u) << "the system header must have loaded";
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol))
+        << "one declaration of puts (from the header) — no conflict";
+}
+
+// GOAL-2: a program that BOTH `#include <io.h>` (which declares `puts`) AND
+// writes its OWN `extern` for the same name declares `puts` twice in the
+// global scope → the existing same-scope duplicate-declaration detection
+// fires S_RedeclaredSymbol. The conflict fails LOUD; it does not silently
+// pick one. (A conflicting signature is the motivating case; the analyzer
+// is stricter — ANY same-scope duplicate name is rejected.)
+TEST(SemanticAnalyzerCSubset, FF11AngleIncludePlusInlineExternConflictFailsLoud) {
+    auto cu = buildAngleIncludeUnit(
+        "io.h", "extern int puts(const char* s);\n",
+        "extern char puts(int x);\n"
+        "#include <io.h>\n"
+        "int main() { return 0; }\n");
+    ASSERT_EQ(cu->trees().size(), 2u) << "the system header must have loaded";
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "puts declared by BOTH <io.h> and the inline extern must fail loud";
+}
+
+// GOAL-2 de-dup: the SAME conflicting header `#include`d TWICE is still ONE
+// logical name collision and must fail loud EXACTLY ONCE. The ImportResolver
+// emits one crossRefs edge per `#include` directive, so two identical
+// directives produce two (sourceTree, targetTree) edges; the goal-2 conflict
+// loop must de-dup on (sourceTree, name) so the duplicate edge does not
+// double-report S_RedeclaredSymbol. (`io.h` is loaded once — dedup by
+// canonical path — but the second directive still yields a second edge.)
+// NOTE: in this adjacent case the reporter's generic dedup window (size 4)
+// ALSO collapses the two identical reports, so this test documents the
+// behavioral contract; the window-INDEPENDENT proof of the goal-2 guard is
+// FF11DuplicateHeaderAcrossDedupWindowReportsOnce below (which separates the
+// duplicates past the window).
+TEST(SemanticAnalyzerCSubset, FF11SameConflictingHeaderIncludedTwiceReportsOnce) {
+    auto cu = buildAngleIncludeUnit(
+        "io.h", "extern int puts(const char* s);\n",
+        "extern char puts(int x);\n"
+        "#include <io.h>\n"
+        "#include <io.h>\n"
+        "int main() { return 0; }\n");
+    ASSERT_EQ(cu->trees().size(), 2u)
+        << "io.h loads once (path dedup) → main.c + io.h only";
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "the same header included twice is ONE conflict — not one per "
+           "duplicate include edge";
+}
+
+// GOAL-2 de-dup, window-DEFEATING regression guard. The DiagnosticReporter
+// has a generic dedup WINDOW (Config.dedupWindow = 4) that drops an
+// identical (code, buffer, span, rule, actual) diagnostic seen within the
+// last 4 emissions — so the adjacent same-header-twice case above is ALSO
+// (coincidentally) collapsed by that window, and the simple test cannot by
+// itself prove the goal-2 (sourceTree, name) guard. This test DEFEATS the
+// window: the same conflicting header `dup.h` is included TWICE, but the two
+// includes are separated by FOUR OTHER distinct conflicting headers, so the
+// second `dup` redeclaration lands >4 diagnostics after the first and the
+// reporter window does NOT cover it. Therefore the goal-2 (sourceTree, name)
+// de-dup is the ONLY thing that keeps `dup`'s name from double-reporting —
+// remove that guard and this test goes RED (count becomes 6, not 5).
+//
+// Each header conflicts on its OWN distinct source-declared name (h0..h3 +
+// dup), with distinct parameter names so no spurious same-scope param clash
+// contaminates the count. Expected: 5 distinct colliding names → 5 reports
+// (each name once); the duplicate `dup` edge is suppressed by the guard.
+TEST(SemanticAnalyzerCSubset, FF11DuplicateHeaderAcrossDedupWindowReportsOnce) {
+    namespace fs = std::filesystem;
+    static std::atomic<unsigned> counter{0};
+    auto dir = fs::temp_directory_path()
+             / ("dss_ff11_goal2_win_" + std::to_string(counter.fetch_add(1)));
+    fs::create_directories(dir);
+    std::ofstream(dir / "dup.h", std::ios::binary)
+        << "extern int dup(int p);\n";
+    for (int i = 0; i < 4; ++i) {
+        std::ofstream(dir / ("h" + std::to_string(i) + ".h"), std::ios::binary)
+            << "extern int h" << i << "(int p);\n";
+    }
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(dir);
+    // Source declares all five colliding names (distinct param names a0..a4
+    // so the only S_RedeclaredSymbols are the five cross-tree collisions).
+    // The two `#include <dup.h>` directives bracket the four single-conflict
+    // headers, so the duplicate `dup` edge is processed >4 diagnostics after
+    // the first — outside the reporter's dedup window.
+    builder.addInMemory(
+        "extern char dup(int a0);\n"
+        "extern char h0(int a1);\n"
+        "extern char h1(int a2);\n"
+        "extern char h2(int a3);\n"
+        "extern char h3(int a4);\n"
+        "#include <dup.h>\n"
+        "#include <h0.h>\n"
+        "#include <h1.h>\n"
+        "#include <h2.h>\n"
+        "#include <h3.h>\n"
+        "#include <dup.h>\n"
+        "int main() { return 0; }\n",
+        "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    ASSERT_EQ(cu->trees().size(), 6u) << "main.c + dup.h + h0..h3.h (dup loads once)";
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 5u)
+        << "five distinct colliding names each fire ONCE; the duplicate "
+           "<dup.h> edge (>4 diags later, past the reporter window) is "
+           "suppressed by the goal-2 (sourceTree, name) guard — RED (6) "
+           "without it";
 }

@@ -184,6 +184,14 @@ public:
     // job; this is the minimal hook CU4 needs. Aborts if called after finish().
     void addIncludeDir(std::filesystem::path dir);
 
+    // FF11: declare a SYSTEM include directory (absolute) the import
+    // resolver searches for the ANGLE form `#include <h>` (distinct from
+    // `addIncludeDir`, the quote form's search). The analogue of C's
+    // /usr/include; the production driver resolves the language's
+    // `semantics.shippedLibDirs` config strings to absolute dirs and
+    // calls this per dir. Aborts if called after finish().
+    void addSystemDir(std::filesystem::path dir);
+
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
     // does not consume the lvalue, so a second rvalue-qualified call is
@@ -221,6 +229,7 @@ private:
     // (resolve an #include to an already-loaded tree instead of re-parsing).
     std::unordered_map<std::string, std::size_t> pathToTreeIndex_;
     std::vector<std::filesystem::path>   includeDirs_;
+    std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
     bool                                 finished_ = false;
 };
 

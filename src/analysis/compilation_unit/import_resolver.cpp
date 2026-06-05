@@ -58,14 +58,24 @@ void reportDriver(DiagnosticReporter& reporter,
     resolverFatal("rootOfTree: TreeId not present in the CompilationUnit");
 }
 
-// First Token child of `parent` whose token-kind is `kind`, or InvalidNode.
-[[nodiscard]] NodeId firstChildOfKind(Tree const& tree, NodeId parent, SchemaTokenId kind) {
-    for (NodeId child : tree.children(parent)) {
-        if (tree.kind(child) == NodeKind::Token && tree.tokenKind(child) == kind) {
-            return child;
+// First Token DESCENDANT of `parent` whose token-kind is `kind`, or
+// InvalidNode. A descendant (not direct-child) walk because the
+// directive's path token may sit under an intermediate rule node — e.g.
+// FF11 nests the target as `includeDirective → includeTarget →
+// include{Quote,Angle}Target → <pathToken>`, so the StringStart /
+// HeaderStart is a grandchild, not a direct child. Pre-order so the
+// FIRST such token in source order wins (a well-formed directive has
+// exactly one).
+[[nodiscard]] NodeId firstDescendantOfKind(Tree const& tree, NodeId parent, SchemaTokenId kind) {
+    NodeId found = InvalidNode;
+    walkPreOrder(tree, parent, [&](TreeCursor const& cursor) {
+        if (found.valid()) return;
+        NodeId const id = cursor.current();
+        if (tree.kind(id) == NodeKind::Token && tree.tokenKind(id) == kind) {
+            found = id;
         }
-    }
-    return InvalidNode;
+    });
+    return found;
 }
 
 // Read the quoted filename of a `#include "..."`. The StringStart token spans
@@ -80,6 +90,38 @@ void reportDriver(DiagnosticReporter& reporter,
     auto const close = src.find('"', open + 1);
     if (close == std::string_view::npos) return {};
     return std::string(src.substr(open + 1, close - (open + 1)));
+}
+
+// Read the angle-bracketed header name of a `#include <h.h>` (FF11). The
+// HeaderStart token spans only the opening `<`; the path bytes run to
+// the closing `>` (read from the source slice — the path is a filename,
+// not a decoded string, mirroring the quote form). Returns empty when
+// the `<...>` isn't well-formed.
+[[nodiscard]] std::string extractAngleFilename(Tree const& tree, NodeId headerStart) {
+    std::string_view const src = tree.source().text();
+    ByteOffset const open = tree.span(headerStart).start();
+    if (open >= src.size() || src[open] != '<') return {};
+    auto const close = src.find('>', open + 1);
+    if (close == std::string_view::npos) return {};
+    return std::string(src.substr(open + 1, close - (open + 1)));
+}
+
+// Search `dirs` for `filename` (a relative header name). First existing
+// match wins. Absolute names resolve against the filesystem directly.
+// Shared by the quote (includeDirs) and angle (systemDirs) forms — the
+// only difference between the two is WHICH dir list is passed and the
+// self-dir prepend (quote-only), handled by the caller.
+[[nodiscard]] std::optional<fs::path> findInDirs(
+    std::string_view filename, std::span<fs::path const> dirs) {
+    fs::path const rel{filename};
+    std::error_code ec;
+    if (rel.is_absolute()) {
+        return fs::exists(rel, ec) ? std::optional{rel} : std::nullopt;
+    }
+    for (fs::path const& dir : dirs) {
+        if (auto candidate = dir / rel; fs::exists(candidate, ec)) return candidate;
+    }
+    return std::nullopt;
 }
 
 [[nodiscard]] std::optional<fs::path> resolveIncludePath(
@@ -170,11 +212,25 @@ private:
         return tree.schema().schemaId() == schema_->schemaId();
     }
 
-    // include-following: follow each `directiveRule` node's `pathToken` literal.
+    // include-following: follow each `directiveRule` node's path literal.
+    // TWO forms (FF11), distinguished by which path-opener token the
+    // directive carries — NO branch on the language name:
+    //   * QUOTE form (`config_.pathToken`, e.g. StringStart): a LOCAL
+    //     include. Searched on the including file's dir + includeDirs; a
+    //     miss is the SOFT D_UnresolvedImport (a local include may be
+    //     provided by a later build step).
+    //   * ANGLE/SYSTEM form (`config_.systemPathToken`, e.g.
+    //     HeaderStart): a SYSTEM include. Searched on `systemDirs`
+    //     (shippedLibDirs); a miss is the HARD F_ShippedHeaderNotFound
+    //     (a missing system header is a fatal C error). Absent token ⇒
+    //     the language declares no angle form.
     void resolveIncludeFollowing(ResolutionContext& context) const {
         RuleId const includeRule = schema_->rules().find(config_.directiveRule);
         if (!includeRule.valid()) return;
         SchemaTokenId const stringKind = schema_->schemaTokens().find(config_.pathToken);
+        SchemaTokenId const systemKind = config_.systemPathToken.empty()
+            ? SchemaTokenId{}
+            : schema_->schemaTokens().find(config_.systemPathToken);
 
         struct Edge { TreeId source; NodeId node; SourceSpan span; TreeId target; };
         std::vector<Edge> edges;
@@ -184,7 +240,7 @@ private:
         // rather than holding a Tree reference across loadFile.
         std::size_t index = 0;
         while (index < context.trees.size()) {
-            struct Directive { NodeId node; SourceSpan span; std::string filename; };
+            struct Directive { NodeId node; SourceSpan span; std::string filename; bool isSystem; };
             std::vector<Directive> directives;
             TreeId   sourceTree;
             BufferId sourceBuffer;
@@ -199,23 +255,56 @@ private:
                     NodeId const node = cursor.current();
                     if (tree.kind(node) != NodeKind::Internal) return;
                     if (tree.rule(node) != includeRule) return;
-                    NodeId const strNode = firstChildOfKind(tree, node, stringKind);
-                    std::string filename =
-                        strNode.valid() ? extractQuotedFilename(tree, strNode) : std::string{};
-                    directives.push_back({node, tree.span(node), std::move(filename)});
+                    // Quote form first; fall back to the angle form. A
+                    // well-formed directive carries exactly one path
+                    // opener, so the order only matters for malformed
+                    // input (both absent → empty filename → unresolved).
+                    NodeId const strNode =
+                        stringKind.valid() ? firstDescendantOfKind(tree, node, stringKind)
+                                           : InvalidNode;
+                    if (strNode.valid()) {
+                        directives.push_back({node, tree.span(node),
+                                              extractQuotedFilename(tree, strNode), false});
+                        return;
+                    }
+                    NodeId const hdrNode =
+                        systemKind.valid() ? firstDescendantOfKind(tree, node, systemKind)
+                                           : InvalidNode;
+                    if (hdrNode.valid()) {
+                        directives.push_back({node, tree.span(node),
+                                              extractAngleFilename(tree, hdrNode), true});
+                        return;
+                    }
+                    // Neither opener present — a malformed `#include`.
+                    directives.push_back({node, tree.span(node), std::string{}, false});
                 });
             }  // Tree reference released before any loadFile call below.
 
             for (Directive& directive : directives) {
+                // Miss handler: SYSTEM includes hard-fail (a missing
+                // shipped header is fatal in C); LOCAL includes soft-fail
+                // (D_UnresolvedImport Warning).
                 auto const unresolved = [&] {
-                    reportDriver(context.diagnostics, DiagnosticCode::D_UnresolvedImport,
-                                 DiagnosticSeverity::Warning, sourceBuffer, directive.span,
-                                 directive.filename.empty() ? "<malformed include>"
-                                                            : directive.filename);
+                    if (directive.isSystem) {
+                        reportDriver(context.diagnostics, DiagnosticCode::F_ShippedHeaderNotFound,
+                                     DiagnosticSeverity::Error, sourceBuffer, directive.span,
+                                     directive.filename.empty() ? "<malformed system include>"
+                                                                : directive.filename);
+                    } else {
+                        reportDriver(context.diagnostics, DiagnosticCode::D_UnresolvedImport,
+                                     DiagnosticSeverity::Warning, sourceBuffer, directive.span,
+                                     directive.filename.empty() ? "<malformed include>"
+                                                                : directive.filename);
+                    }
                 };
                 if (directive.filename.empty()) { unresolved(); continue; }
-                auto const resolved =
-                    resolveIncludePath(directive.filename, includingDir, context.includeDirs);
+                // Quote form searches self-dir + includeDirs; angle form
+                // searches systemDirs (shippedLibDirs). Both load the
+                // resolved header under THIS schema (the included header
+                // is a source file in the same language).
+                auto const resolved = directive.isSystem
+                    ? findInDirs(directive.filename, context.systemDirs)
+                    : resolveIncludePath(directive.filename, includingDir, context.includeDirs);
                 if (!resolved) { unresolved(); continue; }
 
                 bool ok = false;

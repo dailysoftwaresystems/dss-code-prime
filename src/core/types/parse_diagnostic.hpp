@@ -1044,6 +1044,20 @@ enum class DiagnosticCode : std::uint16_t {
     //   declaration for source-declared externs". (FF6 Slice 2,
     //   2026-06-02.)
     F_FfiNoImportLibraryForFormat  = 0x5019,
+    // F_ShippedHeaderNotFound: FF11 angle-include resolution. A
+    //   `#include <h.h>` (the SYSTEM/angle form) named a header that
+    //   was NOT found on any of the language's `shippedLibDirs` (the
+    //   /usr/include analogue). A missing SYSTEM header is a HARD error
+    //   in C — distinct from the missing QUOTE-include
+    //   (`#include "x.h"`), which surfaces as the soft
+    //   `D_UnresolvedImport` Warning (a local include may legitimately
+    //   be provided by a later build step). Remediation: ship the
+    //   header under `src/dss-config/<shippedLibDir>/<name>`, OR add
+    //   the dir to the language's `semantics.shippedLibDirs`, OR fix
+    //   the spelling. Member of `kUnsuppressableCodes` — a dropped
+    //   system-header miss would silently compile a program that calls
+    //   an undeclared library symbol. (FF11, 2026-06-05.)
+    F_ShippedHeaderNotFound        = 0x501A,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

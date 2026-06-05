@@ -783,6 +783,18 @@ TokenizeResult Tokenizer::tokenize() && {
         if (c == '\n') {
             r.advance(1);
             emit(CoreTokenKind::Newline, newlineKind);
+            // Line-scoped mode auto-pop: a mode declared `popAtNewline`
+            // (a C-directive / assembly-line mode) drops its frame here,
+            // AFTER the newline token, so its lexing rules never leak
+            // into the next line. The body-mode branch above already
+            // `continue`d, so `frames.back()` is the active main-scan
+            // mode. Loop, not a single pop, so a (degenerate) stack of
+            // nested line-scoped modes all unwind at one newline. The
+            // depth>1 guard keeps the always-on main frame.
+            while (frames.size() > 1
+                   && schema_->lexerMode(frames.back().mode).popAtNewline) {
+                frames.pop_back();
+            }
             continue;
         }
         if (isAsciiSpace(c)) {
@@ -912,6 +924,15 @@ TokenizeResult Tokenizer::tokenize() && {
     // single-code match.
     while (frames.size() > 1) {
         const auto& mode = schema_->lexerMode(frames.back().mode);
+        // A line-scoped (`popAtNewline`) mode that reaches EOF without a
+        // trailing newline is NOT unterminated — EOF is a valid end of
+        // the last line (a file ending in `#include "x.h"` with no final
+        // newline is well-formed C). Close it silently, like the newline
+        // pop would have.
+        if (mode.popAtNewline) {
+            frames.pop_back();
+            continue;
+        }
         ParseDiagnostic d;
         switch (mode.unterminatedFlavor) {
             case UnterminatedFlavor::Comment:

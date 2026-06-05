@@ -41,6 +41,12 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::D_TargetAbiModelUnsupportedByDriver));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_FfiIngestAbiModelUnsupported));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_FfiIngestEmptyCanonical));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedHeaderNotFound))
+        << "FF11: a missing system header `#include <h>` must be unsuppressable "
+           "(suppressing it would compile a program calling an undeclared symbol)";
+    EXPECT_FALSE(isUnsuppressable(DiagnosticCode::None))
+        << "None must never be a member (guards the array-size-bumped-without-"
+           "adding-the-entry bug at runtime too)";
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::D_PlanNotLanded));
 }
 

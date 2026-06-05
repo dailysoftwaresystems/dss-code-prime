@@ -1749,6 +1749,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     if (mainModeId.valid()) {
         data.lexerModeTokens[mainModeId.v] = data.lexemeTable;
     }
+    // Modes whose `tokens` is the literal `"default"` (a verbatim copy of
+    // the GLOBAL `lexemeTable`, NOT an inline override). Recorded here so
+    // the later `modeIntroducedKinds` harvest can skip them: a "default"
+    // mode introduces NO new kind meanings, so dumping the whole global
+    // table into the drift-guard exception set would broadly weaken the
+    // builder's synthetic-meaning guard for that language. Only REAL inline
+    // overrides (a mode whose table differs from global) may contribute.
+    std::unordered_set<std::uint32_t> tokensDefaultModes;
     if (doc.contains("lexerModes") && doc.at("lexerModes").is_object()) {
         for (auto const& [modeName, modeObj] : doc.at("lexerModes").items()) {
             const auto modePath = std::format("/lexerModes/{}", modeName);
@@ -1828,7 +1836,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
             }
-            data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken, flavor);
+            // Optional `popAtNewline` field — declares a line-scoped
+            // mode that the tokenizer auto-pops at the next newline (C
+            // preprocessor directives, assembly lines). General
+            // capability: a mode entered mid-line must not leak its
+            // lexing into the following line. Mutually exclusive with
+            // `defaultToken` — a body mode already has an explicit close
+            // (its `endsAt`); a second auto-close at newline would fight
+            // it (and silently truncate a multiline body). Reject the
+            // combination loudly rather than pick a winner.
+            bool popAtNewline = false;
+            if (modeObj.contains("popAtNewline")) {
+                json const& pn = modeObj.at("popAtNewline");
+                if (!pn.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/popAtNewline", modePath),
+                              "'popAtNewline' must be a boolean");
+                } else {
+                    popAtNewline = pn.get<bool>();
+                    if (popAtNewline && defaultToken.has_value()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/popAtNewline", modePath),
+                                  "'popAtNewline' is mutually exclusive with "
+                                  "'defaultToken' — a body mode closes at its "
+                                  "endsAt, not at newline");
+                    }
+                }
+            }
+            data.lexerModes[modeId.v] =
+                LexerMode::make(modeName, modeId, defaultToken, flavor, popAtNewline);
 
             // tokens field: "default" inherits top-level lexemeTable;
             // an inline object IS the per-mode override table. While the
@@ -1843,6 +1879,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 json const& tk = modeObj.at("tokens");
                 if (tk.is_string() && tk.get<std::string>() == "default") {
                     data.lexerModeTokens[modeId.v] = data.lexemeTable;
+                    // Verbatim global-table copy, not an inline override —
+                    // excluded from the modeIntroducedKinds harvest below.
+                    tokensDefaultModes.insert(modeId.v);
                 } else if (tk.is_object()) {
                     // Parse the inline override table with the SAME shared
                     // meaning parser the global `tokens` table uses, so a
@@ -2593,6 +2632,41 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         data.bodyDefaultTokenKinds.insert(
                             mode.defaultToken->kind);
                     }
+                    // FF11: a COALESCED defaultToken kind that is NOT a
+                    // built-in literal (e.g. `HeaderPath`) is in-grammar
+                    // but tokenizer-pre-resolved from a body mode with no
+                    // global per-lexeme entry — record it so the builder's
+                    // synthetic-meaning drift guard accepts it.
+                    if (mode.defaultToken && mode.defaultToken->coalesce) {
+                        data.modeIntroducedKinds.insert(mode.defaultToken->kind);
+                    }
+                }
+                // FF11: every kind declared in a per-mode `tokens` override
+                // (e.g. `HeaderStart`, the in-`include-directive` meaning of
+                // `<`) is mode-introduced — the tokenizer pre-resolves it
+                // from mode context, but the GLOBAL lexeme table maps that
+                // lexeme to a DIFFERENT kind. Exclude the main mode (its
+                // table mirrors the global `lexemeTable`, so its kinds are
+                // already globally resolvable). Record the rest so the
+                // builder treats them as clean leaves, not drift.
+                {
+                    auto const mainIt = data.lexerModeIds.find("main");
+                    std::uint32_t const mainModeV =
+                        mainIt != data.lexerModeIds.end() ? mainIt->second.v : 0u;
+                    for (auto const& [modeV, table] : data.lexerModeTokens) {
+                        if (modeV == mainModeV) continue;   // global table, not an override
+                        // A `tokens: "default"` mode is ALSO a verbatim copy
+                        // of the global table (just under a non-main id), so
+                        // it introduces no new kind meaning either. Skipping
+                        // it keeps the drift-guard exception set tight — only
+                        // genuine inline overrides contribute their kinds.
+                        if (tokensDefaultModes.contains(modeV)) continue;
+                        for (auto const& [lexeme, meanings] : table) {
+                            for (auto const& m : meanings) {
+                                if (m.id.valid()) data.modeIntroducedKinds.insert(m.id);
+                            }
+                        }
+                    }
                 }
                 computeFirstAndNullable    (data, doc.at("shapes"));
                 buildPositionTables        (data, doc.at("shapes"), coll);
@@ -2922,6 +2996,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 readField("pathToken",     cfg.pathToken);
                 checkRule (cfg.directiveRule, "directiveRule");
                 checkToken(cfg.pathToken,     "pathToken");
+                // Optional `systemPathToken` (FF11): the angle-form
+                // (`#include <h>`) path-opener token. Absent ⇒ the
+                // language has only the quote form. Present-but-wrong-
+                // type → C_InvalidImports; an unknown token kind →
+                // C_UnknownToken (same fail-loud as pathToken).
+                if (imp.contains("systemPathToken")) {
+                    if (!imp.at("systemPathToken").is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidImports,
+                                  "/imports/systemPathToken",
+                                  "'imports.systemPathToken' must be a string");
+                    } else {
+                        cfg.systemPathToken =
+                            imp.at("systemPathToken").get<std::string>();
+                        checkToken(cfg.systemPathToken, "systemPathToken");
+                    }
+                }
             } else if (strategyStr == "name-matching") {
                 cfg.strategy = ImportStrategy::NameMatching;
                 readField("nameRule",       cfg.nameRule);
@@ -4718,6 +4808,45 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         cfg.externLibraryByFormat
                             .emplace(formatName, libName);
+                    }
+                }
+            }
+
+            // `shippedLibDirs` (FF11) — SYSTEM include search path: an
+            // array of subdirectory strings under `src/dss-config/`
+            // (e.g. ["shippedLibs/windows-x86_64"]) the angle-form
+            // `#include <h>` resolves against. Each entry must be a
+            // non-empty string. Empty/absent ⇒ the language ships no
+            // system headers. (Platform auto-select is deferred —
+            // D-FFI-SHIPPED-LIB-PLATFORM-SELECT; the dir names its
+            // platform explicitly for now.)
+            if (sem.contains("shippedLibDirs")) {
+                auto const& arr = sem.at("shippedLibDirs");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/shippedLibDirs",
+                              "'shippedLibDirs' must be an array of "
+                              "subdirectory-path strings");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        auto const dirPath = std::format(
+                            "/semantics/shippedLibDirs/{}", i);
+                        if (!arr[i].is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dirPath,
+                                      "each 'shippedLibDirs' entry must be "
+                                      "a string");
+                            continue;
+                        }
+                        auto const dir = arr[i].get<std::string>();
+                        if (dir.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dirPath,
+                                      "each 'shippedLibDirs' entry must be "
+                                      "a non-empty string");
+                            continue;
+                        }
+                        cfg.shippedLibDirs.push_back(dir);
                     }
                 }
             }

@@ -609,10 +609,11 @@ struct ResolvedMeaning {
     std::unordered_set<SchemaTokenId> const& bodyKinds,
     std::span<ScopeKind const> scopes) noexcept {
     if (!(bodyKinds.contains(preResolved)
-          || isBuiltinLiteralKind(schema, preResolved))) {
+          || isBuiltinLiteralKind(schema, preResolved)
+          || schema.isModeIntroducedKind(preResolved))) {
         tbFatal("resolveMeaning synthesizing for a kind that is neither "
-                "a body-mode defaultToken nor a built-in literal — "
-                "likely a tokenizer/schema drift bug");
+                "a body-mode defaultToken, a built-in literal, nor a "
+                "mode-introduced kind — likely a tokenizer/schema drift bug");
     }
     if (!schema.isTokenValidInScope(preResolved, scopes)) {
         return ResolvedMeaning{};

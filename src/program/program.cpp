@@ -485,6 +485,35 @@ int Program::transpile(
     return 1;
 }
 
+// FF11: declare the language's SYSTEM include dirs (its
+// `semantics.shippedLibDirs`, the /usr/include analogue) on `builder`
+// so the angle form `#include <h>` resolves against them. Each config
+// string is a subdirectory under `src/dss-config/`; resolve it to an
+// absolute dir by walking up from cwd (mirroring `findShippedConfig`'s
+// 8-level walk, so it works from repo root, build/, or a nested ctest
+// cwd). A dir not found in the ancestry is skipped — a header miss then
+// hard-fails downstream with F_ShippedHeaderNotFound, which is the
+// correct fail-loud surface (vs. silently swallowing here). NO language
+// branch: the dirs come entirely from the schema's per-language config.
+void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
+    auto const& dirs = grammar.semantics().shippedLibDirs;
+    if (dirs.empty()) return;
+    std::error_code ec;
+    for (std::string const& sub : dirs) {
+        fs::path here = fs::current_path(ec);
+        for (int i = 0; i < 8 && !here.empty(); ++i) {
+            fs::path const candidate = here / "src" / "dss-config" / sub;
+            if (fs::is_directory(candidate, ec)) {
+                builder.addSystemDir(candidate);
+                break;
+            }
+            fs::path const parent = here.parent_path();
+            if (parent == here) break;   // hit filesystem root
+            here = parent;
+        }
+    }
+}
+
 int Program::compileFiles(
     const std::vector<std::string>& sourceFiles,
     const std::string& languageName,
@@ -538,6 +567,7 @@ int Program::compileFiles(
     // schema by extension). For one CU per file (a multi-CU image the linker MERGES, LK11)
     // use `compileUnits` — this entry's single-CU semantics are unchanged.
     UnitBuilder builder{grammar};
+    applySystemDirs(builder, *grammar);
     for (auto const& path : sourceFiles) {
         builder.addFile(fs::path{path});
     }
@@ -603,6 +633,7 @@ int Program::compileUnits(
     cus.reserve(sourceFiles.size());
     for (auto const& path : sourceFiles) {
         UnitBuilder builder{grammar};
+        applySystemDirs(builder, *grammar);
         builder.addFile(fs::path{path});
         cus.push_back(std::move(builder).finish());
     }

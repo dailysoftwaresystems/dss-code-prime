@@ -10,15 +10,28 @@
   "artifactProfiles": ["cli", "lib", "staticlib"],
 
   "imports": {
-    "strategy":      "include-following",
-    "directiveRule": "includeDirective",
-    "pathToken":     "StringStart"
+    "strategy":        "include-following",
+    "directiveRule":   "includeDirective",
+    "pathToken":       "StringStart",
+    "systemPathToken": "HeaderStart"
   },
 
   "lexerModes": {
     "main":          { "tokens": "default" },
     "string":        { "defaultToken": { "kind": "StringLiteral", "coalesce": true } },
     "charBody":      { "defaultToken": { "kind": "CharLiteral",   "coalesce": true } },
+
+    "include-directive": {
+      "tokens": {
+        "<": [{
+          "kind": "HeaderStart",
+          "modeOp": "replaceMode", "modeArg": "header-body",
+          "stringStyle": { "escapeKind": "none", "endsAt": ">" }
+        }]
+      },
+      "popAtNewline": true
+    },
+    "header-body":   { "defaultToken": { "kind": "HeaderPath",    "coalesce": true } },
     "line-comment":  {
       "defaultToken":    { "kind": "CommentChar", "flags": ["EmptySpace"] },
       "unterminatedAs":  "comment"
@@ -28,6 +41,8 @@
       "unterminatedAs":  "comment"
     }
   },
+
+  "$ff11AngleIncludeComment": "FF11 angle-include lexing. `#` pushes the line-scoped `include-directive` mode (popAtNewline:true -> the frame auto-pops at the next newline, so a malformed `#include` with no header -- or any directive -- never leaks `<`-as-header-opener into the following line; C preprocessor directives are line-oriented). That mode inherits the top-level token map (tokens:default) so `include`, `\"...\"`, and identifiers all lex normally; the ONLY override is `<`, which there OPENS a header path (replaceMode -> header-body, stringStyle.endsAt `>`) instead of meaning LtOp. The override-first longest-match rule (language-config-spec section 9.6) means `<` wins at length 1 and the global `<<`/`<=` are deliberately suppressed inside a directive -- correct, since `#include <<x>>` is not valid C. The `header-body` mode mirrors the `string` body: a coalesced `HeaderPath` token captures the raw path bytes between `<` and the closing `>` (which pops the frame back to main); escapeKind:none -- header paths have no escapes. The quote form keeps the global `\"`->StringStart->string body unchanged (additive: both `#include <h>` and `#include \"h\"` work). The resolver reads the raw path slice (a filename, not a decoded string) for both forms, and picks the search path by which token kind it finds under the directive (imports.pathToken=StringStart -> self-dir+includeDirs; imports.systemPathToken=HeaderStart -> shippedLibDirs).",
 
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -57,7 +72,7 @@
     ",":  [{ "kind": "Comma" }],
     ":":  [{ "kind": "Colon" }],
 
-    "#": [{ "kind": "HashOp" }],
+    "#": [{ "kind": "HashOp", "modeOp": "pushMode", "modeArg": "include-directive" }],
     "\"": [{
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "string",
@@ -300,7 +315,17 @@
     },
 
     "includeDirective": {
-      "sequence": [ "HashOp", "IncludeKeyword", "StringStart", "StringLiteral" ]
+      "sequence": [ "HashOp", "IncludeKeyword", "includeTarget" ]
+    },
+
+    "includeTarget": {
+      "alt": [ "includeQuoteTarget", "includeAngleTarget" ]
+    },
+    "includeQuoteTarget": {
+      "sequence": [ "StringStart", "StringLiteral" ]
+    },
+    "includeAngleTarget": {
+      "sequence": [ "HeaderStart", "HeaderPath" ]
     },
 
     "externDecl": {
@@ -580,6 +605,8 @@
       "elf":   "libc.so.6",
       "macho": "/usr/lib/libSystem.B.dylib"
     },
+    "$shippedLibDirsComment": "FF11 (2026-06-05): the SYSTEM include search path (C's /usr/include analogue) for the angle form `#include <h>`. A subdirectory under src/dss-config/; the header is a c-subset SOURCE file (extern prototypes) parsed by THIS grammar + merged via the existing include-following resolver, then annotated by FF5 synthesizeFfiFromSourceDecls. Platform auto-select (windows-x86_64 vs linux-x86_64 from the active target) is DEFERRED — D-FFI-SHIPPED-LIB-PLATFORM-SELECT; the dir names its platform explicitly for now.",
+    "shippedLibDirs": ["shippedLibs/windows-x86_64"],
     "$pointerConversionsComment": "D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): C-standard §6.3.2.3 — `void*` converts implicitly to/from any object-pointer type without a cast. The two directions are configured INDEPENDENTLY (matching C++'s split, where only the safe direction is implicit). c-subset declares BOTH true (C-family semantics). A future C++ frontend would declare {implicitToVoidPtr: true, implicitFromVoidPtr: false} matching ISO C++ §7.11. Rust/Swift would declare both false. DEFAULT is false (struct-init); strict typing is the safety-respecting default, opposite of the Array→Ptr decay opt-out direction (which is pervasive C-family idiom; void-ptr conversion is a safety relaxation). Pointer arithmetic on void* and void*↔fn-pointer conversions are separate concerns anchored at D-LANG-VOIDPTR-ARITH-REJECT and D-LANG-VOIDPTR-FN-CONVERT respectively.",
     "pointerConversions": {
       "implicitToVoidPtr":                  true,

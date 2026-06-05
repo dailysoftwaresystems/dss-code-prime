@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 57> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 58> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -63,6 +63,14 @@ constexpr std::array<DiagnosticCode, 57> kUnsuppressableCodes{{
     // of policy", which is independent of severity; Warning members
     // are admissible when their visibility is load-bearing.
     DiagnosticCode::F_BinaryReaderPartialCorruption,
+    // F_ShippedHeaderNotFound (FF11, 2026-06-05): a `#include <h>`
+    // SYSTEM header not found on any `shippedLibDirs` search dir. A
+    // missing system header is a HARD error in C (unlike a local
+    // include's soft `D_UnresolvedImport`) — suppressing or cap-dropping
+    // it would let a program that calls an undeclared shipped-library
+    // symbol compile SILENTLY, exactly the silent-miscompile this
+    // fail-loud closes. The closed-table membership pins it.
+    DiagnosticCode::F_ShippedHeaderNotFound,
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-
@@ -203,6 +211,24 @@ consteval bool kUnsuppressableCodesAreUnique() {
 static_assert(kUnsuppressableCodesAreUnique(),
               "kUnsuppressableCodes must not contain duplicate entries — "
               "every code appears at most once.");
+
+// FF11 audit (2026-06-05): guard against the "bump the array size but
+// forget to add the entry" class — a missing initializer value-inits the
+// trailing slot to `DiagnosticCode::None` (0), which would silently make a
+// real code suppressible AND make `isUnsuppressable(None)` wrongly true.
+// `std::array<DiagnosticCode, N>` accepts a short initializer; this catches
+// the resulting `None` slot at COMPILE time (the uniqueness check above does
+// not — a single `None` is "unique"). It also rejects an intentional `None`.
+consteval bool kUnsuppressableCodesHaveNoNone() {
+    for (auto const c : kUnsuppressableCodes) {
+        if (c == DiagnosticCode::None) return false;
+    }
+    return true;
+}
+static_assert(kUnsuppressableCodesHaveNoNone(),
+              "kUnsuppressableCodes must not contain DiagnosticCode::None — a "
+              "None slot means the array size was bumped without adding the "
+              "intended code.");
 
 } // namespace
 

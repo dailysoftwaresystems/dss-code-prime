@@ -320,6 +320,81 @@ TEST(LexerModesLoader, PushModeWithoutModeArgIsLoadError) {
     }));
 }
 
+// ── FF11 general `popAtNewline` capability — loader ──────────────────────
+
+TEST(LexerModesLoader, PopAtNewlineLoadsAndSetsFlag) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "#": [{ "kind": "Hash", "modeOp": "pushMode", "modeArg": "line" }],
+        "<": [{ "kind": "LtOp" }]
+      },
+      "shapes": { "root": { "sequence": [ "LtOp" ] } },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "line": { "tokens": { "<": [{ "kind": "Ang" }] }, "popAtNewline": true }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value())
+        << "popAtNewline (no defaultToken) must load cleanly";
+    auto const id = (*loaded)->findLexerMode("line");
+    ASSERT_TRUE(id.valid());
+    EXPECT_TRUE((*loaded)->lexerMode(id).popAtNewline)
+        << "the loaded 'line' mode must carry popAtNewline=true";
+    // The default 'main' mode is NOT line-scoped.
+    auto const mainId = (*loaded)->findLexerMode("main");
+    ASSERT_TRUE(mainId.valid());
+    EXPECT_FALSE((*loaded)->lexerMode(mainId).popAtNewline);
+}
+
+TEST(LexerModesLoader, PopAtNewlineWithDefaultTokenIsLoadError) {
+    // Mutually exclusive: a body mode (defaultToken) already closes at
+    // its endsAt; a second auto-close at newline would fight it (and
+    // silently truncate a multiline body). Reject loudly.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "\"": [{ "kind": "Str", "modeOp": "pushMode", "modeArg": "body",
+                 "stringStyle": { "escapeKind": "none", "endsAt": "\"" } }]
+      },
+      "shapes": { "root": { "sequence": [ "Str" ] } },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "body": { "defaultToken": { "kind": "Ch" }, "popAtNewline": true }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("mutually exclusive") != std::string::npos;
+    })) << "popAtNewline + defaultToken must fail loud as C_ConflictingField";
+}
+
+TEST(LexerModesLoader, PopAtNewlineNonBoolIsLoadError) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "#": [{ "kind": "Hash", "modeOp": "pushMode", "modeArg": "line" }]
+      },
+      "shapes": { "root": { "sequence": [ "Hash" ] } },
+      "lexerModes": {
+        "main": { "tokens": "default" },
+        "line": { "tokens": "default", "popAtNewline": "yes" }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_ConflictingField &&
+               d.message.find("popAtNewline") != std::string::npos;
+    }));
+}
+
 TEST(LexerModesLoader, ModeArgWithPopModeWarns) {
     // The warning doesn't fail the load. Pair with a sibling error
     // (ambiguity-detect) to surface the warning via the error vector.

@@ -36,7 +36,19 @@ struct DSS_EXPORT ImportConfig {
 
     // include-following:
     std::string directiveRule;   // e.g. "includeDirective"
-    std::string pathToken;       // e.g. "StringStart"
+    std::string pathToken;       // e.g. "StringStart" — the LOCAL (quote)
+                                 // form's path-opener token. Searched on
+                                 // the including file's dir + includeDirs.
+    // Optional SYSTEM (angle) form's path-opener token (e.g. "HeaderStart"
+    // for c-subset's `#include <h>`). When a directive carries THIS token
+    // instead of `pathToken`, the resolver searches the SYSTEM path
+    // (SemanticConfig.shippedLibDirs, the analogue of C's /usr/include)
+    // and HARD-FAILS (F_ShippedHeaderNotFound) on a miss — a missing
+    // system header is a fatal error in C, not the soft D_UnresolvedImport
+    // used for a missing quote-include. Empty ⇒ the language declares no
+    // angle form (only the quote form resolves). Additive: a language may
+    // declare both, one, or neither.
+    std::string systemPathToken; // e.g. "HeaderStart"
 
     // name-matching:
     std::string nameRule;        // e.g. "qualifiedName"

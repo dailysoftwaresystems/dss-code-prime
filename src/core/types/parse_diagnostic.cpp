@@ -193,6 +193,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_FfiIngestEmptyCanonical:      return "F_FfiIngestEmptyCanonical";
         case DiagnosticCode::F_BinaryReaderPartialCorruption: return "F_BinaryReaderPartialCorruption";
         case DiagnosticCode::F_FfiNoImportLibraryForFormat:  return "F_FfiNoImportLibraryForFormat";
+        case DiagnosticCode::F_ShippedHeaderNotFound:        return "F_ShippedHeaderNotFound";
     }
     return "Unknown";
 }

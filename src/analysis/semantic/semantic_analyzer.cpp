@@ -22,12 +22,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2210,11 +2212,96 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
     // defining/included tree. To make the referencing file see the
     // defining file's symbols we inject every binding of the TARGET tree's
     // root scope into the SOURCE tree's root scope.
+    //
+    // Conflict detection (FF11 GOAL-2): if the SOURCE tree ALREADY declares
+    // a top-level symbol of the same name in its OWN root scope (a genuine
+    // user declaration — `SymbolRecord.tree == sourceTree`), then including
+    // a header that ALSO declares that name is a redeclaration — exactly C's
+    // rule that `#include <stdio.h>` + your own `extern ... puts(...)` is a
+    // duplicate. Emit S_RedeclaredSymbol at the SOURCE decl (where the user
+    // wrote the conflicting line) rather than silently shadowing. We do NOT
+    // flag injected-vs-injected collisions (a diamond/transitive include
+    // making the same target symbol visible via two edges): those are
+    // idempotent visibility, not a user conflict — gated by the
+    // `tree == sourceTree` check (an injected binding carries the DEFINING
+    // tree's id, never the source's).
+    //
+    // De-duplication: the ImportResolver emits one crossRefs edge per
+    // `#include` directive, so `#include <h>` written TWICE produces two
+    // edges with the same (sourceTree, targetTree). Without de-dup, one
+    // logical name collision would emit S_RedeclaredSymbol once PER
+    // duplicate edge (over-reporting). Track the (sourceTree, name) pairs
+    // already reported across the WHOLE loop so a given colliding name in a
+    // given source tree fails loud exactly once — independent of how many
+    // include directives (or how many distinct headers) re-declare it. A
+    // genuine single conflict still fires once; a DIFFERENT colliding name
+    // (whether via the same or another header) is a distinct key and still
+    // fires.
+    std::unordered_set<std::string> reportedConflicts;
+    auto const conflictKey = [](std::uint32_t treeV,
+                                std::string_view name) {
+        // EXACT (collision-free) composite key: the tree id's decimal digits,
+        // a NUL separator (never present in an identifier), then the name. Two
+        // trees declaring the same colliding name stay distinct. A 64-bit HASH
+        // key would risk a (vanishingly rare) collision silently dropping a
+        // genuinely-distinct second conflict — exact-over-probabilistic is the
+        // right standard for a correctness-bearing dedup set.
+        std::string key = std::to_string(treeV);
+        key.push_back('\0');
+        key.append(name);
+        return key;
+    };
     for (auto const& edge : cu->crossRefs()) {
         auto srcIt = treeRootScope.find(edge.sourceTree.v);
         auto tgtIt = treeRootScope.find(edge.targetTree.v);
         if (srcIt == treeRootScope.end() || tgtIt == treeRootScope.end()) continue;
+
+        // The source tree's OWN top-level bindings (declared in pass 1),
+        // keyed by name. An entry here whose symbol's tree is the source
+        // tree is a real user declaration; a later same-name inject is a
+        // conflict. Built once per edge from the source root scope.
+        std::unordered_map<std::string_view, SymbolId> ownByName;
+        for (auto const& [name, sym] : s.scopes.bindingsOf(srcIt->second)) {
+            if (sym.valid() && s.symbols.at(sym).tree.v == edge.sourceTree.v) {
+                ownByName.emplace(name, sym);
+            }
+        }
+
         for (auto const& [name, sym] : s.scopes.bindingsOf(tgtIt->second)) {
+            if (auto it = ownByName.find(name); it != ownByName.end()) {
+                // The source file declared `name` itself AND includes a
+                // header declaring it — duplicate. Fail loud at the source,
+                // but only ONCE per (sourceTree, name): a second include of
+                // the same (or another) header re-declaring `name` is the
+                // same logical conflict, already reported.
+                if (!reportedConflicts.insert(
+                        conflictKey(edge.sourceTree.v, name)).second) {
+                    continue;   // already reported; still skip injection
+                }
+                auto const& srcTree = *std::find_if(
+                    trees.begin(), trees.end(),
+                    [&](Tree const& t) { return t.id().v == edge.sourceTree.v; });
+                auto const& ownRec = s.symbols.at(it->second);
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = srcTree.source().id();
+                d.span     = srcTree.span(ownRec.declNode);
+                d.actual   = std::string{name};
+                auto const& hdrRec = s.symbols.at(sym);
+                auto const tgtTreeIt = std::find_if(
+                    trees.begin(), trees.end(),
+                    [&](Tree const& t) { return t.id().v == edge.targetTree.v; });
+                if (tgtTreeIt != trees.end()) {
+                    d.related.push_back(RelatedLocation{
+                        tgtTreeIt->source().id(),
+                        tgtTreeIt->span(hdrRec.declNode),
+                        "also declared by the included header",
+                    });
+                }
+                s.reporter.report(std::move(d));
+                continue;   // do not inject the conflicting binding
+            }
             s.scopes.injectBinding(srcIt->second, std::string{name}, sym);
         }
     }

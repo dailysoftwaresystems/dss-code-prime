@@ -555,6 +555,26 @@ struct DSS_EXPORT SemanticConfig {
     // top of this language-level default.
     std::unordered_map<std::string, std::string> externLibraryByFormat;
 
+    // FF11 (2026-06-05): SYSTEM include search path — the per-language
+    // analogue of C's /usr/include. Each entry is a subdirectory under
+    // `src/dss-config/` (e.g. "shippedLibs/windows-x86_64"); the
+    // angle-form `#include <h>` resolves the header name against these
+    // dirs (the wiring layer walks up from cwd to find each, mirroring
+    // `findShippedConfig`). DISTINCT from the quote form's search
+    // (self-dir + includeDirs). A header found here is a c-subset SOURCE
+    // file parsed by THIS language's own grammar and merged via the
+    // existing include-following resolver — its `extern` decls then flow
+    // through FF5 `synthesizeFfiFromSourceDecls` like a program's own.
+    // Empty ⇒ the language ships no system headers (the angle form, if
+    // declared, resolves nothing and hard-fails on use).
+    //
+    // Per-language data: a second language ships its own headers under
+    // its own dir(s) with ZERO engine change. Platform auto-select
+    // (picking windows-x86_64 vs linux-x86_64 from the active target) is
+    // DEFERRED — anchored D-FFI-SHIPPED-LIB-PLATFORM-SELECT; for now the
+    // single shipped dir names its platform explicitly.
+    std::vector<std::string> shippedLibDirs;
+
     // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): per-language
     // rules governing implicit conversion between `Ptr<Void>` (untyped
     // memory) and `Ptr<T>` (typed memory). The two directions carry

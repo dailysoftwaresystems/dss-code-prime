@@ -900,6 +900,72 @@ TEST(Tokenizer, PerModeOverrideShortCircuitsLongerGlobalLexeme) {
     }
 }
 
+// FF11 drift-guard scoping (footgun pin): a NON-MAIN mode whose `tokens` is
+// the literal `"default"` is a verbatim copy of the GLOBAL lexeme table — it
+// introduces no new kind meaning. The `modeIntroducedKinds` harvest must
+// NOT dump that copied global table into the builder's synthetic-meaning
+// drift-guard exception set, which would broadly weaken the guard. Only a
+// REAL inline override (a mode whose table genuinely differs) may contribute
+// its kinds. This synthetic grammar pairs BOTH: a `"default"` mode (`dfl`)
+// and an inline-override mode (`hdr` → `HeaderOpen`).
+namespace {
+constexpr std::string_view kDefaultModeHarvestSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "DefaultModeHarvest", "version": "0.1.0" },
+  "tokens": {
+    "<": [{ "kind": "LtOp" }],
+    "[": [{ "kind": "OpenBracket", "modeOp": "pushMode", "modeArg": "hdr" }],
+    "{": [{ "kind": "OpenBrace", "modeOp": "pushMode", "modeArg": "dfl" }],
+    "]": [{ "kind": "CloseBracket" }],
+    "}": [{ "kind": "CloseBrace" }]
+  },
+  "shapes": { "root": { "sequence": [ "LtOp" ] } },
+  "lexerModes": {
+    "hdr": {
+      "tokens": {
+        "<": [{ "kind": "HeaderOpen" }],
+        "]": [{ "kind": "CloseBracket", "modeOp": "popMode" }]
+      }
+    },
+    "dfl": {
+      "tokens": "default"
+    }
+  }
+})JSON";
+} // namespace
+
+TEST(Tokenizer, DefaultModeDoesNotDumpGlobalKindsIntoModeIntroducedSet) {
+    auto loaded = GrammarSchema::loadFromText(kDefaultModeHarvestSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << "synthetic default-mode-harvest schema must load";
+    auto schema = *loaded;
+
+    const auto ltOp       = schema->schemaTokens().find("LtOp");
+    const auto openBr     = schema->schemaTokens().find("OpenBracket");
+    const auto headerOpen = schema->schemaTokens().find("HeaderOpen");
+    ASSERT_TRUE(ltOp.valid());
+    ASSERT_TRUE(openBr.valid());
+    ASSERT_TRUE(headerOpen.valid());
+
+    // THE FIX: a global kind that appears in the `dfl` mode ONLY because
+    // `tokens: "default"` copied the whole global table must NOT be treated
+    // as mode-introduced. RED-on-regression: without the `"default"`-skip
+    // guard, the harvest inserts EVERY global kind (LtOp, OpenBracket, ...)
+    // into modeIntroducedKinds, broadly weakening the drift guard.
+    EXPECT_FALSE(schema->isModeIntroducedKind(ltOp))
+        << "`LtOp` is a global kind — a `tokens:\"default\"` copy must not "
+           "make it mode-introduced";
+    EXPECT_FALSE(schema->isModeIntroducedKind(openBr))
+        << "no global kind copied via `tokens:\"default\"` may enter the "
+           "drift-guard exception set";
+
+    // CONTROL: a genuine inline override (`hdr` introduces `HeaderOpen`,
+    // which has NO global entry) MUST still be mode-introduced — the fix
+    // narrows the harvest to real overrides, it does not disable it.
+    EXPECT_TRUE(schema->isModeIntroducedKind(headerOpen))
+        << "a real inline-override kind must remain mode-introduced";
+}
+
 TEST(Tokenizer, UnterminatedCoalescedStringEmitsDiagnostic) {
     // A `"`-opened string with no closing quote. The coalesce-body path scans
     // the body to EOF, emits ONE StringLiteral token, leaves the mode open, and
@@ -1796,4 +1862,218 @@ TEST(Tokenizer, TsqlNumberStyleSmoke) {
         EXPECT_EQ(tokens[0].coreKind, CoreTokenKind::IntLiteral);
         EXPECT_EQ(textOf(*src, tokens[0]), "0");
     }
+}
+
+// ─── FF11: angle-include (`#include <h>`) context-sensitive lexing ────────
+//
+// `#` pushes the line-scoped `include-directive` mode; inside it `<` opens
+// a header path (replaceMode → header-body) instead of meaning LtOp; the
+// coalesced `HeaderPath` body captures the path bytes; `>` (the
+// stringStyle.endsAt) closes it. These pin the cycle-20 per-mode capability
+// as FF11's first consumer — and that the ADDITIVE paths (quote include,
+// `<` as an operator) are untouched.
+
+namespace {
+
+// Non-trivia tokens (drops Whitespace/Newline) for compact sequence pins.
+[[nodiscard]] std::vector<Token> codeTokens(LexResult const& r) {
+    std::vector<Token> out;
+    for (auto const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Whitespace
+            || t.coreKind == CoreTokenKind::Newline
+            || t.coreKind == CoreTokenKind::Eof) continue;
+        out.push_back(t);
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(Tokenizer, FF11AngleIncludeLexesAsOpenerPathCloser) {
+    auto h = loadCSubset("#include <stdio.h>\n");
+    auto schema = h.schema;
+    ASSERT_TRUE(schema != nullptr);
+    auto srcBuf = h.src;   // keep the buffer alive past lex()'s by-value consume
+    auto result = lex(std::move(h));
+    EXPECT_TRUE(result.diags.empty()) << "well-formed angle include must lex cleanly";
+
+    const auto hashOp      = schema->schemaTokens().find("HashOp");
+    const auto includeKw   = schema->schemaTokens().find("IncludeKeyword");
+    const auto headerStart = schema->schemaTokens().find("HeaderStart");
+    const auto headerPath  = schema->schemaTokens().find("HeaderPath");
+    const auto ltOp        = schema->schemaTokens().find("LtOp");
+    ASSERT_TRUE(headerStart.valid());
+    ASSERT_TRUE(headerPath.valid());
+    ASSERT_NE(headerStart, ltOp) << "HeaderStart and LtOp must be distinct kinds";
+
+    auto code = codeTokens(result);
+    // Exactly: HashOp, IncludeKeyword(Word), HeaderStart, HeaderPath.
+    ASSERT_EQ(code.size(), 4u);
+    EXPECT_EQ(code[0].schemaKind, hashOp);
+    EXPECT_EQ(code[1].schemaKind, includeKw);
+    EXPECT_EQ(code[2].schemaKind, headerStart)
+        << "`<` after `#include` must be HeaderStart (RED-on-disable: would "
+           "be LtOp if the include-directive mode override is unwired)";
+    EXPECT_EQ(code[3].schemaKind, headerPath);
+    // The path token captures exactly the bytes between `<` and `>`.
+    EXPECT_EQ(textOf(*srcBuf, code[3]), "stdio.h");
+}
+
+TEST(Tokenizer, FF11AngleBracketIsLtOpOutsideDirective) {
+    // The SAME `<` byte outside a directive stays the LtOp operator —
+    // the mode override is scoped to the directive, not global.
+    auto h = loadCSubset("a < b;\n");
+    auto schema = h.schema;
+    auto result = lex(std::move(h));
+    const auto ltOp = schema->schemaTokens().find("LtOp");
+    auto code = codeTokens(result);
+    bool sawLt = false;
+    for (auto const& t : code) if (t.schemaKind == ltOp) sawLt = true;
+    EXPECT_TRUE(sawLt) << "`<` outside a directive must remain LtOp";
+}
+
+TEST(Tokenizer, FF11QuoteIncludeStillProducesStringStart) {
+    // ADDITIVE: the quote form is unchanged — `#` enters the directive
+    // mode (popAtNewline), but `"` still uses the GLOBAL StringStart →
+    // string body, so `imports.pathToken: StringStart` keeps matching.
+    auto h = loadCSubset("#include \"local.h\"\n");
+    auto schema = h.schema;
+    auto result = lex(std::move(h));
+    EXPECT_TRUE(result.diags.empty());
+    const auto stringStart = schema->schemaTokens().find("StringStart");
+    auto code = codeTokens(result);
+    bool sawStringStart = false;
+    for (auto const& t : code) if (t.schemaKind == stringStart) sawStringStart = true;
+    EXPECT_TRUE(sawStringStart)
+        << "quote include must still produce StringStart (additive path)";
+}
+
+TEST(Tokenizer, FF11DirectiveModeDoesNotLeakToNextLine) {
+    // The line-scoped `include-directive` mode (popAtNewline) must NOT
+    // carry `<`-as-header-opener past the newline. A malformed `#include`
+    // (no header) on line 1, then `a < b` on line 2: the line-2 `<` must
+    // be LtOp, proving the directive frame popped at the newline.
+    auto h = loadCSubset("#include\na < b;\n");
+    auto schema = h.schema;
+    auto result = lex(std::move(h));
+    const auto ltOp        = schema->schemaTokens().find("LtOp");
+    const auto headerStart = schema->schemaTokens().find("HeaderStart");
+    auto code = codeTokens(result);
+    bool sawLt = false, sawHeaderStart = false;
+    for (auto const& t : code) {
+        if (t.schemaKind == ltOp)        sawLt = true;
+        if (t.schemaKind == headerStart) sawHeaderStart = true;
+    }
+    EXPECT_TRUE(sawLt)
+        << "line-2 `<` must be LtOp (RED-on-disable: would be HeaderStart "
+           "if the directive mode leaked past the newline)";
+    EXPECT_FALSE(sawHeaderStart)
+        << "no HeaderStart — the line-2 `<` is an operator, not a header opener";
+}
+
+// FF11 fail-loud pin: a malformed angle include `#include <foo` with NO
+// closing `>` must be reported (a diagnostic), NOT silently accepted. The
+// `header-body` mode mirrors the string body — `<` opens a coalesced
+// HeaderPath whose `endsAt` is `>`; reaching EOF without `>` leaves the
+// body frame open and the post-loop unterminated handler emits
+// P_UnterminatedString (same flavor as an unterminated `"`). This guards
+// against a future silent-acceptance regression. (The UX polish — a
+// header-specific flavor + newline-scoped termination so the rest of the
+// file is not consumed — is deferred: anchor
+// D-FFI-ANGLE-INCLUDE-LINE-SCOPED-HEADER. This test only pins fail-loud.)
+TEST(Tokenizer, FF11MalformedAngleIncludeNoCloserFailsLoud) {
+    auto h      = loadCSubset("#include <foo\n");
+    auto result = lex(std::move(h));
+    EXPECT_FALSE(result.diags.empty())
+        << "a malformed `#include <foo` (no closing `>`) must fail loud — "
+           "a diagnostic, not silent acceptance";
+    // Today's flavor is the string-body P_UnterminatedString (identical to
+    // an unterminated `\"`). Asserted to document the CURRENT behavior; the
+    // load-bearing guarantee is the fail-loud check above. If the deferred
+    // anchor lands a header-specific flavor, update this line.
+    bool sawUnterminated = false;
+    for (auto const& d : result.diags)
+        if (d.code == DiagnosticCode::P_UnterminatedString) sawUnterminated = true;
+    EXPECT_TRUE(sawUnterminated)
+        << "the unterminated header body reports P_UnterminatedString "
+           "(string-body flavor) today";
+}
+
+// ─── General `popAtNewline` capability (NOT c-subset-specific) ────────────
+//
+// A line-scoped mode that auto-pops at the next newline. Synthetic schema
+// so the capability is pinned independently of FF11's grammar. C
+// preprocessor directives and assembly lines are the motivating general
+// use case.
+
+namespace {
+
+constexpr std::string_view kPopAtNewlineSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "PopLine", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "#":  [{ "kind": "Hash", "modeOp": "pushMode", "modeArg": "directive" }],
+    "<":  [{ "kind": "LtOp" }]
+  },
+  "shapes": { "root": { "sequence": [ "LtOp" ] } },
+  "lexerModes": {
+    "main":      { "tokens": "default" },
+    "directive": {
+      "tokens": { "<": [{ "kind": "AngleOpen" }] },
+      "popAtNewline": true
+    }
+  }
+})JSON";
+
+} // namespace
+
+TEST(Tokenizer, PopAtNewlineModeAutoPopsAtNewline) {
+    auto loaded = GrammarSchema::loadFromText(kPopAtNewlineSchema);
+    ASSERT_TRUE(loaded.has_value()) << "popAtNewline synthetic schema must load";
+    auto schema = *loaded;
+    const auto ltOp      = schema->schemaTokens().find("LtOp");
+    const auto angleOpen = schema->schemaTokens().find("AngleOpen");
+    ASSERT_TRUE(angleOpen.valid());
+    ASSERT_NE(ltOp, angleOpen);
+
+    // Line 1: `#` pushes directive → `<` is AngleOpen. Newline pops the
+    // directive frame. Line 2: `<` is back to the global LtOp.
+    H h{
+        .src    = SourceBuffer::fromString("#<\n<", "<popline>"),
+        .schema = schema,
+    };
+    auto result = lex(h);
+    EXPECT_TRUE(result.diags.empty())
+        << "no unterminated diagnostic — the directive popped at the newline";
+
+    std::vector<Token> code;
+    for (auto const& t : result.tokens) {
+        if (t.coreKind == CoreTokenKind::Whitespace
+            || t.coreKind == CoreTokenKind::Newline
+            || t.coreKind == CoreTokenKind::Eof) continue;
+        code.push_back(t);
+    }
+    ASSERT_EQ(code.size(), 3u);   // Hash, AngleOpen, LtOp
+    EXPECT_EQ(code[1].schemaKind, angleOpen)
+        << "`<` inside the directive uses the override";
+    EXPECT_EQ(code[2].schemaKind, ltOp)
+        << "after the newline auto-pop, `<` returns to the global LtOp "
+           "(RED-on-disable: stays AngleOpen if popAtNewline is unwired)";
+}
+
+TEST(Tokenizer, PopAtNewlineModeAutoPopsAtEofWithoutNewline) {
+    // A line-scoped mode left open at EOF (no trailing newline) is NOT
+    // unterminated — EOF validly ends the last line. No diagnostic.
+    auto loaded = GrammarSchema::loadFromText(kPopAtNewlineSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    H h{
+        .src    = SourceBuffer::fromString("#<", "<popline-eof>"),
+        .schema = schema,
+    };
+    auto result = lex(h);
+    EXPECT_TRUE(result.diags.empty())
+        << "a popAtNewline mode at EOF closes silently — not unterminated";
 }
