@@ -8,6 +8,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/strong_ids.hpp"  // CompilationUnitId (CuMirModule member)
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_interner.hpp"  // TypeInterner (optimizeModule arg)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
 #include "mir/mir.hpp"  // Mir (CuMirModule member, move-only)
@@ -221,6 +222,29 @@ buildCuMir(CompilationUnit const&         cu,
            std::uint16_t                  callingConventionIndex,
            DiagnosticReporter&            reporter,
            CompileOptions const&          opts = {});
+
+// Run the configured optimizer pipeline over `mir` in place. Resolves the pipeline
+// the same way `buildCuMir` always did: an explicit `opts.pipelineOverride` (the
+// examples_runner's differential-verify arm + unit tests) takes precedence, else the
+// shipped JSON pipeline named by `resolvePipelineName(opts.config)` (Debug→"debug",
+// Release→"release"). Runs `opt::optimize(mir, target, interner, pipeline, reporter)`
+// and returns `optResult.ok && tierClean(reporter, entryCount)`. Fails loud on an
+// out-of-range CompileConfig ordinal (`X_PipelineNameResolutionFailed`) or a pipeline
+// load failure (config diagnostics drained) — both return false.
+//
+// Extracted from `buildCuMir` (Cycle 26) so the N>1 whole-program path
+// (`Program::compileOneTarget`) can run the SAME pipeline resolution + optimize over
+// the MERGED module — where cross-CU calls (made intra-module DIRECT by the cycle-25
+// merge) become inline-eligible (`D-OPT7-1`). Pure code-motion: the per-CU output is
+// byte-identical (`buildCuMir` calls this with the same arguments it used inline).
+// `interner` is the type space the module's TypeIds index into — the per-CU lattice's
+// interner for `buildCuMir`, the merged host lattice's interner for the merged path.
+[[nodiscard]] DSS_EXPORT bool
+optimizeModule(Mir&                  mir,
+               TargetSchema const&   target,
+               TypeInterner const&   interner,
+               CompileOptions const& opts,
+               DiagnosticReporter&   reporter);
 
 // LOWER half: MIR → LIR → liveness → regalloc → rewrite → legalize → callconv →
 // assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`

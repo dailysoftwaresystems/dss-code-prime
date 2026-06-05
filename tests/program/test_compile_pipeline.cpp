@@ -35,17 +35,22 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"
+#include "mir/mir.hpp"
+#include "mir/mir_opcode.hpp"
+#include "opt/optimizer.hpp"
 #include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -70,6 +75,26 @@ fs::path writeCSubsetSource(fs::path const& dir,
     std::ofstream f(p);
     f << text;
     return p;
+}
+
+// Module-wide count of a MIR opcode (the established opt-test pattern). Used by the
+// cross-CU inlining effectiveness pin to assert a Call disappeared from the optimized
+// merged module.
+std::size_t countOpInModule(Mir const& mir, MirOpcode op) {
+    std::size_t n = 0;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                if (mir.instOpcode(mir.blockInstAt(b, ii)) == op) ++n;
+            }
+        }
+    }
+    return n;
 }
 
 } // namespace
@@ -881,4 +906,146 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
         << "the merged image has NO cross-CU reference — `mergeModules` mints a thunk "
            "slot only from a non-empty resolvedCrossCuRefs, so this is the definitive "
            "proof the cycle-19 thunk is gone for the now-internal main→add5 call";
+}
+
+// ── G2 (Cycle 26, D-OPT7-1): a cross-CU call is INLINED on the merged module ──────────
+//
+// The cycle-25 merge made main→add5 an intra-module DIRECT call; cycle 26 optimizes the
+// MERGED module so the inliner (whose `symToFunc` now resolves the in-module add5)
+// SPLICES add5's body into main. This pin drives the exact `cross_cu_call` corpus source
+// through buildCuMir×2 → mergeCuMirs → `optimizeModule` and asserts main's Call to add5
+// is GONE in the optimized merged module.
+//
+// RED-on-disable is demonstrated IN-TEST by a second arm that runs an `[Identity]`
+// pipeline over the SAME freshly-merged module: with no Inlining pass the Call SURVIVES.
+// So a green `[Inlining]` arm (Call gone) + a green `[Identity]` arm (Call present) prove
+// the disappearance is caused by the Inlining pass running on the merged module — not by
+// the merge, lowering, or any unrelated rewrite. (Equivalently: deleting the Part-2
+// `optimizeModule` wiring leaves the Call present, which this `[Inlining]` arm catches.)
+//
+// NON-VACUITY: `add5(37)` is a real cross-FUNCTION call. The `[Inlining]`-only pipeline
+// runs no ConstFold, so `37 + 5` is NOT folded — the only way main's Call vanishes is the
+// callee body being spliced in. A surviving Call ⇒ no inline happened.
+TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
+    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(grammarR.has_value());
+    auto grammar = *grammarR;
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto formatR = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(formatR.has_value());
+
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, rep);
+    ASSERT_TRUE(abi.has_value());
+    ASSERT_NE(abi->cc, nullptr);
+    auto const ccSpan = (*targetR)->callingConventions();
+    auto const ccIndex = static_cast<std::uint16_t>(
+        std::distance(ccSpan.data(), abi->cc));
+
+    auto buildCu = [&](std::string src, std::string label) {
+        UnitBuilder builder{grammar};
+        builder.addInMemory(std::move(src), std::move(label));
+        return std::move(builder).finish();
+    };
+
+    // Build a fresh whole-program MERGED module from the cross_cu_call corpus sources.
+    // Re-built per arm because `optimizeModule` mutates the merged `Mir` in place — each
+    // arm needs its own pristine merged module. The CUs/CuMirModules are rebuilt too so
+    // there is zero shared mutable state between arms.
+    auto buildMergedModule = [&]() -> std::optional<MergedMirModule> {
+        CompilationUnit cuMain = buildCu(
+            "extern int add5(int x);\nint main() { return add5(37); }\n", "main.c");
+        CompilationUnit cuHelper =
+            buildCu("int add5(int x) { return x + 5; }\n", "helper.c");
+
+        auto mirMain = buildCuMir(cuMain, *grammar, **targetR, **formatR, ccIndex, rep);
+        if (!mirMain.has_value()) return std::nullopt;
+        auto mirHelper = buildCuMir(cuHelper, *grammar, **targetR, **formatR, ccIndex, rep);
+        if (!mirHelper.has_value()) return std::nullopt;
+
+        // `cuMirs` + `inputs` must stay alive through `mergeCuMirs` (the merge reads each
+        // CU's nameOf + interner while cloning). The returned `MergedMirModule` is
+        // self-contained (owns its host lattice + cloned MIR), so dropping these locals
+        // at lambda exit is safe.
+        std::vector<CuMirModule> cuMirs;
+        cuMirs.push_back(std::move(*mirMain));
+        cuMirs.push_back(std::move(*mirHelper));
+
+        std::vector<MergeCuInput> inputs;
+        for (auto& cm : cuMirs) {
+            MergeCuInput in;
+            in.mir      = &cm.mir;
+            in.interner = &cm.model.lattice().interner();
+            in.nameOf   = [cmP = &cm](SymbolId s) -> std::string {
+                if (SymbolRecord const* r = cmP->model.recordFor(s)) return r->name;
+                for (auto const& e : cmP->externImports) {
+                    if (e.symbol.v == s.v) return e.mangledName;
+                }
+                return std::string{};
+            };
+            in.externImports = cm.externImports;
+            inputs.push_back(std::move(in));
+        }
+
+        TypeLattice host{cuMirs[0].cuId,
+                         std::string{cuMirs[0].model.lattice().registry().sourceLanguage()}};
+        std::vector<std::string> entryNames;
+        for (auto const& decl : grammar->semantics().declarations) {
+            for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+                entryNames.push_back(n);
+            }
+        }
+
+        return mergeCuMirs(
+            std::span<MergeCuInput const>{inputs.data(), inputs.size()},
+            std::move(host),
+            std::span<std::string const>{entryNames.data(), entryNames.size()}, rep);
+    };
+
+    // The cross_cu_call merged module always carries exactly one main→add5 Call before
+    // optimization — the precondition the two arms diverge from.
+    {
+        auto merged = buildMergedModule();
+        ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+        ASSERT_EQ(countOpInModule(merged->mir, MirOpcode::Call), 1u)
+            << "before optimization the merged module holds main's single direct call "
+               "to the in-module add5";
+    }
+
+    // ── ARM 1: [Inlining] over the merged module → the Call is GONE. ──
+    {
+        auto merged = buildMergedModule();
+        ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+        opt::OptPipeline inlining{"inlining", {opt::PassId::Inlining}};
+        CompileOptions opts;
+        opts.pipelineOverride = &inlining;
+        auto const before = rep.errorCount();
+        ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
+                                   merged->host.interner(), opts, rep))
+            << "optimizing the merged module with [Inlining] must succeed";
+        EXPECT_EQ(rep.errorCount(), before)
+            << "the merged-module optimize must not emit any error";
+        EXPECT_EQ(countOpInModule(merged->mir, MirOpcode::Call), 0u)
+            << "the cross-CU call main→add5 must be INLINED on the merged module — its "
+               "Call is replaced by the spliced add5 body (D-OPT7-1)";
+    }
+
+    // ── ARM 2 (RED-on-disable demonstration): [Identity] → the Call SURVIVES. ──
+    // Identical merged module, but the pipeline runs NO Inlining pass — so the Call is
+    // still present. This proves arm 1's disappearance is caused by Inlining specifically.
+    {
+        auto merged = buildMergedModule();
+        ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+        opt::OptPipeline identity{"identity", {opt::PassId::Identity}};
+        CompileOptions opts;
+        opts.pipelineOverride = &identity;
+        ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
+                                   merged->host.interner(), opts, rep));
+        EXPECT_EQ(countOpInModule(merged->mir, MirOpcode::Call), 1u)
+            << "with an [Identity] pipeline (no Inlining) the cross-CU Call MUST survive "
+               "— the inlining in arm 1 is what removes it (RED-on-disable witness)";
+    }
 }

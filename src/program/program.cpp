@@ -361,6 +361,28 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         reporter);
     if (!merged) return false;  // merge failure (conflict / verify) already reported.
 
+    // Cycle 26 (D-OPT7-1): optimize the WHOLE-PROGRAM merged module with the configured
+    // pipeline. The merge made every cross-CU call an intra-module DIRECT call, so the
+    // inliner's `symToFunc` now resolves the callee — a cross-CU call becomes inline-
+    // eligible exactly like an intra-CU one. `merged->host.interner()` is the type space
+    // the merged TypeIds index into (the same interner `lowerMergedToAssembly` uses). The
+    // optimizer runs MirVerifier after every pass (the merged-module safety net). DOUBLE-
+    // OPT is correct: a cross-CU call's per-CU inline was a no-op (extern, unresolvable
+    // per-CU); the merged inline does the work. Same pipeline resolution as the per-CU
+    // path (`optimizeModule`), so the examples-runner's `["Inlining"]` override flows here
+    // via `compileOpts.pipelineOverride`.
+    //
+    // D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE (deferred, efficiency-only): the N>1 path
+    // currently optimizes each CU's MIR in `buildCuMir` AND optimizes the merged module
+    // here (DOUBLE-OPT). Correct but redundant work — a true LTO shape would skip the
+    // per-CU optimize for multi-CU builds and optimize the whole-program merged module
+    // ONCE. Not done now because `buildCuMir` is shared with the N==1 path (which must
+    // still optimize per-CU) and the redundant per-CU pass is correctness-neutral.
+    if (!optimizeModule(merged->mir, **targetR, merged->host.interner(),
+                        compileOpts, reporter)) {
+        return false;  // optimize / verify failure already reported via `reporter`
+    }
+
     auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
                                      ccIndex, cuMirs[0].cuId, reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`

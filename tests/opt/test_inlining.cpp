@@ -32,11 +32,13 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/symbol_attrs.hpp"
+#include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_verifier.hpp"
+#include "opt/optimizer.hpp"
 #include "opt/passes/inlining.hpp"
 
 #include <gtest/gtest.h>
@@ -1121,4 +1123,51 @@ TEST(Inlining, MultiBlockVoidLeafIsInlined) {
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep))
         << "the void multi-block splice (invalid result id) must verify clean";
+}
+
+// ── G4 (Cycle 26, D-OPT7-1): a WEAK callee that SURVIVES the merge is REFUSED by the
+// inliner running on the MERGED module ───────────────────────────────────────────────
+//
+// The cross-CU Weak corpus (`weak_inline_crosscu`) proves the MERGE drops a weak `f`
+// when a STRONG sibling exists (strong-shadows-weak), so the merged inliner only ever
+// sees the strong body. But a weak symbol with NO strong sibling SURVIVES the merge with
+// its `SymbolBinding::Weak` preserved — and at final link a strong def from ANOTHER
+// translation unit (or library) may still replace it. So the merged-module inliner must
+// ITSELF refuse a surviving Weak callee; the merge's strong-drop is not the only line of
+// defense. This pin makes that merged-tier Weak gate load-bearing.
+//
+// It runs the FULL `opt::optimize` engine (exactly what `optimizeModule` drives on the
+// merged module) with an `[Inlining]` pipeline over a module where `f` is Weak (no
+// strong sibling present) + `main` calls it. The §2.9 rule-2 Weak refusal must fire →
+// main's Call SURVIVES. RED-on-disable: removing the Weak refusal in
+// `inlineLegalityGate` would splice `return 7` into main and the Call would vanish
+// (`countOpInModule(..., Call) == 0`), failing this pin — the same miscompile the
+// cross-CU corpus catches at exit-code tier.
+TEST(Inlining, WeakCalleeSurvivingMergeIsRefusedByMergedOptimize) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildCallerCalleeModule(interner, SymbolBinding::Weak, 7);
+
+    auto const callsBefore = countOpInModule(mir, MirOpcode::Call);
+    ASSERT_EQ(callsBefore, 1u) << "before: main holds one direct call to the weak f";
+
+    DiagnosticReporter rep;
+    opt::OptPipeline inlining{"inlining", {opt::PassId::Inlining}};
+    auto const result = opt::optimize(mir, target, interner, inlining, rep);
+    EXPECT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(result.mutationCount(opt::PassId::Inlining), 0u)
+        << "the Inlining pass must record ZERO mutations — a surviving Weak callee is "
+           "refused on the merged module (a strong def may still replace it at link)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), callsBefore)
+        << "the cross-CU/merged-module inliner MUST NOT inline a surviving Weak callee "
+           "— the Call survives (D-OPT7-1 merged-tier Weak gate)";
+
+    // The module the merged optimize produced still verifies (the refusal is a no-op,
+    // not a malformed rewrite).
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep));
 }

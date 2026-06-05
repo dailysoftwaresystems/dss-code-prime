@@ -52,6 +52,60 @@ namespace {
 
 } // namespace
 
+// MIR optimizer driver (Cycle 26 extraction). Resolves the pipeline — explicit
+// `opts.pipelineOverride` (examples_runner differential-verify arm + unit tests) else
+// the shipped JSON named by `resolvePipelineName(opts.config)` — then runs
+// `opt::optimize` over `mir` in place, returning `ok && tierClean`. Fails loud (false)
+// on an out-of-range CompileConfig ordinal or a pipeline load failure. The verifier
+// runs after every pass (D-OPT1-VERIFY-AFTER-EVERY-PASS), so this is the safety net
+// for the merged module too.
+//
+// `buildCuMir` calls this with the per-CU lattice's interner; the N>1 merged path
+// (`Program::compileOneTarget`) calls it with the merged host lattice's interner so
+// cross-CU calls — made intra-module DIRECT by the cycle-25 merge — get inlined
+// (D-OPT7-1). Agnostic: no language/target/format branch — the pipeline is
+// config-driven and `optimize` is target-blind at the MIR tier.
+bool optimizeModule(Mir&                  mir,
+                    TargetSchema const&   target,
+                    TypeInterner const&   interner,
+                    CompileOptions const& opts,
+                    DiagnosticReporter&   reporter) {
+    auto const optEntry = reporter.errorCount();
+    ::dss::opt::OptPipeline loadedPipeline;
+    ::dss::opt::OptPipeline const* effectivePipeline = opts.pipelineOverride;
+    if (effectivePipeline == nullptr) {
+        auto const name = resolvePipelineName(opts.config);
+        if (!name.has_value()) {
+            // Out-of-range CompileConfig ordinal — fail loud rather
+            // than silently degrade to "debug" (which would let a
+            // buggy CLI parser silently demote a release build).
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::X_PipelineNameResolutionFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "compile_pipeline: CompileConfig ordinal {} out of range "
+                "(kCompileConfigCount = {}) — substrate-shape violation "
+                "(D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG).",
+                static_cast<int>(opts.config), kCompileConfigCount);
+            reporter.report(std::move(d));
+            return false;
+        }
+        auto loaded = ::dss::opt::loadShippedPipeline(*name);
+        if (!loaded.has_value()) {
+            // The pipeline file ships with the repo; a load failure
+            // here is a deploy/install bug. Drain config diagnostics
+            // so the user sees the JSON-path context.
+            forwardConfigDiagnostics(loaded.error(), reporter);
+            return false;
+        }
+        loadedPipeline = std::move(loaded).value();
+        effectivePipeline = &loadedPipeline;
+    }
+    auto const optResult = ::dss::opt::optimize(
+        mir, target, interner, *effectivePipeline, reporter);
+    return optResult.ok && tierClean(reporter, optEntry);
+}
+
 // BUILD half (Cycle 24): semantic analysis → HIR → FFI synthesis → MIR → optimize for
 // ONE CompilationUnit, returning the `CuMirModule` the LOWER half consumes. The
 // `SemanticModel` is MOVED into the result so its `TypeLattice` interner stays alive
@@ -188,47 +242,11 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         return std::nullopt;
     }
 
-    // 3.5. MIR optimizer (plan 22). Pipeline resolution:
-    //   (a) explicit `opts.pipelineOverride` (examples_runner's
-    //       differential-verify arm, unit tests) — bypasses the JSON
-    //       registry.
-    //   (b) shipped JSON via `resolvePipelineName(opts.config)`
-    //       (Debug → "debug" / Release → "release").
-    auto const optEntry = reporter.errorCount();
-    ::dss::opt::OptPipeline loadedPipeline;
-    ::dss::opt::OptPipeline const* effectivePipeline = opts.pipelineOverride;
-    if (effectivePipeline == nullptr) {
-        auto const name = resolvePipelineName(opts.config);
-        if (!name.has_value()) {
-            // Out-of-range CompileConfig ordinal — fail loud rather
-            // than silently degrade to "debug" (which would let a
-            // buggy CLI parser silently demote a release build).
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::X_PipelineNameResolutionFailed;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "compile_pipeline: CompileConfig ordinal {} out of range "
-                "(kCompileConfigCount = {}) — substrate-shape violation "
-                "(D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG).",
-                static_cast<int>(opts.config), kCompileConfigCount);
-            reporter.report(std::move(d));
-            return std::nullopt;
-        }
-        auto loaded = ::dss::opt::loadShippedPipeline(*name);
-        if (!loaded.has_value()) {
-            // The pipeline file ships with the repo; a load failure
-            // here is a deploy/install bug. Drain config diagnostics
-            // so the user sees the JSON-path context.
-            forwardConfigDiagnostics(loaded.error(), reporter);
-            return std::nullopt;
-        }
-        loadedPipeline = std::move(loaded).value();
-        effectivePipeline = &loadedPipeline;
-    }
-    auto const optResult = ::dss::opt::optimize(
-        mir.mir, target, model.lattice().interner(),
-        *effectivePipeline, reporter);
-    if (!optResult.ok || !tierClean(reporter, optEntry)) {
+    // 3.5. MIR optimizer (plan 22). Pipeline resolution + optimize + tier-clean gate
+    //      extracted to the shared `optimizeModule` (Cycle 26) so the N>1 whole-program
+    //      path can run the SAME pipeline over the MERGED module. Pure code-motion —
+    //      same arguments as the former inline block, so the per-CU output is identical.
+    if (!optimizeModule(mir.mir, target, model.lattice().interner(), opts, reporter)) {
         return std::nullopt;
     }
 
