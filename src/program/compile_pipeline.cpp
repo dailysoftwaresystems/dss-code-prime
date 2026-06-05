@@ -49,14 +49,19 @@ namespace {
 
 } // namespace
 
-bool compileSingleUnit(CompilationUnit const&        cu,
-                       GrammarSchema const&          grammar,
-                       TargetSchema const&           target,
-                       ObjectFormatSchema const&     format,
-                       std::uint16_t                 callingConventionIndex,
-                       std::filesystem::path const&  outPath,
-                       DiagnosticReporter&           reporter,
-                       CompileOptions const&         opts) {
+// Per-CU assembly: runs the full HIR→MIR→LIR→ASM chain + the LK11a symbol-table
+// populate for ONE CompilationUnit, producing its `AssembledModule` (NO link, NO
+// write). File-local shared impl behind both `assembleUnit` (optional wrapper, for
+// the multi-CU driver) and `compileSingleUnit` (assemble + linkAndWrite). The
+// out-param keeps every tier-failure `return false` site below unchanged.
+static bool buildAssembledModule(CompilationUnit const&        cu,
+                                 GrammarSchema const&          grammar,
+                                 TargetSchema const&           target,
+                                 ObjectFormatSchema const&     format,
+                                 std::uint16_t                 callingConventionIndex,
+                                 DiagnosticReporter&           reporter,
+                                 CompileOptions const&         opts,
+                                 AssembledModule&              out) {
     // Take a CU pointer matching `analyze()`'s shared_ptr signature.
     // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
     // with a null deleter so `analyze`'s ref-counting contract is
@@ -436,15 +441,60 @@ bool compileSingleUnit(CompilationUnit const&        cu,
         }
     }
 
-    // 11. Link.
+    // Assembly complete — return the per-CU module; linking + writing is the shared
+    // `linkAndWrite` phase below, so N CUs can each assemble before one merged link.
+    out = std::move(assembled);
+    return true;
+}
+
+// Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
+// path; N>1 the linker merges the CUs (LK11a resolution + LK11b byte emission)
+// before the format walker emits. `outPath` is caller-owned.
+bool linkAndWrite(std::span<AssembledModule const> modules,
+                  TargetSchema const&              target,
+                  ObjectFormatSchema const&        format,
+                  std::filesystem::path const&     outPath,
+                  DiagnosticReporter&              reporter) {
     auto const linkEntry = reporter.errorCount();
-    auto image = linker::link(assembled, target, format, reporter);
+    auto image = linker::link(modules, target, format, reporter);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
         return false;
     }
-
-    // 12. Commit to disk.
     return linker::writeImage(image, outPath, reporter);
+}
+
+// Assemble ONE CompilationUnit to its AssembledModule (no link/write). Returns
+// nullopt on any tier failure (diagnostics already emitted via `reporter`). The
+// multi-CU driver calls this per CU, collects the modules, then `linkAndWrite`s once.
+std::optional<AssembledModule>
+assembleUnit(CompilationUnit const&        cu,
+             GrammarSchema const&          grammar,
+             TargetSchema const&           target,
+             ObjectFormatSchema const&     format,
+             std::uint16_t                 callingConventionIndex,
+             DiagnosticReporter&           reporter,
+             CompileOptions const&         opts) {
+    AssembledModule out;
+    if (!buildAssembledModule(cu, grammar, target, format,
+                              callingConventionIndex, reporter, opts, out)) {
+        return std::nullopt;
+    }
+    return out;
+}
+
+bool compileSingleUnit(CompilationUnit const&        cu,
+                       GrammarSchema const&          grammar,
+                       TargetSchema const&           target,
+                       ObjectFormatSchema const&     format,
+                       std::uint16_t                 callingConventionIndex,
+                       std::filesystem::path const&  outPath,
+                       DiagnosticReporter&           reporter,
+                       CompileOptions const&         opts) {
+    auto mod = assembleUnit(cu, grammar, target, format,
+                            callingConventionIndex, reporter, opts);
+    if (!mod) return false;
+    return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
+                        target, format, outPath, reporter);
 }
 
 } // namespace dss

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "asm/asm.hpp"  // AssembledModule (assembleUnit return + linkAndWrite span)
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -11,6 +12,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -155,5 +157,29 @@ compileSingleUnit(CompilationUnit const&         cu,
                   std::filesystem::path const&   outPath,
                   DiagnosticReporter&            reporter,
                   CompileOptions const&          opts = {});
+
+// Assemble ONE CompilationUnit to its `AssembledModule` (the per-CU half of
+// `compileSingleUnit` — no link, no write). Returns nullopt on any tier failure
+// (diagnostics emitted via `reporter`). The multi-CU driver (CU6) calls this per
+// CU, collects the N modules, then `linkAndWrite`s them into one merged image.
+[[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
+assembleUnit(CompilationUnit const&         cu,
+             GrammarSchema const&           grammar,
+             TargetSchema const&            target,
+             ObjectFormatSchema const&      format,
+             std::uint16_t                  callingConventionIndex,
+             DiagnosticReporter&            reporter,
+             CompileOptions const&          opts = {});
+
+// Link N assembled CUs into one image + commit to `outPath` (the shared half of
+// `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's
+// cross-CU merge (LK11a resolution + LK11b byte emission). Returns true iff the
+// image is `ok()`, no link-tier error fired, and `writeImage` committed bytes.
+[[nodiscard]] DSS_EXPORT bool
+linkAndWrite(std::span<AssembledModule const> modules,
+             TargetSchema const&              target,
+             ObjectFormatSchema const&        format,
+             std::filesystem::path const&     outPath,
+             DiagnosticReporter&              reporter);
 
 } // namespace dss
