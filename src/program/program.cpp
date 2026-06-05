@@ -5,8 +5,10 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
 #include "ffi/abi/abi_catalog.hpp"
 #include "link/object_format_schema.hpp"
+#include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/thread_pool.hpp"
@@ -282,23 +284,10 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     }
     auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
 
-    // Cycle 24 two-loop re-sequence (whole-program-MIR-merge prerequisite). LOOP 1:
-    // build EVERY CU's MIR up front (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding
-    // each `CuMirModule` (which keeps its SemanticModel — the interner owner — alive).
-    // LOOP 2: lower each independently (`lowerCuMirToAssembly` — MIR→LIR→…→assemble) to
-    // its AssembledModule. Then the linker MERGES the N modules into one image (LK11) and
-    // writes it — exactly as before; each CU is still lowered + assembled independently, so
-    // the merge input is byte-for-byte what the former single-loop produced. On any SUCCESSFUL
-    // compile the emitted image is byte-identical; SemanticModels are simply held across loop 1
-    // (deferred lowering). A single CU (the CU5 multi-file case) is the v1 single-CU path.
-    // Early-return on the FIRST CU's build OR lower failure preserves the former assembleUnit
-    // fail-fast (diagnostics already reported via `reporter`); no later CU is processed past a
-    // failure. NOTE — the two-loop split has one benign observable delta vs the old single loop,
-    // only on a FAILING multi-CU compile: build-all-then-lower-all can surface a later CU's
-    // *build* error before an earlier CU's *lower* error (the old interleaved loop would have
-    // hit the earlier lower error first). Both are valid errors, no artifact is written either
-    // way, and the function returns non-zero either way — so this changes only *which* diagnostic
-    // lands on a broken multi-CU input, never a successful build's output.
+    // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
+    // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
+    // its SemanticModel — the interner owner — alive). Early-return on the FIRST CU's
+    // build failure preserves the fail-fast contract (diagnostics already reported).
     std::vector<CuMirModule> cuMirs;
     cuMirs.reserve(cus.size());
     for (auto const& cu : cus) {
@@ -307,14 +296,75 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         if (!cuMir) return false;  // front-half tier failure already reported via `reporter`
         cuMirs.push_back(std::move(*cuMir));
     }
-    std::vector<AssembledModule> modules;
-    modules.reserve(cuMirs.size());
-    for (auto& cuMir : cuMirs) {
-        auto mod = lowerCuMirToAssembly(cuMir, reporter);
+
+    // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
+    // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
+    // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
+    // work + a different code path); keep the proven single-CU lowering for byte-identity.
+    if (cuMirs.size() == 1) {
+        auto mod = lowerCuMirToAssembly(cuMirs[0], reporter);
         if (!mod) return false;  // back-half tier failure already reported via `reporter`
-        modules.push_back(std::move(*mod));
+        return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
+                            **targetR, **formatR, outPath, reporter);
     }
-    return linkAndWrite(std::span<AssembledModule const>{modules.data(), modules.size()},
+
+    // N>1 (CU6 multi-CU): WHOLE-PROGRAM MIR MERGE (Cycle 25 Stage C). Fold the N per-CU
+    // modules into ONE module over a fresh host lattice, resolving cross-CU calls to
+    // DIRECT intra-module calls (no cycle-19 assembled-tier thunk), then lower that single
+    // module ONCE and link it (the linker takes its single-module path). The merge reads
+    // each CU's `nameOf` (SemanticModel symbol names + extern mangledNames) while cloning,
+    // so `cuMirs` must stay alive through `mergeCuMirs` — it does (function-local, no CU's
+    // lattice is moved out: the host is FRESH, leaving every SemanticModel intact).
+    std::vector<MergeCuInput> mergeInputs;
+    mergeInputs.reserve(cuMirs.size());
+    for (auto& cuMir : cuMirs) {
+        MergeCuInput in;
+        in.mir      = &cuMir.mir;
+        in.interner = &cuMir.model.lattice().interner();
+        // nameOf: symbol id → declared name. Covers DEFINITIONS (SemanticModel record)
+        // AND extern IMPORTS (the import's mangledName, when the symbol has no record —
+        // an extern reference's SymbolId is not in the semantic symbol table). The merge
+        // keys cross-CU matching on this name exactly as the linker keys on the on-binary
+        // symbol name. Capturing `&cuMir` is safe — `cuMirs` is done growing.
+        in.nameOf = [cuMirP = &cuMir](SymbolId s) -> std::string {
+            if (SymbolRecord const* r = cuMirP->model.recordFor(s)) return r->name;
+            for (auto const& e : cuMirP->externImports) {
+                if (e.symbol.v == s.v) return e.mangledName;
+            }
+            return std::string{};
+        };
+        in.externImports = cuMir.externImports;
+        mergeInputs.push_back(std::move(in));
+    }
+
+    // Fresh host TypeLattice for the merged module: seeded with CU0's id + source
+    // language (cosmetic — the registry's sourceLanguage tags extension types; c-subset
+    // has none). The merge re-interns ALL CUs (incl CU0) into this fresh host, so no
+    // SemanticModel's lattice is mutated or moved — still "re-intern at merge", just a
+    // fresh host rather than CU0's in-place. Agnostic: id + language string, no branch.
+    TypeLattice host{cuMirs[0].cuId,
+                     std::string{cuMirs[0].model.lattice().registry().sourceLanguage()}};
+
+    // entryNames: the grammar's entry-function name list (the same list the single-CU
+    // user-entry scan reads). The merge uses it to compute the merged `userEntrySymbol`.
+    std::vector<std::string> entryNames;
+    for (auto const& decl : grammar.semantics().declarations) {
+        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+            entryNames.push_back(n);
+        }
+    }
+
+    auto merged = mergeCuMirs(
+        std::span<MergeCuInput const>{mergeInputs.data(), mergeInputs.size()},
+        std::move(host),
+        std::span<std::string const>{entryNames.data(), entryNames.size()},
+        reporter);
+    if (!merged) return false;  // merge failure (conflict / verify) already reported.
+
+    auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
+                                     ccIndex, cuMirs[0].cuId, reporter);
+    if (!mod) return false;  // back-half tier failure already reported via `reporter`
+    return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
                         **targetR, **formatR, outPath, reporter);
 }
 

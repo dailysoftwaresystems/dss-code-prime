@@ -14,3 +14,6 @@ dss_add_test(NAME mir/test_mir_lowering_c_subset SOURCES test_mir_lowering_c_sub
 
 # LK6 cycle 2d — HIR ExternFunction → MIR.externImports thread-through.
 dss_add_test(NAME mir/test_mir_lowering_extern SOURCES test_mir_lowering_extern.cpp)
+
+# Cycle 25 Stage B — cross-module MIR merge (mergeCuMirs) tested in isolation.
+dss_add_test(NAME mir/test_mir_merge SOURCES test_mir_merge.cpp)

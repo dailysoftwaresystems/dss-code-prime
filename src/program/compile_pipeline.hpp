@@ -9,6 +9,7 @@
 #include "core/types/strong_ids.hpp"  // CompilationUnitId (CuMirModule member)
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
+#include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
 #include "mir/mir.hpp"  // Mir (CuMirModule member, move-only)
 #include "opt/optimizer.hpp"
 #include "program/cli_args.hpp"  // CompileConfig
@@ -228,6 +229,22 @@ buildCuMir(CompilationUnit const&         cu,
 [[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
 lowerCuMirToAssembly(CuMirModule&        cuMir,
                      DiagnosticReporter& reporter);
+
+// LOWER half for the MERGED whole-program module (Cycle 25 Stage C). Drives the
+// single module `mergeCuMirs` produced (N CUs unified, cross-CU calls already DIRECT,
+// resolved externs stripped, user-entry pre-computed) through the SAME lowering body
+// `lowerCuMirToAssembly` uses, yielding ONE AssembledModule. The N>1 driver
+// (`Program::compileOneTarget`) then `linkAndWrite`s that single module — so the
+// linker takes its single-CU path and never mints a cross-CU thunk (the cross-CU call
+// is an intra-module direct call). `merged` is mutated (its `Mir` interns lowered
+// types; its `externImports` are moved out). `cuId` is the merged image's id (CU0's).
+[[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
+lowerMergedToAssembly(MergedMirModule&    merged,
+                      GrammarSchema const& grammar,
+                      TargetSchema const&  target,
+                      std::uint16_t        callingConventionIndex,
+                      CompilationUnitId    cuId,
+                      DiagnosticReporter&  reporter);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

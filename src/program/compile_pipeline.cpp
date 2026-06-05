@@ -17,11 +17,14 @@
 #include "lir/lir_rewrite.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
 #include "opt/optimizer.hpp"
 
 #include <algorithm>
 #include <format>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -245,28 +248,45 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
     return cuMir;
 }
 
-// LOWER half (Cycle 24): MIR → LIR → liveness → regalloc → rewrite → legalize →
-// callconv → assemble → the LK11a symbol-table populate → the user-entry scan,
-// producing the `AssembledModule` (NO link, NO write). Consumes the `CuMirModule`
-// the BUILD half handed across the MIR/LIR seam: its `externImports` are MOVED into
-// MIR→LIR; its `mir` + `model` (interner) are read. Returns nullopt on any back-half
-// tier failure (diagnostics already emitted via `reporter`).
-std::optional<AssembledModule>
-lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
-    // Re-bind the seam state under the names the back-half body uses. `model` stays a
-    // mutable reference — MIR→LIR + the optimizer-minted-type reads re-open its
-    // interner (`lattice().interner()` is non-const). `grammar`/`target` are the
-    // caller's schemas (live across both driver loops); the cuId is stamped below.
-    auto&                     model                  = cuMir.model;
-    GrammarSchema const&      grammar                = *cuMir.grammar;
-    TargetSchema const&       target                 = *cuMir.target;
-    std::uint16_t const       callingConventionIndex = cuMir.callingConventionIndex;
-
+// LOWER half body (Cycle 25, Stage C): MIR → LIR → liveness → regalloc → rewrite →
+// legalize → callconv → assemble → the LK11a symbol-table populate → the user-entry
+// resolution, producing the `AssembledModule` (NO link, NO write). PARAMETERIZED on
+// the seam state so BOTH the single-CU path (`lowerCuMirToAssembly`) and the merged
+// whole-program path (`lowerMergedToAssembly`) share one body:
+//   * `mir`               — the module to lower (per-CU optimized OR whole-program merged).
+//   * `interner`          — the type interner the module's TypeIds index into (the per-CU
+//                           lattice's interner OR the merged host lattice's interner).
+//   * `nameOf`            — merged/declared symbol-id → declared name; powers the LK11a
+//                           symbol-table populate (replaces the per-CU `model.recordFor`).
+//   * `externImports`     — the module's surviving real-FFI imports (MOVED into MIR→LIR).
+//   * `userEntrySymbol`   — the caller's pre-resolved user-entry symbol (its CALLER ran
+//                           the entry-name scan: the single-CU path against the
+//                           SemanticModel, the merged path inside `mergeCuMirs`). When
+//                           set it is stamped onto `AssembledModule.userEntrySymbol`;
+//                           nullopt leaves it nullopt (no entry found — pre-Cycle-25 shape).
+//   * `target`            — the MIR→LIR + assemble target.
+//   * `cuId`              — stamped onto the AssembledModule so the linker keys symbols.
+// Returns nullopt on any back-half tier failure (diagnostics already emitted via `reporter`).
+//
+// The grammar's entry-name list is intentionally NOT a parameter — the entry-name SCAN
+// needs to ENUMERATE symbols + names (which `nameOf` cannot do) plus the ambiguity
+// fail-loud, so each caller runs it and hands the resolved id here. Keeping a dead
+// `grammar` param just to mirror the old monolith would be a smell.
+static std::optional<AssembledModule>
+lowerMirModuleToAssembly(Mir&                                        mir,
+                         TypeInterner const&                         interner,
+                         std::function<std::string(SymbolId)> const& nameOf,
+                         std::vector<ExternImport>                    externImports,
+                         std::optional<SymbolId>                     userEntrySymbol,
+                         TargetSchema const&                         target,
+                         std::uint16_t                               callingConventionIndex,
+                         CompilationUnitId                           cuId,
+                         DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     auto const lirEntry = reporter.errorCount();
-    auto lir = lowerToLir(cuMir.mir, target,
-                          model.lattice().interner(), reporter,
-                          std::move(cuMir.externImports));
+    auto lir = lowerToLir(mir, target,
+                          interner, reporter,
+                          std::move(externImports));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -320,77 +340,19 @@ lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
         return std::nullopt;
     }
 
-    // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
-    // 2026-06-03): plumb the source-language entry-function symbol
-    // into AssembledModule.userEntrySymbol. The language config's
-    // declaration rules carry an `implicitReturnZeroForFunctionNames`
-    // list — c-subset names "main" there; toy / future languages
-    // name their own entry. Scan the semantic model's symbol records
-    // for a function symbol whose name appears in ANY decl rule's
-    // entry-name list, and stamp it on the AssembledModule so the
-    // trampoline injector's `resolveUserEntrySymbol` doesn't fall
-    // through to the `functions[0]` default (which silently picked
-    // the FIRST-declared function — wrong when the entry isn't
-    // declared first in source order).
-    //
-    // Source-agnostic: the trigger comes from grammar config, not
-    // a hardcoded "main" string. Multiple symbols matching the
-    // entry-name list fail-loud (silent-failure post-fold HIGH #1
-    // 2026-06-03 — never pick silently between candidates).
-    if (!assembled.userEntrySymbol.has_value()) {
-        std::vector<std::string_view> entryNames;
-        for (auto const& decl : grammar.semantics().declarations) {
-            for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
-                entryNames.push_back(n);
-            }
-        }
-        if (!entryNames.empty()) {
-            // Silent-failure HIGH #1 post-fold (2026-06-03): walk
-            // EVERY function symbol matching the entry-name list;
-            // fail-loud on multiple matches rather than silently
-            // first-match-wins. A future language declaring
-            // `["main", "_start"]` (both defined in the source)
-            // OR a duplicate-name config (same name across two
-            // decl rules) would otherwise re-introduce the silent
-            // wrong-entry bug class this fix is supposed to close.
-            std::vector<SymbolId> matches;
-            std::vector<std::string_view> matchNames;
-            for (auto const& rec : model.symbols()) {
-                if (rec.kind != DeclarationKind::Function) continue;
-                bool const isEntry = std::any_of(
-                    entryNames.begin(), entryNames.end(),
-                    [&](std::string_view n){ return n == rec.name; });
-                if (isEntry) {
-                    SymbolId const sym{static_cast<std::uint32_t>(
-                        &rec - model.symbols().data())};
-                    matches.push_back(sym);
-                    matchNames.push_back(rec.name);
-                }
-            }
-            if (matches.size() > 1) {
-                std::string list;
-                for (std::size_t i = 0; i < matchNames.size(); ++i) {
-                    if (i) list += ", ";
-                    list += matchNames[i];
-                }
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::K_SymbolUndefined;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "compile_pipeline: ambiguous user-entry — {} "
-                    "function symbol(s) match the language's entry-"
-                    "name list (matched: {}). The trampoline injector "
-                    "cannot silently pick one. Declare distinct entry "
-                    "names per decl rule OR restrict the source to "
-                    "exactly one of these (D-CSUBSET-MULTI-FN-WIN64-CC "
-                    "ambiguity gate).", matches.size(), list);
-                reporter.report(std::move(d));
-                return std::nullopt;
-            }
-            if (matches.size() == 1) {
-                assembled.userEntrySymbol = matches[0];
-            }
-        }
+    // Cycle 25 Stage C — stamp the user-entry symbol the CALLER pre-resolved
+    // (D-CSUBSET-MULTI-FN-WIN64-CC). The entry-name SCAN lives in each caller because
+    // it ENUMERATES symbols + names (which `nameOf` cannot do) plus the ambiguity
+    // fail-loud:
+    //   * single-CU (`lowerCuMirToAssembly`) scans the SemanticModel's symbol records
+    //     — verbatim the scan this body ran pre-Cycle-25, so the result is identical;
+    //   * merged whole-program (`lowerMergedToAssembly`) reads the id `mergeCuMirs`
+    //     already computed against the merged functions.
+    // `assembled.userEntrySymbol` is nullopt out of `assemble()`, so a caller passing
+    // nullopt (no entry found) leaves it nullopt — exactly the pre-Cycle-25 shape (the
+    // trampoline injector then falls through to its own default).
+    if (userEntrySymbol.has_value()) {
+        assembled.userEntrySymbol = userEntrySymbol;
     }
 
     // D-LK4-RODATA-PRODUCER (2026-06-02): materialize MIR globals
@@ -402,7 +364,7 @@ lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
     // since the assembler had no globals-bytes path. The new pass
     // closes the producer thread end-to-end.
     auto dataItems = lowerMirGlobalsToDataItems(
-        cuMir.mir, model.lattice().interner(), reporter);
+        mir, interner, reporter);
     if (!tierClean(reporter, asmEntry)) {
         // Any per-global encoding error already raised a loud
         // diagnostic via the function's internal `emit`.
@@ -411,71 +373,198 @@ lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
     assembled.dataItems = std::move(dataItems);
 
     // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
-    // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; the
-    // compound key only matters once LK11 links multiple CUs in one image.
-    assembled.cuId = cuMir.cuId;
+    // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; a merged
+    // whole-program image carries CU0's id (cosmetic — the merge already collapsed
+    // every CU into one symbol space, so the linker receives a single module).
+    assembled.cuId = cuId;
 
     // LK11a: build the per-module symbol table the linker matches by NAME across
     // CUs (cross-CU resolution + weak-vs-strong). One entry per DEFINED function /
     // global — extern imports are references, not definitions, and are carried
-    // separately in `externImports`. The name comes from the semantic symbol table
-    // (raw declared identifier, no mangling); binding/visibility from MIR. IRs stay
-    // numeric — the name is assembled here, where `model` + `mir` are both in scope,
-    // not threaded through MIR/LIR. A defined symbol with no semantic record, or a
-    // Global/Weak with an empty name, is a producer-contract breach the linker could
-    // only mis-resolve cross-CU — fail loud here rather than emit an unmatchable
-    // symbol. (Source/target/format-agnostic: reads the symbol table + MIR linkage,
-    // no language/CPU/format branch.)
+    // separately in `externImports`. The name comes from `nameOf` (raw declared
+    // identifier, no mangling — the SemanticModel name for a CU, the merged symbol
+    // name for a whole-program module); binding/visibility from MIR. IRs stay
+    // numeric — the name is resolved here via `nameOf`, not threaded through MIR/LIR.
+    // (Source/target/format-agnostic: reads `nameOf` + MIR linkage, no language/CPU/
+    // format branch.)
+    //
+    // Cycle 25 Stage C — `nameOf` returns "" for a symbol with NO declared name. That
+    // covers two cases, both module-private and SKIPPED here (no symbol-table entry):
+    //   * a compiler-SYNTHESIZED symbol — e.g. a string-literal rodata global (minted
+    //     ABOVE the semantic range per D-LK4-RODATA-PRODUCER-STRING) or a synthesized
+    //     init thunk. Never referenced across CUs by name; resolved intra-module by id.
+    //   * (single-CU) a SymbolId with no SemanticModel record at all — `nameOf`'s
+    //     `recordFor(s) ? name : ""` returns "" exactly as the old `rec == nullptr`
+    //     skip did. Byte-identical: every REAL c-subset func/global has a non-empty
+    //     declared name, so only synthesized symbols hit the "" skip in the corpus.
+    // (The pre-Cycle-25 monolith ALSO had an `empty-name && non-Local` fail-loud arm;
+    // it required a symbol with a record but an empty name — a state the semantic
+    // analyzer never produces, and indistinguishable from a synthesized symbol once
+    // names flow through `nameOf`. The merged module legitimately carries empty-named
+    // externally-visible synthesized globals, so an empty name is no longer a breach.
+    // The merge's own `MirVerifier` + `mergedSymbolOf` fail-louds guard merged-module
+    // integrity in that arm's place.)
     {
         auto appendSym = [&](SymbolId sym, SymbolBinding bind,
-                             SymbolVisibility vis) -> bool {
-            SymbolRecord const* rec = model.recordFor(sym);
-            if (rec == nullptr) {
-                // No semantic record → a compiler-SYNTHESIZED, module-internal symbol:
-                // e.g. a string-literal rodata global (its SymbolId is minted ABOVE the
-                // semantic range per D-LK4-RODATA-PRODUCER-STRING, so it lands out of
-                // range here, never a wrong-record collision), or a synthesized init
-                // thunk. Such a symbol is never referenced across CUs by name — exclude
-                // it from the cross-CU symbol table; it stays module-private, resolved
-                // intra-CU by its SymbolId. (A genuinely corrupted producer id — OOR for
-                // a real source symbol — is indistinguishable from a synthetic one at
-                // this layer, so it is likewise skipped rather than fail-loud; such
-                // corruption surfaces downstream where the SymbolId is actually consumed.
-                // That is the honest reason this is a skip, not a hard error.)
-                return true;
-            }
-            if (rec->name.empty() && bind != SymbolBinding::Local) {
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::K_SymbolUndefined;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "compile_pipeline: externally-visible symbol #{} has an empty "
-                    "name — the linker cannot match it across CUs (LK11a).", sym.v);
-                reporter.report(std::move(d));
-                return false;
-            }
-            assembled.symbols.push_back(ModuleSymbol{sym, rec->name, bind, vis});
-            return true;
+                             SymbolVisibility vis) {
+            std::string name = nameOf(sym);
+            if (name.empty()) return;  // module-private (synthesized / no record)
+            assembled.symbols.push_back(
+                ModuleSymbol{sym, std::move(name), bind, vis});
         };
-        for (std::uint32_t i = 0; i < cuMir.mir.moduleFuncCount(); ++i) {
-            MirFuncId const fid = cuMir.mir.funcAt(i);
-            if (!appendSym(cuMir.mir.funcSymbol(fid), cuMir.mir.funcBinding(fid),
-                           cuMir.mir.funcVisibility(fid))) {
-                return std::nullopt;
-            }
+        for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
+            MirFuncId const fid = mir.funcAt(i);
+            appendSym(mir.funcSymbol(fid), mir.funcBinding(fid),
+                      mir.funcVisibility(fid));
         }
-        for (std::uint32_t i = 0; i < cuMir.mir.moduleGlobalCount(); ++i) {
-            MirGlobalId const gid = cuMir.mir.globalAt(i);
-            if (!appendSym(cuMir.mir.globalSymbol(gid), cuMir.mir.globalBinding(gid),
-                           cuMir.mir.globalVisibility(gid))) {
-                return std::nullopt;
-            }
+        for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
+            MirGlobalId const gid = mir.globalAt(i);
+            appendSym(mir.globalSymbol(gid), mir.globalBinding(gid),
+                      mir.globalVisibility(gid));
         }
     }
 
     // Assembly complete — return the per-CU module; linking + writing is the shared
     // `linkAndWrite` phase below, so N CUs can each assemble before one merged link.
     return assembled;
+}
+
+namespace {
+
+// Resolve the user-entry symbol for a SINGLE CU by scanning its SemanticModel's
+// symbol records for a function symbol whose declared name appears in ANY decl
+// rule's entry-name list (D-CSUBSET-MULTI-FN-WIN64-CC). Returns the matched
+// SymbolId, or nullopt when no function matches. Fail-loud on MULTIPLE matches
+// (sets `*ok=false` + reports K_SymbolUndefined) — the trampoline injector cannot
+// silently pick one.
+//
+// This is the entry-name SCAN that used to live inline in the LOWER half (pre-
+// Cycle-25); it stays CU-specific because it ENUMERATES the model's symbol records
+// (which the merged path's symbol→name `nameOf` cannot express). The merged path's
+// equivalent runs inside `mergeCuMirs` against the merged functions. Source-agnostic:
+// the trigger is the grammar's `implicitReturnZeroForFunctionNames`, never a
+// hardcoded "main".
+[[nodiscard]] std::optional<SymbolId>
+resolveSingleCuUserEntry(SemanticModel const& model, GrammarSchema const& grammar,
+                         DiagnosticReporter& reporter, bool& ok) {
+    ok = true;
+    std::vector<std::string_view> entryNames;
+    for (auto const& decl : grammar.semantics().declarations) {
+        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+            entryNames.push_back(n);
+        }
+    }
+    if (entryNames.empty()) return std::nullopt;
+
+    // Silent-failure HIGH #1 (2026-06-03): walk EVERY function symbol matching the
+    // entry-name list; fail-loud on multiple matches rather than silently
+    // first-match-wins (a future `["main", "_start"]` both-defined, or a duplicate-
+    // name config, would otherwise re-introduce the silent wrong-entry bug class).
+    std::vector<SymbolId> matches;
+    std::vector<std::string_view> matchNames;
+    for (auto const& rec : model.symbols()) {
+        if (rec.kind != DeclarationKind::Function) continue;
+        bool const isEntry = std::any_of(
+            entryNames.begin(), entryNames.end(),
+            [&](std::string_view n){ return n == rec.name; });
+        if (isEntry) {
+            SymbolId const sym{static_cast<std::uint32_t>(
+                &rec - model.symbols().data())};
+            matches.push_back(sym);
+            matchNames.push_back(rec.name);
+        }
+    }
+    if (matches.size() > 1) {
+        std::string list;
+        for (std::size_t i = 0; i < matchNames.size(); ++i) {
+            if (i) list += ", ";
+            list += matchNames[i];
+        }
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_SymbolUndefined;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "compile_pipeline: ambiguous user-entry — {} "
+            "function symbol(s) match the language's entry-"
+            "name list (matched: {}). The trampoline injector "
+            "cannot silently pick one. Declare distinct entry "
+            "names per decl rule OR restrict the source to "
+            "exactly one of these (D-CSUBSET-MULTI-FN-WIN64-CC "
+            "ambiguity gate).", matches.size(), list);
+        reporter.report(std::move(d));
+        ok = false;
+        return std::nullopt;
+    }
+    if (matches.size() == 1) return matches[0];
+    return std::nullopt;
+}
+
+} // namespace
+
+// LOWER half (single-CU): thin wrapper over the shared `lowerMirModuleToAssembly`.
+// Binds the seam state from the `CuMirModule`: the per-CU type interner, a
+// `nameOf` that reads the SemanticModel's symbol records, the CU's extern imports,
+// and the entry symbol resolved by the CU-specific scan above. Produces output
+// byte-identical to the pre-Cycle-25 monolith for any single-CU build.
+std::optional<AssembledModule>
+lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
+    SemanticModel&       model   = cuMir.model;
+    GrammarSchema const& grammar = *cuMir.grammar;
+
+    // Resolve the user-entry FIRST (fail-loud on ambiguity, exactly as the inline
+    // scan did) so a multi-entry source halts before lowering — same observable
+    // failure point as pre-Cycle-25.
+    bool entryOk = true;
+    std::optional<SymbolId> const userEntry =
+        resolveSingleCuUserEntry(model, grammar, reporter, entryOk);
+    if (!entryOk) return std::nullopt;
+
+    // `nameOf`: SymbolId → declared name. A SymbolId with no record (synthesized /
+    // out-of-range) yields "" — the LK11a symbol-table populate then skips it as
+    // module-private, exactly as the old `rec == nullptr` skip did.
+    auto nameOf = [&](SymbolId s) -> std::string {
+        SymbolRecord const* r = model.recordFor(s);
+        return r ? r->name : std::string{};
+    };
+
+    return lowerMirModuleToAssembly(
+        cuMir.mir, model.lattice().interner(), nameOf,
+        std::move(cuMir.externImports), userEntry, *cuMir.target,
+        cuMir.callingConventionIndex, cuMir.cuId, reporter);
+}
+
+// LOWER half (merged whole-program): thin wrapper over the shared
+// `lowerMirModuleToAssembly` for the N>1 merge path. `mergeCuMirs` already unified
+// the N CUs into ONE module over a host lattice, resolved cross-CU calls to DIRECT
+// intra-module calls (stripping the resolved extern imports), and computed the
+// user-entry symbol. This drives that single module through the same LOWER body,
+// so the linker downstream receives exactly ONE AssembledModule (no assembled-tier
+// cross-CU thunk — the cycle-19 GOT-like rodata slot is never minted).
+//
+// `merged` is taken by non-const ref because the shared body needs a mutable `Mir&`
+// (MIR→LIR may intern lowered-expression types into the host) + the surviving
+// externImports are MOVED into MIR→LIR. The host lattice's interner is the type
+// space for the merged module's TypeIds. `cuId` is CU0's (the merge stamped CU0's
+// symbol values preferentially; cosmetic, since the linker gets one module).
+std::optional<AssembledModule>
+lowerMergedToAssembly(MergedMirModule&    merged,
+                      GrammarSchema const& /*grammar*/,
+                      TargetSchema const& target,
+                      std::uint16_t       callingConventionIndex,
+                      CompilationUnitId   cuId,
+                      DiagnosticReporter& reporter) {
+    // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
+    // A synthesized / nameless merged symbol is absent from the map → "" → skipped
+    // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
+    auto nameOf = [&](SymbolId s) -> std::string {
+        auto const it = merged.symbolNames.find(s.v);
+        return it != merged.symbolNames.end() ? it->second : std::string{};
+    };
+
+    return lowerMirModuleToAssembly(
+        merged.mir, merged.host.interner(), nameOf,
+        std::move(merged.externImports), merged.userEntrySymbol, target,
+        callingConventionIndex, cuId, reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

@@ -23,9 +23,19 @@
 // Anchored at plan 14 §3.1 D-LK10-2 for closure when ML7 cycle 2
 // lands.
 
+#include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp"
+#include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_lattice.hpp"
 #include "diagnostic_count.hpp"
+#include "ffi/abi/abi_catalog.hpp"
+#include "link/linker.hpp"
+#include "link/object_format_schema.hpp"
+#include "mir/merge/mir_merge.hpp"
+#include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
 
@@ -34,6 +44,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -734,4 +747,138 @@ TEST(Program_CompileDirectory, RejectsNoMatchingFiles) {
                                     "c-subset",
                                     {"x86_64:elf64-x86_64-linux"}),
               1);
+}
+
+// ── Cycle 25 Stage C — whole-program MIR merge makes a cross-CU call DIRECT ──────
+//
+// The driver's N>1 path now folds the per-CU MIRs into ONE module via `mergeCuMirs`
+// BEFORE lowering, so a cross-CU call (`main` → `add5` defined in a sibling CU) is an
+// intra-module DIRECT call — NOT the cycle-19 assembled-tier GOT-like rodata thunk
+// slot. This pins that the thunk is GONE end-to-end, by driving the SAME source the
+// `cross_cu_call` runtime example uses through `buildCuMir` ×2 → `mergeCuMirs` →
+// `lowerMergedToAssembly` and asserting:
+//   1. the merge STRIPS the resolved cross-CU extern (`add5` absent from the merged
+//      externImports) — the import that WOULD have forced a thunk;
+//   2. the single lowered `AssembledModule` likewise carries no `add5` import;
+//   3. `linker::link` over that ONE module takes its single-module path and produces
+//      ZERO `resolvedCrossCuRefs` — and `mergeModules` mints a thunk slot ONLY from a
+//      non-empty `resolvedCrossCuRefs`, so an empty list is the definitive "no thunk".
+// A regression that routed the N>1 build back through the per-CU-then-link-merge path
+// would leave `add5` as a surviving cross-CU reference → a thunk slot → this fails.
+TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
+    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(grammarR.has_value());
+    auto grammar = *grammarR;
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto formatR = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(formatR.has_value());
+
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, rep);
+    ASSERT_TRUE(abi.has_value());
+    ASSERT_NE(abi->cc, nullptr);
+    auto const ccSpan = (*targetR)->callingConventions();
+    auto const ccIndex = static_cast<std::uint16_t>(
+        std::distance(ccSpan.data(), abi->cc));
+
+    // The exact cross_cu_call corpus: main calls extern add5; helper defines it.
+    auto buildCu = [&](std::string src, std::string label) {
+        UnitBuilder builder{grammar};
+        builder.addInMemory(std::move(src), std::move(label));
+        return std::move(builder).finish();
+    };
+    CompilationUnit cuMain =
+        buildCu("extern int add5(int x);\nint main() { return add5(37); }\n", "main.c");
+    CompilationUnit cuHelper =
+        buildCu("int add5(int x) { return x + 5; }\n", "helper.c");
+
+    // LOOP 1 (driver-parity): build each CU's MIR.
+    auto mirMain = buildCuMir(cuMain, *grammar, **targetR, **formatR, ccIndex, rep);
+    ASSERT_TRUE(mirMain.has_value()) << "errorCount=" << rep.errorCount();
+    auto mirHelper = buildCuMir(cuHelper, *grammar, **targetR, **formatR, ccIndex, rep);
+    ASSERT_TRUE(mirHelper.has_value()) << "errorCount=" << rep.errorCount();
+
+    // MergeCuInputs (constructed exactly as `compileOneTarget`'s N>1 arm does).
+    std::vector<CuMirModule> cuMirs;
+    cuMirs.push_back(std::move(*mirMain));
+    cuMirs.push_back(std::move(*mirHelper));
+
+    std::vector<MergeCuInput> inputs;
+    for (auto& cm : cuMirs) {
+        MergeCuInput in;
+        in.mir      = &cm.mir;
+        in.interner = &cm.model.lattice().interner();
+        in.nameOf   = [cmP = &cm](SymbolId s) -> std::string {
+            if (SymbolRecord const* r = cmP->model.recordFor(s)) return r->name;
+            for (auto const& e : cmP->externImports) {
+                if (e.symbol.v == s.v) return e.mangledName;
+            }
+            return std::string{};
+        };
+        in.externImports = cm.externImports;
+        inputs.push_back(std::move(in));
+    }
+
+    TypeLattice host{cuMirs[0].cuId,
+                     std::string{cuMirs[0].model.lattice().registry().sourceLanguage()}};
+    std::vector<std::string> entryNames;
+    for (auto const& decl : grammar->semantics().declarations) {
+        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+            entryNames.push_back(n);
+        }
+    }
+
+    auto merged = mergeCuMirs(
+        std::span<MergeCuInput const>{inputs.data(), inputs.size()},
+        std::move(host),
+        std::span<std::string const>{entryNames.data(), entryNames.size()}, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    // (1a) Both `main` AND `add5` are DEFINED in the single merged module — the
+    //      positive shape of a direct intra-module call (the call target is in-module,
+    //      not an external symbol the linker must bridge).
+    bool haveMain = false, haveAdd5 = false;
+    for (std::uint32_t i = 0; i < merged->mir.moduleFuncCount(); ++i) {
+        auto const it = merged->symbolNames.find(
+            merged->mir.funcSymbol(merged->mir.funcAt(i)).v);
+        if (it == merged->symbolNames.end()) continue;
+        if (it->second == "main") haveMain = true;
+        if (it->second == "add5") haveAdd5 = true;
+    }
+    EXPECT_TRUE(haveMain) << "main must be defined in the merged module";
+    EXPECT_TRUE(haveAdd5)
+        << "add5 must be DEFINED in the merged module — the cross-CU call's target is "
+           "now in-module (direct call), the precondition for there being no thunk";
+
+    // (1b) The merge rewired main→add5 to a DIRECT call and STRIPPED the extern.
+    for (auto const& e : merged->externImports) {
+        EXPECT_NE(e.mangledName, "add5")
+            << "the cross-CU-resolved extern `add5` must NOT survive the merge — its "
+               "call is now a direct intra-module call, so no thunk is needed";
+    }
+
+    // Lower the single merged module → ONE AssembledModule.
+    auto mod = lowerMergedToAssembly(*merged, *grammar, **targetR, ccIndex,
+                                     cuMirs[0].cuId, rep);
+    ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
+
+    // (2) The lowered module carries no `add5` import either (direct call).
+    for (auto const& e : mod->externImports) {
+        EXPECT_NE(e.mangledName, "add5");
+    }
+
+    // (3) The linker receives a SINGLE module → its single-module path → ZERO
+    //     resolvedCrossCuRefs → NO thunk slot minted. (A two-strong / undefined ref
+    //     would also be empty here; the merged module being one self-contained unit is
+    //     why there is no cross-CU edge at all.)
+    auto const before = rep.errorCount();
+    auto image = dss::linker::link(
+        std::span<AssembledModule const>{&*mod, 1}, **targetR, **formatR, rep);
+    EXPECT_EQ(rep.errorCount(), before) << "linking the single merged module must not error";
+    EXPECT_TRUE(image.ok()) << "the merged single-module image must link cleanly";
+    EXPECT_TRUE(image.resolvedCrossCuRefs.empty())
+        << "the merged image has NO cross-CU reference — `mergeModules` mints a thunk "
+           "slot only from a non-empty resolvedCrossCuRefs, so this is the definitive "
+           "proof the cycle-19 thunk is gone for the now-internal main→add5 call";
 }
