@@ -825,13 +825,12 @@ enum class DiagnosticCode : std::uint16_t {
     //   weak; multiple weak resolve to a deterministic pick); Local defs never trip
     //   it (they stay module-private and are matched only within their own module).
     K_SymbolRedefinedAcrossUnits   = 0x8011,
-    // K_CrossCuImageEmitDeferred: cross-CU symbol resolution SUCCEEDED (every
-    //   relocation resolved, no redefinition conflict), but emitting the merged
-    //   image BYTES (cross-CU section layout + VA assignment + cross-module reloc
-    //   application + per-format walker) is LK11b — it co-lands with the multi-CU
-    //   build driver, since real merged bytes need real multi-CU input to verify.
-    //   Distinct from K_CrossCuMergeUnsupported so a caller can tell "resolution
-    //   passed, bytes pending" from "this merge interaction isn't supported".
+    // K_CrossCuImageEmitDeferred: RETIRED at LK11b (2026-06-04). It signalled
+    //   "cross-CU resolution succeeded, merged bytes pending" while LK11a deferred
+    //   emission. LK11b now PRE-MERGES the resolved CUs into one combined module that
+    //   the existing format walker emits — there is no deferral, so this code is no
+    //   longer emitted. Retained (not reused — diagnostic codes are append-only) for
+    //   log-decode back-compat; the slot stays burned.
     K_CrossCuImageEmitDeferred     = 0x8012,
     // K-NEXT-SLOT: 0x8013 — grep this marker before adding a K_* code.
 

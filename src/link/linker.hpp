@@ -57,14 +57,14 @@ struct DSS_EXPORT LinkedImage {
     // the per-function-resolved count.
     std::size_t               expectedFuncCount = 0;
     std::size_t               resolvedFuncCount = 0;
-    // Count of indexed symbols — meaning depends on the link arity:
-    //   * Single-CU (N==1): distinct (cuId, SymbolId) compound keys in the per-module
-    //     index (D-LK4-3 — the compound key keeps two CUs' colliding bare SymbolId
-    //     distinct; a regression to a bare key collapses them, which the collision pin
-    //     asserts via the count + the absence of a false duplicate).
-    //   * Cross-CU (N>1, LK11a): the number of resolved global DEFINITIONS in
-    //     `resolvedGlobalDefs` after weak-vs-strong resolution.
-    // Read by tests; not load-bearing for emission.
+    // Count of indexed symbols in the EMITTED module's compound-key index (set by the
+    // emission path). Single-CU: the sole module's symbols (D-LK4-3 — the compound key
+    // keeps two CUs' colliding bare SymbolId distinct; a regression to a bare key
+    // collapses them, which the collision pin asserts). Cross-CU (N>1, LK11b): the
+    // MERGED combined module's symbols (functions + data + externs the walker emits).
+    // An N>1 merge that fail-louds BEFORE emission (a pending cross-CU reference /
+    // ambiguous entry) retains the resolution-side count. Prefer `resolvedGlobalDefs`
+    // (.size()) for the cross-CU RESOLUTION outcome — symbolCount is the EMISSION count.
     std::size_t               symbolCount = 0;
 
     // LK11a: the cross-CU symbol-resolution outcome — for each externally-visible

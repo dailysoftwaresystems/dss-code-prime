@@ -155,6 +155,114 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     image.symbolCount = image.resolvedGlobalDefs.size();
 }
 
+// LK11b — pre-merge N resolved CUs into ONE combined AssembledModule, so the existing
+// single-CU format walker emits the merged image (no per-format N-module rewrite).
+// Symbols are remapped into a fresh unified id space: each winning Global/Weak
+// DEFINITION (image.resolvedGlobalDefs) gets one fresh id that all same-name versions
+// fold onto (dedup); a Local symbol gets a distinct fresh id (module-private — two CUs'
+// SymbolId{3} locals are different functions). Every function's relocations are
+// retargeted from (its cuId, old SymbolId) to the merged id. Cross-CU REFERENCE
+// byte-patching (an extern bound to a sibling-CU definition becomes an intra-image
+// relocation to that def) needs the cross-CU-call expression — the NEXT LK11b step; an
+// extern with no cross-CU definition is a real FFI import, kept (remapped). Fails loud
+// (rather than silently emit a DLL import for a resolved cross-CU reference) if any
+// reference resolved cross-CU.
+AssembledModule mergeModules(std::span<AssembledModule const> modules,
+                             LinkedImage const&  image,
+                             DiagnosticReporter& reporter) {
+    if (!image.resolvedCrossCuRefs.empty()) {
+        report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported,
+               DiagnosticSeverity::Error,
+               std::to_string(image.resolvedCrossCuRefs.size()) +
+               " cross-CU reference(s) resolved to sibling-CU definitions; patching the "
+               "referencing relocations into the merged image is the next LK11b step "
+               "(co-lands with the cross-CU-call / sibling-CU-extern expression).");
+        return {};
+    }
+
+    AssembledModule combined;
+
+    // Per-module SymbolId.v -> ModuleSymbol for O(1) name/binding lookup during remap.
+    std::vector<std::unordered_map<std::uint32_t, ModuleSymbol const*>> byId(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        for (auto const& ms : modules[i].symbols) byId[i].emplace(ms.symbol.v, &ms);
+    }
+
+    // (cuId, old SymbolId) -> fresh merged SymbolId.v. Pre-assign one fresh id per
+    // resolved global name (the winning definition); same-name versions fold onto it.
+    std::unordered_map<LinkedSymbolKey, std::uint32_t> remap;
+    std::unordered_map<std::string, std::uint32_t>     nameToId;
+    std::uint32_t nextId = 1;
+    for (auto const& [name, key] : image.resolvedGlobalDefs) {
+        std::uint32_t const id = nextId++;
+        remap.emplace(key, id);
+        nameToId.emplace(name, id);
+    }
+    auto mergedIdFor = [&](std::size_t modIdx, SymbolId old) -> std::uint32_t {
+        LinkedSymbolKey const key{modules[modIdx].cuId, old};
+        if (auto it = remap.find(key); it != remap.end()) return it->second;
+        // Not a pre-assigned winner: fold an externally-visible same-name def onto its
+        // winner; otherwise mint a fresh id (Local / extern import / unnamed).
+        if (auto sit = byId[modIdx].find(old.v); sit != byId[modIdx].end()) {
+            ModuleSymbol const& ms = *sit->second;
+            if (ms.binding != SymbolBinding::Local) {
+                if (auto nit = nameToId.find(ms.name); nit != nameToId.end()) {
+                    remap.emplace(key, nit->second);
+                    return nit->second;
+                }
+            }
+        }
+        std::uint32_t const id = nextId++;
+        remap.emplace(key, id);
+        return id;
+    };
+    // Single chokepoint for relocation retargeting — functions AND data items route
+    // through it, so a future change can't retarget one kind and miss the other.
+    auto retargetRelocs = [&](std::size_t modIdx, std::vector<Relocation>& relocs) {
+        for (auto& rel : relocs) rel.target = SymbolId{mergedIdFor(modIdx, rel.target)};
+    };
+
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        auto const& m = modules[i];
+        for (auto const& fn : m.functions) {
+            AssembledFunction out = fn;  // bytes + relocations + sourceMap copied
+            out.symbol = SymbolId{mergedIdFor(i, fn.symbol)};
+            retargetRelocs(i, out.relocations);
+            combined.functions.push_back(std::move(out));
+        }
+        for (auto const& di : m.dataItems) {
+            AssembledData out = di;
+            out.symbol = SymbolId{mergedIdFor(i, di.symbol)};
+            retargetRelocs(i, out.relocations);  // same chokepoint as the function path
+            combined.dataItems.push_back(std::move(out));
+        }
+        for (auto const& ext : m.externImports) {
+            ExternImport out = ext;
+            out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};
+            combined.externImports.push_back(std::move(out));
+        }
+    }
+    combined.expectedFuncCount = combined.functions.size();
+
+    // Exactly one CU may name the user entry; more than one is an ambiguous cross-CU
+    // entry (the merged image has exactly one entry point) — fail loud.
+    bool entrySet = false;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        if (!modules[i].userEntrySymbol.has_value()) continue;
+        if (entrySet) {
+            report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits,
+                   DiagnosticSeverity::Error,
+                   "more than one CompilationUnit names a user entry symbol — the merged "
+                   "image has exactly one entry point.");
+            continue;
+        }
+        combined.userEntrySymbol = SymbolId{mergedIdFor(i, *modules[i].userEntrySymbol)};
+        entrySet = true;
+    }
+    // combined.cuId stays default — the merged image is not a single CU.
+    return combined;
+}
+
 } // namespace
 
 LinkedImage link(std::span<AssembledModule const> modules,
@@ -174,36 +282,35 @@ LinkedImage link(std::span<AssembledModule const> modules,
                "linker::link received no modules to link.");
         return image;
     }
+    // N>1: cross-CU merge (LK11a resolution + LK11b pre-merge emission). Validate each
+    // CU, resolve symbols, then pre-merge the resolved CUs into ONE combined module that
+    // flows through the SAME single-CU emission path below (kind validation + walker).
+    // N==1 uses the sole module directly (path unchanged).
+    AssembledModule mergedStorage;                 // populated only for N>1
+    AssembledModule const* selectedInput = &modules[0];
     if (modules.size() > 1) {
-        // Per-CU validation first (within-CU duplicate SymbolId + empty extern
-        // name/path), via the same compound-key gate the single-CU path uses.
-        // Cross-CU entries never collide (distinct cuId), so one shared index
-        // validates every CU's internal consistency.
+        std::size_t const errsBeforeMerge = reporter.errorCount();
+        // Per-CU validation (within-CU duplicate SymbolId + empty extern name/path) via
+        // the same compound-key gate the single-CU path uses; cross-CU entries never
+        // collide (distinct cuId), so one shared index validates every CU.
         std::unordered_map<LinkedSymbolKey, SymbolKind> compoundIndex;
         for (auto const& m : modules) buildCompoundIndex(compoundIndex, m, reporter);
-
-        // Cross-CU merge: DEFINITION merge + weak-vs-strong (-> resolvedGlobalDefs) +
-        // REFERENCE resolution (extern -> sibling def -> resolvedCrossCuRefs) + per-CU
-        // relocation resolution (undefined -> K_SymbolUndefined).
+        // DEFINITION merge + weak-vs-strong (-> resolvedGlobalDefs) + REFERENCE
+        // resolution (-> resolvedCrossCuRefs) + per-CU undefined-reloc check.
         resolveCrossCuSymbols(modules, compoundIndex, image, reporter);
-
-        // The merged-image BYTE emission (cross-CU section layout + VA assignment +
-        // cross-module relocation apply + per-format walker) AND resolving a
-        // reference to a sibling-CU definition (the extern -> definition path) are
-        // LK11b — they co-land with the multi-CU build driver, since real merged
-        // bytes need real multi-CU input to verify. Distinct code so a caller can
-        // tell "resolution passed, emission pending" from a true merge failure.
-        report(reporter, DiagnosticCode::K_CrossCuImageEmitDeferred,
-               DiagnosticSeverity::Error,
-               "cross-CU symbol resolution completed for " +
-               std::to_string(modules.size()) + " CompilationUnits (" +
-               std::to_string(image.symbolCount) + " global definition(s) resolved); "
-               "merged-image byte emission is LK11b (co-lands with the multi-CU "
-               "build driver).");
-        return image;
+        if (reporter.errorCount() != errsBeforeMerge) {
+            // A within-CU duplicate, a cross-CU redefinition, or an undefined reference —
+            // fail-loud already reported; do not emit a half-merged image.
+            return image;
+        }
+        // Pre-merge into one combined module + flow it through the emission path below.
+        mergedStorage = mergeModules(modules, image, reporter);
+        if (reporter.errorCount() != errsBeforeMerge) {
+            return image;  // merge fail-loud (ambiguous entry / cross-CU ref pending).
+        }
+        selectedInput = &mergedStorage;
     }
-
-    AssembledModule const& inputModule = modules[0];
+    AssembledModule const& inputModule = *selectedInput;
     image.expectedFuncCount = inputModule.expectedFuncCount;
 
     // D-LK10-ENTRY Slice C (plan 14 §2.13): when the format declares
