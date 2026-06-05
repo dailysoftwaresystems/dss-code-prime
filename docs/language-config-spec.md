@@ -389,10 +389,12 @@ Tokenizers for interpolated strings, here-strings, and multi-language embeddings
 
 | Field | Required | Notes |
 |---|---|---|
-| `tokens` | no | `"default"` inherits the top-level `tokens` map. Inline `{ ... }` object is parsed-deferred (warning emitted; lookup table stays empty until per-mode-inline-tokens lands). |
+| `tokens` | no | `"default"` inherits the top-level `tokens` map. An inline `{ ... }` object is a **per-mode override table** parsed with the same meaning semantics as the top-level `tokens` map: while the tokenizer is in this mode the scanner consults this table FIRST and falls back to the top-level `tokens` map for any lexeme the mode doesn't override. So the same source character can lex to a different token kind inside the mode than outside it (context-sensitive lexing). A non-array value for a lexeme key, or a meaning entry missing its `kind`, is a load error (same fail-loud discipline as the top-level map). |
 | `defaultToken` | no | `{ "kind": "X" }`. Emitted by the tokenizer when nothing else matches the input. Common for `string-body` modes whose body is mostly free text. |
 
 **`defaultToken.kind` is off-grammar.** A kind declared here is implicitly off-grammar — it represents per-codepoint body content that the schema cursor never expects. The builder skips the cursor-advance for those tokens (string/comment bodies stay visible in the AST but don't drive shape matching). Referencing the same kind from any `shapes/*` rule emits `C_BodyDefaultKindInShape` at load time, because the shape's slot would silently never match. Either pick a distinct kind for the shape slot, or stop using the kind as a `defaultToken`.
+
+**Override-first longest-match (a context-sensitivity footgun).** A per-mode `tokens` override wins at the LONGEST length *it* matches, short-circuiting before the top-level map is consulted. So if a mode overrides a 1-char lexeme (`<`) that is also the prefix of a 2-char *global* lexeme (`<<`), input `<<` inside that mode lexes as TWO override tokens — the global `<<` is never reached. This is the intended semantic: a mode *redefines* what a character means (e.g. an `#include` mode makes `<` open a header path, deliberately suppressing `<<`-as-shift). To keep a longer global lexeme available INSIDE a mode, **re-list it in the mode's override table**. Longest-match still applies *within* the override table.
 
 **Backward compat.** If `lexerModes` is absent the loader synthesizes a `"main"` mode pointing at the top-level `tokens` map. v1 configs continue to load unchanged.
 
@@ -462,7 +464,7 @@ Delimited string literals — `"hello"`, `@"verbatim ""quotes"""`, `R"DELIM(raw)
 | `C_InvalidStringStyle` | A `stringStyle` block is malformed — see §9.7 (missing/empty `endsAt`; `escapeChar` without `escapeKind: "char"`; `tagPattern` without `delimiterTag: "matched"`; invalid `tagPattern` regex; unknown `escapeKind`; non-`"matched"` `delimiterTag` value; wrong-typed sub-field). |
 | `C_BodyDefaultKindInShape` | A `lexerModes.<m>.defaultToken.kind` is also referenced from a `shapes/*` rule. Body-default kinds are off-grammar (the cursor never expects them); a shape reference would silently never match. Pick a distinct kind for the shape slot or stop using the kind as a `defaultToken`. |
 | `C_RedundantScopeRequire` (warning) | Your `scopeRequire` has a contradiction or redundancy. The rule still loads. |
-| `C_RedundantField` (warning) | `lookahead` without `speculative: true`; `modeArg` with `popMode`; case-folded duplicate mode name; mode with only `defaultToken` and no `tokens` field; inline per-mode `tokens` object (not yet parsed). The rule still loads. |
+| `C_RedundantField` (warning) | `lookahead` without `speculative: true`; `modeArg` with `popMode`; case-folded duplicate mode name; mode with only `defaultToken` and no `tokens` field. The rule still loads. |
 | `P_ContextualKeywordResolution` (info, at parse) | A soft keyword demoted to `Identifier`. Expected behavior when the cursor's expected set excludes the keyword. |
 | `P_SchemaCursorDesync` (info, one-shot) | The schema cursor went off-track. Usually means a caller drove the builder against a sequence the schema doesn't expect. Contextual resolution stays strict from this point. |
 | `P_MaxSpeculationDepth` (error, one-shot) | `TreeBuilder::Checkpoint` stack exceeded `BuilderConfig::maxSpeculationDepth` (default 64). Subsequent `checkpoint()` calls return no-op guards. |

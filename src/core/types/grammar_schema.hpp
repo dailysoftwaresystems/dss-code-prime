@@ -221,8 +221,10 @@ struct DSS_EXPORT GrammarSchemaData {
     // sentinel via `subspan(1)`. Real ids dense 1..N; "main"
     // synthesized at id 1 even when JSON omits `lexerModes`.
     // `lexerModeTokens` keyed by id; "main" mirrors `lexemeTable`;
-    // modes with `tokens: "default"` inherit it; inline
-    // `tokens: {...}` parsing is deferred (loader warns).
+    // modes with `tokens: "default"` inherit it; an inline
+    // `tokens: {...}` object is parsed into a per-mode override table,
+    // consulted BEFORE `lexemeTable` with global fallback (see
+    // `lookupLexemeInMode`) — context-sensitive lexing.
     std::vector<LexerMode>                            lexerModes;
     std::unordered_map<std::string, LexerModeId>      lexerModeIds;
     std::unordered_map<std::uint32_t,

@@ -121,6 +121,44 @@ struct LookupHit {
     return {};
 }
 
+// ── per-mode (context-sensitive) lexeme lookup ───────────────────────────
+//
+// Mode-aware longest-match. The active lexer mode may declare a per-mode
+// `tokens` override table (parsed by the loader into
+// `lexerModeTokens[mode]`); while in that mode the scanner consults the
+// override table FIRST. The override wins wherever it matches — even at a
+// shorter length than a competing GLOBAL lexeme — because a
+// context-sensitive mode exists precisely to redefine what a character
+// means in that context (e.g. `<` opening a header path inside an
+// `#include` mode while staying `LtOp` everywhere else).
+//
+// ZERO-REGRESSION FALLBACK (the load-bearing correctness property): if the
+// mode's override table produces NO match, the result is the EXACT global
+// `longestMatch` — the same code path the tokenizer used before per-mode
+// lexing existed. In the default mode that every shipped language uses
+// (its override table is a verbatim copy of the global `lexemeTable`, and
+// no shipped grammar declares a distinct override), the override-table
+// longest-match equals the global longest-match for every input, so this
+// function is byte-identical to the prior behavior. A grammar that does
+// declare overrides only diverges for the lexemes it overrides, while in
+// that mode; everything else still routes through the global fallback.
+[[nodiscard]] LookupHit longestMatchInMode(GrammarSchema const& schema,
+                                           LexerModeId mode,
+                                           std::string_view remaining,
+                                           std::size_t maxLength) noexcept {
+    if (maxLength == 0) return {};
+    const std::size_t maxN = std::min(maxLength, remaining.size());
+    // 1. Override table first — longest declared override key wins.
+    for (std::size_t len = maxN; len >= 1; --len) {
+        const auto cands = schema.lookupLexemeInMode(mode, remaining.substr(0, len));
+        if (cands.empty()) continue;
+        return LookupHit{ .length = len, .meaning = cands[0] };
+    }
+    // 2. Nothing in the mode overrides this position — fall back to the
+    //    exact global longest-match path (unchanged behavior).
+    return longestMatch(schema, remaining, maxLength);
+}
+
 // ── UTF-8 codepoint length ────────────────────────────────────────────────
 //
 // In a body mode (where the user chose per-codepoint defaultToken
@@ -732,6 +770,13 @@ TokenizeResult Tokenizer::tokenize() && {
 
         const char c = r.peek();
 
+        // Active lexer mode for this main-scan position. The body-mode
+        // branch above already `continue`d, so `frames.back()` is the
+        // mode whose token table the operator/identifier lookups must
+        // consult first (with global fallback). `frames` always holds at
+        // least the always-on "main" frame, so `back()` is safe.
+        const LexerModeId activeMode = frames.back().mode;
+
         // Whitespace runs emit one token per byte (matches the per-char
         // schema convention) — the pre-resolved kinds avoid the
         // longest-match loop for these known single-byte lookups.
@@ -756,7 +801,8 @@ TokenizeResult Tokenizer::tokenize() && {
             std::size_t identLen = 1;
             while (isIdContinue(r.peek(identLen))) ++identLen;
 
-            const auto globalHit = longestMatch(*schema_, r.remaining(), lexemeProbeMax);
+            const auto globalHit = longestMatchInMode(*schema_, activeMode,
+                                                      r.remaining(), lexemeProbeMax);
             if (globalHit.length > identLen) {
                 r.advance(globalHit.length);
                 // coreKindForByte returns Operator for an id-start byte;
@@ -770,7 +816,8 @@ TokenizeResult Tokenizer::tokenize() && {
 
             r.advance(identLen);
             const auto lexeme = r.slice(start, r.position());
-            const auto hit = longestMatch(*schema_, lexeme, lexemeProbeMax);
+            const auto hit = longestMatchInMode(*schema_, activeMode,
+                                                lexeme, lexemeProbeMax);
             // Only honor the lookup when it covers the entire run; a
             // schema entry like `int` shouldn't claim part of `integer`.
             const bool fullMatch = (hit.length == lexeme.size());
@@ -824,10 +871,12 @@ TokenizeResult Tokenizer::tokenize() && {
             continue;
         }
 
-        // Operator or punctuation: longest-match against the schema's
-        // declared lexeme keys, bounded by the schema's longest key
-        // length (no silent truncation on a future 5+ char lexeme).
-        const auto hit = longestMatch(*schema_, r.remaining(), lexemeProbeMax);
+        // Operator or punctuation: longest-match against the active
+        // mode's override table first, then the schema's global lexeme
+        // keys, bounded by the schema's longest key length (no silent
+        // truncation on a future 5+ char lexeme).
+        const auto hit = longestMatchInMode(*schema_, activeMode,
+                                            r.remaining(), lexemeProbeMax);
         if (hit.length > 0) {
             r.advance(hit.length);
             emit(coreKindForByte(c), hit.meaning.id, hit.meaning.flagsApplied);

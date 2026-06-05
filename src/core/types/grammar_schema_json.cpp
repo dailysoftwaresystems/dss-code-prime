@@ -1243,6 +1243,262 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
     }
 }
 
+// Parse one lexeme's array of meaning objects into a vector of
+// LexemeMeaning, sorted priority-ascending (stable on declaration-order
+// ties). Shared by the top-level `tokens` table and per-mode `tokens`
+// override tables so both honor IDENTICAL meaning semantics — kind,
+// priority, flags, opensScope, scopeRequire/validScopes, mode ops, and
+// stringStyle — with no second, drifting copy of the validation.
+//
+// `pathPrefix` is the JSON-pointer prefix for diagnostics and already
+// includes the lexeme segment (e.g. `/tokens/<` for the global table or
+// `/lexerModes/include/tokens/<` for a per-mode override), so emitted
+// pointers stay accurate to the author's source location.
+//
+// Side effects on `data`: interns token kinds, records EmptySpace kinds,
+// appends scope lists to `scopeListPool`, and appends StringStyles to
+// `stringStyles`. The scope-pool reservation is done up front INSIDE
+// this call (count, then grow capacity by the needed amount) so no
+// reallocation occurs while spans into the pool are being taken — the
+// same invariant the top-level token loader relied on, now local to and
+// guaranteed by each invocation.
+[[nodiscard]] std::vector<LexemeMeaning> parseMeaningArray(
+    json const& arr,
+    std::string const& pathPrefix,
+    GrammarSchemaData& data,
+    Collector& coll) {
+
+    std::vector<LexemeMeaning> meanings;
+
+    // Pass A: count scopeRequire/validScopes lists this array contributes
+    // and grow the pool's capacity once so the spans taken in Pass B point
+    // into storage that does not reallocate mid-loop.
+    std::size_t poolNeeded = 0;
+    for (auto const& m : arr) {
+        if (!m.is_object()) continue;
+        if (m.contains("validScopes")) ++poolNeeded;
+        if (m.contains("scopeRequire") && m.at("scopeRequire").is_object()) {
+            auto const& sr = m.at("scopeRequire");
+            if (sr.contains("anyOf"))  ++poolNeeded;
+            if (sr.contains("forbid")) ++poolNeeded;
+        }
+    }
+    data.scopeListPool.reserve(data.scopeListPool.size() + poolNeeded);
+
+    meanings.reserve(arr.size());
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        json const& m = arr[i];
+        const auto entryPath = std::format("{}/{}", pathPrefix, i);
+        if (!m.is_object()) {
+            coll.emit(DiagnosticCode::C_UnknownToken, entryPath,
+                      "meaning entry must be an object");
+            continue;
+        }
+        if (!m.contains("kind") || !m.at("kind").is_string()) {
+            coll.emit(DiagnosticCode::C_MissingField, entryPath,
+                      "meaning must have a string 'kind' field");
+            continue;
+        }
+
+        LexemeMeaning lm{};
+        lm.id          = data.schemaTokens->intern(m.at("kind").get<std::string>());
+        lm.priority    = m.value("priority", 0);
+        lm.closesScope = m.value("closesScope", false);
+
+        // `contextual` is a keyword-only concept. Tokens are
+        // operators / punctuation / built-ins — they don't
+        // degrade to identifiers based on parse position.
+        if (m.contains("contextual")) {
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("{}/contextual", entryPath),
+                      "'contextual' is only valid on keyword entries — tokens never degrade to identifiers");
+        }
+
+        if (m.contains("flags")) {
+            lm.flagsApplied = parseFlagList(m.at("flags"));
+        }
+        if (isEmptySpace(lm.flagsApplied)) {
+            data.emptySpaceTokens.insert(lm.id.v);
+        }
+        if (m.contains("opensScope") && m.at("opensScope").is_string()) {
+            const auto sk = parseScopeName(m.at("opensScope").get<std::string>());
+            if (!sk) {
+                coll.emit(DiagnosticCode::C_UnknownScopeName, entryPath,
+                          std::format("unknown scope name '{}'",
+                                      m.at("opensScope").get<std::string>()));
+            } else {
+                lm.opensScope = *sk;
+            }
+        }
+        // Reject co-existence of legacy `validScopes` and
+        // `scopeRequire`. One source of truth per meaning
+        // keeps span backing unambiguous and prevents an
+        // author from splitting their intent across two
+        // fields and ending up with neither.
+        const bool hasLegacy = m.contains("validScopes");
+        const bool hasNew    = m.contains("scopeRequire");
+        bool scopeRequireFatal = false;
+        if (hasLegacy && hasNew) {
+            coll.emit(DiagnosticCode::C_ConflictingField, entryPath,
+                      "meaning declares both 'validScopes' and "
+                      "'scopeRequire' — use 'scopeRequire' only "
+                      "(legacy 'validScopes' is shorthand for 'scopeRequire.anyOf')");
+            scopeRequireFatal = true;
+        } else if (hasLegacy) {
+            if (!m.at("validScopes").is_array()) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("{}/validScopes", entryPath),
+                          "'validScopes' must be an array of scope-name strings");
+            } else {
+                auto anyOf = parseScopeArray(m.at("validScopes"),
+                                             std::format("{}/validScopes", entryPath),
+                                             coll);
+                if (!anyOf.empty()) {
+                    data.scopeListPool.push_back(std::move(anyOf));
+                    lm.scopeRequire.anyOf = std::span<ScopeKind const>{
+                        data.scopeListPool.back()};
+                } else if (!m.at("validScopes").empty()) {
+                    // Author wrote a non-empty array but every
+                    // entry failed parsing — the diagnostics
+                    // already flagged each bad name. No extra
+                    // emission needed; the meaning loads with
+                    // no anyOf constraint, the way it would
+                    // have with an explicit `[]`.
+                } else {
+                    coll.emit(DiagnosticCode::C_RedundantScopeRequire,
+                              std::format("{}/validScopes", entryPath),
+                              "'validScopes' is an empty array — drop the "
+                              "field or list at least one scope",
+                              DiagnosticSeverity::Warning);
+                }
+            }
+        } else if (hasNew) {
+            if (!m.at("scopeRequire").is_object()) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("{}/scopeRequire", entryPath),
+                          "'scopeRequire' must be an object");
+            } else {
+                json const& sr = m.at("scopeRequire");
+                auto loadList = [&](std::string_view key,
+                                    std::span<ScopeKind const>& outSpan) {
+                    if (!sr.contains(key)) return;
+                    json const& v = sr.at(key);
+                    const auto path = std::format("{}/scopeRequire/{}",
+                                                  entryPath, key);
+                    if (!v.is_array()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                  std::format("'{}' must be an array of scope-name strings", key));
+                        return;
+                    }
+                    if (v.empty()) {
+                        coll.emit(DiagnosticCode::C_RedundantScopeRequire, path,
+                                  std::format("'{}' is an empty array — drop the field "
+                                              "or list at least one scope", key),
+                                  DiagnosticSeverity::Warning);
+                        return;
+                    }
+                    auto parsed = parseScopeArray(v, path, coll);
+                    if (!parsed.empty()) {
+                        data.scopeListPool.push_back(std::move(parsed));
+                        outSpan = std::span<ScopeKind const>{
+                            data.scopeListPool.back()};
+                    }
+                };
+                loadList("anyOf",  lm.scopeRequire.anyOf);
+                loadList("forbid", lm.scopeRequire.forbid);
+                lm.scopeRequire.topMustBe =
+                    parseScopeNameField(sr, "topMustBe", entryPath + "/scopeRequire", coll);
+                lm.scopeRequire.outermost =
+                    parseScopeNameField(sr, "outermost", entryPath + "/scopeRequire", coll);
+
+                // Redundancy / contradiction checks. None of
+                // these reject the meaning — the builder will
+                // run the rule as-written — but the author
+                // almost always wants to know.
+                auto const& sm = lm.scopeRequire;
+                const auto srPath = std::format("{}/scopeRequire", entryPath);
+                if (sm.topMustBe.has_value() && !sm.anyOf.empty()) {
+                    coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                              "'anyOf' is redundant when 'topMustBe' is set "
+                              "(topMustBe is the stricter constraint)",
+                              DiagnosticSeverity::Warning);
+                }
+                if (sm.topMustBe.has_value() && sm.outermost.has_value() &&
+                    *sm.topMustBe == *sm.outermost) {
+                    coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                              "'topMustBe' and 'outermost' name the same scope; "
+                              "the rule matches only single-scope stacks",
+                              DiagnosticSeverity::Warning);
+                }
+                auto forbidContains = [&](ScopeKind k) {
+                    for (auto x : sm.forbid) if (x == k) return true;
+                    return false;
+                };
+                if (sm.topMustBe.has_value() && forbidContains(*sm.topMustBe)) {
+                    coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                              "'forbid' lists the same scope as 'topMustBe' — "
+                              "the rule can never match",
+                              DiagnosticSeverity::Warning);
+                }
+                if (sm.outermost.has_value() && forbidContains(*sm.outermost)) {
+                    coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                              "'forbid' lists the same scope as 'outermost' — "
+                              "the rule can never match",
+                              DiagnosticSeverity::Warning);
+                }
+                for (auto a : sm.anyOf) {
+                    if (forbidContains(a)) {
+                        coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
+                                  std::format("scope '{}' appears in both "
+                                              "'anyOf' and 'forbid' — the rule "
+                                              "can never match",
+                                              scopeName(a)),
+                                  DiagnosticSeverity::Warning);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (scopeRequireFatal) {
+            // Don't push a meaning with no constraint when the
+            // author asked for one via conflicting fields —
+            // skip it entirely so the rest of the schema isn't
+            // weakened by the loader's silent fallback.
+            continue;
+        }
+        parseModeFields(m, entryPath, data.lexerModeIds, lm, coll);
+
+        if (m.contains("stringStyle")) {
+            auto ss = parseStringStyle(m.at("stringStyle"),
+                                       std::format("{}/stringStyle", entryPath),
+                                       coll);
+            if (ss.has_value()) {
+                // Reserve slot 0 as the InvalidStringStyle
+                // sentinel; real ids 1..N. Matches the
+                // LexerModeId / NodeId / RuleId convention.
+                if (data.stringStyles.empty()) {
+                    data.stringStyles.push_back(StringStyle{});
+                }
+                lm.stringStyleId = StringStyleId{
+                    static_cast<std::uint32_t>(data.stringStyles.size())};
+                data.stringStyles.push_back(std::move(*ss));
+            }
+        }
+
+        meanings.push_back(lm);
+    }
+
+    // Deterministic ordering: lowest priority wins; ties
+    // broken by declaration order (hence stable_sort).
+    std::stable_sort(meanings.begin(), meanings.end(),
+        [](LexemeMeaning const& a, LexemeMeaning const& b) {
+            return a.priority < b.priority;
+        });
+
+    return meanings;
+}
+
 } // anonymous namespace
 
 LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
@@ -1402,28 +1658,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             coll.emit(DiagnosticCode::C_MissingField, "/tokens",
                       "'tokens' must be an object");
         } else {
-            // Pass A: count anyOf/forbid lists upfront to reserve the
-            // backing pool exactly. Reallocation would invalidate the
-            // ScopeMatch spans we set up next.
-            //   - legacy `validScopes`         → 1 list (anyOf)
-            //   - `scopeRequire.anyOf`         → 1 list
-            //   - `scopeRequire.forbid`        → 1 list
-            std::size_t poolNeeded = 0;
-            for (auto const& [lex, arr] : doc.at("tokens").items()) {
-                if (!arr.is_array()) continue;
-                for (auto const& m : arr) {
-                    if (!m.is_object()) continue;
-                    if (m.contains("validScopes")) ++poolNeeded;
-                    if (m.contains("scopeRequire") && m.at("scopeRequire").is_object()) {
-                        auto const& sr = m.at("scopeRequire");
-                        if (sr.contains("anyOf"))  ++poolNeeded;
-                        if (sr.contains("forbid")) ++poolNeeded;
-                    }
-                }
-            }
-            data.scopeListPool.reserve(poolNeeded);
-
-            // Pass B: populate lexemeTable + spans.
+            // Each lexeme's meaning array is parsed by the shared
+            // `parseMeaningArray` helper — the SAME routine the per-mode
+            // `tokens` override path uses, so global and per-mode tables
+            // can never drift in meaning semantics. The helper owns its
+            // own scope-pool reservation (the former Pass A) so no
+            // reallocation occurs while it takes spans into the pool.
             for (auto const& [lex, arr] : doc.at("tokens").items()) {
                 if (!arr.is_array()) {
                     coll.emit(DiagnosticCode::C_UnknownToken,
@@ -1431,218 +1671,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "value must be an array of meaning objects");
                     continue;
                 }
-                auto& meanings = data.lexemeTable[lex];
-                meanings.reserve(arr.size());
-
-                for (std::size_t i = 0; i < arr.size(); ++i) {
-                    json const& m = arr[i];
-                    const auto entryPath = std::format("/tokens/{}/{}", lex, i);
-                    if (!m.is_object()) {
-                        coll.emit(DiagnosticCode::C_UnknownToken, entryPath,
-                                  "meaning entry must be an object");
-                        continue;
-                    }
-                    if (!m.contains("kind") || !m.at("kind").is_string()) {
-                        coll.emit(DiagnosticCode::C_MissingField, entryPath,
-                                  "meaning must have a string 'kind' field");
-                        continue;
-                    }
-
-                    LexemeMeaning lm{};
-                    lm.id          = data.schemaTokens->intern(m.at("kind").get<std::string>());
-                    lm.priority    = m.value("priority", 0);
-                    lm.closesScope = m.value("closesScope", false);
-
-                    // `contextual` is a keyword-only concept. Tokens are
-                    // operators / punctuation / built-ins — they don't
-                    // degrade to identifiers based on parse position.
-                    if (m.contains("contextual")) {
-                        coll.emit(DiagnosticCode::C_MissingField,
-                                  std::format("{}/contextual", entryPath),
-                                  "'contextual' is only valid on keyword entries — tokens never degrade to identifiers");
-                    }
-
-                    if (m.contains("flags")) {
-                        lm.flagsApplied = parseFlagList(m.at("flags"));
-                    }
-                    if (isEmptySpace(lm.flagsApplied)) {
-                        data.emptySpaceTokens.insert(lm.id.v);
-                    }
-                    if (m.contains("opensScope") && m.at("opensScope").is_string()) {
-                        const auto sk = parseScopeName(m.at("opensScope").get<std::string>());
-                        if (!sk) {
-                            coll.emit(DiagnosticCode::C_UnknownScopeName, entryPath,
-                                      std::format("unknown scope name '{}'",
-                                                  m.at("opensScope").get<std::string>()));
-                        } else {
-                            lm.opensScope = *sk;
-                        }
-                    }
-                    // Reject co-existence of legacy `validScopes` and
-                    // `scopeRequire`. One source of truth per meaning
-                    // keeps span backing unambiguous and prevents an
-                    // author from splitting their intent across two
-                    // fields and ending up with neither.
-                    const bool hasLegacy = m.contains("validScopes");
-                    const bool hasNew    = m.contains("scopeRequire");
-                    bool scopeRequireFatal = false;
-                    if (hasLegacy && hasNew) {
-                        coll.emit(DiagnosticCode::C_ConflictingField, entryPath,
-                                  "meaning declares both 'validScopes' and "
-                                  "'scopeRequire' — use 'scopeRequire' only "
-                                  "(legacy 'validScopes' is shorthand for 'scopeRequire.anyOf')");
-                        scopeRequireFatal = true;
-                    } else if (hasLegacy) {
-                        if (!m.at("validScopes").is_array()) {
-                            coll.emit(DiagnosticCode::C_ConflictingField,
-                                      std::format("{}/validScopes", entryPath),
-                                      "'validScopes' must be an array of scope-name strings");
-                        } else {
-                            auto anyOf = parseScopeArray(m.at("validScopes"),
-                                                         std::format("{}/validScopes", entryPath),
-                                                         coll);
-                            if (!anyOf.empty()) {
-                                data.scopeListPool.push_back(std::move(anyOf));
-                                lm.scopeRequire.anyOf = std::span<ScopeKind const>{
-                                    data.scopeListPool.back()};
-                            } else if (!m.at("validScopes").empty()) {
-                                // Author wrote a non-empty array but every
-                                // entry failed parsing — the diagnostics
-                                // already flagged each bad name. No extra
-                                // emission needed; the meaning loads with
-                                // no anyOf constraint, the way it would
-                                // have with an explicit `[]`.
-                            } else {
-                                coll.emit(DiagnosticCode::C_RedundantScopeRequire,
-                                          std::format("{}/validScopes", entryPath),
-                                          "'validScopes' is an empty array — drop the "
-                                          "field or list at least one scope",
-                                          DiagnosticSeverity::Warning);
-                            }
-                        }
-                    } else if (hasNew) {
-                        if (!m.at("scopeRequire").is_object()) {
-                            coll.emit(DiagnosticCode::C_ConflictingField,
-                                      std::format("{}/scopeRequire", entryPath),
-                                      "'scopeRequire' must be an object");
-                        } else {
-                            json const& sr = m.at("scopeRequire");
-                            auto loadList = [&](std::string_view key,
-                                                std::span<ScopeKind const>& outSpan) {
-                                if (!sr.contains(key)) return;
-                                json const& v = sr.at(key);
-                                const auto path = std::format("{}/scopeRequire/{}",
-                                                              entryPath, key);
-                                if (!v.is_array()) {
-                                    coll.emit(DiagnosticCode::C_ConflictingField, path,
-                                              std::format("'{}' must be an array of scope-name strings", key));
-                                    return;
-                                }
-                                if (v.empty()) {
-                                    coll.emit(DiagnosticCode::C_RedundantScopeRequire, path,
-                                              std::format("'{}' is an empty array — drop the field "
-                                                          "or list at least one scope", key),
-                                              DiagnosticSeverity::Warning);
-                                    return;
-                                }
-                                auto parsed = parseScopeArray(v, path, coll);
-                                if (!parsed.empty()) {
-                                    data.scopeListPool.push_back(std::move(parsed));
-                                    outSpan = std::span<ScopeKind const>{
-                                        data.scopeListPool.back()};
-                                }
-                            };
-                            loadList("anyOf",  lm.scopeRequire.anyOf);
-                            loadList("forbid", lm.scopeRequire.forbid);
-                            lm.scopeRequire.topMustBe =
-                                parseScopeNameField(sr, "topMustBe", entryPath + "/scopeRequire", coll);
-                            lm.scopeRequire.outermost =
-                                parseScopeNameField(sr, "outermost", entryPath + "/scopeRequire", coll);
-
-                            // Redundancy / contradiction checks. None of
-                            // these reject the meaning — the builder will
-                            // run the rule as-written — but the author
-                            // almost always wants to know.
-                            auto const& sm = lm.scopeRequire;
-                            const auto srPath = std::format("{}/scopeRequire", entryPath);
-                            if (sm.topMustBe.has_value() && !sm.anyOf.empty()) {
-                                coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
-                                          "'anyOf' is redundant when 'topMustBe' is set "
-                                          "(topMustBe is the stricter constraint)",
-                                          DiagnosticSeverity::Warning);
-                            }
-                            if (sm.topMustBe.has_value() && sm.outermost.has_value() &&
-                                *sm.topMustBe == *sm.outermost) {
-                                coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
-                                          "'topMustBe' and 'outermost' name the same scope; "
-                                          "the rule matches only single-scope stacks",
-                                          DiagnosticSeverity::Warning);
-                            }
-                            auto forbidContains = [&](ScopeKind k) {
-                                for (auto x : sm.forbid) if (x == k) return true;
-                                return false;
-                            };
-                            if (sm.topMustBe.has_value() && forbidContains(*sm.topMustBe)) {
-                                coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
-                                          "'forbid' lists the same scope as 'topMustBe' — "
-                                          "the rule can never match",
-                                          DiagnosticSeverity::Warning);
-                            }
-                            if (sm.outermost.has_value() && forbidContains(*sm.outermost)) {
-                                coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
-                                          "'forbid' lists the same scope as 'outermost' — "
-                                          "the rule can never match",
-                                          DiagnosticSeverity::Warning);
-                            }
-                            for (auto a : sm.anyOf) {
-                                if (forbidContains(a)) {
-                                    coll.emit(DiagnosticCode::C_RedundantScopeRequire, srPath,
-                                              std::format("scope '{}' appears in both "
-                                                          "'anyOf' and 'forbid' — the rule "
-                                                          "can never match",
-                                                          scopeName(a)),
-                                              DiagnosticSeverity::Warning);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if (scopeRequireFatal) {
-                        // Don't push a meaning with no constraint when the
-                        // author asked for one via conflicting fields —
-                        // skip it entirely so the rest of the schema isn't
-                        // weakened by the loader's silent fallback.
-                        continue;
-                    }
-                    parseModeFields(m, entryPath, data.lexerModeIds, lm, coll);
-
-                    if (m.contains("stringStyle")) {
-                        auto ss = parseStringStyle(m.at("stringStyle"),
-                                                   std::format("{}/stringStyle", entryPath),
-                                                   coll);
-                        if (ss.has_value()) {
-                            // Reserve slot 0 as the InvalidStringStyle
-                            // sentinel; real ids 1..N. Matches the
-                            // LexerModeId / NodeId / RuleId convention.
-                            if (data.stringStyles.empty()) {
-                                data.stringStyles.push_back(StringStyle{});
-                            }
-                            lm.stringStyleId = StringStyleId{
-                                static_cast<std::uint32_t>(data.stringStyles.size())};
-                            data.stringStyles.push_back(std::move(*ss));
-                        }
-                    }
-
-                    meanings.push_back(lm);
-                }
-
-                // Deterministic ordering: lowest priority wins; ties
-                // broken by declaration order (hence stable_sort).
-                std::stable_sort(meanings.begin(), meanings.end(),
-                    [](LexemeMeaning const& a, LexemeMeaning const& b) {
-                        return a.priority < b.priority;
-                    });
+                data.lexemeTable[lex] =
+                    parseMeaningArray(arr, std::format("/tokens/{}", lex), data, coll);
             }
         }
     }
@@ -1801,21 +1831,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             data.lexerModes[modeId.v] = LexerMode::make(modeName, modeId, defaultToken, flavor);
 
             // tokens field: "default" inherits top-level lexemeTable;
-            // an inline object IS the per-mode table (parsing deferred).
+            // an inline object IS the per-mode override table. While the
+            // tokenizer is in this mode it consults THIS table first and
+            // falls back to the global `lexemeTable` for any lexeme the
+            // mode doesn't override (see GrammarSchema::lookupLexemeInMode
+            // + the tokenizer's mode-aware longest-match). So the inline
+            // object lists ONLY the lexemes whose meaning differs in this
+            // mode — everything else lexes exactly as it does globally.
             const bool hasTokens = modeObj.contains("tokens");
             if (hasTokens) {
                 json const& tk = modeObj.at("tokens");
                 if (tk.is_string() && tk.get<std::string>() == "default") {
                     data.lexerModeTokens[modeId.v] = data.lexemeTable;
                 } else if (tk.is_object()) {
-                    coll.emit(DiagnosticCode::C_RedundantField,
-                              std::format("{}/tokens", modePath),
-                              "per-mode inline 'tokens' objects are not yet "
-                              "parsed; the mode's lookup table will be empty. "
-                              "Use 'tokens: \"default\"' to inherit the top-level "
-                              "map, or list mode-specific tokens at top-level "
-                              "with appropriate 'modeOp' entries to switch in",
-                              DiagnosticSeverity::Warning);
+                    // Parse the inline override table with the SAME shared
+                    // meaning parser the global `tokens` table uses, so a
+                    // per-mode entry honors identical kind/priority/flags/
+                    // scope/mode/stringStyle semantics with no second copy
+                    // of the validation. Each value must be an array of
+                    // meaning objects; a non-array value is a real config
+                    // error (mirrors the top-level table's guard).
+                    auto& modeTable = data.lexerModeTokens[modeId.v];
+                    for (auto const& [lex, arr] : tk.items()) {
+                        const auto lexPath = std::format("{}/tokens/{}", modePath, lex);
+                        if (!arr.is_array()) {
+                            coll.emit(DiagnosticCode::C_UnknownToken, lexPath,
+                                      "value must be an array of meaning objects");
+                            continue;
+                        }
+                        modeTable[lex] = parseMeaningArray(arr, lexPath, data, coll);
+                    }
                 } else {
                     coll.emit(DiagnosticCode::C_ConflictingField,
                               std::format("{}/tokens", modePath),

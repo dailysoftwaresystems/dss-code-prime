@@ -12,8 +12,7 @@ namespace dss {
 
 // Return aggregate from `Tokenizer::tokenize()`. Named fields beat
 // `std::pair` for self-documenting call sites and survive future
-// additions (TZ2 will likely surface lexer-mode-stack residue and per-
-// run stats) without rippling through every caller.
+// additions (per-run stats, etc.) without rippling through every caller.
 struct DSS_EXPORT TokenizeResult {
     TokenStream                         stream;
     std::unique_ptr<DiagnosticReporter> diagnostics;
@@ -24,9 +23,10 @@ struct DSS_EXPORT TokenizeResult {
 //   Tokenizer tk{src, schema};
 //   auto [stream, diagnostics] = std::move(tk).tokenize();
 //
-// TZ1 ships the no-modes path only — always operates in the schema's
-// "main" mode. TZ2 will add a `LexerModeStack` member and wire mode-
-// aware lookup via `GrammarSchema::lookupLexemeInMode`.
+// Mode-aware: the operator/identifier scan consults
+// `GrammarSchema::lookupLexemeInMode` for the active scan frame's mode
+// with a global fallback (context-sensitive lexing); the active mode is
+// carried per scan frame and switched by `modeOp` token side-effects.
 //
 // Emits *every* token including whitespace, comments, and the trailing
 // Eof. Schema `EmptySpace` flagging is applied via the meaning's

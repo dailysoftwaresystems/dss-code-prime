@@ -508,29 +508,76 @@ TEST(LexerModesLoader, TokensWrongTypeIsLoadError) {
     }));
 }
 
-// ── Inline tokens deferral warning + `tokens: "default"` inheritance ────
+// ── Inline tokens override parses into the per-mode table + `tokens:
+//    "default"` inheritance ──────────────────────────────────────────────
 
-TEST(LexerModesLoader, InlineTokensObjectEmitsDeferralWarning) {
-    // The warning doesn't fail the load on its own; pair with an
-    // ambiguity error so the diagnostic vector reaches us.
+TEST(LexerModesLoader, InlineTokensObjectParsesIntoPerModeTable) {
+    // An inline per-mode `tokens` object is now parsed into the mode's
+    // override table (the deferral warning it used to emit is retired).
+    // The override lexeme resolves via lookupLexemeInMode for that mode
+    // and does NOT leak into the global lexemeTable.
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 2,
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { "+": [{ "kind": "PlusOp" }] },
-      "shapes": {
-        "root":      { "alt": ["A", "B"] },
-        "A":         { "sequence": [ "PlusOp" ] },
-        "B":         { "sequence": [ "PlusOp" ] }
-      },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
       "lexerModes": {
         "m": { "tokens": { "@": [{ "kind": "AtOp" }] } }
       }
     })JSON";
     auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value())
+        << "inline per-mode tokens override must load cleanly";
+    auto const& s = **loaded;
+    const auto mId = s.findLexerMode("m");
+    ASSERT_TRUE(mId.valid());
+    auto inMode = s.lookupLexemeInMode(mId, "@");
+    ASSERT_FALSE(inMode.empty())
+        << "per-mode '@' override must be parsed into the mode table";
+    // Global table is untouched by the per-mode override.
+    EXPECT_TRUE(s.lookupLexeme("@").empty())
+        << "per-mode override must not leak into the global lexemeTable";
+}
+
+TEST(LexerModesLoader, InlineTokensNonArrayValueIsLoadError) {
+    // A per-mode tokens value that is not an array of meaning objects is
+    // a real config error — same fail-loud discipline as the top-level
+    // table. Mirrors the malformed-config contract for the new path.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": {
+        "m": { "tokens": { "@": { "kind": "AtOp" } } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
     ASSERT_FALSE(loaded.has_value());
     EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
-        return d.code == DiagnosticCode::C_RedundantField &&
-               d.message.find("not yet parsed") != std::string::npos;
+        return d.code == DiagnosticCode::C_UnknownToken &&
+               d.path.find("/lexerModes/m/tokens/@") != std::string::npos;
+    }));
+}
+
+TEST(LexerModesLoader, InlineTokensMeaningMissingKindIsLoadError) {
+    // A per-mode meaning entry missing its required `kind` flows through
+    // the SAME shared meaning parser the global table uses, so it fails
+    // loud identically.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": {
+        "m": { "tokens": { "@": [{ "priority": 1 }] } }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
+        return d.code == DiagnosticCode::C_MissingField &&
+               d.path.find("/lexerModes/m/tokens/@/0") != std::string::npos;
     }));
 }
 

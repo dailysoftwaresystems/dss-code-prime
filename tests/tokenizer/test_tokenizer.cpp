@@ -745,6 +745,161 @@ TEST(Tokenizer, UnterminatedBlockCommentEmitsDiagnostic) {
     EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedComment);
 }
 
+// ── Context-sensitive per-mode lexing (agnostic engine capability) ─────────
+//
+// A grammar declares a lexer mode carrying a per-mode `tokens` override
+// table. While the tokenizer is in that mode the scanner consults the
+// override table FIRST and falls back to the global table for anything the
+// mode does not override. So the SAME source character lexes to a
+// DIFFERENT token kind depending on the active mode — the substrate FF11
+// will use to make `<` open a header path inside `#include` while staying
+// a normal operator everywhere else. Proven here on a SYNTHETIC grammar
+// (loadFromText, no shipped .lang.json) so the capability is pinned even
+// though it ships UNCONSUMED.
+namespace {
+
+// `[` pushes the `hdr` mode; inside `hdr`, `<` is overridden to
+// HeaderOpen (vs LtOp globally) and `]` pops back. `<` is NOT listed in
+// the override table outside its single in-mode meaning, so OUTSIDE the
+// mode it must still resolve to the global LtOp via the fallback.
+constexpr std::string_view kPerModeOverrideSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "PerMode", "version": "0.1.0" },
+  "tokens": {
+    "<": [{ "kind": "LtOp" }],
+    "<<": [{ "kind": "ShlOp" }],
+    "[": [{ "kind": "OpenBracket", "modeOp": "pushMode", "modeArg": "hdr" }],
+    "]": [{ "kind": "CloseBracket" }]
+  },
+  "shapes": { "root": { "sequence": [ "LtOp" ] } },
+  "lexerModes": {
+    "hdr": {
+      "tokens": {
+        "<": [{ "kind": "HeaderOpen" }],
+        "]": [{ "kind": "CloseBracket", "modeOp": "popMode" }]
+      }
+    }
+  }
+})JSON";
+
+} // namespace
+
+TEST(Tokenizer, PerModeOverrideLexesSameCharDifferentlyInsideMode) {
+    auto loaded = GrammarSchema::loadFromText(kPerModeOverrideSchema);
+    ASSERT_TRUE(loaded.has_value()) << "synthetic per-mode override schema must load";
+    auto schema = *loaded;
+
+    const auto ltOp       = schema->schemaTokens().find("LtOp");
+    const auto headerOpen = schema->schemaTokens().find("HeaderOpen");
+    const auto openBr     = schema->schemaTokens().find("OpenBracket");
+    const auto closeBr     = schema->schemaTokens().find("CloseBracket");
+    ASSERT_TRUE(ltOp.valid());
+    ASSERT_TRUE(headerOpen.valid());
+    // The override kind and the global kind are genuinely distinct ids —
+    // otherwise the test could pass trivially.
+    ASSERT_NE(ltOp, headerOpen);
+
+    // Input crosses the mode boundary twice: `<` in main → `[` enters hdr
+    // → `<` in hdr → `]` exits hdr → `<` back in main. (No whitespace so
+    // the token indices are exact.)
+    H h{
+        .src    = SourceBuffer::fromString("<[<]<", "<permode>"),
+        .schema = schema,
+    };
+    auto result = lex(h);
+
+    // 5 operator tokens, no whitespace.
+    ASSERT_EQ(result.tokens.size(), 5u);
+    EXPECT_EQ(result.tokens[0].schemaKind, ltOp)
+        << "`<` OUTSIDE the mode must be the global LtOp";
+    EXPECT_EQ(result.tokens[1].schemaKind, openBr);
+    EXPECT_EQ(result.tokens[2].schemaKind, headerOpen)
+        << "`<` INSIDE the mode must use the per-mode HeaderOpen override "
+           "(RED-on-disable: falls back to LtOp if the mode lookup is unwired)";
+    EXPECT_EQ(result.tokens[3].schemaKind, closeBr);
+    EXPECT_EQ(result.tokens[4].schemaKind, ltOp)
+        << "after popping the mode, `<` must return to the global LtOp — "
+           "lexing OUTSIDE the mode is unchanged";
+
+    // The same byte `<` produced two different schema kinds in one stream.
+    EXPECT_NE(result.tokens[0].schemaKind, result.tokens[2].schemaKind);
+    EXPECT_EQ(result.tokens[0].schemaKind, result.tokens[4].schemaKind);
+    EXPECT_TRUE(result.diags.empty());
+}
+
+TEST(Tokenizer, PerModeOverrideFallsBackToGlobalForNonOverriddenLexeme) {
+    // Inside `hdr` the only overrides are `<` and `]`. A `<`-adjacent but
+    // non-overridden global lexeme encountered in the mode must resolve
+    // via the global fallback. Here `[` is global-only; reaching it inside
+    // the mode (via a nested push is not modeled, so instead we prove the
+    // fallback by checking a global operator that the mode omits: `]` pops,
+    // then in main `[` pushes again). The decisive fallback check: the
+    // FIRST `<` (main) and a global-only token both resolve normally while
+    // the override is active only for the chars it lists.
+    auto loaded = GrammarSchema::loadFromText(kPerModeOverrideSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const auto headerOpen = schema->schemaTokens().find("HeaderOpen");
+    const auto openBr     = schema->schemaTokens().find("OpenBracket");
+
+    // `[<[` — outer `[` enters hdr, `<` is HeaderOpen, then `[` inside hdr
+    // is NOT overridden so it falls back to the GLOBAL `[` (OpenBracket,
+    // which pushes hdr again — harmless for tokenization).
+    H h{
+        .src    = SourceBuffer::fromString("[<[", "<permode-fallback>"),
+        .schema = schema,
+    };
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 3u);
+    EXPECT_EQ(result.tokens[0].schemaKind, openBr);
+    EXPECT_EQ(result.tokens[1].schemaKind, headerOpen)
+        << "`<` inside hdr uses the override";
+    EXPECT_EQ(result.tokens[2].schemaKind, openBr)
+        << "`[` inside hdr is NOT overridden → resolves via the global fallback";
+}
+
+TEST(Tokenizer, PerModeOverrideShortCircuitsLongerGlobalLexeme) {
+    // The documented override-first short-circuit (language-config-spec.md): a per-mode
+    // override wins at ITS length even if a LONGER global lexeme shares the prefix. The
+    // `hdr` mode overrides 1-char `<` but NOT 2-char `<<`; the global table has `<<`→ShlOp.
+    // INSIDE the mode, `<<` lexes as TWO HeaderOpen (the override hits at len 1, SUPPRESSING
+    // the global 2-char `<<`); OUTSIDE, `<<` is the global ShlOp. This is the intended
+    // context-sensitive semantic (a mode redefines what `<` means); the footgun is documented.
+    auto loaded = GrammarSchema::loadFromText(kPerModeOverrideSchema);
+    ASSERT_TRUE(loaded.has_value());
+    auto schema = *loaded;
+    const auto headerOpen = schema->schemaTokens().find("HeaderOpen");
+    const auto shlOp      = schema->schemaTokens().find("ShlOp");
+    const auto openBr     = schema->schemaTokens().find("OpenBracket");
+    ASSERT_TRUE(headerOpen.valid());
+    ASSERT_TRUE(shlOp.valid());
+    ASSERT_NE(headerOpen, shlOp);
+
+    // OUTSIDE the mode: `<<` is the global 2-char ShlOp (longest-match within the main table).
+    {
+        H h{ .src = SourceBuffer::fromString("<<", "<sc-out>"), .schema = schema };
+        auto r = lex(h);
+        ASSERT_EQ(r.tokens.size(), 1u);
+        EXPECT_EQ(r.tokens[0].schemaKind, shlOp)
+            << "`<<` outside any override mode is the global 2-char ShlOp";
+    }
+    // INSIDE the mode: `[` enters hdr; `<<` → TWO 1-char HeaderOpen (the override short-circuits
+    // the global `<<`); then `]` pops. (RED if `longestMatchInMode` consulted global first.)
+    {
+        H h{ .src = SourceBuffer::fromString("[<<]", "<sc-in>"), .schema = schema };
+        auto r = lex(h);
+        ASSERT_EQ(r.tokens.size(), 4u);
+        EXPECT_EQ(r.tokens[0].schemaKind, openBr);
+        EXPECT_EQ(r.tokens[1].schemaKind, headerOpen)
+            << "first `<` in hdr → override HeaderOpen (len 1)";
+        EXPECT_EQ(r.tokens[2].schemaKind, headerOpen)
+            << "second `<` in hdr → override HeaderOpen — the global 2-char `<<` is SUPPRESSED "
+               "(override-first short-circuit)";
+        EXPECT_NE(r.tokens[1].schemaKind, shlOp)
+            << "the global `<<` must NOT win inside the override mode";
+    }
+}
+
 TEST(Tokenizer, UnterminatedCoalescedStringEmitsDiagnostic) {
     // A `"`-opened string with no closing quote. The coalesce-body path scans
     // the body to EOF, emits ONE StringLiteral token, leaves the mode open, and
