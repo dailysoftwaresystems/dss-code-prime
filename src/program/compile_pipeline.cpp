@@ -49,19 +49,18 @@ namespace {
 
 } // namespace
 
-// Per-CU assembly: runs the full HIR→MIR→LIR→ASM chain + the LK11a symbol-table
-// populate for ONE CompilationUnit, producing its `AssembledModule` (NO link, NO
-// write). File-local shared impl behind both `assembleUnit` (optional wrapper, for
-// the multi-CU driver) and `compileSingleUnit` (assemble + linkAndWrite). The
-// out-param keeps every tier-failure `return false` site below unchanged.
-static bool buildAssembledModule(CompilationUnit const&        cu,
-                                 GrammarSchema const&          grammar,
-                                 TargetSchema const&           target,
-                                 ObjectFormatSchema const&     format,
-                                 std::uint16_t                 callingConventionIndex,
-                                 DiagnosticReporter&           reporter,
-                                 CompileOptions const&         opts,
-                                 AssembledModule&              out) {
+// BUILD half (Cycle 24): semantic analysis → HIR → FFI synthesis → MIR → optimize for
+// ONE CompilationUnit, returning the `CuMirModule` the LOWER half consumes. The
+// `SemanticModel` is MOVED into the result so its `TypeLattice` interner stays alive
+// past this call — `lowerCuMirToAssembly` re-opens it for MIR→LIR + the symbol-table
+// populate. Returns nullopt on any front-half tier failure (diagnostics via `reporter`).
+std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticReporter&           reporter,
+                                      CompileOptions const&         opts) {
     // Take a CU pointer matching `analyze()`'s shared_ptr signature.
     // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
     // with a null deleter so `analyze`'s ref-counting contract is
@@ -83,14 +82,14 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
     auto model = analyze(std::move(borrowed));
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 2. CST → HIR.
     auto const hirEntry = reporter.errorCount();
     auto hir = lowerToHir(model, reporter);
     if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 2.5. FFI metadata synthesis for source-declared externs
@@ -157,7 +156,7 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
             refs, importLibrary, target, format, ffiMap, reporter);
         (void)ffiResult;  // shape inspected via reporter.errorCount()
         if (!tierClean(reporter, ffiEntry)) {
-            return false;
+            return std::nullopt;
         }
     }
 
@@ -183,7 +182,7 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
                           &hir->sourceMap, mirCfg, &ffiMap,
                           &hir->linkageMap);
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 3.5. MIR optimizer (plan 22). Pipeline resolution:
@@ -210,7 +209,7 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
                 "(D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG).",
                 static_cast<int>(opts.config), kCompileConfigCount);
             reporter.report(std::move(d));
-            return false;
+            return std::nullopt;
         }
         auto loaded = ::dss::opt::loadShippedPipeline(*name);
         if (!loaded.has_value()) {
@@ -218,7 +217,7 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
             // here is a deploy/install bug. Drain config diagnostics
             // so the user sees the JSON-path context.
             forwardConfigDiagnostics(loaded.error(), reporter);
-            return false;
+            return std::nullopt;
         }
         loadedPipeline = std::move(loaded).value();
         effectivePipeline = &loadedPipeline;
@@ -227,16 +226,49 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
         mir.mir, target, model.lattice().interner(),
         *effectivePipeline, reporter);
     if (!optResult.ok || !tierClean(reporter, optEntry)) {
-        return false;
+        return std::nullopt;
     }
+
+    // BUILD half complete — hand the optimized MIR + the SemanticModel (interner
+    // owner) + extern imports + the schema refs across the MIR/LIR seam. The model
+    // is MOVED in so the interner survives for `lowerCuMirToAssembly`. Loop 1 of the
+    // multi-CU driver collects these; loop 2 lowers each (Cycle 24 re-sequence).
+    CuMirModule cuMir{
+        std::move(mir.mir),
+        std::move(model),
+        std::move(mir.externImports),
+        cu.id(),
+        &grammar,
+        &target,
+        callingConventionIndex,
+    };
+    return cuMir;
+}
+
+// LOWER half (Cycle 24): MIR → LIR → liveness → regalloc → rewrite → legalize →
+// callconv → assemble → the LK11a symbol-table populate → the user-entry scan,
+// producing the `AssembledModule` (NO link, NO write). Consumes the `CuMirModule`
+// the BUILD half handed across the MIR/LIR seam: its `externImports` are MOVED into
+// MIR→LIR; its `mir` + `model` (interner) are read. Returns nullopt on any back-half
+// tier failure (diagnostics already emitted via `reporter`).
+std::optional<AssembledModule>
+lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
+    // Re-bind the seam state under the names the back-half body uses. `model` stays a
+    // mutable reference — MIR→LIR + the optimizer-minted-type reads re-open its
+    // interner (`lattice().interner()` is non-const). `grammar`/`target` are the
+    // caller's schemas (live across both driver loops); the cuId is stamped below.
+    auto&                     model                  = cuMir.model;
+    GrammarSchema const&      grammar                = *cuMir.grammar;
+    TargetSchema const&       target                 = *cuMir.target;
+    std::uint16_t const       callingConventionIndex = cuMir.callingConventionIndex;
 
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     auto const lirEntry = reporter.errorCount();
-    auto lir = lowerToLir(mir.mir, target,
+    auto lir = lowerToLir(cuMir.mir, target,
                           model.lattice().interner(), reporter,
-                          std::move(mir.externImports));
+                          std::move(cuMir.externImports));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 5. Liveness analysis (input to regalloc).
@@ -247,21 +279,21 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
     auto const alloc = allocateRegisters(lir.lir, target, liveness,
                                           callingConventionIndex, reporter);
     if (!alloc.ok() || !tierClean(reporter, allocEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 7. Rewrite vregs → physical registers.
     auto const rewriteEntry = reporter.errorCount();
     auto rewritten = rewriteWithAllocation(lir.lir, target, alloc, reporter);
     if (!rewritten.ok || !tierClean(reporter, rewriteEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 8. Two-address legalize (post-regalloc).
     auto const legalEntry = reporter.errorCount();
     auto legal = legalizeTwoAddress(rewritten.lir, target, reporter);
     if (!legal.ok() || !tierClean(reporter, legalEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 9. Calling-convention materialization (prologue/epilogue,
@@ -270,7 +302,7 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
     auto const ccEntry = reporter.errorCount();
     auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // 10. Assemble. `lirToMir` is all-invalid at this stage — the
@@ -285,7 +317,7 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
     auto assembled = assemble(cc.lir, target, lirToMir, reporter,
                               lir.externImports);
     if (!assembled.ok() || !tierClean(reporter, asmEntry)) {
-        return false;
+        return std::nullopt;
     }
 
     // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
@@ -353,7 +385,7 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
                     "exactly one of these (D-CSUBSET-MULTI-FN-WIN64-CC "
                     "ambiguity gate).", matches.size(), list);
                 reporter.report(std::move(d));
-                return false;
+                return std::nullopt;
             }
             if (matches.size() == 1) {
                 assembled.userEntrySymbol = matches[0];
@@ -370,18 +402,18 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
     // since the assembler had no globals-bytes path. The new pass
     // closes the producer thread end-to-end.
     auto dataItems = lowerMirGlobalsToDataItems(
-        mir.mir, model.lattice().interner(), reporter);
+        cuMir.mir, model.lattice().interner(), reporter);
     if (!tierClean(reporter, asmEntry)) {
         // Any per-global encoding error already raised a loud
         // diagnostic via the function's internal `emit`.
-        return false;
+        return std::nullopt;
     }
     assembled.dataItems = std::move(dataItems);
 
     // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
     // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; the
     // compound key only matters once LK11 links multiple CUs in one image.
-    assembled.cuId = cu.id();
+    assembled.cuId = cuMir.cuId;
 
     // LK11a: build the per-module symbol table the linker matches by NAME across
     // CUs (cross-CU resolution + weak-vs-strong). One entry per DEFINED function /
@@ -425,26 +457,25 @@ static bool buildAssembledModule(CompilationUnit const&        cu,
             assembled.symbols.push_back(ModuleSymbol{sym, rec->name, bind, vis});
             return true;
         };
-        for (std::uint32_t i = 0; i < mir.mir.moduleFuncCount(); ++i) {
-            MirFuncId const fid = mir.mir.funcAt(i);
-            if (!appendSym(mir.mir.funcSymbol(fid), mir.mir.funcBinding(fid),
-                           mir.mir.funcVisibility(fid))) {
-                return false;
+        for (std::uint32_t i = 0; i < cuMir.mir.moduleFuncCount(); ++i) {
+            MirFuncId const fid = cuMir.mir.funcAt(i);
+            if (!appendSym(cuMir.mir.funcSymbol(fid), cuMir.mir.funcBinding(fid),
+                           cuMir.mir.funcVisibility(fid))) {
+                return std::nullopt;
             }
         }
-        for (std::uint32_t i = 0; i < mir.mir.moduleGlobalCount(); ++i) {
-            MirGlobalId const gid = mir.mir.globalAt(i);
-            if (!appendSym(mir.mir.globalSymbol(gid), mir.mir.globalBinding(gid),
-                           mir.mir.globalVisibility(gid))) {
-                return false;
+        for (std::uint32_t i = 0; i < cuMir.mir.moduleGlobalCount(); ++i) {
+            MirGlobalId const gid = cuMir.mir.globalAt(i);
+            if (!appendSym(cuMir.mir.globalSymbol(gid), cuMir.mir.globalBinding(gid),
+                           cuMir.mir.globalVisibility(gid))) {
+                return std::nullopt;
             }
         }
     }
 
     // Assembly complete — return the per-CU module; linking + writing is the shared
     // `linkAndWrite` phase below, so N CUs can each assemble before one merged link.
-    out = std::move(assembled);
-    return true;
+    return assembled;
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -466,6 +497,12 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
 // Assemble ONE CompilationUnit to its AssembledModule (no link/write). Returns
 // nullopt on any tier failure (diagnostics already emitted via `reporter`). The
 // multi-CU driver calls this per CU, collects the modules, then `linkAndWrite`s once.
+//
+// = `buildCuMir(...)` composed with `lowerCuMirToAssembly(...)`. Single-CU callers
+// (`compileSingleUnit`, `compileFiles`) get byte-identical output to the former
+// monolithic `buildAssembledModule` — the two halves run back-to-back with no
+// state held between them other than the `CuMirModule` that carried the MIR/LIR
+// seam state inline before the split.
 std::optional<AssembledModule>
 assembleUnit(CompilationUnit const&        cu,
              GrammarSchema const&          grammar,
@@ -474,12 +511,10 @@ assembleUnit(CompilationUnit const&        cu,
              std::uint16_t                 callingConventionIndex,
              DiagnosticReporter&           reporter,
              CompileOptions const&         opts) {
-    AssembledModule out;
-    if (!buildAssembledModule(cu, grammar, target, format,
-                              callingConventionIndex, reporter, opts, out)) {
-        return std::nullopt;
-    }
-    return out;
+    auto cuMir = buildCuMir(cu, grammar, target, format,
+                            callingConventionIndex, reporter, opts);
+    if (!cuMir) return std::nullopt;
+    return lowerCuMirToAssembly(*cuMir, reporter);
 }
 
 bool compileSingleUnit(CompilationUnit const&        cu,

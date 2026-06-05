@@ -1,6 +1,7 @@
 #include "link/linker.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/cross_cu_resolve.hpp"
 #include "link/entry_trampoline.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
@@ -16,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace dss::linker {
 
@@ -85,51 +87,45 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                            std::unordered_map<LinkedSymbolKey, SymbolKind> const& compoundIndex,
                            LinkedImage&        image,
                            DiagnosticReporter& reporter) {
-    auto lessKey = [](LinkedSymbolKey a, LinkedSymbolKey b) {
-        return (a.cuId.v != b.cuId.v) ? (a.cuId.v < b.cuId.v)
-                                      : (a.symbol.v < b.symbol.v);
-    };
-    struct Winner { LinkedSymbolKey key; SymbolBinding binding; };
-    std::unordered_map<std::string, Winner> table;
+    // (1) DEFINITION merge + weak-vs-strong — delegated to the PURE, tier-neutral
+    // `resolveCrossCuDefs` kernel (Cycle 24). Flatten every module's symbol table into
+    // `(name, binding, key)` triples (Local stays in — the kernel excludes it), resolve,
+    // then emit ONE K_SymbolRedefinedAcrossUnits per recorded conflict event (K strong
+    // defs of one name → K-1 events, so the diagnostic count is unchanged). The kernel
+    // owns the strong-shadows-weak / all-weak-lowest-key policy AND hands back the
+    // colliding key PAIR per conflict; this caller owns the diagnostic. Each conflict
+    // names BOTH defining CompilationUnits (existing + incoming) — byte-for-byte the
+    // original wording, before the conflict data was reduced to a name. The winner table
+    // flows into reference-resolution + the resolvedGlobalDefs copy below.
+    std::vector<CrossCuDef> defs;
     for (auto const& m : modules) {
         for (auto const& s : m.symbols) {
-            if (s.binding == SymbolBinding::Local) continue;  // module-private
-            if (s.name.empty()) continue;  // producer-guarded; defensive
-            LinkedSymbolKey const key{m.cuId, s.symbol};
-            auto [it, inserted] = table.try_emplace(s.name, Winner{key, s.binding});
-            if (inserted) continue;
-            Winner& cur = it->second;
-            bool const newStrong = (s.binding == SymbolBinding::Global);
-            bool const curStrong = (cur.binding == SymbolBinding::Global);
-            if (newStrong && curStrong) {
-                report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits,
-                       DiagnosticSeverity::Error,
-                       "symbol \"" + s.name + "\" has multiple strong (Global) "
-                       "definitions across CompilationUnits (CU #" +
-                       std::to_string(cur.key.cuId.v) + " and CU #" +
-                       std::to_string(key.cuId.v) + ") — a strong symbol may be "
-                       "defined only once across the linked image.");
-                if (lessKey(key, cur.key)) cur = Winner{key, s.binding};  // order-independent reported state
-            } else if (newStrong) {        // strong shadows the existing weak
-                cur = Winner{key, s.binding};
-            } else if (!curStrong) {       // both weak — lowest key wins deterministically
-                if (lessKey(key, cur.key)) cur = Winner{key, s.binding};
-            }                              // else: existing strong shadows the new weak
+            defs.push_back(CrossCuDef{s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol}});
         }
+    }
+    CrossCuResolution const resolution = resolveCrossCuDefs(defs);
+    for (auto const& c : resolution.conflicts) {
+        report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits,
+               DiagnosticSeverity::Error,
+               "symbol \"" + c.name + "\" has multiple strong (Global) "
+               "definitions across CompilationUnits (CU #" +
+               std::to_string(c.existing.cuId.v) + " and CU #" +
+               std::to_string(c.incoming.cuId.v) + ") — a strong symbol may be "
+               "defined only once across the linked image.");
     }
     // (2) Reference resolution — an extern import whose name is DEFINED in a sibling CU
     // binds to that definition (the definition shadows the extern declaration). Record
     // the symbolic edge; LK11b patches the referencing relocations to the def's address.
     // An extern with no cross-CU definition stays a real FFI import (resolved via the
-    // import table — unchanged). Local defs are not in `table`, so a Local of the same
+    // import table — unchanged). Local defs are not in `winners`, so a Local of the same
     // name never satisfies an extern (correct — Local is module-private).
     image.resolvedCrossCuRefs.clear();
     for (auto const& m : modules) {
         for (auto const& ext : m.externImports) {
-            auto it = table.find(ext.mangledName);
-            if (it != table.end()) {
+            auto it = resolution.winners.find(ext.mangledName);
+            if (it != resolution.winners.end()) {
                 image.resolvedCrossCuRefs.push_back(LinkedImage::CrossCuRef{
-                    LinkedSymbolKey{m.cuId, ext.symbol}, it->second.key});
+                    LinkedSymbolKey{m.cuId, ext.symbol}, it->second});
             }
         }
     }
@@ -152,7 +148,7 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
         }
     }
     image.resolvedGlobalDefs.clear();
-    for (auto const& [name, w] : table) image.resolvedGlobalDefs.emplace(name, w.key);
+    for (auto const& [name, key] : resolution.winners) image.resolvedGlobalDefs.emplace(name, key);
     image.symbolCount = image.resolvedGlobalDefs.size();
 }
 

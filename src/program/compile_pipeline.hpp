@@ -1,15 +1,20 @@
 #pragma once
 
+#include "analysis/semantic/semantic_model.hpp"  // SemanticModel (CuMirModule member, move-only)
 #include "asm/asm.hpp"  // AssembledModule (assembleUnit return + linkAndWrite span)
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp"  // ExternImport (CuMirModule member)
 #include "core/types/grammar_schema.hpp"
+#include "core/types/strong_ids.hpp"  // CompilationUnitId (CuMirModule member)
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
+#include "mir/mir.hpp"  // Mir (CuMirModule member, move-only)
 #include "opt/optimizer.hpp"
 #include "program/cli_args.hpp"  // CompileConfig
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -162,6 +167,12 @@ compileSingleUnit(CompilationUnit const&         cu,
 // `compileSingleUnit` — no link, no write). Returns nullopt on any tier failure
 // (diagnostics emitted via `reporter`). The multi-CU driver (CU6) calls this per
 // CU, collects the N modules, then `linkAndWrite`s them into one merged image.
+//
+// Implemented as `buildCuMir(...)` composed with `lowerCuMirToAssembly(...)` — the
+// two halves below. The single-CU output is byte-identical to the former monolithic
+// `buildAssembledModule`; the split exists so the multi-CU driver can build EVERY
+// CU's MIR (loop 1) before lowering any (loop 2) — the prerequisite shape for a
+// future whole-program MIR merge (cycle 25). Most callers use this composed entry.
 [[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
 assembleUnit(CompilationUnit const&         cu,
              GrammarSchema const&           grammar,
@@ -170,6 +181,53 @@ assembleUnit(CompilationUnit const&         cu,
              std::uint16_t                  callingConventionIndex,
              DiagnosticReporter&            reporter,
              CompileOptions const&          opts = {});
+
+// ── assembleUnit's two halves (Cycle 24) ──────────────────────────────────────
+//
+// The verified MIR/LIR seam: everything through the optimizer is the BUILD half
+// (`buildCuMir`); MIR→LIR onward is the LOWER half (`lowerCuMirToAssembly`). The
+// `CuMirModule` carries every piece of state the lower half reads across the seam —
+// crucially the move-only `SemanticModel`, whose `TypeLattice` owns the type
+// interner that MIR→LIR + the optimizer + the symbol-table populate all consume.
+// Holding the model BY VALUE keeps the interner alive after MIR-build returns, so
+// loop 1 can build all CUs' MIR and loop 2 can lower them later.
+//
+// Move-only (the `Mir` + `SemanticModel` members are both move-only). The
+// `grammar` / `target` references are non-owning POINTERS into the caller's
+// schemas, which outlive both loops (owned by `compileOneTarget`).
+struct DSS_EXPORT CuMirModule {
+    Mir                       mir;             // the optimized module
+    SemanticModel             model;           // MOVED in — owns the interner past MIR-build
+    std::vector<ExternImport> externImports;   // MOVED into lowerToLir by the lower half
+    CompilationUnitId         cuId{};          // == cu.id(); stamped onto the AssembledModule
+
+    // Non-owning back-references the lower half reads. The caller's GrammarSchema /
+    // TargetSchema outlive the CuMirModule (they live across both driver loops).
+    GrammarSchema const*      grammar = nullptr;  // entry-name list + (unused-by-lower) policy
+    TargetSchema const*       target  = nullptr;  // MIR→LIR + assemble target
+    std::uint16_t             callingConventionIndex = 0;
+};
+
+// BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
+// `CuMirModule` carrying the optimized MIR + the SemanticModel (interner owner) +
+// extern imports + the cuId/schema refs the lower half needs. Returns nullopt on any
+// front-half tier failure (diagnostics emitted via `reporter`).
+[[nodiscard]] DSS_EXPORT std::optional<CuMirModule>
+buildCuMir(CompilationUnit const&         cu,
+           GrammarSchema const&           grammar,
+           TargetSchema const&            target,
+           ObjectFormatSchema const&      format,
+           std::uint16_t                  callingConventionIndex,
+           DiagnosticReporter&            reporter,
+           CompileOptions const&          opts = {});
+
+// LOWER half: MIR → LIR → liveness → regalloc → rewrite → legalize → callconv →
+// assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`
+// (its `externImports` are MOVED into MIR→LIR; its `mir` + `model` are read). Returns
+// nullopt on any back-half tier failure (diagnostics emitted via `reporter`).
+[[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
+lowerCuMirToAssembly(CuMirModule&        cuMir,
+                     DiagnosticReporter& reporter);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

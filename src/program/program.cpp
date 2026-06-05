@@ -282,14 +282,36 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     }
     auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
 
-    // Assemble each CU to its AssembledModule; the linker MERGES the N CUs into one image
-    // (LK11) and writes it. A single CU (the CU5 multi-file case) is the v1 single-CU path.
-    std::vector<AssembledModule> modules;
-    modules.reserve(cus.size());
+    // Cycle 24 two-loop re-sequence (whole-program-MIR-merge prerequisite). LOOP 1:
+    // build EVERY CU's MIR up front (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding
+    // each `CuMirModule` (which keeps its SemanticModel — the interner owner — alive).
+    // LOOP 2: lower each independently (`lowerCuMirToAssembly` — MIR→LIR→…→assemble) to
+    // its AssembledModule. Then the linker MERGES the N modules into one image (LK11) and
+    // writes it — exactly as before; each CU is still lowered + assembled independently, so
+    // the merge input is byte-for-byte what the former single-loop produced. On any SUCCESSFUL
+    // compile the emitted image is byte-identical; SemanticModels are simply held across loop 1
+    // (deferred lowering). A single CU (the CU5 multi-file case) is the v1 single-CU path.
+    // Early-return on the FIRST CU's build OR lower failure preserves the former assembleUnit
+    // fail-fast (diagnostics already reported via `reporter`); no later CU is processed past a
+    // failure. NOTE — the two-loop split has one benign observable delta vs the old single loop,
+    // only on a FAILING multi-CU compile: build-all-then-lower-all can surface a later CU's
+    // *build* error before an earlier CU's *lower* error (the old interleaved loop would have
+    // hit the earlier lower error first). Both are valid errors, no artifact is written either
+    // way, and the function returns non-zero either way — so this changes only *which* diagnostic
+    // lands on a broken multi-CU input, never a successful build's output.
+    std::vector<CuMirModule> cuMirs;
+    cuMirs.reserve(cus.size());
     for (auto const& cu : cus) {
-        auto mod = assembleUnit(cu, grammar, **targetR, **formatR,
+        auto cuMir = buildCuMir(cu, grammar, **targetR, **formatR,
                                 ccIndex, reporter, compileOpts);
-        if (!mod) return false;  // tier failure already reported via `reporter`
+        if (!cuMir) return false;  // front-half tier failure already reported via `reporter`
+        cuMirs.push_back(std::move(*cuMir));
+    }
+    std::vector<AssembledModule> modules;
+    modules.reserve(cuMirs.size());
+    for (auto& cuMir : cuMirs) {
+        auto mod = lowerCuMirToAssembly(cuMir, reporter);
+        if (!mod) return false;  // back-half tier failure already reported via `reporter`
         modules.push_back(std::move(*mod));
     }
     return linkAndWrite(std::span<AssembledModule const>{modules.data(), modules.size()},
