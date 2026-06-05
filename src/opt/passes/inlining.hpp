@@ -41,13 +41,22 @@
 //      function pointer means an indirect call could reach F, so the
 //      out-of-line body must be preserved AND we refuse to inline
 //      (conservative).
-//   5. F is a SINGLE-BLOCK LEAF: `funcBlockCount(F) == 1` AND F's
-//      block contains no call-like op of ANY kind — neither `Call` nor
-//      `IntrinsicCall` (leaf = no `Call` or `IntrinsicCall`) — and no
-//      `Phi` (a single-block function has no CFG merge, so a Phi would
-//      be malformed) — the minimal-splice scope. (Relaxing the
-//      IntrinsicCall-leaf refusal is deferred to a later OPT7 cycle —
-//      D-OPT7-INLINE-LEGALITY-GATE.)
+//   5. F's body is SPLICE-ELIGIBLE. The cycle-1 minimal slice (a
+//      SINGLE-BLOCK LEAF) has since been generalized: multi-block
+//      callees inline via the CFG-clone + return-merge-Phi machinery
+//      (cycle 2); a callee containing a regular `Call` (non-leaf) is
+//      admitted (cycle 3); a callee containing an `IntrinsicCall` is
+//      admitted (cycle 6). What REMAINS refused: a callee `Phi`
+//      (D-OPT7-MULTIBLOCK-SPLICE-PHI), a callee with NO returning path,
+//      a recursive-cycle call (the call-graph SCC gate, rule 3), and a
+//      callee whose instruction-count exceeds the cost bound (cycle 28).
+//      The IntrinsicCall admission carries a frame-sensitivity caveat —
+//      a frame-sensitive intrinsic (va_start / frameaddress / setjmp-
+//      class) must NOT be inlined — but no shipped frontend emits any
+//      intrinsic today, so blanket admission is correct for the current
+//      model; per-intrinsic inline-safety gating is trigger-gated to the
+//      first frame-sensitive intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-
+//      INTRINSIC.
 //
 // **NEVER DELETE a callee body in this pass.** OPT7 inlines call
 // SITES only. A now-dead callee is removed by a LATER DCE pass, which

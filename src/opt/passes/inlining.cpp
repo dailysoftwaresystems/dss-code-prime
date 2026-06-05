@@ -198,12 +198,11 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // recursion danger a non-leaf body would introduce is handled by rule
     // 3 (the SCC refusal), NOT by a leaf restriction — a non-recursive
     // call chain inlines safely one level per pass, `maxIterations`-
-    // bounded. What STAYS refused:
-    //   * An `IntrinsicCall` in ANY callee block (OPT7 cycle 6 / c6 —
-    //     SEPARATE from the regular-`Call` relaxation; see the per-op
-    //     check below). Inlining it would be SSA-correct (the intrinsic
-    //     id is module-stable + correctly remapped), but relaxing the
-    //     IntrinsicCall arm is deferred (D-OPT7-INLINE-LEGALITY-GATE).
+    // bounded. OPT7 cycle 6 LIFTS the `IntrinsicCall` restriction too — a
+    // callee whose body contains an `IntrinsicCall` is now ADMITTED (it
+    // clones SSA-correctly via the same generic arm; the per-op check below
+    // carries the frame-sensitivity caveat + its trigger-gated anchor
+    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC). What STAYS refused:
     //   * A callee `Phi` in ANY block. A multi-block callee CAN legally
     //     carry a Phi at a real CFG merge (e.g. a post-Mem2Reg join), but
     //     cloning a Phi requires remapping its incomings through the
@@ -242,12 +241,25 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // non-leaf callee whose body contains a direct/indirect `Call`
             // is now admitted (its inner Call clones correctly via the
             // splice's generic arm; recursion is caught by rule 3's SCC
-            // refusal, above). `IntrinsicCall` STAYS refused this cycle —
-            // a SEPARATE relaxation (c6): inlining it would be SSA-correct
-            // (the intrinsic id is module-stable + correctly remapped),
-            // but relaxing the IntrinsicCall arm is deferred
-            // (D-OPT7-INLINE-LEGALITY-GATE).
-            if (op == MirOpcode::IntrinsicCall) return std::nullopt;  // c6 — deferred
+            // refusal, above). OPT7 cycle 6: an `IntrinsicCall` is likewise
+            // NO LONGER a refusal — it clones SSA-correctly via the SAME
+            // generic arm. The intrinsic id lives in the inst PAYLOAD (a
+            // module-stable integer the clone copies verbatim); its operands
+            // (the args) remap through the `local` map like any other op; no
+            // IntrinsicCall-specific field exists that the generic arm drops.
+            // FRAME-SENSITIVITY caveat: a hypothetical frame-sensitive
+            // intrinsic (va_start / frameaddress / setjmp-class) would, if
+            // inlined, bind to the CALLER's frame instead of the callee's —
+            // a miscompile. No such intrinsic exists or is emitted by any
+            // shipped frontend today: the intrinsic registry has no inline-
+            // safety attribute and is EMPTY through every real compile (no
+            // sema/lowering path registers or emits an intrinsic; only the
+            // HIR text format can, in tests). That precondition is pinned by
+            // a fail-loud tripwire (the c-subset lowering test asserting an
+            // empty registry), so blanket admission is correct for the
+            // current intrinsic model. Gating on a per-intrinsic inline-
+            // safety attribute is trigger-gated to the first frame-sensitive
+            // intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
             if (op == MirOpcode::Phi)  return std::nullopt;  // deferred (see above)
             if (op == MirOpcode::Return) hasReturn = true;
             if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
