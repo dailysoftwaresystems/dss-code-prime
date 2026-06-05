@@ -668,6 +668,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   module, distinct from "ran 0 mutations because the code was
     //   already optimal."
     X_OptPassSkipped                  = 0x2007,
+    // X_InlineMalformedCallSite: the Inlining pass (OPT7) selected a
+    //   call site for inlining (callee passed the §2.9 legality gate —
+    //   a defined, non-Weak, non-recursive, non-escaping single-block
+    //   leaf) but the call's argument count does NOT match the callee's
+    //   Arg-parameter count, so the Arg(i)→actual-operand substitution
+    //   cannot preserve SSA. This is a structural violation of the
+    //   MIR contract (the HIR→MIR lowering pairs a Call's args 1:1 with
+    //   the callee signature), NOT a normal "decline to inline" — the
+    //   ordinary gate refusals leave the call as-is silently. Fail loud
+    //   so a malformed call never silently miscompiles into a wrong-arity
+    //   splice (D-OPT7-INLINE-LEGALITY-GATE).
+    X_InlineMalformedCallSite         = 0x2008,
 
     // ── Linker (renders as `K`) ───────────────────────────────────────
     //

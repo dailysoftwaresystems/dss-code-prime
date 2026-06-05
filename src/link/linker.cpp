@@ -298,15 +298,40 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         strippedExterns.insert(ref.reference);
     }
 
+    // A defined symbol (function or data) is SHADOWED when it is an externally-visible
+    // (Global/Weak) definition whose name's WINNING definition (image.resolvedGlobalDefs)
+    // lives at a DIFFERENT (cuId, SymbolId) — i.e. this body lost the weak-vs-strong /
+    // all-weak resolution. Its body MUST be DROPPED (not emitted): every reference to the
+    // name already folds onto the winner's merged id via `mergedIdFor`, so emitting the
+    // loser's body would mint a SECOND function/data item carrying the SAME merged id —
+    // the within-image duplicate-SymbolId collision the compound index rejects. This is
+    // the EMISSION-tier completion of strong-over-weak: the resolution layer picks the
+    // winner; here we drop the loser's bytes (exactly what a real linker does — the
+    // shadowed weak body never lands in the image). Local / unnamed bodies are never
+    // shadowed (Local is module-private; absent from resolvedGlobalDefs).
+    auto isShadowedDuplicate = [&](std::size_t modIdx, SymbolId sym) -> bool {
+        auto sit = byId[modIdx].find(sym.v);
+        if (sit == byId[modIdx].end()) return false;          // unnamed / synthesized — keep
+        ModuleSymbol const& ms = *sit->second;
+        if (ms.binding == SymbolBinding::Local) return false; // module-private — keep
+        auto wit = image.resolvedGlobalDefs.find(ms.name);
+        if (wit == image.resolvedGlobalDefs.end()) return false;  // not a resolved global — keep
+        LinkedSymbolKey const winner = wit->second;
+        LinkedSymbolKey const self{modules[modIdx].cuId, sym};
+        return !(winner == self);  // a different key won → this body is shadowed
+    };
+
     for (std::size_t i = 0; i < modules.size(); ++i) {
         auto const& m = modules[i];
         for (auto const& fn : m.functions) {
+            if (isShadowedDuplicate(i, fn.symbol)) continue;  // shadowed weak body — drop
             AssembledFunction out = fn;  // bytes + relocations + sourceMap copied
             out.symbol = SymbolId{mergedIdFor(i, fn.symbol)};
             retargetRelocs(i, out.relocations);
             combined.functions.push_back(std::move(out));
         }
         for (auto const& di : m.dataItems) {
+            if (isShadowedDuplicate(i, di.symbol)) continue;  // shadowed global data — drop
             AssembledData out = di;
             out.symbol = SymbolId{mergedIdFor(i, di.symbol)};
             retargetRelocs(i, out.relocations);  // same chokepoint as the function path

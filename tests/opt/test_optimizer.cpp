@@ -813,5 +813,47 @@ TEST(Optimizer, OptPassIdFromNameResolvesAllEnumerators) {
     EXPECT_EQ(opt::optPassIdFromName("Identity"),  opt::PassId::Identity);
     EXPECT_EQ(opt::optPassIdFromName("ConstFold"), opt::PassId::ConstFold);
     EXPECT_EQ(opt::optPassIdFromName("Dce"),       opt::PassId::Dce);
+    EXPECT_EQ(opt::optPassIdFromName("Inlining"),  opt::PassId::Inlining);
     EXPECT_FALSE(opt::optPassIdFromName("DoesNotExist").has_value());
+}
+
+// OPT7 effectiveness pin: the Inlining pass, driven through the engine
+// on a module with an eligible Global single-block leaf call, records
+// `mutationCount(PassId::Inlining) >= 1`. Proves the pass is reachable
+// via the engine dispatch + its mutated=true accounting flows into the
+// per-PassId metrics array (D-OPT-PASS-METRICS), not only via the
+// pass's own InliningResult counter. Fixture: main() { return g(); }
+// with g() a Global leaf returning 7 → main's call is inlined.
+TEST(Optimizer, EffectivenessInliningFiresOnLeafCall) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder b;
+    // g (SymbolId 50): Global single-block leaf returning 7.
+    b.addFunction(fnSig, SymbolId{50});
+    MirBlockId const gEntry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(gEntry);
+    MirLiteralValue seven; seven.value = std::int64_t{7}; seven.core = TypeKind::I32;
+    b.addReturn(b.addConst(seven, i32));
+    // main (SymbolId 100): return g();
+    b.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(mEntry);
+    MirInstId const gAddr = b.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const callOps[] = {gAddr};
+    MirInstId const call = b.addInst(MirOpcode::Call, callOps, i32);
+    b.addReturn(call);
+    Mir mir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"inlining", {opt::PassId::Inlining}};
+    auto const result = opt::optimize(mir, target, interner, pipeline, rep);
+    EXPECT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_GE(result.mutationCount(opt::PassId::Inlining), 1u)
+        << "Inlining must record >= 1 mutation on a module with an "
+           "eligible Global single-block leaf call";
 }

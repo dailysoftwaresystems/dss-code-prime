@@ -554,6 +554,80 @@ TEST(Linker, CrossCuMergeEmitsBothCusFunctionBytes) {
         << "CU #2's function bytes must appear in the merged image";
 }
 
+// LK11b strong-over-weak EMISSION (the OPT7 weak-inline corpus substrate): TWO CUs each
+// DEFINE a function `f` of the SAME name — one WEAK (body returns 7), one STRONG (body
+// returns 42). The resolution layer (resolveCrossCuSymbols) picks the strong def as the
+// winner; the MERGE must then DROP the shadowed WEAK body, NOT emit it with a colliding
+// merged id. Pre-fix the merge folded both ids onto the winner → TWO functions with the
+// SAME merged SymbolId → the within-image compound-index collision (K_SymbolUndefined
+// "declared more than once"). Post-fix: exactly the STRONG body lands in the image, the
+// WEAK body is dropped, and the link succeeds clean.
+//
+// RED-ON-DISABLE: remove the `isShadowedDuplicate` drop in mergeModules and this fires
+// (K_SymbolUndefined collision) — the same failure the weak_inline_crosscu corpus baseline
+// hit before the fix. This is the EMISSION-tier completion of strong-over-weak that the
+// §2.9 Weak-inline gate's end-to-end exit-42 proof rides on.
+TEST(Linker, CrossCuStrongShadowsWeakEmitsOnlyStrongBody) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // Distinct recognizable bodies: `mov eax, 7; ret` (weak) vs `mov eax, 42; ret` (strong).
+    std::vector<std::uint8_t> const weakBody  {0xB8, 0x07, 0x00, 0x00, 0x00, 0xC3};
+    std::vector<std::uint8_t> const strongBody{0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};
+
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;  // CU #1: weak f
+        m.cuId = CompilationUnitId{1};
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = weakBody;
+        m.functions.push_back(std::move(fn));
+        m.symbols.push_back(ModuleSymbol{SymbolId{1}, "f",
+                                         SymbolBinding::Weak, SymbolVisibility::Default});
+        mods.push_back(std::move(m));
+    }
+    {
+        AssembledModule m;  // CU #2: strong f (same name, per-CU SymbolId also 1)
+        m.cuId = CompilationUnitId{2};
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = strongBody;
+        m.functions.push_back(std::move(fn));
+        m.symbols.push_back(ModuleSymbol{SymbolId{1}, "f",
+                                         SymbolBinding::Global, SymbolVisibility::Default});
+        mods.push_back(std::move(m));
+    }
+
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+
+    // The link must NOT collide: the shadowed weak body is dropped, not emitted with a
+    // duplicate merged id.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "strong-over-weak emission must drop the shadowed weak body, not collide";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits), 0u);
+    EXPECT_EQ(image.resolvedGlobalDefs.at("f").cuId.v, 2u)
+        << "the strong def (CU #2) wins resolution";
+
+    auto contains = [](std::vector<std::uint8_t> const& hay,
+                       std::vector<std::uint8_t> const& needle) {
+        if (needle.empty() || hay.size() < needle.size()) return false;
+        for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+            if (std::equal(needle.begin(), needle.end(), hay.begin() + i)) return true;
+        }
+        return false;
+    };
+    EXPECT_FALSE(image.bytes.empty()) << "the merged image must emit bytes";
+    EXPECT_TRUE(contains(image.bytes, strongBody))
+        << "the STRONG f body (return 42) must be in the merged image";
+    EXPECT_FALSE(contains(image.bytes, weakBody))
+        << "the shadowed WEAK f body (return 7) must NOT be in the merged image — "
+           "inlining it (or emitting it) is the silent miscompile the OPT7 gate prevents";
+}
+
 // LK11b reloc retarget: a function's intra-CU relocation must be remapped from the
 // per-CU SymbolId to the merged id. The callee uses a LARGE per-CU SymbolId (100) with
 // no counterpart in the small merged id range — so a MISSED retarget leaves a stale
