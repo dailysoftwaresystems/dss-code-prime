@@ -198,27 +198,40 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 }
             }
 
-            // ── Silent-failure M-1: fixed32 register-only guard ─────
-            // Cycle-3 fixed32 walker rejects non-Reg operands at
-            // runtime (it has no immediate-slot support yet — Imm12
-            // / ImmShift land alongside their ARM64 consumer cycle).
-            // Surfacing at schema-load time catches a misauthored
-            // variant once, not per-instruction.
+            // ── Silent-failure M-1: fixed32 supported-operand guard ──
+            // The fixed32 walker handles Reg (register slots), SymbolRef
+            // (the symbol-bearing Imm26 slot), and — since D-LK10-ENTRY-
+            // ARM64 (v0.0.2 V2-1) — ImmInt (the Imm16 immediate slot,
+            // AArch64 MOVZ) plus MemBase + MemOffset (the unscaled
+            // LDUR/STUR memory form: base reg → Rn, MemOffset → the
+            // signed Imm9 slot, MemBase's scale validated == 1). The
+            // remaining operand kinds (block-ref / index forms) have no
+            // fixed32 walker yet and land alongside their consumer
+            // cycle. Surfacing at schema-load time catches a misauthored
+            // variant once, not per-instruction. (The walker still
+            // enforces the operand→slot pairing — ImmInt→Imm16,
+            // MemOffset→Imm9, SymbolRef→Imm26 — the immediate/offset
+            // range, and MemBase scale==1; this gate only screens the
+            // KIND.)
             if (o.encoding.shape == TargetEncodingShape::Fixed32) {
                 for (std::size_t ki = 0; ki < v.operandKinds.size(); ++ki) {
-                    if (v.operandKinds[ki] != OperandKindFilter::Reg
-                        && v.operandKinds[ki] != OperandKindFilter::SymbolRef) {
+                    auto const k = v.operandKinds[ki];
+                    if (k != OperandKindFilter::Reg
+                        && k != OperandKindFilter::SymbolRef
+                        && k != OperandKindFilter::ImmInt
+                        && k != OperandKindFilter::MemBase
+                        && k != OperandKindFilter::MemOffset) {
                         fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", i, vi, ki),
                              std::format("opcode '{}' variant {}: "
-                                         "fixed32 cycle-4 scope is "
-                                         "register + symbol-ref only "
-                                         "— operand kind '{}' at "
-                                         "position {} needs an "
-                                         "immediate-slot walker "
-                                         "(Imm12 / ImmShift, per "
-                                         "plan 13 §3.1 D-AS3-6)",
+                                         "fixed32 supports register, "
+                                         "symbol-ref, immediate, and "
+                                         "memory (base+offset) operands — "
+                                         "operand kind '{}' at position {} "
+                                         "needs a fixed32 walker for that "
+                                         "kind (block-ref / indexed forms, "
+                                         "per plan 13 §3.1 D-AS3-6)",
                                          o.mnemonic, vi,
-                                         operandKindFilterName(v.operandKinds[ki]),
+                                         operandKindFilterName(k),
                                          ki));
                     }
                 }

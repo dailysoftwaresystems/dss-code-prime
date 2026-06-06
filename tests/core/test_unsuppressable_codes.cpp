@@ -50,6 +50,11 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedLibUnsupportedType))
         << "v0.0.2 V2-2: a shipped-lib signature that fails to decode must be "
            "unsuppressable (suppressing it would silently drop the import)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::A_ImmediateOperandOutOfRange))
+        << "v0.0.2 V2-1: an immediate/offset too wide for its fixed32 slot "
+           "must be unsuppressable (suppressing it would silently truncate to "
+           "a WRONG machine-code constant — a wrong syscall number / frame "
+           "size / stack slot)";
     EXPECT_FALSE(isUnsuppressable(DiagnosticCode::None))
         << "None must never be a member (guards the array-size-bumped-without-"
            "adding-the-entry bug at runtime too)";

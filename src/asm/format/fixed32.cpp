@@ -53,6 +53,25 @@ windowFor(EncodingSlotKind s) noexcept {
         // scope: source is always a `SymbolRef`; the wire emits a
         // Relocation entry, the bits are left at 0 (linker patches).
         case EncodingSlotKind::Imm26: return SlotBitWindow{ 0,  26 };
+        // Imm16 (D-LK10-ENTRY-ARM64): AArch64 MOVZ wide-immediate at
+        // bits 5..20 of the fixed word (Rd at 0..4). Unlike Imm26 this
+        // is NOT symbol-bearing — the walker writes the operand's
+        // immediate value directly (range-checked in the wire loop).
+        case EncodingSlotKind::Imm16: return SlotBitWindow{ 5,  16 };
+        // Imm9 (D-LK10-ENTRY-ARM64): AArch64 unscaled LDUR/STUR signed
+        // byte offset at bits 12..20. The wire-loop range-checks signed
+        // -256..255 and writes the low 9 bits (two's-complement).
+        case EncodingSlotKind::Imm9:  return SlotBitWindow{ 12, 9 };
+        // MemBaseNoScale (D-LK10-ENTRY-ARM64): width-0 marker for a
+        // memory-base operand on an ISA with no scale field (AArch64
+        // unscaled). orInto with width 0 writes nothing but marks the
+        // slot consumed (satisfying the "every guard position is wired"
+        // validate rule). lsb is irrelevant at width 0.
+        case EncodingSlotKind::MemBaseNoScale: return SlotBitWindow{ 0, 0 };
+        // Imm12 (D-LK10-ENTRY-ARM64): AArch64 ADD/SUB-immediate
+        // unsigned 12-bit field at bits 10..21 (frame-size stack
+        // adjust). Range-checked 0..4095 in the wire loop.
+        case EncodingSlotKind::Imm12: return SlotBitWindow{ 10, 12 };
         // x86-variable slots — never reached on a fixed32 variant
         // (validate() rejects). Returning nullopt makes the walker
         // fail loud if a schema bypasses validate() somehow.
@@ -127,8 +146,14 @@ bool encode(Lir const&                  lir,
 
     std::uint32_t word = selected->tmpl.fixedWord;
 
+    // `value` is uint32 so the SAME helper writes both 5-bit register
+    // encodings (hwEncoding ≤ 31) and wider immediates (e.g. the
+    // 16-bit MOVZ Imm16 slot). The width mask below clips to the
+    // slot's declared bit-width; the wire loop range-checks an
+    // immediate BEFORE calling this (a too-wide value fails loud,
+    // never silently masked here).
     auto const orInto = [&](EncodingSlotKind slot,
-                            std::uint8_t value) -> bool {
+                            std::uint32_t value) -> bool {
         auto const w = windowFor(slot);
         if (!w.has_value()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -267,11 +292,151 @@ bool encode(Lir const&                  lir,
                 *wire.relocationKind,
                 SymbolId{srcOp.symbolV}
             };
+        } else if (srcOp.kind == LirOperandKind::ImmInt) {
+            // Immediate operand → an UNSIGNED immediate fixed32 slot.
+            // Cycle scope (D-LK10-ENTRY-ARM64): Imm16 (AArch64 MOVZ
+            // wide-immediate) or Imm12 (AArch64 ADD/SUB-immediate frame
+            // adjust). Mirrors the SymbolRef arm's slot restriction; a
+            // future immediate slot adds its case + window when its
+            // consumer cycle lands (the file-header convention). The
+            // slot's bit-WIDTH defines the valid range — no hardcoded
+            // per-slot bound.
+            if (wire.slotKind != EncodingSlotKind::Imm16
+                && wire.slotKind != EncodingSlotKind::Imm12) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': ImmInt operand wired to "
+                                   "slot '{}' — fixed32 supports immediate "
+                                   "operands only on the Imm16 (MOVZ) or "
+                                   "Imm12 (ADD/SUB) slots in this cycle",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            auto const w = windowFor(wire.slotKind);
+            if (!w.has_value()) {
+                // walker-internal drift: windowFor must know the slot
+                // (added in lockstep with the enum). Fail loud rather
+                // than silently skip the immediate.
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': slot '{}' has no bit-window "
+                                   "(walker-vs-enum drift)", info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            // These forms take an UNSIGNED immediate. Reject negatives
+            // and any value wider than the slot — silent truncation would
+            // emit a WRONG machine-code constant (a wrong syscall number
+            // / a wrong frame size). A wider constant needs a multi-
+            // instruction or shifted materialization, anchored for a
+            // future cycle. Unsuppressable (A_ImmediateOperandOutOfRange).
+            std::int32_t const imm = srcOp.immInt32;
+            std::uint32_t const maxVal = (1u << w->width) - 1u;
+            if (imm < 0 || static_cast<std::uint32_t>(imm) > maxVal) {
+                report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': immediate {} is out of range "
+                                   "for the {}-bit '{}' slot (valid 0..{}) — a "
+                                   "wider constant needs a multi-instruction "
+                                   "or shifted materialization, not yet "
+                                   "supported",
+                                   info->mnemonic, imm, w->width,
+                                   encodingSlotKindName(wire.slotKind), maxVal));
+                return false;
+            }
+            // orInto marks wroteSlot (same collision/double-write guard
+            // as the Reg arm).
+            if (!orInto(wire.slotKind, static_cast<std::uint32_t>(imm)))
+                return false;
+        } else if (srcOp.kind == LirOperandKind::MemOffset) {
+            // AArch64 LDUR/STUR signed 9-bit byte displacement → the
+            // Imm9 slot (bits 12..20). Mirrors the ImmInt arm's
+            // single-slot restriction; the scaled imm12 form (large
+            // frames) adds its own slot when its consumer cycle lands.
+            if (wire.slotKind != EncodingSlotKind::Imm9) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': MemOffset operand wired to "
+                                   "slot '{}' — fixed32 supports memory "
+                                   "displacements only on the Imm9 slot "
+                                   "(unscaled LDUR/STUR) in this cycle",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            auto const w = windowFor(wire.slotKind);
+            if (!w.has_value()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': slot '{}' has no bit-window "
+                                   "(walker-vs-enum drift)", info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            std::int32_t const disp = srcOp.offset;
+            // SIGNED range derived from the slot WIDTH (two's-complement):
+            // [-(2^(w-1)), 2^(w-1)-1] — for Imm9 that is -256..255.
+            // Deriving from width (not a baked literal) keeps the signed
+            // path as generic as the unsigned ImmInt arm above; fail loud
+            // rather than silently truncate to a WRONG stack slot. A
+            // larger frame needs the scaled LDR/STR imm12 form (future).
+            std::int32_t const lo = -(1 << (w->width - 1));
+            std::int32_t const hi = (1 << (w->width - 1)) - 1;
+            if (disp < lo || disp > hi) {
+                report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': memory offset {} is out of "
+                                   "range for the signed {}-bit '{}' slot "
+                                   "(valid {}..{}) — a larger frame needs the "
+                                   "scaled LDR/STR imm12 form, not yet "
+                                   "supported",
+                                   info->mnemonic, disp, w->width,
+                                   encodingSlotKindName(wire.slotKind),
+                                   lo, hi));
+                return false;
+            }
+            // orInto masks to the slot's bit-window (two's-complement for
+            // a negative displacement) + marks wroteSlot.
+            if (!orInto(wire.slotKind, static_cast<std::uint32_t>(disp)))
+                return false;
+        } else if (srcOp.kind == LirOperandKind::MemBase) {
+            // The memory-base SCALE marker. AArch64 unscaled addressing
+            // has no scale field, so this operand encodes ZERO bits — it
+            // is wired to the width-0 MemBaseNoScale slot purely to
+            // satisfy the "every guard position is wired" validate rule.
+            // Validate scale==1 here (the only place it is checked) and
+            // write nothing.
+            if (wire.slotKind != EncodingSlotKind::MemBaseNoScale) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': MemBase operand wired to "
+                                   "slot '{}' — fixed32 supports memory-base "
+                                   "operands only on the MemBaseNoScale slot "
+                                   "(unscaled addressing) in this cycle",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            if (srcOp.scale != 1u) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': fixed32 memory addressing "
+                                   "supports only scale=1 (unscaled "
+                                   "LDUR/STUR) — got scale {}",
+                                   info->mnemonic, srcOp.scale));
+                return false;
+            }
+            // orInto with the width-0 slot writes no bits but marks
+            // wroteSlot[MemBaseNoScale] (collision/consumed tracking).
+            if (!orInto(wire.slotKind, 0u)) return false;
         } else {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': variant operand {} has "
-                               "non-Reg, non-SymbolRef kind (ordinal {})",
+                               "unsupported kind for fixed32 (not Reg / "
+                               "SymbolRef / ImmInt / MemOffset / MemBase; "
+                               "ordinal {})",
                                info->mnemonic, wire.index,
                                static_cast<int>(srcOp.kind)));
             return false;

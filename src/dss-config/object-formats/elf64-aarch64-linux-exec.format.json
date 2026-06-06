@@ -12,7 +12,16 @@
   "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol and the walker will resolve it by name.",
   "entryPoint": "",
 
-  "$processExitDeferredComment": "D-LK10-ENTRY Slice B (plan 14 §2.13) intentionally OMITS `processExit` + `entryCallingConvention` here pending D-LK10-ENTRY-ARM64. Adding them now would create a partial substrate: `arm64.target.json` lacks the `syscall` opcode (encoding 0xD4000001 = SVC #0) + `call_indirect_via_extern` (ADRP+LDR+BLR macro-op) the trampoline emitter needs at Slice C. The schema-side fields land together with the target-side opcodes as one ARM64 cycle. Linux ARM64 values when it lands: mechanism=\"syscall\", syscallNumber=94 (exit_group), syscallNumGpr=\"x8\", syscallOpcodeBytes=[1, 0, 0, 212] (LE-stored SVC #0 = 0xD4000001), entryCallingConvention=\"aapcs64\".",
+  "$processExitComment": "D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): the Linux AArch64 runnable-binary spine — a raw `exit_group` syscall (no libc dependency). The trampoline emitter loads the syscall number into x8 via `mov x8, 94` (the new MOVZ Imm16 encoding — see arm64.target.json), moves the user fn's return value from returnGprs[0] (x0) into argGprs[0] (x0 — a no-op mov here since both are x0, emitted for ABI uniformity with x86_64's rax→rdi), then issues SVC #0 (the target's `syscall` opcode). Linux AArch64 syscall ABI: x8 = syscall number, x0 = arg0 (exit status). syscallOpcodeBytes [1, 0, 0, 212] = the LITTLE-ENDIAN byte stream of 0xD4000001 (SVC #0); it cross-checks the target's `syscall` opcode fixedWord. Self-contained exit mechanism — no ADRP+LDR+BLR `call_indirect_via_extern` is needed (that GOT/PLT path stays deferred at D-LK6-8).",
+  "processExit": {
+    "mechanism": "syscall",
+    "syscallNumber": 94,
+    "syscallNumGpr": "x8",
+    "syscallOpcodeBytes": [1, 0, 0, 212]
+  },
+
+  "$entryCallingConventionComment": "AAPCS64 calling convention — the user fn's return value (returnGprs[0] = x0) is moved into argGprs[0] (= x0) before SVC. Read via `target.callingConventionByName(\"aapcs64\")` at trampoline-build time.",
+  "entryCallingConvention": "aapcs64",
 
   "elf": {
     "$comment": "Elf64_Ehdr identity for an executable. type = ET_EXEC (2). class = ELFCLASS64; data = ELFDATA2LSB; osabi = sysv; machine = EM_AARCH64 (183). pageAlign = 4096 — most ARM64 Linux distributions ship with 4 KB pages. Apple Silicon (16 KB) and high-end ARM64 server configs (64 KB) declare their own values in their respective schemas; the same kernel PT_LOAD congruence rule (`p_vaddr % p_align == p_offset % p_align`) applies uniformly.",

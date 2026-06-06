@@ -614,6 +614,17 @@ enum class DiagnosticCode : std::uint16_t {
     // is missing) so the user/test isn't surprised by the bytes
     // being absent without a function-tier diagnostic.
     A_FunctionEncodeAborted        = 0x1006,
+    // A_ImmediateOperandOutOfRange (D-LK10-ENTRY-ARM64, v0.0.2 V2-1):
+    //   a fixed32 encoder wire targeting an immediate slot (e.g. the
+    //   AArch64 MOVZ `Imm16` slot) received an operand value that does
+    //   not fit the slot's bit width (negative, or wider than the
+    //   field). The encoder REFUSES to silently truncate — a truncated
+    //   immediate is a wrong machine-code constant (e.g. a wrong
+    //   syscall number), the exact miscompile class the round-trip
+    //   oracle exists to prevent. Fix: materialize the constant with a
+    //   multi-instruction sequence (MOVZ+MOVK / shifted MOVZ) once that
+    //   lowering lands, or narrow the value. Unsuppressable.
+    A_ImmediateOperandOutOfRange   = 0x1007,
 
     // ── Optimizer (renders as `X`) ────────────────────────────────────
     //

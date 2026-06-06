@@ -349,10 +349,31 @@ TEST(Arm64RoundTrip, BlSymRoundTrips) {
     auto schema = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(schema.has_value());
     auto bundle = buildAndAssemble(**schema, [&](LirBuilder& b) {
-        auto const blOp  = (*schema)->opcodeByMnemonic("bl");
+        // Direct call = generic `call` verb (AArch64 ISA: BL).
+        auto const blOp  = (*schema)->opcodeByMnemonic("call");
         auto const retOp = (*schema)->opcodeByMnemonic("ret");
         LirOperand const ops[] = { LirOperand::makeSymbolRef(123) };
         (void)b.addInst(*blOp, LirReg{}, ops);
+        (void)b.addReturn(*retOp, {});
+    });
+    assertRoundTripsClean(bundle, **schema);
+}
+
+TEST(Arm64RoundTrip, MovImm16RoundTrips) {
+    // D-LK10-ENTRY-ARM64: MOVZ Xd, #imm16 (the Imm16 immediate slot).
+    // Exercises the disasm's Imm16 bit-window + the oracle's ImmInt
+    // value comparison (the disasm-extracted imm must equal 94).
+    auto schema = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(schema.has_value());
+    auto bundle = buildAndAssemble(**schema, [&](LirBuilder& b) {
+        auto const movOp = (*schema)->opcodeByMnemonic("mov");
+        auto const retOp = (*schema)->opcodeByMnemonic("ret");
+        auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+        LirReg const x8{
+            static_cast<std::uint32_t>(*(*schema)->registerByName("x8")),
+            1, cls};
+        LirOperand const ops[] = { LirOperand::makeImmInt32(94) };
+        (void)b.addInst(*movOp, x8, ops);
         (void)b.addReturn(*retOp, {});
     });
     assertRoundTripsClean(bundle, **schema);
@@ -444,7 +465,8 @@ TEST(DisasmDefensive, RoundTripDetectsArm64Imm26NonZero) {
     // though it's the right LENGTH and right opcode prefix.
     auto schema = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(schema.has_value());
-    auto const blOp = (*schema)->opcodeByMnemonic("bl");
+    // Direct call = generic `call` verb (AArch64 ISA: BL).
+    auto const blOp = (*schema)->opcodeByMnemonic("call");
     LirBuilder b{**schema};
     (void)b.addFunction(SymbolId{1});
     auto blk = b.createBlock();

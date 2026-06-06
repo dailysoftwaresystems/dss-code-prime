@@ -25,6 +25,10 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rn:    return SlotBitWindow{ 5,  5 };
         case EncodingSlotKind::Rm:    return SlotBitWindow{ 16, 5 };
         case EncodingSlotKind::Imm26: return SlotBitWindow{ 0,  26 };
+        // D-LK10-ENTRY-ARM64: MOVZ Imm16 at bits 5..20. NOT
+        // symbol-bearing — extracted as a normal value (the Imm26
+        // must-be-zero symbol-slot path below does not apply).
+        case EncodingSlotKind::Imm16: return SlotBitWindow{ 5,  16 };
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:

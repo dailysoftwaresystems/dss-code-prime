@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 60> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 61> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -207,6 +207,11 @@ constexpr std::array<DiagnosticCode, 60> kUnsuppressableCodes{{
     DiagnosticCode::A_RoundTripMismatch,
     DiagnosticCode::A_NoEncodingDeclared,
     DiagnosticCode::A_NoEncodingShapeWalker,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): a too-wide immediate that
+    // can't fit a fixed32 immediate slot must never be silently
+    // truncated to a wrong machine-code constant (e.g. wrong syscall
+    // number). Same bytes-on-disk-invariant band as the others above.
+    DiagnosticCode::A_ImmediateOperandOutOfRange,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

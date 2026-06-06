@@ -48,6 +48,15 @@
               { "$comment": "ORR Xd, XZR, Xm — bits 16..20 hold Rm (the source register's encoding). The fixed word's bits 9..5 = 0b11111 (XZR) are baked in; the wire only adds Rm bits.",
                 "index": 0, "slotKind": "rm" }
             ]
+          },
+          {
+            "$comment": "MOVZ Xd, #imm16 — move a 16-bit UNSIGNED immediate (zeroing the rest of the register; hw shift = 0). Fixed word 0xD2800000 (sf=1, opc=10, fixed bits 100101, hw=00). The Imm16 slot writes imm16 at bits 5..20; Rd at bits 0..4. Selected by the `imm32` operand-kind guard (the engine's immediate-operand filter — the SLOT is 16-bit, MOVZ-specific). The entry trampoline uses this to load the exit-syscall number into x8 (D-LK10-ENTRY-ARM64). A value wider than 16 bits fails loud (A_ImmediateOperandOutOfRange) — MOVZ+MOVK / shifted-MOVZ materialization is a future cycle.",
+            "guard":      { "operandKinds": ["imm32"] },
+            "template":   { "fixedWord": 3531603968 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "imm16" }
+            ]
           }
         ]
       }
@@ -109,6 +118,16 @@
               { "index": 0, "slotKind": "rn" },
               { "index": 1, "slotKind": "rm" }
             ]
+          },
+          {
+            "$comment": "ADD Xd, Xn, #imm12 (immediate). Fixed word 0x91000000 (sf=1, op=0 add, S=0, sh=0). imm12 at bits 10..21 via the Imm12 slot; Rd 0..4, Rn 5..9. Used by the callconv prologue/epilogue stack adjust (`add sp, sp, #frame`). 2-operand LIR form [reg, imm]: operand 0 → Rn (also the dest via resultSlot), operand 1 → Imm12. Range 0..4095.",
+            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "template":   { "fixedWord": 2432696320 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"    },
+              { "index": 1, "slotKind": "imm12" }
+            ]
           }
         ]
       }
@@ -128,6 +147,16 @@
             "wires":      [
               { "index": 0, "slotKind": "rn" },
               { "index": 1, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "SUB Xd, Xn, #imm12 (immediate). Fixed word 0xD1000000 (sf=1, op=1 sub, S=0, sh=0). imm12 at bits 10..21; Rd 0..4, Rn 5..9. Used by the callconv prologue stack adjust (`sub sp, sp, #frame`). Same 2-operand [reg, imm] LIR form as ADD-immediate.",
+            "guard":      { "operandKinds": ["reg", "imm32"] },
+            "template":   { "fixedWord": 3506438144 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"    },
+              { "index": 1, "slotKind": "imm12" }
             ]
           }
         ]
@@ -216,8 +245,8 @@
       }
     },
     {
-      "$comment": "BL imm26 — branch with link to symbol. Fixed-word base = 0x94000000 (opcode bits 26..31 = 0b100101). Imm26 wire at bits 0..25 emits a call26 relocation; the bits are left at 0 (linker patches at link time).",
-      "mnemonic":         "bl",
+      "$comment": "Direct call to a symbol — AArch64 `BL imm26` (branch-with-link). Declared under the engine's GENERIC `call` verb (NOT the ISA spelling 'bl'), the same convention every other opcode in this file already follows (`mov`=ORR-alias, `add`=ADD, `xor`=EOR, `or`=ORR): the target's mnemonics ARE the engine's verb vocabulary; the real ISA mnemonic lives in this comment. This is what lets the format-blind trampoline emitter (`opcodeByMnemonic(\"call\")`) and the MIR→LIR `MnemonicSlot::Call` resolve the direct call on ANY target. Fixed-word base = 0x94000000 (opcode bits 26..31 = 0b100101). Imm26 wire at bits 0..25 emits a call26 relocation; the bits are left at 0 (linker patches at link time).",
+      "mnemonic":         "call",
       "result":           "none",
       "hasSideEffects":   true,
       "isCall":           true,
@@ -231,6 +260,87 @@
             "template": { "fixedWord": 2483027968 },
             "wires":    [
               { "index": 0, "slotKind": "imm26", "relocationKind": "call26" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "AArch64 SVC #0 = 0xD4000001 — supervisor call (the syscall instruction). Zero-operand at LIR level; the Linux AArch64 syscall ABI puts the syscall number in x8 (the format's processExit.syscallNumGpr), args in x0..x7, return in x0. Mirrors x86_64's `syscall` (0F 05). Added at D-LK10-ENTRY-ARM64 so the entry trampoline can issue the exit_group syscall and terminate the process. fixedWord 3556769793 = 0xD4000001 (SVC with imm16=0).",
+      "mnemonic":      "syscall",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "fixedWord": 3556769793 }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Spill-reload pseudo-op (target-blind, NO encoding — exactly like x86_64's). Payload = spill-slot index. The ML7 callconv pass materializes this into the target's real `load` (the LDUR opcode below) ONLY when a function actually spills / restores a callee-saved reg; the spill-rewrite pass requires the mnemonic to EXIST upfront. A register-pressure-light leaf (e.g. `return 42`) never emits one.",
+      "mnemonic": "frame_load", "result": "value",
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Spill-store pseudo-op (target-blind, NO encoding). Payload = spill-slot index. Operand[0] = the physical reg being stored. Materialized into the target's real `store` (the STUR opcode below) by the ML7 callconv pass, only when a function spills / saves a callee-saved reg.",
+      "mnemonic": "frame_store", "result": "none",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Memory LOAD — AArch64 LDUR Xt, [Xn, #simm9] (unscaled, signed 9-bit byte offset). Fixed word 0xF8400000 (size=11 64-bit, opc=01 load, unscaled mode bits 11..10 = 00). Operand layout (shared LIR load form): [base_reg, MemBase(scale=1), MemOffset(disp)] + result. Wires: result→Rt (rd, bits 0..4), base_reg(index 0)→Rn (bits 5..9), MemOffset(index 2)→Imm9 (bits 12..20, signed). The MemBase(index 1) carries no AArch64 bits (scale must be 1; the walker validates it). The callconv materializes frame_load into this. Offset range -256..255; a wider frame fails loud (scaled LDR imm12 = future).",
+      "mnemonic":      "load",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template":   { "fixedWord": 4164943872 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"             },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Memory STORE — AArch64 STUR Xt, [Xn, #simm9] (unscaled). Fixed word 0xF8000000 (opc=00 store). Operand layout (shared LIR store form): [value_reg, base_reg, MemBase(scale=1), MemOffset(disp)], no result. Wires: value_reg(index 0)→Rt (rd, bits 0..4), base_reg(index 1)→Rn (bits 5..9), MemOffset(index 3)→Imm9 (bits 12..20, signed). MemBase(index 2) carries no bits (scale must be 1). The callconv materializes frame_store into this.",
+      "mnemonic":      "store",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "template": { "fixedWord": 4160749568 },
+            "wires":    [
+              { "index": 0, "slotKind": "rd"             },
+              { "index": 1, "slotKind": "rn"             },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "imm9"           }
             ]
           }
         ]

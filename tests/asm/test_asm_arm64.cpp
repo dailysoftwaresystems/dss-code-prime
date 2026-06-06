@@ -194,6 +194,250 @@ TEST(Arm64Encoder, MovX19FromX2DerivesBitFields) {
     EXPECT_EQ(bytes[3], 0xAA);
 }
 
+// ── fixed32 walker — `mov Xd, #imm16` (MOVZ) — D-LK10-ENTRY-ARM64 ──
+
+TEST(Arm64Encoder, MovImm16EncodesMOVZ) {
+    // mov X8, #94 via MOVZ X8, #94 (the entry trampoline's syscall-
+    // number load). MOVZ base = 0xD2800000.
+    //   Rd    = X8 (enc 8) at bits 0..4  → 0x8
+    //   Imm16 = 94          at bits 5..20 → 94 << 5 = 0xBC0
+    // word = 0xD2800000 | 0xBC0 | 0x8 = 0xD2800BC8; LE: C8 0B 80 D2.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const movOp = (*s)->opcodeByMnemonic("mov");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x8{
+        static_cast<std::uint32_t>(*(*s)->registerByName("x8")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeImmInt32(94) };
+    (void)b.addInst(*movOp, x8, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xC8);
+    EXPECT_EQ(bytes[1], 0x0B);
+    EXPECT_EQ(bytes[2], 0x80);
+    EXPECT_EQ(bytes[3], 0xD2);
+}
+
+TEST(Arm64Encoder, MovImm16DerivesBitFields) {
+    // mov X5, #0xABCD — pins the Imm16 window (bits 5..20) + Rd (0..4)
+    // independently of the trampoline value.
+    //   Rd    = X5 (enc 5)  at bits 0..4  → 0x5
+    //   Imm16 = 0xABCD       at bits 5..20 → 0xABCD << 5 = 0x1579A0
+    // word = 0xD2800000 | 0x1579A0 | 0x5 = 0xD29579A5; LE: A5 79 95 D2.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const movOp = (*s)->opcodeByMnemonic("mov");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x5{
+        static_cast<std::uint32_t>(*(*s)->registerByName("x5")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeImmInt32(0xABCD) };
+    (void)b.addInst(*movOp, x5, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xA5);
+    EXPECT_EQ(bytes[1], 0x79);
+    EXPECT_EQ(bytes[2], 0x95);
+    EXPECT_EQ(bytes[3], 0xD2);
+}
+
+TEST(Arm64Encoder, ImmediateWiderThanImm16FailsLoud) {
+    // RED-on-disable for the immediate range guard: a value wider than
+    // the 16-bit Imm16 slot must fail loud (A_ImmediateOperandOutOfRange)
+    // rather than silently truncate to a WRONG machine-code constant
+    // (e.g. a wrong syscall number). 70000 > 0xFFFF.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const movOp = (*s)->opcodeByMnemonic("mov");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{
+        static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeImmInt32(70000) };
+    (void)b.addInst(*movOp, x0, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) {
+            sawOutOfRange = true;
+        }
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a >16-bit immediate must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+// ── fixed32 walker — load/store (LDUR/STUR) + ADD-imm — D-LK10-ENTRY-ARM64 ──
+
+namespace {
+[[nodiscard]] LirReg gpr(TargetSchema const& s, std::string_view name) {
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    return LirReg{static_cast<std::uint32_t>(*s.registerByName(name)), 1, cls};
+}
+} // namespace
+
+TEST(Arm64Encoder, LoadLdurEncodes) {
+    // load X1, [SP, #8] → LDUR X1, [SP, #8]. Base 0xF8400000.
+    //   Rt   = X1 (1)  at bits 0..4  → 0x01
+    //   Rn   = SP (31) at bits 5..9  → 0x3E0
+    //   Imm9 = 8       at bits 12..20 → 0x8000
+    // word = 0xF84083E1; LE: E1 83 40 F8.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(loadOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(8)
+    };
+    (void)b.addInst(*loadOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0x83);
+    EXPECT_EQ(bytes[2], 0x40);
+    EXPECT_EQ(bytes[3], 0xF8);
+}
+
+TEST(Arm64Encoder, StoreSturEncodes) {
+    // store X1, [SP, #8] → STUR X1, [SP, #8]. Base 0xF8000000.
+    //   Rt(value) = X1 (1) at 0..4, Rn = SP (31) at 5..9, Imm9 = 8.
+    // word = 0xF80083E1; LE: E1 83 00 F8.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const storeOp = (*s)->opcodeByMnemonic("store");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(storeOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(8)
+    };
+    (void)b.addInst(*storeOp, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xE1);
+    EXPECT_EQ(bytes[1], 0x83);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xF8);
+}
+
+TEST(Arm64Encoder, AddImm12Encodes) {
+    // add SP, SP, #16 → ADD SP, SP, #16. Base 0x91000000.
+    //   Rd = SP (31) at 0..4 → 0x1F, Rn = SP (31) at 5..9 → 0x3E0,
+    //   Imm12 = 16 at bits 10..21 → 0x4000.
+    // word = 0x910043FF; LE: FF 43 00 91.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const addOp = (*s)->opcodeByMnemonic("add");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(addOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeImmInt32(16)
+    };
+    (void)b.addInst(*addOp, gpr(**s, "sp"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x43);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0x91);
+}
+
+TEST(Arm64Encoder, MemOffsetWiderThanImm9FailsLoud) {
+    // RED-on-disable for the Imm9 range guard: a memory offset wider
+    // than signed 9-bit (-256..255) must fail loud rather than silently
+    // truncate to a WRONG stack slot. 300 > 255.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const loadOp = (*s)->opcodeByMnemonic("load");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "sp")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(300)
+    };
+    (void)b.addInst(*loadOp, gpr(**s, "x1"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    (void)assemble(lir, **s, lirToMir, rep);
+    bool sawOutOfRange = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) {
+            sawOutOfRange = true;
+        }
+    }
+    EXPECT_TRUE(sawOutOfRange)
+        << "a >9-bit memory offset must emit A_ImmediateOperandOutOfRange";
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
 // ── Shape-vs-slot validate rejection ──────────────────────────────
 
 TEST(EncodingValidate, RejectsModRmSlotInFixed32Variant) {

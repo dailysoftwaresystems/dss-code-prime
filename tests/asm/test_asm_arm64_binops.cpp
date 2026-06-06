@@ -36,7 +36,9 @@ struct ArmFx {
     f.andOp = *f.schema->opcodeByMnemonic("and");
     f.orOp  = *f.schema->opcodeByMnemonic("or");
     f.xorOp = *f.schema->opcodeByMnemonic("xor");
-    f.blOp  = *f.schema->opcodeByMnemonic("bl");
+    // The direct-call opcode is declared under the engine's generic
+    // `call` verb (AArch64 ISA spelling: BL) — see arm64.target.json.
+    f.blOp  = *f.schema->opcodeByMnemonic("call");
     f.retOp = *f.schema->opcodeByMnemonic("ret");
     return f;
 }

@@ -686,12 +686,49 @@ enum class EncodingSlotKind : std::uint8_t {
     // which already encodes the target both as operand[0] and via
     // successors[0].
     BlockRel32     = 14,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): 16-bit UNSIGNED immediate for
+    // the AArch64 MOVZ wide-immediate form (`MOVZ Xd, #imm16`). Bits
+    // 5..20 of the fixed word (Rd occupies bits 0..4). This is the
+    // FIRST fixed32 immediate slot: the entry trampoline loads the
+    // exit-syscall number into x8 via `mov x8, #94` → MOVZ. Unlike
+    // the symbol-bearing Imm26, the walker writes the operand's
+    // immediate value DIRECTLY into the bit window (range-checked —
+    // a value wider than the slot fails loud, never silently
+    // truncates), no relocation. Reusable by RV32 `addi`/`lui`-style
+    // immediate forms when a RISC-V target lands (its own slot when
+    // the bit-window differs).
+    Imm16          = 15,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): SIGNED 9-bit offset for the
+    // AArch64 unscaled load/store form (`LDUR/STUR Xt, [Xn, #simm9]`),
+    // bits 12..20. The frame load/store materialized by the callconv
+    // (spill reload / store, callee-saved save/restore) encodes its
+    // byte offset here — a RAW byte displacement (unscaled), range
+    // -256..255; a wider frame offset fails loud (a scaled LDR/STR
+    // imm12 form is the future generalization). Two's-complement: the
+    // walker writes the low 9 bits; negative offsets carry bit 8 set.
+    Imm9           = 16,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): the memory-base operand
+    // position in a fixed32 memory instruction whose ISA encoding has
+    // NO scale field (AArch64 unscaled LDUR/STUR). The shared LIR
+    // load/store form carries a MemBase(scale) operand (an x86-SIB-ism);
+    // on AArch64 it is a structural marker that must be wired (the
+    // "every guard position is wired" validate rule) yet contributes
+    // ZERO bits — a width-0 slot. The walker validates scale==1 here
+    // and writes nothing. (A scaled ISA would use a real bit-field slot
+    // instead, like x86's MemBaseScale.)
+    MemBaseNoScale = 17,
+    // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): UNSIGNED 12-bit immediate for
+    // the AArch64 ADD/SUB-immediate form (`ADD/SUB Xd, Xn, #imm12`),
+    // bits 10..21. The callconv's prologue/epilogue stack adjust
+    // (`sub sp, sp, #frame` / `add sp, sp, #frame`) encodes the frame
+    // size here. Range 0..4095; a larger frame needs the shifted
+    // imm12<<12 form (future). Unsigned (frame sizes are non-negative).
+    Imm12          = 18,
     // Future fixed32 slots (paired with their consumer cycle):
-    //   Imm12 bits 10..21  (12-bit immediate for ADD/SUB-imm forms)
-    //   ImmShift / Sf-flag / etc.
+    //   ImmShift / Sf-flag / scaled LDR imm12 / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 15> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 19> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -707,6 +744,10 @@ inline constexpr EnumNameTable<EncodingSlotKind, 15> kEncodingSlotKindTable{{{
     { EncodingSlotKind::RipRelDisp32, "riprel.disp32" },
     { EncodingSlotKind::CondCodeNibble, "condcode.nibble" },
     { EncodingSlotKind::BlockRel32,    "block.rel32"    },
+    { EncodingSlotKind::Imm16,         "imm16"          },
+    { EncodingSlotKind::Imm9,          "imm9"           },
+    { EncodingSlotKind::MemBaseNoScale, "membase.noscale" },
+    { EncodingSlotKind::Imm12,         "imm12"          },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -725,7 +766,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 15,
+static_assert(kEncodingSlotKindCount == 19,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -756,6 +797,10 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
         case EncodingSlotKind::Imm26:
+        case EncodingSlotKind::Imm16:
+        case EncodingSlotKind::Imm9:
+        case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::Imm12:
             return TargetEncodingShape::Fixed32;
     }
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
@@ -860,6 +905,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
         case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Imm16:
+        case EncodingSlotKind::Imm9:
+        case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::Imm12:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:

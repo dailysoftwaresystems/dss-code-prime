@@ -71,6 +71,23 @@ namespace {
     return mod;
 }
 
+// AArch64 analogue of makeReturn42Module — a user fn that returns 42.
+// Hand-assembled (NOT through MIR/LIR — the fixture stands alone):
+//   D2 80 05 40   MOVZ X0, #42   (0xD2800540 = base | (42<<5) | Rd=0)
+//   D6 5F 03 C0   RET            (0xD65F03C0, X30 implicit)
+// Little-endian byte stream: 40 05 80 D2 | C0 03 5F D6.
+// The trampoline emitter wraps this with the ELF/Syscall `_start`:
+//   call user_entry → mov x0,x0 → mov x8,#94 → SVC #0 → BRK.
+[[nodiscard]] AssembledModule makeReturn42ModuleArm64() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x40, 0x05, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    return mod;
+}
+
 // Build a PE-Exec ObjectFormatSchema by loading the shipped
 // pe64-x86_64-windows-exec format JSON and patching its
 // `entryPoint` field. Used by the D-LK10-ENTRY-EXTERN-ENTRY-DIAG
@@ -463,6 +480,66 @@ TEST(LK10EntrySliceC, SysvElfTrampolineEmitsNoPrologue) {
     EXPECT_EQ(trampBytes[0], 0xE8u)
         << "SysV trampoline's first instruction is `call user_entry` "
            "directly (no prologue).";
+}
+
+// ── D-LK10-ENTRY-ARM64 trampoline byte pin (v0.0.2 V2-1) ───────────
+//
+// The deterministic, host-independent proof that the ARM64 exit
+// mechanism encodes correctly. Asserts the EXACT 20-byte `_start`
+// sequence for the aapcs64/syscall trampoline on arm64 +
+// elf64-aarch64-linux-exec. RED-on-disable across the whole cycle's
+// substrate: break the MOVZ Imm16 encoding → bytes[8..11] wrong;
+// break the bl→call rename → injectEntryTrampoline returns false;
+// break the syscall opcode → bytes[12..15] wrong. This is the proof
+// that lands green on EVERY host (the runnable corpus example runs
+// under QEMU only where present).
+TEST(LK10EntrySliceC, Arm64TrampolineEmitsExactExitSequence) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42ModuleArm64();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep))
+        << "ARM64 syscall-arm trampoline injection must succeed — "
+           "requires the `call` (BL), `mov` reg+MOVZ, `syscall` (SVC), "
+           "and `unreachable` (BRK) opcodes all present on arm64.";
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(mod.functions.size(), 2u);
+
+    // The 5-instruction `_start` (aapcs64 → no stack prologue since
+    // entryStackPointerBias=0 + shadowSpaceBytes=0):
+    //   BL  user_entry  → 0x94000000 (imm26=0, call26 reloc patches it)
+    //   ORR X0, XZR, X0 → 0xAA0003E0 (mov x0,x0: argGpr0←returnGpr0)
+    //   MOVZ X8, #94     → 0xD2800BC8 (exit_group syscall number)
+    //   SVC #0           → 0xD4000001 (the syscall)
+    //   BRK #0           → 0xD4200000 (unreachable — never returns)
+    std::vector<std::uint8_t> const expected = {
+        0x00, 0x00, 0x00, 0x94,   // BL imm26
+        0xE0, 0x03, 0x00, 0xAA,   // ORR X0, XZR, X0
+        0xC8, 0x0B, 0x80, 0xD2,   // MOVZ X8, #94
+        0x01, 0x00, 0x00, 0xD4,   // SVC #0
+        0x00, 0x00, 0x20, 0xD4,   // BRK #0
+    };
+    EXPECT_EQ(mod.functions[0].bytes, expected)
+        << "ARM64 _start trampoline byte sequence drifted — check the "
+           "MOVZ Imm16 encoding (bytes 8..11), the BL/SVC/BRK opcodes, "
+           "and that no spurious prologue was emitted.";
+
+    // Syscall arm: NO synthetic ExternImport (distinguishes from the
+    // PE ByNameImport arm).
+    EXPECT_TRUE(mod.externImports.empty())
+        << "syscall arm must not inject an ExternImport";
+    // The BL is a call26 relocation to the user entry (SymbolId{1}).
+    bool userCallReloc = false;
+    for (auto const& r : mod.functions[0].relocations) {
+        if (r.target == SymbolId{1}) { userCallReloc = true; break; }
+    }
+    EXPECT_TRUE(userCallReloc)
+        << "trampoline's BL must carry a call26 reloc to user_entry";
+    EXPECT_TRUE(mod.imageEntryOverride.has_value());
+    EXPECT_EQ(*mod.imageEntryOverride, 0u);
 }
 
 // ── D-LK10-ENTRY-EXTERN-ENTRY-DIAG distinct diagnostic ─────────────

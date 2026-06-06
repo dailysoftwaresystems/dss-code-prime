@@ -27,6 +27,15 @@ jobs:
       # installs Homebrew LLVM on macos-latest to recover C++23 coverage.
       # See .plans/03-substrate-hardening-plan - ok.md SH2.
       run-macos: true
+      # v0.0.2 V2-1 (D-LK10-ENTRY-ARM64): opt into the reusable workflow's
+      # optional NATIVE arm64 Linux leg (ubuntu-24.04-arm) so CI builds the
+      # compiler on arm64 AND runs its emitted AArch64 binaries. The compiler
+      # is a cross-compiler; on the native arm64 runner the `arm64_exit` corpus
+      # runs its ELF DIRECTLY (host arch == target arch → no emulator). The
+      # harness's qemu-aarch64 path is only for running aarch64 binaries on an
+      # x86_64 host (e.g. local dev) — CI does not use QEMU. Native arm64
+      # execution-verifies the whole ARM64 backend end-to-end.
+      run-linux-arm64: true
     secrets:
       DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
       DSS_BOTS_APP_PRIVATE_KEY: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}
