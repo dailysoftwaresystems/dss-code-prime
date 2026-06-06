@@ -194,6 +194,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::F_BinaryReaderPartialCorruption: return "F_BinaryReaderPartialCorruption";
         case DiagnosticCode::F_FfiNoImportLibraryForFormat:  return "F_FfiNoImportLibraryForFormat";
         case DiagnosticCode::F_ShippedHeaderNotFound:        return "F_ShippedHeaderNotFound";
+        case DiagnosticCode::F_ShippedLibDescriptorMalformed: return "F_ShippedLibDescriptorMalformed";
+        case DiagnosticCode::F_ShippedLibUnsupportedType:    return "F_ShippedLibUnsupportedType";
     }
     return "Unknown";
 }

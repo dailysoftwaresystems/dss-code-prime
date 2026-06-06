@@ -35,6 +35,7 @@ add_library(dss-code-prime-lib SHARED
     $<TARGET_OBJECTS:asm>
     $<TARGET_OBJECTS:link>
     $<TARGET_OBJECTS:ffi>
+    $<TARGET_OBJECTS:ffi_shipped>
     $<TARGET_OBJECTS:ffi_abi>
     $<TARGET_OBJECTS:ffi_mangling>
     $<TARGET_OBJECTS:lsp>

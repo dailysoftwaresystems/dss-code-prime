@@ -10,6 +10,7 @@
 #include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -1245,153 +1246,218 @@ TEST(SemanticAnalyzerCSubset, SpacedIncludeIsRecognized) {
     fs::remove_all(dir, ec);
 }
 
-// ── FF11 GOAL-2: angle-include + a conflicting inline extern fails loud ──────
+// ── FF11: angle-include resolves a NEUTRAL JSON DESCRIPTOR + injects its ──────
+// ── externs at the SEMANTIC phase + GOAL-2 (user decl wins) ──────────────────
+//
+// These pin the DESCRIPTOR model (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC) that
+// REPLACED cycle-21's source-`.h` load. An angle `#include <io.h>` no longer
+// pulls in a parsed c-subset header; it resolves to `io.json` on the system
+// dir, and the semantic phase reads that descriptor and MINTS its externs into
+// scope BEFORE Pass 2 (the builtinFunctions analogue) — so a call resolves.
+// A descriptor symbol a USER declaration already claims is SKIPPED (goal-2:
+// user decl wins; no duplicate symbol). The old cycle-21 tree-level
+// S_RedeclaredSymbol no longer applies (a descriptor is not a tree).
 
 namespace {
-// Build a c-subset CU whose `main.c` source is `mainSrc`, with `header`
-// written to a SYSTEM dir reachable by the angle form `#include <...>`.
+using dss::test_support::Location;
+using dss::test_support::ScratchDir;
+
+// Build a c-subset CU whose `main.c` source is `mainSrc`, with a NEUTRAL JSON
+// descriptor `descName` (content `descJson`) written into `sysDir` (a SYSTEM
+// dir reachable by the angle form `#include <...>`). The descriptor FILE must
+// outlive the returned CU — the SEMANTIC phase reads it at `analyze()` time —
+// so the caller owns the `ScratchDir` (its dtor cleans up AFTER `analyze`),
+// rather than the helper deleting the dir before returning (which would race
+// the read).
 [[nodiscard]] std::shared_ptr<CompilationUnit const>
-buildAngleIncludeUnit(std::string const& headerName,
-                      std::string const& headerSrc,
-                      std::string const& mainSrc) {
-    namespace fs = std::filesystem;
-    static std::atomic<unsigned> counter{0};
-    auto dir = fs::temp_directory_path()
-             / ("dss_ff11_goal2_" + std::to_string(counter.fetch_add(1)));
-    fs::create_directories(dir);
-    std::ofstream(dir / headerName, std::ios::binary) << headerSrc;
+buildAngleDescriptorUnit(ScratchDir const& sysDir,
+                         std::string const& descName,
+                         std::string const& descJson,
+                         std::string const& mainSrc) {
+    std::ofstream(sysDir.path() / descName, std::ios::binary) << descJson;
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
-    builder.addSystemDir(dir);
+    builder.addSystemDir(sysDir.path());
     builder.addInMemory(mainSrc, "main.c");
-    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-    return cu;
+    return std::make_shared<CompilationUnit>(std::move(builder).finish());
+}
+
+// Count how many minted symbols carry `name` (1 for a clean injection; >1 is a
+// duplicate-symbol bug). Walks the whole symbol table (slot 0 unused).
+[[nodiscard]] std::size_t countSymbolsNamed(SemanticModel const& model,
+                                            std::string_view name) {
+    std::size_t n = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == name) ++n;
+    }
+    return n;
 }
 } // namespace
 
-// The C-faithful angle include with NO conflicting decl: `#include <io.h>`
-// brings in `puts`, the program uses it — clean, no redeclaration. This is
-// the additive happy path the GOAL-2 negative pins against.
-TEST(SemanticAnalyzerCSubset, FF11AngleIncludeNoConflictIsClean) {
-    auto cu = buildAngleIncludeUnit(
-        "io.h", "extern int puts(const char* s);\n",
+// The C-faithful angle include: `#include <io.h>` resolves `io.json` (which
+// declares `puts`), the semantic phase injects `puts`, and the program's call
+// `puts("hi")` RESOLVES — no S_UndeclaredIdentifier. This is the semantic-tier
+// end-to-end pin: REMOVE the descriptor injection (semantic_analyzer.cpp) and
+// `puts` is undeclared → RED. The injected `puts` carries a FnSig and the
+// model records exactly one `shippedExterns` row for it.
+TEST(SemanticAnalyzerCSubset, FF11AngleIncludeResolvesPutsViaDescriptor) {
+    ScratchDir sysDir{Location::Temp, "ff11-desc"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "io.json",
+        R"({ "library": "msvcrt.dll",
+             "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ] })",
         "#include <io.h>\nint main() { puts(\"hi\"); return 0; }\n");
-    ASSERT_EQ(cu->trees().size(), 2u) << "the system header must have loaded";
+    // NO second tree — the descriptor is not parsed source.
+    ASSERT_EQ(cu->trees().size(), 1u) << "a descriptor is recorded, not loaded as a Tree";
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 1u);
     assertNoBuilderErrors(*cu);
+
     auto model = analyze(cu);
-    EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol))
-        << "one declaration of puts (from the header) — no conflict";
+    // The use of `puts` resolved against the injected descriptor symbol.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "puts must resolve via the injected descriptor extern";
+    EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol));
+
+    // Exactly one `puts` symbol, and exactly one descriptor-extern row, with a
+    // FnSig signature + the descriptor's library.
+    EXPECT_EQ(countSymbolsNamed(model, "puts"), 1u);
+    ASSERT_EQ(model.shippedExterns().size(), 1u)
+        << "one descriptor symbol minted (puts)";
+    auto const& ext = model.shippedExterns()[0];
+    EXPECT_EQ(ext.name, "puts");
+    EXPECT_TRUE(ext.isFunction);
+    EXPECT_EQ(ext.library, "msvcrt.dll");
+    ASSERT_TRUE(ext.signature.valid());
+    EXPECT_EQ(model.lattice().interner().kind(ext.signature), TypeKind::FnSig);
 }
 
-// GOAL-2: a program that BOTH `#include <io.h>` (which declares `puts`) AND
-// writes its OWN `extern` for the same name declares `puts` twice in the
-// global scope → the existing same-scope duplicate-declaration detection
-// fires S_RedeclaredSymbol. The conflict fails LOUD; it does not silently
-// pick one. (A conflicting signature is the motivating case; the analyzer
-// is stricter — ANY same-scope duplicate name is rejected.)
-TEST(SemanticAnalyzerCSubset, FF11AngleIncludePlusInlineExternConflictFailsLoud) {
-    auto cu = buildAngleIncludeUnit(
-        "io.h", "extern int puts(const char* s);\n",
+// GOAL-2 BEHAVIOR PIN: a program that BOTH `#include <io.h>` (descriptor
+// declares `puts`) AND writes its OWN `extern char puts(int x);` — the USER
+// DECLARATION WINS. The descriptor injection SKIPS a name a user decl already
+// claimed, so there is exactly ONE `puts` symbol (the user's), and NO
+// descriptor-extern row for `puts` (it was skipped). No duplicate symbol, no
+// double-bound import. The old tree-level S_RedeclaredSymbol does NOT fire (a
+// descriptor is not a tree) — this is the deliberate descriptor-model behavior.
+TEST(SemanticAnalyzerCSubset, FF11AngleIncludePlusInlineExternUserDeclWins) {
+    ScratchDir sysDir{Location::Temp, "ff11-desc"};
+    // The descriptor declares TWO symbols: `puts` (which the user ALSO declares
+    // — must be skipped) and `fputs` (which the user does NOT — must be
+    // injected). The pair makes the goal-2 skip provably SELECTIVE: RED if it
+    // skips nothing (puts doubled) AND RED if it skips everything (fputs lost).
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "io.json",
+        R"({ "library": "msvcrt.dll",
+             "symbols": [ { "name": "puts",  "signature": "fn(ptr<char>) -> i32" },
+                          { "name": "fputs", "signature": "fn(ptr<char>) -> i32" } ] })",
         "extern char puts(int x);\n"
         "#include <io.h>\n"
         "int main() { return 0; }\n");
-    ASSERT_EQ(cu->trees().size(), 2u) << "the system header must have loaded";
+    ASSERT_EQ(cu->trees().size(), 1u);
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
-    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
-        << "puts declared by BOTH <io.h> and the inline extern must fail loud";
-}
 
-// GOAL-2 de-dup: the SAME conflicting header `#include`d TWICE is still ONE
-// logical name collision and must fail loud EXACTLY ONCE. The ImportResolver
-// emits one crossRefs edge per `#include` directive, so two identical
-// directives produce two (sourceTree, targetTree) edges; the goal-2 conflict
-// loop must de-dup on (sourceTree, name) so the duplicate edge does not
-// double-report S_RedeclaredSymbol. (`io.h` is loaded once — dedup by
-// canonical path — but the second directive still yields a second edge.)
-// NOTE: in this adjacent case the reporter's generic dedup window (size 4)
-// ALSO collapses the two identical reports, so this test documents the
-// behavioral contract; the window-INDEPENDENT proof of the goal-2 guard is
-// FF11DuplicateHeaderAcrossDedupWindowReportsOnce below (which separates the
-// duplicates past the window).
-TEST(SemanticAnalyzerCSubset, FF11SameConflictingHeaderIncludedTwiceReportsOnce) {
-    auto cu = buildAngleIncludeUnit(
-        "io.h", "extern int puts(const char* s);\n",
-        "extern char puts(int x);\n"
-        "#include <io.h>\n"
-        "#include <io.h>\n"
-        "int main() { return 0; }\n");
-    ASSERT_EQ(cu->trees().size(), 2u)
-        << "io.h loads once (path dedup) → main.c + io.h only";
-    assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
-        << "the same header included twice is ONE conflict — not one per "
-           "duplicate include edge";
-}
-
-// GOAL-2 de-dup, window-DEFEATING regression guard. The DiagnosticReporter
-// has a generic dedup WINDOW (Config.dedupWindow = 4) that drops an
-// identical (code, buffer, span, rule, actual) diagnostic seen within the
-// last 4 emissions — so the adjacent same-header-twice case above is ALSO
-// (coincidentally) collapsed by that window, and the simple test cannot by
-// itself prove the goal-2 (sourceTree, name) guard. This test DEFEATS the
-// window: the same conflicting header `dup.h` is included TWICE, but the two
-// includes are separated by FOUR OTHER distinct conflicting headers, so the
-// second `dup` redeclaration lands >4 diagnostics after the first and the
-// reporter window does NOT cover it. Therefore the goal-2 (sourceTree, name)
-// de-dup is the ONLY thing that keeps `dup`'s name from double-reporting —
-// remove that guard and this test goes RED (count becomes 6, not 5).
-//
-// Each header conflicts on its OWN distinct source-declared name (h0..h3 +
-// dup), with distinct parameter names so no spurious same-scope param clash
-// contaminates the count. Expected: 5 distinct colliding names → 5 reports
-// (each name once); the duplicate `dup` edge is suppressed by the guard.
-TEST(SemanticAnalyzerCSubset, FF11DuplicateHeaderAcrossDedupWindowReportsOnce) {
-    namespace fs = std::filesystem;
-    static std::atomic<unsigned> counter{0};
-    auto dir = fs::temp_directory_path()
-             / ("dss_ff11_goal2_win_" + std::to_string(counter.fetch_add(1)));
-    fs::create_directories(dir);
-    std::ofstream(dir / "dup.h", std::ios::binary)
-        << "extern int dup(int p);\n";
-    for (int i = 0; i < 4; ++i) {
-        std::ofstream(dir / ("h" + std::to_string(i) + ".h"), std::ios::binary)
-            << "extern int h" << i << "(int p);\n";
+    // The user's decl is the SOLE `puts` — the descriptor symbol was skipped.
+    EXPECT_EQ(countSymbolsNamed(model, "puts"), 1u)
+        << "user decl wins — the descriptor's puts is skipped (no duplicate)";
+    // The UNCLAIMED descriptor symbol `fputs` IS injected (selective skip).
+    EXPECT_EQ(countSymbolsNamed(model, "fputs"), 1u)
+        << "an unclaimed descriptor symbol must still inject";
+    ASSERT_EQ(model.shippedExterns().size(), 1u)
+        << "exactly one descriptor extern row — fputs only (puts skipped)";
+    EXPECT_EQ(model.shippedExterns()[0].name, "fputs");
+    for (auto const& ext : model.shippedExterns()) {
+        EXPECT_NE(ext.name, "puts")
+            << "a descriptor symbol a user decl claimed must NOT be injected";
     }
+    // The user's `puts` carries the user's signature (`char(int)`), not the
+    // descriptor's `i32(ptr<char>)` — concrete proof the user decl is the one
+    // that survived. The user's first param is the int (I32) it declared.
+    SymbolRecord const* userPuts = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "puts") userPuts = &model.symbols()[i];
+    }
+    ASSERT_NE(userPuts, nullptr);
+    ASSERT_TRUE(userPuts->type.valid());
+    auto const& ti = model.lattice().interner();
+    ASSERT_EQ(ti.kind(userPuts->type), TypeKind::FnSig);
+    auto const params = ti.fnParams(userPuts->type);
+    ASSERT_EQ(params.size(), 1u) << "the user's puts(int) has one int param";
+    EXPECT_EQ(ti.kind(params[0]), TypeKind::I32)
+        << "the surviving puts is the USER's (int param), not the descriptor's "
+           "(ptr<char> param)";
+}
+
+// DEDUP: the SAME descriptor `#include`d TWICE injects its symbol EXACTLY ONCE.
+// The resolver records the descriptor path per directive (twice here), so the
+// semantic injection must de-dup on canonical path. RED (two `puts` symbols /
+// two extern rows) if the path-dedup is removed.
+TEST(SemanticAnalyzerCSubset, FF11SameDescriptorIncludedTwiceInjectsOnce) {
+    ScratchDir sysDir{Location::Temp, "ff11-desc"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "io.json",
+        R"({ "library": "msvcrt.dll",
+             "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ] })",
+        "#include <io.h>\n"
+        "#include <io.h>\n"
+        "int main() { puts(\"hi\"); return 0; }\n");
+    ASSERT_EQ(cu->trees().size(), 1u);
+    // Two directives → two recorded descriptor paths (deduped at injection).
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 2u);
+    assertNoBuilderErrors(*cu);
+
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+    EXPECT_EQ(countSymbolsNamed(model, "puts"), 1u)
+        << "the same descriptor twice injects puts ONCE — not per directive";
+    EXPECT_EQ(model.shippedExterns().size(), 1u)
+        << "exactly one descriptor-extern row for puts";
+}
+
+// DEDUP across MANY symbols + a repeated descriptor: every DISTINCT descriptor
+// symbol is injected EXACTLY ONCE, and a descriptor included twice does not
+// double-inject. Mirrors the old window-defeating guard's spirit (many symbols,
+// a duplicated one) under the descriptor model: a name is minted at most once
+// regardless of how many descriptors (or repeats) declare it. Each of the five
+// names (dup + s0..s3) is used by the program so all must resolve.
+TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
+    ScratchDir sysDir{Location::Temp, "ff11-desc-multi"};
+    auto writeDesc = [&](std::string const& stem, std::string const& sym) {
+        std::ofstream(sysDir.path() / (stem + ".json"), std::ios::binary)
+            << R"({ "library": "msvcrt.dll", "symbols": [ { "name": ")"
+            << sym << R"(", "signature": "fn() -> i32" } ] })";
+    };
+    writeDesc("dup", "dup");
+    for (int i = 0; i < 4; ++i) writeDesc("s" + std::to_string(i), "s" + std::to_string(i));
+
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
-    builder.addSystemDir(dir);
-    // Source declares all five colliding names (distinct param names a0..a4
-    // so the only S_RedeclaredSymbols are the five cross-tree collisions).
-    // The two `#include <dup.h>` directives bracket the four single-conflict
-    // headers, so the duplicate `dup` edge is processed >4 diagnostics after
-    // the first — outside the reporter's dedup window.
+    builder.addSystemDir(sysDir.path());
+    // <dup.h> is included TWICE (bracketing the others); each of dup,s0..s3 is
+    // called so all five must resolve, and dup must be minted only once.
     builder.addInMemory(
-        "extern char dup(int a0);\n"
-        "extern char h0(int a1);\n"
-        "extern char h1(int a2);\n"
-        "extern char h2(int a3);\n"
-        "extern char h3(int a4);\n"
         "#include <dup.h>\n"
-        "#include <h0.h>\n"
-        "#include <h1.h>\n"
-        "#include <h2.h>\n"
-        "#include <h3.h>\n"
+        "#include <s0.h>\n"
+        "#include <s1.h>\n"
+        "#include <s2.h>\n"
+        "#include <s3.h>\n"
         "#include <dup.h>\n"
-        "int main() { return 0; }\n",
+        "int main() { return dup() + s0() + s1() + s2() + s3(); }\n",
         "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-    ASSERT_EQ(cu->trees().size(), 6u) << "main.c + dup.h + h0..h3.h (dup loads once)";
+    ASSERT_EQ(cu->trees().size(), 1u) << "descriptors are not parsed Trees";
+    // Six directives → six recorded paths (dup repeated); deduped at injection.
+    EXPECT_EQ(cu->shippedLibDescriptors().size(), 6u);
     assertNoBuilderErrors(*cu);
+
     auto model = analyze(cu);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 5u)
-        << "five distinct colliding names each fire ONCE; the duplicate "
-           "<dup.h> edge (>4 diags later, past the reporter window) is "
-           "suppressed by the goal-2 (sourceTree, name) guard — RED (6) "
-           "without it";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "all five descriptor symbols must resolve";
+    // Five distinct symbols, each minted EXACTLY once (dup not doubled).
+    EXPECT_EQ(countSymbolsNamed(model, "dup"), 1u)
+        << "dup included twice is minted ONCE — not per directive";
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(countSymbolsNamed(model, "s" + std::to_string(i)), 1u);
+    }
+    EXPECT_EQ(model.shippedExterns().size(), 5u)
+        << "five distinct descriptor symbols → five extern rows (no duplicate)";
 }

@@ -44,6 +44,12 @@ TEST(UnsuppressableCodes, MembershipIncludesCoreArchitecturalCodes) {
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedHeaderNotFound))
         << "FF11: a missing system header `#include <h>` must be unsuppressable "
            "(suppressing it would compile a program calling an undeclared symbol)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedLibDescriptorMalformed))
+        << "v0.0.2 V2-2: a malformed shipped-lib JSON descriptor must be "
+           "unsuppressable (suppressing it would silently drop shipped externs)";
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::F_ShippedLibUnsupportedType))
+        << "v0.0.2 V2-2: a shipped-lib signature that fails to decode must be "
+           "unsuppressable (suppressing it would silently drop the import)";
     EXPECT_FALSE(isUnsuppressable(DiagnosticCode::None))
         << "None must never be a member (guards the array-size-bumped-without-"
            "adding-the-entry bug at runtime too)";

@@ -60,7 +60,8 @@ public:
                     std::shared_ptr<GrammarSchema const> schema,
                     std::vector<Tree>                    trees,
                     DiagnosticReporter                   driverDiagnostics,
-                    std::vector<CrossTreeRef>            crossRefs);
+                    std::vector<CrossTreeRef>            crossRefs,
+                    std::vector<std::filesystem::path>   shippedLibDescriptors);
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -101,6 +102,18 @@ public:
     // tests in test_compilation_unit.cpp must be revisited deliberately.
     [[nodiscard]] std::span<CrossTreeRef const>  crossRefs()         const noexcept;
 
+    // FF11 neutral-JSON shipped-library descriptors
+    // (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC): the absolute paths of every
+    // shipped-lib JSON descriptor an angle/system `#include <h>` resolved to.
+    // Empty unless a tree did `#include <h>` that mapped to a `<stem>.json` on
+    // the system search path. The semantic phase reads each descriptor and
+    // mints its extern symbols into scope (the builtinFunctions analogue) — a
+    // descriptor is a neutral symbol table, NOT a parsed source Tree, so it
+    // produces no entry in `trees()`/`crossRefs()`. CU4's ImportResolver is the
+    // only producer.
+    [[nodiscard]] std::span<std::filesystem::path const>
+    shippedLibDescriptors() const noexcept;
+
     // Process-global monotonic id counter. Mirrors `TreeBuilder::nextTreeId`
     // exactly. Public so test harnesses can mint a `CompilationUnitId` that
     // does not collide with builder-produced ids — same posture as
@@ -113,6 +126,7 @@ private:
     std::vector<Tree>                    trees_;
     DiagnosticReporter                   driverDiagnostics_;
     std::vector<CrossTreeRef>            crossRefs_;
+    std::vector<std::filesystem::path>   shippedLibDescriptors_;  // FF11 neutral-JSON descriptor paths
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same

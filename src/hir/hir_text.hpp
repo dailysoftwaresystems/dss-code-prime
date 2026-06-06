@@ -45,6 +45,7 @@
 namespace dss {
 
 class DiagnosticReporter;
+class TypeRegistry;
 
 // ── HirTextContext ────────────────────────────────────────────────────────────
 //
@@ -138,5 +139,25 @@ struct DSS_EXPORT HirParseResult {
 // than aborting. On an unrecoverable header error the returned module is empty.
 [[nodiscard]] DSS_EXPORT std::unique_ptr<HirParseResult> parseHir(
     std::string_view text, CompilationUnitId cuId, DiagnosticReporter& reporter);
+
+// ── parseTypeFromText ─────────────────────────────────────────────────────────
+//
+// Parse a STANDALONE hir-text TYPE string (e.g. `"fn(ptr<char>) -> i32"`,
+// `"ptr<char>"`, `"i32"`, `"void"`) into a `TypeId`, interning the result into
+// the CALLER-PROVIDED `interner` (+ `typeReg` for `ext<>` extension kinds). The
+// caller's interner/registry is used DIRECTLY — the produced TypeId belongs to
+// `interner` (its `owner()` CU), ready to drop into that CU's IR.
+//
+// This drives the SAME grammar production as the hir-text module parser's `type`
+// rule (`parseType`): there is EXACTLY ONE type-text decoder in the codebase, so
+// the standalone path can never drift from what the module parser accepts.
+//
+// Returns `InvalidType` and emits at least one Error-severity diagnostic into
+// `reporter` on malformed or unknown type text; it never returns a partially
+// constructed type silently. Trailing tokens after a complete type are reported
+// (the input must be a single type, nothing more).
+[[nodiscard]] DSS_EXPORT TypeId
+parseTypeFromText(std::string_view typeText, TypeInterner& interner,
+                  TypeRegistry& typeReg, DiagnosticReporter& reporter);
 
 } // namespace dss

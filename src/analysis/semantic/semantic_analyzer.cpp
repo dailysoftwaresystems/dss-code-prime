@@ -15,12 +15,14 @@
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
 #include "hir/cst_const_eval.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <limits>
@@ -2306,6 +2308,87 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
         }
     }
 
+    // FF11 shipped-library descriptor injection (the builtinFunctions analogue),
+    // closing D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC's semantic half. An
+    // angle/system `#include <stdio.h>` resolved (in CU4) to a LANGUAGE-NEUTRAL
+    // JSON descriptor whose path the CU recorded; here — AFTER every tree's
+    // Pass 1 (so user decls exist for the goal-2 skip) and BEFORE Pass 2 (so a
+    // user CALL like `puts("hi")` resolves against the injected symbol) — we
+    // read each descriptor, intern each symbol's signature into THIS CU's
+    // interner (`s.lattice.interner()`, the same interner the lowerer lowers
+    // through), mint an extern function SymbolRecord, and inject it into the CU
+    // ROOT scope (the parent of every language's builtin scope → visible to
+    // every tree, language-blind — a neutral system import). The minted row is
+    // recorded on `shippedExterns` so the CST→HIR lowerer can synthesize the
+    // matching ExternFunction + HirExternRecord that FF5 binds to the library.
+    //
+    // GOAL-2 (a user who BOTH `#include <stdio.h>` AND writes `extern int
+    // puts(...)`): the descriptor symbol is SKIPPED when ANY user declaration
+    // already claims the name. The user decl wins and is the sole authority — no
+    // duplicate symbol, no duplicate extern HIR node, no double-bound import.
+    // This is the descriptor-model analogue of cycle-21's tree-level
+    // S_RedeclaredSymbol (which no longer applies — a descriptor is not a tree).
+    std::vector<ShippedExternSymbol> shippedExterns;
+    {
+        // Names any USER declaration (top-level, in any tree's own root scope)
+        // claimed — the goal-2 skip set. A binding whose symbol's `tree` is the
+        // root scope's own tree is a real user decl (injected cross-tree
+        // bindings carry the DEFINING tree's id; builtins carry InvalidTree).
+        std::unordered_set<std::string> userDeclaredNames;
+        for (auto const& [treeV, scope] : treeRootScope) {
+            for (auto const& [name, sym] : s.scopes.bindingsOf(scope)) {
+                if (sym.valid() && s.symbols.at(sym).tree.v == treeV) {
+                    userDeclaredNames.insert(std::string{name});
+                }
+            }
+        }
+
+        // Dedup descriptor paths (the same `#include <stdio.h>` in two trees, or
+        // twice in one tree, records the path twice) AND symbol names already
+        // minted (two descriptors both declaring `puts` → first wins) so a name
+        // is injected at most once.
+        std::unordered_set<std::string> readDescriptors;
+        std::unordered_set<std::string> injectedNames;
+        for (std::filesystem::path const& descPath :
+             cu->shippedLibDescriptors()) {
+            std::error_code ec;
+            auto canonical = std::filesystem::weakly_canonical(descPath, ec);
+            std::string const key =
+                (ec ? descPath.lexically_normal() : canonical).string();
+            if (!readDescriptors.insert(key).second) continue;  // already read
+
+            // Read + decode against THIS CU's interner/registry/reporter. The
+            // reader fails loud (F_ShippedLibDescriptorMalformed /
+            // F_ShippedLibUnsupportedType) and returns nullopt on any problem;
+            // nothing is injected in that case (the pipeline then aborts on the
+            // reporter error delta — never a silent partial import).
+            auto desc = ffi::readShippedLibDescriptor(
+                descPath, s.lattice.interner(), s.lattice.registry(), s.reporter);
+            if (!desc) continue;
+
+            for (auto const& sym : desc->symbols) {
+                // GOAL-2: a user decl of this name wins — skip the descriptor's.
+                if (userDeclaredNames.contains(sym.name)) continue;
+                if (!injectedNames.insert(sym.name).second) continue;  // first wins
+
+                SymbolRecord rec;
+                rec.name  = sym.name;
+                rec.scope = cuRoot;
+                rec.tree  = InvalidTree;   // not a user decl (mirrors builtins)
+                rec.kind  = sym.kind == ffi::ShippedSymbolKind::Function
+                                ? DeclarationKind::Function
+                                : DeclarationKind::Variable;
+                rec.type  = sym.signature;
+                SymbolId const id = s.symbols.mint(rec);
+                s.scopes.injectBinding(cuRoot, sym.name, id);
+
+                shippedExterns.push_back(ShippedExternSymbol{
+                    id, sym.name, sym.signature, desc->library,
+                    sym.kind == ffi::ShippedSymbolKind::Function});
+            }
+        }
+    }
+
     // Pass 1.5 per tree: resolve declaration types + function signatures.
     for (auto const& tree : trees) {
         if (!tree.root().valid()) continue;
@@ -2368,6 +2451,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu) {
         std::move(s.reporter),
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),
+        std::move(shippedExterns),
     };
 }
 

@@ -18,4 +18,12 @@ target_compile_definitions(analysis_semantic PRIVATE DSS_SHARED_BUILD DSS_BUILDI
 # + the type lattice, all of which live in `core` and
 # `analysis_compilation_unit`. No parser dependency — Pass 1/2 read the
 # parsed Tree only.
-target_link_libraries(analysis_semantic PRIVATE core analysis_compilation_unit)
+#
+# ffi_shipped (FF11 neutral-JSON descriptor reader): the FF11 shipped-library
+# injection (semantic_analyzer.cpp) reads a resolved descriptor via
+# `readShippedLibDescriptor` to mint its extern symbols before Pass 2. The
+# reader is frontend-free (depends only on core + hir's parseTypeFromText), so
+# analysis_semantic -> ffi_shipped is acyclic (ffi_shipped never reads the
+# SemanticModel). Declared to keep the dependency graph honest against the
+# include surface (this repo's OBJECT-lib discipline).
+target_link_libraries(analysis_semantic PRIVATE core analysis_compilation_unit ffi_shipped)

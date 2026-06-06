@@ -1,0 +1,6 @@
+{
+  "library": "msvcrt.dll",
+  "symbols": [
+    { "name": "puts", "signature": "fn(ptr<char>) -> i32", "kind": "function", "linkage": "external" }
+  ]
+}

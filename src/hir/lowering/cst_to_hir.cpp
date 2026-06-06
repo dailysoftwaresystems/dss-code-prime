@@ -3107,6 +3107,34 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.at(t.schema().schemaId().v)->lowerTree(t, decls);
     }
 
+    // FF11 shipped-library descriptor externs
+    // (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC): synthesize one extern HIR node
+    // per descriptor symbol the semantic phase minted (e.g. `puts` from
+    // `stdio.json`, pulled in by `#include <stdio.h>`). These have NO source
+    // CST — the semantic phase already minted the SymbolId + interned the
+    // signature into the CU lattice (`model.lattice().interner()`, the same
+    // interner `builder` lowers through), and applied the goal-2 skip (a symbol
+    // a user decl claimed is absent from `shippedExterns()`). Each synthesized
+    // node is appended to BOTH the module `decls` (so `collectExterns` in
+    // HIR→MIR finds it) and `externDecls` with the descriptor's `library` as the
+    // `libraryOverride` — so the EXISTING FF5 `synthesizeFfiFromSourceDecls`
+    // (compile_pipeline step 2.5) binds it to the import library exactly like a
+    // source-declared extern. A function symbol synthesizes ExternFunction (the
+    // FnSig carries the param types, so the node needs NO param children — the
+    // HIR→MIR extern pre-pass reads the signature, never the children); an
+    // object symbol synthesizes ExternGlobal.
+    for (ShippedExternSymbol const& ext : model.shippedExterns()) {
+        HirNodeId const node = ext.isFunction
+            ? builder.makeExternFunction(ext.signature, ext.symbol.v, {})
+            : builder.makeExternGlobal(ext.signature, ext.symbol.v);
+        decls.push_back(node);
+        // libraryOverride = the descriptor's `library`; empty ⇒ FF5 falls back
+        // to the language's `externLibraryByFormat[format]` default (the same
+        // fallback a source extern with no trailing `"lib"` override uses).
+        externDecls.push_back(HirExternRecord{
+            node, ext.name, ext.library});
+    }
+
     HirNodeId const root = builder.makeModule(decls);
     Hir hir = std::move(builder).finish(root);
     lowerers.clear();   // drop the Lowerers (their builder ref is now moved-from)
